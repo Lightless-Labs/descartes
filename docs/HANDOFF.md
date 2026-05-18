@@ -207,7 +207,8 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 
 - This directory is now a git repository; `git status --short` works.
 - Current checked command: `npm test` passes 7 Node test cases.
-- Current checked command: local tarball global install from `npm pack --silent` installed dependencies, `descartes --help` worked, and `descartes triage "my machine is slow" --json` reached the expected "No configured model credentials" error with isolated XDG paths.
+- Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
+- Current checked command: GitHub-installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists.
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Full `descartes login` / `descartes triage` end-to-end flow has not been validated because local package dependencies/auth were not installed/configured in this repo.
