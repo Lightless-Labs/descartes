@@ -1,0 +1,12 @@
+# Local reference material / scratch inputs
+materials/
+
+# Local logs and process output
+*.log
+nohup.out
+
+# Rust build output
+/target/
+
+# Editor / OS noise
+.DS_Store
