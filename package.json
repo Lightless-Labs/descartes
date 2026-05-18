@@ -1,0 +1,31 @@
+{
+  "name": "@lightless-labs/descartes",
+  "version": "0.0.0",
+  "description": "LLM-backed local operations triage CLI for Descartes",
+  "type": "module",
+  "bin": {
+    "descartes": "tools/descartes-cli/src/index.js"
+  },
+  "scripts": {
+    "test": "node --test tools/descartes-cli/test/*.test.js",
+    "smoke:cli": "node tools/descartes-cli/src/index.js --help",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "typebox": "^1.1.24"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "files": [
+    "README.md",
+    "tools/descartes-cli/src",
+    "tools/descartes-cli/test"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Lightless-Labs/descartes.git"
+  }
+}

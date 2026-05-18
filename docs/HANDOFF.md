@@ -11,6 +11,7 @@ Existing files:
 - `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.
 - `AGENTS.md` — operating instructions for coding agents.
 - `.gitignore` — excludes local reference material, logs, Rust build output, Node package output, and OS noise.
+- `package.json` — root npm package so end users can install with `npm install -g github:Lightless-Labs/descartes` without cloning.
 - `tools/descartes-cli/` — initial npm-style Descartes CLI scaffold.
   - `src/paths.js` resolves Descartes-owned XDG paths and rejects Pi-owned paths.
   - `src/tools/` contains read-only evidence collectors for system overview, processes, disks, deterministic findings, and a combined triage bundle.
@@ -176,7 +177,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 Continue the focused harness spike from the new `tools/descartes-cli/` scaffold:
 
-1. Run `npm install --prefix tools/descartes-cli` when network/package access is acceptable.
+1. Validate install from the public repo on a clean machine: `npm install -g github:Lightless-Labs/descartes`.
 2. Validate that `descartes login` works with at least one subscription provider and writes only to `$XDG_CONFIG_HOME/descartes/auth.json` (or the default XDG config path).
 3. Validate that `descartes triage "my machine is slow"` starts a private Pi SDK agent with only Descartes evidence tools and returns an evidence-cited answer.
 4. Add an integration test or harness-level fake around `createPrivateTriageSession` to assert active tools are exactly Descartes evidence tools.
@@ -205,7 +206,8 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test --prefix tools/descartes-cli` passes 7 Node test cases.
+- Current checked command: `npm test` passes 7 Node test cases.
+- Current checked command: local tarball global install from `npm pack --silent` installed dependencies, `descartes --help` worked, and `descartes triage "my machine is slow" --json` reached the expected "No configured model credentials" error with isolated XDG paths.
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Full `descartes login` / `descartes triage` end-to-end flow has not been validated because local package dependencies/auth were not installed/configured in this repo.

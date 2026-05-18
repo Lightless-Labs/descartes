@@ -35,7 +35,21 @@ The model is a router, narrator, auditor, planner, and learning layer. It is not
 
 ## First External Slice
 
-The current first slice is an installable, read-only, LLM-backed local triage CLI:
+The current first slice is an installable, read-only, LLM-backed local triage CLI.
+
+End-user install from GitHub, without cloning the repository (requires Node.js/npm 20.6+):
+
+```bash
+npm install -g github:Lightless-Labs/descartes
+```
+
+HTTPS tarball form if preferred:
+
+```bash
+npm install -g https://github.com/Lightless-Labs/descartes/tarball/main
+```
+
+Then run:
 
 ```bash
 descartes login
