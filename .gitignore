@@ -8,5 +8,10 @@ nohup.out
 # Rust build output
 /target/
 
+# JavaScript package output
+node_modules/
+/tools/descartes-cli/node_modules/
+/tools/descartes-cli/package-lock.json
+
 # Editor / OS noise
 .DS_Store

@@ -33,28 +33,29 @@ Descartes is therefore designed as a layered system:
 
 The model is a router, narrator, auditor, planner, and learning layer. It is not the source of truth. The source of truth is structured evidence from local tools.
 
-## Initial MVP Direction
+## First External Slice
 
-A first useful Descartes should be read-only and local:
-
-- summarize machine health
-- inspect CPU, memory, swap, load, pressure, uptime
-- detect disk and inode pressure
-- list top resource consumers
-- inspect failed or flapping services
-- read recent high-priority logs
-- detect OOM kills, kernel errors, failed logins, reboot-required state, and overdue jobs where available
-- group related events into candidate incidents
-- produce concise reports and notifications
-
-Example future CLI shape:
+The current first slice is an installable, read-only, LLM-backed local triage CLI:
 
 ```bash
-descartes status
-descartes report --since 24h
-descartes diagnose
-descartes ask "why did postgres restart last night?"
+descartes login
+descartes triage "my machine is slow"
+descartes triage "my machine is slow" --json
 ```
+
+Descartes uses deterministic local tools to collect evidence for CPU/load, memory/swap, disks/inodes, and top processes. An LLM-backed private agent session interprets the user's complaint, decides which Descartes evidence tools to call, and produces an evidence-cited diagnosis with safe next checks.
+
+Safety and privacy boundaries for v0:
+
+- local evidence collection is read-only
+- no host actions are taken
+- no telemetry, background upload, or federation
+- explicit triage requests may send collected evidence to the selected LLM provider
+- saved reports/session state are sensitive diagnostic artifacts
+- Descartes-owned config/state follows XDG paths such as `$XDG_CONFIG_HOME/descartes`
+- Descartes may use an internal Pi SDK harness, but it must not require, read, import, reuse, or modify the user's personal Pi setup (`~/.pi`, project `.pi`, Pi sessions, settings, auth, skills, prompts, themes, or model config)
+
+The initial scaffold lives under `tools/descartes-cli/`.
 
 Later, once policy and audit foundations exist:
 

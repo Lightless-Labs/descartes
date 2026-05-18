@@ -2,7 +2,8 @@
 
 **Created:** 2026-05-18  
 **Revised:** 2026-05-18 — first slice must be LLM-backed, may use Pi internally as Descartes' private agent harness, must not touch the user's Pi setup, and should use XDG-style application paths.  
-**Status:** Proposed  
+**Status:** In progress  
+**Addendum:** 2026-05-18 — initial npm-style CLI scaffold added under `tools/descartes-cli/` with XDG path isolation tests, read-only resource evidence collectors, deterministic findings, and a private Pi SDK harness wrapper. Subscription login and real LLM triage still need end-to-end validation after dependency installation/auth.  
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

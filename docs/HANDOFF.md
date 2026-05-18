@@ -4,14 +4,21 @@
 
 ## Current Status
 
-Descartes is at concept/scaffolding stage. There is not yet a Rust workspace, Cargo manifest, source tree, package manifest, or tests.
+Descartes has an initial first-slice CLI scaffold, but it is not yet end-to-end validated with installed dependencies and real auth.
 
 Existing files:
 
-- `README.md` — initial public-facing project vision. It predates the latest first-slice decision and will need updating before release.
+- `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.
 - `AGENTS.md` — operating instructions for coding agents.
-- `.gitignore` — excludes local reference material, logs, Rust build output, and OS noise.
-- `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current next implementation plan**.
+- `.gitignore` — excludes local reference material, logs, Rust build output, Node package output, and OS noise.
+- `tools/descartes-cli/` — initial npm-style Descartes CLI scaffold.
+  - `src/paths.js` resolves Descartes-owned XDG paths and rejects Pi-owned paths.
+  - `src/tools/` contains read-only evidence collectors for system overview, processes, disks, deterministic findings, and a combined triage bundle.
+  - `src/pi-harness.js` wraps Pi SDK session creation with Descartes-owned auth/model paths, no default resource discovery, no built-in coding tools, and only explicit Descartes evidence tools.
+  - `src/login.js` implements a first terminal OAuth/API-key login path storing under Descartes config.
+  - `src/triage.js` implements human and JSON triage prompts around the private harness.
+  - `test/` covers XDG path resolution, Pi-path guardrails, and deterministic finding thresholds.
+- `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.
 - `docs/plans/2026-05-18-002-descartes-bootstrap-kernel-and-workbench-plan.md` — superseded; do not implement this first.
 
@@ -167,16 +174,17 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Before writing substantial product code, do a focused harness spike:
+Continue the focused harness spike from the new `tools/descartes-cli/` scaffold:
 
-1. Re-read Pi SDK/RPC/auth docs and examples relevant to private resource loading, auth storage, model registry, subscription login, and custom tools.
-2. Decide whether the first `descartes` CLI is TypeScript/Pi-SDK-first, Rust-spawns-private-Pi-RPC, or another private harness package.
-3. Prove path isolation: Descartes uses only XDG Descartes paths and does not discover/read/write `~/.pi` or project `.pi`.
-4. Prove `descartes login` can store auth/config under Descartes-owned paths, preferably supporting subscription auth.
-5. Prove `descartes triage "my machine is slow"` can start a private agent with only Descartes read-only evidence tools and return an evidence-cited answer.
-6. Add tests for XDG path resolution and Pi-path non-interaction.
-7. Update README with install/login/triage/platform/Pi-boundary language.
-8. Update this handoff before stopping.
+1. Run `npm install --prefix tools/descartes-cli` when network/package access is acceptable.
+2. Validate that `descartes login` works with at least one subscription provider and writes only to `$XDG_CONFIG_HOME/descartes/auth.json` (or the default XDG config path).
+3. Validate that `descartes triage "my machine is slow"` starts a private Pi SDK agent with only Descartes evidence tools and returns an evidence-cited answer.
+4. Add an integration test or harness-level fake around `createPrivateTriageSession` to assert active tools are exactly Descartes evidence tools.
+5. Improve JSON-mode robustness so final diagnosis is guaranteed structured, not merely prompt-requested JSON.
+6. Add tests for renderer requirements: diagnosis, evidence citations, safe next checks, and `No actions were taken.`
+7. Decide whether the first package stays JavaScript/Node, moves to TypeScript, or wraps a Rust collector component.
+8. Update README with exact install command after packaging is chosen.
+9. Update this handoff before stopping.
 
 ## Tests / Checks To Prioritize
 
@@ -196,7 +204,11 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 
 ## Repository Notes
 
-- This directory was not a git repository when last checked (`git status` failed with "not a git repository"). Re-check before making assumptions.
+- This directory is now a git repository; `git status --short` works.
+- Current checked command: `npm test --prefix tools/descartes-cli` passes 7 Node test cases.
+- Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies.
+- Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
+- Full `descartes login` / `descartes triage` end-to-end flow has not been validated because local package dependencies/auth were not installed/configured in this repo.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

@@ -1,0 +1,23 @@
+{
+  "name": "@lightless-labs/descartes",
+  "version": "0.0.0",
+  "description": "LLM-backed local operations triage CLI for Descartes",
+  "type": "module",
+  "bin": {
+    "descartes": "src/index.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "triage": "node src/index.js triage"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "typebox": "^1.1.24"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "src"
+  ]
+}
