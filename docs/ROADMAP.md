@@ -52,28 +52,7 @@ Approve?
 
 If the user says they need a real VM, Descartes replans around Tart/Lima/UTM/Multipass if available. If local options are unsuitable but an authenticated CI/remote agent is available, Descartes can propose delegation. If nothing suitable exists, it recommends an install option and explains tradeoffs before asking for approval.
 
-For temporary environments, Descartes should also track lifecycle intent. If the user approved a VM for “quick npm/GitHub install validation,” Descartes can observe that the validation commands completed, the VM is now idle, and no follow-up activity has occurred for a bounded interval. It should then notify and recommend cleanup rather than silently leaving resources around:
-
-```text
-The Tart VM `pi-npm-test-ubuntu` appears idle.
-
-Original purpose:
-- temporary Ubuntu environment for npm/GitHub install validation
-
-Evidence:
-- requested validation commands completed successfully
-- no active shell/session activity observed for 20 minutes
-- no persistent artifact was requested
-
-Recommended cleanup:
-1. Stop the VM now.
-2. Delete the VM after confirmation.
-3. Keep it for another hour and ask again.
-
-Approve stopping it now?
-```
-
-Any stop/delete action remains policy-gated and audited. Descartes records the original purpose, observed completion evidence, user approval, exact VM/container command, result, and final cleanup state. This keeps the system useful without drifting into unbounded autonomy: it can notice likely forgotten temporary resources, but it cannot tear them down without scoped authority.
+This temporary-environment story is a useful north-star behavior, not a single hardcoded workflow. Descartes should be biased toward preserving user intent, noticing operational lifecycle signals, and offering bounded next steps when local evidence suggests they are relevant. For example, after helping with an ephemeral VM/container validation, the same capability set could eventually let Descartes recognize that the original purpose appears complete and suggest follow-up options such as stopping, deleting, snapshotting, or keeping the environment alive. Any such recommendation should come from explicit evidence and any stop/delete action remains policy-gated and audited.
 
 ## Required Capability Layers
 
