@@ -30,7 +30,11 @@ Existing files:
   - `src/triage.js` implements human and JSON triage prompts around the private harness.
   - `test/` covers XDG path resolution, Pi-path guardrails, and deterministic finding thresholds.
 - `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
-- `todos/2026-05-19-llm-driven-investigation-tools.md` — **immediate next task**, with YAML frontmatter for quick triage/sorting.
+- `todos/` — frontmatter-indexed work items for quick triage/sorting:
+  - `2026-05-19-llm-driven-investigation-tools.md` — **immediate next task**: restore safe LLM tool-driven local investigation.
+  - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors.
+  - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
+  - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.
 - `docs/plans/2026-05-18-002-descartes-bootstrap-kernel-and-workbench-plan.md` — superseded; do not implement this first.
 
