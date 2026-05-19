@@ -1,6 +1,6 @@
 # Descartes
 
-Descartes is a Rust project for an AI-native operations agent: a maintenance agent, sysadmin assistant, and system operations gateway for computers.
+Descartes is an AI-native operations agent: a maintenance agent, sysadmin assistant, and system operations gateway for computers. The long-term core is intended to be Rust, but the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
 
 It is named after the computer running the literal Blood Bank on the Moon in Philip Kerr's *The Second Angel*. The project is also inspired by the layered autonomic systems of lighthuggers in Alastair Reynolds' *Revelation Space* / *Absolution Gap*: machines with stratified reflexes, diagnostics, and higher-level reasoning rather than a single monolithic intelligence. The project goal is similarly operational: help keep machines alive, understandable, and manageable — whether they are headless servers, VM hosts, ephemeral VMs, developer machines, or future embedded/edge systems.
 
@@ -121,11 +121,13 @@ Descartes should be safe by construction:
 
 ## Implementation
 
-Descartes will be written in Rust.
+The current installable first slice is a Node.js/JavaScript CLI under `tools/descartes-cli/`. It uses the Pi SDK as a private embedded agent harness, Descartes-owned XDG paths, and explicit read-only Descartes evidence tools.
+
+Rust remains the intended direction for the durable core: collectors, typed evidence envelopes, rule/signature engines, local stores, policy/audit machinery, and future native CLIs. When Rust crates are introduced, keep them Bazel-friendly: explicit manifests, reproducible tests, no hidden generation steps, and a clean crate graph.
 
 Early implementation priorities:
 
-1. crate/workspace scaffold
+1. validated Node.js/JavaScript first-slice CLI with subscription login and LLM-backed triage
 2. typed evidence envelope
 3. local system probes
 4. CLI report path
@@ -135,7 +137,7 @@ Early implementation priorities:
 8. diagnosis and recommendation layer
 9. policy-gated action planning
 
-The wider Lightless Labs monorepo prefers Bazel. If Cargo is used initially, the project should remain Bazel-friendly: explicit manifests, reproducible tests, no hidden generation steps, and a clean crate graph.
+The wider Lightless Labs monorepo prefers Bazel.
 
 ## Repository Status
 
