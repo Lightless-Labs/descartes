@@ -1,7 +1,7 @@
 ---
 title: macOS Disk Evidence Classification and Redaction Improvements
 created: 2026-05-19
-status: open
+status: completed
 priority: high
 area: triage
 kind: todo
@@ -12,6 +12,8 @@ related:
 ---
 
 # TODO: macOS Disk Evidence Classification and Redaction Improvements
+
+**Completed:** 2026-05-19 — added disk filesystem classification, fixed macOS `map ... 100% /path` parsing, excluded virtual and CoreSimulator/Cryptex developer runtime image mounts from disk-pressure findings, added aggregate runtime-image notice, and bumped package metadata to v0.0.14.
 
 ## Summary
 

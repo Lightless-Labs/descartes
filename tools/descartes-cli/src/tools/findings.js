@@ -38,7 +38,10 @@ export function deriveFindings(evidence) {
   }
 
   if (Array.isArray(disks?.filesystems)) {
+    const runtimeImages = [];
     for (const fs of disks.filesystems) {
+      if (fs.classification === "developer_runtime_image") runtimeImages.push(fs);
+      if (fs.pressure_relevant === false) continue;
       if (typeof fs.used_fraction === "number" && fs.used_fraction >= 0.9) {
         findings.push({
           id: `disk_pressure:${fs.mount_point}`,
@@ -47,6 +50,16 @@ export function deriveFindings(evidence) {
           evidence_refs: ["disk-usage"],
         });
       }
+    }
+
+    if (runtimeImages.length > 0) {
+      const totalSize = runtimeImages.reduce((sum, fs) => sum + (typeof fs.size_bytes === "number" ? fs.size_bytes : 0), 0);
+      findings.push({
+        id: "developer_runtime_images_mounted",
+        severity: "notice",
+        summary: `${runtimeImages.length} mounted developer runtime image${runtimeImages.length === 1 ? "" : "s"}${totalSize > 0 ? ` (${formatBytes(totalSize)} total image size)` : ""} are excluded from disk-pressure alerts because they are expected to be nearly full`,
+        evidence_refs: ["disk-usage"],
+      });
     }
   }
 

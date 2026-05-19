@@ -34,11 +34,10 @@ Already implemented:
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md` is complete. The next collector-oriented priorities are:
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md` is complete, and the disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md` is complete. The next collector-oriented priorities are:
 
-1. reduce macOS disk evidence noise in `todos/2026-05-19-macos-disk-evidence-classification.md`
-2. add bounded temporal sampling from `todos/2026-05-19-temporal-sampling-investigation-tools.md`
-3. then expand into network, service manager, logs, containers, and scheduled jobs
+1. add bounded temporal sampling from `todos/2026-05-19-temporal-sampling-investigation-tools.md`
+2. then expand into network, service manager, logs, containers, and scheduled jobs
 
 ## Candidate Next Tools
 

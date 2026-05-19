@@ -10,7 +10,7 @@ Current session update: Linux validation report showed the first Ubuntu attempt 
 
 Current session update: normal `triage` is model-led and does not precollect evidence before the LLM turn. The model must request local facts through the guarded Descartes read-only tool surface. It now exposes `collect_system`, `collect_processes`, `collect_disks`, `inspect_process`, `inspect_parent_tree`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch and still uses deterministic precollection. JSON output includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, fallback state, evidence, findings, traces, and `actions_taken: []`. Fallback construction is testable and explicitly marked degraded mode.
 
-Field validation update: a real macOS disk triage using Anthropic Sonnet succeeded end-to-end: `investigation_enabled: true`, active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, and it returned a useful non-fallback diagnosis for large macOS "System Data" caused primarily by Xcode CoreSimulator runtime image mounts. This completes `todos/2026-05-19-llm-driven-investigation-tools.md`. It also exposed lower-layer evidence-quality work: deterministic findings currently flag `/dev` and fixed-size CoreSimulator runtime images as disk pressure; default process command lines have since been redacted/bounded, while redacted-export policy thinking remains useful. A separate refinement todo tracks the disk classification work: `todos/2026-05-19-macos-disk-evidence-classification.md`.
+Field validation update: a real macOS disk triage using Anthropic Sonnet succeeded end-to-end: `investigation_enabled: true`, active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, and it returned a useful non-fallback diagnosis for large macOS "System Data" caused primarily by Xcode CoreSimulator runtime image mounts. This completes `todos/2026-05-19-llm-driven-investigation-tools.md`. The follow-up disk classification work is also complete: `/dev`, `map ... /home`, Linux/macOS pseudo filesystems, and macOS CoreSimulator/Cryptex developer runtime image mounts are classified as not pressure-relevant; runtime images now produce one aggregate notice instead of per-mount critical findings. Package metadata is bumped to v0.0.14.
 
 Process identity/lineage update: `todos/2026-05-19-process-identity-lineage-tools.md` is complete. `collect_processes` now emits redacted/bounded command lines with redaction metadata, and the guarded triage surface includes `inspect_process` plus `inspect_parent_tree` for PID-level identity/provenance using fixed read-only `ps` snapshots and Linux `/proc` metadata where available. Package metadata is bumped to v0.0.13 for this slice. Linux x86_64 validation remains open for CI/true x86_64 coverage, but Linux ARM64 VM validation passed with v0.0.11. Roadmap note added: temporary VM/container cleanup and repeated-work playbook suggestions are framed as glimpses/capability biases enabled by intent preservation, lifecycle signals, structured memory, temporal confidence/decay, evidence-grounded recommendations, and policy-gated actions rather than as hardcoded workflows.
 
@@ -53,7 +53,7 @@ Existing files:
   - `2026-05-19-process-identity-lineage-tools.md` — completed; redacted/bounded process args, `inspect_process`, and `inspect_parent_tree` are implemented and exposed through the guarded triage tool surface.
   - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors; process identity/lineage is complete, with temporal sampling/network/services/logs/containers as later candidates.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
-  - `2026-05-19-macos-disk-evidence-classification.md` — classify macOS pseudo/runtime filesystems, reduce disk finding noise, and plan redacted export for process args.
+  - `2026-05-19-macos-disk-evidence-classification.md` — completed; classifies pseudo/runtime filesystems, fixes macOS map row parsing, and reduces disk finding noise.
   - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
   - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
   - `2026-05-19-no-evidence-no-diagnosis-guard.md` — future hardening for model-led triage: retry or degrade if normal investigation returns without tool calls/evidence.
@@ -68,7 +68,7 @@ Existing files:
 2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
 3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: `todos/2026-05-19-macos-disk-evidence-classification.md`, or `todos/2026-05-19-no-evidence-no-diagnosis-guard.md` if hardening model-led triage is preferred before more collectors.
+5. Recommended next task: `todos/2026-05-19-no-evidence-no-diagnosis-guard.md`, or `todos/2026-05-19-temporal-sampling-investigation-tools.md` if expanding collector capability is preferred.
 
 ## Current First Slice
 
@@ -215,11 +215,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: reduce macOS disk evidence noise and finish the remaining redacted-export thinking now that default process args are bounded. See:
-
-- `todos/2026-05-19-macos-disk-evidence-classification.md`
-
-Alternative hardening task: add the no-evidence/no-diagnosis retry-or-degrade guard from `todos/2026-05-19-no-evidence-no-diagnosis-guard.md` before expanding collectors further.
+Recommended next task: add the no-evidence/no-diagnosis retry-or-degrade guard from `todos/2026-05-19-no-evidence-no-diagnosis-guard.md` before expanding collectors further. If choosing a capability expansion instead, use `todos/2026-05-19-temporal-sampling-investigation-tools.md`.
 
 The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
@@ -242,7 +238,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 37 Node test cases.
+- Current checked command: `npm test` passes 42 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
 - Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts for v0.0.12.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
@@ -253,9 +249,10 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Current checked command: direct `collectProcessEvidence`, `inspectProcessEvidence`, and `inspectParentTreeEvidence` invocations return ok envelopes on the local macOS host with bounded process args.
+- Current checked command: direct `collectDiskEvidence()` invocation returns classified filesystem envelopes on local macOS; `/dev`, `map auto_home`, CoreSimulator runtime mounts, and MetalToolchain Cryptex mounts are not pressure-relevant, and derived disk findings no longer include them as critical pressure.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: true Linux x86_64 behavior/CI. Linux arm64 validation with `$HOME/.local` prefix passes on public v0.0.11: install, symlinked `descartes --version`/`--help`, ChatGPT/Codex `--no-open` login, model-led guarded triage, `fallback_used: false`, `collect_triage_evidence`, `actions_taken: []`, and ok system/process/disk envelopes. v0.0.12 updates the harness dependency to `@earendil-works/pi-coding-agent` 0.75.3 and now requires Node.js 22.19.0+; rerun Linux validation after push. Process args are now redacted/bounded by default, so rerun validation should confirm that behavior on Linux too. The Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
-- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`; recommended next implementation is macOS disk evidence classification or the no-evidence/no-diagnosis guard.
+- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, and disk filesystem classification/noise reduction. Recommended next implementation is the no-evidence/no-diagnosis guard or temporal sampling.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

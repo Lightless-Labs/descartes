@@ -3,39 +3,117 @@ import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
+const VIRTUAL_FILESYSTEMS = new Set([
+  "autofs",
+  "binfmt_misc",
+  "bpf",
+  "cgroup",
+  "cgroup2",
+  "configfs",
+  "debugfs",
+  "devfs",
+  "devpts",
+  "devtmpfs",
+  "efivarfs",
+  "fusectl",
+  "hugetlbfs",
+  "mqueue",
+  "proc",
+  "pstore",
+  "securityfs",
+  "sysfs",
+  "tmpfs",
+  "tracefs",
+]);
 
-function parseDf(stdout) {
-  const lines = stdout.trim().split("\n").slice(1);
-  return lines.map((line) => {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 6) return undefined;
-    const [filesystem, blocks, used, available, capacity, ...mountParts] = parts;
-    return {
-      filesystem,
-      size_bytes: Number(blocks) * 1024,
-      used_bytes: Number(used) * 1024,
-      available_bytes: Number(available) * 1024,
-      used_fraction: Number(capacity.replace("%", "")) / 100,
-      mount_point: mountParts.join(" "),
-    };
-  }).filter(Boolean);
+function parseNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
-function parseDfInodes(stdout) {
+function parseDfRow(line, kind) {
+  const parts = line.trim().split(/\s+/);
+  const capacityIndex = parts.findIndex((part) => /^\d+%$/.test(part));
+  if (capacityIndex < 4) return undefined;
+
+  const metric1 = parseNumber(parts[capacityIndex - 3]);
+  const metric2 = parseNumber(parts[capacityIndex - 2]);
+  const metric3 = parseNumber(parts[capacityIndex - 1]);
+  const filesystem = parts.slice(0, capacityIndex - 3).join(" ");
+  const capacity = Number(parts[capacityIndex].replace("%", "")) / 100;
+  const mountPoint = parts.slice(capacityIndex + 1).join(" ");
+  if (!filesystem || !mountPoint || !Number.isFinite(capacity)) return undefined;
+
+  const base = {
+    filesystem,
+    used_fraction: capacity,
+    mount_point: mountPoint,
+  };
+
+  if (kind === "space") {
+    return classifyFilesystem({
+      ...base,
+      size_bytes: metric1 === null ? null : metric1 * 1024,
+      used_bytes: metric2 === null ? null : metric2 * 1024,
+      available_bytes: metric3 === null ? null : metric3 * 1024,
+    });
+  }
+
+  return classifyFilesystem({
+    ...base,
+    inodes: metric1,
+    used_inodes: metric2,
+    free_inodes: metric3,
+  });
+}
+
+export function parseDf(stdout) {
   const lines = stdout.trim().split("\n").slice(1);
-  return lines.map((line) => {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 6) return undefined;
-    const [filesystem, inodes, used, free, capacity, ...mountParts] = parts;
-    return {
-      filesystem,
-      inodes: Number(inodes),
-      used_inodes: Number(used),
-      free_inodes: Number(free),
-      used_fraction: Number(capacity.replace("%", "")) / 100,
-      mount_point: mountParts.join(" "),
-    };
-  }).filter(Boolean);
+  return lines.map((line) => parseDfRow(line, "space")).filter(Boolean);
+}
+
+export function parseDfInodes(stdout) {
+  const lines = stdout.trim().split("\n").slice(1);
+  return lines.map((line) => parseDfRow(line, "inodes")).filter(Boolean);
+}
+
+export function classifyFilesystem(fs) {
+  const filesystem = String(fs.filesystem ?? "");
+  const mountPoint = String(fs.mount_point ?? "");
+  const lowerFs = filesystem.toLowerCase();
+
+  let classification = "external_or_other";
+  let pressure_relevant = true;
+
+  if (VIRTUAL_FILESYSTEMS.has(lowerFs) || lowerFs.startsWith("map ") || lowerFs === "map") {
+    classification = "virtual";
+    pressure_relevant = false;
+  } else if (
+    mountPoint.includes("/Library/Developer/CoreSimulator/Volumes/") ||
+    mountPoint.includes("/Library/Developer/CoreSimulator/Cryptex/Images/") ||
+    mountPoint.includes("/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain")
+  ) {
+    classification = "developer_runtime_image";
+    pressure_relevant = false;
+  } else if (mountPoint === "/System/Volumes/Data" || mountPoint.startsWith("/System/Volumes/Data/")) {
+    classification = "apfs_data";
+  } else if (
+    (mountPoint === "/" && /^\/dev\/disk/i.test(filesystem)) ||
+    mountPoint.startsWith("/System/Volumes/Preboot") ||
+    mountPoint.startsWith("/System/Volumes/Update") ||
+    mountPoint.startsWith("/System/Volumes/VM") ||
+    mountPoint.startsWith("/System/Volumes/xarts") ||
+    mountPoint.startsWith("/System/Volumes/iSCPreboot") ||
+    mountPoint.startsWith("/System/Volumes/Hardware")
+  ) {
+    classification = "apfs_system";
+  }
+
+  return {
+    ...fs,
+    classification,
+    pressure_relevant,
+  };
 }
 
 export async function collectDiskEvidence() {

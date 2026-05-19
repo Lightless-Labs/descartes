@@ -106,7 +106,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 | model-led guarded tool use | validated | validated on Linux arm64 | credentialed JSON triage called `collect_triage_evidence`, `fallback_used: false`, `actions_taken: []`. |
 | `collect_system` | validated | validated on Linux arm64 | Linux swap from `/proc/meminfo`; host reported Linux arm64. |
 | `collect_processes` | validated | validated on Linux arm64 | v0.0.11 used Linux `ps -eo ...`, returned `top-processes.status: ok`, and sorted top CPU/memory in-process. |
-| `collect_disks` | validated | validated on Linux arm64 | Linux `df -kP` and `df -iP` returned structured filesystem/inode evidence. |
+| `collect_disks` | validated with classification | validated on Linux arm64 before classification | Linux `df -kP` and `df -iP` returned structured filesystem/inode evidence; rerun should confirm pseudo filesystems are classified not pressure-relevant. |
 | `collect_triage_evidence` | validated | validated on Linux arm64 | combined evidence + findings returned through model-requested tool call. |
 | `derive_findings` | validated | validate | deterministic, should be platform-independent |
 | `inspect_process` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only PID identity envelope with redacted/bounded args. |

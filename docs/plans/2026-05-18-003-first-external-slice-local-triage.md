@@ -15,6 +15,7 @@
 **Addendum:** 2026-05-19 — second Ubuntu validation reached Linux arm64 runtime with `$HOME/.local` prefix, completed ChatGPT/Codex `--no-open` login, and produced non-fallback model-led triage with guarded `collect_triage_evidence`; `collect_processes` failed on procps because v0.0.8 used BSD-style `ps -axo ... -m`, so v0.0.10 switches Linux to `ps -eo ...` and sorts process lists in-process.
 **Addendum:** 2026-05-19 — v0.0.12 moves the embedded Pi harness dependency from deprecated `@mariozechner/*` packages to `@earendil-works/pi-coding-agent` 0.75.3 and raises the runtime requirement to Node.js 22.19.0+.
 **Addendum:** 2026-05-19 — process identity and lineage tools were added and package metadata was bumped to v0.0.13: default process evidence now uses redacted/bounded args, and guarded model-led triage can call `inspect_process` and `inspect_parent_tree` for PID-level identity/provenance without exposing shell/coding tools.
+**Addendum:** 2026-05-19 — disk evidence classification was added and package metadata was bumped to v0.0.14: virtual/pseudo filesystems and macOS CoreSimulator/Cryptex developer runtime image mounts are classified as not pressure-relevant, `map ... 100% /path` parsing is fixed, and runtime images now produce one informational aggregate finding instead of noisy critical disk-pressure findings.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

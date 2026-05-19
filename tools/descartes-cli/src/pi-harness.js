@@ -121,7 +121,7 @@ function compactEvidenceForPrompt(evidenceBundle) {
 
   const pressuredFilesystems = Array.isArray(disks?.filesystems)
     ? disks.filesystems
-        .filter((fs) => typeof fs.used_fraction === "number" && fs.used_fraction >= 0.9 && fs.mount_point !== "/dev")
+        .filter((fs) => typeof fs.used_fraction === "number" && fs.used_fraction >= 0.9 && fs.pressure_relevant !== false)
         .slice(0, 8)
         .map((fs) => ({ mount_point: fs.mount_point, used_fraction: fs.used_fraction, available_bytes: fs.available_bytes }))
     : [];
