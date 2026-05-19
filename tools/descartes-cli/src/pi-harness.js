@@ -13,6 +13,7 @@ import { collectProcessEvidence } from "./tools/processes.js";
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
+import { selectTriageModel } from "./model-selection.js";
 
 export const TRIAGE_TOOL_NAMES = ["collect_system", "collect_processes", "collect_disks", "collect_triage_evidence", "derive_findings"];
 
@@ -202,7 +203,7 @@ export async function createPrivateTriageSession(paths, options = {}) {
   await resourceLoader.reload();
 
   const available = modelRegistry.getAvailable();
-  const model = options.model ?? available[0];
+  const { model, thinkingLevel } = selectTriageModel(available, options);
   if (!model) {
     throw new Error("No configured model credentials found. Run `descartes login` or configure an API key in Descartes' XDG config path.");
   }
@@ -218,7 +219,7 @@ export async function createPrivateTriageSession(paths, options = {}) {
     resourceLoader,
     sessionManager: SessionManager.inMemory(),
     model,
-    thinkingLevel: options.thinkingLevel ?? "off",
+    thinkingLevel,
     noTools: enableTools ? undefined : "all",
     tools: enableTools ? TRIAGE_TOOL_NAMES : undefined,
     customTools: enableTools ? createEvidenceTools() : [],

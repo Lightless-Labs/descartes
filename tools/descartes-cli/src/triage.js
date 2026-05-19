@@ -156,6 +156,7 @@ export async function runTriage(paths, args) {
   const toolResults = [];
   const precollected = await collectAllEvidence();
   const { session } = await createPrivateTriageSession(paths, {
+    modelPattern: options.modelPattern,
     thinkingLevel: options.thinkingLevel,
     enableTools: false,
   });
