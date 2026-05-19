@@ -2,6 +2,16 @@ import { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } from 
 import { collectAllEvidence } from "./tools/collect.js";
 import { fallbackDiagnosis } from "./triage-fallback.js";
 import { assistantErrorFromMessages, assistantStopReasonFromMessages, createToolCallRecorder, modelDiagnostic } from "./triage-diagnostics.js";
+import {
+  createEvidenceGuardState,
+  evidenceGuardDiagnostics,
+  evidenceRequiredRetryPrompt,
+  markEvidenceGuardFallback,
+  markEvidenceGuardRetry,
+  markEvidenceGuardSatisfied,
+  shouldFallbackForNoEvidence,
+  shouldRetryForEvidence,
+} from "./triage-guard.js";
 
 function parseTriageArgs(args) {
   const options = { json: false, investigate: true };
@@ -122,7 +132,8 @@ export async function runTriage(paths, args) {
   const events = [];
   const toolResults = [];
   const toolCallRecorder = createToolCallRecorder();
-  const precollected = options.investigate ? undefined : await collectAllEvidence();
+  const evidenceGuard = createEvidenceGuardState({ investigationEnabled: options.investigate });
+  let precollected = options.investigate ? undefined : await collectAllEvidence();
   const { session, selectedModel, selectedThinkingLevel, activeToolNames } = await createPrivateTriageSession(paths, {
     modelPattern: options.modelPattern,
     thinkingLevel: options.thinkingLevel,
@@ -138,24 +149,44 @@ export async function runTriage(paths, args) {
   });
 
   let finalMessages = [];
+  let assistantTextForOutput;
   try {
     const promptOptions = { toolsEnabled: options.investigate };
     await session.prompt(options.json ? jsonTriagePrompt(options.prompt, precollected, promptOptions) : humanTriagePrompt(options.prompt, precollected, promptOptions));
     finalMessages = [...session.messages];
+
+    assistantTextForOutput = lastAssistantTextFromMessages(finalMessages) || lastAssistantTextFromEvents(events);
+    let collected = flattenEvidence(toolResults, precollected);
+    if (shouldRetryForEvidence({ guard: evidenceGuard, assistantText: assistantTextForOutput, evidence: collected.evidence })) {
+      markEvidenceGuardRetry(evidenceGuard);
+      const messageStart = finalMessages.length;
+      const eventStart = events.length;
+      await session.prompt(evidenceRequiredRetryPrompt(options.prompt, { json: options.json }));
+      finalMessages = [...session.messages];
+      assistantTextForOutput = lastAssistantTextFromMessages(finalMessages.slice(messageStart)) || lastAssistantTextFromEvents(events.slice(eventStart));
+      collected = flattenEvidence(toolResults, precollected);
+    }
+
+    markEvidenceGuardSatisfied(evidenceGuard, collected.evidence);
+    if (shouldFallbackForNoEvidence({ guard: evidenceGuard, assistantText: assistantTextForOutput, evidence: collected.evidence })) {
+      markEvidenceGuardFallback(evidenceGuard);
+      precollected = await collectAllEvidence();
+    }
   } finally {
     unsubscribe();
     session.dispose();
   }
 
-  const assistantText = lastAssistantTextFromMessages(finalMessages) || lastAssistantTextFromEvents(events);
+  const assistantText = assistantTextForOutput ?? (lastAssistantTextFromMessages(finalMessages) || lastAssistantTextFromEvents(events));
   const llmError = assistantErrorFromMessages(finalMessages);
   const assistantStopReason = assistantStopReasonFromMessages(finalMessages);
   const { evidence, findings } = flattenEvidence(toolResults, precollected);
-  const fallback = assistantText ? undefined : fallbackDiagnosis(options.prompt, evidence, findings, llmError);
+  const fallback = assistantText && evidenceGuard.outcome !== "fallback_precollected" ? undefined : fallbackDiagnosis(options.prompt, evidence, findings, evidenceGuard.fallback_reason ?? llmError);
 
   if (!options.json) {
-    process.stdout.write(assistantText || renderFallbackHuman(options.prompt, fallback, evidence, findings));
-    if (!(assistantText || "").endsWith("\n")) process.stdout.write("\n");
+    const outputText = fallback ? renderFallbackHuman(options.prompt, fallback, evidence, findings) : assistantText;
+    process.stdout.write(outputText);
+    if (!outputText.endsWith("\n")) process.stdout.write("\n");
     return;
   }
 
@@ -173,6 +204,7 @@ export async function runTriage(paths, args) {
       assistant_stop_reason: assistantStopReason,
       llm_error: llmError,
       fallback_used: Boolean(fallback),
+      evidence_guard: evidenceGuardDiagnostics(evidenceGuard),
     },
     evidence,
     findings,

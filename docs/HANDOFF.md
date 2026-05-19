@@ -14,6 +14,8 @@ Field validation update: a real macOS disk triage using Anthropic Sonnet succeed
 
 Process identity/lineage update: `todos/2026-05-19-process-identity-lineage-tools.md` is complete. `collect_processes` now emits redacted/bounded command lines with redaction metadata, and the guarded triage surface includes `inspect_process` plus `inspect_parent_tree` for PID-level identity/provenance using fixed read-only `ps` snapshots and Linux `/proc` metadata where available. Package metadata is bumped to v0.0.13 for this slice. Linux x86_64 validation remains open for CI/true x86_64 coverage, but Linux ARM64 VM validation passed with v0.0.11. Roadmap note added: temporary VM/container cleanup and repeated-work playbook suggestions are framed as glimpses/capability biases enabled by intent preservation, lifecycle signals, structured memory, temporal confidence/decay, evidence-grounded recommendations, and policy-gated actions rather than as hardcoded workflows.
 
+No-evidence guard update: `todos/2026-05-19-no-evidence-no-diagnosis-guard.md` is complete and package metadata is bumped to v0.0.15. Normal model-led triage now refuses to silently accept assistant text with no collected evidence: it retries once with an explicit instruction to call `collect_triage_evidence` or targeted Descartes tools, then falls back to deterministic precollection and marks degraded fallback diagnostics if evidence is still absent. JSON diagnostics include `evidence_guard.enabled`, `outcome`, `retry_count`, and `fallback_reason`.
+
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
 Field report update: GitHub-installed triage on a real work laptop returned an empty diagnosis after login. `tools/descartes-cli/src/triage.js` now reads final assistant text from `session.messages` after `session.prompt()` instead of relying only on streaming `text_delta` events, and emits a deterministic fallback report if the model still returns no final text.
@@ -56,7 +58,7 @@ Existing files:
   - `2026-05-19-macos-disk-evidence-classification.md` — completed; classifies pseudo/runtime filesystems, fixes macOS map row parsing, and reduces disk finding noise.
   - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
   - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
-  - `2026-05-19-no-evidence-no-diagnosis-guard.md` — future hardening for model-led triage: retry or degrade if normal investigation returns without tool calls/evidence.
+  - `2026-05-19-no-evidence-no-diagnosis-guard.md` — completed; normal model-led triage retries once if assistant text arrives with no evidence, then deterministic-precollection fallback marks degraded diagnostics.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
   - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.
@@ -68,7 +70,7 @@ Existing files:
 2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
 3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: `todos/2026-05-19-no-evidence-no-diagnosis-guard.md`, or `todos/2026-05-19-temporal-sampling-investigation-tools.md` if expanding collector capability is preferred.
+5. Recommended next task: `todos/2026-05-19-temporal-sampling-investigation-tools.md`.
 
 ## Current First Slice
 
@@ -215,7 +217,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: add the no-evidence/no-diagnosis retry-or-degrade guard from `todos/2026-05-19-no-evidence-no-diagnosis-guard.md` before expanding collectors further. If choosing a capability expansion instead, use `todos/2026-05-19-temporal-sampling-investigation-tools.md`.
+Recommended next task: implement bounded temporal sampling from `todos/2026-05-19-temporal-sampling-investigation-tools.md` so Descartes can distinguish sustained pressure from one-off snapshots.
 
 The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
@@ -238,7 +240,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 42 Node test cases.
+- Current checked command: `npm test` passes 47 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
 - Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts for v0.0.12.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
@@ -252,7 +254,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: direct `collectDiskEvidence()` invocation returns classified filesystem envelopes on local macOS; `/dev`, `map auto_home`, CoreSimulator runtime mounts, and MetalToolchain Cryptex mounts are not pressure-relevant, and derived disk findings no longer include them as critical pressure.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: true Linux x86_64 behavior/CI. Linux arm64 validation with `$HOME/.local` prefix passes on public v0.0.11: install, symlinked `descartes --version`/`--help`, ChatGPT/Codex `--no-open` login, model-led guarded triage, `fallback_used: false`, `collect_triage_evidence`, `actions_taken: []`, and ok system/process/disk envelopes. v0.0.12 updates the harness dependency to `@earendil-works/pi-coding-agent` 0.75.3 and now requires Node.js 22.19.0+; rerun Linux validation after push. Process args are now redacted/bounded by default, so rerun validation should confirm that behavior on Linux too. The Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
-- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, and disk filesystem classification/noise reduction. Recommended next implementation is the no-evidence/no-diagnosis guard or temporal sampling.
+- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, and no-evidence/no-diagnosis guard. Recommended next implementation is temporal sampling.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

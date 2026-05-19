@@ -1,7 +1,7 @@
 ---
 title: No Evidence, No Diagnosis Guard
 created: 2026-05-19
-status: open
+status: completed
 priority: high
 area: triage
 kind: todo
@@ -12,6 +12,8 @@ related:
 ---
 
 # TODO: No Evidence, No Diagnosis Guard
+
+**Completed:** 2026-05-19 — added an evidence guard for normal model-led triage: unsupported no-evidence assistant text triggers one explicit evidence-tool retry, then deterministic precollection fallback with JSON diagnostics if evidence is still absent. Package metadata bumped to v0.0.15.
 
 ## Summary
 
