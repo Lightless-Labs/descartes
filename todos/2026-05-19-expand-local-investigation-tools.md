@@ -8,6 +8,7 @@ kind: todo
 owner: unassigned
 related:
   - todos/2026-05-19-llm-driven-investigation-tools.md
+  - todos/2026-05-19-temporal-sampling-investigation-tools.md
 ---
 
 # TODO: Expand Descartes Local Read-Only Investigation Tools
@@ -38,24 +39,27 @@ Prioritize tools that answer common first-triage questions without privileged mu
 2. `inspect_parent_tree`
    - process ancestry and child processes
    - useful for identifying who launched a busy process
-3. `collect_network_basics`
+3. `sample_dimension`
+   - bounded temporal sampling over an LLM-requested dimension, duration, and interval
+   - see `todos/2026-05-19-temporal-sampling-investigation-tools.md`
+4. `collect_network_basics`
    - interfaces, routes, DNS reachability, listening sockets where safe/available
-4. `collect_services`
+5. `collect_services`
    - `launchd` on macOS
    - `systemd` on Linux
    - failed/restarting service summary
-5. `collect_recent_logs`
+6. `collect_recent_logs`
    - strict bounded recent error/warning excerpts
    - explicit privacy notes
    - platform-specific backends (`log`, journal, syslog)
-6. `collect_containers`
+7. `collect_containers`
    - Docker / Colima / Lima / Podman where available
    - read-only container/resource summary
-7. `collect_scheduled_jobs`
+8. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
-8. `collect_certificates`
+9. `collect_certificates`
    - expiring certs in common local stores/paths, later
-9. `collect_time_sync`
+10. `collect_time_sync`
    - clock skew/time sync state
 
 ## Requirements

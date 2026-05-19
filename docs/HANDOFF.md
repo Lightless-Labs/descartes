@@ -33,6 +33,7 @@ Existing files:
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
   - `2026-05-19-llm-driven-investigation-tools.md` — **immediate next task**: restore safe LLM tool-driven local investigation.
   - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors.
+  - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
   - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.
