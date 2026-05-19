@@ -4,13 +4,13 @@
 
 ## Current Status
 
-Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is now in progress: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, and current-package macOS human/JSON triage have been tightened/validated. Remaining release-readiness gap is Linux x86_64 best-effort behavior.
+Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is now in progress: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, and current-package macOS human/JSON triage have been tightened/validated. Remaining release-readiness gap is Linux x86_64 best-effort behavior; no Linux host is currently available, so validation is deferred to future Buildkite CI.
 
 Current session update: the triage path now enables the intended Descartes read-only investigation tool surface by default while preserving deterministic precollection. It exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch. JSON output now includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and whether fallback was used. Fallback construction moved into a testable module and remains explicitly marked as degraded mode.
 
 Field validation update: a real macOS disk triage using Anthropic Sonnet succeeded end-to-end: `investigation_enabled: true`, active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, and it returned a useful non-fallback diagnosis for large macOS "System Data" caused primarily by Xcode CoreSimulator runtime image mounts. This completes `todos/2026-05-19-llm-driven-investigation-tools.md`. It also exposed lower-layer evidence-quality work: deterministic findings currently flag `/dev` and fixed-size CoreSimulator runtime images as disk pressure, and JSON output includes full process command lines that can contain long/sensitive arguments. A separate refinement todo tracks this: `todos/2026-05-19-macos-disk-evidence-classification.md`.
 
-Plan-aligned next step: finish the first-slice release-readiness pass before adding new collectors. The immediate todo remains `todos/2026-05-19-first-external-slice-validation.md`; it is now in progress with all macOS/package/auth-path checks complete except Linux x86_64 validation.
+Plan-aligned next step: either set up Linux x86_64 validation via Buildkite or, if release proceeds before that, document Linux as unvalidated/best-effort. The immediate todo remains `todos/2026-05-19-first-external-slice-validation.md`; all macOS/package/auth-path checks are complete except Linux x86_64 validation.
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
@@ -50,6 +50,7 @@ Existing files:
   - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
   - `2026-05-19-macos-disk-evidence-classification.md` — classify macOS pseudo/runtime filesystems, reduce disk finding noise, and plan redacted export for process args.
+  - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
   - `2026-05-19-no-evidence-no-diagnosis-guard.md` — future hardening for model-led triage: retry or degrade if normal investigation returns without tool calls/evidence.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
   - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
@@ -244,7 +245,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `npm test` and local tarball API-key login still pass after the login UX fix; normal OAuth browser flow still needs a quick user re-test to confirm the no-extra-Enter behavior.
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
-- Remaining validation gap: Linux x86_64 behavior.
+- Remaining validation gap: Linux x86_64 behavior. No Linux host is currently available; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

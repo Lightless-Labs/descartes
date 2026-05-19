@@ -53,7 +53,7 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 ### Platforms
 
 - [x] macOS Apple Silicon passes the full validation flow with at least one subscription provider. Previously validated with Anthropic Sonnet and guarded Descartes tool calls.
-- [ ] Linux x86_64 either passes the full validation flow or gracefully reports unsupported/unavailable evidence without panics.
+- [ ] Linux x86_64 either passes the full validation flow or gracefully reports unsupported/unavailable evidence without panics. No Linux host is currently available; deferred to future Buildkite validation tracked in `todos/2026-05-19-linux-ci-validation.md`.
 - [x] macOS Intel and Linux ARM64 are documented as best effort.
 
 ### Documentation
@@ -79,6 +79,7 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 - Field output showed JSON `evidence_refs` could cite compact summary keys (`top_cpu`, `top_memory`) rather than envelope IDs. Prompt instructions were tightened to require only evidence envelope IDs.
 - Evidence collection policy decision: normal `triage` remains model-led and does not precollect evidence before the LLM turn; the model must use guarded Descartes evidence tools. `--no-investigate` remains the degraded no-tool escape hatch and still precollects deterministic evidence.
 - v0.0.8 GitHub-installed JSON validation succeeded after tool-forcing: `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs (`system-overview`, `top-processes`, `disk-usage`), and `actions_taken: []`.
+- Linux x86_64 validation is deferred because no Linux host is currently available. Future Buildkite validation is tracked separately in `todos/2026-05-19-linux-ci-validation.md`; credentials should be supplied through CI secrets and scoped to validation.
 - Future hardening: add a normal-investigation guard that rejects/retries/degrades if the model returns a diagnosis without tool calls or collected evidence.
 
 ## Acceptance Criteria

@@ -10,6 +10,7 @@
 **Addendum:** 2026-05-19 — current GitHub-installed package was validated with ChatGPT/Codex subscription auth for human and JSON triage. Output was non-fallback, evidence-cited, and read-only with `actions_taken: []`. Login UX was fixed so normal browser OAuth no longer leaves a pending manual paste prompt; `--no-open` remains the manual paste fallback. JSON citation prompting was tightened after the model cited compact summary keys instead of evidence envelope IDs.
 **Addendum:** 2026-05-19 — temporary release-validation change: normal `triage` no longer precollects evidence before the LLM turn, forcing the model to use the guarded Descartes evidence tools. `--no-investigate` still precollects deterministic evidence for degraded no-tool synthesis.
 **Addendum:** 2026-05-19 — v0.0.8 GitHub-installed validation confirmed tool-forced JSON triage works with ChatGPT/Codex: the model called `collect_triage_evidence`, returned non-fallback diagnosis with envelope ID citations, and left `actions_taken: []`.
+**Addendum:** 2026-05-19 — Linux x86_64 validation is deferred because no Linux host is currently available. Future Buildkite CI validation is tracked in `todos/2026-05-19-linux-ci-validation.md`; any credentialed CI flow should use scoped secrets or a dedicated validation account/key rather than personal credentials.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
