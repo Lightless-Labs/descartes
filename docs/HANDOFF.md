@@ -248,7 +248,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
-- Remaining validation gap: Linux x86_64 behavior. No Linux host is currently available; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
+- Remaining validation gap: Linux x86_64 behavior. No physical Linux host is currently available, but user may run a Linux VM/container validation next session/day. `todos/2026-05-19-linux-ci-validation.md` now includes manual VM/container commands plus a tool/feature parity matrix; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
 - Recommended next implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
