@@ -32,7 +32,7 @@ Evidence collection policy decision: keep normal `triage` model-led rather than 
 
 Existing files:
 
-- `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.
+- `README.md` — updated to describe the LLM-backed local triage first slice, Pi/XDG boundaries, and future intent-based policy-gated operations use cases.
 - `AGENTS.md` — operating instructions for coding agents.
 - `.gitignore` — excludes local reference material, logs, Rust build output, Node package output, and OS noise.
 - `package.json` — root npm package so end users can install with `npm install -g github:Lightless-Labs/descartes` without cloning.
@@ -43,6 +43,7 @@ Existing files:
   - `src/login.js` implements a first terminal OAuth/API-key login path storing under Descartes config.
   - `src/triage.js` implements human and JSON triage prompts around the private harness.
   - `test/` covers XDG path resolution, Pi-path guardrails, and deterministic finding thresholds.
+- `docs/ROADMAP.md` — roadmap for capability discovery, process/behavior understanding, temporal sampling, planning, policy-gated action, and learning. Includes the guiding future use case: “I need a quick Linux environment with npm,” where Descartes discovers Docker/Colima/Podman/Tart/Lima/UTM/Multipass/Buildkite options, recommends a plan, asks approval, executes, verifies, and cleans up.
 - `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
   - `2026-05-19-first-external-slice-validation.md` — **immediate next task, in progress**: validate install/login/triage/docs/platform readiness against the first external slice plan.
@@ -217,7 +218,7 @@ Recommended next task: implement process identity and lineage tools. See:
 
 Start with a shared redacted/bounded process argument representation, then add `inspect_process` and `inspect_parent_tree` as read-only Descartes tools exposed through the guarded triage surface. This is the best low-hanging step from snapshot resource triage toward behavior-aware operations/defense investigation.
 
-Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
+The future capability-discovery/action direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
 ## Tests / Checks To Prioritize
 

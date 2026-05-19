@@ -6,7 +6,9 @@ Descartes is a local-first operations triage CLI. Today it can answer questions 
 
 ## Where it's going
 
-Descartes is intended to become a stratified machine operations and defense agent: deterministic local tools and rules first, real-time behavior detection, an adaptive decision layer for ambiguity and tradeoffs, LLM-assisted diagnosis and planning when useful, a self-improvement loop that compiles confirmed learnings into cheaper probes/rules/signatures/tests, and eventually policy-gated actions with audit trails. The long-term goal is to recognize novel harmful behavior as it emerges — for example ransomware-like file activity or trojan-like persistence/network behavior — and interrupt it within explicit policy boundaries. The durable core is expected to move toward Rust, while the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
+Descartes is intended to become a stratified machine operations and defense agent: deterministic local tools and rules first, real-time behavior detection, an adaptive decision layer for ambiguity and tradeoffs, LLM-assisted diagnosis and planning when useful, a self-improvement loop that compiles confirmed learnings into cheaper probes/rules/signatures/tests, and eventually policy-gated actions with audit trails. The long-term goal is to recognize novel harmful behavior as it emerges — for example ransomware-like file activity or trojan-like persistence/network behavior — and interrupt it within explicit policy boundaries. It should also support intent-based operations: for example, if a user says “I need a quick Linux environment with npm”, Descartes should discover whether Docker, Colima, Podman, Tart, Lima, UTM, Multipass, Buildkite, or another option is available, recommend a plan, ask for scoped approval, execute only within that approval, verify the result, and clean up. The durable core is expected to move toward Rust, while the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
+
+See `docs/ROADMAP.md` for the capability roadmap and policy-gated action direction.
 
 ## How to get started
 
@@ -125,12 +127,14 @@ MVP limitations: no daemon, no background monitoring, no remote hosts, no servic
 
 The initial scaffold lives under `tools/descartes-cli/`.
 
-Later, once policy and audit foundations exist:
+Later, once capability discovery, policy, and audit foundations exist:
 
 ```bash
-descartes plan fix postgres-restart-loop
+descartes plan "create a temporary Linux environment with npm for this test"
 descartes apply plan-123
 ```
+
+Descartes should choose between available local options such as Docker/Colima containers, Tart/Lima/UTM/Multipass VMs, or CI integrations based on the user's goal, explain tradeoffs, request scoped approval, and audit what changed.
 
 ## Evidence Envelopes
 
