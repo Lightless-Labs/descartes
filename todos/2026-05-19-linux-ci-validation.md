@@ -98,16 +98,16 @@ Track Linux parity against macOS for the first-slice tool surface.
 
 | Capability / Tool | macOS status | Linux VM/container target | Notes |
 |---|---:|---:|---|
-| GitHub npm install | validated | validated on Linux arm64 with prefix | First attempt used unsupported Node v18.19.1/npm 9.2.0 and a root-owned `/usr/local/lib/node_modules`; rerun with a user prefix installed v0.0.8 successfully. |
-| `descartes --help` / `--version` | validated | validated on Linux arm64 | version returned `0.0.8` from public GitHub at time of run; local repo has moved to v0.0.10. |
+| GitHub npm install | validated | validated on Linux arm64 with prefix | User prefix installed public v0.0.11 successfully. |
+| `descartes --help` / `--version` | validated | validated on Linux arm64 | v0.0.11 returned the expected version and help through the npm prefix symlink. |
 | XDG path isolation | validated | partially validated on Linux arm64 | login stored credentials at `/home/admin/.config/descartes/auth.json`; still need isolated-XDG file listing. |
 | no-auth triage failure | validated | validated on Linux arm64 | expected credentials error, no panic. |
 | subscription/API-key login path | validated on macOS | validated on Linux arm64 | ChatGPT/Codex `--no-open` manual redirect flow succeeded. |
 | model-led guarded tool use | validated | validated on Linux arm64 | credentialed JSON triage called `collect_triage_evidence`, `fallback_used: false`, `actions_taken: []`. |
 | `collect_system` | validated | validated on Linux arm64 | Linux swap from `/proc/meminfo`; host reported Linux arm64. |
-| `collect_processes` | validated | failed on Linux arm64 v0.0.8; fix pending validation | v0.0.8 used `ps -axo ... -m` and procps returned `must set personality to get -x option`; v0.0.10 switches Linux to `ps -eo ...` and sorts in-process. |
+| `collect_processes` | validated | validated on Linux arm64 | v0.0.11 used Linux `ps -eo ...`, returned `top-processes.status: ok`, and sorted top CPU/memory in-process. |
 | `collect_disks` | validated | validated on Linux arm64 | Linux `df -kP` and `df -iP` returned structured filesystem/inode evidence. |
-| `collect_triage_evidence` | validated | validate | combined evidence + findings |
+| `collect_triage_evidence` | validated | validated on Linux arm64 | combined evidence + findings returned through model-requested tool call. |
 | `derive_findings` | validated | validate | deterministic, should be platform-independent |
 | `inspect_process` | not implemented | future parity | tracked in process identity/lineage todo |
 | `inspect_parent_tree` | not implemented | future parity | tracked in process identity/lineage todo |
@@ -116,7 +116,17 @@ Track Linux parity against macOS for the first-slice tool surface.
 
 ## Observed Linux Attempts
 
-2026-05-19 second Ubuntu validation on Linux arm64 with `$HOME/.local` prefix reached runtime and credentialed triage:
+2026-05-19 third Ubuntu validation on Linux arm64 with `$HOME/.local` prefix validated the current public v0.0.11 package:
+
+- `npm install -g --prefix "$HOME/.local" github:Lightless-Labs/descartes` installed public v0.0.11 successfully
+- `descartes --version` returned `0.0.11`; `descartes --help` worked through the npm prefix symlink
+- `descartes login --no-open` completed ChatGPT/Codex OAuth by pasted redirect URL and stored auth in `/home/admin/.config/descartes/auth.json`
+- credentialed human and JSON triage were non-fallback, selected `openai-codex/gpt-5.5`, exposed only guarded tools, called `collect_triage_evidence`, and left `actions_taken: []`
+- `collect_system`, `collect_processes`, and `collect_disks` returned ok envelopes
+- process collection used Linux `ps -eo pid,ppid,pcpu,pmem,rss,comm,args`; top CPU showed the Descartes triage process itself, confirming the procps fix
+- JSON output still includes full process command lines, reinforcing the next process-args redaction/bounding task
+
+2026-05-19 second Ubuntu validation on Linux arm64 with `$HOME/.local` prefix reached runtime and credentialed triage on public v0.0.8:
 
 - `npm install -g --prefix "$HOME/.local" github:Lightless-Labs/descartes` installed public v0.0.8 successfully
 - `descartes --version` returned `0.0.8`; `descartes --help` worked
@@ -124,7 +134,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 - `descartes login --no-open` completed ChatGPT/Codex OAuth by pasted redirect URL and stored auth in `/home/admin/.config/descartes/auth.json`
 - credentialed human and JSON triage were non-fallback, selected `openai-codex/gpt-5.5`, exposed only guarded tools, called `collect_triage_evidence`, and left `actions_taken: []`
 - `collect_system` and `collect_disks` returned ok envelopes
-- `collect_processes` returned unable because Linux procps rejected the v0.0.8 `ps -axo ... -m` invocation with `must set personality to get -x option`; v0.0.10 changes Linux collection to `ps -eo pid,ppid,pcpu,pmem,rss,comm,args` and sorts top CPU/memory in JavaScript
+- `collect_processes` returned unable because Linux procps rejected the v0.0.8 `ps -axo ... -m` invocation with `must set personality to get -x option`; v0.0.10 changed Linux collection to `ps -eo pid,ppid,pcpu,pmem,rss,comm,args` and sorts top CPU/memory in JavaScript
 
 2026-05-19 first Ubuntu validation attempt did not reach Descartes runtime or collectors:
 
