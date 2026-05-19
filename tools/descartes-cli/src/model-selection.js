@@ -23,31 +23,27 @@ function variantRank(id) {
 }
 
 function parseClaudeModel(id) {
-  let match = id.match(/^claude-(sonnet|opus|haiku)-(\d+(?:-\d+)*)(?:-(\d{8}))?$/i);
-  if (match) {
-    return {
-      family: match[1].toLowerCase(),
-      version: match[2].split("-").map((part) => Number(part)),
-      date: match[3] ? Number(match[3]) : 0,
-    };
+  const newFormat = id.match(/^claude-(sonnet|opus|haiku)-(.+)$/i);
+  if (newFormat) {
+    const parts = newFormat[2].split("-");
+    const maybeDate = parts.at(-1);
+    const date = maybeDate && /^\d{8}$/.test(maybeDate) ? Number(parts.pop()) : 0;
+    const version = parts.map((part) => Number(part));
+    if (version.length > 0 && version.every(Number.isFinite)) {
+      return { family: newFormat[1].toLowerCase(), version, date };
+    }
   }
 
-  match = id.match(/^claude-(\d+)-(\d+)-(sonnet|opus|haiku)(?:-(\d{8}|latest))?$/i);
-  if (match) {
-    return {
-      family: match[3].toLowerCase(),
-      version: [Number(match[1]), Number(match[2])],
-      date: match[4] && match[4] !== "latest" ? Number(match[4]) : 0,
-    };
-  }
-
-  match = id.match(/^claude-(\d+)-(sonnet|opus|haiku)(?:-(\d{8}|latest))?$/i);
-  if (match) {
-    return {
-      family: match[2].toLowerCase(),
-      version: [Number(match[1])],
-      date: match[3] && match[3] !== "latest" ? Number(match[3]) : 0,
-    };
+  const oldFormat = id.match(/^claude-(.+)-(sonnet|opus|haiku)(?:-(\d{8}|latest))?$/i);
+  if (oldFormat) {
+    const version = oldFormat[1].split("-").map((part) => Number(part));
+    if (version.length > 0 && version.every(Number.isFinite)) {
+      return {
+        family: oldFormat[2].toLowerCase(),
+        version,
+        date: oldFormat[3] && oldFormat[3] !== "latest" ? Number(oldFormat[3]) : 0,
+      };
+    }
   }
 
   return undefined;

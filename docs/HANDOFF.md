@@ -14,7 +14,7 @@ Second field report update: v0.0.1 still produced fallback with empty `evidence`
 
 Third field report update: v0.0.2 had evidence but still no LLM text. v0.0.3 changes synthesis to a no-tool LLM turn over a compact evidence summary, avoiding custom tool schemas and oversized raw evidence in the provider request. JSON fallback now includes `llm_error` when the assistant message records one.
 
-Fourth field report update: v0.0.3 selected `openai-codex/gpt-5.1`, which ChatGPT subscription Codex rejected. v0.0.4 added explicit model selection and defaulted ChatGPT/Codex subscription auth to `openai-codex/gpt-5.5` with high reasoning when available. v0.0.5 replaces hardcoded Codex preferences with semantic-version "highest GPT model" selection per preferred subscription provider. v0.0.6 also avoids Anthropic registry-order Haiku defaults by selecting the highest available Anthropic Sonnet. `--model` and `--thinking` are passed through to the harness.
+Fourth field report update: v0.0.3 selected `openai-codex/gpt-5.1`, which ChatGPT subscription Codex rejected. v0.0.4 added explicit model selection and defaulted ChatGPT/Codex subscription auth to `openai-codex/gpt-5.5` with high reasoning when available. v0.0.5 replaces hardcoded Codex preferences with semantic-version "highest GPT model" selection per preferred subscription provider. v0.0.6 also avoids Anthropic registry-order Haiku defaults by selecting the highest available Anthropic Sonnet. v0.0.7 fixes Anthropic date parsing so release dates like `20250514` are not treated as version components ahead of `claude-sonnet-4-6`. `--model` and `--thinking` are passed through to the harness.
 
 Existing files:
 

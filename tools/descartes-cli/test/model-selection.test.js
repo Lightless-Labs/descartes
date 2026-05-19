@@ -39,6 +39,16 @@ test("selectTriageModel prefers highest Anthropic Sonnet over Haiku and Opus", (
   assert.equal(selected.thinkingLevel, "high");
 });
 
+test("selectTriageModel does not treat Anthropic release dates as model versions", () => {
+  const selected = selectTriageModel([
+    model("anthropic", "claude-sonnet-4-20250514", "Claude Sonnet 4", true),
+    model("anthropic", "claude-sonnet-4-5-20250929", "Claude Sonnet 4.5", true),
+    model("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", true),
+  ]);
+
+  assert.equal(selected.model.id, "claude-sonnet-4-6");
+});
+
 test("selectTriageModel handles old Anthropic Sonnet id format", () => {
   const selected = selectTriageModel([
     model("anthropic", "claude-3-5-sonnet-20241022", "Claude Sonnet 3.5 v2", false),
