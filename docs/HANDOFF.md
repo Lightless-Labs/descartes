@@ -6,6 +6,8 @@
 
 Descartes has an initial first-slice CLI scaffold, but it is not yet end-to-end validated with installed dependencies and real auth.
 
+Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
+
 Existing files:
 
 - `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.

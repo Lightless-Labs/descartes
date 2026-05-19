@@ -34,12 +34,6 @@ Keep these lifecycle stages conceptually separate from architecture layers:
 
 Do not conflate lifecycle stages with implementation layers. A stage may involve several layers; a layer may support several stages.
 
-### L-1 Interface / Privacy Gate
-
-- Convert user intent into structured requests.
-- Redact, bucket, or keep local sensitive data before external reasoning.
-- Prefer local model/tool paths for raw logs, usernames, paths, hosts, IPs, and process details.
-
 ### L0 Deterministic System Tools
 
 The factual core. Tools should be local-first, structured, testable, and auditable.

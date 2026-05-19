@@ -24,7 +24,6 @@ Descartes is therefore designed as a layered system:
 
 | Layer | Purpose |
 |---|---|
-| **L-1 Interface / Privacy Gate** | Translate user intent, protect raw local data, redact or bucket before anything leaves the host. |
 | **L0 Deterministic System Tools** | Gather factual evidence from logs, processes, services, disks, network, packages, containers, VMs, and platform APIs. |
 | **L1 Monitoring / Rules / Signatures** | Detect thresholds, repeated failures, anomalies, drift, known issue patterns, and notification-worthy events. |
 | **L2 Deliberative Agents** | Escalated diagnosis, incident correlation, explanation, recommendations, and tool/signature improvement proposals. |
