@@ -325,6 +325,19 @@ User prompt
   -> renderer prints human report or structured JSON
 ```
 
+### Evidence collection policy
+
+Default triage should remain model-led rather than unconditionally precollecting evidence before the LLM turn. The model must request local facts through the guarded Descartes evidence tools. For the first slice, `collect_triage_evidence` is the broad obvious first-pass tool, while narrower tools remain available for targeted refresh/scope.
+
+Rationale:
+
+- preserves the product contract that system facts come from auditable Descartes tools
+- validates the private harness/tool boundary instead of silently relying on prompt-injected stats
+- keeps the LLM responsible for deciding what evidence is needed while deterministic code remains the source of truth
+- avoids making normal triage look like a static stats dump
+
+`--no-investigate` is the exception: it disables LLM-requested tools and uses deterministic precollection for degraded no-tool synthesis. A future guard should reject or retry any normal investigation that returns a diagnosis with no tool calls or no evidence.
+
 ### Agent responsibilities
 
 The LLM may:

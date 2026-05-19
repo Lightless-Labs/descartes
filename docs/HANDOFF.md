@@ -28,7 +28,7 @@ Login UX fix: subscription OAuth login no longer starts an immediate manual past
 
 Current-package ChatGPT/Codex validation: GitHub-installed `descartes triage "my machine is slow"` returned a useful non-fallback human diagnosis citing system/process/disk evidence and ended with `No actions were taken.` Initial GitHub-installed JSON triage returned `fallback_used: false`, selected `openai-codex/gpt-5.5` with high thinking, active tools exactly `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, `derive_findings`, three ok precollected evidence envelopes, findings/tool traces, and `actions_taken: []`. The model made no additional tool calls because compact precollected evidence was sufficient; prior Anthropic validation covered explicit tool-call behavior. The JSON model output cited compact summary keys (`top_cpu`, `top_memory`) as evidence refs, so prompt instructions were tightened to require envelope IDs only.
 
-Temporary investigation change: normal `triage` no longer precollects evidence before the LLM turn. This forces the model to request local facts through the guarded Descartes tool surface. `--no-investigate` still precollects deterministic evidence for degraded no-tool synthesis. v0.0.8 GitHub-installed validation confirmed this works: JSON triage had `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs, and `actions_taken: []`.
+Evidence collection policy decision: keep normal `triage` model-led rather than restoring unconditional precollection. The model must request local facts through the guarded Descartes tool surface; `collect_triage_evidence` is the broad first-pass tool. `--no-investigate` remains the degraded no-tool synthesis escape hatch and still precollects deterministic evidence. v0.0.8 GitHub-installed validation confirmed this works: JSON triage had `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs, and `actions_taken: []`. Future hardening: add a "no evidence, no diagnosis" guard that retries or degrades if normal investigation returns without tool calls/evidence.
 
 Existing files:
 
@@ -50,6 +50,7 @@ Existing files:
   - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
   - `2026-05-19-macos-disk-evidence-classification.md` — classify macOS pseudo/runtime filesystems, reduce disk finding noise, and plan redacted export for process args.
+  - `2026-05-19-no-evidence-no-diagnosis-guard.md` — future hardening for model-led triage: retry or degrade if normal investigation returns without tool calls/evidence.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
   - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.

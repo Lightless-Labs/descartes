@@ -77,8 +77,9 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 - Current GitHub-installed `descartes triage "my machine is slow"` with ChatGPT/Codex subscription auth returned a useful non-fallback human diagnosis, cited local evidence, and ended with `No actions were taken.`
 - Initial current GitHub-installed `descartes triage "my machine is slow" --json` returned `fallback_used: false`, selected `openai-codex/gpt-5.5` with high thinking, active tools exactly matching the guarded Descartes tool set, three ok precollected evidence envelopes, findings/tool traces, and `actions_taken: []`. The model did not make additional tool calls because the compact precollected evidence was sufficient; prior Anthropic validation covered the explicit tool-call path.
 - Field output showed JSON `evidence_refs` could cite compact summary keys (`top_cpu`, `top_memory`) rather than envelope IDs. Prompt instructions were tightened to require only evidence envelope IDs.
-- Temporary follow-up change: normal `triage` no longer precollects evidence before the LLM turn, forcing the model to use guarded Descartes evidence tools. `--no-investigate` still precollects deterministic evidence for degraded no-tool synthesis.
+- Evidence collection policy decision: normal `triage` remains model-led and does not precollect evidence before the LLM turn; the model must use guarded Descartes evidence tools. `--no-investigate` remains the degraded no-tool escape hatch and still precollects deterministic evidence.
 - v0.0.8 GitHub-installed JSON validation succeeded after tool-forcing: `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs (`system-overview`, `top-processes`, `disk-usage`), and `actions_taken: []`.
+- Future hardening: add a normal-investigation guard that rejects/retries/degrades if the model returns a diagnosis without tool calls or collected evidence.
 
 ## Acceptance Criteria
 
