@@ -122,7 +122,7 @@ export async function runTriage(paths, args) {
   const events = [];
   const toolResults = [];
   const toolCallRecorder = createToolCallRecorder();
-  const precollected = await collectAllEvidence();
+  const precollected = options.investigate ? undefined : await collectAllEvidence();
   const { session, selectedModel, selectedThinkingLevel, activeToolNames } = await createPrivateTriageSession(paths, {
     modelPattern: options.modelPattern,
     thinkingLevel: options.thinkingLevel,
@@ -177,7 +177,7 @@ export async function runTriage(paths, args) {
     evidence,
     findings,
     tool_traces: [
-      ...precollected.evidence.map((item) => ({
+      ...(precollected?.evidence ?? []).map((item) => ({
         tool_name: item.trace?.tool,
         tool_call_id: "precollected",
         is_error: item.status === "unable",

@@ -83,7 +83,7 @@ For subscription logins, Descartes picks a strong default rather than the provid
 descartes triage "my machine is slow" --model openai-codex/gpt-5.5 --thinking high
 ```
 
-`--json` returns the diagnosis, evidence envelopes, deterministic findings, diagnostics, tool traces, and `actions_taken: []` for replay/debugging. `--no-investigate` is a temporary degraded escape hatch that disables LLM-requested evidence tools; deterministic precollection still runs and fallback output is marked as degraded if the model returns no final text.
+`--json` returns the diagnosis, evidence envelopes, deterministic findings, diagnostics, tool traces, and `actions_taken: []` for replay/debugging. In the normal path, the model must request local evidence through Descartes read-only tools. `--no-investigate` is a temporary degraded escape hatch that disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis; fallback output is marked as degraded if the model returns no final text.
 
 Descartes uses deterministic local tools to collect evidence for CPU/load, memory/swap, disks/inodes, and top processes. An LLM-backed private agent session interprets the user's complaint, decides which Descartes evidence tools to call, and produces an evidence-cited diagnosis with safe next checks.
 

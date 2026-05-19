@@ -4,13 +4,13 @@
 
 ## Current Status
 
-Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on a real macOS Anthropic subscription-auth run. A release-readiness pass is now in progress: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, and metadata drift have been tightened/validated. Remaining release-readiness gaps are a final credentialed current-package human/JSON triage run and Linux x86_64 best-effort behavior.
+Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is now in progress: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, and current-package macOS human/JSON triage have been tightened/validated. Remaining release-readiness gap is Linux x86_64 best-effort behavior.
 
 Current session update: the triage path now enables the intended Descartes read-only investigation tool surface by default while preserving deterministic precollection. It exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch. JSON output now includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and whether fallback was used. Fallback construction moved into a testable module and remains explicitly marked as degraded mode.
 
 Field validation update: a real macOS disk triage using Anthropic Sonnet succeeded end-to-end: `investigation_enabled: true`, active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, and it returned a useful non-fallback diagnosis for large macOS "System Data" caused primarily by Xcode CoreSimulator runtime image mounts. This completes `todos/2026-05-19-llm-driven-investigation-tools.md`. It also exposed lower-layer evidence-quality work: deterministic findings currently flag `/dev` and fixed-size CoreSimulator runtime images as disk pressure, and JSON output includes full process command lines that can contain long/sensitive arguments. A separate refinement todo tracks this: `todos/2026-05-19-macos-disk-evidence-classification.md`.
 
-Plan-aligned next step: finish the first-slice release-readiness pass before adding new collectors. The immediate todo remains `todos/2026-05-19-first-external-slice-validation.md`; it is now in progress with packaging/docs/auth-path checks mostly complete.
+Plan-aligned next step: finish the first-slice release-readiness pass before adding new collectors. The immediate todo remains `todos/2026-05-19-first-external-slice-validation.md`; it is now in progress with all macOS/package/auth-path checks complete except Linux x86_64 validation.
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
@@ -24,7 +24,11 @@ Fourth field report update: v0.0.3 selected `openai-codex/gpt-5.1`, which ChatGP
 
 Release-readiness update: README now starts with concrete "What it does", "Where it's going", and "How to get started" blocks, and frames the long-term goal as real-time operations/defense behavior detection with policy-bounded interruption of novel harmful behavior such as ransomware-like or trojan-like activity. CLI help now documents `--model`/`--thinking`; `--version` reads package metadata instead of a hardcoded string; root package contents exclude tests; root/nested package engine metadata is aligned; and `tools/descartes-cli/test/package-metadata.test.js` covers metadata/help/version drift.
 
-Login UX fix: subscription OAuth login no longer starts an immediate manual paste `readline` prompt during normal browser-based login, because the Pi OAuth helper races that prompt against the localhost callback and leaves the terminal waiting for Enter after browser success. Normal `descartes login` now opens the browser and waits for callback; manual paste is available via `descartes login --no-open`.
+Login UX fix: subscription OAuth login no longer starts an immediate manual paste `readline` prompt during normal browser-based login, because the Pi OAuth helper races that prompt against the localhost callback and leaves the terminal waiting for Enter after browser success. Normal `descartes login` now opens the browser and waits for callback; manual paste is available via `descartes login --no-open`. User re-test confirmed the flow is much better.
+
+Current-package ChatGPT/Codex validation: GitHub-installed `descartes triage "my machine is slow"` returned a useful non-fallback human diagnosis citing system/process/disk evidence and ended with `No actions were taken.` GitHub-installed JSON triage returned `fallback_used: false`, selected `openai-codex/gpt-5.5` with high thinking, active tools exactly `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, `derive_findings`, three ok precollected evidence envelopes, findings/tool traces, and `actions_taken: []`. The model made no additional tool calls because compact precollected evidence was sufficient; prior Anthropic validation covered explicit tool-call behavior. The JSON model output cited compact summary keys (`top_cpu`, `top_memory`) as evidence refs, so prompt instructions were tightened to require envelope IDs only.
+
+Temporary investigation change: normal `triage` no longer precollects evidence before the LLM turn. This forces the model to request local facts through the guarded Descartes tool surface. `--no-investigate` still precollects deterministic evidence for degraded no-tool synthesis.
 
 Existing files:
 
@@ -239,7 +243,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `npm test` and local tarball API-key login still pass after the login UX fix; normal OAuth browser flow still needs a quick user re-test to confirm the no-extra-Enter behavior.
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
-- Remaining validation gaps: final credentialed current-package human/JSON triage run and Linux x86_64 behavior.
+- Remaining validation gap: Linux x86_64 behavior.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

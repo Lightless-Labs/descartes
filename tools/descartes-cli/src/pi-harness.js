@@ -139,6 +139,7 @@ function compactEvidenceForPrompt(evidenceBundle) {
 
 function evidenceContext(evidenceBundle, { toolsEnabled = false } = {}) {
   if (!evidenceBundle) return "";
+  const evidenceIds = (evidenceBundle.evidence ?? []).map((item) => item.id);
   const toolInstruction = toolsEnabled
     ? "You may call Descartes read-only evidence tools if the compact summary is insufficient or you need to refresh/scope evidence. Do not call tools just to restate the same facts."
     : "No tools are available in this synthesis turn; local collection has already happened.";
@@ -146,6 +147,8 @@ function evidenceContext(evidenceBundle, { toolsEnabled = false } = {}) {
 
 Initial read-only Descartes evidence summary, already collected for this explicit triage request:
 ${JSON.stringify(compactEvidenceForPrompt(evidenceBundle), null, 2)}
+
+Evidence citation rule: cite only these evidence envelope IDs: ${evidenceIds.join(", ")}. Do not cite derived summary keys such as top_cpu, top_memory, pressured_filesystems, or findings as evidence_refs.
 
 Use the evidence above and any additional Descartes tool results. Do not claim facts outside this evidence. ${toolInstruction}`;
 }
@@ -158,7 +161,7 @@ Return only valid JSON with this shape:
   "summary": string,
   "confidence": "low" | "medium" | "high",
   "explanation": string,
-  "evidence_refs": string[],
+  "evidence_refs": string[], // only evidence envelope IDs, e.g. "system-overview", "top-processes", "disk-usage"
   "next_checks": string[],
   "avoid": string[],
   "actions_taken": []

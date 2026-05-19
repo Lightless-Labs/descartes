@@ -43,8 +43,8 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 
 ### Triage behavior
 
-- [ ] `descartes triage "my machine is slow"` returns a human evidence-cited diagnosis and ends with "No actions were taken." Needs one final credentialed current-package run.
-- [ ] `descartes triage "my machine is slow" --json` returns diagnosis, evidence, findings, diagnostics, tool traces, and empty `actions_taken`. Needs one final credentialed current-package run.
+- [x] `descartes triage "my machine is slow"` returns a human evidence-cited diagnosis and ends with "No actions were taken." Validated with current GitHub-installed package and ChatGPT/Codex subscription auth.
+- [x] `descartes triage "my machine is slow" --json` returns diagnosis, evidence, findings, diagnostics, tool traces, and empty `actions_taken`. Validated with current GitHub-installed package and ChatGPT/Codex subscription auth.
 - [x] JSON diagnostics include selected model, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error when present, and fallback state.
 - [x] Active tools are exactly the guarded Descartes read-only tool set.
 - [x] `--no-investigate` remains a temporary degraded no-tool synthesis escape hatch and is documented as such if kept.
@@ -60,7 +60,7 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 
 - [x] README accurately describes the current Node.js/JavaScript first slice and long-term Rust direction.
 - [x] README documents install, login, triage, JSON output, model/thinking overrides, `--no-investigate` if retained, supported platforms, limitations, safety, XDG paths, and Pi boundary.
-- [ ] Plan/handoff reflects that the LLM-driven tool loop is complete and release validation is the immediate next task.
+- [x] Plan/handoff reflects that the LLM-driven tool loop is complete and release validation is the immediate next task.
 
 ## Validation Notes
 
@@ -74,6 +74,10 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 - `descartes login test-provider --api-key` with isolated XDG writes credentials to `$XDG_CONFIG_HOME/descartes/auth.json`.
 - User field report found normal subscription OAuth left a pending manual paste prompt after browser success, requiring an extra Enter. Fixed by only enabling manual paste mode for `descartes login --no-open`; normal login now waits on browser callback and documents the `--no-open` fallback.
 - Direct `collectAllEvidence()` invocation on local macOS returns ok envelopes for `system-overview`, `top-processes`, and `disk-usage`, with `actions_taken: []`.
+- Current GitHub-installed `descartes triage "my machine is slow"` with ChatGPT/Codex subscription auth returned a useful non-fallback human diagnosis, cited local evidence, and ended with `No actions were taken.`
+- Current GitHub-installed `descartes triage "my machine is slow" --json` returned `fallback_used: false`, selected `openai-codex/gpt-5.5` with high thinking, active tools exactly matching the guarded Descartes tool set, three ok precollected evidence envelopes, findings/tool traces, and `actions_taken: []`. The model did not make additional tool calls because the compact precollected evidence was sufficient; prior Anthropic validation covered the explicit tool-call path.
+- Field output showed JSON `evidence_refs` could cite compact summary keys (`top_cpu`, `top_memory`) rather than envelope IDs. Prompt instructions were tightened to require only evidence envelope IDs.
+- Temporary follow-up change: normal `triage` no longer precollects evidence before the LLM turn, forcing the model to use guarded Descartes evidence tools. `--no-investigate` still precollects deterministic evidence for degraded no-tool synthesis.
 
 ## Acceptance Criteria
 
