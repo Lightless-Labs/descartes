@@ -38,7 +38,7 @@ Observed gaps:
 
 - `derive_findings` flagged `/dev` (`devfs`) as critical disk pressure, even though it is a virtual pseudo-filesystem and should be ignored or classified separately.
 - `derive_findings` flagged every mounted CoreSimulator runtime image as critical/warning because those fixed-size read-only-ish images are intentionally nearly full.
-- JSON output includes full process command lines, including very long Electron/Chromium arguments and potentially sensitive environment-like payloads. Human prompts are compacted, but JSON output should eventually support a redacted mode or bounded command-line serialization.
+- Historical JSON output included full process command lines; default process evidence now emits redacted/bounded args with metadata, but a future explicit local-only/full vs share-safe export policy still needs design.
 - The model handled the user's "Ignore simulator image volumes" instruction semantically, but deterministic findings still surfaced simulator image pressure as actionable-looking critical findings.
 
 ## Implementation Tasks
@@ -56,9 +56,9 @@ Observed gaps:
    - `devfs` at 100% should not produce critical disk pressure.
    - CoreSimulator runtime images at 98% should not produce critical disk pressure.
    - Data volume at high utilization should still produce real disk pressure.
-6. Add or plan redacted JSON/report output for process command lines:
-   - bounded length by default, or
-   - `--json` full local details but future `--redacted-json` / `--share` for safe export.
+6. Plan explicit report/export policy for process command lines now that default JSON is bounded/redacted:
+   - keep default `--json` safe enough for routine debugging, and
+   - reserve any future raw local-only detail behind an explicit flag and clear sensitivity warning.
 
 ## Acceptance Criteria
 

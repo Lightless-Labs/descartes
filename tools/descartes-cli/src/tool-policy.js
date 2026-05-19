@@ -2,6 +2,8 @@ export const TRIAGE_TOOL_NAMES = Object.freeze([
   "collect_system",
   "collect_processes",
   "collect_disks",
+  "inspect_process",
+  "inspect_parent_tree",
   "collect_triage_evidence",
   "derive_findings",
 ]);

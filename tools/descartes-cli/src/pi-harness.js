@@ -9,7 +9,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { collectDiskEvidence } from "./tools/disks.js";
-import { collectProcessEvidence } from "./tools/processes.js";
+import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEvidence } from "./tools/processes.js";
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
@@ -50,6 +50,25 @@ export function createEvidenceTools() {
       execute: async () => jsonToolResult(await collectDiskEvidence()),
     }),
     defineTool({
+      name: "inspect_process",
+      label: "Inspect process identity",
+      description: "Inspect one process by PID using read-only process table facts, redacted command lines, parent summary, and child summaries.",
+      parameters: Type.Object({ pid: Type.Number({ minimum: 1 }) }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await inspectProcessEvidence({ pid: params.pid })),
+    }),
+    defineTool({
+      name: "inspect_parent_tree",
+      label: "Inspect process parent tree",
+      description: "Inspect a bounded read-only ancestry chain for a process by PID using redacted command line snippets.",
+      parameters: Type.Object({
+        pid: Type.Number({ minimum: 1 }),
+        max_depth: Type.Optional(Type.Number({ minimum: 1, maximum: 64 })),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await inspectParentTreeEvidence({ pid: params.pid, maxDepth: params.max_depth ?? 16 })),
+    }),
+    defineTool({
       name: "collect_triage_evidence",
       label: "Collect all triage evidence",
       description: "Collect the full first-slice read-only resource-pressure evidence bundle and deterministic findings.",
@@ -84,7 +103,8 @@ Hard rules:
 Preferred flow:
 1. Call collect_triage_evidence first for broad resource-pressure triage.
 2. If needed, call specific collectors to refresh or inspect a subset.
-3. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+3. If a process looks important, call inspect_process and/or inspect_parent_tree for process identity and lineage before making claims about provenance.
+4. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {

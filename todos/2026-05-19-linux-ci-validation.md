@@ -109,8 +109,8 @@ Track Linux parity against macOS for the first-slice tool surface.
 | `collect_disks` | validated | validated on Linux arm64 | Linux `df -kP` and `df -iP` returned structured filesystem/inode evidence. |
 | `collect_triage_evidence` | validated | validated on Linux arm64 | combined evidence + findings returned through model-requested tool call. |
 | `derive_findings` | validated | validate | deterministic, should be platform-independent |
-| `inspect_process` | not implemented | future parity | tracked in process identity/lineage todo |
-| `inspect_parent_tree` | not implemented | future parity | tracked in process identity/lineage todo |
+| `inspect_process` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only PID identity envelope with redacted/bounded args. |
+| `inspect_parent_tree` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only bounded ancestry envelope with redacted/bounded args. |
 | temporal sampling | not implemented | future parity | tracked separately |
 | service manager checks | not implemented | future parity | Linux/systemd likely first real host requirement |
 
@@ -132,7 +132,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 - credentialed human and JSON triage were non-fallback, selected `openai-codex/gpt-5.5`, exposed only guarded tools, called `collect_triage_evidence`, and left `actions_taken: []`
 - `collect_system`, `collect_processes`, and `collect_disks` returned ok envelopes
 - process collection used Linux `ps -eo pid,ppid,pcpu,pmem,rss,comm,args`; top CPU showed the Descartes triage process itself, confirming the procps fix
-- JSON output still includes full process command lines, reinforcing the next process-args redaction/bounding task
+- JSON output still included full process command lines in public v0.0.11; current local work now redacts/bounds process args by default and should be revalidated on Linux
 
 2026-05-19 second Ubuntu validation on Linux arm64 with `$HOME/.local` prefix reached runtime and credentialed triage on public v0.0.8:
 

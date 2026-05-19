@@ -27,50 +27,44 @@ Already implemented:
 - `collect_system`
 - `collect_processes`
 - `collect_disks`
+- `inspect_process`
+- `inspect_parent_tree`
 - `collect_triage_evidence`
 - `derive_findings`
 
 ## Current Next Priority
 
-The immediate next capability slice is tracked in `todos/2026-05-19-process-identity-lineage-tools.md`:
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md` is complete. The next collector-oriented priorities are:
 
-1. add a shared redacted/bounded process argument representation
-2. add `inspect_process`
-3. add `inspect_parent_tree`
-
-This is the best next bridge from snapshot resource triage toward behavior-aware operations/defense investigation.
+1. reduce macOS disk evidence noise in `todos/2026-05-19-macos-disk-evidence-classification.md`
+2. add bounded temporal sampling from `todos/2026-05-19-temporal-sampling-investigation-tools.md`
+3. then expand into network, service manager, logs, containers, and scheduled jobs
 
 ## Candidate Next Tools
 
 Prioritize tools that answer common first-triage questions without privileged mutation:
 
-1. `inspect_process`
-   - input: PID or process name
-   - output: parent PID, executable, redacted/bounded command line, CPU/memory snapshot, start time where available
-2. `inspect_parent_tree`
-   - process ancestry and child processes
-   - useful for identifying who launched a busy process
-3. `sample_dimension`
+1. `sample_dimension`
    - bounded temporal sampling over an LLM-requested dimension, duration, and interval
    - see `todos/2026-05-19-temporal-sampling-investigation-tools.md`
-4. `collect_network_basics`
+2. `collect_network_basics`
    - interfaces, routes, DNS reachability, listening sockets where safe/available
-5. `collect_services`
+3. `collect_services`
    - `launchd` on macOS
    - `systemd` on Linux
    - failed/restarting service summary
-6. `collect_recent_logs`
+4. `collect_recent_logs`
    - strict bounded recent error/warning excerpts
    - explicit privacy notes
    - platform-specific backends (`log`, journal, syslog)
-7. `collect_containers`
+5. `collect_containers`
    - Docker / Colima / Lima / Podman where available
    - read-only container/resource summary
-8. `collect_scheduled_jobs`
+6. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
-9. `collect_certificates`
+7. `collect_certificates`
    - expiring certs in common local stores/paths, later
-10. `collect_time_sync`
+8. `collect_time_sync`
    - clock skew/time sync state
 
 ## Requirements

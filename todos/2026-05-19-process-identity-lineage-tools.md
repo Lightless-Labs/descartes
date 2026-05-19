@@ -1,7 +1,7 @@
 ---
 title: Process Identity and Lineage Investigation Tools
 created: 2026-05-19
-status: open
+status: completed
 priority: immediate
 area: collectors
 kind: todo
@@ -14,6 +14,8 @@ related:
 ---
 
 # TODO: Process Identity and Lineage Investigation Tools
+
+**Completed:** 2026-05-19 — implemented redacted/bounded process args, `inspect_process`, `inspect_parent_tree`, guarded triage exposure, and focused tests.
 
 ## Summary
 
