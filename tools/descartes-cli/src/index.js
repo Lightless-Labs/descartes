@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "./paths.js";
 
 function usage() {
@@ -6,10 +9,26 @@ function usage() {
 
 Usage:
   descartes login [provider] [--api-key] [--no-open]
-  descartes triage <PROMPT> [--json] [--no-investigate]
+  descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
+}
+
+function packageVersion() {
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(currentDir, "../../../package.json"),
+    path.resolve(currentDir, "../package.json"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(fs.readFileSync(candidate, "utf8")).version;
+    } catch {
+      // Try the next package location.
+    }
+  }
+  return "unknown";
 }
 
 async function main(argv) {
@@ -19,7 +38,7 @@ async function main(argv) {
     return;
   }
   if (command === "--version" || command === "version") {
-    console.log("0.0.7");
+    console.log(packageVersion());
     return;
   }
 

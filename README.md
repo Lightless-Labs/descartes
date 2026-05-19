@@ -1,12 +1,31 @@
 # Descartes
 
-Descartes is an AI-native operations agent: a maintenance agent, sysadmin assistant, and system operations gateway for computers. The long-term core is intended to be Rust, but the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
+## What it does
+
+Descartes is a local-first operations triage CLI. Today it can answer questions like `descartes triage "my machine is slow"` by collecting read-only local evidence about CPU/load, memory/swap, disks/inodes, and top processes, then asking an LLM-backed private agent session to produce an evidence-cited diagnosis and safe next checks. No host actions are taken.
+
+## Where it's going
+
+Descartes is intended to become a stratified machine operations and defense agent: deterministic local tools and rules first, real-time behavior detection, an adaptive decision layer for ambiguity and tradeoffs, LLM-assisted diagnosis and planning when useful, a self-improvement loop that compiles confirmed learnings into cheaper probes/rules/signatures/tests, and eventually policy-gated actions with audit trails. The long-term goal is to recognize novel harmful behavior as it emerges — for example ransomware-like file activity or trojan-like persistence/network behavior — and interrupt it within explicit policy boundaries. The durable core is expected to move toward Rust, while the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
+
+## How to get started
+
+Requires Node.js/npm 20.6+:
+
+```bash
+npm install -g github:Lightless-Labs/descartes
+descartes login
+descartes triage "my machine is slow"
+descartes triage "my machine is slow" --json
+```
+
+Descartes may use Pi internally as a private harness, but it does not require, read, import, or modify the user's personal Pi setup.
 
 It is named after the computer running the literal Blood Bank on the Moon in Philip Kerr's *The Second Angel*. The project is also inspired by the layered autonomic systems of lighthuggers in Alastair Reynolds' *Revelation Space* / *Absolution Gap*: machines with stratified reflexes, diagnostics, and higher-level reasoning rather than a single monolithic intelligence. The project goal is similarly operational: help keep machines alive, understandable, and manageable — whether they are headless servers, VM hosts, ephemeral VMs, developer machines, or future embedded/edge systems.
 
 ## Vision
 
-Descartes should observe a machine, notify its user about meaningful events, diagnose problems from evidence, recommend remediations, and eventually act on the user's behalf under explicit guardrails.
+Descartes should observe a machine, detect meaningful operational and security behavior in real time, notify its user, diagnose problems from evidence, recommend remediations, and eventually act on the user's behalf under explicit guardrails.
 
 The intended progression is:
 
@@ -30,7 +49,7 @@ Descartes is therefore designed as a layered system:
 | **L3 Federated Knowledge** | Optional future sharing of anonymized signatures, playbooks, incident fingerprints, and outcomes. |
 | **Policy / Authority Plane** | Permissioning, approvals, action plans, audit logs, and autonomy boundaries. |
 
-The model is a router, narrator, auditor, planner, and learning layer. It is not the source of truth. The source of truth is structured evidence from local tools.
+The model can route questions, synthesize evidence into explanations, make adaptive decisions about what to inspect next, audit gaps, plan next steps, and help drive self-improvement by compiling confirmed learnings downward into deterministic tools, probes, rules, signatures, and tests. It is not the source of truth. The source of truth is structured evidence from local tools.
 
 ## First External Slice
 
@@ -62,6 +81,8 @@ For subscription logins, Descartes picks a strong default rather than the provid
 descartes triage "my machine is slow" --model openai-codex/gpt-5.5 --thinking high
 ```
 
+`--json` returns the diagnosis, evidence envelopes, deterministic findings, diagnostics, tool traces, and `actions_taken: []` for replay/debugging. `--no-investigate` is a temporary degraded escape hatch that disables LLM-requested evidence tools; deterministic precollection still runs and fallback output is marked as degraded if the model returns no final text.
+
 Descartes uses deterministic local tools to collect evidence for CPU/load, memory/swap, disks/inodes, and top processes. An LLM-backed private agent session interprets the user's complaint, decides which Descartes evidence tools to call, and produces an evidence-cited diagnosis with safe next checks.
 
 Safety and privacy boundaries for v0:
@@ -73,6 +94,24 @@ Safety and privacy boundaries for v0:
 - saved reports/session state are sensitive diagnostic artifacts
 - Descartes-owned config/state follows XDG paths such as `$XDG_CONFIG_HOME/descartes`
 - Descartes may use an internal Pi SDK harness, but it must not require, read, import, reuse, or modify the user's personal Pi setup (`~/.pi`, project `.pi`, Pi sessions, settings, auth, skills, prompts, themes, or model config)
+
+Supported platforms for the first slice:
+
+- Tier 1: macOS Apple Silicon and Linux x86_64
+- Best effort: macOS Intel and Linux ARM64
+- Not supported initially: Windows, BSD, Android/Termux, remote hosts, and container-only introspection
+
+Descartes-owned paths follow XDG Base Directory conventions:
+
+| Purpose | Default |
+|---|---|
+| Config/auth | `$XDG_CONFIG_HOME/descartes` or `$HOME/.config/descartes` |
+| Data | `$XDG_DATA_HOME/descartes` or `$HOME/.local/share/descartes` |
+| State/session artifacts | `$XDG_STATE_HOME/descartes` or `$HOME/.local/state/descartes` |
+| Cache | `$XDG_CACHE_HOME/descartes` or `$HOME/.cache/descartes` |
+| Runtime | `$XDG_RUNTIME_DIR/descartes` when `XDG_RUNTIME_DIR` is set |
+
+MVP limitations: no daemon, no background monitoring, no remote hosts, no service/log/container-specific collectors yet, no redacted export mode yet, and no mutating actions.
 
 The initial scaffold lives under `tools/descartes-cli/`.
 

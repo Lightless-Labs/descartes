@@ -20,8 +20,7 @@
   },
   "files": [
     "README.md",
-    "tools/descartes-cli/src",
-    "tools/descartes-cli/test"
+    "tools/descartes-cli/src"
   ],
   "license": "UNLICENSED",
   "repository": {

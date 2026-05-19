@@ -16,7 +16,7 @@ function parseTriageArgs(args) {
     else promptParts.push(arg);
   }
   const prompt = promptParts.join(" ").trim();
-  if (!prompt) throw new Error("Usage: descartes triage <PROMPT> [--json] [--no-investigate]");
+  if (!prompt) throw new Error("Usage: descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate]");
   return { ...options, prompt };
 }
 

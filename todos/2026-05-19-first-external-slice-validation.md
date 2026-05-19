@@ -1,7 +1,7 @@
 ---
 title: First External Slice Validation and Release Readiness
 created: 2026-05-19
-status: open
+status: in_progress
 priority: immediate
 area: release
 kind: todo
@@ -27,40 +27,52 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 
 ### Packaging / install
 
-- [ ] Fresh install from GitHub works without cloning:
+- [x] Fresh install from GitHub works without cloning:
   - `npm install -g github:Lightless-Labs/descartes`
   - installed `descartes --help` works
   - installed `descartes --version` matches `package.json`
-- [ ] `npm pack --dry-run` includes expected runtime files and excludes local/generated artifacts.
-- [ ] Root package and nested CLI package metadata do not drift in version, engine requirements, or entrypoint semantics.
+- [x] `npm pack --dry-run` includes expected runtime files and excludes local/generated artifacts.
+- [x] Root package and nested CLI package metadata do not drift in version, engine requirements, or entrypoint semantics.
 
 ### Auth / paths / Pi boundary
 
-- [ ] With isolated XDG paths and no auth, `descartes triage ... --json` fails with the expected Descartes-owned "No configured model credentials" error.
-- [ ] `descartes login` stores auth/config only under Descartes-owned XDG paths.
-- [ ] No command reads, writes, imports, or relies on `~/.pi`, project `.pi`, Pi sessions, Pi settings, Pi auth, Pi skills, Pi prompts, Pi themes, or Pi model config.
-- [ ] Private harness starts with only explicit Descartes resources/tools.
+- [x] With isolated XDG paths and no auth, `descartes triage ... --json` fails with the expected Descartes-owned "No configured model credentials" error.
+- [x] `descartes login` stores auth/config only under Descartes-owned XDG paths. Validated with the API-key path; subscription OAuth was previously field-tested with Anthropic under Descartes-owned config.
+- [x] No command reads, writes, imports, or relies on `~/.pi`, project `.pi`, Pi sessions, Pi settings, Pi auth, Pi skills, Pi prompts, Pi themes, or Pi model config. Covered by path tests and explicit private harness resource overrides.
+- [x] Private harness starts with only explicit Descartes resources/tools.
 
 ### Triage behavior
 
-- [ ] `descartes triage "my machine is slow"` returns a human evidence-cited diagnosis and ends with "No actions were taken."
-- [ ] `descartes triage "my machine is slow" --json` returns diagnosis, evidence, findings, diagnostics, tool traces, and empty `actions_taken`.
-- [ ] JSON diagnostics include selected model, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error when present, and fallback state.
-- [ ] Active tools are exactly the guarded Descartes read-only tool set.
-- [ ] `--no-investigate` remains a temporary degraded no-tool synthesis escape hatch and is documented as such if kept.
-- [ ] Fallback remains clearly marked degraded mode when no assistant text is returned.
+- [ ] `descartes triage "my machine is slow"` returns a human evidence-cited diagnosis and ends with "No actions were taken." Needs one final credentialed current-package run.
+- [ ] `descartes triage "my machine is slow" --json` returns diagnosis, evidence, findings, diagnostics, tool traces, and empty `actions_taken`. Needs one final credentialed current-package run.
+- [x] JSON diagnostics include selected model, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error when present, and fallback state.
+- [x] Active tools are exactly the guarded Descartes read-only tool set.
+- [x] `--no-investigate` remains a temporary degraded no-tool synthesis escape hatch and is documented as such if kept.
+- [x] Fallback remains clearly marked degraded mode when no assistant text is returned.
 
 ### Platforms
 
-- [ ] macOS Apple Silicon passes the full validation flow with at least one subscription provider.
+- [x] macOS Apple Silicon passes the full validation flow with at least one subscription provider. Previously validated with Anthropic Sonnet and guarded Descartes tool calls.
 - [ ] Linux x86_64 either passes the full validation flow or gracefully reports unsupported/unavailable evidence without panics.
-- [ ] macOS Intel and Linux ARM64 are documented as best effort.
+- [x] macOS Intel and Linux ARM64 are documented as best effort.
 
 ### Documentation
 
-- [ ] README accurately describes the current Node.js/JavaScript first slice and long-term Rust direction.
-- [ ] README documents install, login, triage, JSON output, model/thinking overrides, `--no-investigate` if retained, supported platforms, limitations, safety, XDG paths, and Pi boundary.
+- [x] README accurately describes the current Node.js/JavaScript first slice and long-term Rust direction.
+- [x] README documents install, login, triage, JSON output, model/thinking overrides, `--no-investigate` if retained, supported platforms, limitations, safety, XDG paths, and Pi boundary.
 - [ ] Plan/handoff reflects that the LLM-driven tool loop is complete and release validation is the immediate next task.
+
+## Validation Notes
+
+2026-05-19 release-readiness pass:
+
+- `npm test` passes 25 Node test cases, including package metadata drift and CLI help/version checks.
+- `npm pack --dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts.
+- Local tarball install via `npm pack` + `npm install -g --prefix "$tmp"` works; installed `descartes --help` and `descartes --version` work.
+- GitHub install via `npm install -g github:Lightless-Labs/descartes` works for the currently published branch state; installed help/version work.
+- Isolated-XDG no-auth triage from the installed tarball exits with the expected Descartes-owned credentials error and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
+- `descartes login test-provider --api-key` with isolated XDG writes credentials to `$XDG_CONFIG_HOME/descartes/auth.json`.
+- Direct `collectAllEvidence()` invocation on local macOS returns ok envelopes for `system-overview`, `top-processes`, and `disk-usage`, with `actions_taken: []`.
 
 ## Acceptance Criteria
 
