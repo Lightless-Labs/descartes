@@ -30,6 +30,7 @@ Existing files:
   - `src/triage.js` implements human and JSON triage prompts around the private harness.
   - `test/` covers XDG path resolution, Pi-path guardrails, and deterministic finding thresholds.
 - `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
+- `todos/2026-05-19-llm-driven-investigation-tools.md` — **immediate next task**, with YAML frontmatter for quick triage/sorting.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.
 - `docs/plans/2026-05-18-002-descartes-bootstrap-kernel-and-workbench-plan.md` — superseded; do not implement this first.
 
@@ -185,17 +186,17 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Continue the focused harness spike from the new `tools/descartes-cli/` scaffold:
+Immediate next task: restore LLM-driven investigation tools while keeping the stable precollected evidence baseline. See the frontmatter-indexed todo:
 
-1. Validate install from the public repo on a clean machine: `npm install -g github:Lightless-Labs/descartes`.
-2. Validate that `descartes login` works with at least one subscription provider and writes only to `$XDG_CONFIG_HOME/descartes/auth.json` (or the default XDG config path).
-3. Validate that `descartes triage "my machine is slow"` starts a private Pi SDK agent with only Descartes evidence tools and returns an evidence-cited answer.
-4. Add an integration test or harness-level fake around `createPrivateTriageSession` to assert active tools are exactly Descartes evidence tools.
-5. Improve JSON-mode robustness so final diagnosis is guaranteed structured, not merely prompt-requested JSON.
-6. Add tests for renderer requirements: diagnosis, evidence citations, safe next checks, and `No actions were taken.`
-7. Decide whether the first package stays JavaScript/Node, moves to TypeScript, or wraps a Rust collector component.
-8. Update README with exact install command after packaging is chosen.
-9. Update this handoff before stopping.
+- `todos/2026-05-19-llm-driven-investigation-tools.md`
+
+Current CLI behavior is deliberately conservative:
+
+1. precollect first-slice read-only evidence
+2. send a compact evidence summary to the selected LLM
+3. run a no-tool synthesis turn
+
+Next implementation should add a safe tool-enabled investigation phase with only Descartes read-only tools, no Pi coding tools, no arbitrary shell, and explicit JSON diagnostics for selected model, active tools, tool calls, tool errors, and fallback state.
 
 ## Tests / Checks To Prioritize
 
