@@ -8,6 +8,8 @@ Descartes has an initial first-slice CLI scaffold, but it is not yet end-to-end 
 
 Current session update: the triage path now enables the intended Descartes read-only investigation tool surface by default while preserving deterministic precollection. It exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch. JSON output now includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and whether fallback was used. Fallback construction moved into a testable module and remains explicitly marked as degraded mode.
 
+Field validation update: a real macOS disk triage using Anthropic Sonnet succeeded end-to-end: `investigation_enabled: true`, active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, and it returned a useful non-fallback diagnosis for large macOS "System Data" caused primarily by Xcode CoreSimulator runtime image mounts. This exposed lower-layer evidence-quality work: deterministic findings currently flag `/dev` and fixed-size CoreSimulator runtime images as disk pressure, and JSON output includes full process command lines that can contain long/sensitive arguments. A new todo tracks this: `todos/2026-05-19-macos-disk-evidence-classification.md`.
+
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
 Field report update: GitHub-installed triage on a real work laptop returned an empty diagnosis after login. `tools/descartes-cli/src/triage.js` now reads final assistant text from `session.messages` after `session.prompt()` instead of relying only on streaming `text_delta` events, and emits a deterministic fallback report if the model still returns no final text.
@@ -36,6 +38,7 @@ Existing files:
   - `2026-05-19-llm-driven-investigation-tools.md` — **immediate next task**: restore safe LLM tool-driven local investigation.
   - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
+  - `2026-05-19-macos-disk-evidence-classification.md` — classify macOS pseudo/runtime filesystems, reduce disk finding noise, and plan redacted export for process args.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
   - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
 - `docs/plans/2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` — deferred broader product direction.
