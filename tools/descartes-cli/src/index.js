@@ -4,6 +4,39 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "./paths.js";
 
+export const MIN_NODE_20_VERSION = "20.18.1";
+export const MIN_NODE_22_VERSION = "22.9.0";
+export const SUPPORTED_NODE_RANGE = `^${MIN_NODE_20_VERSION} || >=${MIN_NODE_22_VERSION}`;
+
+function parseNodeVersion(version) {
+  return String(version).replace(/^v/, "").split(".").slice(0, 3).map((part) => Number.parseInt(part, 10));
+}
+
+export function isNodeVersionAtLeast(version, minimum) {
+  const actual = parseNodeVersion(version);
+  const required = parseNodeVersion(minimum);
+  if (actual.length < 3 || required.length < 3 || actual.some(Number.isNaN) || required.some(Number.isNaN)) {
+    return false;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (actual[i] > required[i]) return true;
+    if (actual[i] < required[i]) return false;
+  }
+  return true;
+}
+
+export function isSupportedNodeVersion(version) {
+  const [major] = parseNodeVersion(version);
+  if (Number.isNaN(major)) return false;
+  if (major === 20) return isNodeVersionAtLeast(version, MIN_NODE_20_VERSION);
+  if (major === 22) return isNodeVersionAtLeast(version, MIN_NODE_22_VERSION);
+  return major > 22;
+}
+
+export function unsupportedNodeVersionMessage(version = process.version) {
+  return `Descartes requires Node.js ${SUPPORTED_NODE_RANGE} because its embedded agent harness dependencies require current Node APIs. Current Node.js is ${version}. Install Node 20 LTS ${MIN_NODE_20_VERSION}+ or Node ${MIN_NODE_22_VERSION}+ and retry.`;
+}
+
 function usage() {
   return `Descartes
 
@@ -32,6 +65,10 @@ function packageVersion() {
 }
 
 async function main(argv) {
+  if (!isSupportedNodeVersion(process.versions.node)) {
+    throw new Error(unsupportedNodeVersionMessage());
+  }
+
   const [command, ...args] = argv;
   if (!command || command === "--help" || command === "-h") {
     console.log(usage());
@@ -59,7 +96,10 @@ async function main(argv) {
   throw new Error(`Unknown command: ${command}\n\n${usage()}`);
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+const entrypoint = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
+if (entrypoint === fileURLToPath(import.meta.url)) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

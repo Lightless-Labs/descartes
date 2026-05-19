@@ -21,10 +21,14 @@ Container/VM validation is enough to check install/package behavior, path isolat
 
 ## Manual VM/Container Validation
 
-Run in a Linux x86_64 VM/container with Node.js/npm 20.6+:
+Run in a Linux x86_64 VM/container with Node.js 20.18.1+ on Node 20 LTS, or Node.js 22.9.0+:
 
 ```bash
-npm install -g github:Lightless-Labs/descartes
+node --version
+npm --version
+prefix="$(mktemp -d)/npm-prefix"
+npm install -g --prefix "$prefix" github:Lightless-Labs/descartes
+export PATH="$prefix/bin:$PATH"
 descartes --version
 descartes --help
 
@@ -94,7 +98,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 
 | Capability / Tool | macOS status | Linux VM/container target | Notes |
 |---|---:|---:|---|
-| GitHub npm install | validated | validate | `npm install -g github:Lightless-Labs/descartes` |
+| GitHub npm install | validated | blocked once | First Ubuntu attempt used unsupported Node v18.19.1/npm 9.2.0 and a root-owned `/usr/local/lib/node_modules`; rerun with Node 20.18.1+ LTS or Node 22.9.0+ and a writable `--prefix`. |
 | `descartes --help` / `--version` | validated | validate | version should match package metadata |
 | XDG path isolation | validated | validate | no `~/.pi`, no project `.pi` |
 | no-auth triage failure | validated | validate | expected credentials error, no panic |
@@ -110,12 +114,21 @@ Track Linux parity against macOS for the first-slice tool surface.
 | temporal sampling | not implemented | future parity | tracked separately |
 | service manager checks | not implemented | future parity | Linux/systemd likely first real host requirement |
 
+## Observed Linux Attempt
+
+2026-05-19 Ubuntu validation attempt did not reach Descartes runtime or collectors:
+
+- host had Node v18.19.1/npm 9.2.0, below the supported runtime
+- npm emitted `EBADENGINE` warnings for Descartes, Pi, Undici, AWS SDK, and related dependencies
+- install then failed with `EACCES: permission denied, mkdir '/usr/local/lib/node_modules'`
+- next validation should use Node 20.18.1+ LTS or Node 22.9.0+ and a user-writable npm prefix, for example `npm install -g --prefix "$prefix" ...`
+
 ## CI Goals
 
 Promote the manual validation into Buildkite:
 
 - Linux x86_64 agent or container image
-- Node.js/npm 20.6+
+- Node.js 20.18.1+ LTS or Node 22.9.0+
 - package install/help/version check
 - isolated-XDG no-auth triage failure check
 - local collector smoke test

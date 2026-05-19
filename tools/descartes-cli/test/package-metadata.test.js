@@ -13,6 +13,7 @@ test("root and nested package metadata stay aligned", () => {
   assert.equal(rootPackage.name, nestedPackage.name);
   assert.equal(rootPackage.description, nestedPackage.description);
   assert.equal(rootPackage.engines.node, nestedPackage.engines.node);
+  assert.equal(rootPackage.engines.node, "^20.18.1 || >=22.9.0");
   assert.equal(rootPackage.bin.descartes, "tools/descartes-cli/src/index.js");
   assert.equal(nestedPackage.bin.descartes, "src/index.js");
 });

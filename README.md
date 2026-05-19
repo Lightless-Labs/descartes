@@ -12,7 +12,7 @@ See `docs/ROADMAP.md` for the capability roadmap and policy-gated action directi
 
 ## How to get started
 
-Requires Node.js/npm 20.6+:
+Requires Node.js 20.18.1+ on Node 20 LTS, or Node.js 22.9.0+, plus a writable npm global prefix:
 
 ```bash
 npm install -g github:Lightless-Labs/descartes
@@ -57,7 +57,7 @@ The model can route questions, synthesize evidence into explanations, make adapt
 
 The current first slice is an installable, read-only, LLM-backed local triage CLI.
 
-End-user install from GitHub, without cloning the repository (requires Node.js/npm 20.6+):
+End-user install from GitHub, without cloning the repository (requires Node.js 20.18.1+ on Node 20 LTS, or Node.js 22.9.0+):
 
 ```bash
 npm install -g github:Lightless-Labs/descartes
@@ -68,6 +68,8 @@ HTTPS tarball form if preferred:
 ```bash
 npm install -g https://github.com/Lightless-Labs/descartes/tarball/main
 ```
+
+On Linux distributions that ship older Node.js/npm packages or a root-owned global prefix, install Node 20 LTS 20.18.1+ or Node 22.9.0+ through your normal version manager and either configure a user-writable npm prefix or install with `npm install -g --prefix "$HOME/.local" github:Lightless-Labs/descartes` and add `$HOME/.local/bin` to `PATH`.
 
 Then run:
 
