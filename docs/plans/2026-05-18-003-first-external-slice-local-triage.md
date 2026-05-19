@@ -9,6 +9,7 @@
 **Addendum:** 2026-05-19 — release-readiness pass tightened README/help/package metadata, removed tests from published package contents, added package metadata drift tests, and validated local tarball install, GitHub install, isolated-XDG no-auth triage failure, API-key login path storage, and local evidence collection. Remaining validation gaps are a final credentialed current-package human/JSON triage run and Linux x86_64 behavior.
 **Addendum:** 2026-05-19 — current GitHub-installed package was validated with ChatGPT/Codex subscription auth for human and JSON triage. Output was non-fallback, evidence-cited, and read-only with `actions_taken: []`. Login UX was fixed so normal browser OAuth no longer leaves a pending manual paste prompt; `--no-open` remains the manual paste fallback. JSON citation prompting was tightened after the model cited compact summary keys instead of evidence envelope IDs.
 **Addendum:** 2026-05-19 — temporary release-validation change: normal `triage` no longer precollects evidence before the LLM turn, forcing the model to use the guarded Descartes evidence tools. `--no-investigate` still precollects deterministic evidence for degraded no-tool synthesis.
+**Addendum:** 2026-05-19 — v0.0.8 GitHub-installed validation confirmed tool-forced JSON triage works with ChatGPT/Codex: the model called `collect_triage_evidence`, returned non-fallback diagnosis with envelope ID citations, and left `actions_taken: []`.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
