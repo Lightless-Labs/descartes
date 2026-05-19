@@ -75,6 +75,8 @@ descartes triage "my machine is slow"
 descartes triage "my machine is slow" --json
 ```
 
+`descartes login` opens a browser for subscription OAuth when possible. If the browser callback cannot complete, rerun with `descartes login --no-open` and paste the final redirect URL or code.
+
 For subscription logins, Descartes picks a strong default rather than the provider registry's first model: highest available `openai-codex` GPT model by semantic version, or highest available Anthropic Sonnet. It uses high reasoning when available. You can override model selection:
 
 ```bash

@@ -72,6 +72,7 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 - GitHub install via `npm install -g github:Lightless-Labs/descartes` works for the currently published branch state; installed help/version work.
 - Isolated-XDG no-auth triage from the installed tarball exits with the expected Descartes-owned credentials error and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
 - `descartes login test-provider --api-key` with isolated XDG writes credentials to `$XDG_CONFIG_HOME/descartes/auth.json`.
+- User field report found normal subscription OAuth left a pending manual paste prompt after browser success, requiring an extra Enter. Fixed by only enabling manual paste mode for `descartes login --no-open`; normal login now waits on browser callback and documents the `--no-open` fallback.
 - Direct `collectAllEvidence()` invocation on local macOS returns ok envelopes for `system-overview`, `top-processes`, and `disk-usage`, with `actions_taken: []`.
 
 ## Acceptance Criteria

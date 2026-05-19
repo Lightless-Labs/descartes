@@ -24,6 +24,8 @@ Fourth field report update: v0.0.3 selected `openai-codex/gpt-5.1`, which ChatGP
 
 Release-readiness update: README now starts with concrete "What it does", "Where it's going", and "How to get started" blocks, and frames the long-term goal as real-time operations/defense behavior detection with policy-bounded interruption of novel harmful behavior such as ransomware-like or trojan-like activity. CLI help now documents `--model`/`--thinking`; `--version` reads package metadata instead of a hardcoded string; root package contents exclude tests; root/nested package engine metadata is aligned; and `tools/descartes-cli/test/package-metadata.test.js` covers metadata/help/version drift.
 
+Login UX fix: subscription OAuth login no longer starts an immediate manual paste `readline` prompt during normal browser-based login, because the Pi OAuth helper races that prompt against the localhost callback and leaves the terminal waiting for Enter after browser success. Normal `descartes login` now opens the browser and waits for callback; manual paste is available via `descartes login --no-open`.
+
 Existing files:
 
 - `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.
@@ -234,6 +236,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
 - Current checked command: installed `descartes login test-provider --api-key` with isolated XDG writes credentials to `$XDG_CONFIG_HOME/descartes/auth.json`.
+- Current checked command: `npm test` and local tarball API-key login still pass after the login UX fix; normal OAuth browser flow still needs a quick user re-test to confirm the no-extra-Enter behavior.
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Remaining validation gaps: final credentialed current-package human/JSON triage run and Linux x86_64 behavior.

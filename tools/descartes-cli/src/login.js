@@ -65,12 +65,18 @@ export async function runLogin(paths, args) {
     }
   }
 
-  await authStorage.login(provider, {
+  const loginCallbacks = {
     onAuth: (info) => {
       console.log("\nOpen this URL to authorize Descartes:");
       console.log(info.url);
       if (info.instructions) console.log(`\n${info.instructions}`);
-      if (options.openBrowser) maybeOpen(info.url);
+      if (options.openBrowser) {
+        maybeOpen(info.url);
+        console.log("Waiting for browser authentication...");
+        console.log("If the browser callback cannot complete, rerun with `descartes login --no-open` and paste the redirect URL or code.");
+      } else {
+        console.log("Paste the final redirect URL or code when prompted below.");
+      }
     },
     onPrompt: async (prompt) => {
       const rl = createPrompt();
@@ -84,14 +90,6 @@ export async function runLogin(paths, args) {
       }
     },
     onProgress: (message) => console.log(message),
-    onManualCodeInput: async () => {
-      const rl = createPrompt();
-      try {
-        return await rl.question("Paste redirect URL or code: ");
-      } finally {
-        rl.close();
-      }
-    },
     onSelect: async (prompt) => {
       console.log(prompt.message);
       prompt.options.forEach((option, index) => console.log(`  ${index + 1}. ${option.label} (${option.id})`));
@@ -105,7 +103,20 @@ export async function runLogin(paths, args) {
         rl.close();
       }
     },
-  });
+  };
+
+  if (!options.openBrowser) {
+    loginCallbacks.onManualCodeInput = async () => {
+      const rl = createPrompt();
+      try {
+        return await rl.question("Paste redirect URL or code: ");
+      } finally {
+        rl.close();
+      }
+    };
+  }
+
+  await authStorage.login(provider, loginCallbacks);
 
   console.log(`Logged in to ${provider}. Credentials stored under Descartes config: ${paths.authFile}`);
 }
