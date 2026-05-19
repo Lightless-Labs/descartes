@@ -14,8 +14,7 @@ import { collectSystemEvidence } from "./tools/system.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
 import { selectTriageModel } from "./model-selection.js";
-
-export const TRIAGE_TOOL_NAMES = ["collect_system", "collect_processes", "collect_disks", "collect_triage_evidence", "derive_findings"];
+import { assertSafeTriageToolNames, TRIAGE_TOOL_NAMES } from "./tool-policy.js";
 
 function jsonToolResult(value) {
   return {
@@ -138,18 +137,21 @@ function compactEvidenceForPrompt(evidenceBundle) {
   };
 }
 
-function evidenceContext(evidenceBundle) {
+function evidenceContext(evidenceBundle, { toolsEnabled = false } = {}) {
   if (!evidenceBundle) return "";
+  const toolInstruction = toolsEnabled
+    ? "You may call Descartes read-only evidence tools if the compact summary is insufficient or you need to refresh/scope evidence. Do not call tools just to restate the same facts."
+    : "No tools are available in this synthesis turn; local collection has already happened.";
   return `
 
 Initial read-only Descartes evidence summary, already collected for this explicit triage request:
 ${JSON.stringify(compactEvidenceForPrompt(evidenceBundle), null, 2)}
 
-Use the evidence above. Do not claim facts outside this evidence. No tools are available in this synthesis turn; local collection has already happened.`;
+Use the evidence above and any additional Descartes tool results. Do not claim facts outside this evidence. ${toolInstruction}`;
 }
 
-export function jsonTriagePrompt(userPrompt, evidenceBundle) {
-  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}${evidenceContext(evidenceBundle)}
+export function jsonTriagePrompt(userPrompt, evidenceBundle, options = {}) {
+  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}${evidenceContext(evidenceBundle, options)}
 
 Return only valid JSON with this shape:
 {
@@ -163,8 +165,8 @@ Return only valid JSON with this shape:
 }`;
 }
 
-export function humanTriagePrompt(userPrompt, evidenceBundle) {
-  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}${evidenceContext(evidenceBundle)}
+export function humanTriagePrompt(userPrompt, evidenceBundle, options = {}) {
+  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}${evidenceContext(evidenceBundle, options)}
 
 Print a concise report with these headings:
 Descartes triage: <complaint>
@@ -210,7 +212,7 @@ export async function createPrivateTriageSession(paths, options = {}) {
 
   const enableTools = options.enableTools ?? false;
 
-  return createAgentSession({
+  const result = await createAgentSession({
     cwd: options.cwd ?? process.cwd(),
     agentDir: paths.configDir,
     authStorage,
@@ -224,4 +226,14 @@ export async function createPrivateTriageSession(paths, options = {}) {
     tools: enableTools ? TRIAGE_TOOL_NAMES : undefined,
     customTools: enableTools ? createEvidenceTools() : [],
   });
+
+  const activeToolNames = result.session.getActiveToolNames();
+  if (enableTools) assertSafeTriageToolNames(activeToolNames);
+
+  return {
+    ...result,
+    selectedModel: model,
+    selectedThinkingLevel: thinkingLevel,
+    activeToolNames,
+  };
 }

@@ -1,7 +1,7 @@
 ---
 title: LLM-Driven Investigation Tool Loop for Descartes Triage
 created: 2026-05-19
-status: open
+status: in_progress
 priority: immediate
 area: triage
 kind: todo
@@ -103,6 +103,21 @@ New local tools belong in `todos/2026-05-19-expand-local-investigation-tools.md`
    - send compact evidence to the LLM
    - truncate long command lines and noisy mount lists in prompt context
 7. Decide whether tool-calling should be default-on after validation, or hidden behind a temporary debug flag for one release.
+
+## Progress
+
+2026-05-19:
+
+- Implemented default-on tool-enabled investigation while keeping deterministic precollection.
+- Added temporary `--no-investigate` escape hatch for the prior no-tool synthesis flow.
+- Added explicit triage tool policy and runtime guard for exactly the existing Descartes read-only tools.
+- Added JSON diagnostics for selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and fallback state.
+- Added tests for tool policy, diagnostics, and fallback degraded-mode marking.
+
+Remaining:
+
+- Validate end-to-end with installed dependencies and real subscription auth on a laptop.
+- Confirm one Anthropic and/or Codex model actually performs tool calls and returns final diagnosis text.
 
 ## Acceptance Criteria
 

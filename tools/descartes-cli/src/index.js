@@ -6,7 +6,7 @@ function usage() {
 
 Usage:
   descartes login [provider] [--api-key] [--no-open]
-  descartes triage <PROMPT> [--json]
+  descartes triage <PROMPT> [--json] [--no-investigate]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;

@@ -1,10 +1,12 @@
 # Descartes Handoff
 
-**Last updated:** 2026-05-18
+**Last updated:** 2026-05-19
 
 ## Current Status
 
 Descartes has an initial first-slice CLI scaffold, but it is not yet end-to-end validated with installed dependencies and real auth.
+
+Current session update: the triage path now enables the intended Descartes read-only investigation tool surface by default while preserving deterministic precollection. It exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch. JSON output now includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and whether fallback was used. Fallback construction moved into a testable module and remains explicitly marked as degraded mode.
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
@@ -222,10 +224,10 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 7 Node test cases.
+- Current checked command: `npm test` passes 22 Node test cases.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: GitHub-installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists.
-- Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies.
+- Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Full `descartes login` / `descartes triage` end-to-end flow has not been validated because local package dependencies/auth were not installed/configured in this repo.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
