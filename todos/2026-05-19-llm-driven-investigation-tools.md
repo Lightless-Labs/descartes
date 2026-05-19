@@ -1,7 +1,7 @@
 ---
 title: LLM-Driven Investigation Tool Loop for Descartes Triage
 created: 2026-05-19
-status: in_progress
+status: completed
 priority: immediate
 area: triage
 kind: todo
@@ -113,11 +113,11 @@ New local tools belong in `todos/2026-05-19-expand-local-investigation-tools.md`
 - Added explicit triage tool policy and runtime guard for exactly the existing Descartes read-only tools.
 - Added JSON diagnostics for selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and fallback state.
 - Added tests for tool policy, diagnostics, and fallback degraded-mode marking.
+- Validated end-to-end on a real macOS laptop with Anthropic Sonnet subscription auth: active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, returned non-fallback diagnosis text, and JSON diagnostics/evidence/tool traces were populated.
 
-Remaining:
+## Completed
 
-- Validate end-to-end with installed dependencies and real subscription auth on a laptop.
-- Confirm one Anthropic and/or Codex model actually performs tool calls and returns final diagnosis text.
+Completed 2026-05-19. Follow-up release-readiness work moved to `todos/2026-05-19-first-external-slice-validation.md`. New collector expansion remains in `todos/2026-05-19-expand-local-investigation-tools.md`.
 
 ## Acceptance Criteria
 

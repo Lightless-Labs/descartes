@@ -5,6 +5,7 @@
 **Status:** In progress  
 **Addendum:** 2026-05-18 — initial npm-style CLI scaffold added under `tools/descartes-cli/` with XDG path isolation tests, read-only resource evidence collectors, deterministic findings, and a private Pi SDK harness wrapper. Subscription login and real LLM triage still need end-to-end validation after dependency installation/auth.  
 **Addendum:** 2026-05-19 — triage now defaults to a guarded read-only Descartes tool investigation phase after deterministic precollection, with JSON diagnostics for selected model, active tools, tool calls/errors, stop reason, and fallback state. Real provider/auth validation is still pending.
+**Addendum:** 2026-05-19 — real macOS Anthropic subscription-auth field test validated the guarded LLM tool loop with an actual `collect_disks` call and non-fallback diagnosis. Next plan-aligned work is first-slice release readiness; see `todos/2026-05-19-first-external-slice-validation.md`.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
