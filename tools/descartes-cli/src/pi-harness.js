@@ -7,7 +7,7 @@ import {
   ModelRegistry,
   SessionManager,
   SettingsManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectProcessEvidence } from "./tools/processes.js";
 import { collectSystemEvidence } from "./tools/system.js";

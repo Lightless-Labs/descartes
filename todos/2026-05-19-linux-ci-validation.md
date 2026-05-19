@@ -21,7 +21,7 @@ Container/VM validation is enough to check install/package behavior, path isolat
 
 ## Manual VM/Container Validation
 
-Run in a Linux x86_64 VM/container with Node.js 20.18.1+ on Node 20 LTS, or Node.js 22.9.0+:
+Run in a Linux x86_64 VM/container with Node.js 22.19.0+:
 
 ```bash
 node --version
@@ -116,6 +116,14 @@ Track Linux parity against macOS for the first-slice tool surface.
 
 ## Observed Linux Attempts
 
+2026-05-19 local packaging update for v0.0.12:
+
+- Descartes now depends on `@earendil-works/pi-coding-agent` 0.75.3 instead of deprecated `@mariozechner/*` Pi packages.
+- Runtime requirement is now Node.js 22.19.0+.
+- Fresh local tarball install no longer emits the `@mariozechner/*` deprecation warnings.
+- One upstream `node-domexception` deprecation warning remains through `@google/genai`/Google auth transitive dependencies in Pi AI.
+- Linux ARM64 validation should be rerun after v0.0.12 is pushed.
+
 2026-05-19 third Ubuntu validation on Linux arm64 with `$HOME/.local` prefix validated the current public v0.0.11 package:
 
 - `npm install -g --prefix "$HOME/.local" github:Lightless-Labs/descartes` installed public v0.0.11 successfully
@@ -141,14 +149,14 @@ Track Linux parity against macOS for the first-slice tool surface.
 - host had Node v18.19.1/npm 9.2.0, below the supported runtime
 - npm emitted `EBADENGINE` warnings for Descartes, Pi, Undici, AWS SDK, and related dependencies
 - install then failed with `EACCES: permission denied, mkdir '/usr/local/lib/node_modules'`
-- next validation should use Node 20.18.1+ LTS or Node 22.9.0+ and a user-writable npm prefix, for example `npm install -g --prefix "$prefix" ...`
+- next validation should use Node 22.19.0+ and a user-writable npm prefix, for example `npm install -g --prefix "$prefix" ...`
 
 ## CI Goals
 
 Promote the manual validation into Buildkite:
 
 - Linux x86_64 agent or container image
-- Node.js 20.18.1+ LTS or Node 22.9.0+
+- Node.js 22.19.0+
 - package install/help/version check
 - isolated-XDG no-auth triage failure check
 - local collector smoke test

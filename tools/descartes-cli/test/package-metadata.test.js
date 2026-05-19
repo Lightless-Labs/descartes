@@ -15,7 +15,10 @@ test("root and nested package metadata stay aligned", () => {
   assert.equal(rootPackage.name, nestedPackage.name);
   assert.equal(rootPackage.description, nestedPackage.description);
   assert.equal(rootPackage.engines.node, nestedPackage.engines.node);
-  assert.equal(rootPackage.engines.node, "^20.18.1 || >=22.9.0");
+  assert.equal(rootPackage.engines.node, ">=22.19.0");
+  assert.equal(rootPackage.dependencies["@earendil-works/pi-coding-agent"], nestedPackage.dependencies["@earendil-works/pi-coding-agent"]);
+  assert(!rootPackage.dependencies["@mariozechner/pi-coding-agent"]);
+  assert(!nestedPackage.dependencies["@mariozechner/pi-coding-agent"]);
   assert.equal(rootPackage.bin.descartes, "tools/descartes-cli/src/index.js");
   assert.equal(nestedPackage.bin.descartes, "src/index.js");
 });
