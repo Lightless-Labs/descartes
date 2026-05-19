@@ -19,7 +19,7 @@ async function main(argv) {
     return;
   }
   if (command === "--version" || command === "version") {
-    console.log("0.0.5");
+    console.log("0.0.6");
     return;
   }
 

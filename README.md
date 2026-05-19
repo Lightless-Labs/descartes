@@ -56,7 +56,7 @@ descartes triage "my machine is slow"
 descartes triage "my machine is slow" --json
 ```
 
-For ChatGPT/Codex subscription logins, Descartes picks the highest available `openai-codex` GPT model by semantic version and uses high reasoning when available. You can override model selection:
+For subscription logins, Descartes picks a strong default rather than the provider registry's first model: highest available `openai-codex` GPT model by semantic version, or highest available Anthropic Sonnet. It uses high reasoning when available. You can override model selection:
 
 ```bash
 descartes triage "my machine is slow" --model openai-codex/gpt-5.5 --thinking high

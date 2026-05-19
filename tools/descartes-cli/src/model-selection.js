@@ -22,6 +22,57 @@ function variantRank(id) {
   return 70;
 }
 
+function parseClaudeModel(id) {
+  let match = id.match(/^claude-(sonnet|opus|haiku)-(\d+(?:-\d+)*)(?:-(\d{8}))?$/i);
+  if (match) {
+    return {
+      family: match[1].toLowerCase(),
+      version: match[2].split("-").map((part) => Number(part)),
+      date: match[3] ? Number(match[3]) : 0,
+    };
+  }
+
+  match = id.match(/^claude-(\d+)-(\d+)-(sonnet|opus|haiku)(?:-(\d{8}|latest))?$/i);
+  if (match) {
+    return {
+      family: match[3].toLowerCase(),
+      version: [Number(match[1]), Number(match[2])],
+      date: match[4] && match[4] !== "latest" ? Number(match[4]) : 0,
+    };
+  }
+
+  match = id.match(/^claude-(\d+)-(sonnet|opus|haiku)(?:-(\d{8}|latest))?$/i);
+  if (match) {
+    return {
+      family: match[2].toLowerCase(),
+      version: [Number(match[1])],
+      date: match[3] && match[3] !== "latest" ? Number(match[3]) : 0,
+    };
+  }
+
+  return undefined;
+}
+
+function familyRank(family) {
+  if (family === "sonnet") return 100;
+  if (family === "opus") return 80;
+  if (family === "haiku") return 20;
+  return 0;
+}
+
+function highestClaudeModel(models) {
+  return models
+    .map((model) => ({ model, parsed: parseClaudeModel(model.id) }))
+    .filter((item) => item.parsed)
+    .sort((left, right) => {
+      const family = familyRank(right.parsed.family) - familyRank(left.parsed.family);
+      if (family !== 0) return family;
+      const version = compareVersionDesc(left.parsed.version, right.parsed.version);
+      if (version !== 0) return version;
+      return right.parsed.date - left.parsed.date;
+    })[0]?.model;
+}
+
 function highestGptModel(models) {
   return models
     .map((model) => ({ model, version: parseGptVersion(model.id) }))
@@ -56,6 +107,11 @@ export function selectTriageModel(available, options = {}) {
   for (const provider of ["openai-codex", "github-copilot"]) {
     const model = highestGptModel(available.filter((item) => item.provider === provider));
     if (model) return { model, thinkingLevel: options.thinkingLevel ?? (model.reasoning ? "high" : "off") };
+  }
+
+  const anthropicModel = highestClaudeModel(available.filter((item) => item.provider === "anthropic"));
+  if (anthropicModel) {
+    return { model: anthropicModel, thinkingLevel: options.thinkingLevel ?? (anthropicModel.reasoning ? "high" : "off") };
   }
 
   const model = highestGptModel(available) ?? available[0];
