@@ -54,6 +54,8 @@ If the user says they need a real VM, Descartes replans around Tart/Lima/UTM/Mul
 
 This temporary-environment story is a useful north-star behavior, not a single hardcoded workflow. Descartes should be biased toward preserving user intent, noticing operational lifecycle signals, and offering bounded next steps when local evidence suggests they are relevant. For example, after helping with an ephemeral VM/container validation, the same capability set could eventually let Descartes recognize that the original purpose appears complete and suggest follow-up options such as stopping, deleting, snapshotting, or keeping the environment alive. Any such recommendation should come from explicit evidence and any stop/delete action remains policy-gated and audited.
 
+These are glimpses, not requirements. Another glimpse: if a user repeatedly asks Descartes to perform or supervise similar operational work, Descartes should eventually be able to notice the pattern and suggest a reusable playbook, checklist, validation job, deterministic probe, or policy template. That implies later semantic memory, graph-shaped operational memory, temporal confidence/decay, outcome tracking, and careful proactivity thresholds. The near-term design bias is simply to preserve enough structured intent, evidence, approvals, actions, and outcomes that repeated successful work can later be proposed as durable operational knowledge instead of remaining one-off chat history.
+
 ## Required Capability Layers
 
 ### 1. Capability Discovery
