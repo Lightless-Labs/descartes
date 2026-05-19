@@ -2,7 +2,7 @@
 
 Descartes is a Rust project for an AI-native operations agent: a maintenance agent, sysadmin assistant, and system operations gateway for computers.
 
-It is named after the computer running the literal Blood Bank on the Moon in Philip Kerr's *The Second Angel*. The project goal is similarly operational: help keep machines alive, understandable, and manageable — whether they are headless servers, VM hosts, ephemeral VMs, developer machines, or future embedded/edge systems.
+It is named after the computer running the literal Blood Bank on the Moon in Philip Kerr's *The Second Angel*. The project is also inspired by the layered autonomic systems of lighthuggers in Alastair Reynolds' *Revelation Space* / *Absolution Gap*: machines with stratified reflexes, diagnostics, and higher-level reasoning rather than a single monolithic intelligence. The project goal is similarly operational: help keep machines alive, understandable, and manageable — whether they are headless servers, VM hosts, ephemeral VMs, developer machines, or future embedded/edge systems.
 
 ## Vision
 
