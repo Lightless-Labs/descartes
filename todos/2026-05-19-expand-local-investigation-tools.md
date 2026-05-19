@@ -8,6 +8,7 @@ kind: todo
 owner: unassigned
 related:
   - todos/2026-05-19-llm-driven-investigation-tools.md
+  - todos/2026-05-19-process-identity-lineage-tools.md
   - todos/2026-05-19-temporal-sampling-investigation-tools.md
 ---
 
@@ -29,13 +30,23 @@ Already implemented:
 - `collect_triage_evidence`
 - `derive_findings`
 
+## Current Next Priority
+
+The immediate next capability slice is tracked in `todos/2026-05-19-process-identity-lineage-tools.md`:
+
+1. add a shared redacted/bounded process argument representation
+2. add `inspect_process`
+3. add `inspect_parent_tree`
+
+This is the best next bridge from snapshot resource triage toward behavior-aware operations/defense investigation.
+
 ## Candidate Next Tools
 
 Prioritize tools that answer common first-triage questions without privileged mutation:
 
 1. `inspect_process`
    - input: PID or process name
-   - output: parent PID, executable, command line, CPU/memory snapshot, start time where available
+   - output: parent PID, executable, redacted/bounded command line, CPU/memory snapshot, start time where available
 2. `inspect_parent_tree`
    - process ancestry and child processes
    - useful for identifying who launched a busy process

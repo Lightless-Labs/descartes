@@ -4,13 +4,13 @@
 
 ## Current Status
 
-Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is now in progress: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, and current-package macOS human/JSON triage have been tightened/validated. Remaining release-readiness gap is Linux x86_64 best-effort behavior; no Linux host is currently available, so validation is deferred to future Buildkite CI.
+Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is effectively complete for macOS: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, model-led tool use, and current-package human/JSON triage have been tightened/validated. Remaining release-readiness gap is Linux x86_64 best-effort behavior; no Linux host is currently available, so validation is deferred to future Buildkite CI.
 
-Current session update: the triage path now enables the intended Descartes read-only investigation tool surface by default while preserving deterministic precollection. It exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch. JSON output now includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, and whether fallback was used. Fallback construction moved into a testable module and remains explicitly marked as degraded mode.
+Current session update: normal `triage` is model-led and does not precollect evidence before the LLM turn. The model must request local facts through the guarded Descartes read-only tool surface. It currently exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch and still uses deterministic precollection. JSON output includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, fallback state, evidence, findings, traces, and `actions_taken: []`. Fallback construction is testable and explicitly marked degraded mode.
 
 Field validation update: a real macOS disk triage using Anthropic Sonnet succeeded end-to-end: `investigation_enabled: true`, active tools were exactly the guarded Descartes tool set, the model called `collect_disks`, and it returned a useful non-fallback diagnosis for large macOS "System Data" caused primarily by Xcode CoreSimulator runtime image mounts. This completes `todos/2026-05-19-llm-driven-investigation-tools.md`. It also exposed lower-layer evidence-quality work: deterministic findings currently flag `/dev` and fixed-size CoreSimulator runtime images as disk pressure, and JSON output includes full process command lines that can contain long/sensitive arguments. A separate refinement todo tracks this: `todos/2026-05-19-macos-disk-evidence-classification.md`.
 
-Plan-aligned next step: either set up Linux x86_64 validation via Buildkite or, if release proceeds before that, document Linux as unvalidated/best-effort. The immediate todo remains `todos/2026-05-19-first-external-slice-validation.md`; all macOS/package/auth-path checks are complete except Linux x86_64 validation.
+Plan-aligned next step: take the next high-impact capability step toward behavior-aware operations/defense investigation: implement redacted/bounded process arguments, then `inspect_process` and `inspect_parent_tree`. This is tracked in `todos/2026-05-19-process-identity-lineage-tools.md`. Linux x86_64 validation remains deferred to Buildkite (`todos/2026-05-19-linux-ci-validation.md`).
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
@@ -47,7 +47,8 @@ Existing files:
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
   - `2026-05-19-first-external-slice-validation.md` — **immediate next task, in progress**: validate install/login/triage/docs/platform readiness against the first external slice plan.
   - `2026-05-19-llm-driven-investigation-tools.md` — completed; safe LLM tool-driven local investigation restored and validated with Anthropic on macOS.
-  - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors.
+  - `2026-05-19-process-identity-lineage-tools.md` — **recommended next task**: redacted/bounded process args, `inspect_process`, and `inspect_parent_tree`.
+  - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors; now points to process identity/lineage as the immediate next capability slice.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
   - `2026-05-19-macos-disk-evidence-classification.md` — classify macOS pseudo/runtime filesystems, reduce disk finding noise, and plan redacted export for process args.
   - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
@@ -62,7 +63,8 @@ Existing files:
 1. Read `README.md`, `AGENTS.md`, and this handoff.
 2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
 3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
-4. The immediate implementation question is: what is the smallest installable `descartes` CLI that can run an LLM-backed private agent session, collect local read-only evidence, and answer `descartes triage "my machine is slow"` without requiring or touching the user's Pi setup?
+4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
+5. Recommended next task: `todos/2026-05-19-process-identity-lineage-tools.md`.
 
 ## Current First Slice
 
@@ -209,13 +211,13 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Immediate next task: validate the first external slice for release readiness. See the frontmatter-indexed todo:
+Recommended next task: implement process identity and lineage tools. See:
 
-- `todos/2026-05-19-first-external-slice-validation.md`
+- `todos/2026-05-19-process-identity-lineage-tools.md`
 
-Focus on the current plan's shippability criteria before expanding the tool surface: clean GitHub install, login/auth under Descartes-owned XDG paths, no Pi user-state access, human and JSON triage outputs, package contents/version drift, README/help drift, macOS Apple Silicon validation, and Linux x86_64 best-effort behavior.
+Start with a shared redacted/bounded process argument representation, then add `inspect_process` and `inspect_parent_tree` as read-only Descartes tools exposed through the guarded triage surface. This is the best low-hanging step from snapshot resource triage toward behavior-aware operations/defense investigation.
 
-After that pass, the highest-impact next capability work is likely `inspect_process` / `inspect_parent_tree` from `todos/2026-05-19-expand-local-investigation-tools.md`.
+Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
 ## Tests / Checks To Prioritize
 
@@ -242,10 +244,12 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
 - Current checked command: installed `descartes login test-provider --api-key` with isolated XDG writes credentials to `$XDG_CONFIG_HOME/descartes/auth.json`.
-- Current checked command: `npm test` and local tarball API-key login still pass after the login UX fix; normal OAuth browser flow still needs a quick user re-test to confirm the no-extra-Enter behavior.
+- Current checked command: `npm test` and local tarball API-key login still pass after the login UX fix; user re-tested normal OAuth browser login and confirmed the extra-Enter issue is resolved.
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
+- Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: Linux x86_64 behavior. No Linux host is currently available; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
+- Recommended next implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.
