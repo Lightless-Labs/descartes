@@ -89,14 +89,27 @@ function parseDiagnosisJson(text) {
   }
 }
 
-function fallbackDiagnosis(prompt, evidence, findings) {
+function lastAssistantErrorFromMessages(messages) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role === "assistant") {
+      if (message.stopReason === "error" || message.errorMessage) {
+        return message.errorMessage || "LLM provider returned an error without details.";
+      }
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function fallbackDiagnosis(prompt, evidence, findings, llmError) {
   const substantiveFindings = findings.filter((finding) => finding.id !== "insufficient_evidence");
   return {
-    summary: substantiveFindings[0]?.summary ?? "Descartes collected evidence, but the model returned no diagnosis text.",
+    summary: substantiveFindings[0]?.summary ?? (llmError ? "Descartes collected evidence, but the LLM request failed." : "Descartes collected evidence, but the model returned no diagnosis text."),
     confidence: substantiveFindings.length > 0 ? "medium" : "low",
     explanation: substantiveFindings.length > 0
-      ? "Fallback deterministic summary generated because the LLM-backed session produced no final text. Review findings and evidence directly."
-      : "Fallback deterministic summary generated because the LLM-backed session produced no final text and no obvious first-slice resource-pressure threshold was crossed.",
+      ? `Fallback deterministic summary generated because the LLM-backed session produced no final text${llmError ? ` (${llmError})` : ""}. Review findings and evidence directly.`
+      : `Fallback deterministic summary generated because the LLM-backed session produced no final text${llmError ? ` (${llmError})` : ""} and no obvious first-slice resource-pressure threshold was crossed.`,
     evidence_refs: [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))].filter(Boolean).length > 0
       ? [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))].filter(Boolean)
       : evidence.map((item) => item.id),
@@ -108,6 +121,7 @@ function fallbackDiagnosis(prompt, evidence, findings) {
     avoid: ["Do not kill unknown system processes based only on this fallback summary."],
     actions_taken: [],
     fallback: true,
+    llm_error: llmError,
   };
 }
 
@@ -143,6 +157,7 @@ export async function runTriage(paths, args) {
   const precollected = await collectAllEvidence();
   const { session } = await createPrivateTriageSession(paths, {
     thinkingLevel: options.thinkingLevel,
+    enableTools: false,
   });
 
   const unsubscribe = session.subscribe((event) => {
@@ -162,8 +177,9 @@ export async function runTriage(paths, args) {
   }
 
   const assistantText = lastAssistantTextFromMessages(finalMessages) || lastAssistantTextFromEvents(events);
+  const llmError = lastAssistantErrorFromMessages(finalMessages);
   const { evidence, findings } = flattenEvidence(toolResults, precollected);
-  const fallback = assistantText ? undefined : fallbackDiagnosis(options.prompt, evidence, findings);
+  const fallback = assistantText ? undefined : fallbackDiagnosis(options.prompt, evidence, findings, llmError);
 
   if (!options.json) {
     process.stdout.write(assistantText || renderFallbackHuman(options.prompt, fallback, evidence, findings));

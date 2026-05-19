@@ -87,14 +87,64 @@ Preferred flow:
 3. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
+function truncate(value, max = 180) {
+  if (typeof value !== "string") return value;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+function compactEvidenceForPrompt(evidenceBundle) {
+  if (!evidenceBundle) return undefined;
+  const evidence = Object.fromEntries((evidenceBundle.evidence ?? []).map((item) => [item.id, item.result]));
+  const system = evidence["system-overview"];
+  const processes = evidence["top-processes"];
+  const disks = evidence["disk-usage"];
+
+  const pressuredFilesystems = Array.isArray(disks?.filesystems)
+    ? disks.filesystems
+        .filter((fs) => typeof fs.used_fraction === "number" && fs.used_fraction >= 0.9 && fs.mount_point !== "/dev")
+        .slice(0, 8)
+        .map((fs) => ({ mount_point: fs.mount_point, used_fraction: fs.used_fraction, available_bytes: fs.available_bytes }))
+    : [];
+
+  return {
+    system: system ? {
+      hostname: system.hostname,
+      platform: system.platform,
+      arch: system.arch,
+      cpu_count: system.cpu_count,
+      load_average: system.load_average,
+      memory: system.memory,
+      swap: system.swap,
+    } : undefined,
+    top_cpu: (processes?.top_cpu ?? []).slice(0, 8).map((process) => ({
+      pid: process.pid,
+      command: process.command,
+      cpu_percent: process.cpu_percent,
+      memory_percent: process.memory_percent,
+      args: truncate(process.args),
+    })),
+    top_memory: (processes?.top_memory ?? []).slice(0, 5).map((process) => ({
+      pid: process.pid,
+      command: process.command,
+      cpu_percent: process.cpu_percent,
+      memory_percent: process.memory_percent,
+      rss_bytes: process.rss_bytes,
+      args: truncate(process.args),
+    })),
+    pressured_filesystems: pressuredFilesystems,
+    findings: (evidenceBundle.findings ?? []).slice(0, 16),
+    actions_taken: [],
+  };
+}
+
 function evidenceContext(evidenceBundle) {
   if (!evidenceBundle) return "";
   return `
 
-Initial read-only Descartes evidence bundle, already collected for this explicit triage request:
-${JSON.stringify(evidenceBundle, null, 2)}
+Initial read-only Descartes evidence summary, already collected for this explicit triage request:
+${JSON.stringify(compactEvidenceForPrompt(evidenceBundle), null, 2)}
 
-Use the evidence above even if you do not call any tools. You may call tools only if you need refreshed or additional first-slice evidence.`;
+Use the evidence above. Do not claim facts outside this evidence. No tools are available in this synthesis turn; local collection has already happened.`;
 }
 
 export function jsonTriagePrompt(userPrompt, evidenceBundle) {
@@ -157,6 +207,8 @@ export async function createPrivateTriageSession(paths, options = {}) {
     throw new Error("No configured model credentials found. Run `descartes login` or configure an API key in Descartes' XDG config path.");
   }
 
+  const enableTools = options.enableTools ?? false;
+
   return createAgentSession({
     cwd: options.cwd ?? process.cwd(),
     agentDir: paths.configDir,
@@ -167,7 +219,8 @@ export async function createPrivateTriageSession(paths, options = {}) {
     sessionManager: SessionManager.inMemory(),
     model,
     thinkingLevel: options.thinkingLevel ?? "off",
-    tools: TRIAGE_TOOL_NAMES,
-    customTools: createEvidenceTools(),
+    noTools: enableTools ? undefined : "all",
+    tools: enableTools ? TRIAGE_TOOL_NAMES : undefined,
+    customTools: enableTools ? createEvidenceTools() : [],
   });
 }
