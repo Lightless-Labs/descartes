@@ -8,6 +8,8 @@ Descartes has an initial first-slice CLI scaffold, but it is not yet end-to-end 
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
+Field report update: GitHub-installed triage on a real work laptop returned an empty diagnosis after login. `tools/descartes-cli/src/triage.js` now reads final assistant text from `session.messages` after `session.prompt()` instead of relying only on streaming `text_delta` events, and emits a deterministic fallback report if the model still returns no final text.
+
 Existing files:
 
 - `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.

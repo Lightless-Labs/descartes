@@ -36,14 +36,101 @@ function flattenEvidence(toolResults) {
   };
 }
 
-function lastAssistantTextFromEvents(events) {
+export function lastAssistantTextFromEvents(events) {
   let text = "";
   for (const event of events) {
     if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
       text += event.assistantMessageEvent.delta;
     }
   }
-  return text;
+  return text.trim();
+}
+
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (!block || typeof block !== "object") return "";
+      if (block.type === "text" && typeof block.text === "string") return block.text;
+      return "";
+    })
+    .join("");
+}
+
+export function lastAssistantTextFromMessages(messages) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role === "assistant") {
+      const text = contentToText(message.content).trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function parseDiagnosisJson(text) {
+  const trimmed = text.trim();
+  const unfenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim() ?? trimmed;
+  try {
+    return JSON.parse(unfenced);
+  } catch {
+    const start = unfenced.indexOf("{");
+    const end = unfenced.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(unfenced.slice(start, end + 1));
+      } catch {
+        // Fall through to raw text below.
+      }
+    }
+    return { raw_text: text };
+  }
+}
+
+function fallbackDiagnosis(prompt, evidence, findings) {
+  const substantiveFindings = findings.filter((finding) => finding.id !== "insufficient_evidence");
+  return {
+    summary: substantiveFindings[0]?.summary ?? "Descartes collected evidence, but the model returned no diagnosis text.",
+    confidence: substantiveFindings.length > 0 ? "medium" : "low",
+    explanation: substantiveFindings.length > 0
+      ? "Fallback deterministic summary generated because the LLM-backed session produced no final text. Review findings and evidence directly."
+      : "Fallback deterministic summary generated because the LLM-backed session produced no final text and no obvious first-slice resource-pressure threshold was crossed.",
+    evidence_refs: [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))],
+    next_checks: [
+      "Re-run the command with --json and inspect evidence/tool traces.",
+      "Check the top CPU and memory process lists for expected workload.",
+      "If this repeats, update Descartes and report the empty model response as a bug.",
+    ],
+    avoid: ["Do not kill unknown system processes based only on this fallback summary."],
+    actions_taken: [],
+    fallback: true,
+  };
+}
+
+function renderFallbackHuman(prompt, diagnosis, evidence, findings) {
+  const evidenceLines = findings.length > 0
+    ? findings.map((finding) => `  - ${finding.summary} [${(finding.evidence_refs ?? []).join(", ")}]`)
+    : evidence.map((item) => `  - ${item.id}: ${item.status}`);
+
+  return `Descartes triage: ${prompt}
+
+Most likely cause
+  ${diagnosis.summary}
+
+Confidence
+  ${diagnosis.confidence}
+
+Evidence
+${evidenceLines.join("\n") || "  - No evidence was collected."}
+
+Safe next checks
+${diagnosis.next_checks.map((check, index) => `  ${index + 1}. ${check}`).join("\n")}
+
+Avoid for now
+${diagnosis.avoid.map((item) => `  - ${item}`).join("\n")}
+
+No actions were taken.`;
 }
 
 export async function runTriage(paths, args) {
@@ -56,34 +143,31 @@ export async function runTriage(paths, args) {
 
   const unsubscribe = session.subscribe((event) => {
     events.push(event);
-    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta" && !options.json) {
-      process.stdout.write(event.assistantMessageEvent.delta);
-    }
     if (event.type === "tool_execution_end") {
       toolResults.push({ toolName: event.toolName, toolCallId: event.toolCallId, result: event.result, isError: event.isError });
     }
   });
 
+  let finalMessages = [];
   try {
     await session.prompt(options.json ? jsonTriagePrompt(options.prompt) : humanTriagePrompt(options.prompt));
+    finalMessages = [...session.messages];
   } finally {
     unsubscribe();
     session.dispose();
   }
 
-  const assistantText = lastAssistantTextFromEvents(events).trim();
+  const assistantText = lastAssistantTextFromMessages(finalMessages) || lastAssistantTextFromEvents(events);
+  const { evidence, findings } = flattenEvidence(toolResults);
+  const fallback = assistantText ? undefined : fallbackDiagnosis(options.prompt, evidence, findings);
+
   if (!options.json) {
-    if (!assistantText.endsWith("\n")) process.stdout.write("\n");
+    process.stdout.write(assistantText || renderFallbackHuman(options.prompt, fallback, evidence, findings));
+    if (!(assistantText || "").endsWith("\n")) process.stdout.write("\n");
     return;
   }
 
-  const { evidence, findings } = flattenEvidence(toolResults);
-  let diagnosis;
-  try {
-    diagnosis = JSON.parse(assistantText);
-  } catch {
-    diagnosis = { raw_text: assistantText };
-  }
+  const diagnosis = fallback ?? parseDiagnosisJson(assistantText);
 
   process.stdout.write(JSON.stringify({
     prompt: options.prompt,
