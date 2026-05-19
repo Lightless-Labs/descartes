@@ -12,6 +12,7 @@
 **Addendum:** 2026-05-19 — v0.0.8 GitHub-installed validation confirmed tool-forced JSON triage works with ChatGPT/Codex: the model called `collect_triage_evidence`, returned non-fallback diagnosis with envelope ID citations, and left `actions_taken: []`.
 **Addendum:** 2026-05-19 — Linux x86_64 validation is deferred because no Linux host is currently available. Future Buildkite CI validation is tracked in `todos/2026-05-19-linux-ci-validation.md`; any credentialed CI flow should use scoped secrets or a dedicated validation account/key rather than personal credentials.
 **Addendum:** 2026-05-19 — first Ubuntu validation attempt was blocked before Descartes runtime by unsupported Node v18.19.1/npm 9.2.0 and a root-owned global npm prefix. v0.0.9 package/docs now require Node 20.18.1+ LTS or Node 22.9.0+ to match transitive agent-harness dependencies and Linux validation commands use a writable `--prefix`.
+**Addendum:** 2026-05-19 — second Ubuntu validation reached Linux arm64 runtime with `$HOME/.local` prefix, completed ChatGPT/Codex `--no-open` login, and produced non-fallback model-led triage with guarded `collect_triage_evidence`; `collect_processes` failed on procps because v0.0.8 used BSD-style `ps -axo ... -m`, so v0.0.10 switches Linux to `ps -eo ...` and sorts process lists in-process.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

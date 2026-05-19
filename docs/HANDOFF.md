@@ -6,7 +6,7 @@
 
 Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is effectively complete for macOS: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, model-led tool use, and current-package human/JSON triage have been tightened/validated. Remaining release-readiness gap is Linux x86_64 best-effort behavior; the first Ubuntu attempt was blocked before Descartes runtime by unsupported Node v18.19.1/npm 9.2.0 and a root-owned global npm prefix.
 
-Current session update: Linux validation report showed the Ubuntu host was using unsupported Node v18.19.1/npm 9.2.0 and failed global install with `EACCES` on `/usr/local/lib/node_modules`; it did not reach Descartes runtime. v0.0.9 bumps the advertised/guarded Node requirement to Node 20.18.1+ LTS or Node 22.9.0+, documents a writable Linux npm prefix, and records the blocked attempt in the Linux validation todo.
+Current session update: Linux validation report showed the first Ubuntu attempt used unsupported Node v18.19.1/npm 9.2.0 and failed global install with `EACCES` on `/usr/local/lib/node_modules`; it did not reach Descartes runtime. A second run with `$HOME/.local` prefix installed public v0.0.8, completed ChatGPT/Codex `--no-open` login, and produced non-fallback model-led triage on Linux arm64 with guarded `collect_triage_evidence` and `actions_taken: []`. `collect_system` and `collect_disks` were ok; `collect_processes` failed because Linux procps rejected BSD-style `ps -axo ... -m`. v0.0.10 switches Linux process collection to `ps -eo ...` and sorts top CPU/memory in-process. v0.0.9 also bumped the advertised/guarded Node requirement to Node 20.18.1+ LTS or Node 22.9.0+ and documented a writable Linux npm prefix.
 
 Current session update: normal `triage` is model-led and does not precollect evidence before the LLM turn. The model must request local facts through the guarded Descartes read-only tool surface. It currently exposes only `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, and `derive_findings`; a runtime guard rejects Pi coding/shell tools if they appear active. `--no-investigate` is available as a temporary degraded no-tool synthesis escape hatch and still uses deterministic precollection. JSON output includes selected model metadata, thinking level, active tools, tool calls/results/errors, assistant stop reason, LLM error, fallback state, evidence, findings, traces, and `actions_taken: []`. Fallback construction is testable and explicitly marked degraded mode.
 
@@ -242,8 +242,9 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 27 Node test cases.
-- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts for v0.0.9.
+- Current checked command: `npm test` passes 30 Node test cases.
+- Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
+- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts for v0.0.10.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
@@ -252,7 +253,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
-- Remaining validation gap: Linux x86_64 behavior. First Ubuntu attempt used Node v18.19.1/npm 9.2.0 and failed with `EACCES` creating `/usr/local/lib/node_modules`, so it did not validate Descartes runtime or collectors. Package/docs now require Node 20.18.1+ LTS or Node 22.9.0+ and the Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
+- Remaining validation gap: Linux x86_64 behavior. Linux arm64 validation with `$HOME/.local` prefix reached runtime, login, and non-fallback model-led triage; process collection failed on v0.0.8 due procps rejecting `ps -axo ... -m`. v0.0.10 changes Linux process collection to `ps -eo ...` and needs rerun validation. Package/docs require Node 20.18.1+ LTS or Node 22.9.0+ and the Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
 - Recommended next implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
