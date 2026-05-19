@@ -6,7 +6,7 @@ Descartes is a local-first operations triage CLI. Today it can answer questions 
 
 ## Where it's going
 
-Descartes is intended to become a stratified machine operations and defense agent: deterministic local tools and rules first, real-time behavior detection, an adaptive decision layer for ambiguity and tradeoffs, LLM-assisted diagnosis and planning when useful, a self-improvement loop that compiles confirmed learnings into cheaper probes/rules/signatures/tests, and eventually policy-gated actions with audit trails. The long-term goal is to recognize novel harmful behavior as it emerges — for example ransomware-like file activity or trojan-like persistence/network behavior — and interrupt it within explicit policy boundaries. It should also support intent-based operations: for example, if a user says “I need a quick Linux environment with npm”, Descartes should discover whether Docker, Colima, Podman, Tart, Lima, UTM, Multipass, Buildkite, or another option is available, recommend a plan, ask for scoped approval, execute only within that approval, verify the result, and clean up. The durable core is expected to move toward Rust, while the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
+Descartes is intended to become a stratified machine operations and defense agent: deterministic local tools and rules first, real-time behavior detection, an adaptive decision layer for ambiguity and tradeoffs, LLM-assisted diagnosis and planning when useful, a self-improvement loop that compiles confirmed learnings into cheaper probes/rules/signatures/tests, and eventually policy-gated actions with audit trails. The long-term goal is to recognize novel harmful behavior as it emerges — for example ransomware-like file activity or trojan-like persistence/network behavior — and interrupt it within explicit policy boundaries. It should also support intent-based operations: for example, if a user says “I need a quick Linux environment with npm”, Descartes should discover whether Docker, Colima, Podman, Tart, Lima, UTM, Multipass, Buildkite, another local option, or an authenticated remote/CI agent is available, recommend a plan, ask for scoped approval, execute or delegate only within that approval, verify the result, and clean up. The durable core is expected to move toward Rust, while the current first external slice is a Node.js/JavaScript CLI so it can ship quickly with the embedded Pi SDK agent harness and subscription login flow.
 
 See `docs/ROADMAP.md` for the capability roadmap and policy-gated action direction.
 
@@ -27,7 +27,7 @@ It is named after the computer running the literal Blood Bank on the Moon in Phi
 
 ## Vision
 
-Descartes should observe a machine, detect meaningful operational and security behavior in real time, notify its user, diagnose problems from evidence, recommend remediations, and eventually act on the user's behalf under explicit guardrails.
+Descartes should observe a machine, detect meaningful operational and security behavior in real time, notify its user, diagnose problems from evidence, recommend remediations, coordinate with other authenticated agents or execution environments when explicitly authorized, and eventually act on the user's behalf under explicit guardrails.
 
 The intended progression is:
 
@@ -134,7 +134,7 @@ descartes plan "create a temporary Linux environment with npm for this test"
 descartes apply plan-123
 ```
 
-Descartes should choose between available local options such as Docker/Colima containers, Tart/Lima/UTM/Multipass VMs, or CI integrations based on the user's goal, explain tradeoffs, request scoped approval, and audit what changed.
+Descartes should choose between available local options such as Docker/Colima containers, Tart/Lima/UTM/Multipass VMs, CI integrations, or authenticated delegated agents based on the user's goal, explain tradeoffs, request scoped approval, and audit what changed. Delegated work needs explicit agent identity, authentication, scoped authority, user validation when required, and end-to-end audit.
 
 ## Evidence Envelopes
 
@@ -167,8 +167,9 @@ Descartes should be safe by construction:
 - local-first evidence collection
 - explicit user opt-in for telemetry or federation
 - no mutating action without a policy decision
-- clear distinction between recommendations, plans, and executed actions
-- audit log for every proposed and executed action
+- no ambient trust between agents or delegated environments
+- clear distinction between recommendations, plans, delegated work, and executed actions
+- audit log for every proposed, delegated, and executed action
 - prefer reversible, narrowly scoped, pre-tested actions
 - compile confirmed learning back into deterministic rules/signatures where possible
 

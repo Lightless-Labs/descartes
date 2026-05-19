@@ -43,7 +43,7 @@ Existing files:
   - `src/login.js` implements a first terminal OAuth/API-key login path storing under Descartes config.
   - `src/triage.js` implements human and JSON triage prompts around the private harness.
   - `test/` covers XDG path resolution, Pi-path guardrails, and deterministic finding thresholds.
-- `docs/ROADMAP.md` — roadmap for capability discovery, process/behavior understanding, temporal sampling, planning, policy-gated action, and learning. Includes the guiding future use case: “I need a quick Linux environment with npm,” where Descartes discovers Docker/Colima/Podman/Tart/Lima/UTM/Multipass/Buildkite options, recommends a plan, asks approval, executes, verifies, and cleans up.
+- `docs/ROADMAP.md` — roadmap for capability discovery, process/behavior understanding, temporal sampling, planning, inter-agent delegation/identity, policy-gated action, and learning. Includes the guiding future use case: “I need a quick Linux environment with npm,” where Descartes discovers Docker/Colima/Podman/Tart/Lima/UTM/Multipass/Buildkite/authenticated delegated-agent options, recommends a plan, asks approval, executes or delegates within scoped authority, verifies, and cleans up.
 - `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
   - `2026-05-19-first-external-slice-validation.md` — **immediate next task, in progress**: validate install/login/triage/docs/platform readiness against the first external slice plan.
@@ -53,6 +53,7 @@ Existing files:
   - `2026-05-19-temporal-sampling-investigation-tools.md` — bounded LLM-requested monitoring/sampling over time with aggregates/artifacts.
   - `2026-05-19-macos-disk-evidence-classification.md` — classify macOS pseudo/runtime filesystems, reduce disk finding noise, and plan redacted export for process args.
   - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
+  - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
   - `2026-05-19-no-evidence-no-diagnosis-guard.md` — future hardening for model-led triage: retry or degrade if normal investigation returns without tool calls/evidence.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
   - `2026-05-19-federated-process-knowledge-db.md` — future shared/federated process behavior knowledge database.
@@ -218,7 +219,7 @@ Recommended next task: implement process identity and lineage tools. See:
 
 Start with a shared redacted/bounded process argument representation, then add `inspect_process` and `inspect_parent_tree` as read-only Descartes tools exposed through the guarded triage surface. This is the best low-hanging step from snapshot resource triage toward behavior-aware operations/defense investigation.
 
-The future capability-discovery/action direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
+The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
 ## Tests / Checks To Prioritize
 

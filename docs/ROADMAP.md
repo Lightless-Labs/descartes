@@ -4,7 +4,7 @@
 
 ## Direction
 
-Descartes starts as a read-only local triage CLI, but the long-term product is a local-first machine operations and defense agent. It should discover local capabilities, observe behavior, diagnose from evidence, recommend plans, and eventually act only through explicit policy/authority gates.
+Descartes starts as a read-only local triage CLI, but the long-term product is a local-first machine operations and defense agent. It should discover local capabilities, observe behavior, diagnose from evidence, recommend plans, coordinate with other authorized agents or execution environments when useful, and eventually act only through explicit policy/authority gates.
 
 The core progression remains:
 
@@ -20,7 +20,7 @@ A representative future user request:
 I need a quick Linux environment to test a thing. It needs npm.
 ```
 
-The user should not need to know or specify whether the machine has Docker, Colima, Podman, Tart, Lima, UTM, Multipass, Buildkite, or another option. Descartes should discover local capabilities, compare viable strategies, recommend the safest fit, ask for approval on a concrete plan, execute only within that approval, verify the result, and clean up.
+The user should not need to know or specify whether the machine has Docker, Colima, Podman, Tart, Lima, UTM, Multipass, Buildkite, another local option, or a trusted remote/CI agent. Descartes should discover local and delegated capabilities, compare viable strategies, recommend the safest fit, ask for approval on a concrete plan, execute only within that approval, verify the result, and clean up.
 
 A mature interaction might look like:
 
@@ -34,7 +34,7 @@ Descartes found three viable options:
    Installed. Better isolation and a real VM boundary. Slower and uses more disk.
 
 3. Buildkite validation job
-   Available if CI credentials are configured. Best for repeatable release checks.
+   Available if CI credentials are configured. Best for repeatable release checks. Requires delegated authority scoped to this validation job.
 
 Recommended: Docker/Colima unless you need a full VM.
 
@@ -50,7 +50,7 @@ This may download ~X MB. No host files will be mounted. No persistent changes ex
 Approve?
 ```
 
-If the user says they need a real VM, Descartes replans around Tart/Lima/UTM/Multipass if available. If nothing suitable exists, it recommends an install option and explains tradeoffs before asking for approval.
+If the user says they need a real VM, Descartes replans around Tart/Lima/UTM/Multipass if available. If local options are unsuitable but an authenticated CI/remote agent is available, Descartes can propose delegation. If nothing suitable exists, it recommends an install option and explains tradeoffs before asking for approval.
 
 ## Required Capability Layers
 
@@ -127,7 +127,30 @@ No mutating action without explicit authorization. Approval must be scoped to a 
 - post-state
 - rollback/cleanup notes
 
-### 6. Action Tools
+### 6. Inter-Agent Delegation / Identity
+
+Descartes should eventually coordinate with other agents or execution environments, but never through ambient trust. Delegation needs explicit identity, authentication, capability scoping, policy checks, user validation, and end-to-end audit.
+
+Examples:
+
+- local Descartes delegates Linux validation to a Buildkite agent
+- laptop Descartes asks a server-side Descartes instance to inspect that server locally
+- a policy-approved remediation plan delegates one step to a temporary VM/container agent
+- agents exchange evidence envelopes, plan fragments, approval records, and execution results
+
+Required properties:
+
+- every agent has an explicit identity
+- every delegated request is authenticated
+- delegated authority is scoped to a specific capability, target, expiry, and approval
+- the receiving agent verifies caller identity, requested action, policy, and approval scope
+- the initiating agent records why delegation was selected and what authority was granted
+- delegated agents return structured evidence/results, not unverifiable prose
+- user approval can be required before cross-agent delegation, sensitive evidence transfer, or mutation
+
+A first design spike is tracked in `todos/2026-05-19-agent-delegation-identity-authority.md`.
+
+### 7. Action Tools
 
 Mutating tools should be narrow and policy-gated. Avoid exposing arbitrary shell as the default action surface. For the environment provisioning use case, future action tools might include:
 
@@ -138,7 +161,7 @@ Mutating tools should be narrow and policy-gated. Avoid exposing arbitrary shell
 - install package through approved package manager
 - run approved command inside an approved disposable environment
 
-### 7. Learning
+### 8. Learning
 
 Confirmed successful plans should compile downward into cheaper, auditable assets:
 
@@ -184,14 +207,16 @@ Add read-only discovery of package managers, container runtimes, VM runtimes, an
 
 ### Later — Policy-gated action planning
 
-Introduce explicit plan objects, approval scopes, audit trails, and narrow mutating action tools. This is where Descartes can safely move from recommendation to action.
+Introduce explicit plan objects, approval scopes, audit trails, inter-agent delegation envelopes, and narrow mutating action tools. This is where Descartes can safely move from recommendation to action.
 
 ## Non-Negotiables
 
 - read-only by default
 - no arbitrary host mutation without policy approval
 - no silent privilege escalation
+- no ambient trust between agents
 - evidence before reasoning
 - model may adaptively decide what to inspect, but local facts come from tools
 - every mutating action must be auditable and scoped
+- every delegated action must be authenticated, authorized, scoped, and auditable
 - prefer compiling repeated successful behavior into deterministic tools/rules/playbooks
