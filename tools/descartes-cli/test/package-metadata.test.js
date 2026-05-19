@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -32,4 +34,16 @@ test("CLI version and help are generated from current metadata/options", () => {
   assert.match(help, /--model <MODEL>/);
   assert.match(help, /--thinking <LEVEL>/);
   assert.match(help, /--no-investigate/);
+});
+
+test("CLI entrypoint works when launched through an npm-style symlink", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "descartes-bin-"));
+  const link = path.join(tmp, "descartes");
+  fs.symlinkSync(cliPath, link);
+  try {
+    const version = execFileSync(process.execPath, [link, "--version"], { encoding: "utf8" }).trim();
+    assert.equal(version, rootPackage.version);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

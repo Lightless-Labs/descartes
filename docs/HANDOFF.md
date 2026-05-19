@@ -244,7 +244,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - This directory is now a git repository; `git status --short` works.
 - Current checked command: `npm test` passes 30 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts for v0.0.10.
+- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files and excludes tests/local artifacts for v0.0.11.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
@@ -253,7 +253,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: `node tools/descartes-cli/src/index.js --help` works without importing Pi dependencies and documents `--model`, `--thinking`, and `--no-investigate`.
 - Current checked command: direct `collectAllEvidence()` invocation returns three ok evidence envelopes on the local macOS host.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
-- Remaining validation gap: Linux x86_64 behavior. Linux arm64 validation with `$HOME/.local` prefix reached runtime, login, and non-fallback model-led triage; process collection failed on v0.0.8 due procps rejecting `ps -axo ... -m`. v0.0.10 changes Linux process collection to `ps -eo ...` and needs rerun validation. Package/docs require Node 20.18.1+ LTS or Node 22.9.0+ and the Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
+- Remaining validation gap: Linux x86_64 behavior. Linux arm64 validation with `$HOME/.local` prefix reached runtime, login, and non-fallback model-led triage; process collection failed on v0.0.8 due procps rejecting `ps -axo ... -m`. v0.0.10 changed Linux process collection to `ps -eo ...`; v0.0.11 fixes npm-bin symlink entrypoint detection after GitHub-installed commands printed no output when launched through `$HOME/.local/bin/descartes`. Package/docs require Node 20.18.1+ LTS or Node 22.9.0+ and the Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
 - Recommended next implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.

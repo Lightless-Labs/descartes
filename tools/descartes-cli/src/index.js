@@ -96,8 +96,18 @@ async function main(argv) {
   throw new Error(`Unknown command: ${command}\n\n${usage()}`);
 }
 
-const entrypoint = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
-if (entrypoint === fileURLToPath(import.meta.url)) {
+function realpathIfPresent(candidate) {
+  if (!candidate) return undefined;
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+const entrypoint = realpathIfPresent(process.argv[1]);
+const modulePath = realpathIfPresent(fileURLToPath(import.meta.url));
+if (entrypoint === modulePath) {
   main(process.argv.slice(2)).catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
