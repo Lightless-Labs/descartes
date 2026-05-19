@@ -87,8 +87,18 @@ Preferred flow:
 3. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
-export function jsonTriagePrompt(userPrompt) {
-  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}
+function evidenceContext(evidenceBundle) {
+  if (!evidenceBundle) return "";
+  return `
+
+Initial read-only Descartes evidence bundle, already collected for this explicit triage request:
+${JSON.stringify(evidenceBundle, null, 2)}
+
+Use the evidence above even if you do not call any tools. You may call tools only if you need refreshed or additional first-slice evidence.`;
+}
+
+export function jsonTriagePrompt(userPrompt, evidenceBundle) {
+  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}${evidenceContext(evidenceBundle)}
 
 Return only valid JSON with this shape:
 {
@@ -102,8 +112,8 @@ Return only valid JSON with this shape:
 }`;
 }
 
-export function humanTriagePrompt(userPrompt) {
-  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}
+export function humanTriagePrompt(userPrompt, evidenceBundle) {
+  return `Triage this local machine complaint: ${JSON.stringify(userPrompt)}${evidenceContext(evidenceBundle)}
 
 Print a concise report with these headings:
 Descartes triage: <complaint>

@@ -10,6 +10,8 @@ Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Ga
 
 Field report update: GitHub-installed triage on a real work laptop returned an empty diagnosis after login. `tools/descartes-cli/src/triage.js` now reads final assistant text from `session.messages` after `session.prompt()` instead of relying only on streaming `text_delta` events, and emits a deterministic fallback report if the model still returns no final text.
 
+Second field report update: v0.0.1 still produced fallback with empty `evidence`, `findings`, and `tool_traces`, meaning the LLM session did not call any Descartes evidence tools. v0.0.2 precollects the first-slice read-only evidence bundle before invoking the model, injects that evidence into the prompt, and includes precollected evidence/traces in JSON output even when the model makes no tool calls.
+
 Existing files:
 
 - `README.md` — updated to describe the LLM-backed local triage first slice and Pi/XDG boundaries.

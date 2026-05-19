@@ -1,4 +1,5 @@
 import { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } from "./pi-harness.js";
+import { collectAllEvidence } from "./tools/collect.js";
 
 function parseTriageArgs(args) {
   const options = { json: false };
@@ -16,9 +17,9 @@ function parseTriageArgs(args) {
   return { ...options, prompt };
 }
 
-function flattenEvidence(toolResults) {
-  const evidenceById = new Map();
-  const findingsById = new Map();
+function flattenEvidence(toolResults, precollected) {
+  const evidenceById = new Map((precollected?.evidence ?? []).map((item) => [item.id, item]));
+  const findingsById = new Map((precollected?.findings ?? []).map((item) => [item.id, item]));
   for (const entry of toolResults) {
     const details = entry.result?.details;
     if (!details) continue;
@@ -96,7 +97,9 @@ function fallbackDiagnosis(prompt, evidence, findings) {
     explanation: substantiveFindings.length > 0
       ? "Fallback deterministic summary generated because the LLM-backed session produced no final text. Review findings and evidence directly."
       : "Fallback deterministic summary generated because the LLM-backed session produced no final text and no obvious first-slice resource-pressure threshold was crossed.",
-    evidence_refs: [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))],
+    evidence_refs: [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))].filter(Boolean).length > 0
+      ? [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))].filter(Boolean)
+      : evidence.map((item) => item.id),
     next_checks: [
       "Re-run the command with --json and inspect evidence/tool traces.",
       "Check the top CPU and memory process lists for expected workload.",
@@ -137,6 +140,7 @@ export async function runTriage(paths, args) {
   const options = parseTriageArgs(args);
   const events = [];
   const toolResults = [];
+  const precollected = await collectAllEvidence();
   const { session } = await createPrivateTriageSession(paths, {
     thinkingLevel: options.thinkingLevel,
   });
@@ -150,7 +154,7 @@ export async function runTriage(paths, args) {
 
   let finalMessages = [];
   try {
-    await session.prompt(options.json ? jsonTriagePrompt(options.prompt) : humanTriagePrompt(options.prompt));
+    await session.prompt(options.json ? jsonTriagePrompt(options.prompt, precollected) : humanTriagePrompt(options.prompt, precollected));
     finalMessages = [...session.messages];
   } finally {
     unsubscribe();
@@ -158,7 +162,7 @@ export async function runTriage(paths, args) {
   }
 
   const assistantText = lastAssistantTextFromMessages(finalMessages) || lastAssistantTextFromEvents(events);
-  const { evidence, findings } = flattenEvidence(toolResults);
+  const { evidence, findings } = flattenEvidence(toolResults, precollected);
   const fallback = assistantText ? undefined : fallbackDiagnosis(options.prompt, evidence, findings);
 
   if (!options.json) {
@@ -174,12 +178,20 @@ export async function runTriage(paths, args) {
     diagnosis,
     evidence,
     findings,
-    tool_traces: toolResults.map((item) => ({
-      tool_name: item.toolName,
-      tool_call_id: item.toolCallId,
-      is_error: item.isError,
-      trace: item.result?.details?.trace,
-    })),
+    tool_traces: [
+      ...precollected.evidence.map((item) => ({
+        tool_name: item.trace?.tool,
+        tool_call_id: "precollected",
+        is_error: item.status === "unable",
+        trace: item.trace,
+      })),
+      ...toolResults.map((item) => ({
+        tool_name: item.toolName,
+        tool_call_id: item.toolCallId,
+        is_error: item.isError,
+        trace: item.result?.details?.trace,
+      })),
+    ],
     actions_taken: [],
   }, null, 2));
   process.stdout.write("\n");
