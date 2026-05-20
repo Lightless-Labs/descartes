@@ -34,36 +34,33 @@ Already implemented:
 - `read_sampling_artifact`
 - `collect_network_basics`
 - `collect_services`
+- `collect_recent_logs`
 - `collect_triage_evidence`
 - `derive_findings`
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, and service manager basics are complete. The next collector-oriented priorities are logs, containers, VMs, and scheduled jobs.
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, and bounded recent logs are complete. The next collector-oriented priorities are containers, VMs, and scheduled jobs.
 
 ## Candidate Next Tools
 
 Prioritize tools that answer common first-triage questions without privileged mutation:
 
-1. `collect_recent_logs`
-   - strict bounded recent error/warning excerpts
-   - explicit privacy notes
-   - platform-specific backends (`log`, journal, syslog)
-2. `collect_containers`
+1. `collect_containers`
    - Docker / Colima / Lima / Podman where available
    - read-only container/resource summary
-3. `collect_vms`
+2. `collect_vms`
    - parity-oriented normalized VM inventory across macOS and Linux
    - macOS: Tart / Lima VMs / UTM / Multipass / VMware / VirtualBox / Parallels where available
    - Linux: libvirt/KVM/QEMU, direct QEMU processes, VirtualBox, VMware, Multipass, Lima, Incus/LXD VMs, Podman machine, Proxmox `qm`, Xen where available
    - read-only VM inventory, state, resource summary, and owning runtime/source
    - distinguish VM runtime discovery from active VM inventory; do not start/stop/create/delete anything
    - dedicated plan: `todos/2026-05-19-vm-inventory-collector.md`
-4. `collect_scheduled_jobs`
+3. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
-5. `collect_certificates`
+4. `collect_certificates`
    - expiring certs in common local stores/paths, later
-6. `collect_time_sync`
+5. `collect_time_sync`
    - clock skew/time sync state
 
 ## Requirements

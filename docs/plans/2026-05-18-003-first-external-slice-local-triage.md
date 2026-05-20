@@ -20,6 +20,7 @@
 **Addendum:** 2026-05-19 — temporal sampling tools were added and package metadata was bumped to v0.0.16: guarded triage can call bounded `sample_dimension` for CPU processes, memory processes, or load/memory/swap, optionally writing Descartes-owned sampling artifacts readable only through `read_sampling_artifact`.
 **Addendum:** 2026-05-20 — network basics were added and package metadata was bumped to v0.0.17: guarded triage can call `collect_network_basics` for read-only interface, default route, DNS resolver/reachability, and listening socket evidence. README was shortened/reorganized with quick start before longer product direction.
 **Addendum:** 2026-05-20 — service manager basics were added and package metadata was bumped to v0.0.18: guarded triage can call `collect_services` for read-only launchd/systemd service state, including failed/restarting/nonzero-exit summaries.
+**Addendum:** 2026-05-20 — bounded recent logs were added and package metadata was bumped to v0.0.19: guarded triage can call `collect_recent_logs` for warning/error excerpts plus fail2ban/firewall-oriented signals where available, using fixed read-only commands and explicit bounds/redaction.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -289,7 +290,7 @@ The README should become the product surface for v0 and include:
 | top processes | yes | yes |
 | process command lines | yes | yes |
 | service manager basics | yes/launchd | yes/systemd |
-| recent system logs | later | later/journalctl |
+| recent system logs | yes/unified log | yes/journalctl + fixed log files |
 | Docker/container diagnosis | later | later |
 
 The first release can mention Docker only if process evidence shows Docker as a top resource consumer. It should not require Docker API integration.
@@ -306,10 +307,10 @@ Local terminal output may include operationally useful machine identifiers and l
 - process command lines
 - network interfaces, default routes, DNS resolver/reachability, and listening sockets
 - service manager basics for launchd/systemd
+- bounded local log excerpts, including fail2ban/firewall signals where available
 - mount points and paths
 - listening process names if later added
 - service names
-- local log excerpts if later added
 
 The privacy boundary is not "do not show the local user their own machine." The privacy boundary is:
 

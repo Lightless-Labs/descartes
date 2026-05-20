@@ -9,6 +9,7 @@ test("triage investigation active tools are exactly Descartes read-only evidence
     "collect_disks",
     "collect_network_basics",
     "collect_services",
+    "collect_recent_logs",
     "inspect_process",
     "inspect_parent_tree",
     "sample_dimension",

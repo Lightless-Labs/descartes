@@ -9,6 +9,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { collectDiskEvidence } from "./tools/disks.js";
+import { collectRecentLogsEvidence } from "./tools/logs.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEvidence } from "./tools/processes.js";
 import { collectServiceEvidence } from "./tools/services.js";
@@ -73,6 +74,22 @@ export function createEvidenceTools(paths) {
       parameters: Type.Object({ service_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })) }),
       executionMode: "parallel",
       execute: async (_id, params) => jsonToolResult(await collectServiceEvidence({ serviceLimit: params.service_limit ?? 80 })),
+    }),
+    defineTool({
+      name: "collect_recent_logs",
+      label: "Collect recent logs",
+      description: "Collect bounded read-only recent warning/error logs plus fail2ban/firewall-oriented signals where available. Log excerpts are sensitive diagnostic artifacts.",
+      parameters: Type.Object({
+        window_minutes: Type.Optional(Type.Number({ minimum: 1, maximum: 360 })),
+        event_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+        include_security: Type.Optional(Type.Boolean()),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectRecentLogsEvidence({
+        windowMinutes: params.window_minutes ?? 30,
+        eventLimit: params.event_limit ?? 80,
+        includeSecurity: params.include_security ?? true,
+      })),
     }),
     defineTool({
       name: "inspect_process",
@@ -154,8 +171,9 @@ Preferred flow:
 3. If a process looks important, call inspect_process and/or inspect_parent_tree for process identity and lineage before making claims about provenance.
 4. If the complaint involves connectivity, DNS, listening ports, or network reachability, call collect_network_basics rather than guessing.
 5. If the complaint involves a daemon, service, startup item, or repeated restart/failure, call collect_services rather than guessing.
-6. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
-7. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+6. If the complaint involves crashes, reboots, authentication failures, fail2ban, firewall blocks, denied traffic, or recent error context, call collect_recent_logs with tight bounds rather than guessing. Treat log excerpts as sensitive.
+7. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+8. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {

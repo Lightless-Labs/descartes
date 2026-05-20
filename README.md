@@ -67,6 +67,7 @@ Current collectors include:
 - bounded temporal sampling for CPU, memory, load, and swap
 - network basics: interfaces, default route, DNS resolver/reachability, and listening sockets
 - service manager basics: launchd jobs on macOS and systemd services on Linux
+- bounded recent logs: warnings/errors plus fail2ban/firewall-oriented signals where available
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
 
@@ -117,7 +118,7 @@ Descartes may use Pi internally as a private harness, but it does not require, r
 - Best effort: macOS Intel, Linux ARM64
 - Not supported initially: Windows, BSD, Android/Termux, remote hosts, and container-only introspection
 
-MVP limitations: no daemon, no background monitoring, no remote hosts, no log/container-specific collectors yet, limited service-manager coverage, no redacted export mode yet, and no mutating actions.
+MVP limitations: no daemon, no background monitoring, no remote hosts, no container-specific collectors yet, limited service-manager/log coverage, no redacted export mode yet, and no mutating actions.
 
 ## Descartes-owned paths
 
