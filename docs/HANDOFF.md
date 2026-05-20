@@ -26,7 +26,9 @@ Recent logs update: package metadata is bumped to v0.0.19. Guarded triage now ex
 
 Container basics update: package metadata is bumped to v0.0.20. Guarded triage now exposes `collect_containers` for bounded read-only Docker, Podman, Colima, and Lima evidence. Docker/Podman probes collect version, container inventory, and best-effort no-stream stats; Colima/Lima probes collect container-host context. Missing commands, stopped daemons, and permission-limited sockets are represented per-runtime instead of failing the whole envelope. No container mutating commands are exposed.
 
-VM basics update: package metadata is bumped to v0.0.21. A field report showed `descartes triage "do I have any containers or VMs running?"` correctly used container/process evidence but could not see that Tart was installed. Guarded triage now exposes `collect_vms` for bounded read-only Tart, Lima, Multipass, VirtualBox, and libvirt/virsh evidence. Tart uses fixed `tart --version` and `tart list --format json`, so installed-but-empty Tart should be reported as an available VM runtime with zero VMs instead of being omitted.
+VM basics update: package metadata was bumped to v0.0.21 after a field report showed `descartes triage "do I have any containers or VMs running?"` correctly used container/process evidence but could not see that Tart was installed. Guarded triage exposed `collect_vms` for bounded read-only Tart, Lima, Multipass, VirtualBox, and libvirt/virsh evidence. Tart uses fixed `tart --version` and `tart list --format json`, so installed-but-empty Tart should be reported as an available VM runtime with zero VMs instead of being omitted.
+
+VM parity update: package metadata is bumped to v0.0.22. `collect_vms` now also probes Parallels (`prlctl list --all --json`), VMware (`vmrun list`), UTM app fixed paths, Podman machine, Incus/LXD VM instances, Proxmox `qm`, Xen `xl`, and direct VM-like processes (`qemu-system-*`, `vmware-vmx`, UTM) via bounded/redacted `ps` snapshots. Duplicate runtime evidence is merged so a process-backed runtime can override a missing CLI/app probe.
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
@@ -85,7 +87,7 @@ Existing files:
 2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
 3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: expand into scheduled jobs/certificates/time sync from `todos/2026-05-19-expand-local-investigation-tools.md`, deepen VM parity (UTM/VMware/Parallels/QEMU correlation), or close the Linux x86_64 validation gap.
+5. Recommended next task: expand into scheduled jobs/certificates/time sync from `todos/2026-05-19-expand-local-investigation-tools.md`, improve VM deduplication/resource correlation, or close the Linux x86_64 validation gap.
 
 ## Current First Slice
 
@@ -226,7 +228,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: choose the next local read-only collector from `todos/2026-05-19-expand-local-investigation-tools.md`; likely high-value options are scheduled jobs, certificates, or time sync. Alternatively deepen VM parity with UTM/VMware/Parallels/direct QEMU correlation. VM inventory has a dedicated todo: `todos/2026-05-19-vm-inventory-collector.md`, covering macOS runtimes (`Tart`/`Lima`/`UTM`/`Multipass`/`VMware`/`VirtualBox`/`Parallels`) and Linux runtimes (`libvirt`/`KVM`/`QEMU`, direct QEMU processes, VirtualBox, VMware, Multipass, Lima, Incus/LXD VMs, Podman machine, Proxmox `qm`, Xen).
+Recommended next task: choose the next local read-only collector from `todos/2026-05-19-expand-local-investigation-tools.md`; likely high-value options are scheduled jobs, certificates, or time sync. Alternatively improve VM deduplication/resource correlation or close the Linux x86_64 validation gap.
 
 The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
@@ -249,9 +251,9 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 86 Node test cases.
+- Current checked command: `npm test` passes 92 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, and `tools/vms.js`) and excludes tests/local artifacts for v0.0.21.
+- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, and `tools/vms.js`) and excludes tests/local artifacts for v0.0.22.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
@@ -266,10 +268,10 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: direct `collectServiceEvidence({ serviceLimit: 5 })` returns a `services` launchd envelope on local macOS with bounded service output and nonzero-exit summaries.
 - Current checked command: direct `collectRecentLogsEvidence({ windowMinutes: 1, eventLimit: 3, includeSecurity: true })` returns an ok `recent-logs` envelope on local macOS with bounded unified-log excerpts; partial `log show` output is accepted as bounded input when macOS emits more than the collector buffer.
 - Current checked command: direct `collectContainerEvidence({ containerLimit: 5, hostLimit: 5, collectStats: false })` returns a `containers` envelope on local macOS with per-runtime missing/daemon-unavailable state when Docker/Podman/Colima/Lima CLIs are unavailable.
-- Current checked command: direct `collectVmEvidence({ vmLimit: 5 })` returns a `vms` envelope on local macOS with per-runtime missing state on the local host; Tart parser tests cover installed/listable runtimes so the user-reported Tart install should now surface through `collect_vms`.
+- Current checked command: direct `collectVmEvidence({ vmLimit: 5 })` returns an ok `vms` envelope on local macOS with 13 deduplicated runtime entries and two running UTM process-backed VM hints; runtimes with missing CLIs/apps remain represented individually.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: true Linux x86_64 behavior/CI. Linux arm64 validation with `$HOME/.local` prefix passes on public v0.0.11: install, symlinked `descartes --version`/`--help`, ChatGPT/Codex `--no-open` login, model-led guarded triage, `fallback_used: false`, `collect_triage_evidence`, `actions_taken: []`, and ok system/process/disk envelopes. v0.0.12 updates the harness dependency to `@earendil-works/pi-coding-agent` 0.75.3 and now requires Node.js 22.19.0+; rerun Linux validation after push. Process args are now redacted/bounded by default, so rerun validation should confirm that behavior on Linux too. The Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
-- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, and VM basics. Recommended next implementation is scheduled jobs, deeper VM parity, or Linux x86_64 validation.
+- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, and VM basics/parity. Recommended next implementation is scheduled jobs, certificates/time sync, VM deduplication/resource correlation, or Linux x86_64 validation.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

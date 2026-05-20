@@ -13,7 +13,8 @@ related:
 
 # TODO: VM Inventory Collector
 
-**Completed:** 2026-05-20 — implemented first VM inventory slice as `collect_vms` for Tart, Lima, Multipass, VirtualBox, and libvirt/virsh with bounded read-only probes and parser tests. Future expansion can add UTM, VMware, Parallels, direct QEMU process correlation, Incus/LXD VM mode, Podman machine, Proxmox, and Xen.
+**Completed:** 2026-05-20 — implemented first VM inventory slice as `collect_vms` for Tart, Lima, Multipass, VirtualBox, and libvirt/virsh with bounded read-only probes and parser tests.  
+**Enhanced:** 2026-05-20 — expanded VM parity to Parallels, VMware, UTM app/process detection, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, and direct QEMU/VMware/UTM process hints. Future expansion can add richer UTM inventory, richer VMware/Parallels details, Firecracker, Cloud Hypervisor, Kata Containers, and better deduplication/correlation.
 
 ## Summary
 

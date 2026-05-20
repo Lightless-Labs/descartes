@@ -1,6 +1,9 @@
 import { execFile } from "node:child_process";
+import { access } from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { redactAndBoundProcessArgs } from "./processes.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_VM_LIMIT = 80;
@@ -221,6 +224,189 @@ export function parseVirshList(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
   return vms.slice(0, limit);
 }
 
+export function parseParallelsListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  return parseJsonMaybeArray(stdout).map((item) => ({
+    runtime: "parallels",
+    id: boundedString(firstDefined(item.ID, item.id, item.uuid, item.UUID)),
+    name: boundedString(firstDefined(item.Name, item.name)),
+    state: normalizeVmState(firstDefined(item.State, item.Status, item.state, item.status)),
+    backend: "parallels",
+    cpus: asNumber(firstDefined(item.CPUs, item.cpus, item.cpu_count)),
+    memory_bytes: parseByteQuantity(firstDefined(item.Memory, item.memory, item.memory_size)),
+    disk_bytes: parseByteQuantity(firstDefined(item.Disk, item.disk, item.hdd_size)),
+    ips: normalizeIps(firstDefined(item.IP_ADDR, item.ips, item.ipv4)),
+    owner_hint: boundedString(firstDefined(item.Home, item.Path, item.path, item.home), 400),
+    source_runtime: "parallels",
+    confidence: 1,
+  })).filter((vm) => vm.name || vm.id).slice(0, limit);
+}
+
+export function parseVmrunList(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  return String(stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean)
+    .filter((line) => !/^Total running VMs:/i.test(line))
+    .map((vmPath) => ({
+      runtime: "vmware",
+      id: vmPath,
+      name: path.basename(vmPath, path.extname(vmPath)) || vmPath,
+      state: "running",
+      backend: "vmware",
+      owner_hint: vmPath,
+      source_runtime: "vmware",
+      confidence: 1,
+    })).slice(0, limit);
+}
+
+export function parsePodmanMachineListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  return parseJsonMaybeArray(stdout).map((item) => ({
+    runtime: "podman_machine",
+    id: boundedString(firstDefined(item.Name, item.name)),
+    name: boundedString(firstDefined(item.Name, item.name)),
+    state: normalizeVmState(item.Running === true || item.running === true ? "running" : firstDefined(item.State, item.Status, item.state, item.status, "stopped")),
+    backend: boundedString(firstDefined(item.VMType, item.vmType, item.VmType, "unknown")),
+    cpus: asNumber(firstDefined(item.CPUs, item.Cpus, item.cpus)),
+    memory_bytes: parseByteQuantity(firstDefined(item.Memory, item.memory)),
+    disk_bytes: parseByteQuantity(firstDefined(item.DiskSize, item.diskSize, item.disk_size)),
+    ips: normalizeIps(firstDefined(item.IPAddress, item.ipAddress, item.ips)),
+    owner_hint: boundedString(firstDefined(item.LastUp, item.Created, item.Path, item.path)),
+    source_runtime: "podman_machine",
+    confidence: 1,
+  })).filter((vm) => vm.name || vm.id).slice(0, limit);
+}
+
+function instanceIps(item) {
+  const addresses = [];
+  for (const network of Object.values(item.state?.network ?? item.network ?? {})) {
+    for (const address of network.addresses ?? []) {
+      if (address.address) addresses.push(address.address);
+    }
+  }
+  return addresses.slice(0, 8);
+}
+
+export function parseIncusOrLxcListJson(stdout, { runtime = "incus", limit = DEFAULT_VM_LIMIT } = {}) {
+  return parseJsonMaybeArray(stdout).filter((item) => (item.type ?? item.Type) === "virtual-machine").map((item) => ({
+    runtime,
+    id: boundedString(firstDefined(item.name, item.Name)),
+    name: boundedString(firstDefined(item.name, item.Name)),
+    state: normalizeVmState(firstDefined(item.status, item.Status, item.stateful ? "suspended" : undefined)),
+    backend: "qemu",
+    cpus: asNumber(firstDefined(item.config?.["limits.cpu"], item.expanded_config?.["limits.cpu"])),
+    memory_bytes: parseByteQuantity(firstDefined(item.config?.["limits.memory"], item.expanded_config?.["limits.memory"])),
+    disk_bytes: parseByteQuantity(firstDefined(item.devices?.root?.size, item.expanded_devices?.root?.size)),
+    ips: instanceIps(item),
+    owner_hint: boundedString(firstDefined(item.location, item.project, item.description)),
+    source_runtime: runtime,
+    confidence: 1,
+  })).filter((vm) => vm.name || vm.id).slice(0, limit);
+}
+
+export function parseQmList(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  const vms = [];
+  for (const rawLine of String(stdout ?? "").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || /^VMID\s+NAME\s+STATUS/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 3 || !/^\d+$/.test(parts[0])) continue;
+    const [vmid, name, status, memoryMb, diskGb, pid] = parts;
+    vms.push({
+      runtime: "proxmox",
+      id: vmid,
+      name,
+      state: normalizeVmState(status),
+      backend: "kvm_qemu",
+      memory_bytes: parseByteQuantity(memoryMb ? `${memoryMb}MiB` : undefined),
+      disk_bytes: parseByteQuantity(diskGb ? `${diskGb}GiB` : undefined),
+      resource_snapshot: pid && pid !== "0" ? { pid: Number(pid) } : undefined,
+      source_runtime: "proxmox",
+      confidence: 1,
+    });
+  }
+  return vms.slice(0, limit);
+}
+
+export function parseXlList(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  const vms = [];
+  for (const rawLine of String(stdout ?? "").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || /^Name\s+ID\s+Mem/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 5) continue;
+    const [name, id, memMb, vcpus, state] = parts;
+    vms.push({
+      runtime: "xen",
+      id: id === "-" ? undefined : id,
+      name,
+      state: state.includes("r") ? "running" : state.includes("p") ? "paused" : state.includes("s") ? "stopped" : "unknown",
+      backend: "xen",
+      cpus: asNumber(vcpus),
+      memory_bytes: parseByteQuantity(`${memMb}MiB`),
+      source_runtime: "xen",
+      confidence: 1,
+    });
+  }
+  return vms.slice(0, limit);
+}
+
+function psArgsForPlatform(platform = process.platform) {
+  return platform === "linux" ? ["-eo", "pid,ppid,pcpu,pmem,rss,comm,args"] : ["-axo", "pid,ppid,pcpu,pmem,rss,comm,args"];
+}
+
+function argValue(args, flag) {
+  const parts = String(args ?? "").match(/\S+/g) ?? [];
+  const index = parts.indexOf(flag);
+  return index >= 0 ? parts[index + 1] : undefined;
+}
+
+function vmNameFromPathArg(args) {
+  const match = String(args ?? "").match(/([^\s]+\.(?:vmx|utm|qcow2|img|raw|iso))/i);
+  return match ? path.basename(match[1], path.extname(match[1])) : undefined;
+}
+
+function processRuntime(command, args) {
+  const haystack = `${command ?? ""} ${args ?? ""}`.toLowerCase();
+  if (haystack.includes("qemu-system")) return "qemu";
+  if (haystack.includes("vmware-vmx")) return "vmware";
+  if (haystack.includes("utm")) return "utm";
+  return undefined;
+}
+
+export function parseVmProcesses(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  const vms = [];
+  for (const line of String(stdout ?? "").trim().split("\n").slice(1)) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s*(.*)$/);
+    if (!match) continue;
+    const command = match[6];
+    const args = match[7] || command;
+    const runtime = processRuntime(command, args);
+    if (!runtime) continue;
+    const redacted = redactAndBoundProcessArgs(args, { maxLength: 300 });
+    const pid = Number(match[1]);
+    vms.push({
+      runtime,
+      id: String(pid),
+      name: boundedString(argValue(args, "-name") ?? vmNameFromPathArg(args) ?? `${runtime}-process-${pid}`),
+      state: "running",
+      backend: runtime === "qemu" ? "qemu" : runtime,
+      owner_hint: redacted.value,
+      owner_hint_redaction: {
+        redacted: redacted.redacted,
+        truncated: redacted.truncated,
+        original_length: redacted.original_length,
+        max_length: redacted.max_length,
+      },
+      resource_snapshot: {
+        pid,
+        cpu_percent: Number(match[3]),
+        memory_percent: Number(match[4]),
+        rss_bytes: Number(match[5]) * 1024,
+      },
+      source_runtime: runtime,
+      confidence: 0.4,
+    });
+  }
+  return vms.slice(0, limit);
+}
+
 export function classifyCommandFailure(commandResult) {
   if (commandResult.status === "ok") return "ok";
   const combined = `${commandResult.error ?? ""}\n${commandResult.stderr ?? ""}`.toLowerCase();
@@ -255,10 +441,53 @@ function probeMetadata(name, result, parser, count = 0) {
     status: result.status,
     parser,
     command: result.command,
+    source: result.source,
     result_count: count,
     support_status: classifyCommandFailure(result),
     error: result.error,
     stderr: result.stderr,
+  };
+}
+
+async function pathExistsProbe(paths) {
+  for (const candidate of paths.filter(Boolean)) {
+    try {
+      await access(candidate);
+      return { status: "ok", source: { path: candidate, read_only: true } };
+    } catch {
+      // Try the next fixed candidate path.
+    }
+  }
+  return { status: "unable", code: "ENOENT", error: `none of the fixed paths exist: ${paths.filter(Boolean).join(", ")}`, source: { paths: paths.filter(Boolean), read_only: true } };
+}
+
+function runtimeFromPathProbe(runtime, probe) {
+  const supportStatus = classifyCommandFailure(probe);
+  return {
+    runtime,
+    installed: supportStatus !== "missing",
+    available: supportStatus === "ok",
+    support_status: supportStatus,
+    source: probe.source,
+    error: probe.error,
+  };
+}
+
+async function processVms(request) {
+  const args = psArgsForPlatform();
+  const probe = await runFixedCommand("ps", args, { timeout: 3000, maxBuffer: 1024 * 1024 });
+  const vms = probe.status === "ok" ? parseVmProcesses(probe.stdout, { limit: request.vm_limit }) : [];
+  const runtimes = [...new Set(vms.map((vm) => vm.runtime))].map((runtime) => ({
+    runtime,
+    installed: true,
+    available: true,
+    support_status: "ok",
+    source: probe.command,
+  }));
+  return {
+    runtimes,
+    vms,
+    probes: [probeMetadata("vm_process_scan", probe, "ps_vm_processes", vms.length)],
   };
 }
 
@@ -324,6 +553,111 @@ async function collectLibvirt(request) {
   };
 }
 
+async function collectParallels(request) {
+  const [versionProbe, listProbe] = await Promise.all([
+    runFixedCommand("prlctl", ["--version"], { timeout: 2500 }),
+    runFixedCommand("prlctl", ["list", "--all", "--json"], { timeout: 4500, maxBuffer: 512 * 1024 }),
+  ]);
+  const vms = listProbe.status === "ok" ? parseParallelsListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("parallels", versionProbe.status === "ok" ? versionProbe : listProbe, versionFromStdout(versionProbe.stdout)),
+    vms,
+    probes: [
+      probeMetadata("parallels_version", versionProbe, "version_text"),
+      probeMetadata("parallels_list", listProbe, "parallels_list_json", vms.length),
+    ],
+  };
+}
+
+async function collectVmware(request) {
+  const listProbe = await runFixedCommand("vmrun", ["list"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const vms = listProbe.status === "ok" ? parseVmrunList(listProbe.stdout, { limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("vmware", listProbe),
+    vms,
+    probes: [probeMetadata("vmware_vmrun_list", listProbe, "vmrun_list", vms.length)],
+  };
+}
+
+async function collectUtm() {
+  const home = process.env.HOME;
+  const appProbe = await pathExistsProbe([
+    "/Applications/UTM.app",
+    home ? `${home}/Applications/UTM.app` : undefined,
+  ]);
+  return {
+    runtime: runtimeFromPathProbe("utm", appProbe),
+    vms: [],
+    probes: [probeMetadata("utm_app_probe", appProbe, "fixed_path_probe", appProbe.status === "ok" ? 1 : 0)],
+  };
+}
+
+async function collectPodmanMachine(request) {
+  const listProbe = await runFixedCommand("podman", ["machine", "list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const vms = listProbe.status === "ok" ? parsePodmanMachineListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("podman_machine", listProbe),
+    vms,
+    probes: [probeMetadata("podman_machine_list", listProbe, "podman_machine_list_json", vms.length)],
+  };
+}
+
+async function collectIncus(request) {
+  const listProbe = await runFixedCommand("incus", ["list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const vms = listProbe.status === "ok" ? parseIncusOrLxcListJson(listProbe.stdout, { runtime: "incus", limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("incus", listProbe),
+    vms,
+    probes: [probeMetadata("incus_list", listProbe, "incus_list_json", vms.length)],
+  };
+}
+
+async function collectLxd(request) {
+  const listProbe = await runFixedCommand("lxc", ["list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const vms = listProbe.status === "ok" ? parseIncusOrLxcListJson(listProbe.stdout, { runtime: "lxd", limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("lxd", listProbe),
+    vms,
+    probes: [probeMetadata("lxd_list", listProbe, "lxc_list_json", vms.length)],
+  };
+}
+
+async function collectProxmox(request) {
+  const listProbe = await runFixedCommand("qm", ["list"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const vms = listProbe.status === "ok" ? parseQmList(listProbe.stdout, { limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("proxmox", listProbe),
+    vms,
+    probes: [probeMetadata("proxmox_qm_list", listProbe, "qm_list", vms.length)],
+  };
+}
+
+async function collectXen(request) {
+  const listProbe = await runFixedCommand("xl", ["list"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const vms = listProbe.status === "ok" ? parseXlList(listProbe.stdout, { limit: request.vm_limit }) : [];
+  return {
+    runtime: runtimeFromProbe("xen", listProbe),
+    vms,
+    probes: [probeMetadata("xen_xl_list", listProbe, "xl_list", vms.length)],
+  };
+}
+
+function runtimeRank(runtime) {
+  if (runtime.available) return 4;
+  if (runtime.installed && runtime.support_status !== "missing") return 3;
+  if (runtime.installed) return 2;
+  return 1;
+}
+
+export function mergeRuntimes(runtimes) {
+  const byName = new Map();
+  for (const runtime of runtimes) {
+    const existing = byName.get(runtime.runtime);
+    if (!existing || runtimeRank(runtime) > runtimeRank(existing)) byName.set(runtime.runtime, runtime);
+  }
+  return [...byName.values()];
+}
+
 function summarize(runtimes, vms) {
   return {
     runtime_count: runtimes.length,
@@ -357,8 +691,17 @@ export async function collectVmEvidence(options = {}) {
       collectMultipass(request),
       collectVirtualBox(request),
       collectLibvirt(request),
+      collectParallels(request),
+      collectVmware(request),
+      collectUtm(),
+      collectPodmanMachine(request),
+      collectIncus(request),
+      collectLxd(request),
+      collectProxmox(request),
+      collectXen(request),
+      processVms(request),
     ]);
-    const runtimes = results.map((result) => result.runtime);
+    const runtimes = mergeRuntimes(results.flatMap((result) => result.runtimes ?? [result.runtime]).filter(Boolean));
     const vms = results.flatMap((result) => result.vms ?? []).slice(0, request.vm_limit);
     const probes = results.flatMap((result) => result.probes ?? []);
     const unsupported_or_missing = runtimes.filter((runtime) => !runtime.available).map((runtime) => ({

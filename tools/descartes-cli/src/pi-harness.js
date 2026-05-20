@@ -114,7 +114,7 @@ export function createEvidenceTools(paths) {
     defineTool({
       name: "collect_vms",
       label: "Collect VM inventory",
-      description: "Collect bounded read-only VM runtime and inventory evidence for Tart, Lima, Multipass, VirtualBox, and libvirt/virsh where available. No VM actions are taken.",
+      description: "Collect bounded read-only VM runtime and inventory evidence for Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like processes where available. No VM actions are taken."
       parameters: Type.Object({ vm_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })) }),
       executionMode: "parallel",
       execute: async (_id, params) => jsonToolResult(await collectVmEvidence({ vmLimit: params.vm_limit ?? 80 })),
@@ -201,7 +201,7 @@ Preferred flow:
 5. If the complaint involves a daemon, service, startup item, or repeated restart/failure, call collect_services rather than guessing.
 6. If the complaint involves crashes, reboots, authentication failures, fail2ban, firewall blocks, denied traffic, or recent error context, call collect_recent_logs with tight bounds rather than guessing. Treat log excerpts as sensitive.
 7. If the complaint involves Docker, Podman, Colima, Lima, containers, images, container ports, or container resource use, call collect_containers rather than guessing. Do not suggest start/stop/delete/prune actions as already taken.
-8. If the complaint involves VMs, Tart, Lima VMs, Multipass, VirtualBox, libvirt, virsh, KVM, QEMU, hypervisors, or a general “containers or VMs” inventory, call collect_vms as well as collect_containers when relevant rather than inferring only from processes.
+8. If the complaint involves VMs, Tart, UTM, Parallels, VMware, Lima VMs, Multipass, VirtualBox, libvirt, virsh, KVM, QEMU, Podman machine, Incus/LXD VMs, Proxmox, Xen, hypervisors, or a general “containers or VMs” inventory, call collect_vms as well as collect_containers when relevant rather than inferring only from processes.
 9. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
 10. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }

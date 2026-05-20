@@ -2,7 +2,8 @@
 
 **Created:** 2026-05-20  
 **Status:** Completed  
-**Completed:** 2026-05-20 — implemented `collect_vms`, parser tests, guarded triage exposure, docs updates, and v0.0.21 metadata bump.
+**Completed:** 2026-05-20 — implemented `collect_vms`, parser tests, guarded triage exposure, docs updates, and v0.0.21 metadata bump.  
+**Enhanced:** 2026-05-20 — expanded VM parity to Parallels, VMware, UTM app/process detection, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, and direct QEMU/VMware/UTM process hints; bumped metadata to v0.0.22.
 
 ## Goal
 
@@ -10,8 +11,8 @@ Add a guarded read-only `collect_vms` tool so questions about “containers or V
 
 ## Scope
 
-- macOS-oriented runtimes: Tart, Lima, Multipass, VirtualBox.
-- Linux/common runtimes: libvirt/virsh, Lima, Multipass, VirtualBox.
+- macOS-oriented runtimes: Tart, Lima, Multipass, VirtualBox, Parallels, VMware, UTM, Podman machine, and direct QEMU/VMware/UTM process hints.
+- Linux/common runtimes: libvirt/virsh, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, and direct QEMU/VMware process hints.
 - Normalize runtime availability, VM inventory, state, resource-ish fields where exposed, probe metadata, and missing/unsupported runtime entries.
 - Keep Docker/Colima container-host context in `collect_containers`; `collect_vms` may include Lima as VM inventory because Lima instances are VM-backed environments.
 
@@ -25,7 +26,7 @@ Add a guarded read-only `collect_vms` tool so questions about “containers or V
 
 ## Acceptance Criteria
 
-- Parser tests cover Tart, Lima, Multipass, VirtualBox, libvirt/virsh, bounds, and missing/permission command classification.
+- Parser tests cover Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, Podman machine, Incus/LXD VM mode, Proxmox, Xen, direct VM process hints, bounds, and missing/permission command classification.
 - `collect_vms` is exposed in the guarded triage tool surface.
 - The triage prompt tells the model to use `collect_vms` for Tart/UTM/Parallels/VMware/VirtualBox/Multipass/Lima/libvirt/QEMU/VM questions.
 - README/handoff/todo document the collector and package metadata is bumped.
