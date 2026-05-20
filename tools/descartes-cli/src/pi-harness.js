@@ -8,6 +8,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { collectContainerEvidence } from "./tools/containers.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectRecentLogsEvidence } from "./tools/logs.js";
 import { collectNetworkEvidence } from "./tools/network.js";
@@ -92,6 +93,24 @@ export function createEvidenceTools(paths) {
       })),
     }),
     defineTool({
+      name: "collect_containers",
+      label: "Collect container inventory",
+      description: "Collect bounded read-only Docker, Podman, Colima, and Lima container/runtime evidence using fixed local probes. No container actions are taken.",
+      parameters: Type.Object({
+        container_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+        host_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100 })),
+        include_stopped: Type.Optional(Type.Boolean()),
+        collect_stats: Type.Optional(Type.Boolean()),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectContainerEvidence({
+        containerLimit: params.container_limit ?? 80,
+        hostLimit: params.host_limit ?? 40,
+        includeStopped: params.include_stopped ?? true,
+        collectStats: params.collect_stats ?? true,
+      })),
+    }),
+    defineTool({
       name: "inspect_process",
       label: "Inspect process identity",
       description: "Inspect one process by PID using read-only process table facts, redacted command lines, parent summary, and child summaries.",
@@ -172,8 +191,9 @@ Preferred flow:
 4. If the complaint involves connectivity, DNS, listening ports, or network reachability, call collect_network_basics rather than guessing.
 5. If the complaint involves a daemon, service, startup item, or repeated restart/failure, call collect_services rather than guessing.
 6. If the complaint involves crashes, reboots, authentication failures, fail2ban, firewall blocks, denied traffic, or recent error context, call collect_recent_logs with tight bounds rather than guessing. Treat log excerpts as sensitive.
-7. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
-8. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+7. If the complaint involves Docker, Podman, Colima, Lima, containers, images, container ports, or container resource use, call collect_containers rather than guessing. Do not suggest start/stop/delete/prune actions as already taken.
+8. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+9. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {

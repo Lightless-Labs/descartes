@@ -35,32 +35,30 @@ Already implemented:
 - `collect_network_basics`
 - `collect_services`
 - `collect_recent_logs`
+- `collect_containers`
 - `collect_triage_evidence`
 - `derive_findings`
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, and bounded recent logs are complete. The next collector-oriented priorities are containers, VMs, and scheduled jobs.
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, bounded recent logs, and container basics are complete. The next collector-oriented priorities are VMs and scheduled jobs.
 
 ## Candidate Next Tools
 
 Prioritize tools that answer common first-triage questions without privileged mutation:
 
-1. `collect_containers`
-   - Docker / Colima / Lima / Podman where available
-   - read-only container/resource summary
-2. `collect_vms`
+1. `collect_vms`
    - parity-oriented normalized VM inventory across macOS and Linux
    - macOS: Tart / Lima VMs / UTM / Multipass / VMware / VirtualBox / Parallels where available
    - Linux: libvirt/KVM/QEMU, direct QEMU processes, VirtualBox, VMware, Multipass, Lima, Incus/LXD VMs, Podman machine, Proxmox `qm`, Xen where available
    - read-only VM inventory, state, resource summary, and owning runtime/source
    - distinguish VM runtime discovery from active VM inventory; do not start/stop/create/delete anything
    - dedicated plan: `todos/2026-05-19-vm-inventory-collector.md`
-3. `collect_scheduled_jobs`
+2. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
-4. `collect_certificates`
+3. `collect_certificates`
    - expiring certs in common local stores/paths, later
-5. `collect_time_sync`
+4. `collect_time_sync`
    - clock skew/time sync state
 
 ## Requirements
