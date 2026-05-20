@@ -1,7 +1,7 @@
 ---
 title: VM Inventory Collector
 created: 2026-05-19
-status: open
+status: completed
 priority: high
 area: collectors
 kind: todo
@@ -12,6 +12,8 @@ related:
 ---
 
 # TODO: VM Inventory Collector
+
+**Completed:** 2026-05-20 — implemented first VM inventory slice as `collect_vms` for Tart, Lima, Multipass, VirtualBox, and libvirt/virsh with bounded read-only probes and parser tests. Future expansion can add UTM, VMware, Parallels, direct QEMU process correlation, Incus/LXD VM mode, Podman machine, Proxmox, and Xen.
 
 ## Summary
 

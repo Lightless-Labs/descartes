@@ -22,6 +22,7 @@
 **Addendum:** 2026-05-20 — service manager basics were added and package metadata was bumped to v0.0.18: guarded triage can call `collect_services` for read-only launchd/systemd service state, including failed/restarting/nonzero-exit summaries.
 **Addendum:** 2026-05-20 — bounded recent logs were added and package metadata was bumped to v0.0.19: guarded triage can call `collect_recent_logs` for warning/error excerpts plus fail2ban/firewall-oriented signals where available, using fixed read-only commands and explicit bounds/redaction.
 **Addendum:** 2026-05-20 — container basics were added and package metadata was bumped to v0.0.20: guarded triage can call `collect_containers` for bounded read-only Docker, Podman, Colima, and Lima runtime/container evidence without exposing container mutation commands.
+**Addendum:** 2026-05-20 — VM basics were added and package metadata was bumped to v0.0.21 after field validation showed Tart was installed but invisible to container evidence. Guarded triage can call `collect_vms` for bounded read-only Tart, Lima, Multipass, VirtualBox, and libvirt/virsh runtime/inventory evidence.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -293,6 +294,7 @@ The README should become the product surface for v0 and include:
 | service manager basics | yes/launchd | yes/systemd |
 | recent system logs | yes/unified log | yes/journalctl + fixed log files |
 | Docker/container basics | yes/Docker, Colima, Lima, Podman | yes/Docker, Podman, Lima |
+| VM basics | yes/Tart, Lima, Multipass, VirtualBox | yes/libvirt, Lima, Multipass, VirtualBox |
 
 The first release can mention Docker only if process evidence shows Docker as a top resource consumer. It should not require Docker API integration.
 
@@ -310,6 +312,7 @@ Local terminal output may include operationally useful machine identifiers and l
 - service manager basics for launchd/systemd
 - bounded local log excerpts, including fail2ban/firewall signals where available
 - container names, images, commands, ports, runtime state, and resource snapshots where available
+- VM names, paths, IPs, runtime state, and hypervisor/runtime metadata where available
 - mount points and paths
 - listening process names if later added
 - service names
