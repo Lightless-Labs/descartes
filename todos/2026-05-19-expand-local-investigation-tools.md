@@ -34,7 +34,7 @@ Already implemented:
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, and bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md` are complete. The next collector-oriented priorities are network, service manager, logs, containers, and scheduled jobs.
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, and bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md` are complete. The next collector-oriented priorities are network, service manager, logs, containers, VMs, and scheduled jobs.
 
 ## Candidate Next Tools
 
@@ -53,11 +53,15 @@ Prioritize tools that answer common first-triage questions without privileged mu
 4. `collect_containers`
    - Docker / Colima / Lima / Podman where available
    - read-only container/resource summary
-5. `collect_scheduled_jobs`
+5. `collect_vms`
+   - Tart / Lima VMs / UTM / Multipass / VMware / VirtualBox / Parallels where available
+   - read-only VM inventory, state, resource summary, and owning runtime/source
+   - distinguish VM runtime discovery from active VM inventory; do not start/stop/create/delete anything
+6. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
-6. `collect_certificates`
+7. `collect_certificates`
    - expiring certs in common local stores/paths, later
-7. `collect_time_sync`
+8. `collect_time_sync`
    - clock skew/time sync state
 
 ## Requirements

@@ -72,7 +72,7 @@ Existing files:
 2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
 3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: expand into another local read-only collector such as `collect_network_basics`, `collect_services`, or `collect_containers` from `todos/2026-05-19-expand-local-investigation-tools.md`.
+5. Recommended next task: expand into another local read-only collector such as `collect_network_basics`, `collect_services`, `collect_containers`, or `collect_vms` from `todos/2026-05-19-expand-local-investigation-tools.md`.
 
 ## Current First Slice
 
@@ -219,7 +219,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: choose the next local read-only collector from `todos/2026-05-19-expand-local-investigation-tools.md`; likely high-value options are `collect_network_basics`, service manager checks (`launchd`/`systemd`), or container discovery (`Docker`/`Colima`/`Lima`/`Podman`).
+Recommended next task: choose the next local read-only collector from `todos/2026-05-19-expand-local-investigation-tools.md`; likely high-value options are `collect_network_basics`, service manager checks (`launchd`/`systemd`), container discovery (`Docker`/`Colima`/`Lima`/`Podman`), or VM inventory (`Tart`/`Lima`/`UTM`/`Multipass`/`VMware`/`VirtualBox`/`Parallels`).
 
 The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 

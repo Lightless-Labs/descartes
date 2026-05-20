@@ -207,7 +207,7 @@ Tracked in `todos/2026-05-19-temporal-sampling-investigation-tools.md`.
 
 ### Then — Capability discovery
 
-Add read-only discovery of package managers, container runtimes, VM runtimes, and CI integrations. This supports intent-based planning such as “I need a Linux environment with npm”.
+Add read-only discovery of package managers, container runtimes, VM runtimes, active VM/container inventory, and CI integrations. This supports intent-based planning such as “I need a Linux environment with npm”.
 
 ### Later — Policy-gated action planning
 
