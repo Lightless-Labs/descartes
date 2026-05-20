@@ -23,6 +23,7 @@
 **Addendum:** 2026-05-20 — bounded recent logs were added and package metadata was bumped to v0.0.19: guarded triage can call `collect_recent_logs` for warning/error excerpts plus fail2ban/firewall-oriented signals where available, using fixed read-only commands and explicit bounds/redaction.
 **Addendum:** 2026-05-20 — container basics were added and package metadata was bumped to v0.0.20: guarded triage can call `collect_containers` for bounded read-only Docker, Podman, Colima, and Lima runtime/container evidence without exposing container mutation commands.
 **Addendum:** 2026-05-20 — VM basics were added and package metadata was bumped to v0.0.21 after field validation showed Tart was installed but invisible to container evidence. Guarded triage can call `collect_vms` for bounded read-only Tart, Lima, Multipass, VirtualBox, and libvirt/virsh runtime/inventory evidence.
+**Addendum:** 2026-05-20 — policy clarification: `collect_triage_evidence` should remain the compact system/process/disk resource-pressure first-pass bundle, not expand into every new collector. NPM registry publishing is not a product priority; the current npm wrapper is a temporary GitHub-install mechanism for the Node/Pi harness while durable functionality moves toward Rust/Bazel-friendly components.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -89,23 +90,17 @@ The first supported broad area is resource-pressure triage, but the user should 
 
 ### Install
 
-Initial install mechanism is still an implementation choice, but it must produce a `descartes` command and include its private agent-harness dependency. Users should not separately install Pi.
+Initial install mechanism must produce a `descartes` command and include its private agent-harness dependency. Users should not separately install Pi.
 
-Possible first install routes:
-
-```bash
-npm install -g @lightless-labs/descartes
-```
-
-or:
+The current route is a pragmatic GitHub npm install wrapper:
 
 ```bash
-brew install lightless-labs/tap/descartes
+npm install -g github:Lightless-Labs/descartes
 ```
 
-or a GitHub Release binary/package once packaging exists.
+Do not optimize for npm registry publishing. Longer-term distribution should favor GitHub Release binaries/packages, Homebrew, or native Rust/Bazel-friendly artifacts once the durable core is no longer tied to the temporary Node/Pi harness layer.
 
-A Cargo-only install is not sufficient if it cannot include the private Pi/agent harness needed for LLM-backed triage.
+A Cargo-only install is not sufficient today if it cannot include the private Pi/agent harness needed for LLM-backed triage.
 
 ### Login
 
@@ -254,10 +249,10 @@ The README should become the product surface for v0 and include:
 
 ### Later distribution
 
-- npm package if the first CLI is TypeScript/Pi-SDK based
-- Homebrew tap
 - GitHub Releases with prebuilt binaries/packages
+- Homebrew tap
 - Linux packages
+- Avoid spending product effort on npm registry publishing unless there is a concrete short-term need.
 
 ## Supported Platforms
 
@@ -345,7 +340,7 @@ User prompt
 
 ### Evidence collection policy
 
-Default triage should remain model-led rather than unconditionally precollecting evidence before the LLM turn. The model must request local facts through the guarded Descartes evidence tools. For the first slice, `collect_triage_evidence` is the broad obvious first-pass tool, while narrower tools remain available for targeted refresh/scope.
+Default triage should remain model-led rather than unconditionally precollecting evidence before the LLM turn. The model must request local facts through the guarded Descartes evidence tools. For the first slice, `collect_triage_evidence` is the compact resource-pressure first-pass bundle (system/process/disk), while narrower tools remain available for targeted refresh/scope. Do not expand `collect_triage_evidence` into an all-collectors bundle; new collectors should remain explicitly selected targeted tools.
 
 Rationale:
 

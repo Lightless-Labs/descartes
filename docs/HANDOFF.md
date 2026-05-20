@@ -44,7 +44,9 @@ Login UX fix: subscription OAuth login no longer starts an immediate manual past
 
 Current-package ChatGPT/Codex validation: GitHub-installed `descartes triage "my machine is slow"` returned a useful non-fallback human diagnosis citing system/process/disk evidence and ended with `No actions were taken.` Initial GitHub-installed JSON triage returned `fallback_used: false`, selected `openai-codex/gpt-5.5` with high thinking, active tools exactly `collect_system`, `collect_processes`, `collect_disks`, `collect_triage_evidence`, `derive_findings`, three ok precollected evidence envelopes, findings/tool traces, and `actions_taken: []`. The model made no additional tool calls because compact precollected evidence was sufficient; prior Anthropic validation covered explicit tool-call behavior. The JSON model output cited compact summary keys (`top_cpu`, `top_memory`) as evidence refs, so prompt instructions were tightened to require envelope IDs only.
 
-Evidence collection policy decision: keep normal `triage` model-led rather than restoring unconditional precollection. The model must request local facts through the guarded Descartes tool surface; `collect_triage_evidence` is the broad first-pass tool. `--no-investigate` remains the degraded no-tool synthesis escape hatch and still precollects deterministic evidence. v0.0.8 GitHub-installed validation confirmed this works: JSON triage had `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs, and `actions_taken: []`. Future hardening: add a "no evidence, no diagnosis" guard that retries or degrades if normal investigation returns without tool calls/evidence.
+Evidence collection policy decision: keep normal `triage` model-led rather than restoring unconditional precollection. The model must request local facts through the guarded Descartes tool surface; `collect_triage_evidence` remains the compact resource-pressure first-pass bundle (system/process/disk), not an ever-growing all-collectors bundle. New collectors should stay as targeted tools so the model chooses them intentionally. `--no-investigate` remains the degraded no-tool synthesis escape hatch and still precollects deterministic evidence. v0.0.8 GitHub-installed validation confirmed this works: JSON triage had `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs, and `actions_taken: []`. Future hardening: add a "no evidence, no diagnosis" guard that retries or degrades if normal investigation returns without tool calls/evidence.
+
+Packaging/distribution policy update: the current npm package is only a pragmatic GitHub-install wrapper for the embedded Node/Pi harness. Do not prioritize npm registry publishing; npm is not a strategic distribution goal. Long-term direction remains moving durable core functionality away from JavaScript/TypeScript toward Rust/Bazel-friendly components.
 
 Existing files:
 
@@ -156,19 +158,13 @@ https://github.com/lightless-labs/descartes
 
 The first install mechanism is an implementation decision, but it must include/private-vendor the agent harness. A Cargo-only CLI is not sufficient if it cannot provide the LLM-backed private harness and subscription login flow.
 
-Likely first distribution candidates:
+Current distribution is a pragmatic GitHub npm install wrapper around the embedded Node/Pi harness:
 
 ```bash
-npm install -g @lightless-labs/descartes
+npm install -g github:Lightless-Labs/descartes
 ```
 
-or:
-
-```bash
-brew install lightless-labs/tap/descartes
-```
-
-or a GitHub Release package/binary.
+Do not prioritize npm registry publishing. Long-term distribution should move toward GitHub Release packages/binaries, Homebrew, or native Rust/Bazel-friendly artifacts when the durable core moves out of the temporary JavaScript harness layer.
 
 ## Platform Scope
 
