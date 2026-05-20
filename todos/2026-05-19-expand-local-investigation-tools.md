@@ -34,36 +34,30 @@ Already implemented:
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md` is complete, and the disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md` is complete. The next collector-oriented priorities are:
-
-1. add bounded temporal sampling from `todos/2026-05-19-temporal-sampling-investigation-tools.md`
-2. then expand into network, service manager, logs, containers, and scheduled jobs
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, and bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md` are complete. The next collector-oriented priorities are network, service manager, logs, containers, and scheduled jobs.
 
 ## Candidate Next Tools
 
 Prioritize tools that answer common first-triage questions without privileged mutation:
 
-1. `sample_dimension`
-   - bounded temporal sampling over an LLM-requested dimension, duration, and interval
-   - see `todos/2026-05-19-temporal-sampling-investigation-tools.md`
-2. `collect_network_basics`
+1. `collect_network_basics`
    - interfaces, routes, DNS reachability, listening sockets where safe/available
-3. `collect_services`
+2. `collect_services`
    - `launchd` on macOS
    - `systemd` on Linux
    - failed/restarting service summary
-4. `collect_recent_logs`
+3. `collect_recent_logs`
    - strict bounded recent error/warning excerpts
    - explicit privacy notes
    - platform-specific backends (`log`, journal, syslog)
-5. `collect_containers`
+4. `collect_containers`
    - Docker / Colima / Lima / Podman where available
    - read-only container/resource summary
-6. `collect_scheduled_jobs`
+5. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
-7. `collect_certificates`
+6. `collect_certificates`
    - expiring certs in common local stores/paths, later
-8. `collect_time_sync`
+7. `collect_time_sync`
    - clock skew/time sync state
 
 ## Requirements

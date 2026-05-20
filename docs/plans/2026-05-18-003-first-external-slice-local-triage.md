@@ -17,6 +17,7 @@
 **Addendum:** 2026-05-19 — process identity and lineage tools were added and package metadata was bumped to v0.0.13: default process evidence now uses redacted/bounded args, and guarded model-led triage can call `inspect_process` and `inspect_parent_tree` for PID-level identity/provenance without exposing shell/coding tools.
 **Addendum:** 2026-05-19 — disk evidence classification was added and package metadata was bumped to v0.0.14: virtual/pseudo filesystems and macOS CoreSimulator/Cryptex developer runtime image mounts are classified as not pressure-relevant, `map ... 100% /path` parsing is fixed, and runtime images now produce one informational aggregate finding instead of noisy critical disk-pressure findings.
 **Addendum:** 2026-05-19 — no-evidence/no-diagnosis guard was added and package metadata was bumped to v0.0.15: normal model-led triage retries once with an explicit evidence-tool instruction if assistant text arrives without evidence, then falls back to deterministic precollection with degraded diagnostics if evidence is still absent.
+**Addendum:** 2026-05-19 — temporal sampling tools were added and package metadata was bumped to v0.0.16: guarded triage can call bounded `sample_dimension` for CPU processes, memory processes, or load/memory/swap, optionally writing Descartes-owned sampling artifacts readable only through `read_sampling_artifact`.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

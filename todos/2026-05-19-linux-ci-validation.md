@@ -111,7 +111,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 | `derive_findings` | validated | validate | deterministic, should be platform-independent |
 | `inspect_process` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only PID identity envelope with redacted/bounded args. |
 | `inspect_parent_tree` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only bounded ancestry envelope with redacted/bounded args. |
-| temporal sampling | not implemented | future parity | tracked separately |
+| temporal sampling | implemented / local macOS smoke checked | validate on Linux x86_64 | `sample_dimension` supports CPU processes, memory processes, and load/memory/swap plus Descartes-owned artifacts. |
 | service manager checks | not implemented | future parity | Linux/systemd likely first real host requirement |
 
 ## Observed Linux Attempts

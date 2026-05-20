@@ -13,6 +13,7 @@ import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEviden
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
+import { readSamplingArtifactEvidence, sampleDimensionEvidence } from "./tools/sampling.js";
 import { selectTriageModel } from "./model-selection.js";
 import { assertSafeTriageToolNames, TRIAGE_TOOL_NAMES } from "./tool-policy.js";
 
@@ -23,7 +24,7 @@ function jsonToolResult(value) {
   };
 }
 
-export function createEvidenceTools() {
+export function createEvidenceTools(paths) {
   return [
     defineTool({
       name: "collect_system",
@@ -69,6 +70,29 @@ export function createEvidenceTools() {
       execute: async (_id, params) => jsonToolResult(await inspectParentTreeEvidence({ pid: params.pid, maxDepth: params.max_depth ?? 16 })),
     }),
     defineTool({
+      name: "sample_dimension",
+      label: "Sample a dimension over time",
+      description: "Collect bounded read-only temporal samples for process CPU, process memory, or load/memory/swap and return aggregates.",
+      parameters: Type.Object({
+        dimension: Type.Union([Type.Literal("cpu_processes"), Type.Literal("memory_processes"), Type.Literal("load_memory_swap")]),
+        duration_seconds: Type.Optional(Type.Number({ minimum: 1, maximum: 60 })),
+        interval_seconds: Type.Optional(Type.Number({ minimum: 1, maximum: 60 })),
+        top_n: Type.Optional(Type.Number({ minimum: 1, maximum: 20 })),
+        aggregation: Type.Optional(Type.Union([Type.Literal("summary"), Type.Literal("timeseries"), Type.Literal("summary_and_timeseries_ref")])),
+      }),
+      execute: async (_id, params) => jsonToolResult(await sampleDimensionEvidence(params, paths)),
+    }),
+    defineTool({
+      name: "read_sampling_artifact",
+      label: "Read Descartes sampling artifact",
+      description: "Read a bounded excerpt from a Descartes-owned sampling artifact returned by sample_dimension. This is not a general file reader.",
+      parameters: Type.Object({
+        artifact_id: Type.String(),
+        max_samples: Type.Optional(Type.Number({ minimum: 1, maximum: 25 })),
+      }),
+      execute: async (_id, params) => jsonToolResult(await readSamplingArtifactEvidence(params, paths)),
+    }),
+    defineTool({
       name: "collect_triage_evidence",
       label: "Collect all triage evidence",
       description: "Collect the full first-slice read-only resource-pressure evidence bundle and deterministic findings.",
@@ -104,7 +128,8 @@ Preferred flow:
 1. Call collect_triage_evidence first for broad resource-pressure triage.
 2. If needed, call specific collectors to refresh or inspect a subset.
 3. If a process looks important, call inspect_process and/or inspect_parent_tree for process identity and lineage before making claims about provenance.
-4. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+4. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+5. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {
@@ -247,7 +272,7 @@ export async function createPrivateTriageSession(paths, options = {}) {
     thinkingLevel,
     noTools: enableTools ? undefined : "all",
     tools: enableTools ? TRIAGE_TOOL_NAMES : undefined,
-    customTools: enableTools ? createEvidenceTools() : [],
+    customTools: enableTools ? createEvidenceTools(paths) : [],
   });
 
   const activeToolNames = result.session.getActiveToolNames();

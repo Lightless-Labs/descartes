@@ -1,7 +1,7 @@
 ---
 title: Temporal Sampling Investigation Tools
 created: 2026-05-19
-status: open
+status: completed
 priority: high
 area: collectors
 kind: todo
@@ -12,6 +12,8 @@ related:
 ---
 
 # TODO: Temporal Sampling Investigation Tools
+
+**Completed:** 2026-05-19 — added bounded `sample_dimension` support for `cpu_processes`, `memory_processes`, and `load_memory_swap`, Descartes-owned sampling artifacts plus bounded `read_sampling_artifact`, guarded triage exposure, tests for policy clamping/aggregation/artifact paths, and package metadata bump to v0.0.16.
 
 ## Summary
 
