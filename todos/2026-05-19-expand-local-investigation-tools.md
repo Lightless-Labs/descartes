@@ -10,6 +10,7 @@ related:
   - todos/2026-05-19-llm-driven-investigation-tools.md
   - todos/2026-05-19-process-identity-lineage-tools.md
   - todos/2026-05-19-temporal-sampling-investigation-tools.md
+  - todos/2026-05-19-vm-inventory-collector.md
 ---
 
 # TODO: Expand Descartes Local Read-Only Investigation Tools
@@ -54,9 +55,12 @@ Prioritize tools that answer common first-triage questions without privileged mu
    - Docker / Colima / Lima / Podman where available
    - read-only container/resource summary
 5. `collect_vms`
-   - Tart / Lima VMs / UTM / Multipass / VMware / VirtualBox / Parallels where available
+   - parity-oriented normalized VM inventory across macOS and Linux
+   - macOS: Tart / Lima VMs / UTM / Multipass / VMware / VirtualBox / Parallels where available
+   - Linux: libvirt/KVM/QEMU, direct QEMU processes, VirtualBox, VMware, Multipass, Lima, Incus/LXD VMs, Podman machine, Proxmox `qm`, Xen where available
    - read-only VM inventory, state, resource summary, and owning runtime/source
    - distinguish VM runtime discovery from active VM inventory; do not start/stop/create/delete anything
+   - dedicated plan: `todos/2026-05-19-vm-inventory-collector.md`
 6. `collect_scheduled_jobs`
    - cron, launchd timers, systemd timers where available
 7. `collect_certificates`

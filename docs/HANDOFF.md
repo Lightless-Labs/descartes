@@ -55,7 +55,8 @@ Existing files:
   - `2026-05-19-first-external-slice-validation.md` — **immediate next task, in progress**: validate install/login/triage/docs/platform readiness against the first external slice plan.
   - `2026-05-19-llm-driven-investigation-tools.md` — completed; safe LLM tool-driven local investigation restored and validated with Anthropic on macOS.
   - `2026-05-19-process-identity-lineage-tools.md` — completed; redacted/bounded process args, `inspect_process`, and `inspect_parent_tree` are implemented and exposed through the guarded triage tool surface.
-  - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors; process identity/lineage is complete, with temporal sampling/network/services/logs/containers as later candidates.
+  - `2026-05-19-expand-local-investigation-tools.md` — add more local read-only collectors; process identity/lineage and temporal sampling are complete, with network/services/logs/containers/VMs as later candidates.
+  - `2026-05-19-vm-inventory-collector.md` — future parity-oriented `collect_vms` tool across macOS and Linux VM runtimes.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — completed; bounded LLM-requested sampling over time with aggregates and Descartes-owned artifacts.
   - `2026-05-19-macos-disk-evidence-classification.md` — completed; classifies pseudo/runtime filesystems, fixes macOS map row parsing, and reduces disk finding noise.
   - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
@@ -219,7 +220,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: choose the next local read-only collector from `todos/2026-05-19-expand-local-investigation-tools.md`; likely high-value options are `collect_network_basics`, service manager checks (`launchd`/`systemd`), container discovery (`Docker`/`Colima`/`Lima`/`Podman`), or VM inventory (`Tart`/`Lima`/`UTM`/`Multipass`/`VMware`/`VirtualBox`/`Parallels`).
+Recommended next task: choose the next local read-only collector from `todos/2026-05-19-expand-local-investigation-tools.md`; likely high-value options are `collect_network_basics`, service manager checks (`launchd`/`systemd`), container discovery (`Docker`/`Colima`/`Lima`/`Podman`), or parity-oriented VM inventory. VM inventory has a dedicated todo: `todos/2026-05-19-vm-inventory-collector.md`, covering macOS runtimes (`Tart`/`Lima`/`UTM`/`Multipass`/`VMware`/`VirtualBox`/`Parallels`) and Linux runtimes (`libvirt`/`KVM`/`QEMU`, direct QEMU processes, VirtualBox, VMware, Multipass, Lima, Incus/LXD VMs, Podman machine, Proxmox `qm`, Xen).
 
 The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 

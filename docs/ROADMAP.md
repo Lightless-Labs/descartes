@@ -74,6 +74,7 @@ Initial candidate tools:
 - `collect_package_managers`
 - `collect_container_runtimes`
 - `collect_vm_runtimes`
+- `collect_vms` — normalized read-only VM inventory across macOS/Linux runtimes such as Tart, Lima, UTM, Multipass, VirtualBox, VMware, Parallels, libvirt/KVM/QEMU, Incus/LXD VMs, Podman machine, Proxmox `qm`, and Xen
 - `collect_ci_integrations`
 
 ### 2. Process and Behavior Understanding
@@ -207,7 +208,7 @@ Tracked in `todos/2026-05-19-temporal-sampling-investigation-tools.md`.
 
 ### Then — Capability discovery
 
-Add read-only discovery of package managers, container runtimes, VM runtimes, active VM/container inventory, and CI integrations. This supports intent-based planning such as “I need a Linux environment with npm”.
+Add read-only discovery of package managers, container runtimes, VM runtimes, active VM/container inventory, and CI integrations. VM inventory should be feature-parity oriented: adapters differ per platform, but the evidence shape should be normalized across macOS and Linux. This supports intent-based planning such as “I need a Linux environment with npm”.
 
 ### Later — Policy-gated action planning
 
