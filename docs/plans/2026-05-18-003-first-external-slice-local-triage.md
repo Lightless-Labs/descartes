@@ -18,6 +18,8 @@
 **Addendum:** 2026-05-19 — disk evidence classification was added and package metadata was bumped to v0.0.14: virtual/pseudo filesystems and macOS CoreSimulator/Cryptex developer runtime image mounts are classified as not pressure-relevant, `map ... 100% /path` parsing is fixed, and runtime images now produce one informational aggregate finding instead of noisy critical disk-pressure findings.
 **Addendum:** 2026-05-19 — no-evidence/no-diagnosis guard was added and package metadata was bumped to v0.0.15: normal model-led triage retries once with an explicit evidence-tool instruction if assistant text arrives without evidence, then falls back to deterministic precollection with degraded diagnostics if evidence is still absent.
 **Addendum:** 2026-05-19 — temporal sampling tools were added and package metadata was bumped to v0.0.16: guarded triage can call bounded `sample_dimension` for CPU processes, memory processes, or load/memory/swap, optionally writing Descartes-owned sampling artifacts readable only through `read_sampling_artifact`.
+**Addendum:** 2026-05-20 — network basics were added and package metadata was bumped to v0.0.17: guarded triage can call `collect_network_basics` for read-only interface, default route, DNS resolver/reachability, and listening socket evidence. README was shortened/reorganized with quick start before longer product direction.
+**Addendum:** 2026-05-20 — service manager basics were added and package metadata was bumped to v0.0.18: guarded triage can call `collect_services` for read-only launchd/systemd service state, including failed/restarting/nonzero-exit summaries.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -286,7 +288,7 @@ The README should become the product surface for v0 and include:
 | disks/mounts | yes | yes |
 | top processes | yes | yes |
 | process command lines | yes | yes |
-| service manager diagnosis | later | later/systemd |
+| service manager basics | yes/launchd | yes/systemd |
 | recent system logs | later | later/journalctl |
 | Docker/container diagnosis | later | later |
 
@@ -302,9 +304,11 @@ Local terminal output may include operationally useful machine identifiers and l
 - usernames where relevant
 - process names
 - process command lines
+- network interfaces, default routes, DNS resolver/reachability, and listening sockets
+- service manager basics for launchd/systemd
 - mount points and paths
 - listening process names if later added
-- service names if later added
+- service names
 - local log excerpts if later added
 
 The privacy boundary is not "do not show the local user their own machine." The privacy boundary is:

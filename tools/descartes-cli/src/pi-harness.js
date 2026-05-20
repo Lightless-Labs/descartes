@@ -9,7 +9,9 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { collectDiskEvidence } from "./tools/disks.js";
+import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEvidence } from "./tools/processes.js";
+import { collectServiceEvidence } from "./tools/services.js";
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
@@ -49,6 +51,28 @@ export function createEvidenceTools(paths) {
       parameters: Type.Object({}),
       executionMode: "parallel",
       execute: async () => jsonToolResult(await collectDiskEvidence()),
+    }),
+    defineTool({
+      name: "collect_network_basics",
+      label: "Collect network basics",
+      description: "Collect read-only network interface, default route, DNS resolver/reachability, and listening socket evidence using fixed local probes.",
+      parameters: Type.Object({
+        check_dns_reachability: Type.Optional(Type.Boolean()),
+        socket_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectNetworkEvidence({
+        checkDnsReachability: params.check_dns_reachability ?? true,
+        socketLimit: params.socket_limit ?? 50,
+      })),
+    }),
+    defineTool({
+      name: "collect_services",
+      label: "Collect service manager state",
+      description: "Collect read-only service manager evidence: systemd services on Linux or launchd jobs on macOS, with failed/restarting/nonzero-exit summaries.",
+      parameters: Type.Object({ service_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })) }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectServiceEvidence({ serviceLimit: params.service_limit ?? 80 })),
     }),
     defineTool({
       name: "inspect_process",
@@ -125,11 +149,13 @@ Hard rules:
 - Include evidence IDs in citations.
 
 Preferred flow:
-1. Call collect_triage_evidence first for broad resource-pressure triage.
-2. If needed, call specific collectors to refresh or inspect a subset.
+1. Select the narrowest Descartes evidence tools that match the complaint.
+2. For broad slowness/resource-pressure triage, call collect_triage_evidence first.
 3. If a process looks important, call inspect_process and/or inspect_parent_tree for process identity and lineage before making claims about provenance.
-4. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
-5. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+4. If the complaint involves connectivity, DNS, listening ports, or network reachability, call collect_network_basics rather than guessing.
+5. If the complaint involves a daemon, service, startup item, or repeated restart/failure, call collect_services rather than guessing.
+6. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+7. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {

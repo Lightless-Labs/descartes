@@ -2,6 +2,8 @@ export const TRIAGE_TOOL_NAMES = Object.freeze([
   "collect_system",
   "collect_processes",
   "collect_disks",
+  "collect_network_basics",
+  "collect_services",
   "inspect_process",
   "inspect_parent_tree",
   "sample_dimension",
