@@ -44,7 +44,7 @@ Already implemented:
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, bounded recent logs, container basics, VM basics, scheduled job basics, and time sync basics are complete. The next collector-oriented priority is certificates.
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, bounded recent logs, container basics, VM basics, scheduled job basics, and time sync basics are complete. Scheduled jobs and time sync were hardened after review for bounded cron file reads, fair scheduler-source selection, safe NTP server validation, and unknown-state handling. The next collector-oriented priority is certificates.
 
 ## Candidate Next Tools
 

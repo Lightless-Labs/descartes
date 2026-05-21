@@ -36,6 +36,8 @@ Time sync update: package metadata is bumped to v0.0.24. Guarded triage now expo
 
 Collector documentation update: added `docs/reference/collectors.md` as the operator/reference catalog for all model-visible evidence tools, parameters, platforms, sources, network behavior, and privacy notes. Added `tools/descartes-cli/src/tools/README.md` as the source-adjacent developer guide for collector structure, safety rules, and adding new collectors.
 
+Review hardening update: package metadata is bumped to v0.0.25 after a read-only Pi/Codex review. `collect_time_sync` now validates NTP server values before invoking `sntp`, rejects option/path/whitespace values such as `-s`/`-S`, and no longer turns unknown sync state into confirmed `synchronized: false`. `collect_scheduled_jobs` now checks cron paths are regular files, caps large cron file reads before parsing, tracks discovered vs returned job counts, and selects returned jobs fairly across scheduler sources so cron entries cannot hide all systemd timers/launchd jobs.
+
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
 Field report update: GitHub-installed triage on a real work laptop returned an empty diagnosis after login. `tools/descartes-cli/src/triage.js` now reads final assistant text from `session.messages` after `session.prompt()` instead of relying only on streaming `text_delta` events, and emits a deterministic fallback report if the model still returns no final text.
@@ -258,9 +260,9 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 106 Node test cases.
+- Current checked command: `npm test` passes 111 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.24.
+- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.25.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.

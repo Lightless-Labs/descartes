@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, readdir, readFile } from "node:fs/promises";
+import { access, lstat, open, readdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -9,7 +9,8 @@ import { redactAndBoundProcessArgs } from "./processes.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_JOB_LIMIT = 80;
-const MAX_CRON_FILE_BYTES = 128 * 1024;
+export const MAX_CRON_FILE_BYTES = 128 * 1024;
+const MAX_LAUNCHD_PLIST_CANDIDATES = 500;
 
 function clampNumber(value, fallback, min, max) {
   const number = Number(value);
@@ -235,20 +236,45 @@ export function parseLaunchdPlistObject(plist, { path: plistPath, scope = "syste
   };
 }
 
-async function readCronFile(filePath, options = {}) {
-  if (!(await pathExists(filePath))) {
-    return { status: "absent", path: filePath, jobs: [] };
+async function readBoundedRegularFile(filePath) {
+  const stats = await lstat(filePath);
+  if (!stats.isFile()) {
+    return { status: "unable", error: "not a regular file", content: "", truncated: false, size_bytes: stats.size };
   }
+  if (stats.size <= MAX_CRON_FILE_BYTES) {
+    return { status: "ok", content: await readFile(filePath, { encoding: "utf8" }), truncated: false, size_bytes: stats.size };
+  }
+
+  const handle = await open(filePath, "r");
   try {
-    const content = await readFile(filePath, { encoding: "utf8" });
-    const bounded = content.length > MAX_CRON_FILE_BYTES ? content.slice(0, MAX_CRON_FILE_BYTES) : content;
+    const buffer = Buffer.alloc(MAX_CRON_FILE_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, MAX_CRON_FILE_BYTES, 0);
+    return {
+      status: "ok",
+      content: buffer.subarray(0, bytesRead).toString("utf8"),
+      truncated: true,
+      size_bytes: stats.size,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function readCronFile(filePath, options = {}) {
+  try {
+    const file = await readBoundedRegularFile(filePath);
+    if (file.status !== "ok") {
+      return { status: file.status, path: filePath, error: file.error, size_bytes: file.size_bytes, jobs: [] };
+    }
     return {
       status: "ok",
       path: filePath,
-      truncated: content.length > MAX_CRON_FILE_BYTES,
-      jobs: parseCronContent(bounded, options),
+      truncated: file.truncated,
+      size_bytes: file.size_bytes,
+      jobs: parseCronContent(file.content, options),
     };
   } catch (error) {
+    if (error?.code === "ENOENT") return { status: "absent", path: filePath, jobs: [] };
     return {
       status: "unable",
       path: filePath,
@@ -363,7 +389,7 @@ async function collectSystemdTimers({ limit, includeSystem, includeUser }) {
     jobs.push(...parsed);
     probes.push({ source: "systemd_user_timers", status: command.status, command: command.command, stderr: command.stderr, error: command.error, job_count: parsed.length });
   }
-  return { jobs: jobs.slice(0, limit), probes };
+  return { jobs, probes };
 }
 
 async function listLaunchdPlists({ limit, includeSystem, includeUser }) {
@@ -386,13 +412,14 @@ async function listLaunchdPlists({ limit, includeSystem, includeUser }) {
         .filter((entry) => entry.isFile() && entry.name.endsWith(".plist"))
         .map((entry) => entry.name)
         .sort();
-      files.push(...names.slice(0, limit).map((name) => ({ path: path.join(directory, name), scope })));
-      probes.push({ source: "launchd_plist_directory", status: "ok", path: directory, truncated: names.length > limit, file_count: names.length, job_count: 0 });
+      const candidateLimit = Math.min(MAX_LAUNCHD_PLIST_CANDIDATES, Math.max(limit * 10, limit));
+      files.push(...names.slice(0, candidateLimit).map((name) => ({ path: path.join(directory, name), scope })));
+      probes.push({ source: "launchd_plist_directory", status: "ok", path: directory, truncated: names.length > candidateLimit, file_count: names.length, inspected_candidate_count: Math.min(names.length, candidateLimit), job_count: 0 });
     } catch (error) {
       probes.push({ source: "launchd_plist_directory", status: "unable", path: directory, error: error instanceof Error ? error.message : String(error), job_count: 0 });
     }
   }
-  return { files: files.slice(0, limit), probes };
+  return { files: files.slice(0, MAX_LAUNCHD_PLIST_CANDIDATES), probes };
 }
 
 async function collectLaunchdScheduledJobs({ limit, includeSystem, includeUser }) {
@@ -417,11 +444,37 @@ async function collectLaunchdScheduledJobs({ limit, includeSystem, includeUser }
   return { jobs, probes };
 }
 
-function summarizeScheduledJobs(jobs, probes, { limit }) {
-  const byKind = jobs.reduce((acc, job) => {
+function countByKind(jobs) {
+  return jobs.reduce((acc, job) => {
     acc[job.kind] = (acc[job.kind] ?? 0) + 1;
     return acc;
   }, {});
+}
+
+export function selectScheduledJobsFairly(jobs, limit) {
+  const buckets = new Map();
+  for (const job of jobs) {
+    const key = `${job.source ?? "unknown"}:${job.kind ?? "unknown"}`;
+    const bucket = buckets.get(key) ?? [];
+    bucket.push(job);
+    buckets.set(key, bucket);
+  }
+
+  const selected = [];
+  const keys = [...buckets.keys()];
+  while (selected.length < limit && keys.length > 0) {
+    for (let index = 0; index < keys.length && selected.length < limit;) {
+      const bucket = buckets.get(keys[index]);
+      const next = bucket.shift();
+      if (next) selected.push(next);
+      if (bucket.length === 0) keys.splice(index, 1);
+      else index += 1;
+    }
+  }
+  return selected;
+}
+
+function summarizeScheduledJobs(returnedJobs, allJobs, probes, { limit }) {
   const unavailableSources = probes.filter((probe) => probe.status === "unable").map((probe) => ({
     source: probe.source,
     path: probe.path,
@@ -430,8 +483,10 @@ function summarizeScheduledJobs(jobs, probes, { limit }) {
     stderr: probe.stderr,
   })).slice(0, limit);
   return {
-    total_count: jobs.length,
-    by_kind: byKind,
+    total_count: allJobs.length,
+    returned_count: returnedJobs.length,
+    by_kind: countByKind(allJobs),
+    returned_by_kind: countByKind(returnedJobs),
     unavailable_count: probes.filter((probe) => probe.status === "unable").length,
     unavailable_sources: unavailableSources,
   };
@@ -479,15 +534,16 @@ export async function collectScheduledJobsEvidence(options = {}) {
 
     const probes = [...cron.probes, ...platformProbes];
     const allJobs = [...cron.jobs, ...platformJobs];
-    const jobs = allJobs.slice(0, request.job_limit);
+    const jobs = selectScheduledJobsFairly(allJobs, request.job_limit);
+    const truncated = allJobs.length > jobs.length || probes.some((probe) => probe.truncated);
     const status = overallProbeStatus(probes);
     return {
       platform: process.platform,
       status,
       request,
-      summary: summarizeScheduledJobs(jobs, probes, { limit: request.job_limit }),
+      summary: summarizeScheduledJobs(jobs, allJobs, probes, { limit: request.job_limit }),
       jobs,
-      truncated: allJobs.length > jobs.length,
+      truncated,
       probes,
       note: "Scheduled job evidence is read-only and bounded; command lines are redacted for obvious secrets but remain sensitive diagnostic artifacts.",
     };

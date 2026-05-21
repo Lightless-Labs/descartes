@@ -43,7 +43,7 @@ descartes --help
 
 Expected:
 
-- Version should be latest, currently `0.0.24` or newer.
+- Version should be latest, currently `0.0.25` or newer.
 - Help works from npm symlink.
 
 ### 2. Built-in test suite if repo checkout exists
@@ -55,7 +55,7 @@ npm test
 Expected:
 
 - All tests pass.
-- Current expected count is around **106** tests, but do not fail solely on count drift if pass/fail is clean.
+- Current expected count is around **111** tests, but do not fail solely on count drift if pass/fail is clean.
 
 ### 3. Direct collector smoke: scheduled job evidence
 
@@ -308,6 +308,7 @@ Then run `collect_scheduled_jobs`.
 Expected:
 
 - User crontab absence is `absent`, not a fatal failure.
+- Large cron files are size-checked and read with a byte cap before parsing; non-regular cron paths are represented as unavailable.
 - Systemd timers are parsed into `kind: "systemd_timer"` jobs with `unit` and `activates` where present.
 - Cron entries from `/etc/crontab` and `/etc/cron.d` preserve schedule/user fields and redact obvious secrets in command text.
 - Permission-limited cron directories/files are represented as unavailable sources rather than panics.
@@ -333,6 +334,7 @@ Expected:
 - If a selected `ntpq` peer or chrony offset exists, offset is represented in seconds.
 - No clock-setting commands are run.
 - Do not run the optional `checkOffset: true` mode unless you explicitly want an external NTP query.
+- If `checkOffset: true` is tested, server values starting with `-` or containing whitespace/path separators should be rejected before any `sntp` command is run.
 
 ### I. Multipass / VirtualBox / Xen / Proxmox
 

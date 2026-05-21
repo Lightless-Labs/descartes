@@ -20,11 +20,22 @@ function boundedString(value, max = 240) {
   return truncate(String(value), max);
 }
 
+export function validateNtpServer(value) {
+  const server = boundedString(value, 253);
+  if (server === undefined) return { server: undefined };
+  if (server.startsWith("-")) return { server: undefined, error: "NTP server must not start with '-'" };
+  if (/\s/.test(server)) return { server: undefined, error: "NTP server must not contain whitespace" };
+  if (server.includes("/") || server.includes("\\")) return { server: undefined, error: "NTP server must be a hostname or IP address, not a path" };
+  if (!/^[A-Za-z0-9.:-]+$/.test(server)) return { server: undefined, error: "NTP server contains unsupported characters" };
+  return { server };
+}
+
 export function normalizeTimeSyncRequest(options = {}) {
-  const server = boundedString(options.server, 253);
+  const server = validateNtpServer(options.server);
   return {
     check_offset: clampBoolean(options.checkOffset ?? options.check_offset, false),
-    server,
+    ...(server.server !== undefined ? { server: server.server } : {}),
+    ...(server.error !== undefined ? { server_error: server.error } : {}),
   };
 }
 
@@ -237,11 +248,15 @@ async function collectLinuxTimeSync(request) {
   probes.push({ source: "ntpq_peers", status: ntpq.status, optional: true, command: ntpq.command, stderr: ntpq.stderr, error: ntpq.error, result_count: peers.length });
 
   if (request.check_offset) {
-    const server = request.server ?? "pool.ntp.org";
-    const sntp = await runFixedCommand("sntp", ["-t", "2", server], { timeout: 4000, network: true });
-    const sntpParsed = sntp.status === "ok" ? parseSntpOutput(sntp.stdout) : {};
-    if (sntp.status === "ok") result.sntp_offset = sntpParsed;
-    probes.push({ source: "sntp_offset", status: sntp.status, optional: true, command: sntp.command, stderr: sntp.stderr, error: sntp.error, parsed: sntpParsed });
+    if (request.server_error) {
+      probes.push({ source: "sntp_offset", status: "unable", optional: true, error: request.server_error, parsed: {} });
+    } else {
+      const server = request.server ?? "pool.ntp.org";
+      const sntp = await runFixedCommand("sntp", ["-t", "2", server], { timeout: 4000, network: true });
+      const sntpParsed = sntp.status === "ok" ? parseSntpOutput(sntp.stdout) : {};
+      if (sntp.status === "ok") result.sntp_offset = sntpParsed;
+      probes.push({ source: "sntp_offset", status: sntp.status, optional: true, command: sntp.command, stderr: sntp.stderr, error: sntp.error, parsed: sntpParsed });
+    }
   }
 
   return { result, probes };
@@ -264,23 +279,27 @@ async function collectMacTimeSync(request) {
   probes.push({ source: "systemsetup_network_server", status: networkServer.status, command: networkServer.command, stderr: networkServer.stderr, error: networkServer.error, parsed: parseMacSystemsetup(networkServer.stdout) });
 
   if (request.check_offset) {
-    const server = request.server ?? result.network_time_server ?? "time.apple.com";
-    const sntp = await runFixedCommand("sntp", ["-t", "2", server], { timeout: 4000, network: true });
-    const sntpParsed = sntp.status === "ok" ? parseSntpOutput(sntp.stdout) : {};
-    if (sntp.status === "ok") result.sntp_offset = sntpParsed;
-    probes.push({ source: "sntp_offset", status: sntp.status, optional: true, command: sntp.command, stderr: sntp.stderr, error: sntp.error, parsed: sntpParsed });
+    if (request.server_error) {
+      probes.push({ source: "sntp_offset", status: "unable", optional: true, error: request.server_error, parsed: {} });
+    } else {
+      const server = request.server ?? result.network_time_server ?? "time.apple.com";
+      const sntp = await runFixedCommand("sntp", ["-t", "2", server], { timeout: 4000, network: true });
+      const sntpParsed = sntp.status === "ok" ? parseSntpOutput(sntp.stdout) : {};
+      if (sntp.status === "ok") result.sntp_offset = sntpParsed;
+      probes.push({ source: "sntp_offset", status: sntp.status, optional: true, command: sntp.command, stderr: sntp.stderr, error: sntp.error, parsed: sntpParsed });
+    }
   }
 
   return { result, probes };
 }
 
-function summarize(result, probes) {
+export function summarizeTimeSync(result, probes) {
   const selectedNtpqOffset = result.ntpq?.selected_peer?.offset_ms;
   const offsetSeconds = result.chrony?.system_time_offset_seconds
     ?? result.sntp_offset?.offset_seconds
     ?? (Number.isFinite(selectedNtpqOffset) ? selectedNtpqOffset / 1000 : undefined);
-  const synchronized = result.synchronized ?? (result.timed_service?.running ? undefined : false);
-  const ntpEnabled = result.ntp_enabled ?? result.network_time_enabled;
+  const synchronized = result.synchronized;
+  const ntpEnabled = result.ntp_enabled ?? result.network_time_enabled ?? result.ntp_service_active;
   return {
     synchronized,
     ntp_enabled: ntpEnabled,
@@ -332,7 +351,7 @@ export async function collectTimeSyncEvidence(options = {}) {
       probes: [{ source: "platform_time_sync", status: "unsupported", error: `unsupported platform: ${process.platform}` }],
     };
 
-    const summary = summarize(collected.result, collected.probes);
+    const summary = summarizeTimeSync(collected.result, collected.probes);
     const status = overallStatus(summary, collected.probes);
     return {
       platform: process.platform,

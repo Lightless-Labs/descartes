@@ -27,6 +27,7 @@
 **Addendum:** 2026-05-20 — VM parity was deepened and package metadata was bumped to v0.0.22: `collect_vms` now also covers Parallels, VMware, UTM app/process detection, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, and direct QEMU/VMware/UTM process hints.
 **Addendum:** 2026-05-21 — scheduled job basics were added and package metadata was bumped to v0.0.23: guarded triage can call `collect_scheduled_jobs` for bounded read-only cron, Linux systemd timer, and macOS launchd scheduled job evidence with command redaction and fixed probes.
 **Addendum:** 2026-05-21 — time sync basics were added and package metadata was bumped to v0.0.24: guarded triage can call `collect_time_sync` for read-only local clock/NTP state on Linux/macOS plus optional bounded NTP offset checks when directly relevant.
+**Addendum:** 2026-05-21 — review hardening was added and package metadata was bumped to v0.0.25: `collect_time_sync` now rejects NTP server option/path injection and preserves unknown sync state as unknown; `collect_scheduled_jobs` now pre-bounds cron file reads and fairly selects returned jobs across scheduler sources with discovered/returned counts.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
+  MAX_CRON_FILE_BYTES,
   normalizeScheduledJobsRequest,
   parseCronContent,
   parseLaunchdPlistObject,
   parseSystemctlListTimers,
+  readCronFile,
+  selectScheduledJobsFairly,
 } from "../src/tools/scheduled-jobs.js";
 
 test("normalizeScheduledJobsRequest clamps limits and preserves include flags", () => {
@@ -50,6 +56,41 @@ SHELL=/bin/sh
       command_redaction: { redacted: true, truncated: false, original_length: 37, max_length: 260 },
     },
   ]);
+});
+
+test("readCronFile bounds large cron files before parsing", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-cron-"));
+  const file = path.join(tmp, "huge-crontab");
+  try {
+    await fs.writeFile(file, `* * * * * root /usr/local/bin/first\n${"#".repeat(MAX_CRON_FILE_BYTES + 1000)}`);
+    const result = await readCronFile(file, { source: "system_crontab", path: file, hasUserField: true });
+    assert.equal(result.status, "ok");
+    assert.equal(result.truncated, true);
+    assert.equal(result.jobs.length, 1);
+    assert.equal(result.jobs[0].command, "/usr/local/bin/first");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("readCronFile rejects non-regular files", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-cron-"));
+  const directory = path.join(tmp, "not-a-file");
+  try {
+    await fs.mkdir(directory);
+    const result = await readCronFile(directory, { source: "system_crontab", path: directory, hasUserField: true });
+    assert.equal(result.status, "unable");
+    assert.equal(result.error, "not a regular file");
+    assert.deepEqual(result.jobs, []);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("selectScheduledJobsFairly prevents one scheduler source from hiding another", () => {
+  const cronJobs = Array.from({ length: 4 }, (_value, index) => ({ kind: "cron", source: "cron_d", command: `cron-${index}` }));
+  const timer = { kind: "systemd_timer", source: "systemd_timers", unit: "fstrim.timer" };
+  assert.deepEqual(selectScheduledJobsFairly([...cronJobs, timer], 3), [cronJobs[0], timer, cronJobs[1]]);
 });
 
 test("parseCronContent parses system crontab user fields", () => {

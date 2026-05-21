@@ -53,7 +53,7 @@ Use `evidenceEnvelope()` and `timedEnvelope()` from `envelope.js` unless there i
 
 - Read-only by default; no mutating host action.
 - No arbitrary shell strings. Use fixed commands and argument arrays through `execFile`.
-- Bound output size, item counts, timeouts, and sample duration.
+- Bound output size, item counts, timeouts, sample duration, and file reads before parsing untrusted/local scheduler content.
 - Represent missing tools, unsupported platforms, permissions, and daemon/socket failures as structured `unknown`/`unable` evidence rather than throwing or panicking.
 - Capture command argv, read-only intent, stderr/error boundaries, and per-probe status when shelling out.
 - Redact obvious secrets from process args, log excerpts, scheduled commands, and process-backed hints.
@@ -68,7 +68,7 @@ Most collectors should not contact the network. If a collector can contact the n
 Current network-capable behavior:
 
 - `collect_network_basics` may perform a DNS lookup for reachability unless disabled by `check_dns_reachability: false`.
-- `collect_time_sync` only performs an external NTP offset probe when `check_offset: true` is requested.
+- `collect_time_sync` only performs an external NTP offset probe when `check_offset: true` is requested, and validates the server value so it cannot become an `sntp` option.
 
 ## Adding a collector
 

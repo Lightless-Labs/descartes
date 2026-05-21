@@ -9,6 +9,8 @@ import {
   parseSntpOutput,
   parseTimedatectlShow,
   parseTimedatectlStatus,
+  summarizeTimeSync,
+  validateNtpServer,
 } from "../src/tools/time-sync.js";
 
 test("normalizeTimeSyncRequest preserves bounded offset options", () => {
@@ -18,8 +20,30 @@ test("normalizeTimeSyncRequest preserves bounded offset options", () => {
   });
   assert.deepEqual(normalizeTimeSyncRequest({}), {
     check_offset: false,
-    server: undefined,
   });
+});
+
+test("validateNtpServer rejects sntp option injection and non-host values", () => {
+  assert.deepEqual(validateNtpServer("-s"), { server: undefined, error: "NTP server must not start with '-'" });
+  assert.deepEqual(validateNtpServer("-S"), { server: undefined, error: "NTP server must not start with '-'" });
+  assert.deepEqual(validateNtpServer("time.apple.com --bogus"), { server: undefined, error: "NTP server must not contain whitespace" });
+  assert.deepEqual(validateNtpServer("/tmp/socket"), { server: undefined, error: "NTP server must be a hostname or IP address, not a path" });
+  assert.deepEqual(validateNtpServer("2001:db8::123"), { server: "2001:db8::123" });
+});
+
+test("summarizeTimeSync keeps unknown synchronization state unknown", () => {
+  assert.deepEqual(summarizeTimeSync({}, [{ source: "timedatectl_show", status: "unable" }]), {
+    synchronized: undefined,
+    ntp_enabled: undefined,
+    timezone: undefined,
+    local_rtc: undefined,
+    time_service_running: undefined,
+    offset_seconds: undefined,
+    offset_source: undefined,
+    required_unavailable_count: 1,
+    optional_unavailable_count: 0,
+  });
+  assert.equal(summarizeTimeSync({ ntp_service_active: true }, []).ntp_enabled, true);
 });
 
 test("parseTimedatectlShow extracts Linux time sync fields", () => {

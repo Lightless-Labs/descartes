@@ -163,11 +163,11 @@ Collects bounded scheduled job evidence.
 Sources:
 
 - User cron: fixed `crontab -l`.
-- System cron: bounded reads of `/etc/crontab`, `/etc/cron.d`, cron/periodic directories where present.
+- System cron: regular-file-checked, byte-capped reads of `/etc/crontab`, `/etc/cron.d`, cron/periodic directories where present.
 - Linux timers: fixed `systemctl list-timers --all --no-pager --no-legend` and `systemctl --user list-timers --all --no-pager --no-legend`.
 - macOS scheduled launchd jobs: bounded reads of launchd plist paths through fixed `plutil -convert json -o - <plist>`.
 
-Behavior: absent user crontabs and missing/permission-limited scheduler sources are represented per probe. No scheduled jobs are modified.
+Behavior: absent user crontabs, non-regular cron paths, oversized cron files, and missing/permission-limited scheduler sources are represented per probe. Returned jobs are selected fairly across scheduler sources so one source cannot hide all others. No scheduled jobs are modified.
 
 Privacy: scheduled job labels, paths, schedules, users, and commands can be sensitive. Commands are bounded/redacted for obvious secrets best effort.
 
@@ -179,9 +179,9 @@ Sources:
 
 - Linux: fixed `timedatectl show`, `timedatectl status --no-pager`, optional `chronyc tracking`, optional `ntpq -pn`.
 - macOS: fixed `launchctl print system/com.apple.timed`, best-effort `/usr/sbin/systemsetup -getusingnetworktime`, and `/usr/sbin/systemsetup -getnetworktimeserver`.
-- Optional direct offset check: fixed `sntp -t 2 <server>` only when `check_offset: true` is requested.
+- Optional direct offset check: fixed `sntp -t 2 <server>` only when `check_offset: true` is requested. Server values are validated as host/IP-like values and rejected if they could be interpreted as options or paths.
 
-Network: only `check_offset: true` contacts the requested/default NTP server. The collector never uses `sntp -s`, `sntp -S`, or other clock-setting actions.
+Network: only `check_offset: true` contacts the requested/default NTP server. The collector rejects server values such as `-s`/`-S` before invoking `sntp` and never uses clock-setting actions.
 
 Privacy: may include timezone, local RTC setting, NTP synchronization state, NTP server names/peers, and offset estimates.
 
