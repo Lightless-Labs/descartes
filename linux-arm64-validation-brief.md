@@ -2,7 +2,7 @@
 
 ## Goal
 
-Validate Descartes VM/container/runtime collectors on **Linux ARM64 only** for now, across representative distributions. Focus on graceful behavior, parser/runtime compatibility, and no mutating actions.
+Validate Descartes VM/container/runtime collectors and scheduled-job evidence on **Linux ARM64 only** for now, across representative distributions. Focus on graceful behavior, parser/runtime compatibility, and no mutating actions.
 
 ## Target Distributions
 
@@ -43,7 +43,7 @@ descartes --help
 
 Expected:
 
-- Version should be latest, currently `0.0.22` or newer.
+- Version should be latest, currently `0.0.23` or newer.
 - Help works from npm symlink.
 
 ### 2. Built-in test suite if repo checkout exists
@@ -55,9 +55,54 @@ npm test
 Expected:
 
 - All tests pass.
-- Current expected count is around **92** tests, but do not fail solely on count drift if pass/fail is clean.
+- Current expected count is around **98** tests, but do not fail solely on count drift if pass/fail is clean.
 
-### 3. Direct collector smoke: VM evidence
+### 3. Direct collector smoke: scheduled job evidence
+
+From repo checkout:
+
+```bash
+node --input-type=module -e '
+import { collectScheduledJobsEvidence } from "./tools/descartes-cli/src/tools/scheduled-jobs.js";
+const e = await collectScheduledJobsEvidence({ jobLimit: 20 });
+console.log(JSON.stringify({
+  id: e.id,
+  status: e.status,
+  summary: e.result.summary,
+  job_count: e.result.jobs.length,
+  jobs: e.result.jobs.slice(0, 10).map(j => ({
+    kind: j.kind,
+    source: j.source,
+    scope: j.scope,
+    schedule: j.schedule,
+    unit: j.unit,
+    activates: j.activates,
+    path: j.path,
+    command: j.command,
+    command_redaction: j.command_redaction
+  })),
+  probes: e.result.probes.map(p => ({
+    source: p.source,
+    status: p.status,
+    path: p.path,
+    command: p.command,
+    job_count: p.job_count,
+    error: p.error,
+    stderr: p.stderr
+  }))
+}, null, 2));
+'
+```
+
+Expected:
+
+- Returns a single `scheduled-jobs` envelope.
+- No crash if `crontab` or `systemctl --user` are missing/unavailable.
+- Cron/systemd timer probe failures are represented per source.
+- Scheduled command lines are bounded and redact obvious secrets.
+- Linux `systemctl list-timers --all --no-pager --no-legend` parsing works where systemd is present.
+
+### 4. Direct collector smoke: VM evidence
 
 From repo checkout:
 
@@ -95,7 +140,7 @@ Expected:
 - Permission/daemon failures are represented, not fatal.
 - `ps` process scan probe should work on Linux ARM64.
 
-### 4. Direct collector smoke: container evidence
+### 5. Direct collector smoke: container evidence
 
 ```bash
 node --input-type=module -e '
@@ -129,7 +174,7 @@ Run what is feasible per distribution. It is okay if not all runtimes are instal
 
 ### A. Empty/minimal host
 
-No Docker/Podman/libvirt/etc installed.
+No Docker/Podman/libvirt/etc installed. Cron/systemd tools may or may not be present depending image type.
 
 Expected:
 
@@ -137,6 +182,7 @@ Expected:
 - Runtimes listed with `missing`.
 - `summary.vm_count: 0`.
 - `collect_containers` similarly reports missing runtimes.
+- `collect_scheduled_jobs` returns `scheduled-jobs` without crashing; absent crontab/timer sources are represented as absent/unable per probe.
 
 ### B. Podman installed, no machines/containers
 
@@ -212,7 +258,28 @@ Expected:
 - Permission/daemon issues are represented.
 - If VM instances exist, only `type: "virtual-machine"` entries should become VMs; containers should be ignored by `collect_vms`.
 
-### G. Multipass / VirtualBox / Xen / Proxmox
+### G. Cron and systemd timers
+
+On systemd distributions, inspect externally with fixed read-only commands:
+
+```bash
+crontab -l || true
+systemctl list-timers --all --no-pager --no-legend || true
+systemctl --user list-timers --all --no-pager --no-legend || true
+ls -la /etc/cron.d /etc/cron.daily /etc/cron.weekly /etc/cron.monthly 2>/dev/null || true
+```
+
+Then run `collect_scheduled_jobs`.
+
+Expected:
+
+- User crontab absence is `absent`, not a fatal failure.
+- Systemd timers are parsed into `kind: "systemd_timer"` jobs with `unit` and `activates` where present.
+- Cron entries from `/etc/crontab` and `/etc/cron.d` preserve schedule/user fields and redact obvious secrets in command text.
+- Permission-limited cron directories/files are represented as unavailable sources rather than panics.
+- No mutating scheduler commands are run.
+
+### H. Multipass / VirtualBox / Xen / Proxmox
 
 Only if naturally available on the ARM64 target.
 
@@ -230,13 +297,20 @@ With credentials available:
 descartes triage "do I have any containers or VMs running?" --json
 ```
 
+And, if credentials are available, a scheduler-targeted prompt:
+
+```bash
+descartes triage "do I have any scheduled jobs or timers that could be causing recurring load?" --json
+```
+
 Expected:
 
-- `diagnostics.active_tools` includes guarded tool list, including `collect_containers` and `collect_vms`.
-- Model should call `collect_containers` and `collect_vms` for this prompt.
+- `diagnostics.active_tools` includes guarded tool list, including `collect_containers`, `collect_vms`, and `collect_scheduled_jobs`.
+- Model should call `collect_containers` and `collect_vms` for the containers/VMs prompt.
+- Model should call `collect_scheduled_jobs` for the scheduler/timers prompt.
 - `fallback_used: false` if auth/model succeeds.
 - `actions_taken: []`.
-- Final diagnosis cites `containers` and/or `vms` envelope IDs.
+- Final diagnosis cites relevant envelope IDs such as `containers`, `vms`, and/or `scheduled-jobs`.
 - No arbitrary shell/coding tools appear.
 
 If no credentials:
@@ -257,12 +331,12 @@ descartes --version
 Installed relevant tools:
 
 ```bash
-command -v docker podman virsh qemu-system-aarch64 qemu-system-x86_64 limactl multipass VBoxManage incus lxc qm xl || true
+command -v crontab systemctl docker podman virsh qemu-system-aarch64 qemu-system-x86_64 limactl multipass VBoxManage incus lxc qm xl || true
 ```
 
 Include:
 
-- Collector JSON summaries from VM/container smoke commands.
+- Collector JSON summaries from scheduled-job, VM, and container smoke commands.
 - Any stderr/errors classified incorrectly.
 - Whether any command hung or exceeded timeout.
 - Whether any runtime output format failed to parse despite command success.

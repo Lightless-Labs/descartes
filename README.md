@@ -70,6 +70,7 @@ Current collectors include:
 - bounded recent logs: warnings/errors plus fail2ban/firewall-oriented signals where available
 - container basics: Docker, Podman, Colima, and Lima runtime/container inventory where available
 - VM basics: Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like process hints where available
+- scheduled job basics: cron, systemd timers on Linux, and launchd scheduled jobs on macOS
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
 

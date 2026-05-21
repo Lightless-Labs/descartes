@@ -13,6 +13,7 @@ import { collectDiskEvidence } from "./tools/disks.js";
 import { collectRecentLogsEvidence } from "./tools/logs.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEvidence } from "./tools/processes.js";
+import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectVmEvidence } from "./tools/vms.js";
@@ -114,10 +115,26 @@ export function createEvidenceTools(paths) {
     defineTool({
       name: "collect_vms",
       label: "Collect VM inventory",
-      description: "Collect bounded read-only VM runtime and inventory evidence for Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like processes where available. No VM actions are taken."
+      description: "Collect bounded read-only VM runtime and inventory evidence for Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like processes where available. No VM actions are taken.",
       parameters: Type.Object({ vm_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })) }),
       executionMode: "parallel",
       execute: async (_id, params) => jsonToolResult(await collectVmEvidence({ vmLimit: params.vm_limit ?? 80 })),
+    }),
+    defineTool({
+      name: "collect_scheduled_jobs",
+      label: "Collect scheduled jobs",
+      description: "Collect bounded read-only cron, systemd timer, and launchd scheduled job evidence using fixed local probes. No scheduled jobs are modified.",
+      parameters: Type.Object({
+        job_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+        include_system: Type.Optional(Type.Boolean()),
+        include_user: Type.Optional(Type.Boolean()),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectScheduledJobsEvidence({
+        jobLimit: params.job_limit ?? 80,
+        includeSystem: params.include_system ?? true,
+        includeUser: params.include_user ?? true,
+      })),
     }),
     defineTool({
       name: "inspect_process",
@@ -202,8 +219,9 @@ Preferred flow:
 6. If the complaint involves crashes, reboots, authentication failures, fail2ban, firewall blocks, denied traffic, or recent error context, call collect_recent_logs with tight bounds rather than guessing. Treat log excerpts as sensitive.
 7. If the complaint involves Docker, Podman, Colima, Lima, containers, images, container ports, or container resource use, call collect_containers rather than guessing. Do not suggest start/stop/delete/prune actions as already taken.
 8. If the complaint involves VMs, Tart, UTM, Parallels, VMware, Lima VMs, Multipass, VirtualBox, libvirt, virsh, KVM, QEMU, Podman machine, Incus/LXD VMs, Proxmox, Xen, hypervisors, or a general “containers or VMs” inventory, call collect_vms as well as collect_containers when relevant rather than inferring only from processes.
-9. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
-10. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+9. If the complaint involves cron, launchd scheduled jobs, systemd timers, periodic tasks, startup timers, or unexplained recurring/sporadic workload, call collect_scheduled_jobs rather than guessing.
+10. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+11. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {
