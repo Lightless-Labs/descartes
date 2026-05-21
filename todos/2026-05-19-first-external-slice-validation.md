@@ -80,7 +80,13 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 - Evidence collection policy decision: normal `triage` remains model-led and does not precollect evidence before the LLM turn; the model must use guarded Descartes evidence tools. `--no-investigate` remains the degraded no-tool escape hatch and still precollects deterministic evidence.
 - v0.0.8 GitHub-installed JSON validation succeeded after tool-forcing: `fallback_used: false`, selected `openai-codex/gpt-5.5`, active tools exactly matched the guarded Descartes tool set, the model called `collect_triage_evidence`, evidence refs were envelope IDs (`system-overview`, `top-processes`, `disk-usage`), and `actions_taken: []`.
 - Linux x86_64 validation is deferred because no Linux host is currently available. Future Buildkite validation is tracked separately in `todos/2026-05-19-linux-ci-validation.md`; credentials should be supplied through CI secrets and scoped to validation.
-- Future hardening: add a normal-investigation guard that rejects/retries/degrades if the model returns a diagnosis without tool calls or collected evidence.
+2026-05-21 collector/readiness update:
+
+- Current checked command: `npm test` passes 111 Node test cases.
+- Current checked command: `npm run pack:dry-run` passes for v0.0.25 and includes README, `docs/reference/collectors.md`, and runtime collector files.
+- Guarded tool surface now includes all current read-only collector tools: system, processes, disks, network, services, logs, containers, VMs, scheduled jobs, time sync, process inspection, parent tree inspection, temporal sampling/artifacts, triage bundle, and deterministic findings.
+- The normal-investigation no-evidence guard is complete: model-led triage retries once if assistant text arrives without evidence, then degrades to deterministic precollection fallback if still empty.
+- Scheduled-job and time-sync collectors were hardened after read-only review; Linux validation should use v0.0.25+.
 
 ## Acceptance Criteria
 
