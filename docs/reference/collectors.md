@@ -10,7 +10,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 
 - Collectors are read-only and must not mutate host state.
 - No arbitrary shell/coding tools are exposed to the triage agent.
-- Local evidence may include sensitive operational facts such as hostnames, usernames where relevant, process names, redacted command lines, service names, log excerpts, container/VM names, network listeners, mount paths, scheduled commands, NTP peers, and local paths.
+- Local evidence may include sensitive operational facts such as hostnames, usernames where relevant, process names, redacted command lines, service names, log excerpts, container/VM names, network listeners, mount paths, scheduled commands, NTP peers, certificate subjects/issuers/fingerprints, and local paths.
 - Redaction is best effort and does not make reports safe for broad sharing.
 - Evidence may be sent to the selected LLM provider only for an explicit user-requested triage flow.
 
@@ -28,6 +28,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 | `collect_vms` | `vms` | macOS, Linux | `vm_limit?: 1..200` |
 | `collect_scheduled_jobs` | `scheduled-jobs` | macOS, Linux | `job_limit?: 1..200`, `include_system?: boolean`, `include_user?: boolean` |
 | `collect_time_sync` | `time-sync` | macOS, Linux | `check_offset?: boolean`, `server?: string` |
+| `collect_certificates` | `certificates` | macOS, Linux | `warning_days?: 1..3650`, `certificate_limit?: 1..500` |
 | `inspect_process` | `process-<pid>` | macOS, Linux | `pid: number` |
 | `inspect_parent_tree` | `parent-tree-<pid>` | macOS, Linux | `pid: number`, `max_depth?: 1..64` |
 | `sample_dimension` | `sample-<dimension>` | macOS, Linux | `dimension`, `duration_seconds?: 1..60`, `interval_seconds?: 1..60`, `top_n?: 1..20`, `aggregation?: ...` |
@@ -152,9 +153,9 @@ Sources:
 - Linux/common: libvirt/virsh, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, direct QEMU/VMware process hints.
 - Fixed process snapshots for direct VM-like process hints.
 
-Behavior: missing commands, unsupported runtimes, daemon failures, and permission limitations are represented per runtime/probe. No VM mutating commands are exposed.
+Behavior: missing commands, unsupported runtimes, daemon failures, and permission limitations are represented per runtime/probe. Direct QEMU/VMware/UTM process hints are correlated back into matching runtime inventory entries when names/runtimes match, so resource snapshots can be attached without double-counting the VM. No VM mutating commands are exposed.
 
-Privacy: may include VM names, local paths, runtime metadata, IP addresses where reported by runtime tools, and bounded/redacted process hints.
+Privacy: may include VM names, local paths, runtime metadata, IP addresses where reported by runtime tools, resource snapshots, and bounded/redacted process hints.
 
 ### `collect_scheduled_jobs`
 
@@ -184,6 +185,19 @@ Sources:
 Network: only `check_offset: true` contacts the requested/default NTP server. The collector rejects server values such as `-s`/`-S` before invoking `sntp` and never uses clock-setting actions.
 
 Privacy: may include timezone, local RTC setting, NTP synchronization state, NTP server names/peers, and offset estimates.
+
+### `collect_certificates`
+
+Collects bounded local certificate validity evidence. It is intended for TLS/certificate expiry, local trust-store, Let's Encrypt, and common web-server certificate questions. It does not read private keys.
+
+Sources:
+
+- Linux/common paths: `/etc/ssl/certs`, `/etc/ssl/cert.pem`, `/usr/local/share/ca-certificates`, `/etc/pki/tls/certs`, `/etc/letsencrypt/live`, and common nginx/apache/httpd SSL directories when present.
+- macOS/common paths: `/etc/ssl/certs`, `/etc/ssl/cert.pem`, Homebrew certificate stores, and fixed read-only `security find-certificate -a -p` probes for system root/system keychains.
+
+Behavior: file reads are regular-file checked, byte bounded, count bounded, and selected results prioritize expired/soon-expiring certificates. Missing common paths are represented per source. Private-key filenames such as `privkey.pem` are intentionally skipped.
+
+Privacy: certificate subjects, issuers, serial/fingerprint prefixes, keychain names, and local certificate paths can reveal domains, organizations, host roles, and internal infrastructure names.
 
 ### `sample_dimension`
 

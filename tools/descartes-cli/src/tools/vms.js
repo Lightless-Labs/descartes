@@ -658,13 +658,85 @@ export function mergeRuntimes(runtimes) {
   return [...byName.values()];
 }
 
-function summarize(runtimes, vms) {
+function normalizedIdentity(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function isProcessVmHint(vm) {
+  return vm?.resource_snapshot?.pid !== undefined && vm.confidence <= 0.4 && ["qemu", "vmware", "utm"].includes(vm.runtime);
+}
+
+function compatibleProcessRuntime(processRuntimeName, runtimeName) {
+  if (processRuntimeName === runtimeName) return true;
+  if (processRuntimeName === "qemu") return ["libvirt", "proxmox", "incus", "lxd"].includes(runtimeName);
+  return false;
+}
+
+function vmProcessMatchScore(vm, processHint) {
+  if (!compatibleProcessRuntime(processHint.runtime, vm.runtime)) return 0;
+  if (vm.state && processHint.state && vm.state !== processHint.state) return 0;
+
+  const vmName = normalizedIdentity(vm.name ?? vm.id);
+  const hintName = normalizedIdentity(processHint.name ?? processHint.id);
+  if (vmName && hintName && vmName === hintName) return processHint.runtime === vm.runtime ? 4 : 3;
+
+  const vmOwner = normalizedIdentity(vm.owner_hint);
+  const hintOwner = normalizedIdentity(processHint.owner_hint);
+  if (vmOwner && hintOwner && (hintOwner.includes(vmOwner) || vmOwner.includes(hintOwner))) return processHint.runtime === vm.runtime ? 3 : 2;
+  if (vmName && hintOwner && hintOwner.includes(vmName)) return processHint.runtime === vm.runtime ? 3 : 2;
+  return 0;
+}
+
+export function correlateVmProcessHints(vms) {
+  const inventory = vms.filter((vm) => !isProcessVmHint(vm));
+  const processHints = vms.filter(isProcessVmHint);
+  const correlatedHintIndexes = new Set();
+  const correlatedInventory = inventory.map((vm) => ({ ...vm }));
+
+  for (const [hintIndex, processHint] of processHints.entries()) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    for (const [vmIndex, vm] of correlatedInventory.entries()) {
+      const score = vmProcessMatchScore(vm, processHint);
+      if (score > bestScore) {
+        bestIndex = vmIndex;
+        bestScore = score;
+      }
+    }
+    if (bestIndex === -1) continue;
+    const target = correlatedInventory[bestIndex];
+    correlatedInventory[bestIndex] = {
+      ...target,
+      resource_snapshot: target.resource_snapshot ?? processHint.resource_snapshot,
+      process_correlation: {
+        source: "vm_process_scan",
+        pid: processHint.resource_snapshot.pid,
+        runtime: processHint.runtime,
+        confidence: Math.min(0.95, 0.5 + bestScore / 10),
+        owner_hint: processHint.owner_hint,
+        owner_hint_redaction: processHint.owner_hint_redaction,
+      },
+    };
+    correlatedHintIndexes.add(hintIndex);
+  }
+
+  const uncorrelatedProcessHints = processHints.filter((_hint, index) => !correlatedHintIndexes.has(index));
+  return {
+    vms: [...correlatedInventory, ...uncorrelatedProcessHints],
+    correlated_process_count: correlatedHintIndexes.size,
+    uncorrelated_process_hint_count: uncorrelatedProcessHints.length,
+  };
+}
+
+function summarize(runtimes, vms, correlation = {}) {
   return {
     runtime_count: runtimes.length,
     available_runtime_count: runtimes.filter((runtime) => runtime.available).length,
     vm_count: vms.length,
     running_vm_count: vms.filter((vm) => vm.state === "running").length,
     stopped_vm_count: vms.filter((vm) => vm.state === "stopped").length,
+    correlated_process_count: correlation.correlated_process_count ?? 0,
+    uncorrelated_process_hint_count: correlation.uncorrelated_process_hint_count ?? 0,
   };
 }
 
@@ -702,7 +774,9 @@ export async function collectVmEvidence(options = {}) {
       processVms(request),
     ]);
     const runtimes = mergeRuntimes(results.flatMap((result) => result.runtimes ?? [result.runtime]).filter(Boolean));
-    const vms = results.flatMap((result) => result.vms ?? []).slice(0, request.vm_limit);
+    const rawVms = results.flatMap((result) => result.vms ?? []);
+    const correlation = correlateVmProcessHints(rawVms);
+    const vms = correlation.vms.slice(0, request.vm_limit);
     const probes = results.flatMap((result) => result.probes ?? []);
     const unsupported_or_missing = runtimes.filter((runtime) => !runtime.available).map((runtime) => ({
       runtime: runtime.runtime,
@@ -717,7 +791,7 @@ export async function collectVmEvidence(options = {}) {
       vms,
       probes,
       unsupported_or_missing,
-      summary: summarize(runtimes, vms),
+      summary: summarize(runtimes, vms, correlation),
       privacy: {
         bounded: true,
         note: "VM names, paths, IPs, runtime metadata, and resource snapshots are sensitive diagnostic artifacts.",

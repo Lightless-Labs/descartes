@@ -19,6 +19,7 @@ For the operator-facing catalog, see `../../../../docs/reference/collectors.md`.
 | `vms.js` | Local VM runtime inventory and VM-like process hints. |
 | `scheduled-jobs.js` | cron, systemd timers, and launchd scheduled job definitions. |
 | `time-sync.js` | Local clock/NTP state and optional bounded NTP offset checks. |
+| `certificates.js` | Bounded local certificate validity inventory for common stores/paths. |
 | `sampling.js` | Bounded temporal sampling and Descartes-owned sampling artifacts. |
 | `findings.js` | Deterministic findings derived from evidence envelopes. |
 | `collect.js` | Compact first-pass triage bundle: system, processes, disks, findings. |
@@ -69,6 +70,7 @@ Current network-capable behavior:
 
 - `collect_network_basics` may perform a DNS lookup for reachability unless disabled by `check_dns_reachability: false`.
 - `collect_time_sync` only performs an external NTP offset probe when `check_offset: true` is requested, and validates the server value so it cannot become an `sntp` option.
+- `collect_certificates` does not contact the network; it reads bounded local certificate files/stores and intentionally does not read private keys.
 
 ## Adding a collector
 

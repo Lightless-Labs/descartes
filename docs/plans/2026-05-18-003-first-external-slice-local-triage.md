@@ -28,6 +28,8 @@
 **Addendum:** 2026-05-21 — scheduled job basics were added and package metadata was bumped to v0.0.23: guarded triage can call `collect_scheduled_jobs` for bounded read-only cron, Linux systemd timer, and macOS launchd scheduled job evidence with command redaction and fixed probes.
 **Addendum:** 2026-05-21 — time sync basics were added and package metadata was bumped to v0.0.24: guarded triage can call `collect_time_sync` for read-only local clock/NTP state on Linux/macOS plus optional bounded NTP offset checks when directly relevant.
 **Addendum:** 2026-05-21 — review hardening was added and package metadata was bumped to v0.0.25: `collect_time_sync` now rejects NTP server option/path injection and preserves unknown sync state as unknown; `collect_scheduled_jobs` now pre-bounds cron file reads and fairly selects returned jobs across scheduler sources with discovered/returned counts.
+**Addendum:** 2026-05-21 — certificate basics were added and package metadata was bumped to v0.0.26: guarded triage can call `collect_certificates` for bounded read-only local certificate validity evidence from common Linux/macOS stores and service-certificate paths; private keys are intentionally skipped.
+**Addendum:** 2026-05-21 — initial VM resource correlation was added and package metadata was bumped to v0.0.27: process-backed QEMU/VMware/UTM hints are correlated into matching VM runtime inventory entries so resource snapshots can be attached without double-counting matched VMs.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -296,6 +298,7 @@ The README should become the product surface for v0 and include:
 | VM basics | yes/Tart, Lima, Multipass, VirtualBox, Parallels, VMware, UTM, Podman machine, process hints | yes/libvirt, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, process hints |
 | Scheduled job basics | yes/cron + launchd scheduled plists | yes/cron + systemd timers |
 | Time sync basics | yes/timed service + best-effort settings + optional SNTP offset | yes/timedatectl + chrony/ntpq + optional SNTP offset |
+| Certificate basics | yes/common paths + system keychains | yes/common trust/service certificate paths |
 
 The first release can mention Docker only if process evidence shows Docker as a top resource consumer. It should not require Docker API integration.
 
@@ -316,6 +319,7 @@ Local terminal output may include operationally useful machine identifiers and l
 - VM names, paths, IPs, runtime state, and hypervisor/runtime metadata where available
 - scheduled job names, schedules, bounded/redacted commands, and local scheduler metadata where available
 - local time synchronization state, time service status, NTP server names/peers, and optional bounded clock-offset checks where requested
+- certificate subjects, issuers, fingerprint/serial prefixes, keychain names, and local certificate paths
 - mount points and paths
 - listening process names if later added
 - service names

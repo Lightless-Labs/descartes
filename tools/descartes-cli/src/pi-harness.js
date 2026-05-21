@@ -8,6 +8,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { collectCertificateEvidence } from "./tools/certificates.js";
 import { collectContainerEvidence } from "./tools/containers.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectRecentLogsEvidence } from "./tools/logs.js";
@@ -152,6 +153,20 @@ export function createEvidenceTools(paths) {
       })),
     }),
     defineTool({
+      name: "collect_certificates",
+      label: "Collect certificate inventory",
+      description: "Collect bounded read-only local certificate validity evidence from common system/keychain/service certificate stores. Private keys are not read.",
+      parameters: Type.Object({
+        warning_days: Type.Optional(Type.Number({ minimum: 1, maximum: 3650 })),
+        certificate_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectCertificateEvidence({
+        warningDays: params.warning_days ?? 30,
+        certificateLimit: params.certificate_limit ?? 80,
+      })),
+    }),
+    defineTool({
       name: "inspect_process",
       label: "Inspect process identity",
       description: "Inspect one process by PID using read-only process table facts, redacted command lines, parent summary, and child summaries.",
@@ -236,8 +251,9 @@ Preferred flow:
 8. If the complaint involves VMs, Tart, UTM, Parallels, VMware, Lima VMs, Multipass, VirtualBox, libvirt, virsh, KVM, QEMU, Podman machine, Incus/LXD VMs, Proxmox, Xen, hypervisors, or a general “containers or VMs” inventory, call collect_vms as well as collect_containers when relevant rather than inferring only from processes.
 9. If the complaint involves cron, launchd scheduled jobs, systemd timers, periodic tasks, startup timers, or unexplained recurring/sporadic workload, call collect_scheduled_jobs rather than guessing.
 10. If the complaint involves clock skew, time synchronization, NTP, TLS/certificate time validity, Kerberos/auth time errors, or suspicious timestamp drift, call collect_time_sync rather than guessing. Set check_offset only when an external NTP offset check is directly relevant.
-11. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
-12. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+11. If the complaint involves certificate expiry, TLS validity, local trust stores, Let's Encrypt, nginx/apache/httpd certificates, or keychain/system certificate state, call collect_certificates rather than guessing. Treat certificate subjects, issuers, paths, and fingerprints as sensitive.
+12. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+13. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {

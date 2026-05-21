@@ -72,6 +72,7 @@ Current collectors include:
 - VM basics: Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like process hints where available
 - scheduled job basics: cron, systemd timers on Linux, and launchd scheduled jobs on macOS
 - time sync basics: local clock/NTP state and optional bounded offset checks
+- certificate basics: bounded local certificate validity checks for common stores/paths
 
 See `docs/reference/collectors.md` for the full collector/tool reference.
 

@@ -9,6 +9,7 @@ export const TRIAGE_TOOL_NAMES = Object.freeze([
   "collect_vms",
   "collect_scheduled_jobs",
   "collect_time_sync",
+  "collect_certificates",
   "inspect_process",
   "inspect_parent_tree",
   "sample_dimension",

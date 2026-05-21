@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyCommandFailure,
+  correlateVmProcessHints,
   mergeRuntimes,
   normalizeVmRequest,
   parseByteQuantity,
@@ -230,6 +231,21 @@ test("mergeRuntimes prefers available runtime evidence over missing probes", () 
     { runtime: "utm", installed: false, available: false, support_status: "missing" },
     { runtime: "utm", installed: true, available: true, support_status: "ok" },
   ]), [{ runtime: "utm", installed: true, available: true, support_status: "ok" }]);
+});
+
+test("correlateVmProcessHints attaches process resource snapshots to matching inventory VMs", () => {
+  const correlation = correlateVmProcessHints([
+    { runtime: "libvirt", id: "1", name: "ubuntu", state: "running", source_runtime: "libvirt", confidence: 1 },
+    { runtime: "qemu", id: "123", name: "ubuntu", state: "running", source_runtime: "qemu", confidence: 0.4, owner_hint: "qemu-system-aarch64 -name ubuntu", resource_snapshot: { pid: 123, cpu_percent: 12.5, memory_percent: 8, rss_bytes: 1024 } },
+    { runtime: "qemu", id: "124", name: "other", state: "running", source_runtime: "qemu", confidence: 0.4, resource_snapshot: { pid: 124, cpu_percent: 1, memory_percent: 1, rss_bytes: 512 } },
+  ]);
+
+  assert.equal(correlation.correlated_process_count, 1);
+  assert.equal(correlation.uncorrelated_process_hint_count, 1);
+  assert.equal(correlation.vms.length, 2);
+  assert.deepEqual(correlation.vms[0].resource_snapshot, { pid: 123, cpu_percent: 12.5, memory_percent: 8, rss_bytes: 1024 });
+  assert.equal(correlation.vms[0].process_correlation.source, "vm_process_scan");
+  assert.equal(correlation.vms[1].name, "other");
 });
 
 test("parseVmProcesses identifies running QEMU/VMware/UTM processes with redacted args", () => {
