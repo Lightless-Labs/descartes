@@ -25,6 +25,7 @@ test("root and nested package metadata stay aligned", () => {
 
 test("published package includes runtime files but not tests", () => {
   assert(rootPackage.files.includes("README.md"));
+  assert(rootPackage.files.includes("docs/reference"));
   assert(rootPackage.files.includes("tools/descartes-cli/src"));
   assert(!rootPackage.files.includes("tools/descartes-cli/test"));
 });

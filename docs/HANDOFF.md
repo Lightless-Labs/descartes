@@ -34,6 +34,8 @@ Scheduled jobs update: package metadata is bumped to v0.0.23. Guarded triage now
 
 Time sync update: package metadata is bumped to v0.0.24. Guarded triage now exposes `collect_time_sync` for bounded read-only local clock/NTP state. Linux uses fixed `timedatectl show/status`, optional `chronyc tracking` and `ntpq -pn`; macOS uses fixed `launchctl print system/com.apple.timed` plus best-effort `systemsetup` reads that may report missing admin permission. Optional `check_offset` can run fixed read-only `sntp -t 2 <server>` and records that the probe may contact an NTP server; it never uses `sntp -s`/`-S` or adjusts the clock.
 
+Collector documentation update: added `docs/reference/collectors.md` as the operator/reference catalog for all model-visible evidence tools, parameters, platforms, sources, network behavior, and privacy notes. Added `tools/descartes-cli/src/tools/README.md` as the source-adjacent developer guide for collector structure, safety rules, and adding new collectors.
+
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
 Field report update: GitHub-installed triage on a real work laptop returned an empty diagnosis after login. `tools/descartes-cli/src/triage.js` now reads final assistant text from `session.messages` after `session.prompt()` instead of relying only on streaming `text_delta` events, and emits a deterministic fallback report if the model still returns no final text.
@@ -56,7 +58,7 @@ Packaging/distribution policy update: the current npm package is only a pragmati
 
 Existing files:
 
-- `README.md` — updated to describe the LLM-backed local triage first slice, Pi/XDG boundaries, and future intent-based policy-gated operations use cases.
+- `README.md` — updated to describe the LLM-backed local triage first slice, Pi/XDG boundaries, future intent-based policy-gated operations use cases, and the collector reference link.
 - `AGENTS.md` — operating instructions for coding agents.
 - `.gitignore` — excludes local reference material, logs, Rust build output, Node package output, and OS noise.
 - `package.json` — root npm package so end users can install with `npm install -g github:Lightless-Labs/descartes` without cloning.
@@ -68,6 +70,7 @@ Existing files:
   - `src/triage.js` implements human and JSON triage prompts around the private harness.
   - `test/` covers XDG path resolution, Pi-path guardrails, deterministic finding thresholds, parser fixtures, tool policy, sampling, and fallback/guard diagnostics.
 - `docs/ROADMAP.md` — roadmap for capability discovery, process/behavior understanding, temporal sampling, planning, inter-agent delegation/identity, policy-gated action, and learning. Includes the guiding future use case: “I need a quick Linux environment with npm,” where Descartes discovers Docker/Colima/Podman/Tart/Lima/UTM/Multipass/Buildkite/authenticated delegated-agent options, recommends a plan, asks approval, executes or delegates within scoped authority, verifies, and cleans up.
+- `docs/reference/collectors.md` — reference catalog for model-visible evidence tools, envelope IDs, parameters, sources, platform coverage, network behavior, and privacy notes.
 - `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
   - `2026-05-19-first-external-slice-validation.md` — **immediate next task, in progress**: validate install/login/triage/docs/platform readiness against the first external slice plan.
@@ -257,7 +260,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - This directory is now a git repository; `git status --short` works.
 - Current checked command: `npm test` passes 106 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, and `tools/time-sync.js`) and excludes tests/local artifacts for v0.0.24.
+- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.24.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
