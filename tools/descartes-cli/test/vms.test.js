@@ -5,6 +5,7 @@ import {
   correlateVmProcessHints,
   mergeRuntimes,
   normalizeVmRequest,
+  parseColimaListJson,
   parseByteQuantity,
   parseLimaListJson,
   parseIncusOrLxcListJson,
@@ -70,6 +71,26 @@ test("parseTartListJson normalizes Tart VMs and installed-runtime list output", 
   assert.deepEqual(parseTartListJson("[]"), []);
 });
 
+test("parseColimaListJson normalizes Colima VM/container-host entries", () => {
+  const vms = parseColimaListJson(JSON.stringify([{ name: "default", status: "Running", runtime: "docker", arch: "aarch64", cpus: 4, memory: 8, disk: "60GiB", address: "192.168.5.2" }]));
+
+  assert.deepEqual(vms, [{
+    runtime: "colima",
+    id: "default",
+    name: "default",
+    state: "running",
+    backend: "aarch64",
+    cpus: 4,
+    memory_bytes: 8589934592,
+    disk_bytes: 64424509440,
+    ips: ["192.168.5.2"],
+    owner_hint: "docker",
+    container_host_correlation: { runtime: "colima", name: "default", confidence: 1 },
+    source_runtime: "colima",
+    confidence: 1,
+  }]);
+});
+
 test("parseLimaListJson handles ndjson and VM fields", () => {
   const vms = parseLimaListJson(`${JSON.stringify({ name: "default", status: "Running", vmType: "vz", cpus: 2, memory: "4GiB", disk: "20GiB", ips: ["192.168.105.2"], dir: "/Users/me/.lima/default" })}\n`);
 
@@ -84,6 +105,7 @@ test("parseLimaListJson handles ndjson and VM fields", () => {
     disk_bytes: 21474836480,
     ips: ["192.168.105.2"],
     owner_hint: "/Users/me/.lima/default",
+    container_host_correlation: { runtime: "lima", name: "default", confidence: 1 },
     source_runtime: "lima",
     confidence: 1,
   }]);
@@ -172,6 +194,7 @@ test("parsePodmanMachineListJson normalizes podman machine VMs", () => {
     disk_bytes: 107374182400,
     ips: [],
     owner_hint: "2026-05-20",
+    container_host_correlation: { runtime: "podman_machine", name: "podman-machine-default", confidence: 1 },
     source_runtime: "podman_machine",
     confidence: 1,
   }]);

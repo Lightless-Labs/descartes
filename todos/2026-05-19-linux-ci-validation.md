@@ -137,8 +137,8 @@ Track Linux parity against macOS for the first-slice tool surface.
 | `collect_network_basics` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux uses fixed `ip route show default`, `/etc/resolv.conf`, DNS lookup, and `ss -H -ltnu`. |
 | `collect_services` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux uses fixed `systemctl list-units --type=service --all --no-pager --no-legend`. |
 | `collect_recent_logs` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux uses bounded fixed `journalctl` and fixed log-file tail probes. |
-| `collect_containers` | implemented / local macOS smoke checked | validated on Linux ARM64 / validate x86_64 | v0.0.22 ARM64 archive passed direct container collector smokes on Ubuntu/Debian/Fedora with Podman available and missing Docker/Lima represented per runtime. Docker/Podman/Lima coverage; missing daemons/permissions should be represented per runtime. |
-| `collect_vms` | implemented / local macOS smoke checked | validated on Linux ARM64 / validate x86_64 | v0.0.22 ARM64 archive passed direct VM collector smokes on Ubuntu/Debian/Fedora with libvirt/podman-machine/LXD states represented without envelope failure. Linux targets include libvirt/virsh, QEMU process hints, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, and others where available. |
+| `collect_containers` | implemented / local macOS smoke checked | validated on Linux ARM64 / validate x86_64 | v0.0.22 ARM64 archive passed direct container collector smokes on Ubuntu/Debian/Fedora with Podman available and missing Docker/Lima represented per runtime. Docker/Podman/Lima/Colima plus Podman machine host-context coverage; missing daemons/permissions should be represented per runtime/probe. |
+| `collect_vms` | implemented / local macOS smoke checked | validated on Linux ARM64 / validate x86_64 | v0.0.22 ARM64 archive passed direct VM collector smokes on Ubuntu/Debian/Fedora with libvirt/podman-machine/LXD states represented without envelope failure. Linux targets include Colima where installed, libvirt/virsh, QEMU process hints, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, and others where available. |
 | `collect_scheduled_jobs` | implemented / local macOS smoke checked | validate on Linux x86_64 | External Linux ARM64 scheduler command checks passed in the v0.0.22 validation archive, but the collector file did not exist in that version. Linux uses cron file probes plus system/user systemd timers; v0.0.25 bounds cron file reads and fairly selects returned jobs across sources. |
 | `collect_time_sync` | implemented / local macOS smoke checked | validate on Linux x86_64 | External Linux ARM64 `timedatectl`/chrony command checks passed in the v0.0.22 validation archive, but the collector file did not exist in that version. Linux uses `timedatectl`, optional chrony/ntpq, and explicit optional SNTP offset checks; v0.0.25 rejects option/path-like NTP server values and preserves unknown sync state. |
 | `collect_certificates` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux targets common trust/service certificate paths and skips private keys; added in v0.0.26. |
@@ -154,14 +154,15 @@ Track Linux parity against macOS for the first-slice tool surface.
 - One upstream `node-domexception` deprecation warning remains through `@google/genai`/Google auth transitive dependencies in Pi AI.
 - Linux ARM64 validation should be rerun after v0.0.12 is pushed.
 
-2026-05-21 local validation/doc update for v0.0.27:
+2026-05-21 local validation/doc update for v0.0.28:
 
 - Current local package exposes additional guarded tools after the last credentialed public Linux ARM64 validation: network, services, recent logs, containers, VMs, scheduled jobs, time sync, and certificates.
 - `collect_scheduled_jobs` was hardened after review: regular-file checks, byte-capped cron reads before parsing, discovered vs returned counts, and fair returned-job selection across scheduler sources.
 - `collect_time_sync` was hardened after review: validates NTP server values before `sntp`, rejects option/path/whitespace values, and keeps unknown synchronization state unknown.
 - `collect_certificates` was added: bounded local certificate validity evidence for common Linux/macOS stores and service-certificate paths, with private keys skipped.
 - Updated Linux ARM64 validation brief includes scheduled-job, time-sync, and certificate direct collector smoke checks plus model-led prompts for scheduler/time/certificate questions.
-- Linux ARM64/x86_64 validation should now use v0.0.27+.
+- v0.0.28 adds Colima VM inventory, Podman machine container-host context, and Colima/Lima/Podman machine VM/container-host correlation metadata.
+- Linux ARM64/x86_64 validation should now use v0.0.28+.
 
 2026-05-21 Linux ARM64 multi-distro validation archive in ignored `materials/descartes-linux-arm64-validation.zip` validated public v0.0.22-era packaging/runtime on Ubuntu 24.04, Debian 13, and Fedora 42 ARM64:
 

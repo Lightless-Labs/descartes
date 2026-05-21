@@ -3,6 +3,7 @@
 **Created:** 2026-05-21  
 **Status:** In progress  
 **Addendum:** 2026-05-21 — first VM-side correlation landed: direct QEMU/VMware/UTM process hints are matched back into runtime VM inventory entries by compatible runtime/name/path signals, attaching resource snapshots without double-counting matched VMs.
+**Addendum:** 2026-05-21 — container-host correlation metadata landed for Colima, Lima, and Podman machine. `collect_vms` now includes Colima VM inventory, and both VM/container host entries carry explicit runtime/name correlation hints plus summary counts.
 
 ## Goal
 
@@ -21,10 +22,10 @@ Improve Descartes' ability to answer questions such as “which VM/container is 
 
 ## Next Steps
 
-1. Add container-host to VM correlation for Colima, Lima, and Podman machine names.
-2. Add summary counts for correlated container hosts once cross-runtime matches exist.
+1. Validate correlation metadata on macOS with Colima/Lima/Podman machine and Linux with Podman machine/libvirt where available.
+2. Consider attaching process resource snapshots to Colima/Lima/Podman machine hosts when deterministic process matches are available.
 3. Consider a combined diagnostic helper only if targeted `collect_containers` + `collect_vms` evidence remains hard for the model to synthesize.
-4. Validate on macOS with UTM/Colima/Lima and Linux with Podman machine/libvirt where available.
+4. Keep improving confidence scoring for ambiguous runtime/process/name matches.
 
 ## Safety
 

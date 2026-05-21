@@ -68,8 +68,8 @@ Current collectors include:
 - network basics: interfaces, default route, DNS resolver/reachability, and listening sockets
 - service manager basics: launchd jobs on macOS and systemd services on Linux
 - bounded recent logs: warnings/errors plus fail2ban/firewall-oriented signals where available
-- container basics: Docker, Podman, Colima, and Lima runtime/container inventory where available
-- VM basics: Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like process hints where available
+- container basics: Docker, Podman, Colima, Lima, and Podman machine host/runtime/container inventory where available
+- VM basics: Tart, Colima, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like process hints where available
 - scheduled job basics: cron, systemd timers on Linux, and launchd scheduled jobs on macOS
 - time sync basics: local clock/NTP state and optional bounded offset checks
 - certificate basics: bounded local certificate validity checks for common stores/paths

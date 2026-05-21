@@ -263,12 +263,17 @@ function parseColimaBytes(value) {
   return parseByteQuantity(value);
 }
 
+function vmCorrelation(runtime, name) {
+  return name ? { runtime, name: String(name), confidence: 1 } : undefined;
+}
+
 export function parseColimaStatusJson(stdout) {
   const item = parseJsonMaybeArray(stdout)[0];
   if (!item) return undefined;
+  const name = item.name ?? item.Name ?? "default";
   return {
     runtime: "colima",
-    name: item.name ?? item.Name ?? "default",
+    name,
     state: normalizeContainerState(item.status ?? item.Status ?? item.state),
     container_runtime: item.runtime,
     arch: item.arch,
@@ -277,40 +282,69 @@ export function parseColimaStatusJson(stdout) {
     disk_bytes: parseColimaBytes(item.disk),
     address: item.address,
     source_runtime: "colima",
+    vm_correlation: vmCorrelation("colima", name),
     confidence: 1,
   };
 }
 
 export function parseColimaListJson(stdout, { limit = DEFAULT_HOST_LIMIT } = {}) {
-  return parseJsonMaybeArray(stdout).map((item) => ({
-    runtime: "colima",
-    name: item.name ?? item.Name,
-    state: normalizeContainerState(item.status ?? item.Status ?? item.state),
-    container_runtime: item.runtime,
-    arch: item.arch,
-    cpus: item.cpus ?? item.cpu,
-    memory_bytes: parseColimaBytes(item.memory),
-    disk_bytes: parseColimaBytes(item.disk),
-    address: item.address,
-    source_runtime: "colima",
-    confidence: 1,
-  })).slice(0, limit);
+  return parseJsonMaybeArray(stdout).map((item) => {
+    const name = item.name ?? item.Name;
+    return {
+      runtime: "colima",
+      name,
+      state: normalizeContainerState(item.status ?? item.Status ?? item.state),
+      container_runtime: item.runtime,
+      arch: item.arch,
+      cpus: item.cpus ?? item.cpu,
+      memory_bytes: parseColimaBytes(item.memory),
+      disk_bytes: parseColimaBytes(item.disk),
+      address: item.address,
+      source_runtime: "colima",
+      vm_correlation: vmCorrelation("colima", name),
+      confidence: 1,
+    };
+  }).slice(0, limit);
 }
 
 export function parseLimaListJson(stdout, { limit = DEFAULT_HOST_LIMIT } = {}) {
-  return parseJsonMaybeArray(stdout).map((item) => ({
-    runtime: "lima",
-    name: item.name ?? item.Name,
-    state: normalizeContainerState(item.status ?? item.Status),
-    container_runtime: item.containerd ? "containerd" : undefined,
-    arch: item.arch,
-    cpus: item.cpus ?? item.CPUs,
-    memory_bytes: parseByteQuantity(item.memory ?? item.Memory),
-    disk_bytes: parseByteQuantity(item.disk ?? item.Disk),
-    directory: item.dir ?? item.Dir,
-    source_runtime: "lima",
-    confidence: 1,
-  })).slice(0, limit);
+  return parseJsonMaybeArray(stdout).map((item) => {
+    const name = item.name ?? item.Name;
+    return {
+      runtime: "lima",
+      name,
+      state: normalizeContainerState(item.status ?? item.Status),
+      container_runtime: item.containerd ? "containerd" : undefined,
+      arch: item.arch,
+      cpus: item.cpus ?? item.CPUs,
+      memory_bytes: parseByteQuantity(item.memory ?? item.Memory),
+      disk_bytes: parseByteQuantity(item.disk ?? item.Disk),
+      directory: item.dir ?? item.Dir,
+      source_runtime: "lima",
+      vm_correlation: vmCorrelation("lima", name),
+      confidence: 1,
+    };
+  }).slice(0, limit);
+}
+
+export function parsePodmanMachineListJson(stdout, { limit = DEFAULT_HOST_LIMIT } = {}) {
+  return parseJsonMaybeArray(stdout).map((item) => {
+    const name = item.Name ?? item.name;
+    return {
+      runtime: "podman_machine",
+      name,
+      state: normalizeContainerState(item.Running === true || item.running === true ? "running" : (item.State ?? item.Status ?? item.state ?? item.status ?? "stopped")),
+      container_runtime: "podman",
+      arch: item.Arch ?? item.arch,
+      cpus: item.CPUs ?? item.Cpus ?? item.cpus,
+      memory_bytes: parseByteQuantity(item.Memory ?? item.memory),
+      disk_bytes: parseByteQuantity(item.DiskSize ?? item.diskSize ?? item.disk_size),
+      address: item.IPAddress ?? item.ipAddress,
+      source_runtime: "podman_machine",
+      vm_correlation: vmCorrelation("podman_machine", name),
+      confidence: 1,
+    };
+  }).filter((host) => host.name).slice(0, limit);
 }
 
 function probeMetadata(name, result, parser, count = 0) {
@@ -402,6 +436,15 @@ async function collectLima(request) {
   };
 }
 
+async function collectPodmanMachineHost(request) {
+  const listProbe = await runFixedCommand("podman", ["machine", "list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const hosts = listProbe.status === "ok" ? parsePodmanMachineListJson(listProbe.stdout, { limit: request.host_limit }) : [];
+  return {
+    hosts,
+    probes: [probeMetadata("podman_machine_list", listProbe, "podman_machine_list_json", hosts.length)],
+  };
+}
+
 function summarize(runtimes, containers, hosts) {
   return {
     runtime_count: runtimes.length,
@@ -411,6 +454,7 @@ function summarize(runtimes, containers, hosts) {
     stopped_container_count: containers.filter((container) => container.state === "stopped").length,
     host_count: hosts.length,
     running_host_count: hosts.filter((host) => host.state === "running").length,
+    vm_correlatable_host_count: hosts.filter((host) => host.vm_correlation).length,
   };
 }
 
@@ -436,8 +480,9 @@ export async function collectContainerEvidence(options = {}) {
       collectPodman(request),
       collectColima(request),
       collectLima(request),
+      collectPodmanMachineHost(request),
     ]);
-    const runtimes = results.map((result) => result.runtime);
+    const runtimes = results.map((result) => result.runtime).filter(Boolean);
     const containers = results.flatMap((result) => result.containers ?? []).slice(0, request.container_limit);
     const container_hosts = results.flatMap((result) => result.hosts ?? []).slice(0, request.host_limit);
     const probes = results.flatMap((result) => result.probes ?? []);

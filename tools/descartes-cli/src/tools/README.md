@@ -15,8 +15,8 @@ For the operator-facing catalog, see `../../../../docs/reference/collectors.md`.
 | `network.js` | Interfaces, default routes, DNS resolver/reachability, listening sockets. |
 | `services.js` | launchd/systemd service state. |
 | `logs.js` | Bounded recent warning/error/security-oriented log excerpts. |
-| `containers.js` | Docker, Podman, Colima, and Lima container/runtime inventory. |
-| `vms.js` | Local VM runtime inventory and VM-like process hints. |
+| `containers.js` | Docker, Podman, Colima, Lima, and Podman machine container/runtime/host inventory. |
+| `vms.js` | Local VM runtime inventory, container-host correlation metadata, and VM-like process hints. |
 | `scheduled-jobs.js` | cron, systemd timers, and launchd scheduled job definitions. |
 | `time-sync.js` | Local clock/NTP state and optional bounded NTP offset checks. |
 | `certificates.js` | Bounded local certificate validity inventory for common stores/paths. |

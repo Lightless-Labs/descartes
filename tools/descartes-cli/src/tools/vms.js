@@ -124,6 +124,15 @@ function normalizeIps(value) {
   return String(value).split(/[\s,]+/).filter(Boolean).slice(0, 8);
 }
 
+function containerHostCorrelation(runtime, name) {
+  return name ? { runtime, name: String(name), confidence: 1 } : undefined;
+}
+
+function parseColimaBytes(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value * 1024 ** 3;
+  return parseByteQuantity(value);
+}
+
 export function parseTartListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
   return parseJsonMaybeArray(stdout).map((item) => ({
     runtime: "tart",
@@ -141,21 +150,53 @@ export function parseTartListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
   })).filter((vm) => vm.name || vm.id).slice(0, limit);
 }
 
-export function parseLimaListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
-  return parseJsonMaybeArray(stdout).map((item) => ({
-    runtime: "lima",
-    id: boundedString(firstDefined(item.name, item.Name)),
-    name: boundedString(firstDefined(item.name, item.Name)),
+function colimaVmFromItem(item) {
+  const name = boundedString(firstDefined(item.name, item.Name, "default"));
+  return {
+    runtime: "colima",
+    id: name,
+    name,
     state: normalizeVmState(firstDefined(item.status, item.Status, item.state)),
-    backend: boundedString(firstDefined(item.vmType, item.VMType, item.driver, item.Driver, "unknown")),
+    backend: boundedString(firstDefined(item.vmType, item.VMType, item.driver, item.Driver, item.arch, "unknown")),
     cpus: asNumber(firstDefined(item.cpus, item.CPUs, item.cpu)),
-    memory_bytes: parseByteQuantity(firstDefined(item.memory, item.Memory)),
-    disk_bytes: parseByteQuantity(firstDefined(item.disk, item.Disk)),
-    ips: normalizeIps(firstDefined(item.ips, item.IPs, item.address, item.Address)),
-    owner_hint: boundedString(firstDefined(item.dir, item.Dir, item.instanceDir)),
-    source_runtime: "lima",
+    memory_bytes: parseColimaBytes(firstDefined(item.memory, item.Memory)),
+    disk_bytes: parseColimaBytes(firstDefined(item.disk, item.Disk)),
+    ips: normalizeIps(firstDefined(item.address, item.Address, item.ips, item.IPs, item.ipAddress, item.IPAddress)),
+    owner_hint: boundedString(firstDefined(item.runtime, item.containerRuntime, item.dir, item.Dir)),
+    container_host_correlation: containerHostCorrelation("colima", name),
+    source_runtime: "colima",
     confidence: 1,
-  })).filter((vm) => vm.name || vm.id).slice(0, limit);
+  };
+}
+
+export function parseColimaListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  return parseJsonMaybeArray(stdout).map(colimaVmFromItem).filter((vm) => vm.name || vm.id).slice(0, limit);
+}
+
+export function parseColimaStatusJson(stdout) {
+  const item = parseJsonMaybeArray(stdout)[0];
+  return item ? colimaVmFromItem(item) : undefined;
+}
+
+export function parseLimaListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
+  return parseJsonMaybeArray(stdout).map((item) => {
+    const name = boundedString(firstDefined(item.name, item.Name));
+    return {
+      runtime: "lima",
+      id: name,
+      name,
+      state: normalizeVmState(firstDefined(item.status, item.Status, item.state)),
+      backend: boundedString(firstDefined(item.vmType, item.VMType, item.driver, item.Driver, "unknown")),
+      cpus: asNumber(firstDefined(item.cpus, item.CPUs, item.cpu)),
+      memory_bytes: parseByteQuantity(firstDefined(item.memory, item.Memory)),
+      disk_bytes: parseByteQuantity(firstDefined(item.disk, item.Disk)),
+      ips: normalizeIps(firstDefined(item.ips, item.IPs, item.address, item.Address)),
+      owner_hint: boundedString(firstDefined(item.dir, item.Dir, item.instanceDir)),
+      container_host_correlation: containerHostCorrelation("lima", name),
+      source_runtime: "lima",
+      confidence: 1,
+    };
+  }).filter((vm) => vm.name || vm.id).slice(0, limit);
 }
 
 export function parseMultipassListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
@@ -257,20 +298,24 @@ export function parseVmrunList(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
 }
 
 export function parsePodmanMachineListJson(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
-  return parseJsonMaybeArray(stdout).map((item) => ({
-    runtime: "podman_machine",
-    id: boundedString(firstDefined(item.Name, item.name)),
-    name: boundedString(firstDefined(item.Name, item.name)),
-    state: normalizeVmState(item.Running === true || item.running === true ? "running" : firstDefined(item.State, item.Status, item.state, item.status, "stopped")),
-    backend: boundedString(firstDefined(item.VMType, item.vmType, item.VmType, "unknown")),
-    cpus: asNumber(firstDefined(item.CPUs, item.Cpus, item.cpus)),
-    memory_bytes: parseByteQuantity(firstDefined(item.Memory, item.memory)),
-    disk_bytes: parseByteQuantity(firstDefined(item.DiskSize, item.diskSize, item.disk_size)),
-    ips: normalizeIps(firstDefined(item.IPAddress, item.ipAddress, item.ips)),
-    owner_hint: boundedString(firstDefined(item.LastUp, item.Created, item.Path, item.path)),
-    source_runtime: "podman_machine",
-    confidence: 1,
-  })).filter((vm) => vm.name || vm.id).slice(0, limit);
+  return parseJsonMaybeArray(stdout).map((item) => {
+    const name = boundedString(firstDefined(item.Name, item.name));
+    return {
+      runtime: "podman_machine",
+      id: name,
+      name,
+      state: normalizeVmState(item.Running === true || item.running === true ? "running" : firstDefined(item.State, item.Status, item.state, item.status, "stopped")),
+      backend: boundedString(firstDefined(item.VMType, item.vmType, item.VmType, "unknown")),
+      cpus: asNumber(firstDefined(item.CPUs, item.Cpus, item.cpus)),
+      memory_bytes: parseByteQuantity(firstDefined(item.Memory, item.memory)),
+      disk_bytes: parseByteQuantity(firstDefined(item.DiskSize, item.diskSize, item.disk_size)),
+      ips: normalizeIps(firstDefined(item.IPAddress, item.ipAddress, item.ips)),
+      owner_hint: boundedString(firstDefined(item.LastUp, item.Created, item.Path, item.path)),
+      container_host_correlation: containerHostCorrelation("podman_machine", name),
+      source_runtime: "podman_machine",
+      confidence: 1,
+    };
+  }).filter((vm) => vm.name || vm.id).slice(0, limit);
 }
 
 function instanceIps(item) {
@@ -507,6 +552,24 @@ async function collectTart(request) {
   };
 }
 
+async function collectColima(request) {
+  const [statusProbe, listProbe] = await Promise.all([
+    runFixedCommand("colima", ["status", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("colima", ["list", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
+  ]);
+  const statusVm = statusProbe.status === "ok" ? parseColimaStatusJson(statusProbe.stdout) : undefined;
+  const listVms = listProbe.status === "ok" ? parseColimaListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
+  const vms = listVms.length > 0 ? listVms : [statusVm].filter(Boolean);
+  return {
+    runtime: runtimeFromProbe("colima", statusProbe.status === "ok" ? statusProbe : listProbe),
+    vms,
+    probes: [
+      probeMetadata("colima_status", statusProbe, "colima_status_json", statusVm ? 1 : 0),
+      probeMetadata("colima_list", listProbe, "colima_list_json", listVms.length),
+    ],
+  };
+}
+
 async function collectLima(request) {
   const listProbe = await runFixedCommand("limactl", ["list", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 });
   const vms = listProbe.status === "ok" ? parseLimaListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
@@ -737,6 +800,7 @@ function summarize(runtimes, vms, correlation = {}) {
     stopped_vm_count: vms.filter((vm) => vm.state === "stopped").length,
     correlated_process_count: correlation.correlated_process_count ?? 0,
     uncorrelated_process_hint_count: correlation.uncorrelated_process_hint_count ?? 0,
+    container_host_correlatable_vm_count: vms.filter((vm) => vm.container_host_correlation).length,
   };
 }
 
@@ -759,6 +823,7 @@ export async function collectVmEvidence(options = {}) {
   return timedEnvelope(async () => {
     const results = await Promise.all([
       collectTart(request),
+      collectColima(request),
       collectLima(request),
       collectMultipass(request),
       collectVirtualBox(request),

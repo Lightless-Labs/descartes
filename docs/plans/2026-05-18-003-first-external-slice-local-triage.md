@@ -30,6 +30,7 @@
 **Addendum:** 2026-05-21 — review hardening was added and package metadata was bumped to v0.0.25: `collect_time_sync` now rejects NTP server option/path injection and preserves unknown sync state as unknown; `collect_scheduled_jobs` now pre-bounds cron file reads and fairly selects returned jobs across scheduler sources with discovered/returned counts.
 **Addendum:** 2026-05-21 — certificate basics were added and package metadata was bumped to v0.0.26: guarded triage can call `collect_certificates` for bounded read-only local certificate validity evidence from common Linux/macOS stores and service-certificate paths; private keys are intentionally skipped.
 **Addendum:** 2026-05-21 — initial VM resource correlation was added and package metadata was bumped to v0.0.27: process-backed QEMU/VMware/UTM hints are correlated into matching VM runtime inventory entries so resource snapshots can be attached without double-counting matched VMs.
+**Addendum:** 2026-05-21 — container-host/VM correlation metadata was added and package metadata was bumped to v0.0.28: Colima is now included in VM inventory, Podman machine host context is included in container inventory, and Colima/Lima/Podman machine entries carry cross-collector correlation hints.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -295,7 +296,7 @@ The README should become the product surface for v0 and include:
 | service manager basics | yes/launchd | yes/systemd |
 | recent system logs | yes/unified log | yes/journalctl + fixed log files |
 | Docker/container basics | yes/Docker, Colima, Lima, Podman | yes/Docker, Podman, Lima |
-| VM basics | yes/Tart, Lima, Multipass, VirtualBox, Parallels, VMware, UTM, Podman machine, process hints | yes/libvirt, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, process hints |
+| VM basics | yes/Tart, Colima, Lima, Multipass, VirtualBox, Parallels, VMware, UTM, Podman machine, process hints | yes/Colima where installed, libvirt, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, process hints |
 | Scheduled job basics | yes/cron + launchd scheduled plists | yes/cron + systemd timers |
 | Time sync basics | yes/timed service + best-effort settings + optional SNTP offset | yes/timedatectl + chrony/ntpq + optional SNTP offset |
 | Certificate basics | yes/common paths + system keychains | yes/common trust/service certificate paths |

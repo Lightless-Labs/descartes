@@ -11,6 +11,7 @@ import {
   parseLimaListJson,
   parseMemoryUsagePair,
   parsePercent,
+  parsePodmanMachineListJson,
   parsePodmanPsJson,
   parsePodmanStatsJson,
 } from "../src/tools/containers.js";
@@ -120,10 +121,28 @@ test("parseColimaStatusJson and parseColimaListJson normalize container host con
     disk_bytes: 64424509440,
     address: "192.168.5.2",
     source_runtime: "colima",
+    vm_correlation: { runtime: "colima", name: "default", confidence: 1 },
     confidence: 1,
   });
 
   assert.equal(parseColimaListJson(JSON.stringify([{ name: "default", status: "Stopped", runtime: "containerd" }]))[0].state, "stopped");
+});
+
+test("parsePodmanMachineListJson returns container host context with VM correlation", () => {
+  assert.deepEqual(parsePodmanMachineListJson(JSON.stringify([{ Name: "podman-machine-default", Running: true, VMType: "applehv", CPUs: 4, Memory: "2GiB", DiskSize: "100GiB", IPAddress: "192.168.127.2" }])), [{
+    runtime: "podman_machine",
+    name: "podman-machine-default",
+    state: "running",
+    container_runtime: "podman",
+    arch: undefined,
+    cpus: 4,
+    memory_bytes: 2147483648,
+    disk_bytes: 107374182400,
+    address: "192.168.127.2",
+    source_runtime: "podman_machine",
+    vm_correlation: { runtime: "podman_machine", name: "podman-machine-default", confidence: 1 },
+    confidence: 1,
+  }]);
 });
 
 test("parseLimaListJson accepts ndjson-style limactl output", () => {
@@ -140,6 +159,7 @@ test("parseLimaListJson accepts ndjson-style limactl output", () => {
     disk_bytes: 21474836480,
     directory: "/Users/me/.lima/docker",
     source_runtime: "lima",
+    vm_correlation: { runtime: "lima", name: "docker", confidence: 1 },
     confidence: 1,
   }]);
 });
