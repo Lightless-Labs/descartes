@@ -2,7 +2,7 @@
 
 ## Goal
 
-Validate Descartes VM/container/runtime collectors and scheduled-job evidence on **Linux ARM64 only** for now, across representative distributions. Focus on graceful behavior, parser/runtime compatibility, and no mutating actions.
+Validate Descartes VM/container/runtime collectors, scheduled-job evidence, and time-sync evidence on **Linux ARM64 only** for now, across representative distributions. Focus on graceful behavior, parser/runtime compatibility, and no mutating actions.
 
 ## Target Distributions
 
@@ -43,7 +43,7 @@ descartes --help
 
 Expected:
 
-- Version should be latest, currently `0.0.23` or newer.
+- Version should be latest, currently `0.0.24` or newer.
 - Help works from npm symlink.
 
 ### 2. Built-in test suite if repo checkout exists
@@ -55,7 +55,7 @@ npm test
 Expected:
 
 - All tests pass.
-- Current expected count is around **98** tests, but do not fail solely on count drift if pass/fail is clean.
+- Current expected count is around **106** tests, but do not fail solely on count drift if pass/fail is clean.
 
 ### 3. Direct collector smoke: scheduled job evidence
 
@@ -102,7 +102,40 @@ Expected:
 - Scheduled command lines are bounded and redact obvious secrets.
 - Linux `systemctl list-timers --all --no-pager --no-legend` parsing works where systemd is present.
 
-### 4. Direct collector smoke: VM evidence
+### 4. Direct collector smoke: time sync evidence
+
+From repo checkout:
+
+```bash
+node --input-type=module -e '
+import { collectTimeSyncEvidence } from "./tools/descartes-cli/src/tools/time-sync.js";
+const e = await collectTimeSyncEvidence({ checkOffset: false });
+console.log(JSON.stringify({
+  id: e.id,
+  status: e.status,
+  summary: e.result.summary,
+  probes: e.result.probes.map(p => ({
+    source: p.source,
+    status: p.status,
+    optional: p.optional,
+    command: p.command,
+    error: p.error,
+    stderr: p.stderr,
+    parsed: p.parsed
+  }))
+}, null, 2));
+'
+```
+
+Expected:
+
+- Returns a single `time-sync` envelope.
+- No crash if `chronyc`, `ntpq`, or `sntp` are missing.
+- Linux `timedatectl show/status` failures are represented as unavailable sources, not panics.
+- Optional chrony/ntpq failures do not make the whole envelope fail if timedatectl works.
+- No external NTP server is contacted unless `checkOffset: true` is explicitly requested.
+
+### 5. Direct collector smoke: VM evidence
 
 From repo checkout:
 
@@ -140,7 +173,7 @@ Expected:
 - Permission/daemon failures are represented, not fatal.
 - `ps` process scan probe should work on Linux ARM64.
 
-### 5. Direct collector smoke: container evidence
+### 6. Direct collector smoke: container evidence
 
 ```bash
 node --input-type=module -e '
@@ -183,6 +216,7 @@ Expected:
 - `summary.vm_count: 0`.
 - `collect_containers` similarly reports missing runtimes.
 - `collect_scheduled_jobs` returns `scheduled-jobs` without crashing; absent crontab/timer sources are represented as absent/unable per probe.
+- `collect_time_sync` returns `time-sync` without crashing; missing optional chrony/ntpq tools are represented per probe.
 
 ### B. Podman installed, no machines/containers
 
@@ -279,7 +313,28 @@ Expected:
 - Permission-limited cron directories/files are represented as unavailable sources rather than panics.
 - No mutating scheduler commands are run.
 
-### H. Multipass / VirtualBox / Xen / Proxmox
+### H. Time sync state
+
+On systemd distributions, inspect externally with fixed read-only commands:
+
+```bash
+timedatectl show --property=Timezone --property=LocalRTC --property=NTP --property=CanNTP --property=NTPSynchronized --property=TimeUSec --property=RTCTimeUSec || true
+timedatectl status --no-pager || true
+chronyc tracking || true
+ntpq -pn || true
+```
+
+Then run `collect_time_sync`.
+
+Expected:
+
+- `timedatectl` fields parse into `summary.synchronized`, `summary.ntp_enabled`, `timezone`, and `local_rtc` where present.
+- Missing `chronyc`/`ntpq` is optional and does not fail the whole envelope.
+- If a selected `ntpq` peer or chrony offset exists, offset is represented in seconds.
+- No clock-setting commands are run.
+- Do not run the optional `checkOffset: true` mode unless you explicitly want an external NTP query.
+
+### I. Multipass / VirtualBox / Xen / Proxmox
 
 Only if naturally available on the ARM64 target.
 
@@ -297,20 +352,22 @@ With credentials available:
 descartes triage "do I have any containers or VMs running?" --json
 ```
 
-And, if credentials are available, a scheduler-targeted prompt:
+And, if credentials are available, scheduler/time-targeted prompts:
 
 ```bash
 descartes triage "do I have any scheduled jobs or timers that could be causing recurring load?" --json
+descartes triage "is my clock or NTP synchronization broken?" --json
 ```
 
 Expected:
 
-- `diagnostics.active_tools` includes guarded tool list, including `collect_containers`, `collect_vms`, and `collect_scheduled_jobs`.
+- `diagnostics.active_tools` includes guarded tool list, including `collect_containers`, `collect_vms`, `collect_scheduled_jobs`, and `collect_time_sync`.
 - Model should call `collect_containers` and `collect_vms` for the containers/VMs prompt.
 - Model should call `collect_scheduled_jobs` for the scheduler/timers prompt.
+- Model should call `collect_time_sync` for the clock/NTP prompt.
 - `fallback_used: false` if auth/model succeeds.
 - `actions_taken: []`.
-- Final diagnosis cites relevant envelope IDs such as `containers`, `vms`, and/or `scheduled-jobs`.
+- Final diagnosis cites relevant envelope IDs such as `containers`, `vms`, `scheduled-jobs`, and/or `time-sync`.
 - No arbitrary shell/coding tools appear.
 
 If no credentials:
@@ -331,12 +388,12 @@ descartes --version
 Installed relevant tools:
 
 ```bash
-command -v crontab systemctl docker podman virsh qemu-system-aarch64 qemu-system-x86_64 limactl multipass VBoxManage incus lxc qm xl || true
+command -v crontab systemctl timedatectl chronyc ntpq sntp docker podman virsh qemu-system-aarch64 qemu-system-x86_64 limactl multipass VBoxManage incus lxc qm xl || true
 ```
 
 Include:
 
-- Collector JSON summaries from scheduled-job, VM, and container smoke commands.
+- Collector JSON summaries from scheduled-job, time-sync, VM, and container smoke commands.
 - Any stderr/errors classified incorrectly.
 - Whether any command hung or exceeded timeout.
 - Whether any runtime output format failed to parse despite command success.

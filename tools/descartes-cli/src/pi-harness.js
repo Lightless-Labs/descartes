@@ -16,6 +16,7 @@ import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEviden
 import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSystemEvidence } from "./tools/system.js";
+import { collectTimeSyncEvidence } from "./tools/time-sync.js";
 import { collectVmEvidence } from "./tools/vms.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
@@ -137,6 +138,20 @@ export function createEvidenceTools(paths) {
       })),
     }),
     defineTool({
+      name: "collect_time_sync",
+      label: "Collect time sync state",
+      description: "Collect bounded read-only clock/time synchronization evidence using local system time tools. Optional offset checks may contact a requested/default NTP server but never adjust the clock.",
+      parameters: Type.Object({
+        check_offset: Type.Optional(Type.Boolean()),
+        server: Type.Optional(Type.String()),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectTimeSyncEvidence({
+        checkOffset: params.check_offset ?? false,
+        server: params.server,
+      })),
+    }),
+    defineTool({
       name: "inspect_process",
       label: "Inspect process identity",
       description: "Inspect one process by PID using read-only process table facts, redacted command lines, parent summary, and child summaries.",
@@ -220,8 +235,9 @@ Preferred flow:
 7. If the complaint involves Docker, Podman, Colima, Lima, containers, images, container ports, or container resource use, call collect_containers rather than guessing. Do not suggest start/stop/delete/prune actions as already taken.
 8. If the complaint involves VMs, Tart, UTM, Parallels, VMware, Lima VMs, Multipass, VirtualBox, libvirt, virsh, KVM, QEMU, Podman machine, Incus/LXD VMs, Proxmox, Xen, hypervisors, or a general “containers or VMs” inventory, call collect_vms as well as collect_containers when relevant rather than inferring only from processes.
 9. If the complaint involves cron, launchd scheduled jobs, systemd timers, periodic tasks, startup timers, or unexplained recurring/sporadic workload, call collect_scheduled_jobs rather than guessing.
-10. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
-11. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
+10. If the complaint involves clock skew, time synchronization, NTP, TLS/certificate time validity, Kerberos/auth time errors, or suspicious timestamp drift, call collect_time_sync rather than guessing. Set check_offset only when an external NTP offset check is directly relevant.
+11. If a snapshot is ambiguous or the user asks about patterns over time, call sample_dimension with a short bounded duration before diagnosing sustained/flapping behavior.
+12. Produce a concise operator-facing report: most likely cause, confidence, evidence, safe next checks, avoid for now, and the exact sentence "No actions were taken."`;
 }
 
 function truncate(value, max = 180) {

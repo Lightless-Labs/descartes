@@ -13,6 +13,7 @@ test("triage investigation active tools are exactly Descartes read-only evidence
     "collect_containers",
     "collect_vms",
     "collect_scheduled_jobs",
+    "collect_time_sync",
     "inspect_process",
     "inspect_parent_tree",
     "sample_dimension",

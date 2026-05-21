@@ -38,12 +38,13 @@ Already implemented:
 - `collect_containers`
 - `collect_vms`
 - `collect_scheduled_jobs`
+- `collect_time_sync`
 - `collect_triage_evidence`
 - `derive_findings`
 
 ## Current Next Priority
 
-The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, bounded recent logs, container basics, VM basics, and scheduled job basics are complete. The next collector-oriented priorities are certificates and time sync.
+The process identity/lineage slice in `todos/2026-05-19-process-identity-lineage-tools.md`, disk evidence noise reduction in `todos/2026-05-19-macos-disk-evidence-classification.md`, bounded temporal sampling in `todos/2026-05-19-temporal-sampling-investigation-tools.md`, network basics, service manager basics, bounded recent logs, container basics, VM basics, scheduled job basics, and time sync basics are complete. The next collector-oriented priority is certificates.
 
 ## Candidate Next Tools
 
@@ -51,8 +52,6 @@ Prioritize tools that answer common first-triage questions without privileged mu
 
 1. `collect_certificates`
    - expiring certs in common local stores/paths, later
-2. `collect_time_sync`
-   - clock skew/time sync state
 
 ## Requirements
 

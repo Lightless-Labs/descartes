@@ -26,6 +26,7 @@
 **Addendum:** 2026-05-20 — policy clarification: `collect_triage_evidence` should remain the compact system/process/disk resource-pressure first-pass bundle, not expand into every new collector. NPM registry publishing is not a product priority; the current npm wrapper is a temporary GitHub-install mechanism for the Node/Pi harness while durable functionality moves toward Rust/Bazel-friendly components.
 **Addendum:** 2026-05-20 — VM parity was deepened and package metadata was bumped to v0.0.22: `collect_vms` now also covers Parallels, VMware, UTM app/process detection, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, and direct QEMU/VMware/UTM process hints.
 **Addendum:** 2026-05-21 — scheduled job basics were added and package metadata was bumped to v0.0.23: guarded triage can call `collect_scheduled_jobs` for bounded read-only cron, Linux systemd timer, and macOS launchd scheduled job evidence with command redaction and fixed probes.
+**Addendum:** 2026-05-21 — time sync basics were added and package metadata was bumped to v0.0.24: guarded triage can call `collect_time_sync` for read-only local clock/NTP state on Linux/macOS plus optional bounded NTP offset checks when directly relevant.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary
@@ -293,6 +294,7 @@ The README should become the product surface for v0 and include:
 | Docker/container basics | yes/Docker, Colima, Lima, Podman | yes/Docker, Podman, Lima |
 | VM basics | yes/Tart, Lima, Multipass, VirtualBox, Parallels, VMware, UTM, Podman machine, process hints | yes/libvirt, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, process hints |
 | Scheduled job basics | yes/cron + launchd scheduled plists | yes/cron + systemd timers |
+| Time sync basics | yes/timed service + best-effort settings + optional SNTP offset | yes/timedatectl + chrony/ntpq + optional SNTP offset |
 
 The first release can mention Docker only if process evidence shows Docker as a top resource consumer. It should not require Docker API integration.
 
@@ -312,6 +314,7 @@ Local terminal output may include operationally useful machine identifiers and l
 - container names, images, commands, ports, runtime state, and resource snapshots where available
 - VM names, paths, IPs, runtime state, and hypervisor/runtime metadata where available
 - scheduled job names, schedules, bounded/redacted commands, and local scheduler metadata where available
+- local time synchronization state, time service status, NTP server names/peers, and optional bounded clock-offset checks where requested
 - mount points and paths
 - listening process names if later added
 - service names
