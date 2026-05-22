@@ -9,6 +9,8 @@ owner: unassigned
 related:
   - todos/2026-05-19-first-external-slice-validation.md
   - docs/plans/2026-05-18-003-first-external-slice-local-triage.md
+  - linux-arm64-validation-brief.md
+  - linux-x86_64-validation-brief.md
 ---
 
 # TODO: Linux x86_64 VM/Container and CI Validation
@@ -153,6 +155,11 @@ Track Linux parity against macOS for the first-slice tool surface.
 - Fresh local tarball install no longer emits the `@mariozechner/*` deprecation warnings.
 - One upstream `node-domexception` deprecation warning remains through `@google/genai`/Google auth transitive dependencies in Pi AI.
 - Linux ARM64 validation should be rerun after v0.0.12 is pushed.
+
+2026-05-22 validation brief update for v0.0.30+:
+
+- Dedicated infrastructure-agent briefs now exist at `linux-arm64-validation-brief.md` and `linux-x86_64-validation-brief.md`. They cover public GitHub install, help/version, installed collector docs, isolated-XDG no-auth failure, clone `npm test`, pack dry-run, sanitized direct collector smokes across the current tool surface, read-only external capability snapshots, and optional credentialed model-led triage summaries.
+- The ARM64 brief is for best-effort multi-distro reruns after the v0.0.30 collector/correlation additions; the x86_64 brief is the Tier-1 gap-closing validation.
 
 2026-05-21/22 local validation/doc update for v0.0.30:
 

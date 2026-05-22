@@ -1,29 +1,33 @@
-# Linux ARM64 Validation Brief
+# Linux x86_64 Validation Brief
 
 **Prepared:** 2026-05-22
 **Audience:** infrastructure-running agent
-**Target:** Linux ARM64 / `aarch64` best-effort platform validation for Descartes `v0.0.30+`
+**Target:** Linux x86_64 Tier-1 validation for Descartes `v0.0.30+`
 
 ## Goal
 
-Rerun Linux ARM64 validation against the current Descartes package after the newer collector work: network, services, logs, containers, VMs, scheduled jobs, time sync, certificates, VM/container correlation, and Apple Virtualization attribution-adjacent changes. Previous ARM64 coverage validated older public packages; this run should confirm current packaging and Linux collector behavior.
+Close the main remaining first-slice platform gap: true Linux x86_64 behavior. Validate public GitHub install, XDG isolation, package tests, and direct Linux collector behavior. If safe credentials are available, validate model-led guarded triage without exposing raw host diagnostics.
 
 ## Safety / Privacy
 
 - Read-only validation only, except installing Node/npm dependencies into temporary work directories and a user-writable npm prefix.
-- Do not run privileged service changes, stop daemons, create VMs, or mutate containers for this validation.
+- Do not stop/start host services, create/destroy containers, create VMs, edit cron, adjust time, or install system packages unless the host is explicitly disposable and already approved for that setup.
 - Do not upload raw triage JSON, full process arguments, hostnames, usernames, logs, certificate subjects, or command lines unless separately scrubbed.
 - Report sanitized summaries only: envelope IDs/statuses/sources, probe statuses, counts, selected model metadata, called tool names, fallback state, and `actions_taken`.
 
 ## Target Hosts
 
-Run on ARM64 (`uname -m` is `aarch64` or `arm64`). Prioritize:
+Required:
 
-1. Ubuntu 24.04 ARM64
-2. Debian 13 ARM64 (Debian 12 acceptable if 13 unavailable)
-3. Fedora 42 ARM64
+1. One Linux x86_64 host or VM (`uname -m` is `x86_64` or `amd64`).
 
-Optional: any additional ARM64 distro already available.
+Preferred matrix if easy:
+
+1. Ubuntu 24.04 x86_64
+2. Debian 13 x86_64
+3. Fedora 42 x86_64
+
+A container is acceptable for install/parser smoke coverage, but a VM or host with systemd/journal/procfs is better for service/log/timer/time validation.
 
 ## Prerequisites
 
@@ -38,7 +42,7 @@ Start every host with:
 set -euo pipefail
 
 case "$(uname -m)" in
-  aarch64|arm64) ;;
+  x86_64|amd64) ;;
   *) echo "wrong architecture: $(uname -m)" >&2; exit 2 ;;
 esac
 
@@ -195,7 +199,7 @@ const collectors = [
   ["certificates", () => collectCertificateEvidence({ certificateLimit: 10 })],
   ["inspect_process_self", () => inspectProcessEvidence({ pid: process.pid })],
   ["inspect_parent_tree_self", () => inspectParentTreeEvidence({ pid: process.pid, maxDepth: 8 })],
-  ["sample_load_memory_swap", () => sampleDimensionEvidence({ dimension: "load_memory_swap", duration_seconds: 1, interval_seconds: 1, aggregation: "summary" }, { cacheDir: path.join(os.tmpdir(), "descartes-arm64-smoke-cache") })],
+  ["sample_load_memory_swap", () => sampleDimensionEvidence({ dimension: "load_memory_swap", duration_seconds: 1, interval_seconds: 1, aggregation: "summary" }, { cacheDir: path.join(os.tmpdir(), "descartes-x86-smoke-cache") })],
 ];
 
 for (const [name, run] of collectors) {
@@ -217,27 +221,48 @@ Expected:
 - No collector throws.
 - Each collector returns a structured evidence envelope with `ok`, `warning`, `unknown`, or graceful `unable` status as appropriate.
 - Linux process collection uses procps-compatible `ps -eo ...` behavior and redacted/bounded args internally.
+- Disk collection parses Linux `df -kP` and `df -iP`; pseudo/runtime filesystems are not misreported as pressure-relevant.
+- systemd service/timer and journal probes parse where available and degrade cleanly in containers.
 - Missing Docker/Podman/Lima/Colima/libvirt/etc. are represented per runtime/probe, not as whole-envelope crashes.
-- systemd/journal/cron/time/certificate permission gaps are represented as bounded probe failures.
+- Time sync and certificate collectors avoid mutating commands and skip private keys.
 
-## 5. External Read-Only Capability Snapshot
+## 5. x86_64 Runtime/Platform Snapshot
 
 ```bash
 {
   echo "arch=$(uname -m)"
-  command -v crontab systemctl timedatectl journalctl chronyc ntpq sntp docker podman virsh qemu-system-aarch64 qemu-system-x86_64 limactl multipass VBoxManage incus lxc qm xl || true
+  command -v crontab systemctl timedatectl journalctl chronyc ntpq sntp docker podman virsh qemu-system-x86_64 qemu-kvm limactl multipass VBoxManage vmrun prlctl incus lxc qm xl || true
   timedatectl status --no-pager || true
-  systemctl list-timers --all --no-pager --no-legend | head -50 || true
-  systemctl --user list-timers --all --no-pager --no-legend | head -50 || true
+  systemctl list-units --type=service --all --no-pager --no-legend | head -80 || true
+  systemctl list-timers --all --no-pager --no-legend | head -80 || true
+  systemctl --user list-timers --all --no-pager --no-legend | head -80 || true
+  journalctl -p warning --since "15 minutes ago" --no-pager -n 20 || true
   podman --version || true
+  podman ps --all || true
+  podman machine list --format json || true
   docker --version || true
+  docker ps --all || true
   virsh list --all || true
+  ps -eo pid,ppid,pcpu,pmem,rss,comm,args | head -20 || true
 } | tee "$work/external-capabilities.txt"
 ```
 
 Expected: read-only commands complete or fail gracefully. Do not make service/package/container changes to improve these results.
 
-## 6. Optional Credentialed Model-Led Triage
+## 6. Optional x86_64 Runtime Coverage, Only If Already Available
+
+If these runtimes naturally exist on the host, verify the direct collector summaries reflect them:
+
+- Docker installed with daemon unavailable, permission-limited, or available.
+- Podman installed with zero or more containers.
+- Podman machine installed with zero or more machines.
+- libvirt/virsh installed with daemon unavailable, permission-limited, or available.
+- QEMU/KVM process hints already running.
+- VirtualBox, VMware, Multipass, Incus/LXD, Proxmox, or Xen if naturally present.
+
+Do not create workloads just for this brief unless the infrastructure owner explicitly asked for disposable-runtime setup.
+
+## 7. Optional Credentialed Model-Led Triage
 
 Only run if a dedicated validation credential or pre-seeded Descartes auth is available. Prefer a revocable validation account/key, not a personal token. Do not upload full JSON.
 
@@ -277,11 +302,23 @@ Expected:
 - `fallback_used: false` when auth/model succeeds.
 - `actions_taken: []`.
 - Active tools are only guarded Descartes evidence tools.
+- At least one Descartes evidence tool is called for each prompt.
 - Prompt-specific tool calls should include relevant collectors: `collect_triage_evidence`, `collect_containers`, `collect_vms`, `collect_scheduled_jobs`, `collect_time_sync`, and/or `collect_certificates`.
+
+## Acceptance Criteria
+
+This brief is complete when the returned report shows:
+
+- Public GitHub install, `--help`, and `--version` work on Linux x86_64.
+- Isolated-XDG no-auth failure is clean and does not touch Pi-owned paths.
+- `npm test` passes from a clone.
+- Direct collector smoke suite returns structured summaries with no thrown collector.
+- Linux x86_64 parser/runtime issues are either absent or clearly captured with sanitized errors.
+- Optional credentialed validation, if run, shows guarded tool use, `fallback_used: false`, and `actions_taken: []`.
 
 ## Report Back
 
-Return a concise per-distro summary:
+Return a concise host summary:
 
 - Distro, kernel, architecture, Node/npm versions.
 - `descartes --version` and installed collector-doc presence.
