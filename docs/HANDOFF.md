@@ -44,7 +44,9 @@ Linux ARM64 validation brief update: `todos/2026-05-19-linux-ci-validation.md` n
 
 VM resource correlation update: package metadata was bumped to v0.0.27 and `docs/plans/2026-05-21-vm-container-resource-correlation.md` was created. `collect_vms` now correlates direct QEMU/VMware/UTM process hints into matching runtime VM inventory entries by compatible runtime/name/path signals, attaches process `resource_snapshot` plus `process_correlation`, and avoids double-counting matched process-backed hints.
 
-Container-host/VM correlation update: package metadata is bumped to v0.0.28. `collect_vms` now includes Colima VM inventory, `collect_containers` now includes Podman machine host context, and Colima/Lima/Podman machine entries on both sides carry explicit runtime/name correlation metadata plus summary counts (`container_host_correlatable_vm_count` and `vm_correlatable_host_count`). Next correlation work is validation on real Colima/Lima/Podman-machine hosts and optional deterministic process-resource attachment to those host entries.
+Container-host/VM correlation update: package metadata was bumped to v0.0.28. `collect_vms` now includes Colima VM inventory, `collect_containers` now includes Podman machine host context, and Colima/Lima/Podman machine entries on both sides carry explicit runtime/name correlation metadata plus summary counts (`container_host_correlatable_vm_count` and `vm_correlatable_host_count`).
+
+Container-host resource attachment update: package metadata is bumped to v0.0.29. `collect_containers` now performs a fixed read-only `ps` scan when container-host entries are present and attaches bounded `resource_snapshot` plus `process_correlation` to Colima/Lima/Podman machine hosts when QEMU process names/paths deterministically match. `collect_vms` process matching now recognizes `.lima/<name>`, `.colima/_lima/<name>`, and `podman-machine-*` process paths/names and can correlate QEMU hints into Colima/Lima/Podman machine VM entries. Next correlation work is real-host validation and Apple Virtualization/VZ attribution for non-QEMU backends.
 
 Conceptual update: Descartes no longer has a separate L-1 Interface / Privacy Gate layer. Privacy and provider-boundary behavior remain product/safety constraints, but architecture layers now start at L0 deterministic system tools.
 
@@ -105,7 +107,7 @@ Existing files:
 2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
 3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: continue `docs/plans/2026-05-21-vm-container-resource-correlation.md` by validating on real Colima/Lima/Podman-machine hosts and considering deterministic process-resource attachment to those host entries, or close the Linux x86_64 validation gap.
+5. Recommended next task: continue `docs/plans/2026-05-21-vm-container-resource-correlation.md` by validating on real Colima/Lima/Podman-machine hosts and investigating Apple Virtualization/VZ process attribution for non-QEMU backends, or close the Linux x86_64 validation gap.
 
 ## Current First Slice
 
@@ -246,7 +248,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: continue `docs/plans/2026-05-21-vm-container-resource-correlation.md` by validating correlation metadata on real Colima/Lima/Podman-machine hosts and considering deterministic process-resource attachment to those host entries. Alternatively close the Linux x86_64 validation gap.
+Recommended next task: continue `docs/plans/2026-05-21-vm-container-resource-correlation.md` by validating correlation metadata/resource attachment on real Colima/Lima/Podman-machine hosts and investigating Apple Virtualization/VZ process attribution for non-QEMU backends. Alternatively close the Linux x86_64 validation gap.
 
 The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
 
@@ -269,9 +271,9 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 119 Node test cases.
+- Current checked command: `npm test` passes 120 Node test cases.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.28.
+- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.29.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
 - Current checked command: installed `descartes triage "my machine is slow" --json` reaches the expected "No configured model credentials" error with isolated XDG paths when no login exists and creates only `$XDG_CONFIG_HOME/descartes/auth.json`.
@@ -285,14 +287,14 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: direct `collectNetworkEvidence({ checkDnsReachability: false, socketLimit: 5 })` returns an ok `network-basics` envelope on local macOS with interface, route, and listening socket sub-results.
 - Current checked command: direct `collectServiceEvidence({ serviceLimit: 5 })` returns a `services` launchd envelope on local macOS with bounded service output and nonzero-exit summaries.
 - Current checked command: direct `collectRecentLogsEvidence({ windowMinutes: 1, eventLimit: 3, includeSecurity: true })` returns an ok `recent-logs` envelope on local macOS with bounded unified-log excerpts; partial `log show` output is accepted as bounded input when macOS emits more than the collector buffer.
-- Current checked command: direct `collectContainerEvidence({ containerLimit: 5, hostLimit: 5, collectStats: false })` returns a `containers` envelope on local macOS with per-runtime missing/daemon-unavailable state when Docker/Podman/Colima/Lima/Podman machine CLIs are unavailable, plus `vm_correlatable_host_count` in the summary.
+- Current checked command: direct `collectContainerEvidence({ containerLimit: 3, hostLimit: 5, collectStats: false })` returns a `containers` envelope on local macOS with per-runtime missing/daemon-unavailable state when Docker/Podman/Colima/Lima/Podman machine CLIs are unavailable, plus `vm_correlatable_host_count`, `correlated_host_process_count`, and `uncorrelated_host_process_hint_count` in the summary.
 - Current checked command: direct `collectVmEvidence({ vmLimit: 8 })` returns an ok `vms` envelope on local macOS with 14 deduplicated runtime entries including Colima, two running UTM process-backed VM hints, and correlation summary counts; runtimes with missing CLIs/apps remain represented individually.
 - Current checked command: direct `collectScheduledJobsEvidence({ jobLimit: 5 })` returns an ok `scheduled-jobs` envelope on local macOS with bounded cron/launchd probes.
 - Current checked command: direct `collectTimeSyncEvidence()` returns an ok `time-sync` envelope on local macOS with `launchctl_timed` ok and `systemsetup` probes represented as unable/missing admin permission.
 - Current checked command: direct `collectCertificateEvidence({ certificateLimit: 3 })` returns an ok `certificates` envelope on local macOS with bounded source summaries and no private-key reads.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: true Linux x86_64 behavior/CI. Linux arm64 validation with `$HOME/.local` prefix passes on public v0.0.11: install, symlinked `descartes --version`/`--help`, ChatGPT/Codex `--no-open` login, model-led guarded triage, `fallback_used: false`, `collect_triage_evidence`, `actions_taken: []`, and ok system/process/disk envelopes. v0.0.12 updates the harness dependency to `@earendil-works/pi-coding-agent` 0.75.3 and now requires Node.js 22.19.0+; rerun Linux validation after push. Process args are now redacted/bounded by default, so rerun validation should confirm that behavior on Linux too. The Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
-- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, VM basics/parity, scheduled job basics, time sync basics, certificate basics, initial VM process-resource correlation, and container-host/VM correlation metadata. Recommended next implementation is real-host validation/process-resource attachment for Colima/Lima/Podman machine, or Linux x86_64 validation.
+- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, VM basics/parity, scheduled job basics, time sync basics, certificate basics, initial VM process-resource correlation, container-host/VM correlation metadata, and QEMU-backed container-host process-resource attachment. Recommended next implementation is real-host validation/Apple Virtualization attribution for Colima/Lima/Podman machine, or Linux x86_64 validation.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.

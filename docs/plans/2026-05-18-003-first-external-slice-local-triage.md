@@ -31,6 +31,7 @@
 **Addendum:** 2026-05-21 — certificate basics were added and package metadata was bumped to v0.0.26: guarded triage can call `collect_certificates` for bounded read-only local certificate validity evidence from common Linux/macOS stores and service-certificate paths; private keys are intentionally skipped.
 **Addendum:** 2026-05-21 — initial VM resource correlation was added and package metadata was bumped to v0.0.27: process-backed QEMU/VMware/UTM hints are correlated into matching VM runtime inventory entries so resource snapshots can be attached without double-counting matched VMs.
 **Addendum:** 2026-05-21 — container-host/VM correlation metadata was added and package metadata was bumped to v0.0.28: Colima is now included in VM inventory, Podman machine host context is included in container inventory, and Colima/Lima/Podman machine entries carry cross-collector correlation hints.
+**Addendum:** 2026-05-21 — container-host process-resource attachment was added and package metadata was bumped to v0.0.29: Colima/Lima/Podman machine host entries can receive bounded process resource snapshots when QEMU process names/paths deterministically match host identities.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

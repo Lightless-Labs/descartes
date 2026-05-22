@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { parseVmProcesses } from "./vms.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CONTAINER_LIMIT = 80;
@@ -360,6 +361,86 @@ function probeMetadata(name, result, parser, count = 0) {
   };
 }
 
+function psArgsForPlatform(platform = process.platform) {
+  return platform === "linux" ? ["-eo", "pid,ppid,pcpu,pmem,rss,comm,args"] : ["-axo", "pid,ppid,pcpu,pmem,rss,comm,args"];
+}
+
+function normalizedIdentity(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function compatibleHostProcessRuntime(processRuntimeName, hostRuntimeName) {
+  if (processRuntimeName === hostRuntimeName) return true;
+  if (processRuntimeName === "qemu") return ["colima", "lima", "podman_machine"].includes(hostRuntimeName);
+  return false;
+}
+
+function containerHostProcessMatchScore(host, processHint) {
+  const correlation = host.vm_correlation;
+  const hostRuntime = correlation?.runtime ?? host.runtime;
+  if (!compatibleHostProcessRuntime(processHint.runtime, hostRuntime)) return 0;
+  if (host.state && processHint.state && host.state !== processHint.state) return 0;
+
+  const hostName = normalizedIdentity(correlation?.name ?? host.name);
+  const hintName = normalizedIdentity(processHint.name ?? processHint.id);
+  if (hostName && hintName && hostName === hintName) return processHint.runtime === hostRuntime ? 4 : 3;
+
+  const hintOwner = normalizedIdentity(processHint.owner_hint);
+  if (hostName && hintOwner && hintOwner.includes(hostName)) return processHint.runtime === hostRuntime ? 3 : 2;
+  return 0;
+}
+
+export function correlateContainerHostProcessHints(hosts, processHints) {
+  const correlatedHosts = hosts.map((host) => ({ ...host }));
+  const correlatedHintIndexes = new Set();
+
+  for (const [hintIndex, processHint] of processHints.entries()) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    for (const [hostIndex, host] of correlatedHosts.entries()) {
+      const score = containerHostProcessMatchScore(host, processHint);
+      if (score > bestScore) {
+        bestIndex = hostIndex;
+        bestScore = score;
+      }
+    }
+    if (bestIndex === -1) continue;
+    const target = correlatedHosts[bestIndex];
+    correlatedHosts[bestIndex] = {
+      ...target,
+      resource_snapshot: target.resource_snapshot ?? processHint.resource_snapshot,
+      process_correlation: {
+        source: "container_host_process_scan",
+        pid: processHint.resource_snapshot.pid,
+        runtime: processHint.runtime,
+        confidence: Math.min(0.95, 0.5 + bestScore / 10),
+        owner_hint: processHint.owner_hint,
+        owner_hint_redaction: processHint.owner_hint_redaction,
+      },
+    };
+    correlatedHintIndexes.add(hintIndex);
+  }
+
+  return {
+    hosts: correlatedHosts,
+    correlated_host_process_count: correlatedHintIndexes.size,
+    uncorrelated_host_process_hint_count: processHints.length - correlatedHintIndexes.size,
+  };
+}
+
+async function correlateContainerHostResources(hosts, request) {
+  if (hosts.length === 0) return { hosts, probes: [], correlation: { correlated_host_process_count: 0, uncorrelated_host_process_hint_count: 0 } };
+  const args = psArgsForPlatform();
+  const probe = await runFixedCommand("ps", args, { timeout: 3000, maxBuffer: 1024 * 1024 });
+  const processHints = probe.status === "ok" ? parseVmProcesses(probe.stdout, { limit: request.host_limit * 4 }) : [];
+  const correlation = correlateContainerHostProcessHints(hosts, processHints);
+  return {
+    hosts: correlation.hosts,
+    probes: [probeMetadata("container_host_process_scan", probe, "ps_vm_processes", processHints.length)],
+    correlation,
+  };
+}
+
 async function collectDocker(request) {
   const psArgs = ["ps", request.include_stopped ? "--all" : undefined, "--no-trunc", "--format", "{{json .}}"].filter(Boolean);
   const [versionProbe, psProbe] = await Promise.all([
@@ -445,7 +526,7 @@ async function collectPodmanMachineHost(request) {
   };
 }
 
-function summarize(runtimes, containers, hosts) {
+function summarize(runtimes, containers, hosts, correlation = {}) {
   return {
     runtime_count: runtimes.length,
     available_runtime_count: runtimes.filter((runtime) => runtime.available).length,
@@ -455,6 +536,8 @@ function summarize(runtimes, containers, hosts) {
     host_count: hosts.length,
     running_host_count: hosts.filter((host) => host.state === "running").length,
     vm_correlatable_host_count: hosts.filter((host) => host.vm_correlation).length,
+    correlated_host_process_count: correlation.correlated_host_process_count ?? 0,
+    uncorrelated_host_process_hint_count: correlation.uncorrelated_host_process_hint_count ?? 0,
   };
 }
 
@@ -484,8 +567,10 @@ export async function collectContainerEvidence(options = {}) {
     ]);
     const runtimes = results.map((result) => result.runtime).filter(Boolean);
     const containers = results.flatMap((result) => result.containers ?? []).slice(0, request.container_limit);
-    const container_hosts = results.flatMap((result) => result.hosts ?? []).slice(0, request.host_limit);
-    const probes = results.flatMap((result) => result.probes ?? []);
+    const rawContainerHosts = results.flatMap((result) => result.hosts ?? []).slice(0, request.host_limit);
+    const hostResourceCorrelation = await correlateContainerHostResources(rawContainerHosts, request);
+    const container_hosts = hostResourceCorrelation.hosts;
+    const probes = [...results.flatMap((result) => result.probes ?? []), ...hostResourceCorrelation.probes];
     const unsupported_or_missing = runtimes.filter((runtime) => !runtime.available).map((runtime) => ({
       runtime: runtime.runtime,
       support_status: runtime.support_status,
@@ -500,7 +585,7 @@ export async function collectContainerEvidence(options = {}) {
       container_hosts,
       probes,
       unsupported_or_missing,
-      summary: summarize(runtimes, containers, container_hosts),
+      summary: summarize(runtimes, containers, container_hosts, hostResourceCorrelation.correlation),
       privacy: {
         bounded: true,
         note: "Container names, images, commands, ports, and host instance metadata are sensitive diagnostic artifacts.",

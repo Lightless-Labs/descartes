@@ -154,7 +154,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 - One upstream `node-domexception` deprecation warning remains through `@google/genai`/Google auth transitive dependencies in Pi AI.
 - Linux ARM64 validation should be rerun after v0.0.12 is pushed.
 
-2026-05-21 local validation/doc update for v0.0.28:
+2026-05-21 local validation/doc update for v0.0.29:
 
 - Current local package exposes additional guarded tools after the last credentialed public Linux ARM64 validation: network, services, recent logs, containers, VMs, scheduled jobs, time sync, and certificates.
 - `collect_scheduled_jobs` was hardened after review: regular-file checks, byte-capped cron reads before parsing, discovered vs returned counts, and fair returned-job selection across scheduler sources.
@@ -162,7 +162,8 @@ Track Linux parity against macOS for the first-slice tool surface.
 - `collect_certificates` was added: bounded local certificate validity evidence for common Linux/macOS stores and service-certificate paths, with private keys skipped.
 - Updated Linux ARM64 validation brief includes scheduled-job, time-sync, and certificate direct collector smoke checks plus model-led prompts for scheduler/time/certificate questions.
 - v0.0.28 adds Colima VM inventory, Podman machine container-host context, and Colima/Lima/Podman machine VM/container-host correlation metadata.
-- Linux ARM64/x86_64 validation should now use v0.0.28+.
+- v0.0.29 adds QEMU-backed process-resource attachment for Colima/Lima/Podman machine host entries when process names/paths deterministically match.
+- Linux ARM64/x86_64 validation should now use v0.0.29+.
 
 2026-05-21 Linux ARM64 multi-distro validation archive in ignored `materials/descartes-linux-arm64-validation.zip` validated public v0.0.22-era packaging/runtime on Ubuntu 24.04, Debian 13, and Fedora 42 ARM64:
 

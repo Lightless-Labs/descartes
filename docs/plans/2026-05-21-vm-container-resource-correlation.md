@@ -4,6 +4,7 @@
 **Status:** In progress  
 **Addendum:** 2026-05-21 — first VM-side correlation landed: direct QEMU/VMware/UTM process hints are matched back into runtime VM inventory entries by compatible runtime/name/path signals, attaching resource snapshots without double-counting matched VMs.
 **Addendum:** 2026-05-21 — container-host correlation metadata landed for Colima, Lima, and Podman machine. `collect_vms` now includes Colima VM inventory, and both VM/container host entries carry explicit runtime/name correlation hints plus summary counts.
+**Addendum:** 2026-05-21 — deterministic process-resource attachment landed for container hosts where QEMU process names/paths match Colima, Lima, or Podman machine host identities. `collect_containers` now attaches bounded `resource_snapshot` and `process_correlation` to matched host entries.
 
 ## Goal
 
@@ -22,10 +23,10 @@ Improve Descartes' ability to answer questions such as “which VM/container is 
 
 ## Next Steps
 
-1. Validate correlation metadata on macOS with Colima/Lima/Podman machine and Linux with Podman machine/libvirt where available.
-2. Consider attaching process resource snapshots to Colima/Lima/Podman machine hosts when deterministic process matches are available.
-3. Consider a combined diagnostic helper only if targeted `collect_containers` + `collect_vms` evidence remains hard for the model to synthesize.
-4. Keep improving confidence scoring for ambiguous runtime/process/name matches.
+1. Validate correlation metadata/resource attachment on macOS with Colima/Lima/Podman machine and Linux with Podman machine/libvirt where available.
+2. Consider a combined diagnostic helper only if targeted `collect_containers` + `collect_vms` evidence remains hard for the model to synthesize.
+3. Keep improving confidence scoring for ambiguous runtime/process/name matches.
+4. Investigate Apple Virtualization / VZ process attribution for non-QEMU Colima/Lima/Podman machine backends.
 
 ## Safety
 

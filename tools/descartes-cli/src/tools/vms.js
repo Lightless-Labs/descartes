@@ -403,7 +403,14 @@ function argValue(args, flag) {
 }
 
 function vmNameFromPathArg(args) {
-  const match = String(args ?? "").match(/([^\s]+\.(?:vmx|utm|qcow2|img|raw|iso))/i);
+  const text = String(args ?? "");
+  const lima = text.match(/(?:^|\s)\S*\.lima\/([^/\s]+)/i);
+  if (lima) return lima[1];
+  const colima = text.match(/(?:^|\s)\S*\.colima\/(?:_lima\/)?([^/\s]+)/i);
+  if (colima) return colima[1];
+  const podmanMachine = text.match(/\b(podman-machine-[A-Za-z0-9_.-]+)\b/i);
+  if (podmanMachine) return podmanMachine[1];
+  const match = text.match(/([^\s]+\.(?:vmx|utm|qcow2|img|raw|iso))/i);
   return match ? path.basename(match[1], path.extname(match[1])) : undefined;
 }
 
@@ -731,7 +738,7 @@ function isProcessVmHint(vm) {
 
 function compatibleProcessRuntime(processRuntimeName, runtimeName) {
   if (processRuntimeName === runtimeName) return true;
-  if (processRuntimeName === "qemu") return ["libvirt", "proxmox", "incus", "lxd"].includes(runtimeName);
+  if (processRuntimeName === "qemu") return ["libvirt", "proxmox", "incus", "lxd", "colima", "lima", "podman_machine"].includes(runtimeName);
   return false;
 }
 

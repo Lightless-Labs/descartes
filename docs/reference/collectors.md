@@ -140,7 +140,7 @@ Sources:
 - Colima and Lima: fixed host/runtime context probes.
 - Podman machine: fixed `podman machine list --format json` host-context probe when available.
 
-Behavior: missing commands, stopped daemons, and permission-limited sockets are represented per runtime. Colima, Lima, and Podman machine host entries include VM-correlation metadata so matching VM inventory can be connected by name/runtime when both collectors are called. No container mutating commands are exposed.
+Behavior: missing commands, stopped daemons, and permission-limited sockets are represented per runtime. Colima, Lima, and Podman machine host entries include VM-correlation metadata so matching VM inventory can be connected by name/runtime when both collectors are called. When deterministic process matches are available, host entries also get bounded process resource snapshots from a fixed read-only `ps` scan. No container mutating commands are exposed.
 
 Privacy: may include container names, images, commands, ports, mounts, networks, container-host names/addresses, and resource snapshots.
 
@@ -154,7 +154,7 @@ Sources:
 - Linux/common: Colima where installed, libvirt/virsh, Lima, Multipass, VirtualBox, VMware, Podman machine, Incus/LXD VM mode, Proxmox `qm`, Xen `xl`, direct QEMU/VMware process hints.
 - Fixed process snapshots for direct VM-like process hints.
 
-Behavior: missing commands, unsupported runtimes, daemon failures, and permission limitations are represented per runtime/probe. Direct QEMU/VMware/UTM process hints are correlated back into matching runtime inventory entries when names/runtimes match, so resource snapshots can be attached without double-counting the VM. Colima, Lima, and Podman machine VM entries include container-host correlation metadata so container-host inventory can be connected by name/runtime when both collectors are called. No VM mutating commands are exposed.
+Behavior: missing commands, unsupported runtimes, daemon failures, and permission limitations are represented per runtime/probe. Direct QEMU/VMware/UTM process hints are correlated back into matching runtime inventory entries when names/runtimes/paths match, so resource snapshots can be attached without double-counting the VM. QEMU path/name matching includes common Colima, Lima, and Podman machine identifiers. Colima, Lima, and Podman machine VM entries include container-host correlation metadata so container-host inventory can be connected by name/runtime when both collectors are called. No VM mutating commands are exposed.
 
 Privacy: may include VM names, local paths, runtime metadata, IP addresses where reported by runtime tools, resource snapshots, and bounded/redacted process hints.
 

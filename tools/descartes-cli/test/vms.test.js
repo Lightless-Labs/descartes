@@ -272,14 +272,17 @@ test("correlateVmProcessHints attaches process resource snapshots to matching in
 });
 
 test("parseVmProcesses identifies running QEMU/VMware/UTM processes with redacted args", () => {
-  const vms = parseVmProcesses(`  PID  PPID  %CPU %MEM   RSS COMM ARGS\n 1000     1   5.5  2.1 1000 qemu-system-aarch64 qemu-system-aarch64 -name linux -drive token=secret\n 1001     1   1.0  1.5 2000 vmware-vmx /Users/me/VMs/dev.vmwarevm/dev.vmx\n 1002     1   2.0  3.0 3000 UTM /Applications/UTM.app/Contents/MacOS/UTM /Users/me/test.utm\n`);
+  const vms = parseVmProcesses(`  PID  PPID  %CPU %MEM   RSS COMM ARGS\n 1000     1   5.5  2.1 1000 qemu-system-aarch64 qemu-system-aarch64 -name linux -drive token=secret\n 1001     1   1.0  1.5 2000 vmware-vmx /Users/me/VMs/dev.vmwarevm/dev.vmx\n 1002     1   2.0  3.0 3000 UTM /Applications/UTM.app/Contents/MacOS/UTM /Users/me/test.utm\n 1003     1   6.0  2.5 4000 qemu-system-aarch64 qemu-system-aarch64 /Users/me/.lima/docker/diffdisk\n 1004     1   7.0  3.5 5000 qemu-system-aarch64 qemu-system-aarch64 /Users/me/.colima/_lima/default/diffdisk\n 1005     1   8.0  4.5 6000 qemu-system-aarch64 qemu-system-aarch64 podman-machine-default\n`);
 
-  assert.equal(vms.length, 3);
+  assert.equal(vms.length, 6);
   assert.equal(vms[0].runtime, "qemu");
   assert.equal(vms[0].name, "linux");
   assert.equal(vms[0].owner_hint.includes("token=[REDACTED]"), true);
   assert.deepEqual(vms[1].resource_snapshot, { pid: 1001, cpu_percent: 1, memory_percent: 1.5, rss_bytes: 2048000 });
   assert.equal(vms[2].runtime, "utm");
+  assert.equal(vms[3].name, "docker");
+  assert.equal(vms[4].name, "default");
+  assert.equal(vms[5].name, "podman-machine-default");
 });
 
 test("classifyCommandFailure distinguishes missing, daemon, permission, and unknown failures", () => {
