@@ -82,12 +82,12 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 - Linux x86_64 validation is deferred because no Linux host is currently available. Future Buildkite validation is tracked separately in `todos/2026-05-19-linux-ci-validation.md`; credentials should be supplied through CI secrets and scoped to validation.
 2026-05-21 collector/readiness update:
 
-- Current checked command: `npm test` passes 120 Node test cases.
-- Current checked command: `npm run pack:dry-run` passes for v0.0.29 and includes README, `docs/reference/collectors.md`, and runtime collector files.
+- Current checked command: `npm test` passes 121 Node test cases.
+- Current checked command: `npm run pack:dry-run` passes for v0.0.30 and includes README, `docs/reference/collectors.md`, and runtime collector files.
 - Guarded tool surface now includes all current read-only collector tools: system, processes, disks, network, services, logs, containers, VMs, scheduled jobs, time sync, certificates, process inspection, parent tree inspection, temporal sampling/artifacts, triage bundle, and deterministic findings.
 - The normal-investigation no-evidence guard is complete: model-led triage retries once if assistant text arrives without evidence, then degrades to deterministic precollection fallback if still empty.
 - Scheduled-job and time-sync collectors were hardened after read-only review; Linux validation should use v0.0.29+.
-- Recent collector expansion through v0.0.29 includes certificate evidence, VM process-resource correlation, Colima/Lima/Podman machine VM/container-host correlation metadata, and QEMU-backed process-resource attachment for matching container-host entries.
+- Recent collector expansion through v0.0.30 includes certificate evidence, VM process-resource correlation, Colima/Lima/Podman machine VM/container-host correlation metadata, QEMU-backed process-resource attachment, and Apple Virtualization/VZ process-resource attribution by deterministic path/name hints for matching VM/container-host entries.
 
 ## Acceptance Criteria
 

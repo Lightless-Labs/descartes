@@ -402,6 +402,14 @@ function argValue(args, flag) {
   return index >= 0 ? parts[index + 1] : undefined;
 }
 
+function vmNameFromArgs(args) {
+  return argValue(args, "-name")
+    ?? argValue(args, "--name")
+    ?? argValue(args, "--vm-name")
+    ?? argValue(args, "--machine")
+    ?? vmNameFromPathArg(args);
+}
+
 function vmNameFromPathArg(args) {
   const text = String(args ?? "");
   const lima = text.match(/(?:^|\s)\S*\.lima\/([^/\s]+)/i);
@@ -419,6 +427,7 @@ function processRuntime(command, args) {
   if (haystack.includes("qemu-system")) return "qemu";
   if (haystack.includes("vmware-vmx")) return "vmware";
   if (haystack.includes("utm")) return "utm";
+  if (haystack.includes("virtualizationservice") || haystack.includes("com.apple.virtualization.virtualmachine") || haystack.includes("/virtualization.framework/")) return "apple_virtualization";
   return undefined;
 }
 
@@ -436,7 +445,7 @@ export function parseVmProcesses(stdout, { limit = DEFAULT_VM_LIMIT } = {}) {
     vms.push({
       runtime,
       id: String(pid),
-      name: boundedString(argValue(args, "-name") ?? vmNameFromPathArg(args) ?? `${runtime}-process-${pid}`),
+      name: boundedString(vmNameFromArgs(args) ?? `${runtime}-process-${pid}`),
       state: "running",
       backend: runtime === "qemu" ? "qemu" : runtime,
       owner_hint: redacted.value,
@@ -733,12 +742,13 @@ function normalizedIdentity(value) {
 }
 
 function isProcessVmHint(vm) {
-  return vm?.resource_snapshot?.pid !== undefined && vm.confidence <= 0.4 && ["qemu", "vmware", "utm"].includes(vm.runtime);
+  return vm?.resource_snapshot?.pid !== undefined && vm.confidence <= 0.4 && ["qemu", "vmware", "utm", "apple_virtualization"].includes(vm.runtime);
 }
 
 function compatibleProcessRuntime(processRuntimeName, runtimeName) {
   if (processRuntimeName === runtimeName) return true;
   if (processRuntimeName === "qemu") return ["libvirt", "proxmox", "incus", "lxd", "colima", "lima", "podman_machine"].includes(runtimeName);
+  if (processRuntimeName === "apple_virtualization") return ["tart", "colima", "lima", "podman_machine"].includes(runtimeName);
   return false;
 }
 

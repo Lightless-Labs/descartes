@@ -5,6 +5,7 @@
 **Addendum:** 2026-05-21 — first VM-side correlation landed: direct QEMU/VMware/UTM process hints are matched back into runtime VM inventory entries by compatible runtime/name/path signals, attaching resource snapshots without double-counting matched VMs.
 **Addendum:** 2026-05-21 — container-host correlation metadata landed for Colima, Lima, and Podman machine. `collect_vms` now includes Colima VM inventory, and both VM/container host entries carry explicit runtime/name correlation hints plus summary counts.
 **Addendum:** 2026-05-21 — deterministic process-resource attachment landed for container hosts where QEMU process names/paths match Colima, Lima, or Podman machine host identities. `collect_containers` now attaches bounded `resource_snapshot` and `process_correlation` to matched host entries.
+**Addendum:** 2026-05-22 — Apple Virtualization/VZ process attribution landed for non-QEMU Colima, Lima, Podman machine, and Tart-style inventory. `collect_vms` and `collect_containers` now recognize bounded `VirtualizationService` / `com.apple.Virtualization.VirtualMachine` process hints and correlate them by deterministic runtime/name/path signals.
 
 ## Goal
 
@@ -23,10 +24,10 @@ Improve Descartes' ability to answer questions such as “which VM/container is 
 
 ## Next Steps
 
-1. Validate correlation metadata/resource attachment on macOS with Colima/Lima/Podman machine and Linux with Podman machine/libvirt where available.
+1. Validate correlation metadata/resource attachment on macOS with real QEMU and VZ/Apple Virtualization Colima/Lima/Podman machine hosts, and on Linux with Podman machine/libvirt where available.
 2. Consider a combined diagnostic helper only if targeted `collect_containers` + `collect_vms` evidence remains hard for the model to synthesize.
 3. Keep improving confidence scoring for ambiguous runtime/process/name matches.
-4. Investigate Apple Virtualization / VZ process attribution for non-QEMU Colima/Lima/Podman machine backends.
+4. If real-host validation shows unnamed Apple Virtualization helper processes with no path/name hints, document the process shape and add a conservative attribution rule only when ambiguity can be bounded.
 
 ## Safety
 

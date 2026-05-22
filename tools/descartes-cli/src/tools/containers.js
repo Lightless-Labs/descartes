@@ -372,6 +372,7 @@ function normalizedIdentity(value) {
 function compatibleHostProcessRuntime(processRuntimeName, hostRuntimeName) {
   if (processRuntimeName === hostRuntimeName) return true;
   if (processRuntimeName === "qemu") return ["colima", "lima", "podman_machine"].includes(hostRuntimeName);
+  if (processRuntimeName === "apple_virtualization") return ["colima", "lima", "podman_machine"].includes(hostRuntimeName);
   return false;
 }
 

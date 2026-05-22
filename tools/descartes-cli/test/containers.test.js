@@ -150,17 +150,21 @@ test("correlateContainerHostProcessHints attaches process resource snapshots to 
   const correlation = correlateContainerHostProcessHints([
     { runtime: "lima", name: "docker", state: "running", vm_correlation: { runtime: "lima", name: "docker", confidence: 1 } },
     { runtime: "podman_machine", name: "podman-machine-default", state: "running", vm_correlation: { runtime: "podman_machine", name: "podman-machine-default", confidence: 1 } },
+    { runtime: "colima", name: "vz-default", state: "running", vm_correlation: { runtime: "colima", name: "vz-default", confidence: 1 } },
   ], [
     { runtime: "qemu", name: "docker", state: "running", owner_hint: "qemu-system-aarch64 /Users/me/.lima/docker/diffdisk", resource_snapshot: { pid: 200, cpu_percent: 10, memory_percent: 5, rss_bytes: 1000 } },
-    { runtime: "qemu", name: "podman-machine-default", state: "running", owner_hint: "qemu-system-aarch64 podman-machine-default", resource_snapshot: { pid: 201, cpu_percent: 4, memory_percent: 2, rss_bytes: 500 } },
-    { runtime: "qemu", name: "unmatched", state: "running", resource_snapshot: { pid: 202, cpu_percent: 1, memory_percent: 1, rss_bytes: 100 } },
+    { runtime: "apple_virtualization", name: "podman-machine-default", state: "running", owner_hint: "VirtualizationService --vm-name podman-machine-default", resource_snapshot: { pid: 201, cpu_percent: 4, memory_percent: 2, rss_bytes: 500 } },
+    { runtime: "apple_virtualization", name: "vz-default", state: "running", owner_hint: "com.apple.Virtualization.VirtualMachine /Users/me/.colima/_lima/vz-default/lima.yaml", resource_snapshot: { pid: 203, cpu_percent: 7, memory_percent: 3, rss_bytes: 700 } },
+    { runtime: "apple_virtualization", name: "unmatched", state: "running", resource_snapshot: { pid: 202, cpu_percent: 1, memory_percent: 1, rss_bytes: 100 } },
   ]);
 
-  assert.equal(correlation.correlated_host_process_count, 2);
+  assert.equal(correlation.correlated_host_process_count, 3);
   assert.equal(correlation.uncorrelated_host_process_hint_count, 1);
   assert.deepEqual(correlation.hosts[0].resource_snapshot, { pid: 200, cpu_percent: 10, memory_percent: 5, rss_bytes: 1000 });
   assert.equal(correlation.hosts[0].process_correlation.source, "container_host_process_scan");
   assert.deepEqual(correlation.hosts[1].resource_snapshot, { pid: 201, cpu_percent: 4, memory_percent: 2, rss_bytes: 500 });
+  assert.equal(correlation.hosts[1].process_correlation.runtime, "apple_virtualization");
+  assert.deepEqual(correlation.hosts[2].resource_snapshot, { pid: 203, cpu_percent: 7, memory_percent: 3, rss_bytes: 700 });
 });
 
 test("parseLimaListJson accepts ndjson-style limactl output", () => {

@@ -32,6 +32,7 @@
 **Addendum:** 2026-05-21 — initial VM resource correlation was added and package metadata was bumped to v0.0.27: process-backed QEMU/VMware/UTM hints are correlated into matching VM runtime inventory entries so resource snapshots can be attached without double-counting matched VMs.
 **Addendum:** 2026-05-21 — container-host/VM correlation metadata was added and package metadata was bumped to v0.0.28: Colima is now included in VM inventory, Podman machine host context is included in container inventory, and Colima/Lima/Podman machine entries carry cross-collector correlation hints.
 **Addendum:** 2026-05-21 — container-host process-resource attachment was added and package metadata was bumped to v0.0.29: Colima/Lima/Podman machine host entries can receive bounded process resource snapshots when QEMU process names/paths deterministically match host identities.
+**Addendum:** 2026-05-22 — Apple Virtualization/VZ process attribution was added and package metadata was bumped to v0.0.30: `collect_vms` and `collect_containers` can correlate bounded `VirtualizationService` / `com.apple.Virtualization.VirtualMachine` process resource snapshots into matching Tart/Colima/Lima/Podman-machine inventory when deterministic name/path hints are present.
 **Scope:** First functional end-to-end slice usable by external users and shippable quickly.
 
 ## Summary

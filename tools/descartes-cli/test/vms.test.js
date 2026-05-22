@@ -271,10 +271,10 @@ test("correlateVmProcessHints attaches process resource snapshots to matching in
   assert.equal(correlation.vms[1].name, "other");
 });
 
-test("parseVmProcesses identifies running QEMU/VMware/UTM processes with redacted args", () => {
-  const vms = parseVmProcesses(`  PID  PPID  %CPU %MEM   RSS COMM ARGS\n 1000     1   5.5  2.1 1000 qemu-system-aarch64 qemu-system-aarch64 -name linux -drive token=secret\n 1001     1   1.0  1.5 2000 vmware-vmx /Users/me/VMs/dev.vmwarevm/dev.vmx\n 1002     1   2.0  3.0 3000 UTM /Applications/UTM.app/Contents/MacOS/UTM /Users/me/test.utm\n 1003     1   6.0  2.5 4000 qemu-system-aarch64 qemu-system-aarch64 /Users/me/.lima/docker/diffdisk\n 1004     1   7.0  3.5 5000 qemu-system-aarch64 qemu-system-aarch64 /Users/me/.colima/_lima/default/diffdisk\n 1005     1   8.0  4.5 6000 qemu-system-aarch64 qemu-system-aarch64 podman-machine-default\n`);
+test("parseVmProcesses identifies running QEMU/VMware/UTM/Apple Virtualization processes with redacted args", () => {
+  const vms = parseVmProcesses(`  PID  PPID  %CPU %MEM   RSS COMM ARGS\n 1000     1   5.5  2.1 1000 qemu-system-aarch64 qemu-system-aarch64 -name linux -drive token=secret\n 1001     1   1.0  1.5 2000 vmware-vmx /Users/me/VMs/dev.vmwarevm/dev.vmx\n 1002     1   2.0  3.0 3000 UTM /Applications/UTM.app/Contents/MacOS/UTM /Users/me/test.utm\n 1003     1   6.0  2.5 4000 qemu-system-aarch64 qemu-system-aarch64 /Users/me/.lima/docker/diffdisk\n 1004     1   7.0  3.5 5000 qemu-system-aarch64 qemu-system-aarch64 /Users/me/.colima/_lima/default/diffdisk\n 1005     1   8.0  4.5 6000 qemu-system-aarch64 qemu-system-aarch64 podman-machine-default\n 1006     1   9.0  5.5 7000 VirtualizationService /System/Library/PrivateFrameworks/Virtualization.framework/VirtualizationService /Users/me/.lima/vz-docker/lima.yaml\n 1007     1   3.0  1.5 8000 com.apple.Virtualization.VirtualMachine /System/Library/Frameworks/Virtualization.framework/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine /Users/me/.colima/_lima/vz-default/lima.yaml\n 1008     1   4.0  2.5 9000 VirtualizationService VirtualizationService --vm-name podman-machine-default\n`);
 
-  assert.equal(vms.length, 6);
+  assert.equal(vms.length, 9);
   assert.equal(vms[0].runtime, "qemu");
   assert.equal(vms[0].name, "linux");
   assert.equal(vms[0].owner_hint.includes("token=[REDACTED]"), true);
@@ -283,6 +283,27 @@ test("parseVmProcesses identifies running QEMU/VMware/UTM processes with redacte
   assert.equal(vms[3].name, "docker");
   assert.equal(vms[4].name, "default");
   assert.equal(vms[5].name, "podman-machine-default");
+  assert.equal(vms[6].runtime, "apple_virtualization");
+  assert.equal(vms[6].name, "vz-docker");
+  assert.equal(vms[7].runtime, "apple_virtualization");
+  assert.equal(vms[7].name, "vz-default");
+  assert.equal(vms[8].runtime, "apple_virtualization");
+  assert.equal(vms[8].name, "podman-machine-default");
+});
+
+test("correlateVmProcessHints attaches Apple Virtualization snapshots to matching VZ inventory VMs", () => {
+  const correlation = correlateVmProcessHints([
+    { runtime: "lima", id: "vz-docker", name: "vz-docker", state: "running", backend: "vz", source_runtime: "lima", confidence: 1 },
+    { runtime: "podman_machine", id: "podman-machine-default", name: "podman-machine-default", state: "running", backend: "applehv", source_runtime: "podman_machine", confidence: 1 },
+    { runtime: "apple_virtualization", id: "1006", name: "vz-docker", state: "running", source_runtime: "apple_virtualization", confidence: 0.4, owner_hint: "VirtualizationService /Users/me/.lima/vz-docker/lima.yaml", resource_snapshot: { pid: 1006, cpu_percent: 9, memory_percent: 5.5, rss_bytes: 7168000 } },
+    { runtime: "apple_virtualization", id: "1008", name: "podman-machine-default", state: "running", source_runtime: "apple_virtualization", confidence: 0.4, owner_hint: "VirtualizationService --vm-name podman-machine-default", resource_snapshot: { pid: 1008, cpu_percent: 4, memory_percent: 2.5, rss_bytes: 9216000 } },
+  ]);
+
+  assert.equal(correlation.correlated_process_count, 2);
+  assert.equal(correlation.uncorrelated_process_hint_count, 0);
+  assert.deepEqual(correlation.vms[0].resource_snapshot, { pid: 1006, cpu_percent: 9, memory_percent: 5.5, rss_bytes: 7168000 });
+  assert.equal(correlation.vms[0].process_correlation.runtime, "apple_virtualization");
+  assert.deepEqual(correlation.vms[1].resource_snapshot, { pid: 1008, cpu_percent: 4, memory_percent: 2.5, rss_bytes: 9216000 });
 });
 
 test("classifyCommandFailure distinguishes missing, daemon, permission, and unknown failures", () => {
