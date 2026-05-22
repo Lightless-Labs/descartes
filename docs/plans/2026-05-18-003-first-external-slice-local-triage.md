@@ -1,9 +1,10 @@
 # Descartes First External Slice: LLM-Backed Local Triage CLI
 
-**Created:** 2026-05-18  
-**Revised:** 2026-05-18 — first slice must be LLM-backed, may use Pi internally as Descartes' private agent harness, must not touch the user's Pi setup, and should use XDG-style application paths.  
-**Status:** In progress  
-**Addendum:** 2026-05-18 — initial npm-style CLI scaffold added under `tools/descartes-cli/` with XDG path isolation tests, read-only resource evidence collectors, deterministic findings, and a private Pi SDK harness wrapper. Subscription login and real LLM triage still need end-to-end validation after dependency installation/auth.  
+**Created:** 2026-05-18
+**Revised:** 2026-05-18 — first slice must be LLM-backed, may use Pi internally as Descartes' private agent harness, must not touch the user's Pi setup, and should use XDG-style application paths.
+**Status:** In progress
+**Reviewed:** 2026-05-22 — parallel Codex 5.5 xhigh via Pi reviews completed: technical implementation review and functional/project-direction alignment review. Reports are in `docs/reviews/2026-05-22-technical-implementation-codex-5.5-xhigh.md` and `docs/reviews/2026-05-22-functional-alignment-codex-5.5-xhigh.md`.
+**Addendum:** 2026-05-18 — initial npm-style CLI scaffold added under `tools/descartes-cli/` with XDG path isolation tests, read-only resource evidence collectors, deterministic findings, and a private Pi SDK harness wrapper. Subscription login and real LLM triage still need end-to-end validation after dependency installation/auth.
 **Addendum:** 2026-05-19 — triage now defaults to a guarded read-only Descartes tool investigation phase after deterministic precollection, with JSON diagnostics for selected model, active tools, tool calls/errors, stop reason, and fallback state. Real provider/auth validation is still pending.
 **Addendum:** 2026-05-19 — real macOS Anthropic subscription-auth field test validated the guarded LLM tool loop with an actual `collect_disks` call and non-fallback diagnosis. Next plan-aligned work is first-slice release readiness; see `todos/2026-05-19-first-external-slice-validation.md`.
 **Addendum:** 2026-05-19 — release-readiness pass tightened README/help/package metadata, removed tests from published package contents, added package metadata drift tests, and validated local tarball install, GitHub install, isolated-XDG no-auth triage failure, API-key login path storage, and local evidence collection. Remaining validation gaps are a final credentialed current-package human/JSON triage run and Linux x86_64 behavior.
