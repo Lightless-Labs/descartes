@@ -11,10 +11,11 @@ The target is closer to a Casbin-style policy/evaluation engine plus a Prolog/Da
 
 ## Core Idea
 
-Collectors produce structured evidence envelopes. A fact bridge reifies that evidence into typed facts. The agent authors declarative artifacts over those facts:
+Collectors produce structured evidence envelopes. A fact bridge reifies that evidence into typed facts. A local time-series/history store persists facts and metrics over time. The agent authors declarative artifacts over current facts and historical windows:
 
 - logic rules / signatures over current evidence
 - sensors over current or recent fact windows
+- durable metric definitions over sampled or event-driven observations
 - triggers and alarms with severity/confidence/review hints
 - statistical feature definitions and baseline/anomaly/classification models
 - tests, fixtures, and promotion metadata
@@ -27,6 +28,7 @@ The runtime executes these artifacts deterministically and cheaply. The LLM is u
 L0 collectors
   -> evidence envelopes
   -> fact bridge / typed fact catalog
+  -> local history + metric store
   -> logic engine (safe Prolog/Datalog-like rules)
   -> statistical model engine (features, baselines, classifiers)
   -> findings / triggers / alarms / recommendations
@@ -64,13 +66,30 @@ Includes:
 - positive/negative fixtures
 - provenance and review history
 
+### Metric artifact
+
+Defines what to persist over time from facts/evidence and how to aggregate it.
+
+Includes:
+
+- metric name and dimensions, for example `process.cpu_percent{command="postgres"}` or `service.failed_count{scope="system"}`
+- source facts and extraction expression
+- collection mode: sampled interval, event-driven, on-demand, or derived from another metric
+- sampling interval and jitter policy when sampled
+- retention and rollup policy
+- aggregations: count, min, max, mean, median, p95/p99, stddev, rate, delta, last value, distinct count
+- dimensionality/cardinality bounds
+- missing-data semantics
+- privacy/sensitivity labels
+- provenance to source envelopes/facts
+
 ### Statistical model artifact
 
 A constrained model definition, not arbitrary code.
 
 Includes:
 
-- feature definitions over facts/time windows
+- feature definitions over persisted metrics and fact/time windows
 - model family: threshold, EWMA, linear regression, logistic/classifier, clustering, anomaly score, etc.
 - training window and inclusion/exclusion policy
 - validation metrics
@@ -93,8 +112,9 @@ Connects rule/model outputs to monitoring behavior:
 
 The background LLM agent should receive tools for building tools, not host mutation:
 
-- inspect fact catalog and example facts
+- inspect fact catalog, metric catalog, and example facts/metric windows
 - propose fact schema additions from collector envelopes
+- propose metric definitions, sampling intervals, rollups, and retention policies
 - author logic rules in the safe rule language
 - author statistical feature/model definitions from approved model families
 - generate synthetic fixtures and scrubbed regression fixtures
@@ -134,20 +154,28 @@ Promotion requires:
 - Add a safe rule-runner prototype with fixtures.
 - Seed only 2-3 example rules to validate the substrate, not to build a full hand-authored rule library.
 
-### Milestone 2: Agent workbench commands
+### Milestone 2: Local history and metric store
 
-- Let an agent inspect facts, propose a rule, generate fixtures, run evaluation, and produce a review packet.
+- Persist selected facts/metrics over time under Descartes-owned XDG state/cache paths.
+- Support sampled and event-driven metric updates.
+- Store timestamps, dimensions, provenance, and sensitivity labels.
+- Implement bounded rollups: min, max, mean, count, rate, p95, last, and missing-data markers.
+- Enforce retention, size limits, and cardinality caps.
+
+### Milestone 3: Agent workbench commands
+
+- Let an agent inspect facts and metric windows, propose a rule or metric, generate fixtures, run evaluation, and produce a review packet.
 - Keep outputs as candidate artifacts; do not auto-activate.
 
-### Milestone 3: Statistical model artifact prototype
+### Milestone 4: Statistical model artifact prototype
 
-- Add simple feature definitions and approved model families such as threshold, EWMA, and linear/logistic models.
+- Add simple feature definitions over stored metrics and approved model families such as threshold, EWMA, and linear/logistic models.
 - Generate model-output facts that logic rules can consume.
 
-### Milestone 4: Shadow-mode sensors
+### Milestone 5: Shadow-mode sensors
 
-- Run selected candidate sensors against collected evidence without notifying or acting.
-- Record false positives/negatives and confidence decay.
+- Run selected candidate sensors against collected evidence/history without notifying or acting.
+- Record false positives/negatives, confidence decay, and baseline drift.
 
 ## Non-Goals For This Plan
 
@@ -160,5 +188,7 @@ Promotion requires:
 
 - Exact rule engine: embedded Prolog, Datalog, Datafrog, Soufflé-style offline compile, or a custom restricted rule DSL.
 - Whether logic and statistical artifacts share one syntax or separate schemas.
+- Storage engine for local metrics/history: SQLite, embedded time-series tables, append-only JSONL for early prototypes, or Rust-native store.
 - How much historical fact storage is required for useful baselines before a daemon exists.
+- How to schedule sampling before a full daemon exists without violating read-only/no-background-surprise expectations.
 - How to package artifacts for future Rust/Bazel-friendly execution while the current harness remains Node/Pi.
