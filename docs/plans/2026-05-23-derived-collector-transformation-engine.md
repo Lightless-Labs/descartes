@@ -79,6 +79,72 @@ hot_process(Command) :-
   Mean > 80.
 ```
 
+## Example Capability: Track One Executable Across Process Instances
+
+A concrete end-state capability should be possible from the CLI:
+
+```bash
+descartes watch executable /usr/bin/postgres --name postgres-behavior
+```
+
+or, through the model-led CLI:
+
+```bash
+descartes triage "keep an eye on postgres and tell me if its behavior changes"
+```
+
+Descartes should be able to set up a derived collector/sensor that tracks one binary, executable identity, process name, bundle ID, container image entrypoint, or other stable executable identity across all process instances over time.
+
+The daemon still only runs normal read-only process/system collectors. The derived collector groups process observations by stable executable identity and computes behavior metrics across all instances:
+
+- instance count over time
+- total and per-instance CPU
+- total and per-instance RSS/memory
+- parent/child lineage patterns
+- command-line shape changes with redacted arguments
+- user/UID distribution where available
+- container/VM correlation where available
+- listening ports / network role when network facts are available
+- restart/churn rate
+- first seen / last seen
+- baseline windows and anomaly scores
+
+Example artifact sketch:
+
+```yaml
+kind: derived_collector
+name: postgres_behavior
+version: 1
+inputs:
+  - fact: process_observation
+  - fact: process_parent_edge
+window: 24h
+identity:
+  executable_path: /usr/bin/postgres
+group_by: [executable_identity]
+transform:
+  reduce:
+    instances: distinct_count(pid)
+    total_cpu: sum(cpu_percent)
+    mean_cpu_per_instance: mean(cpu_percent)
+    max_cpu_per_instance: max(cpu_percent)
+    total_rss_bytes: sum(rss_bytes)
+    max_rss_bytes: max(rss_bytes)
+    restart_rate_1h: rate(new_pid_seen)
+    command_shapes: distinct_count(redacted_command_shape)
+emit:
+  metric: executable.behavior
+  dimensions: [executable_identity]
+bounds:
+  max_groups: 1
+  max_window: 24h
+  max_command_shapes: 25
+privacy:
+  sensitivity: process_metadata
+```
+
+A later sensor/model can consume this derived metric to detect behavior drift without the LLM watching raw process tables continuously.
+
 ## Transformation DSL Requirements
 
 The DSL should be deliberately small and auditable.

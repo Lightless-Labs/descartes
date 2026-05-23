@@ -29,6 +29,16 @@ This is map/filter/group/reduce/window over stored data, not arbitrary code exec
 - Explicitly forbidden arbitrary JS/Rust/Python/shell, filesystem/network/process access, dynamic imports, unbounded loops, unbounded joins, and source mutation.
 - Provenance and diagnostics for every output.
 
+## Example Capability
+
+The CLI should eventually be able to set up a derived collector that tracks a specific executable/binary/process identity across all process instances over time, for example:
+
+```bash
+descartes watch executable /usr/bin/postgres --name postgres-behavior
+```
+
+The derived collector should group process observations by stable executable identity and compute bounded behavior metrics such as instance count, total/per-instance CPU, total/per-instance RSS, restart/churn rate, command-line shape changes with redacted args, lineage patterns, and container/VM correlation where available.
+
 ## Acceptance Criteria
 
 - A candidate derived collector can be expressed as a declarative artifact.
