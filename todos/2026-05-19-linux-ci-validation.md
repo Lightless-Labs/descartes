@@ -164,6 +164,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 - Direct collector statuses are now validated for system/processes/disks/network/services/recent logs/containers/VMs/scheduled jobs/time sync/certificates/process inspection/parent tree/sampling on true Linux x86_64. This substantially closes the x86_64 collector/runtime gap.
 - Credentialed model-led triage was skipped because no dedicated validation credential was available.
 - Version caveat: the run observed v0.0.30 because local v0.0.31 review-finding fixes had not yet been pushed. `main` has now been pushed through v0.0.31; next rerun should confirm public `descartes --version` is 0.0.31+ and exercise the container-command redaction/fallback guard fixes.
+- Deferred rerun note: the temporary x86 host was deleted after the v0.0.30 validation run, so the short v0.0.31+ rerun is intentionally deferred until infrastructure is available again. Do not block L1/product consolidation work on it.
 - Scaleway x86_64 host was IPv6-only and needed an SSH reverse HTTP CONNECT proxy for GitHub/codeload access; future CI should prefer IPv4/NAT64-capable runners or a known proxy path.
 
 2026-05-22 validation brief update for v0.0.31+:
