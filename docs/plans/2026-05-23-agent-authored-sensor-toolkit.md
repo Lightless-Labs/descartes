@@ -2,6 +2,7 @@
 
 **Created:** 2026-05-23
 **Status:** Proposed
+**Depends on:** `docs/plans/2026-05-23-daemon-history-store.md` for background collection and local metric/history persistence.
 
 ## Purpose
 
@@ -154,13 +155,15 @@ Promotion requires:
 - Add a safe rule-runner prototype with fixtures.
 - Seed only 2-3 example rules to validate the substrate, not to build a full hand-authored rule library.
 
-### Milestone 2: Local history and metric store
+### Milestone 2: Local history and metric store integration
 
-- Persist selected facts/metrics over time under Descartes-owned XDG state/cache paths.
-- Support sampled and event-driven metric updates.
-- Store timestamps, dimensions, provenance, and sensitivity labels.
-- Implement bounded rollups: min, max, mean, count, rate, p95, last, and missing-data markers.
-- Enforce retention, size limits, and cardinality caps.
+The underlying daemon/history store is covered by `docs/plans/2026-05-23-daemon-history-store.md`. This milestone integrates the sensor toolkit with that store:
+
+- Read selected facts/metrics over time from the daemon-owned history store.
+- Support sampled and event-driven metric windows.
+- Preserve timestamps, dimensions, provenance, and sensitivity labels.
+- Consume bounded rollups: min, max, mean, count, rate, p95, last, and missing-data markers.
+- Respect retention, size limits, and cardinality caps.
 
 ### Milestone 3: Agent workbench commands
 
