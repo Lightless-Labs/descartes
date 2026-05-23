@@ -122,29 +122,29 @@ Track Linux parity against macOS for the first-slice tool surface.
 
 | Capability / Tool | macOS status | Linux VM/container target | Notes |
 |---|---:|---:|---|
-| GitHub npm install | validated | validated on Linux arm64 with prefix | User prefix installed public v0.0.11 successfully. |
-| `descartes --help` / `--version` | validated | validated on Linux arm64 | v0.0.11 returned the expected version and help through the npm prefix symlink. |
-| XDG path isolation | validated | partially validated on Linux arm64 | login stored credentials at `/home/admin/.config/descartes/auth.json`; still need isolated-XDG file listing. |
-| no-auth triage failure | validated | validated on Linux arm64 | expected credentials error, no panic. |
+| GitHub npm install | validated | validated on Linux ARM64 and x86_64 for v0.0.30 / rerun v0.0.31+ | User-prefix public GitHub installs passed on Ubuntu 24.04 ARM64, Debian 13 ARM64, Fedora 42 ARM64, and Debian 13 x86_64. Latest rerun still needed after v0.0.31 was pushed. |
+| `descartes --help` / `--version` | validated | validated on Linux ARM64 and x86_64 for v0.0.30 / rerun v0.0.31+ | Help and symlinked version worked everywhere; latest run observed version 0.0.30 before v0.0.31 was pushed. |
+| XDG path isolation | validated | validated on Linux ARM64 and x86_64 | Isolated no-auth runs created only Descartes XDG files where files were created, with no Pi path evidence. |
+| no-auth triage failure | validated | validated on Linux ARM64 and x86_64 | Expected missing-credentials error and exit status 1 everywhere. |
 | subscription/API-key login path | validated on macOS | validated on Linux arm64 | ChatGPT/Codex `--no-open` manual redirect flow succeeded. |
 | model-led guarded tool use | validated | validated on Linux arm64 | credentialed JSON triage called `collect_triage_evidence`, `fallback_used: false`, `actions_taken: []`. |
 | `collect_system` | validated | validated on Linux arm64 | Linux swap from `/proc/meminfo`; host reported Linux arm64. |
 | `collect_processes` | validated | validated on Linux arm64 | v0.0.11 used Linux `ps -eo ...`, returned `top-processes.status: ok`, and sorted top CPU/memory in-process. |
 | `collect_disks` | validated with classification | validated on Linux arm64 before classification | Linux `df -kP` and `df -iP` returned structured filesystem/inode evidence; rerun should confirm pseudo filesystems are classified not pressure-relevant. |
 | `collect_triage_evidence` | validated | validated on Linux arm64 | combined evidence + findings returned through model-requested tool call. |
-| `derive_findings` | validated | validate | deterministic, should be platform-independent |
-| `inspect_process` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only PID identity envelope with redacted/bounded args. |
-| `inspect_parent_tree` | implemented / local macOS smoke checked | validate on Linux x86_64 | read-only bounded ancestry envelope with redacted/bounded args. |
-| temporal sampling | implemented / local macOS smoke checked | validate on Linux x86_64 | `sample_dimension` supports CPU processes, memory processes, and load/memory/swap plus Descartes-owned artifacts. |
-| `collect_network_basics` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux uses fixed `ip route show default`, `/etc/resolv.conf`, DNS lookup, and `ss -H -ltnu`. |
-| `collect_services` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux uses fixed `systemctl list-units --type=service --all --no-pager --no-legend`. |
-| `collect_recent_logs` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux uses bounded fixed `journalctl` and fixed log-file tail probes. |
-| `collect_containers` | implemented / local macOS smoke checked | validated on Linux ARM64 / validate x86_64 | v0.0.22 ARM64 archive passed direct container collector smokes on Ubuntu/Debian/Fedora with Podman available and missing Docker/Lima represented per runtime. Docker/Podman/Lima/Colima plus Podman machine host-context coverage; missing daemons/permissions should be represented per runtime/probe. |
-| `collect_vms` | implemented / local macOS smoke checked | validated on Linux ARM64 / validate x86_64 | v0.0.22 ARM64 archive passed direct VM collector smokes on Ubuntu/Debian/Fedora with libvirt/podman-machine/LXD states represented without envelope failure. Linux targets include Colima where installed, libvirt/virsh, QEMU process hints, VirtualBox, VMware, Podman machine, Incus/LXD VMs, Proxmox, Xen, and others where available. |
-| `collect_scheduled_jobs` | implemented / local macOS smoke checked | validate on Linux x86_64 | External Linux ARM64 scheduler command checks passed in the v0.0.22 validation archive, but the collector file did not exist in that version. Linux uses cron file probes plus system/user systemd timers; v0.0.25 bounds cron file reads and fairly selects returned jobs across sources. |
-| `collect_time_sync` | implemented / local macOS smoke checked | validate on Linux x86_64 | External Linux ARM64 `timedatectl`/chrony command checks passed in the v0.0.22 validation archive, but the collector file did not exist in that version. Linux uses `timedatectl`, optional chrony/ntpq, and explicit optional SNTP offset checks; v0.0.25 rejects option/path-like NTP server values and preserves unknown sync state. |
-| `collect_certificates` | implemented / local macOS smoke checked | validate on Linux x86_64 | Linux targets common trust/service certificate paths and skips private keys; added in v0.0.26. |
-| collector reference docs | validated | validate package install includes docs | `docs/reference/collectors.md` is included in the package as of v0.0.24+. |
+| `derive_findings` | validated | validated on Linux ARM64 and x86_64 for v0.0.30 | Covered by `collect_all` direct smokes and npm tests. |
+| `inspect_process` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Read-only PID identity envelope returned ok everywhere. |
+| `inspect_parent_tree` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Read-only bounded ancestry envelope returned ok everywhere. |
+| temporal sampling | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | `sample_load_memory_swap` returned ok everywhere. |
+| `collect_network_basics` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct network collector returned ok everywhere. |
+| `collect_services` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct services collector returned ok everywhere with 0 failed services in latest validation hosts. |
+| `collect_recent_logs` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct recent-logs collector returned ok everywhere. |
+| `collect_containers` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 / rerun v0.0.31 redaction | Direct collector returned unknown on hosts with no runtimes and ok on Fedora ARM64 with Podman; no crashes. v0.0.31 container command redaction still needs public Linux rerun. |
+| `collect_vms` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct collector returned warning/unknown/ok as appropriate; unavailable LXC/libvirt-style runtime states degraded gracefully. |
+| `collect_scheduled_jobs` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct collector returned warning everywhere due expected unavailable user/system sources, with 5–32 jobs discovered depending host. |
+| `collect_time_sync` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct collector returned ok everywhere with synchronized, NTP-enabled summaries. |
+| `collect_certificates` | implemented / local macOS smoke checked | validated on Linux ARM64 and x86_64 for v0.0.30 | Direct collector returned ok except Fedora warning due expired certificate material; no parser failure. |
+| collector reference docs | validated | validated on Linux ARM64 and x86_64 for v0.0.30 / rerun v0.0.31+ | Installed package included `docs/reference/collectors.md` everywhere. |
 
 ## Observed Linux Attempts
 
@@ -155,6 +155,16 @@ Track Linux parity against macOS for the first-slice tool surface.
 - Fresh local tarball install no longer emits the `@mariozechner/*` deprecation warnings.
 - One upstream `node-domexception` deprecation warning remains through `@google/genai`/Google auth transitive dependencies in Pi AI.
 - Linux ARM64 validation should be rerun after v0.0.12 is pushed.
+
+2026-05-23 Linux ARM64/x86_64 validation summary:
+
+- Curated report: `docs/reviews/2026-05-23-linux-validation-summary.md`.
+- Public v0.0.30 at commit `eccea4332ce87ab32bcb0bda95ba8790cd22d0e0` validated on Ubuntu 24.04 ARM64, Debian 13 ARM64, Fedora 42 ARM64, and Debian 13 x86_64 with Node v22.21.1/npm 10.9.4.
+- Public GitHub install, symlinked help/version, installed collector docs, isolated-XDG no-auth failure, `npm test`, pack dry-run, and direct collector smokes all passed. No collector threw or emitted malformed JSON.
+- Direct collector statuses are now validated for system/processes/disks/network/services/recent logs/containers/VMs/scheduled jobs/time sync/certificates/process inspection/parent tree/sampling on true Linux x86_64. This substantially closes the x86_64 collector/runtime gap.
+- Credentialed model-led triage was skipped because no dedicated validation credential was available.
+- Version caveat: the run observed v0.0.30 because local v0.0.31 review-finding fixes had not yet been pushed. `main` has now been pushed through v0.0.31; next rerun should confirm public `descartes --version` is 0.0.31+ and exercise the container-command redaction/fallback guard fixes.
+- Scaleway x86_64 host was IPv6-only and needed an SSH reverse HTTP CONNECT proxy for GitHub/codeload access; future CI should prefer IPv4/NAT64-capable runners or a known proxy path.
 
 2026-05-22 validation brief update for v0.0.31+:
 
