@@ -2,7 +2,7 @@
 
 **Prepared:** 2026-05-22
 **Audience:** infrastructure-running agent
-**Target:** Linux ARM64 / `aarch64` best-effort platform validation for Descartes `v0.0.30+`
+**Target:** Linux ARM64 / `aarch64` best-effort platform validation for Descartes `v0.0.31+`
 
 ## Goal
 
@@ -63,7 +63,7 @@ find "$prefix/lib/node_modules" -path '*/docs/reference/collectors.md' -print -q
 
 Expected:
 
-- `descartes --version` is `0.0.30` or newer.
+- `descartes --version` is `0.0.31` or newer.
 - `descartes --help` works through the npm-prefix symlink.
 - `docs/reference/collectors.md` is included in the installed package.
 - The known upstream `node-domexception` deprecation warning may appear; do not fail solely for that.
@@ -226,25 +226,38 @@ Expected:
 {
   echo "arch=$(uname -m)"
   command -v crontab systemctl timedatectl journalctl chronyc ntpq sntp docker podman virsh qemu-system-aarch64 qemu-system-x86_64 limactl multipass VBoxManage incus lxc qm xl || true
-  timedatectl status --no-pager || true
-  systemctl list-timers --all --no-pager --no-legend | head -50 || true
-  systemctl --user list-timers --all --no-pager --no-legend | head -50 || true
+  timedatectl show --property=Timezone --property=LocalRTC --property=NTP --property=CanNTP --property=NTPSynchronized --property=TimeUSec --property=RTCTimeUSec || true
+  systemctl list-timers --all --no-pager --no-legend 2>/dev/null | wc -l | awk '{print "system_timer_row_count", $1}' || true
+  systemctl --user list-timers --all --no-pager --no-legend 2>/dev/null | wc -l | awk '{print "user_timer_row_count", $1}' || true
   podman --version || true
+  podman ps --all --format '{{.State}}' 2>/dev/null | sort | uniq -c | sed 's/^/podman_container_state /' || true
   docker --version || true
-  virsh list --all || true
+  docker ps --all --format '{{.State}}' 2>/dev/null | sort | uniq -c | sed 's/^/docker_container_state /' || true
+  virsh list --all --name 2>/dev/null | sed '/^$/d' | wc -l | awk '{print "virsh_vm_count", $1}' || true
+  virsh list --state-running --name 2>/dev/null | sed '/^$/d' | wc -l | awk '{print "virsh_running_vm_count", $1}' || true
 } | tee "$work/external-capabilities.txt"
 ```
 
-Expected: read-only commands complete or fail gracefully. Do not make service/package/container changes to improve these results.
+Expected: read-only commands complete or fail gracefully while capturing counts/states, not raw logs, process args, container names/images, VM names, or command lines. Do not make service/package/container changes to improve these results.
 
 ## 6. Optional Credentialed Model-Led Triage
 
 Only run if a dedicated validation credential or pre-seeded Descartes auth is available. Prefer a revocable validation account/key, not a personal token. Do not upload full JSON.
 
 ```bash
-# If auth is not already seeded, run the supported login flow for the environment.
+auth_xdg="$work/xdg-auth"
+mkdir -p "$auth_xdg/home" "$auth_xdg/config" "$auth_xdg/data" "$auth_xdg/state" "$auth_xdg/cache"
+descartes_env=(env \
+  HOME="$auth_xdg/home" \
+  XDG_CONFIG_HOME="$auth_xdg/config" \
+  XDG_DATA_HOME="$auth_xdg/data" \
+  XDG_STATE_HOME="$auth_xdg/state" \
+  XDG_CACHE_HOME="$auth_xdg/cache")
+
+# If auth is not already seeded into "$auth_xdg/config/descartes/auth.json",
+# run the supported login flow in the isolated XDG environment.
 # Interactive/headless OAuth fallback:
-#   descartes login --no-open
+#   "${descartes_env[@]}" descartes login --no-open
 
 for prompt in \
   "my machine is slow" \
@@ -254,7 +267,7 @@ for prompt in \
   "are any local certificates expiring soon?"
 do
   safe_name="$(printf '%s' "$prompt" | tr -cs '[:alnum:]' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//')"
-  descartes triage "$prompt" --json > "$work/triage-$safe_name.raw.json"
+  "${descartes_env[@]}" descartes triage "$prompt" --json > "$work/triage-$safe_name.raw.json"
   node -e '
     const fs = require("fs");
     const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));

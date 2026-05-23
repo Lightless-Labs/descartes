@@ -57,7 +57,7 @@ Use `evidenceEnvelope()` and `timedEnvelope()` from `envelope.js` unless there i
 - Bound output size, item counts, timeouts, sample duration, and file reads before parsing untrusted/local scheduler content.
 - Represent missing tools, unsupported platforms, permissions, and daemon/socket failures as structured `unknown`/`unable` evidence rather than throwing or panicking.
 - Capture command argv, read-only intent, stderr/error boundaries, and per-probe status when shelling out.
-- Redact obvious secrets from process args, log excerpts, scheduled commands, and process-backed hints.
+- Redact obvious secrets from process args, container commands, log excerpts, scheduled commands, and process-backed hints.
 - Treat local evidence as sensitive diagnostic artifacts even when redacted.
 - Do not read or write Pi-owned paths. Descartes-owned artifact paths must go through the path helpers and guardrails.
 - Do not add a new collector to `collect_triage_evidence` by default; that bundle intentionally remains the compact resource-pressure first pass.

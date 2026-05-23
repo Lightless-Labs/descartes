@@ -28,3 +28,12 @@ test("fallback diagnosis preserves substantive deterministic evidence refs", () 
   assert.equal(diagnosis.summary, "Memory pressure is high");
   assert.deepEqual(diagnosis.evidence_refs, ["system-overview"]);
 });
+
+test("fallback diagnosis does not claim evidence was collected when evidence is empty", () => {
+  const diagnosis = fallbackDiagnosis("my machine is slow", [], []);
+
+  assert.equal(diagnosis.fallback, true);
+  assert.match(diagnosis.summary, /could not collect evidence/);
+  assert.match(diagnosis.explanation, /no evidence was available/);
+  assert.deepEqual(diagnosis.evidence_refs, []);
+});

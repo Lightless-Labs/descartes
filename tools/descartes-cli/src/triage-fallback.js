@@ -1,11 +1,18 @@
 export function fallbackDiagnosis(prompt, evidence, findings, llmError) {
   const substantiveFindings = findings.filter((finding) => finding.id !== "insufficient_evidence");
+  const hasEvidence = evidence.length > 0;
+  const emptyEvidenceSummary = llmError
+    ? "Descartes could not collect evidence and the LLM request failed."
+    : "Descartes could not collect evidence and the model returned no diagnosis text.";
+  const evidenceBackedSummary = llmError
+    ? "Descartes collected evidence, but the LLM request failed."
+    : "Descartes collected evidence, but the model returned no diagnosis text.";
   return {
-    summary: substantiveFindings[0]?.summary ?? (llmError ? "Descartes collected evidence, but the LLM request failed." : "Descartes collected evidence, but the model returned no diagnosis text."),
+    summary: substantiveFindings[0]?.summary ?? (hasEvidence ? evidenceBackedSummary : emptyEvidenceSummary),
     confidence: substantiveFindings.length > 0 ? "medium" : "low",
     explanation: substantiveFindings.length > 0
       ? `Fallback deterministic summary generated because the LLM-backed session produced no final text${llmError ? ` (${llmError})` : ""}. Review findings and evidence directly.`
-      : `Fallback deterministic summary generated because the LLM-backed session produced no final text${llmError ? ` (${llmError})` : ""} and no obvious first-slice resource-pressure threshold was crossed.`,
+      : `Fallback deterministic summary generated because the LLM-backed session produced no final text${llmError ? ` (${llmError})` : ""}${hasEvidence ? " and no obvious first-slice resource-pressure threshold was crossed." : " and no evidence was available for deterministic synthesis."}`,
     evidence_refs: [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))].filter(Boolean).length > 0
       ? [...new Set(findings.flatMap((finding) => finding.evidence_refs ?? []))].filter(Boolean)
       : evidence.map((item) => item.id),

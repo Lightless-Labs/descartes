@@ -156,10 +156,10 @@ Track Linux parity against macOS for the first-slice tool surface.
 - One upstream `node-domexception` deprecation warning remains through `@google/genai`/Google auth transitive dependencies in Pi AI.
 - Linux ARM64 validation should be rerun after v0.0.12 is pushed.
 
-2026-05-22 validation brief update for v0.0.30+:
+2026-05-22 validation brief update for v0.0.31+:
 
 - Dedicated infrastructure-agent briefs now exist at `linux-arm64-validation-brief.md` and `linux-x86_64-validation-brief.md`. They cover public GitHub install, help/version, installed collector docs, isolated-XDG no-auth failure, clone `npm test`, pack dry-run, sanitized direct collector smokes across the current tool surface, read-only external capability snapshots, and optional credentialed model-led triage summaries.
-- The ARM64 brief is for best-effort multi-distro reruns after the v0.0.30 collector/correlation additions; the x86_64 brief is the Tier-1 gap-closing validation.
+- The ARM64 brief is for best-effort multi-distro reruns after the v0.0.31 review-finding fixes and previous collector/correlation additions; the x86_64 brief is the Tier-1 gap-closing validation.
 
 2026-05-21/22 local validation/doc update for v0.0.30:
 
@@ -171,7 +171,7 @@ Track Linux parity against macOS for the first-slice tool surface.
 - v0.0.28 adds Colima VM inventory, Podman machine container-host context, and Colima/Lima/Podman machine VM/container-host correlation metadata.
 - v0.0.29 adds QEMU-backed process-resource attachment for Colima/Lima/Podman machine host entries when process names/paths deterministically match.
 - v0.0.30 adds Apple Virtualization/VZ process-resource attribution for Colima/Lima/Podman machine and Tart-style inventory when deterministic name/path hints are present.
-- Linux ARM64/x86_64 validation should now use v0.0.30+.
+- Linux ARM64/x86_64 validation should now use v0.0.31+.
 
 2026-05-21 Linux ARM64 multi-distro validation archive in ignored `materials/descartes-linux-arm64-validation.zip` validated public v0.0.22-era packaging/runtime on Ubuntu 24.04, Debian 13, and Fedora 42 ARM64:
 

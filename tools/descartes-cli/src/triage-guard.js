@@ -22,12 +22,11 @@ export function shouldRetryForEvidence({ guard, assistantText, evidence, maxRetr
 }
 
 export function shouldFallbackForNoEvidence({ guard, assistantText, evidence }) {
+  const hasAssistantText = typeof assistantText === "string" && assistantText.trim().length > 0;
   return Boolean(
     guard?.enabled &&
-    typeof assistantText === "string" &&
-    assistantText.trim() &&
     !hasCollectedEvidence(evidence) &&
-    guard.retry_count >= 1
+    (!hasAssistantText || guard.retry_count >= 1)
   );
 }
 

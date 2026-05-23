@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { redactAndBoundProcessArgs } from "./processes.js";
 import { parseVmProcesses } from "./vms.js";
 
 const execFileAsync = promisify(execFile);
@@ -119,6 +120,21 @@ function boundedString(value, max = 240) {
   return truncate(String(value), max);
 }
 
+function redactContainerCommand(value) {
+  if (value === undefined || value === null) return { command: undefined, command_redaction: undefined };
+  const text = Array.isArray(value) ? value.join(" ") : String(value);
+  const redaction = redactAndBoundProcessArgs(text, { maxLength: 240 });
+  return {
+    command: redaction.value,
+    command_redaction: {
+      redacted: redaction.redacted,
+      truncated: redaction.truncated,
+      original_length: redaction.original_length,
+      max_length: redaction.max_length,
+    },
+  };
+}
+
 function firstName(value) {
   if (Array.isArray(value)) return value[0];
   return value;
@@ -139,12 +155,13 @@ export function parseDockerPsJsonLines(stdout, { limit = DEFAULT_CONTAINER_LIMIT
   return parseJsonLines(stdout).map((item) => {
     const state = normalizeContainerState(item.State ?? item.Status);
     if (!includeStopped && state !== "running") return undefined;
+    const command = redactContainerCommand(item.Command);
     return {
       runtime: "docker",
       id: item.ID,
       name: item.Names,
       image: item.Image,
-      command: boundedString(item.Command),
+      ...command,
       state,
       status: item.Status,
       ports: boundedString(item.Ports, 400),
@@ -179,12 +196,13 @@ export function parsePodmanPsJson(stdout, { limit = DEFAULT_CONTAINER_LIMIT, inc
   return parseJsonMaybeArray(stdout).map((item) => {
     const state = normalizeContainerState(item.State ?? item.Status);
     if (!includeStopped && state !== "running") return undefined;
+    const command = redactContainerCommand(item.Command);
     return {
       runtime: "podman",
       id: item.Id ?? item.ID,
       name: firstName(item.Names ?? item.Namespaces),
       image: item.Image,
-      command: Array.isArray(item.Command) ? boundedString(item.Command.join(" ")) : boundedString(item.Command),
+      ...command,
       state,
       status: item.Status,
       ports: Array.isArray(item.Ports) ? item.Ports.slice(0, 12) : item.Ports,

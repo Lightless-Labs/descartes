@@ -169,7 +169,8 @@ export async function runTriage(paths, args) {
 
     markEvidenceGuardSatisfied(evidenceGuard, collected.evidence);
     if (shouldFallbackForNoEvidence({ guard: evidenceGuard, assistantText: assistantTextForOutput, evidence: collected.evidence })) {
-      markEvidenceGuardFallback(evidenceGuard);
+      const fallbackReason = assistantTextForOutput?.trim() ? "no_evidence_after_retry" : "no_evidence_no_assistant_text";
+      markEvidenceGuardFallback(evidenceGuard, fallbackReason);
       precollected = await collectAllEvidence();
     }
   } finally {

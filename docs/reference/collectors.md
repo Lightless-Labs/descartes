@@ -1,6 +1,6 @@
 # Descartes Collector Reference
 
-**Updated:** 2026-05-21
+**Updated:** 2026-05-22
 
 This is the reference catalog for Descartes' current read-only evidence collectors and model-visible investigation tools. The source-adjacent developer guide lives at `tools/descartes-cli/src/tools/README.md`.
 
@@ -30,7 +30,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 | `collect_time_sync` | `time-sync` | macOS, Linux | `check_offset?: boolean`, `server?: string` |
 | `collect_certificates` | `certificates` | macOS, Linux | `warning_days?: 1..3650`, `certificate_limit?: 1..500` |
 | `inspect_process` | `process-<pid>` | macOS, Linux | `pid: number` |
-| `inspect_parent_tree` | `parent-tree-<pid>` | macOS, Linux | `pid: number`, `max_depth?: 1..64` |
+| `inspect_parent_tree` | `process-parent-tree-<pid>` | macOS, Linux | `pid: number`, `max_depth?: 1..64` |
 | `sample_dimension` | `sample-<dimension>` | macOS, Linux | `dimension`, `duration_seconds?: 1..60`, `interval_seconds?: 1..60`, `top_n?: 1..20`, `aggregation?: ...` |
 | `read_sampling_artifact` | `sampling-artifact-<id>` | macOS, Linux | `artifact_id: string`, `max_samples?: 1..25` |
 | `collect_triage_evidence` | bundle: `evidence[]`, `findings[]`, `actions_taken: []` | macOS, Linux | none |
@@ -140,9 +140,9 @@ Sources:
 - Colima and Lima: fixed host/runtime context probes.
 - Podman machine: fixed `podman machine list --format json` host-context probe when available.
 
-Behavior: missing commands, stopped daemons, and permission-limited sockets are represented per runtime. Colima, Lima, and Podman machine host entries include VM-correlation metadata so matching VM inventory can be connected by name/runtime when both collectors are called. When deterministic QEMU or Apple Virtualization process matches are available, host entries also get bounded process resource snapshots from a fixed read-only `ps` scan. No container mutating commands are exposed.
+Behavior: missing commands, stopped daemons, and permission-limited sockets are represented per runtime. Docker and Podman container commands are bounded/redacted for obvious secrets and include command redaction metadata. Colima, Lima, and Podman machine host entries include VM-correlation metadata so matching VM inventory can be connected by name/runtime when both collectors are called. When deterministic QEMU or Apple Virtualization process matches are available, host entries also get bounded process resource snapshots from a fixed read-only `ps` scan. No container mutating commands are exposed.
 
-Privacy: may include container names, images, commands, ports, mounts, networks, container-host names/addresses, and resource snapshots.
+Privacy: may include container names, images, bounded/redacted commands, ports, mounts, networks, container-host names/addresses, and resource snapshots.
 
 ### `collect_vms`
 

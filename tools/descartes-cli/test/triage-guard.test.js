@@ -49,6 +49,21 @@ test("evidence guard exposes degraded fallback diagnostics after retry still has
   });
 });
 
+test("evidence guard falls back when assistant returns no text and no evidence", () => {
+  const guard = createEvidenceGuardState({ investigationEnabled: true });
+
+  assert.equal(shouldRetryForEvidence({ guard, assistantText: "", evidence: [] }), false);
+  assert.equal(shouldFallbackForNoEvidence({ guard, assistantText: "", evidence: [] }), true);
+  markEvidenceGuardFallback(guard, "no_evidence_no_assistant_text");
+
+  assert.deepEqual(evidenceGuardDiagnostics(guard), {
+    enabled: true,
+    outcome: "fallback_precollected",
+    retry_count: 0,
+    fallback_reason: "no_evidence_no_assistant_text",
+  });
+});
+
 test("evidence retry prompt explicitly requires Descartes evidence tools", () => {
   const prompt = evidenceRequiredRetryPrompt("what is using CPU?", { json: true });
 

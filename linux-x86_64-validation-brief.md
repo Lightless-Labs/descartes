@@ -2,7 +2,7 @@
 
 **Prepared:** 2026-05-22
 **Audience:** infrastructure-running agent
-**Target:** Linux x86_64 Tier-1 validation for Descartes `v0.0.30+`
+**Target:** Linux x86_64 Tier-1 validation for Descartes `v0.0.31+`
 
 ## Goal
 
@@ -67,7 +67,7 @@ find "$prefix/lib/node_modules" -path '*/docs/reference/collectors.md' -print -q
 
 Expected:
 
-- `descartes --version` is `0.0.30` or newer.
+- `descartes --version` is `0.0.31` or newer.
 - `descartes --help` works through the npm-prefix symlink.
 - `docs/reference/collectors.md` is included in the installed package.
 - The known upstream `node-domexception` deprecation warning may appear; do not fail solely for that.
@@ -232,22 +232,24 @@ Expected:
 {
   echo "arch=$(uname -m)"
   command -v crontab systemctl timedatectl journalctl chronyc ntpq sntp docker podman virsh qemu-system-x86_64 qemu-kvm limactl multipass VBoxManage vmrun prlctl incus lxc qm xl || true
-  timedatectl status --no-pager || true
-  systemctl list-units --type=service --all --no-pager --no-legend | head -80 || true
-  systemctl list-timers --all --no-pager --no-legend | head -80 || true
-  systemctl --user list-timers --all --no-pager --no-legend | head -80 || true
-  journalctl -p warning --since "15 minutes ago" --no-pager -n 20 || true
+  timedatectl show --property=Timezone --property=LocalRTC --property=NTP --property=CanNTP --property=NTPSynchronized --property=TimeUSec --property=RTCTimeUSec || true
+  systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null | awk '{state[$4]++} END {for (s in state) print "system_service_state", s, state[s]}' || true
+  systemctl list-units --type=service --state=failed --no-pager --no-legend 2>/dev/null | wc -l | awk '{print "failed_system_service_count", $1}' || true
+  systemctl list-timers --all --no-pager --no-legend 2>/dev/null | wc -l | awk '{print "system_timer_row_count", $1}' || true
+  systemctl --user list-timers --all --no-pager --no-legend 2>/dev/null | wc -l | awk '{print "user_timer_row_count", $1}' || true
+  journalctl -p warning --since "15 minutes ago" --no-pager -q 2>/dev/null | wc -l | awk '{print "recent_warning_or_worse_journal_line_count", $1}' || true
   podman --version || true
-  podman ps --all || true
-  podman machine list --format json || true
+  podman ps --all --format '{{.State}}' 2>/dev/null | sort | uniq -c | sed 's/^/podman_container_state /' || true
+  podman machine list --format '{{.Running}} {{.VMType}}' 2>/dev/null | sort | uniq -c | sed 's/^/podman_machine_state /' || true
   docker --version || true
-  docker ps --all || true
-  virsh list --all || true
-  ps -eo pid,ppid,pcpu,pmem,rss,comm,args | head -20 || true
+  docker ps --all --format '{{.State}}' 2>/dev/null | sort | uniq -c | sed 's/^/docker_container_state /' || true
+  virsh list --all --name 2>/dev/null | sed '/^$/d' | wc -l | awk '{print "virsh_vm_count", $1}' || true
+  virsh list --state-running --name 2>/dev/null | sed '/^$/d' | wc -l | awk '{print "virsh_running_vm_count", $1}' || true
+  ps -eo comm= 2>/dev/null | sort | uniq -c | sort -nr | head -20 | sed 's/^/process_comm_count /' || true
 } | tee "$work/external-capabilities.txt"
 ```
 
-Expected: read-only commands complete or fail gracefully. Do not make service/package/container changes to improve these results.
+Expected: read-only commands complete or fail gracefully while capturing counts/states, not raw logs, process args, container names/images, VM names, or command lines. Do not make service/package/container changes to improve these results.
 
 ## 6. Optional x86_64 Runtime Coverage, Only If Already Available
 
@@ -267,9 +269,19 @@ Do not create workloads just for this brief unless the infrastructure owner expl
 Only run if a dedicated validation credential or pre-seeded Descartes auth is available. Prefer a revocable validation account/key, not a personal token. Do not upload full JSON.
 
 ```bash
-# If auth is not already seeded, run the supported login flow for the environment.
+auth_xdg="$work/xdg-auth"
+mkdir -p "$auth_xdg/home" "$auth_xdg/config" "$auth_xdg/data" "$auth_xdg/state" "$auth_xdg/cache"
+descartes_env=(env \
+  HOME="$auth_xdg/home" \
+  XDG_CONFIG_HOME="$auth_xdg/config" \
+  XDG_DATA_HOME="$auth_xdg/data" \
+  XDG_STATE_HOME="$auth_xdg/state" \
+  XDG_CACHE_HOME="$auth_xdg/cache")
+
+# If auth is not already seeded into "$auth_xdg/config/descartes/auth.json",
+# run the supported login flow in the isolated XDG environment.
 # Interactive/headless OAuth fallback:
-#   descartes login --no-open
+#   "${descartes_env[@]}" descartes login --no-open
 
 for prompt in \
   "my machine is slow" \
@@ -279,7 +291,7 @@ for prompt in \
   "are any local certificates expiring soon?"
 do
   safe_name="$(printf '%s' "$prompt" | tr -cs '[:alnum:]' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//')"
-  descartes triage "$prompt" --json > "$work/triage-$safe_name.raw.json"
+  "${descartes_env[@]}" descartes triage "$prompt" --json > "$work/triage-$safe_name.raw.json"
   node -e '
     const fs = require("fs");
     const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
