@@ -1,6 +1,6 @@
 # Descartes Handoff
 
-**Last updated:** 2026-05-22
+**Last updated:** 2026-05-23
 
 ## Current Status
 
@@ -115,7 +115,8 @@ Existing files:
   - `2026-05-19-vm-inventory-collector.md` — completed first VM inventory slice and parity expansion for Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VM mode, Proxmox, Xen, and direct VM-like process hints.
   - `2026-05-19-temporal-sampling-investigation-tools.md` — completed; bounded LLM-requested sampling over time with aggregates and Descartes-owned artifacts.
   - `2026-05-19-macos-disk-evidence-classification.md` — completed; classifies pseudo/runtime filesystems, fixes macOS map row parsing, and reduces disk finding noise.
-  - `2026-05-19-linux-ci-validation.md` — future Buildkite Linux x86_64 validation, optionally with scoped CI credentials.
+  - `2026-05-19-linux-ci-validation.md` — v0.0.31+ Linux rerun is deferred; public v0.0.30 direct collector/package validation passed on Linux ARM64 and x86_64.
+  - `2026-05-23-agent-authored-sensor-toolkit.md` — **recommended next task, open**: build the fact/rule/metric-history/statistical-model substrate that lets background LLM agents author deterministic sensors/tools.
   - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
   - `2026-05-19-no-evidence-no-diagnosis-guard.md` — completed; normal model-led triage retries once if assistant text arrives with no evidence, then deterministic-precollection fallback marks degraded diagnostics.
   - `2026-05-19-web-search-retrieval-tools.md` — closer-future explicit web/search retrieval tools and optional proxy.
@@ -126,10 +127,10 @@ Existing files:
 ## Start Here In A New Session
 
 1. Read `README.md`, `AGENTS.md`, and this handoff.
-2. Treat `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current source of truth.
-3. Do **not** start with the artifact lifecycle, Pi workbench, deterministic-only triage, keyword matching, or a Cargo-only CLI unless the harness/package decision has been revisited.
+2. Treat `docs/plans/2026-05-23-agent-authored-sensor-toolkit.md` as the next architectural source of truth, while `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` remains the current first-slice product baseline.
+3. Do **not** hand-author a giant deterministic signature library. The next task is the toolkit/substrate that lets background LLM agents author, test, evaluate, and propose deterministic sensors/tools/models safely.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: validate `docs/plans/2026-05-21-vm-container-resource-correlation.md` on real Colima/Lima/Podman-machine hosts, including VZ/Apple Virtualization backends, or close the Linux x86_64 validation gap.
+5. Recommended next task: start `todos/2026-05-23-agent-authored-sensor-toolkit.md` with the fact bridge, tiny safe rule runner, and local metric/history store design.
 
 ## Current First Slice
 
@@ -270,9 +271,9 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: continue `docs/plans/2026-05-21-vm-container-resource-correlation.md` by validating correlation metadata/resource attachment on real Colima/Lima/Podman-machine hosts, especially VZ/Apple Virtualization backends and any helper processes without stable path/name hints. Alternatively close the Linux x86_64 validation gap.
+Recommended next task: start `docs/plans/2026-05-23-agent-authored-sensor-toolkit.md` / `todos/2026-05-23-agent-authored-sensor-toolkit.md`. Build the substrate for background agents to author their own deterministic sensors/tools/models: fact bridge from evidence envelopes, a tiny safe Prolog/Datalog/Casbin-like rule runner, local metric/history persistence, fixtures/evaluation harness, and promotion gates.
 
-The future capability-discovery/action/delegation direction is documented in `docs/ROADMAP.md`, including the “quick Linux environment with npm” use case and explicit inter-agent identity/auth/scoped-authority requirements. Linux x86_64 validation is deferred to future Buildkite CI and tracked separately in `todos/2026-05-19-linux-ci-validation.md`.
+The v0.0.31+ Linux rerun and real-host VM/container correlation validation remain useful but deferred; do not block the sensor toolkit on them.
 
 ## Tests / Checks To Prioritize
 
@@ -320,7 +321,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: direct `collectCertificateEvidence({ certificateLimit: 3 })` returns an ok `certificates` envelope on local macOS with bounded source summaries and no private-key reads.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: v0.0.31+ Linux rerun and optional credentialed model-led Linux validation. Linux arm64 validation with `$HOME/.local` prefix passes on public v0.0.11 for install, symlinked `descartes --version`/`--help`, ChatGPT/Codex `--no-open` login, model-led guarded triage, `fallback_used: false`, `collect_triage_evidence`, `actions_taken: []`, and ok system/process/disk envelopes. Public v0.0.30 direct collector/package validation passes on Ubuntu 24.04 ARM64, Debian 13 ARM64, Fedora 42 ARM64, and Debian 13 x86_64 with Node 22.21.1/npm 10.9.4; see `docs/reviews/2026-05-23-linux-validation-summary.md`. v0.0.31 review-finding fixes were pushed after that validation, so rerun should confirm public package version 0.0.31+ and container command redaction/fallback guard behavior on Linux. The Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
-- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, VM basics/parity, scheduled job basics, time sync basics, certificate basics, initial VM process-resource correlation, container-host/VM correlation metadata, QEMU-backed container-host process-resource attachment, and Apple Virtualization/VZ process attribution by deterministic path/name hints. Recommended next work is real-host validation for Colima/Lima/Podman-machine QEMU/VZ backends or Linux x86_64 validation.
+- Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, VM basics/parity, scheduled job basics, time sync basics, certificate basics, initial VM process-resource correlation, container-host/VM correlation metadata, QEMU-backed container-host process-resource attachment, and Apple Virtualization/VZ process attribution by deterministic path/name hints. Recommended next work is the agent-authored sensor toolkit, starting with fact bridge, safe rule runner, and metric/history store.
 - `materials/` exists locally but is ignored and should not be referenced in committed project docs.
 - `nohup.out` exists locally and is ignored.
 - `lynx` is installed and can be used for web docs via `lynx -dump`.
