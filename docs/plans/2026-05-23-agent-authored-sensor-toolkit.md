@@ -2,7 +2,7 @@
 
 **Created:** 2026-05-23
 **Status:** Proposed
-**Depends on:** `docs/plans/2026-05-23-daemon-history-store.md` for background collection and local metric/history persistence.
+**Depends on:** `docs/plans/2026-05-23-daemon-history-store.md` for background collection and local metric/history persistence; `docs/plans/2026-05-23-derived-collector-transformation-engine.md` for agent-authored pure map/reduce/window transformations over stored data.
 
 ## Purpose
 
@@ -30,6 +30,7 @@ L0 collectors
   -> evidence envelopes
   -> fact bridge / typed fact catalog
   -> local history + metric store
+  -> derived collector / pure transformation engine
   -> logic engine (safe Prolog/Datalog-like rules)
   -> statistical model engine (features, baselines, classifiers)
   -> findings / triggers / alarms / recommendations
@@ -165,17 +166,25 @@ The underlying daemon/history store is covered by `docs/plans/2026-05-23-daemon-
 - Consume bounded rollups: min, max, mean, count, rate, p95, last, and missing-data markers.
 - Respect retention, size limits, and cardinality caps.
 
-### Milestone 3: Agent workbench commands
+### Milestone 3: Derived collector / transformation engine integration
 
-- Let an agent inspect facts and metric windows, propose a rule or metric, generate fixtures, run evaluation, and produce a review packet.
+The pure map/filter/group/reduce/window engine is covered by `docs/plans/2026-05-23-derived-collector-transformation-engine.md`. This milestone integrates its derived facts/metrics into the broader sensor toolkit.
+
+- Consume derived facts/metrics as first-class inputs to rules and models.
+- Preserve transformation provenance and diagnostics.
+- Keep derived collectors sandboxed: no host collection, process execution, network access, arbitrary file reads, or arbitrary generated code.
+
+### Milestone 4: Agent workbench commands
+
+- Let an agent inspect facts and metric windows, propose a rule, metric, or derived collector, generate fixtures, run evaluation, and produce a review packet.
 - Keep outputs as candidate artifacts; do not auto-activate.
 
-### Milestone 4: Statistical model artifact prototype
+### Milestone 5: Statistical model artifact prototype
 
 - Add simple feature definitions over stored metrics and approved model families such as threshold, EWMA, and linear/logistic models.
 - Generate model-output facts that logic rules can consume.
 
-### Milestone 5: Shadow-mode sensors
+### Milestone 6: Shadow-mode sensors
 
 - Run selected candidate sensors against collected evidence/history without notifying or acting.
 - Record false positives/negatives, confidence decay, and baseline drift.
