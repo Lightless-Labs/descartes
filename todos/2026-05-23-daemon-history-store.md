@@ -47,5 +47,6 @@ Build the local background substrate before implementing agent-authored sensors.
 - [x] CLI can summarize recent history without invoking an LLM.
 - [x] Tests cover storage writes, rollups, retention, corrupt/partial store handling, metric extraction, and daemon status writes.
 - [ ] Tests cover repeated loop scheduling without waiting on real time.
-- [ ] Platform daemon install/start/status/stop/uninstall remains follow-on work.
+- [x] Idempotent user-level service-file install/status/uninstall exists for launchd/systemd.
+- [ ] Platform daemon load/start/stop/enable/disable remains follow-on work.
 - [ ] `triage --use-history` remains follow-on work.

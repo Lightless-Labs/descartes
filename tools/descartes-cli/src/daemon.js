@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -136,17 +139,137 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   return { evidence, points, write, status };
 }
 
-function daemonUsage() {
-  return `Usage:
-  descartes daemon run --foreground [--once] [--interval <duration>]
+export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
 
-The initial daemon command is a foreground, read-only development loop. It performs no background LLM calls and no host actions.`;
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
-function parseDaemonArgs(args) {
-  const [subcommand, ...rest] = args;
-  if (subcommand !== "run") throw new Error(`Unsupported daemon command: ${subcommand ?? ""}\n\n${daemonUsage()}`);
+function systemdEscape(value) {
+  return String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
 
+function xmlEscape(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function homeDir(env = process.env) {
+  return env.HOME || os.homedir();
+}
+
+function daemonLogDir(descartesPaths) {
+  return path.join(descartesPaths.stateDir, "daemon");
+}
+
+function xdgEnvLines(env = process.env) {
+  return ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]
+    .filter((name) => env[name] && String(env[name]).trim())
+    .map((name) => `Environment="${name}=${systemdEscape(env[name])}"`);
+}
+
+export function resolveDaemonServiceSpec(descartesPaths, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const nodePath = options.nodePath ?? process.execPath;
+  const cliPath = options.cliPath ?? process.argv[1];
+  if (!cliPath) throw new Error("Cannot determine Descartes CLI path for daemon service installation");
+
+  const logDir = daemonLogDir(descartesPaths);
+  if (platform === "darwin") {
+    const installPath = path.join(homeDir(env), "Library", "LaunchAgents", `${DAEMON_LABEL}.plist`);
+    const programArguments = [nodePath, cliPath, "daemon", "run", "--foreground"];
+    const argumentXml = programArguments.map((argument) => `\t\t<string>${xmlEscape(argument)}</string>`).join("\n");
+    return {
+      service_manager: "launchd-user",
+      label: DAEMON_LABEL,
+      install_path: installPath,
+      log_dir: logDir,
+      content: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n\t<key>Label</key>\n\t<string>${DAEMON_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n${argumentXml}\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>StandardOutPath</key>\n\t<string>${xmlEscape(path.join(logDir, "stdout.log"))}</string>\n\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(path.join(logDir, "stderr.log"))}</string>\n</dict>\n</plist>\n`,
+    };
+  }
+
+  if (platform === "linux") {
+    const configBase = path.dirname(descartesPaths.configDir);
+    const installPath = path.join(configBase, "systemd", "user", "descartes.service");
+    const execStart = [nodePath, cliPath, "daemon", "run", "--foreground"].map(shellQuote).join(" ");
+    const envLines = xdgEnvLines(env).join("\n");
+    return {
+      service_manager: "systemd-user",
+      label: "descartes.service",
+      install_path: installPath,
+      log_dir: logDir,
+      content: `[Unit]\nDescription=Descartes local history daemon\nDocumentation=https://github.com/Lightless-Labs/descartes\n\n[Service]\nType=simple\nExecStart=${execStart}\nRestart=on-failure\nRestartSec=10\n${envLines ? `${envLines}\n` : ""}\n[Install]\nWantedBy=default.target\n`,
+    };
+  }
+
+  throw new Error(`Daemon install is not supported on ${platform}. Use 'descartes daemon run --foreground' instead.`);
+}
+
+async function readFileIfPresent(file) {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+export async function installDaemonService(descartesPaths, options = {}) {
+  const spec = resolveDaemonServiceSpec(descartesPaths, options);
+  await fs.mkdir(path.dirname(spec.install_path), { recursive: true, mode: 0o700 });
+  await fs.mkdir(spec.log_dir, { recursive: true, mode: 0o700 });
+  const existing = await readFileIfPresent(spec.install_path);
+  if (existing === spec.content) {
+    return { status: "unchanged", installed: true, ...spec };
+  }
+  await fs.writeFile(spec.install_path, spec.content, { mode: 0o600 });
+  return { status: existing === undefined ? "installed" : "updated", installed: true, ...spec };
+}
+
+export async function daemonServiceStatus(descartesPaths, options = {}) {
+  const spec = resolveDaemonServiceSpec(descartesPaths, options);
+  const existing = await readFileIfPresent(spec.install_path);
+  return {
+    status: existing === undefined ? "not_installed" : existing === spec.content ? "installed" : "drifted",
+    installed: existing !== undefined,
+    content_matches: existing === spec.content,
+    service_manager: spec.service_manager,
+    label: spec.label,
+    install_path: spec.install_path,
+    log_dir: spec.log_dir,
+  };
+}
+
+export async function uninstallDaemonService(descartesPaths, options = {}) {
+  const spec = resolveDaemonServiceSpec(descartesPaths, options);
+  try {
+    await fs.unlink(spec.install_path);
+    return { status: "removed", installed: false, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { status: "not_installed", installed: false, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path };
+    }
+    throw error;
+  }
+}
+
+function daemonUsage() {
+  return `Usage:
+  descartes daemon install
+  descartes daemon status
+  descartes daemon uninstall
+  descartes daemon run --foreground [--once] [--interval <duration>]
+
+Install writes an idempotent user-level launchd/systemd service file. It does not start the service yet.
+The foreground daemon loop is read-only, performs no background LLM calls, and takes no host actions.`;
+}
+
+function parseRunArgs(rest) {
   const options = { foreground: false, once: false, intervalMs: DEFAULT_DAEMON_INTERVAL_MS };
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index];
@@ -169,10 +292,32 @@ function parseDaemonArgs(args) {
   return options;
 }
 
+function parseDaemonArgs(args) {
+  const [subcommand, ...rest] = args;
+  if (!subcommand || subcommand === "--help" || subcommand === "-h") return { subcommand: "help" };
+  if (!["install", "status", "uninstall", "run"].includes(subcommand)) {
+    throw new Error(`Unsupported daemon command: ${subcommand}\n\n${daemonUsage()}`);
+  }
+  if (subcommand !== "run" && rest.length > 0) throw new Error(`Unexpected daemon ${subcommand} arguments: ${rest.join(" ")}\n\n${daemonUsage()}`);
+  return subcommand === "run" ? { subcommand, ...parseRunArgs(rest) } : { subcommand };
+}
+
 export async function runDaemon(descartesPaths, args) {
   const options = parseDaemonArgs(args);
-  if (options.help) {
+  if (options.subcommand === "help" || options.help) {
     console.log(daemonUsage());
+    return;
+  }
+  if (options.subcommand === "install") {
+    console.log(JSON.stringify(await installDaemonService(descartesPaths), null, 2));
+    return;
+  }
+  if (options.subcommand === "status") {
+    console.log(JSON.stringify(await daemonServiceStatus(descartesPaths), null, 2));
+    return;
+  }
+  if (options.subcommand === "uninstall") {
+    console.log(JSON.stringify(await uninstallDaemonService(descartesPaths), null, 2));
     return;
   }
 

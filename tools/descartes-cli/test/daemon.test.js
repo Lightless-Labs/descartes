@@ -3,7 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { metricPointsFromEvidence, runDaemonIteration } from "../src/daemon.js";
+import {
+  daemonServiceStatus,
+  installDaemonService,
+  metricPointsFromEvidence,
+  resolveDaemonServiceSpec,
+  runDaemonIteration,
+  uninstallDaemonService,
+} from "../src/daemon.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 
@@ -85,4 +92,49 @@ test("foreground daemon iteration writes metric history and daemon status", asyn
 
   const summary = await buildHistorySummary(paths, { now: "2026-05-24T00:01:00.000Z", windowMs: 5 * 60 * 1000 });
   assert(summary.metrics.some((metric) => metric.metric_name === "system.memory.used_fraction"));
+});
+
+test("daemon install is idempotent for launchd user agents", async () => {
+  const paths = await tempPaths();
+  const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
+  const options = { platform: "darwin", env, nodePath: "/usr/local/bin/node", cliPath: "/opt/descartes/index.js" };
+
+  const first = await installDaemonService(paths, options);
+  const second = await installDaemonService(paths, options);
+  assert.equal(first.status, "installed");
+  assert.equal(second.status, "unchanged");
+  assert.equal(first.install_path, second.install_path);
+  assert.match(await fs.readFile(first.install_path, "utf8"), /com\.lightless-labs\.descartes\.daemon/);
+
+  const status = await daemonServiceStatus(paths, options);
+  assert.equal(status.status, "installed");
+  assert.equal(status.content_matches, true);
+});
+
+test("daemon install updates drifted systemd user unit and uninstall is idempotent", async () => {
+  const paths = await tempPaths();
+  const options = {
+    platform: "linux",
+    env: {
+      XDG_CONFIG_HOME: path.dirname(paths.configDir),
+      XDG_DATA_HOME: path.dirname(paths.dataDir),
+      XDG_STATE_HOME: path.dirname(paths.stateDir),
+      XDG_CACHE_HOME: path.dirname(paths.cacheDir),
+    },
+    nodePath: "/usr/bin/node",
+    cliPath: "/opt/descartes/index.js",
+  };
+
+  const spec = resolveDaemonServiceSpec(paths, options);
+  await fs.mkdir(path.dirname(spec.install_path), { recursive: true });
+  await fs.writeFile(spec.install_path, "drifted");
+
+  assert.equal((await daemonServiceStatus(paths, options)).status, "drifted");
+  const updated = await installDaemonService(paths, options);
+  assert.equal(updated.status, "updated");
+  assert.match(await fs.readFile(spec.install_path, "utf8"), /ExecStart='\/usr\/bin\/node' '\/opt\/descartes\/index\.js' 'daemon' 'run' '--foreground'/);
+  assert.match(await fs.readFile(spec.install_path, "utf8"), /Environment="XDG_STATE_HOME=/);
+
+  assert.equal((await uninstallDaemonService(paths, options)).status, "removed");
+  assert.equal((await uninstallDaemonService(paths, options)).status, "not_installed");
 });
