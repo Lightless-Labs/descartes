@@ -1,7 +1,7 @@
 ---
 title: Daemon and Local History Store
 created: 2026-05-23
-status: open
+status: in_progress
 priority: high
 area: architecture
 kind: todo
@@ -41,8 +41,11 @@ Build the local background substrate before implementing agent-authored sensors.
 
 ## Acceptance Criteria
 
-- Default daemon loop can collect system/process/disk history over time.
-- History is persisted under Descartes-owned XDG paths.
-- Rotation/retention prevents unbounded disk growth.
-- CLI can summarize recent history without invoking an LLM.
-- Tests cover daemon loop scheduling, storage writes, rollups, retention, and corrupt/partial store handling.
+- [x] Default foreground daemon loop can collect system/process/disk history over time.
+- [x] History is persisted under Descartes-owned XDG paths.
+- [x] Rotation/retention prevents unbounded disk growth for the initial JSONL metric store.
+- [x] CLI can summarize recent history without invoking an LLM.
+- [x] Tests cover storage writes, rollups, retention, corrupt/partial store handling, metric extraction, and daemon status writes.
+- [ ] Tests cover repeated loop scheduling without waiting on real time.
+- [ ] Platform daemon install/start/status/stop/uninstall remains follow-on work.
+- [ ] `triage --use-history` remains follow-on work.

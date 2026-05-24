@@ -38,6 +38,8 @@ function usage() {
 Usage:
   descartes login [provider] [--api-key] [--no-open]
   descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate]
+  descartes daemon run --foreground [--once] [--interval <duration>]
+  descartes history summary [--json] [--window <duration>]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
@@ -85,6 +87,16 @@ async function main(argv) {
   if (command === "triage") {
     const { runTriage } = await import("./triage.js");
     await runTriage(paths, args);
+    return;
+  }
+  if (command === "daemon") {
+    const { runDaemon } = await import("./daemon.js");
+    await runDaemon(paths, args);
+    return;
+  }
+  if (command === "history") {
+    const { runHistory } = await import("./history.js");
+    await runHistory(paths, args);
     return;
   }
 

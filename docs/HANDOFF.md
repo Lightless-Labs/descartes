@@ -4,6 +4,8 @@
 
 ## Current Status
 
+Current session update: started the recommended daemon/history substrate and bumped package metadata to v0.0.32. Added `descartes daemon run --foreground [--once] [--interval <duration>]` as a read-only foreground development loop over the conservative system/process/disk collector profile; it writes compact metric points to `metrics.jsonl` and daemon status to `daemon-status.json` under Descartes-owned XDG state history paths. Added retention/max-byte enforcement, corrupt-record skipping, metric rollups, `descartes history summary [--json] [--window <duration>]`, README/help updates, and tests for metric extraction, storage writes, summaries, retention, corrupt records, and daemon status. This is intentionally not an installed platform daemon yet, does not call an LLM in the background, and does not mutate the host. Follow-ups: repeated loop scheduling tests, launchd/systemd lifecycle, richer collectors/rollups, and `triage --use-history`.
+
 Descartes has an initial first-slice CLI scaffold. The LLM-driven investigation loop has been validated on real macOS subscription-auth runs with Anthropic and ChatGPT/Codex. A release-readiness pass is effectively complete for macOS: packaging, local/GitHub install, XDG no-auth failure, API-key login storage, README/help drift, metadata drift, login UX, model-led tool use, and current-package human/JSON triage have been tightened/validated. Linux ARM64 best-effort validation now passes for public v0.0.11 install/help/version, ChatGPT/Codex `--no-open` login, model-led guarded triage, and system/process/disk evidence collection. Public v0.0.30 direct collector/package validation passed on Ubuntu 24.04 ARM64, Debian 13 ARM64, Fedora 42 ARM64, and Debian 13 x86_64. Remaining validation gap is v0.0.31+ rerun after review-finding fixes plus optional credentialed model-led Linux validation.
 
 Current session update: prepared dedicated infrastructure-agent validation briefs for Linux ARM64 and Linux x86_64 at `linux-arm64-validation-brief.md` and `linux-x86_64-validation-brief.md`. Both briefs target v0.0.31+, use Node.js 22.19.0+, avoid privileged/mutating actions, install into a temporary npm prefix, check installed collector docs, validate isolated-XDG no-auth failure, run clone `npm test`/pack dry-run, run sanitized direct collector smokes across the current tool surface, capture read-only platform capability snapshots, and define optional credentialed model-led triage summaries without raw report upload. `todos/2026-05-19-linux-ci-validation.md` links these briefs and frames x86_64 as the Tier-1 gap-closing run.
@@ -138,10 +140,10 @@ Existing files:
 ## Start Here In A New Session
 
 1. Read `README.md`, `AGENTS.md`, and this handoff.
-2. Treat `docs/plans/2026-05-23-daemon-history-store.md` as the next implementation source of truth, while `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` remains the current first-slice product baseline.
+2. Treat `docs/plans/2026-05-23-daemon-history-store.md` as the active implementation source of truth, while `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` remains the current first-slice product baseline.
 3. Do **not** jump directly to hand-authored signatures or background LLM calls. The next task is the daemon/history substrate: foreground daemon loop first, bounded local metric/history store, rotation/retention, and CLI history summaries.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: start `todos/2026-05-23-daemon-history-store.md` with daemon/storage schema design and a foreground daemon loop prototype.
+5. Recommended next task: continue `todos/2026-05-23-daemon-history-store.md` after the initial foreground daemon/history summary slice. Next useful steps are repeated scheduling tests without real-time sleeps, platform-independent status diagnostics, and then launchd/systemd lifecycle design.
 
 ## Current First Slice
 
@@ -282,7 +284,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: start `docs/plans/2026-05-23-daemon-history-store.md` / `todos/2026-05-23-daemon-history-store.md`. Build the local background substrate first: foreground daemon loop, conservative default read-only collector profile, bounded XDG-owned history/metric store, retention/rotation, `descartes history summary`, and later platform install/start/status/stop plus `triage --use-history`.
+Recommended next task: continue `docs/plans/2026-05-23-daemon-history-store.md` / `todos/2026-05-23-daemon-history-store.md`. The first foreground loop and history summary slice exists; build out scheduling tests/status diagnostics next, then platform install/start/status/stop and later `triage --use-history`.
 
 The v0.0.31+ Linux rerun and real-host VM/container correlation validation remain useful but deferred; do not block the daemon/history work on them.
 
@@ -305,12 +307,12 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 123 Node test cases after v0.0.31 review-finding fixes.
+- Current checked command: `npm test` passes 129 Node test cases after the v0.0.32 foreground daemon/history slice.
 - Current checked command: `git diff --check` passes after the Linux validation brief updates.
 - Current checked command: extracted `collector-smoke.mjs` snippets from both Linux validation briefs pass `node --check`.
 - Current checked command: two parallel Pi print-mode reviews completed with `PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi --no-session --tools read,grep,find,ls --model openai-codex/gpt-5.5 --thinking xhigh -p ...` and wrote reports under `docs/reviews/`.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.31.
+- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `daemon.js`, `history-store.js`, `history.js`, `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.32.
 - Current checked command: `git push origin main` succeeded after v0.0.31 review-finding fixes; public GitHub `main` should now expose package version 0.0.31 for the next Linux validation rerun.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
@@ -330,6 +332,7 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 - Current checked command: direct `collectScheduledJobsEvidence({ jobLimit: 5 })` returns an ok `scheduled-jobs` envelope on local macOS with bounded cron/launchd probes.
 - Current checked command: direct `collectTimeSyncEvidence()` returns an ok `time-sync` envelope on local macOS with `launchctl_timed` ok and `systemsetup` probes represented as unable/missing admin permission.
 - Current checked command: direct `collectCertificateEvidence({ certificateLimit: 3 })` returns an ok `certificates` envelope on local macOS with bounded source summaries and no private-key reads.
+- Current checked command: isolated-XDG `node tools/descartes-cli/src/index.js daemon run --foreground --once` writes 49 metric points on the local macOS host, and `descartes history summary --json --window 5m` reads them back successfully.
 - Current field validation: v0.0.8 GitHub-installed JSON triage with ChatGPT/Codex called `collect_triage_evidence`, returned `fallback_used: false`, cited envelope IDs, and left `actions_taken: []`.
 - Remaining validation gap: v0.0.31+ Linux rerun and optional credentialed model-led Linux validation. Linux arm64 validation with `$HOME/.local` prefix passes on public v0.0.11 for install, symlinked `descartes --version`/`--help`, ChatGPT/Codex `--no-open` login, model-led guarded triage, `fallback_used: false`, `collect_triage_evidence`, `actions_taken: []`, and ok system/process/disk envelopes. Public v0.0.30 direct collector/package validation passes on Ubuntu 24.04 ARM64, Debian 13 ARM64, Fedora 42 ARM64, and Debian 13 x86_64 with Node 22.21.1/npm 10.9.4; see `docs/reviews/2026-05-23-linux-validation-summary.md`. v0.0.31 review-finding fixes were pushed after that validation, so rerun should confirm public package version 0.0.31+ and container command redaction/fallback guard behavior on Linux. The Linux todo uses a writable `--prefix`; future Buildkite validation should use scoped CI secrets rather than personal credentials where possible.
 - Completed implementation: process args redaction/bounding plus `inspect_process` / `inspect_parent_tree`, disk filesystem classification/noise reduction, no-evidence/no-diagnosis guard, temporal sampling, network basics, service manager basics, bounded recent logs, container basics, VM basics/parity, scheduled job basics, time sync basics, certificate basics, initial VM process-resource correlation, container-host/VM correlation metadata, QEMU-backed container-host process-resource attachment, and Apple Virtualization/VZ process attribution by deterministic path/name hints. Recommended next work is the daemon/history store, which becomes the substrate for the later agent-authored sensor toolkit.

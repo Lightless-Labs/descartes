@@ -19,6 +19,10 @@ npm install -g github:Lightless-Labs/descartes
 descartes login
 descartes triage "my machine is slow"
 descartes triage "my machine is slow" --json
+
+# Optional foreground history prototype, no background LLM calls:
+descartes daemon run --foreground --once
+descartes history summary
 ```
 
 HTTPS tarball form:
@@ -125,7 +129,7 @@ Descartes may use Pi internally as a private harness, but it does not require, r
 - Best effort: macOS Intel, Linux ARM64
 - Not supported initially: Windows, BSD, Android/Termux, remote hosts, and container-only introspection
 
-MVP limitations: no daemon, no background monitoring, no remote hosts, limited VM/container/service-manager/log coverage, no redacted export mode yet, and no mutating actions.
+MVP limitations: no installed platform daemon yet, foreground-only history prototype, no remote hosts, limited VM/container/service-manager/log coverage, no redacted export mode yet, and no mutating actions.
 
 ## Descartes-owned paths
 
@@ -181,7 +185,7 @@ The model may route questions, request evidence, synthesize explanations, audit 
 
 ## Repository status
 
-The installable first slice lives under `tools/descartes-cli/`.
+The installable first slice lives under `tools/descartes-cli/`. It includes a foreground-only `descartes daemon run --foreground` development loop that stores bounded metric history under Descartes-owned XDG state paths, plus `descartes history summary` for deterministic local summaries.
 
 Rust remains the intended direction for durable collectors, stores, policy/audit machinery, and future native CLIs. When Rust crates are introduced, they should stay Bazel-friendly: explicit manifests, reproducible tests, no hidden generation steps, and a clean crate graph.
 

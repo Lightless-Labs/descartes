@@ -1,7 +1,8 @@
 # Descartes Daemon and Local History Store
 
 **Created:** 2026-05-23
-**Status:** Proposed
+**Status:** In Progress
+**Addendum:** 2026-05-24 — Started the first Node.js implementation slice with a foreground-only daemon loop and JSONL metric store. SQLite remains a likely later durable store, but JSONL is sufficient for the initial bounded system/process/disk history summary path and avoids adding runtime dependencies while the CLI remains a temporary harness layer.
 
 ## Purpose
 
@@ -150,23 +151,23 @@ The daemon/history store is the substrate for:
 
 ### Milestone 1: Daemon design and storage schema
 
-- Decide storage engine for first implementation.
-- Define daemon config schema, collection profile schema, and metric schema.
-- Define retention/rotation policy.
+- Decide storage engine for first implementation. **Initial decision:** bounded JSONL metric points under XDG state for the Node.js prototype; revisit SQLite when query needs outgrow simple summaries or when the durable Rust substrate begins.
+- Define daemon config schema, collection profile schema, and metric schema. **Initial slice:** built-in conservative profile for system/process/disk and compact metric points with `ts`, `metric_name`, `dimensions`, `value`, `unit`, source envelope/tool, and sensitivity.
+- Define retention/rotation policy. **Initial slice:** retention window plus max-byte enforcement on metric append / daemon iteration paths.
 - Define service install/status lifecycle.
 
 ### Milestone 2: Local daemon loop prototype
 
-- Run a foreground `descartes daemon run --foreground` loop for development.
-- Execute a small default collector set at bounded intervals.
-- Persist compact metric points and daemon status records.
+- Run a foreground `descartes daemon run --foreground` loop for development. **Initial slice:** `descartes daemon run --foreground [--once] [--interval <duration>]`.
+- Execute a small default collector set at bounded intervals. **Initial slice:** system/process/disk only.
+- Persist compact metric points and daemon status records. **Initial slice:** `metrics.jsonl` and `daemon-status.json` under XDG state history dir.
 - Enforce rotation/retention.
 
 ### Milestone 3: CLI history read path
 
-- Add `descartes history summary` over persisted metrics.
-- Add JSON output for history summaries.
-- Add tests for retention, rollups, and corrupt/partial store handling.
+- Add `descartes history summary` over persisted metrics. **Initial slice:** implemented deterministic summary renderer.
+- Add JSON output for history summaries. **Initial slice:** `descartes history summary --json [--window <duration>]`.
+- Add tests for retention, rollups, and corrupt/partial store handling. **Initial slice:** added Node tests for rollups, retention, corrupt records, max bytes, metric extraction, and daemon status writes.
 
 ### Milestone 4: Platform install/start/stop
 
