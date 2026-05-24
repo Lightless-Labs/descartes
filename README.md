@@ -86,6 +86,60 @@ See `docs/reference/collectors.md` for the full collector/tool reference.
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
 
+## Local history daemon
+
+Descartes can keep a bounded local metric history so later CLI commands can answer “what changed recently?” without invoking an LLM.
+
+```bash
+# Install/update the user-level service file. Safe to rerun.
+descartes daemon install
+
+# Load/start the user service. Safe to rerun if already running.
+descartes daemon start
+
+# Report service-file state plus best-effort runtime state.
+descartes daemon status
+
+# Stop/unload the user service. Safe to rerun if already stopped.
+descartes daemon stop
+
+# Stop if needed, then remove the service file. Safe to rerun.
+descartes daemon uninstall
+```
+
+For development or one-shot collection, you can run the loop in the foreground:
+
+```bash
+descartes daemon run --foreground --once
+descartes daemon run --foreground --interval 60s
+```
+
+Current daemon collection is deliberately conservative: system overview, top processes, and disk usage. It writes compact metric points and daemon status under Descartes-owned XDG state paths, then enforces retention/max-size bounds. It does **not** make background LLM calls, upload telemetry, expose shell tools, or take remediation actions.
+
+Service management is user-level only:
+
+| Platform | Service file | Start/stop mechanism |
+|---|---|---|
+| macOS | `$HOME/Library/LaunchAgents/com.lightless-labs.descartes.daemon.plist` | `launchctl bootstrap` / `launchctl bootout` for `gui/$UID` |
+| Linux | `$XDG_CONFIG_HOME/systemd/user/descartes.service` or `$HOME/.config/systemd/user/descartes.service` | `systemctl --user enable --now` / `disable --now` |
+
+The daemon commands are intended to be idempotent:
+
+- `install`: `installed`, `updated`, or `unchanged`
+- `start`: `started` or `already_running`
+- `status`: `installed`, `not_installed`, or `drifted`, plus runtime fields where available
+- `stop`: `stopped` or `not_running`
+- `uninstall`: `removed` or `not_installed`
+
+Summarize local history without an LLM:
+
+```bash
+descartes history summary
+descartes history summary --json --window 1h
+```
+
+This daemon lifecycle is new and still needs broader real-host validation across launchd/systemd variants.
+
 ## Login and model selection
 
 `descartes login` opens a browser for subscription OAuth when possible. If the browser callback cannot complete, use:
@@ -119,7 +173,8 @@ JSON output includes the diagnosis, evidence envelopes, deterministic findings, 
 Current v0 boundaries:
 
 - local evidence collection is read-only
-- no host actions are taken
+- triage takes no host actions
+- daemon lifecycle commands mutate only explicit Descartes user-level service files/service state
 - no arbitrary shell/coding tools are exposed to the triage agent
 - no telemetry, background upload, or federation
 - explicit `triage` requests may send collected evidence to the selected LLM provider
