@@ -22,7 +22,9 @@ descartes triage "my machine is slow" --json
 
 # Optional local history prototype, no background LLM calls:
 descartes daemon install       # idempotently writes a user launchd/systemd service file
+descartes daemon start         # idempotently loads/starts the user service
 descartes daemon status
+descartes daemon stop
 descartes daemon run --foreground --once
 descartes history summary
 ```
@@ -131,7 +133,7 @@ Descartes may use Pi internally as a private harness, but it does not require, r
 - Best effort: macOS Intel, Linux ARM64
 - Not supported initially: Windows, BSD, Android/Termux, remote hosts, and container-only introspection
 
-MVP limitations: user-level daemon install writes service files but start/stop lifecycle is not implemented yet, history collection is still foreground-only unless started externally, no remote hosts, limited VM/container/service-manager/log coverage, no redacted export mode yet, and no mutating actions.
+MVP limitations: user-level daemon lifecycle is new and still needs real-host validation, no remote hosts, limited VM/container/service-manager/log coverage, no redacted export mode yet, and no remediation actions beyond explicit daemon lifecycle commands.
 
 ## Descartes-owned paths
 
@@ -187,7 +189,7 @@ The model may route questions, request evidence, synthesize explanations, audit 
 
 ## Repository status
 
-The installable first slice lives under `tools/descartes-cli/`. It includes idempotent user-level daemon service-file install/status/uninstall commands, a foreground `descartes daemon run --foreground` development loop that stores bounded metric history under Descartes-owned XDG state paths, plus `descartes history summary` for deterministic local summaries.
+The installable first slice lives under `tools/descartes-cli/`. It includes idempotent user-level daemon install/start/status/stop/uninstall commands, a foreground `descartes daemon run --foreground` development loop that stores bounded metric history under Descartes-owned XDG state paths, plus `descartes history summary` for deterministic local summaries.
 
 Rust remains the intended direction for durable collectors, stores, policy/audit machinery, and future native CLIs. When Rust crates are introduced, they should stay Bazel-friendly: explicit manifests, reproducible tests, no hidden generation steps, and a clean crate graph.
 

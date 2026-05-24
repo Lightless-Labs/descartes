@@ -7,6 +7,8 @@ import {
   daemonServiceStatus,
   installDaemonService,
   metricPointsFromEvidence,
+  startDaemonService,
+  stopDaemonService,
   resolveDaemonServiceSpec,
   runDaemonIteration,
   uninstallDaemonService,
@@ -36,6 +38,21 @@ async function tempPaths() {
     XDG_STATE_HOME: path.join(root, "state"),
     XDG_CACHE_HOME: path.join(root, "cache"),
   });
+}
+
+function fakeRunner(responses, calls = []) {
+  return async (command, args) => {
+    calls.push([command, ...args]);
+    const response = responses.shift() ?? { stdout: "", stderr: "" };
+    if (response.error) {
+      const error = new Error(response.stderr ?? "command failed");
+      error.stdout = response.stdout ?? "";
+      error.stderr = response.stderr ?? "";
+      error.code = response.code ?? 1;
+      throw error;
+    }
+    return { stdout: response.stdout ?? "", stderr: response.stderr ?? "" };
+  };
 }
 
 test("daemon metric extraction keeps compact metrics instead of raw process args", () => {
@@ -135,6 +152,78 @@ test("daemon install updates drifted systemd user unit and uninstall is idempote
   assert.match(await fs.readFile(spec.install_path, "utf8"), /ExecStart='\/usr\/bin\/node' '\/opt\/descartes\/index\.js' 'daemon' 'run' '--foreground'/);
   assert.match(await fs.readFile(spec.install_path, "utf8"), /Environment="XDG_STATE_HOME=/);
 
-  assert.equal((await uninstallDaemonService(paths, options)).status, "removed");
-  assert.equal((await uninstallDaemonService(paths, options)).status, "not_installed");
+  const uninstallOptions = {
+    ...options,
+    runner: fakeRunner([{ stderr: "Unit descartes.service not loaded.", error: true, code: 1 }]),
+  };
+  const removed = await uninstallDaemonService(paths, uninstallOptions);
+  assert.equal(removed.status, "removed");
+  assert.equal(removed.stop.status, "not_running");
+  assert.equal((await uninstallDaemonService(paths, uninstallOptions)).status, "not_installed");
+});
+
+test("daemon start and stop use idempotent launchd user lifecycle commands", async () => {
+  const paths = await tempPaths();
+  const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
+  const calls = [];
+  const options = {
+    platform: "darwin",
+    env,
+    uid: 501,
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/descartes/index.js",
+    runner: fakeRunner([
+      { stderr: "Bootstrap failed: 5: Input/output error: Service is already loaded", error: true, code: 5 },
+      { stderr: "Boot-out failed: 3: No such process", error: true, code: 3 },
+    ], calls),
+  };
+
+  const started = await startDaemonService(paths, options);
+  assert.equal(started.status, "already_running");
+  assert.deepEqual(calls[0], ["launchctl", "bootstrap", "gui/501", started.install_path]);
+
+  const stopped = await stopDaemonService(paths, options);
+  assert.equal(stopped.status, "not_running");
+  assert.deepEqual(calls[1], ["launchctl", "bootout", "gui/501/com.lightless-labs.descartes.daemon"]);
+});
+
+test("daemon start, stop, and runtime status use systemd user lifecycle commands", async () => {
+  const paths = await tempPaths();
+  const calls = [];
+  const options = {
+    platform: "linux",
+    env: {
+      XDG_CONFIG_HOME: path.dirname(paths.configDir),
+      XDG_DATA_HOME: path.dirname(paths.dataDir),
+      XDG_STATE_HOME: path.dirname(paths.stateDir),
+      XDG_CACHE_HOME: path.dirname(paths.cacheDir),
+    },
+    nodePath: "/usr/bin/node",
+    cliPath: "/opt/descartes/index.js",
+    runner: fakeRunner([
+      {},
+      {},
+      { stdout: "active\n" },
+      { stdout: "enabled\n" },
+      {},
+    ], calls),
+  };
+
+  const started = await startDaemonService(paths, options);
+  assert.equal(started.status, "started");
+  assert.equal(started.install_status, "installed");
+  assert.equal(started.running, true);
+  assert.deepEqual(calls[0], ["systemctl", "--user", "daemon-reload"]);
+  assert.deepEqual(calls[1], ["systemctl", "--user", "enable", "--now", "descartes.service"]);
+
+  const status = await daemonServiceStatus(paths, options);
+  assert.equal(status.running, true);
+  assert.equal(status.enabled, true);
+  assert.deepEqual(calls[2], ["systemctl", "--user", "is-active", "descartes.service"]);
+  assert.deepEqual(calls[3], ["systemctl", "--user", "is-enabled", "descartes.service"]);
+
+  const stopped = await stopDaemonService(paths, options);
+  assert.equal(stopped.status, "stopped");
+  assert.equal(stopped.running, false);
+  assert.deepEqual(calls[4], ["systemctl", "--user", "disable", "--now", "descartes.service"]);
 });

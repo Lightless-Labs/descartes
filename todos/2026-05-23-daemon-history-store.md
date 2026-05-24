@@ -48,5 +48,6 @@ Build the local background substrate before implementing agent-authored sensors.
 - [x] Tests cover storage writes, rollups, retention, corrupt/partial store handling, metric extraction, and daemon status writes.
 - [ ] Tests cover repeated loop scheduling without waiting on real time.
 - [x] Idempotent user-level service-file install/status/uninstall exists for launchd/systemd.
-- [ ] Platform daemon load/start/stop/enable/disable remains follow-on work.
+- [x] Idempotent platform daemon load/start/stop/enable/disable command construction exists for launchd/systemd.
+- [ ] Real-host validation for launchd/systemd start/stop/status remains follow-on work.
 - [ ] `triage --use-history` remains follow-on work.

@@ -2,7 +2,7 @@
 
 **Created:** 2026-05-23
 **Status:** In Progress
-**Addendum:** 2026-05-24 — Started the first Node.js implementation slice with a foreground daemon loop, JSONL metric store, and idempotent user-level service-file install/status/uninstall commands. SQLite remains a likely later durable store, but JSONL is sufficient for the initial bounded system/process/disk history summary path and avoids adding runtime dependencies while the CLI remains a temporary harness layer.
+**Addendum:** 2026-05-24 — Started the first Node.js implementation slice with a foreground daemon loop, JSONL metric store, and idempotent user-level service install/start/status/stop/uninstall commands. SQLite remains a likely later durable store, but JSONL is sufficient for the initial bounded system/process/disk history summary path and avoids adding runtime dependencies while the CLI remains a temporary harness layer.
 
 ## Purpose
 
@@ -154,7 +154,7 @@ The daemon/history store is the substrate for:
 - Decide storage engine for first implementation. **Initial decision:** bounded JSONL metric points under XDG state for the Node.js prototype; revisit SQLite when query needs outgrow simple summaries or when the durable Rust substrate begins.
 - Define daemon config schema, collection profile schema, and metric schema. **Initial slice:** built-in conservative profile for system/process/disk and compact metric points with `ts`, `metric_name`, `dimensions`, `value`, `unit`, source envelope/tool, and sensitivity.
 - Define retention/rotation policy. **Initial slice:** retention window plus max-byte enforcement on metric append / daemon iteration paths.
-- Define service install/status lifecycle. **Initial slice:** `descartes daemon install`, `status`, and `uninstall` write/check/remove deterministic user-level launchd/systemd service files idempotently; start/stop/enable/load remains follow-on.
+- Define service install/status lifecycle. **Initial slice:** `descartes daemon install`, `start`, `status`, `stop`, and `uninstall` write/check/remove deterministic user-level launchd/systemd service files and load/unload them idempotently.
 
 ### Milestone 2: Local daemon loop prototype
 
@@ -171,9 +171,9 @@ The daemon/history store is the substrate for:
 
 ### Milestone 4: Platform install/start/stop
 
-- Add launchd user agent install/uninstall on macOS. **Initial slice:** service-file install/status/uninstall only; no launchctl load/start yet.
-- Add systemd user service install/uninstall on Linux. **Initial slice:** service-file install/status/uninstall only; no systemctl enable/start yet.
-- Add status diagnostics. **Initial slice:** reports installed/not_installed/drifted based on deterministic service-file content.
+- Add launchd user agent install/uninstall on macOS. **Initial slice:** service-file install/status/uninstall plus `launchctl bootstrap`/`bootout` start/stop with already-loaded/not-loaded treated idempotently.
+- Add systemd user service install/uninstall on Linux. **Initial slice:** service-file install/status/uninstall plus `systemctl --user daemon-reload`, `enable --now`, and `disable --now`.
+- Add status diagnostics. **Initial slice:** reports installed/not_installed/drifted based on deterministic service-file content and queries runtime status where possible.
 
 ### Milestone 5: Triage history integration
 
