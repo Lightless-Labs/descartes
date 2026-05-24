@@ -223,16 +223,25 @@ async function readFileIfPresent(file) {
   }
 }
 
+function publicServiceSpec(spec) {
+  return {
+    service_manager: spec.service_manager,
+    label: spec.label,
+    install_path: spec.install_path,
+    log_dir: spec.log_dir,
+  };
+}
+
 export async function installDaemonService(descartesPaths, options = {}) {
   const spec = resolveDaemonServiceSpec(descartesPaths, options);
   await fs.mkdir(path.dirname(spec.install_path), { recursive: true, mode: 0o700 });
   await fs.mkdir(spec.log_dir, { recursive: true, mode: 0o700 });
   const existing = await readFileIfPresent(spec.install_path);
   if (existing === spec.content) {
-    return { status: "unchanged", installed: true, ...spec };
+    return { status: "unchanged", installed: true, ...publicServiceSpec(spec) };
   }
   await fs.writeFile(spec.install_path, spec.content, { mode: 0o600 });
-  return { status: existing === undefined ? "installed" : "updated", installed: true, ...spec };
+  return { status: existing === undefined ? "installed" : "updated", installed: true, ...publicServiceSpec(spec) };
 }
 
 async function runServiceCommand(command, args, options = {}) {
@@ -372,11 +381,11 @@ export async function uninstallDaemonService(descartesPaths, options = {}) {
 
 function daemonUsage() {
   return `Usage:
-  descartes daemon install
-  descartes daemon start
-  descartes daemon status
-  descartes daemon stop
-  descartes daemon uninstall
+  descartes daemon install [--json]
+  descartes daemon start [--json]
+  descartes daemon status [--json]
+  descartes daemon stop [--json]
+  descartes daemon uninstall [--json]
   descartes daemon run --foreground [--once] [--interval <duration>]
 
 Install writes an idempotent user-level launchd/systemd service file. Start/stop load and unload it through the user service manager.
@@ -406,14 +415,66 @@ function parseRunArgs(rest) {
   return options;
 }
 
+function parseLifecycleArgs(subcommand, rest) {
+  const options = { subcommand, json: false };
+  for (const arg of rest) {
+    if (arg === "--json") options.json = true;
+    else if (arg === "--help" || arg === "-h") options.help = true;
+    else throw new Error(`Unexpected daemon ${subcommand} argument: ${arg}\n\n${daemonUsage()}`);
+  }
+  return options;
+}
+
 function parseDaemonArgs(args) {
   const [subcommand, ...rest] = args;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") return { subcommand: "help" };
   if (!["install", "start", "status", "stop", "uninstall", "run"].includes(subcommand)) {
     throw new Error(`Unsupported daemon command: ${subcommand}\n\n${daemonUsage()}`);
   }
-  if (subcommand !== "run" && rest.length > 0) throw new Error(`Unexpected daemon ${subcommand} arguments: ${rest.join(" ")}\n\n${daemonUsage()}`);
-  return subcommand === "run" ? { subcommand, ...parseRunArgs(rest) } : { subcommand };
+  return subcommand === "run" ? { subcommand, ...parseRunArgs(rest) } : parseLifecycleArgs(subcommand, rest);
+}
+
+function statusDescription(result) {
+  const descriptions = {
+    installed: "installed",
+    updated: "updated",
+    unchanged: "already installed and up to date",
+    started: "started",
+    already_running: "already running",
+    stopped: "stopped",
+    not_running: "not running",
+    removed: "removed",
+    not_installed: "not installed",
+    drifted: "installed but differs from the expected Descartes service file",
+  };
+  return descriptions[result.status] ?? result.status;
+}
+
+export function renderDaemonResult(command, result) {
+  const lines = [`Descartes daemon ${statusDescription(result)}.`];
+  if (result.service_manager) lines.push(`Service manager: ${result.service_manager}`);
+  if (result.label) lines.push(`Service: ${result.label}`);
+  if (result.install_path) lines.push(`Service file: ${result.install_path}`);
+  if (result.log_dir) lines.push(`Logs: ${result.log_dir}`);
+  if (result.running !== undefined) lines.push(`Running: ${result.running ? "yes" : "no"}`);
+  if (result.enabled !== undefined) lines.push(`Enabled: ${result.enabled ? "yes" : "no"}`);
+  if (result.runtime_status) lines.push(`Runtime status: ${result.runtime_status}`);
+  if (result.enablement_status) lines.push(`Enablement: ${result.enablement_status}`);
+  if (result.content_matches === false) lines.push("Service file drift: yes");
+
+  if (command === "install" && ["installed", "updated", "unchanged"].includes(result.status)) {
+    lines.push("Next: run `descartes daemon start` to load/start the user service.");
+  } else if (command === "start" && result.running) {
+    lines.push("Next: run `descartes history summary` after a minute or two to inspect collected metrics.");
+  } else if (command === "stop") {
+    lines.push("The service file remains installed. Run `descartes daemon uninstall` to remove it.");
+  }
+  return lines.join("\n");
+}
+
+function printDaemonResult(command, result, options) {
+  if (options.json) console.log(JSON.stringify(result, null, 2));
+  else console.log(renderDaemonResult(command, result));
 }
 
 export async function runDaemon(descartesPaths, args) {
@@ -423,23 +484,23 @@ export async function runDaemon(descartesPaths, args) {
     return;
   }
   if (options.subcommand === "install") {
-    console.log(JSON.stringify(await installDaemonService(descartesPaths), null, 2));
+    printDaemonResult("install", await installDaemonService(descartesPaths), options);
     return;
   }
   if (options.subcommand === "start") {
-    console.log(JSON.stringify(await startDaemonService(descartesPaths), null, 2));
+    printDaemonResult("start", await startDaemonService(descartesPaths), options);
     return;
   }
   if (options.subcommand === "status") {
-    console.log(JSON.stringify(await daemonServiceStatus(descartesPaths), null, 2));
+    printDaemonResult("status", await daemonServiceStatus(descartesPaths), options);
     return;
   }
   if (options.subcommand === "stop") {
-    console.log(JSON.stringify(await stopDaemonService(descartesPaths), null, 2));
+    printDaemonResult("stop", await stopDaemonService(descartesPaths), options);
     return;
   }
   if (options.subcommand === "uninstall") {
-    console.log(JSON.stringify(await uninstallDaemonService(descartesPaths), null, 2));
+    printDaemonResult("uninstall", await uninstallDaemonService(descartesPaths), options);
     return;
   }
 

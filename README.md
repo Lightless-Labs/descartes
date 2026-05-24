@@ -105,6 +105,9 @@ descartes daemon stop
 
 # Stop if needed, then remove the service file. Safe to rerun.
 descartes daemon uninstall
+
+# Add --json to any lifecycle command for machine-readable output.
+descartes daemon status --json
 ```
 
 For development or one-shot collection, you can run the loop in the foreground:
@@ -122,6 +125,8 @@ Service management is user-level only:
 |---|---|---|
 | macOS | `$HOME/Library/LaunchAgents/com.lightless-labs.descartes.daemon.plist` | `launchctl bootstrap` / `launchctl bootout` for `gui/$UID` |
 | Linux | `$XDG_CONFIG_HOME/systemd/user/descartes.service` or `$HOME/.config/systemd/user/descartes.service` | `systemctl --user enable --now` / `disable --now` |
+
+Daemon lifecycle commands print concise human-readable output by default. Add `--json` for machine-readable output; generated service-file contents are not printed.
 
 The daemon commands are intended to be idempotent:
 

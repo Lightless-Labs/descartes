@@ -9,6 +9,7 @@ import {
   metricPointsFromEvidence,
   startDaemonService,
   stopDaemonService,
+  renderDaemonResult,
   resolveDaemonServiceSpec,
   runDaemonIteration,
   uninstallDaemonService,
@@ -121,6 +122,7 @@ test("daemon install is idempotent for launchd user agents", async () => {
   assert.equal(first.status, "installed");
   assert.equal(second.status, "unchanged");
   assert.equal(first.install_path, second.install_path);
+  assert.equal(first.content, undefined);
   assert.match(await fs.readFile(first.install_path, "utf8"), /com\.lightless-labs\.descartes\.daemon/);
 
   const status = await daemonServiceStatus(paths, options);
@@ -226,4 +228,19 @@ test("daemon start, stop, and runtime status use systemd user lifecycle commands
   assert.equal(stopped.status, "stopped");
   assert.equal(stopped.running, false);
   assert.deepEqual(calls[4], ["systemctl", "--user", "disable", "--now", "descartes.service"]);
+});
+
+test("daemon lifecycle renderer is human-readable and omits service file content", () => {
+  const output = renderDaemonResult("install", {
+    status: "installed",
+    service_manager: "launchd-user",
+    label: "com.lightless-labs.descartes.daemon",
+    install_path: "/Users/alice/Library/LaunchAgents/com.lightless-labs.descartes.daemon.plist",
+    log_dir: "/Users/alice/.local/state/descartes/daemon",
+    content: "<plist>should never be printed</plist>",
+  });
+  assert.match(output, /Descartes daemon installed\./);
+  assert.match(output, /Service manager: launchd-user/);
+  assert.match(output, /Next: run `descartes daemon start`/);
+  assert(!output.includes("<plist>"));
 });
