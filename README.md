@@ -19,6 +19,8 @@ npm install -g github:Lightless-Labs/descartes
 descartes login
 descartes triage "my machine is slow"
 descartes triage "my machine is slow" --json
+# If the daemon has collected local history:
+descartes triage --use-history "How's my system doing?"
 
 # Optional local history prototype, no background LLM calls:
 descartes daemon install       # idempotently writes a user launchd/systemd service file
@@ -85,6 +87,13 @@ Current collectors include:
 See `docs/reference/collectors.md` for the full collector/tool reference.
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
+
+If the local history daemon has collected metrics, `--use-history` includes a bounded history summary as another evidence envelope in the triage prompt:
+
+```bash
+descartes triage --use-history "How's my system doing?"
+descartes triage --use-history --history-window 6h "Did anything change recently?" --json
+```
 
 ## Local history daemon
 

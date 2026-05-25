@@ -55,4 +55,5 @@ Build the local background substrate before implementing agent-authored sensors.
 - [ ] macOS real-host status/idempotent reruns/stop/uninstall/log inspection remain follow-on validation.
 - [ ] Linux systemd-user lifecycle validation remains follow-on work; use `linux-daemon-lifecycle-validation-brief.md`.
 - [ ] `history summary` default human output should become compact; keep full metric tables behind `--verbose`/`--json`.
-- [ ] `triage --use-history` remains follow-on work.
+- [x] Initial `triage --use-history [--history-window <duration>]` exists and injects a bounded `history-summary` evidence envelope.
+- [ ] Richer history-aware triage prompting/evaluation remains follow-on work.

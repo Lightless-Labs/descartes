@@ -1,4 +1,5 @@
 import { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } from "./pi-harness.js";
+import { buildHistorySummary, parseDurationMs } from "./history-store.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { fallbackDiagnosis } from "./triage-fallback.js";
 import { assistantErrorFromMessages, assistantStopReasonFromMessages, createToolCallRecorder, modelDiagnostic } from "./triage-diagnostics.js";
@@ -13,21 +14,54 @@ import {
   shouldRetryForEvidence,
 } from "./triage-guard.js";
 
-function parseTriageArgs(args) {
-  const options = { json: false, investigate: true };
+export function parseTriageArgs(args) {
+  const options = { json: false, investigate: true, useHistory: false, historyWindow: "1h" };
   const promptParts = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--json") options.json = true;
     else if (arg === "--no-investigate") options.investigate = false;
+    else if (arg === "--use-history") options.useHistory = true;
+    else if (arg === "--history-window") options.historyWindow = args[++i];
     else if (arg === "--model") options.modelPattern = args[++i];
     else if (arg === "--thinking") options.thinkingLevel = args[++i];
     else if (arg.startsWith("-")) throw new Error(`Unknown triage argument: ${arg}`);
     else promptParts.push(arg);
   }
   const prompt = promptParts.join(" ").trim();
-  if (!prompt) throw new Error("Usage: descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate]");
+  if (!prompt) throw new Error("Usage: descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate] [--use-history] [--history-window <DURATION>]");
+  if (options.useHistory) parseDurationMs(options.historyWindow);
   return { ...options, prompt };
+}
+
+function historyEnvelope(summary) {
+  if (!summary) return undefined;
+  return {
+    id: "history-summary",
+    status: "ok",
+    layer: "L0",
+    source: "history_store",
+    result: summary,
+    confidence: 1,
+    review_hint: summary.point_count > 0 ? "none" : "insufficient_evidence",
+    trace: {
+      tool: "summarize_history",
+      target: `window_ms=${summary.window_ms}`,
+      latency_ms: 0,
+      ts: new Date().toISOString(),
+    },
+  };
+}
+
+function mergePrecollected(...bundles) {
+  const evidence = [];
+  const findings = [];
+  for (const bundle of bundles) {
+    if (!bundle) continue;
+    evidence.push(...(bundle.evidence ?? []));
+    findings.push(...(bundle.findings ?? []));
+  }
+  return evidence.length || findings.length ? { evidence, findings, actions_taken: [] } : undefined;
 }
 
 function flattenEvidence(toolResults, precollected) {
@@ -133,7 +167,11 @@ export async function runTriage(paths, args) {
   const toolResults = [];
   const toolCallRecorder = createToolCallRecorder();
   const evidenceGuard = createEvidenceGuardState({ investigationEnabled: options.investigate });
-  let precollected = options.investigate ? undefined : await collectAllEvidence();
+  const historySummary = options.useHistory
+    ? await buildHistorySummary(paths, { windowMs: parseDurationMs(options.historyWindow) })
+    : undefined;
+  const historyBundle = historySummary ? { evidence: [historyEnvelope(historySummary)], findings: [], actions_taken: [] } : undefined;
+  let precollected = mergePrecollected(options.investigate ? undefined : await collectAllEvidence(), historyBundle);
   const { session, selectedModel, selectedThinkingLevel, activeToolNames } = await createPrivateTriageSession(paths, {
     modelPattern: options.modelPattern,
     thinkingLevel: options.thinkingLevel,
@@ -171,7 +209,7 @@ export async function runTriage(paths, args) {
     if (shouldFallbackForNoEvidence({ guard: evidenceGuard, assistantText: assistantTextForOutput, evidence: collected.evidence })) {
       const fallbackReason = assistantTextForOutput?.trim() ? "no_evidence_after_retry" : "no_evidence_no_assistant_text";
       markEvidenceGuardFallback(evidenceGuard, fallbackReason);
-      precollected = await collectAllEvidence();
+      precollected = mergePrecollected(await collectAllEvidence(), historyBundle);
     }
   } finally {
     unsubscribe();
@@ -205,6 +243,15 @@ export async function runTriage(paths, args) {
       assistant_stop_reason: assistantStopReason,
       llm_error: llmError,
       fallback_used: Boolean(fallback),
+      history_used: options.useHistory,
+      history_window: options.useHistory ? options.historyWindow : undefined,
+      history_summary: historySummary ? {
+        point_count: historySummary.point_count,
+        metric_names: historySummary.metrics.map((metric) => metric.metric_name),
+        since: historySummary.since,
+        until: historySummary.until,
+        corrupt_count: historySummary.corrupt_count,
+      } : undefined,
       evidence_guard: evidenceGuardDiagnostics(evidenceGuard),
     },
     evidence,

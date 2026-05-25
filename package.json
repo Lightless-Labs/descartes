@@ -1,6 +1,6 @@
 {
   "name": "@lightless-labs/descartes",
-  "version": "0.0.34",
+  "version": "0.0.35",
   "description": "LLM-backed local operations triage CLI for Descartes",
   "type": "module",
   "bin": {

@@ -37,7 +37,7 @@ function usage() {
 
 Usage:
   descartes login [provider] [--api-key] [--no-open]
-  descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate]
+  descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate] [--use-history] [--history-window <DURATION>]
   descartes daemon install|start|status|stop|uninstall [--json]
   descartes daemon run --foreground [--once] [--interval <duration>]
   descartes history summary [--json] [--window <duration>]

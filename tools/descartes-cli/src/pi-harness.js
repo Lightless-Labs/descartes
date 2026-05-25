@@ -267,6 +267,7 @@ function compactEvidenceForPrompt(evidenceBundle) {
   const system = evidence["system-overview"];
   const processes = evidence["top-processes"];
   const disks = evidence["disk-usage"];
+  const history = evidence["history-summary"];
 
   const pressuredFilesystems = Array.isArray(disks?.filesystems)
     ? disks.filesystems
@@ -301,6 +302,24 @@ function compactEvidenceForPrompt(evidenceBundle) {
       args: truncate(process.args),
     })),
     pressured_filesystems: pressuredFilesystems,
+    history: history ? {
+      window_ms: history.window_ms,
+      since: history.since,
+      until: history.until,
+      point_count: history.point_count,
+      corrupt_count: history.corrupt_count,
+      metrics: (history.metrics ?? []).slice(0, 32).map((metric) => ({
+        metric_name: metric.metric_name,
+        unit: metric.unit,
+        count: metric.count,
+        min: metric.min,
+        max: metric.max,
+        mean: metric.mean,
+        last: metric.last,
+        p95: metric.p95,
+        dimensions_seen: metric.dimensions_seen,
+      })),
+    } : undefined,
     findings: (evidenceBundle.findings ?? []).slice(0, 16),
     actions_taken: [],
   };
