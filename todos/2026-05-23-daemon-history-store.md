@@ -10,6 +10,8 @@ related:
   - docs/plans/2026-05-23-daemon-history-store.md
   - docs/plans/2026-05-23-agent-authored-sensor-toolkit.md
   - docs/plans/2026-05-18-003-first-external-slice-local-triage.md
+  - docs/reviews/2026-05-24-macos-daemon-validation.md
+  - linux-daemon-lifecycle-validation-brief.md
 ---
 
 # TODO: Daemon and Local History Store
@@ -26,14 +28,14 @@ Build the local background substrate before implementing agent-authored sensors.
 - Bounded metric points and rollups.
 - Retention/rotation/max-size enforcement.
 - `descartes history summary` read path.
-- Later: launchd/systemd user service install/start/status/stop/uninstall.
+- User-level launchd/systemd service install/start/status/stop/uninstall.
 - Later: `descartes triage --use-history` with bounded history summaries.
 
 ## Safety Boundaries
 
 - No background LLM calls.
 - No telemetry/upload/federation.
-- No mutating host actions.
+- No remediation/mutating host actions outside explicit daemon lifecycle commands.
 - Read-only collectors only.
 - No arbitrary shell/coding tools.
 - No unbounded raw log/process capture.
@@ -49,5 +51,8 @@ Build the local background substrate before implementing agent-authored sensors.
 - [ ] Tests cover repeated loop scheduling without waiting on real time.
 - [x] Idempotent user-level service-file install/status/uninstall exists for launchd/systemd.
 - [x] Idempotent platform daemon load/start/stop/enable/disable command construction exists for launchd/systemd.
-- [ ] Real-host validation for launchd/systemd start/stop/status remains follow-on work.
+- [x] macOS real-host install/start/history accumulation validated; see `docs/reviews/2026-05-24-macos-daemon-validation.md`.
+- [ ] macOS real-host status/idempotent reruns/stop/uninstall/log inspection remain follow-on validation.
+- [ ] Linux systemd-user lifecycle validation remains follow-on work; use `linux-daemon-lifecycle-validation-brief.md`.
+- [ ] `history summary` default human output should become compact; keep full metric tables behind `--verbose`/`--json`.
 - [ ] `triage --use-history` remains follow-on work.

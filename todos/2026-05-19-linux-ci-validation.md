@@ -11,6 +11,7 @@ related:
   - docs/plans/2026-05-18-003-first-external-slice-local-triage.md
   - linux-arm64-validation-brief.md
   - linux-x86_64-validation-brief.md
+  - linux-daemon-lifecycle-validation-brief.md
 ---
 
 # TODO: Linux x86_64 VM/Container and CI Validation
@@ -19,7 +20,9 @@ related:
 
 A physical Linux x86_64 host is not currently available, but a Linux VM or container can provide useful first-slice validation. Treat VM/container validation as best-effort coverage for the current resource-pressure CLI, and later promote it into Buildkite CI.
 
-Container/VM validation is enough to check install/package behavior, path isolation, Linux command/parsing behavior, and graceful collector envelopes. It is not a complete substitute for a real Linux host with representative systemd services, disks, pressure signals, and host process table.
+Container/VM validation is enough to check install/package behavior, path isolation, Linux command/parsing behavior, and graceful collector envelopes. It is not a complete substitute for a real Linux host with representative systemd services, disks, pressure signals, host process table, and a working systemd user manager for daemon lifecycle validation.
+
+For the daemon/history work, use `linux-daemon-lifecycle-validation-brief.md` in addition to the broader collector/package briefs. That brief validates `descartes daemon install/start/status/stop/uninstall`, idempotency, systemd-user runtime state, and history accumulation.
 
 ## Manual VM/Container Validation
 
