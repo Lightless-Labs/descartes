@@ -88,7 +88,7 @@ See `docs/reference/collectors.md` for the full collector/tool reference.
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
 
-If the local history daemon has collected metrics, `--use-history` includes a bounded history summary as another evidence envelope in the triage prompt:
+If the local history daemon has collected metrics, `--use-history` includes a bounded history summary as another evidence envelope in the triage prompt. The default history window is `24h`; use `--history-window` to narrow or widen it within retained data:
 
 ```bash
 descartes triage --use-history "How's my system doing?"

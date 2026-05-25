@@ -15,7 +15,7 @@ import {
 } from "./triage-guard.js";
 
 export function parseTriageArgs(args) {
-  const options = { json: false, investigate: true, useHistory: false, historyWindow: "1h" };
+  const options = { json: false, investigate: true, useHistory: false, historyWindow: "24h" };
   const promptParts = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

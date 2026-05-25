@@ -13,7 +13,7 @@ test("triage parser accepts history options after the prompt", () => {
   const parsed = parseTriageArgs(["Hey there!", "--use-history", "--json"]);
   assert.equal(parsed.useHistory, true);
   assert.equal(parsed.json, true);
-  assert.equal(parsed.historyWindow, "1h");
+  assert.equal(parsed.historyWindow, "24h");
   assert.equal(parsed.prompt, "Hey there!");
 });
 
