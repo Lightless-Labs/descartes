@@ -22,7 +22,7 @@ A physical Linux x86_64 host is not currently available, but a Linux VM or conta
 
 Container/VM validation is enough to check install/package behavior, path isolation, Linux command/parsing behavior, and graceful collector envelopes. It is not a complete substitute for a real Linux host with representative systemd services, disks, pressure signals, host process table, and a working systemd user manager for daemon lifecycle validation.
 
-For the daemon/history work, use `linux-daemon-lifecycle-validation-brief.md` in addition to the broader collector/package briefs. That brief validates `descartes daemon install/start/status/stop/uninstall`, idempotency, systemd-user runtime state, and history accumulation.
+For the daemon/history work, use `linux-daemon-lifecycle-validation-brief.md` in addition to the broader collector/package briefs. That brief validates `descartes daemon install/start/status/stop/uninstall`, idempotency, systemd-user runtime state, and history accumulation. Current public target for daemon/history validation is v0.0.36+ because it includes `triage --use-history` and the 24h default history window.
 
 ## Manual VM/Container Validation
 
