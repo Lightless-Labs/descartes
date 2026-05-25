@@ -12,6 +12,7 @@ import {
   renderDaemonResult,
   resolveDaemonServiceSpec,
   runDaemonIteration,
+  runForegroundDaemonLoop,
   uninstallDaemonService,
 } from "../src/daemon.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
@@ -228,6 +229,35 @@ test("daemon start, stop, and runtime status use systemd user lifecycle commands
   assert.equal(stopped.status, "stopped");
   assert.equal(stopped.running, false);
   assert.deepEqual(calls[4], ["systemctl", "--user", "disable", "--now", "descartes.service"]);
+});
+
+test("foreground daemon loop schedules repeated iterations without waiting on real time", async () => {
+  const paths = await tempPaths();
+  const sleeps = [];
+  const outputs = [];
+  let iterations = 0;
+
+  await runForegroundDaemonLoop(paths, {
+    intervalMs: 1234,
+    iterate: async (iterationPaths, iterationOptions) => {
+      assert.equal(iterationPaths, paths);
+      assert.equal(iterationOptions.mode, "foreground");
+      iterations += 1;
+      return {
+        points: Array.from({ length: iterations }),
+        status: { ts: `2026-05-24T00:00:0${iterations}.000Z` },
+      };
+    },
+    sleep: async (ms, _value, sleepOptions) => {
+      sleeps.push({ ms, ref: sleepOptions.ref });
+    },
+    shouldStop: () => iterations >= 3,
+    output: (line) => outputs.push(JSON.parse(line)),
+  });
+
+  assert.equal(iterations, 3);
+  assert.deepEqual(sleeps, [{ ms: 1234, ref: true }, { ms: 1234, ref: true }]);
+  assert.deepEqual(outputs.map((output) => output.points_written), [1, 2, 3]);
 });
 
 test("daemon lifecycle renderer is human-readable and omits service file content", () => {

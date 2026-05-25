@@ -477,6 +477,20 @@ function printDaemonResult(command, result, options) {
   else console.log(renderDaemonResult(command, result));
 }
 
+export async function runForegroundDaemonLoop(descartesPaths, options = {}) {
+  const iterate = options.iterate ?? runDaemonIteration;
+  const sleeper = options.sleep ?? sleep;
+  const output = options.output ?? console.log;
+  const shouldStop = options.shouldStop ?? (() => false);
+
+  do {
+    const result = await iterate(descartesPaths, { mode: "foreground" });
+    output(JSON.stringify({ status: "ok", points_written: result.points.length, ts: result.status.ts }));
+    if (options.once || shouldStop()) break;
+    await sleeper(options.intervalMs, undefined, { ref: true });
+  } while (!shouldStop());
+}
+
 export async function runDaemon(descartesPaths, args) {
   const options = parseDaemonArgs(args);
   if (options.subcommand === "help" || options.help) {
@@ -511,12 +525,11 @@ export async function runDaemon(descartesPaths, args) {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
-    do {
-      const result = await runDaemonIteration(descartesPaths, { mode: "foreground" });
-      console.log(JSON.stringify({ status: "ok", points_written: result.points.length, ts: result.status.ts }));
-      if (options.once) break;
-      await sleep(options.intervalMs, undefined, { ref: true });
-    } while (!stopping);
+    await runForegroundDaemonLoop(descartesPaths, {
+      intervalMs: options.intervalMs,
+      once: options.once,
+      shouldStop: () => stopping,
+    });
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);

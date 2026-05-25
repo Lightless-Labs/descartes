@@ -48,7 +48,7 @@ Build the local background substrate before implementing agent-authored sensors.
 - [x] Rotation/retention prevents unbounded disk growth for the initial JSONL metric store.
 - [x] CLI can summarize recent history without invoking an LLM.
 - [x] Tests cover storage writes, rollups, retention, corrupt/partial store handling, metric extraction, and daemon status writes.
-- [ ] Tests cover repeated loop scheduling without waiting on real time.
+- [x] Tests cover repeated loop scheduling without waiting on real time.
 - [x] Idempotent user-level service-file install/status/uninstall exists for launchd/systemd.
 - [x] Idempotent platform daemon load/start/stop/enable/disable command construction exists for launchd/systemd.
 - [x] macOS real-host install/start/history accumulation validated; see `docs/reviews/2026-05-24-macos-daemon-validation.md`.

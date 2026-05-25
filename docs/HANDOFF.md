@@ -1,8 +1,10 @@
 # Descartes Handoff
 
-**Last updated:** 2026-05-24
+**Last updated:** 2026-05-25
 
 ## Current Status
+
+Current session update: picked up the daemon/history handoff and completed the repeated foreground-loop scheduling test gap without real-time sleeps. Added exported `runForegroundDaemonLoop` injection seams around iteration/sleep/output/stop checks, wired `runDaemon` through it, and marked the daemon/history todo scheduling criterion complete. `npm test` now passes 138 Node test cases.
 
 Current session update: implemented and pushed `descartes triage --use-history [--history-window <duration>]` after field report showed the public CLI rejected the documented next-step flag. The flag builds a bounded `history-summary` evidence envelope from the local XDG history store, includes compact metric rollups in the triage prompt, and exposes `diagnostics.history_used`, `history_window`, and a sanitized `history_summary` in JSON output. README/help/tests were updated. Follow-up field report showed the initial 1h default was too short for an overall system-health question, so the default `--use-history` window is now `24h`; users can narrow with `--history-window`. Package metadata is now v0.0.36 and `main` has been pushed through commit `0ad3526`. Current retention reality: high-resolution JSONL metric history is kept for 24h or until the store reaches 5 MiB, whichever trims first; planned longer rollups are not implemented yet. This is the first history-aware triage slice; richer history-specific prompting, compact human history summaries, configurable retention, and longer rollups remain follow-up work.
 
@@ -314,8 +316,8 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 133 Node test cases after the v0.0.34 idempotent daemon start/stop lifecycle slice.
-- Current checked command: `git diff --check` passes after the Linux validation brief updates.
+- Current checked command: `npm test` passes 138 Node test cases after the daemon foreground-loop scheduling test slice.
+- Current checked command: `git diff --check` passes after the daemon foreground-loop scheduling test slice.
 - Current checked command: extracted `collector-smoke.mjs` snippets from both Linux validation briefs pass `node --check`.
 - Current checked command: two parallel Pi print-mode reviews completed with `PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi --no-session --tools read,grep,find,ls --model openai-codex/gpt-5.5 --thinking xhigh -p ...` and wrote reports under `docs/reviews/`.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
