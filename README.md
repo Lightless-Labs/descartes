@@ -28,7 +28,7 @@ descartes daemon start         # idempotently loads/starts the user service
 descartes daemon status
 descartes daemon stop
 descartes daemon run --foreground --once
-descartes history summary
+descartes history summary          # compact local metric summary
 ```
 
 HTTPS tarball form:
@@ -148,7 +148,8 @@ The daemon commands are intended to be idempotent:
 Summarize local history without an LLM:
 
 ```bash
-descartes history summary
+descartes history summary                 # compact operator summary
+descartes history summary --verbose       # full human metric table
 descartes history summary --json --window 1h
 ```
 

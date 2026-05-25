@@ -2,7 +2,7 @@
 
 **Prepared:** 2026-05-24
 **Audience:** infrastructure-running agent
-**Target:** Linux systemd-user daemon lifecycle validation for Descartes `v0.0.34+`
+**Target:** Linux systemd-user daemon lifecycle validation for Descartes `v0.0.37+`
 
 ## Goal
 
@@ -87,7 +87,7 @@ descartes --help > "$work/descartes-help.txt"
 
 Expected:
 
-- `descartes --version` is `0.0.34` or newer.
+- `descartes --version` is `0.0.37` or newer.
 - Help includes `daemon install|start|status|stop|uninstall [--json]`.
 - The known upstream `node-domexception` deprecation warning may appear; do not fail solely for that.
 
@@ -173,6 +173,8 @@ descartes daemon status --json | tee "$work/status-after-start.json"
 # Let at least two daemon intervals elapse.
 sleep 130
 
+descartes history summary --window 10m | tee "$work/history-after-130s-human.txt"
+descartes history summary --verbose --window 10m | tee "$work/history-after-130s-verbose.txt"
 descartes history summary --json --window 10m | tee "$work/history-after-130s.raw.json"
 
 # Stop and uninstall should be idempotent.
@@ -190,7 +192,9 @@ Expected:
 - `start-1.status` is `started` or `already_running`.
 - `start-2.status` is `started` or `already_running`; it must not fail solely because the unit is already active/loaded.
 - `status-after-start.installed` is `true` and should report `running: true` when systemd status commands work.
-- `history-after-130s` has `history.point_count > 0` and includes system/process/disk metric names.
+- Compact human `history summary` includes last sample age/cadence and highlights without dumping the full metric table.
+- Verbose human `history summary --verbose` includes the full per-metric table.
+- `history-after-130s` JSON has `history.point_count > 0` and includes system/process/disk metric names.
 - `stop-1.status` is `stopped` or `not_running`.
 - `stop-2.status` is `stopped` or `not_running`; it must not fail solely because the unit is already stopped.
 - `uninstall-1.status` is `removed` or `not_installed`.
@@ -282,7 +286,7 @@ Expected:
 
 This brief is complete when the returned report shows:
 
-- Public GitHub install works and version is `0.0.34+`.
+- Public GitHub install works and version is `0.0.37+`.
 - Isolated install human output is concise and does not leak generated unit content.
 - Isolated install JSON does not include generated unit content.
 - Full systemd-user lifecycle works on at least one Linux host/VM:

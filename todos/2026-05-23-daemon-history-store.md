@@ -54,7 +54,7 @@ Build the local background substrate before implementing agent-authored sensors.
 - [x] macOS real-host install/start/history accumulation validated; see `docs/reviews/2026-05-24-macos-daemon-validation.md`.
 - [ ] macOS real-host status/idempotent reruns/stop/uninstall/log inspection remain follow-on validation.
 - [ ] Linux systemd-user lifecycle validation remains follow-on work; use `linux-daemon-lifecycle-validation-brief.md`.
-- [ ] `history summary` default human output should become compact; keep full metric tables behind `--verbose`/`--json`.
+- [x] `history summary` default human output should become compact; keep full metric tables behind `--verbose`/`--json`.
 - [x] Initial `triage --use-history [--history-window <duration>]` exists and injects a bounded `history-summary` evidence envelope.
 - [x] Default `--use-history` window is 24h after field feedback that 1h was too short.
 - [x] Current retention is documented in handoff: 24h high-resolution JSONL, capped at 5 MiB.

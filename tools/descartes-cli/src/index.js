@@ -40,7 +40,7 @@ Usage:
   descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate] [--use-history] [--history-window <DURATION>]
   descartes daemon install|start|status|stop|uninstall [--json]
   descartes daemon run --foreground [--once] [--interval <duration>]
-  descartes history summary [--json] [--window <duration>]
+  descartes history summary [--json] [--verbose] [--window <duration>]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;

@@ -3,6 +3,7 @@
 **Created:** 2026-05-23
 **Status:** In Progress
 **Addendum:** 2026-05-24 — Started the first Node.js implementation slice with a foreground daemon loop, JSONL metric store, and idempotent user-level service install/start/status/stop/uninstall commands. SQLite remains a likely later durable store, but JSONL is sufficient for the initial bounded system/process/disk history summary path and avoids adding runtime dependencies while the CLI remains a temporary harness layer.
+**Addendum:** 2026-05-25 — Changed default human `history summary` output from a full metric table to a compact operator summary with last-sample age/cadence, highlights, and `--verbose` for the detailed table. This addresses real-host validation feedback that repeated summaries within the one-minute daemon interval looked stuck and were too noisy by default.
 
 ## Purpose
 
@@ -165,8 +166,8 @@ The daemon/history store is the substrate for:
 
 ### Milestone 3: CLI history read path
 
-- Add `descartes history summary` over persisted metrics. **Initial slice:** implemented deterministic summary renderer.
-- Add JSON output for history summaries. **Initial slice:** `descartes history summary --json [--window <duration>]`.
+- Add `descartes history summary` over persisted metrics. **Initial slice:** implemented deterministic summary renderer; default human output is now compact and operator-oriented.
+- Add JSON output for history summaries. **Initial slice:** `descartes history summary --json [--window <duration>]`; full human metric tables are available with `--verbose`.
 - Add tests for retention, rollups, and corrupt/partial store handling. **Initial slice:** added Node tests for rollups, retention, corrupt records, max bytes, metric extraction, and daemon status writes.
 
 ### Milestone 4: Platform install/start/stop
