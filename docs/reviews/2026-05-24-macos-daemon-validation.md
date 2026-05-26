@@ -73,14 +73,42 @@ Repeated summaries run within the same daemon interval naturally showed no new p
 - No remediation actions were taken.
 - The only host mutation was the explicit user-level launchd service lifecycle.
 
+## 2026-05-25 follow-up: launchd idempotency failure and local fix validation
+
+A later real macOS field report against public v0.0.37 showed an idempotent-start failure:
+
+- `npm install -g github:Lightless-Labs/descartes` installed v0.0.37.
+- `descartes daemon install` returned `unchanged`.
+- `descartes daemon start` failed with launchd's generic `Bootstrap failed: 5: Input/output error`.
+- `descartes daemon stop` then returned `stopped`, proving launchd had service state to unload despite the failed `start` report.
+- Immediate retries of `start` continued to hit the generic bootstrap error.
+
+Local investigation on a macOS development host found two launchd behaviors that the CLI needed to handle:
+
+1. Bootstrapping an already-loaded user agent can return only `Bootstrap failed: 5: Input/output error`, without an explicit “already loaded” string.
+2. Immediately starting after `bootout` can see a transient loaded-but-not-running state such as `SIGTERMed`; another bootstrap during that state also returns the generic I/O error.
+
+The v0.0.38 fix parses `launchctl print` state, treats `state = running` as idempotent before or after a generic bootstrap error, clears stale non-running launchd state with `bootout`, waits for it to disappear, and then bootstraps again.
+
+Local validation after the fix, with cleanup, passed:
+
+```bash
+descartes daemon install
+descartes daemon start
+descartes daemon start      # now reports already running
+descartes daemon status --json  # runtime_status: running
+descartes history summary --window 5m
+descartes daemon stop
+descartes daemon start      # immediate restart after stop now works
+descartes daemon uninstall
+```
+
+The test host's service was stopped/uninstalled after validation.
+
 ## Remaining validation
 
 - macOS:
-  - `descartes daemon status` after start
-  - idempotent `install` rerun
-  - idempotent `start` rerun
-  - `descartes daemon stop`
-  - `descartes daemon uninstall`
+  - Re-run the failing field-user sequence with public v0.0.38+.
   - log file inspection for noise/crash loops
 - Linux:
   - systemd user install/start/status/stop/uninstall

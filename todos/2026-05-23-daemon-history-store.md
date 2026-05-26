@@ -52,7 +52,8 @@ Build the local background substrate before implementing agent-authored sensors.
 - [x] Idempotent user-level service-file install/status/uninstall exists for launchd/systemd.
 - [x] Idempotent platform daemon load/start/stop/enable/disable command construction exists for launchd/systemd.
 - [x] macOS real-host install/start/history accumulation validated; see `docs/reviews/2026-05-24-macos-daemon-validation.md`.
-- [ ] macOS real-host status/idempotent reruns/stop/uninstall/log inspection remain follow-on validation.
+- [ ] macOS field-user retry on v0.0.38+ remains follow-on after launchd generic bootstrap I/O/stale-state hardening.
+- [ ] macOS real-host log inspection remains follow-on validation.
 - [ ] Linux systemd-user lifecycle validation remains follow-on work; use `linux-daemon-lifecycle-validation-brief.md`.
 - [x] `history summary` default human output should become compact; keep full metric tables behind `--verbose`/`--json`.
 - [x] Initial `triage --use-history [--history-window <duration>]` exists and injects a bounded `history-summary` evidence envelope.

@@ -7,6 +7,7 @@ import {
   daemonServiceStatus,
   installDaemonService,
   metricPointsFromEvidence,
+  parseLaunchdPrintState,
   startDaemonService,
   stopDaemonService,
   renderDaemonResult,
@@ -165,6 +166,86 @@ test("daemon install updates drifted systemd user unit and uninstall is idempote
   assert.equal((await uninstallDaemonService(paths, uninstallOptions)).status, "not_installed");
 });
 
+test("launchd print state parser extracts runtime state", () => {
+  assert.equal(parseLaunchdPrintState("\tstate = running\n"), "running");
+  assert.equal(parseLaunchdPrintState("state = SIGTERMed\n"), "SIGTERMed");
+  assert.equal(parseLaunchdPrintState("no state here"), undefined);
+});
+
+test("daemon start treats an already running launchd service as idempotent before bootstrap", async () => {
+  const paths = await tempPaths();
+  const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
+  const calls = [];
+  const options = {
+    platform: "darwin",
+    env,
+    uid: 501,
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/descartes/index.js",
+    runner: fakeRunner([{ stdout: "state = running\n" }], calls),
+  };
+
+  const started = await startDaemonService(paths, options);
+  assert.equal(started.status, "already_running");
+  assert.deepEqual(calls, [["launchctl", "print", "gui/501/com.lightless-labs.descartes.daemon"]]);
+});
+
+test("daemon start clears stale non-running launchd state before bootstrap", async () => {
+  const paths = await tempPaths();
+  const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
+  const calls = [];
+  const options = {
+    platform: "darwin",
+    env,
+    uid: 501,
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/descartes/index.js",
+    sleep: async () => {},
+    runner: fakeRunner([
+      { stdout: "state = SIGTERMed\n" },
+      {},
+      { stderr: "Could not find service", error: true, code: 113 },
+      {},
+    ], calls),
+  };
+
+  const started = await startDaemonService(paths, options);
+  assert.equal(started.status, "started");
+  assert.deepEqual(calls.map((call) => call.slice(0, 2)), [
+    ["launchctl", "print"],
+    ["launchctl", "bootout"],
+    ["launchctl", "print"],
+    ["launchctl", "bootstrap"],
+  ]);
+});
+
+test("daemon start recognizes generic launchd bootstrap I/O errors when the service is running", async () => {
+  const paths = await tempPaths();
+  const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
+  const calls = [];
+  const options = {
+    platform: "darwin",
+    env,
+    uid: 501,
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/descartes/index.js",
+    runner: fakeRunner([
+      { stderr: "Could not find service", error: true, code: 113 },
+      { stderr: "Bootstrap failed: 5: Input/output error", error: true, code: 5 },
+      { stdout: "state = running\n" },
+    ], calls),
+  };
+
+  const started = await startDaemonService(paths, options);
+  assert.equal(started.status, "already_running");
+  assert.equal(started.running, true);
+  assert.deepEqual(calls.map((call) => call.slice(0, 2)), [
+    ["launchctl", "print"],
+    ["launchctl", "bootstrap"],
+    ["launchctl", "print"],
+  ]);
+});
+
 test("daemon start and stop use idempotent launchd user lifecycle commands", async () => {
   const paths = await tempPaths();
   const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
@@ -176,18 +257,20 @@ test("daemon start and stop use idempotent launchd user lifecycle commands", asy
     nodePath: "/usr/local/bin/node",
     cliPath: "/opt/descartes/index.js",
     runner: fakeRunner([
+      { stderr: "Could not find service", error: true, code: 113 },
       { stderr: "Bootstrap failed: 5: Input/output error: Service is already loaded", error: true, code: 5 },
+      { stdout: "state = running\n" },
       { stderr: "Boot-out failed: 3: No such process", error: true, code: 3 },
     ], calls),
   };
 
   const started = await startDaemonService(paths, options);
   assert.equal(started.status, "already_running");
-  assert.deepEqual(calls[0], ["launchctl", "bootstrap", "gui/501", started.install_path]);
+  assert.deepEqual(calls[1], ["launchctl", "bootstrap", "gui/501", started.install_path]);
 
   const stopped = await stopDaemonService(paths, options);
   assert.equal(stopped.status, "not_running");
-  assert.deepEqual(calls[1], ["launchctl", "bootout", "gui/501/com.lightless-labs.descartes.daemon"]);
+  assert.deepEqual(calls[3], ["launchctl", "bootout", "gui/501/com.lightless-labs.descartes.daemon"]);
 });
 
 test("daemon start, stop, and runtime status use systemd user lifecycle commands", async () => {

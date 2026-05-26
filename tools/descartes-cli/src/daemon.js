@@ -278,19 +278,46 @@ function launchdDomain(options = {}) {
   return `gui/${options.uid ?? process.getuid?.() ?? os.userInfo().uid}`;
 }
 
+export function parseLaunchdPrintState(output) {
+  const match = String(output ?? "").match(/^\s*state\s*=\s*([^\n]+)\s*$/m);
+  return match ? match[1].trim() : undefined;
+}
+
+function launchdServiceName(spec, options = {}) {
+  return `${launchdDomain(options)}/${spec.label}`;
+}
+
+async function launchdRuntimeStatus(spec, options = {}) {
+  const service = launchdServiceName(spec, options);
+  const result = await runServiceCommand("launchctl", ["print", service], options);
+  const state = result.ok ? parseLaunchdPrintState(result.stdout) : undefined;
+  return {
+    runtime_checked: true,
+    running: state === "running",
+    loaded: result.ok,
+    runtime_status: result.ok ? state ?? "loaded" : isNotLoaded(result) ? "not_loaded" : "unknown",
+    runtime_command: result.command,
+    runtime_error: result.ok ? undefined : result.stderr,
+  };
+}
+
+async function waitForLaunchdUnloaded(spec, options = {}) {
+  const attempts = options.unloadWaitAttempts ?? 20;
+  const intervalMs = options.unloadWaitIntervalMs ?? 250;
+  const sleeper = options.sleep ?? sleep;
+  let status;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    status = await launchdRuntimeStatus(spec, options);
+    if (!status.loaded) return status;
+    await sleeper(intervalMs, undefined, { ref: true });
+  }
+  return status;
+}
+
 async function runtimeStatusForSpec(spec, options = {}) {
   if (options.runtime === false) return { runtime_checked: false };
   if (spec.service_manager === "launchd-user") {
-    const service = `${launchdDomain(options)}/${spec.label}`;
-    const result = await runServiceCommand("launchctl", ["print", service], options);
-    return {
-      runtime_checked: true,
-      running: result.ok,
-      loaded: result.ok,
-      runtime_status: result.ok ? "loaded" : isNotLoaded(result) ? "not_loaded" : "unknown",
-      runtime_command: result.command,
-      runtime_error: result.ok ? undefined : result.stderr,
-    };
+    return launchdRuntimeStatus(spec, options);
   }
   if (spec.service_manager === "systemd-user") {
     const active = await runServiceCommand("systemctl", ["--user", "is-active", spec.label], options);
@@ -326,11 +353,40 @@ export async function startDaemonService(descartesPaths, options = {}) {
   const install = await installDaemonService(descartesPaths, options);
   const spec = resolveDaemonServiceSpec(descartesPaths, options);
   if (spec.service_manager === "launchd-user") {
+    const commands = [];
+    const preStatus = await launchdRuntimeStatus(spec, options);
+    commands.push(preStatus.runtime_command);
+    if (preStatus.loaded && preStatus.running) {
+      return { status: "already_running", running: true, installed: true, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path, runtime_status: preStatus.runtime_status, commands };
+    }
+    if (preStatus.loaded && !preStatus.running) {
+      const staleBootout = await runServiceCommand("launchctl", ["bootout", launchdServiceName(spec, options)], options);
+      commands.push(staleBootout.command);
+      if (!staleBootout.ok && !isNotLoaded(staleBootout)) {
+        throw new Error(`Failed to clear stale launchd service state ${preStatus.runtime_status}: ${staleBootout.stderr || staleBootout.stdout}`);
+      }
+      const unloaded = await waitForLaunchdUnloaded(spec, options);
+      commands.push(unloaded.runtime_command);
+      if (unloaded.loaded) {
+        throw new Error(`Failed to clear stale launchd service state ${unloaded.runtime_status}; try \`descartes daemon stop\` and retry in a few seconds.`);
+      }
+    }
+
     const domain = launchdDomain(options);
     const result = await runServiceCommand("launchctl", ["bootstrap", domain, spec.install_path], options);
-    if (result.ok) return { status: "started", install_status: install.status, running: true, installed: true, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path, commands: [result.command] };
-    if (isAlreadyLoaded(result)) return { status: "already_running", running: true, installed: true, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path, commands: [result.command] };
-    throw new Error(`Failed to start launchd service: ${result.stderr || result.stdout}`);
+    commands.push(result.command);
+    if (result.ok) return { status: "started", install_status: install.status, running: true, installed: true, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path, commands };
+
+    const postStatus = await launchdRuntimeStatus(spec, options);
+    commands.push(postStatus.runtime_command);
+    if ((isAlreadyLoaded(result) || postStatus.loaded) && postStatus.running) {
+      return { status: "already_running", running: true, installed: true, service_manager: spec.service_manager, label: spec.label, install_path: spec.install_path, runtime_status: postStatus.runtime_status, commands };
+    }
+
+    const detail = postStatus.loaded
+      ? `launchd reports service state ${postStatus.runtime_status}; run \`descartes daemon status --json\` and inspect ${spec.log_dir}/stderr.log`
+      : `launchd reports service state ${postStatus.runtime_status}; inspect ${spec.log_dir}/stderr.log if it exists`;
+    throw new Error(`Failed to start launchd service: ${result.stderr || result.stdout}\n${detail}`);
   }
 
   if (spec.service_manager === "systemd-user") {
