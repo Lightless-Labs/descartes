@@ -2,7 +2,7 @@
 
 **Prepared:** 2026-05-24
 **Audience:** infrastructure-running agent
-**Target:** Linux systemd-user daemon lifecycle validation for Descartes `v0.0.37+`
+**Target:** Linux systemd-user daemon lifecycle validation for Descartes `v0.0.39+`
 
 ## Goal
 
@@ -87,7 +87,7 @@ descartes --help > "$work/descartes-help.txt"
 
 Expected:
 
-- `descartes --version` is `0.0.37` or newer.
+- `descartes --version` is `0.0.39` or newer.
 - Help includes `daemon install|start|status|stop|uninstall [--json]`.
 - The known upstream `node-domexception` deprecation warning may appear; do not fail solely for that.
 
@@ -286,7 +286,7 @@ Expected:
 
 This brief is complete when the returned report shows:
 
-- Public GitHub install works and version is `0.0.37+`.
+- Public GitHub install works and version is `0.0.39+`.
 - Isolated install human output is concise and does not leak generated unit content.
 - Isolated install JSON does not include generated unit content.
 - Full systemd-user lifecycle works on at least one Linux host/VM:

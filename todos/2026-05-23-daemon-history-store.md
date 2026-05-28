@@ -57,7 +57,8 @@ Build the local background substrate before implementing agent-authored sensors.
 - [ ] Linux systemd-user lifecycle validation remains follow-on work; use `linux-daemon-lifecycle-validation-brief.md`.
 - [x] `history summary` default human output should become compact; keep full metric tables behind `--verbose`/`--json`.
 - [x] Initial `triage --use-history [--history-window <duration>]` exists and injects a bounded `history-summary` evidence envelope.
-- [x] Default `--use-history` window is 24h after field feedback that 1h was too short.
+- [x] Triage auto-includes fresh daemon-backed history by default, with `--no-history` opt-out and `--use-history` force mode.
+- [x] Default history window is 24h after field feedback that 1h was too short.
 - [x] Current retention is documented in handoff: 24h high-resolution JSONL, capped at 5 MiB.
 - [ ] Richer history-aware triage prompting/evaluation remains follow-on work.
 - [ ] Configurable retention and longer rollups remain follow-on work.

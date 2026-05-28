@@ -19,8 +19,8 @@ npm install -g github:Lightless-Labs/descartes
 descartes login
 descartes triage "my machine is slow"
 descartes triage "my machine is slow" --json
-# If the daemon has collected local history:
-descartes triage --use-history "How's my system doing?"
+# If fresh daemon history exists, triage includes a bounded history summary automatically:
+descartes triage "How's my system doing?"
 
 # Optional local history prototype, no background LLM calls:
 descartes daemon install       # idempotently writes a user launchd/systemd service file
@@ -88,11 +88,12 @@ See `docs/reference/collectors.md` for the full collector/tool reference.
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
 
-If the local history daemon has collected metrics, `--use-history` includes a bounded history summary as another evidence envelope in the triage prompt. The default history window is `24h`; use `--history-window` to narrow or widen it within retained data:
+If the local history daemon has collected fresh metrics, triage automatically includes a bounded history summary as another evidence envelope in the prompt. The default history window is `24h`; use `--history-window` to narrow or widen it within retained data. Use `--no-history` to opt out, or `--use-history` to force including a history summary even when it is stale or empty:
 
 ```bash
-descartes triage --use-history "How's my system doing?"
-descartes triage --use-history --history-window 6h "Did anything change recently?" --json
+descartes triage "How's my system doing?"
+descartes triage --history-window 6h "Did anything change recently?" --json
+descartes triage --no-history "Ignore local history for this question"
 ```
 
 ## Local history daemon

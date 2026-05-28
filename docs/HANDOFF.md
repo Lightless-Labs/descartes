@@ -4,6 +4,8 @@
 
 ## Current Status
 
+Current session update: made history-aware triage automatic by default and bumped package metadata to v0.0.39. `descartes triage` now auto-includes a bounded `history-summary` evidence envelope when the local daemon has fresh points, daemon status is `ok`, and the newest sample is within `max(5m, 3x daemon interval)`. `--no-history` opts out, while `--use-history` is retained as force mode for stale/empty history. JSON diagnostics now include `history_mode`, `history_used`, `history_skip_reason`, freshness/max-age, a daemon status summary, and sanitized history summary. README/help/tests/todo/plan were updated.
+
 Current session update: investigated the macOS launchd start failure reported after v0.0.37. Local testing showed launchd can return only `Bootstrap failed: 5: Input/output error` when bootstrapping an already-loaded user agent, and immediate restart after `bootout` can see a transient loaded-but-not-running `SIGTERMed` state. Implemented v0.0.38 launchd hardening: parse `launchctl print` state, treat `state = running` as idempotent before/after generic bootstrap errors, clear stale non-running launchd state with `bootout`, wait for unload, then bootstrap. Added tests for launchd state parsing, generic bootstrap I/O idempotency, and stale-state clearing. Local real launchd validation passed install/start/start/status/history/stop/immediate-start, then cleanup stopped/uninstalled the service. `npm test` passes 146 Node test cases. Follow-up: ask the field user to retry with public v0.0.38+ after push.
 
 Current session update: implemented compact default `descartes history summary` output and bumped package metadata to v0.0.37. Human summaries now show point count/window, last sample age, daemon cadence from the profile, daemon state, and key load/memory/swap/disk/process highlights; the previous full metric table is available behind `--verbose`, while `--json` remains machine-readable. README/help/tests/todo/plan were updated. `npm test` now passes 142 Node test cases, and an isolated-XDG daemon one-shot plus compact/verbose history summary smoke succeeded locally.
@@ -320,12 +322,12 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 146 Node test cases after the launchd start idempotency/stale-state hardening slice.
+- Current checked command: `npm test` passes 152 Node test cases after the auto history-aware triage slice.
 - Current checked command: `git diff --check` passes after the compact history summary slice.
 - Current checked command: extracted `collector-smoke.mjs` snippets from both Linux validation briefs pass `node --check`.
 - Current checked command: two parallel Pi print-mode reviews completed with `PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi --no-session --tools read,grep,find,ls --model openai-codex/gpt-5.5 --thinking xhigh -p ...` and wrote reports under `docs/reviews/`.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `daemon.js`, `history-store.js`, `history.js`, `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.38.
+- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `daemon.js`, `history-store.js`, `history.js`, `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.39.
 - Current checked command: `git push origin main` succeeded after v0.0.31 review-finding fixes; public GitHub `main` should now expose package version 0.0.31 for the next Linux validation rerun.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.

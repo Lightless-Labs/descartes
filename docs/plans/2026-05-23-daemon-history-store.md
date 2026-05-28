@@ -4,6 +4,7 @@
 **Status:** In Progress
 **Addendum:** 2026-05-24 — Started the first Node.js implementation slice with a foreground daemon loop, JSONL metric store, and idempotent user-level service install/start/status/stop/uninstall commands. SQLite remains a likely later durable store, but JSONL is sufficient for the initial bounded system/process/disk history summary path and avoids adding runtime dependencies while the CLI remains a temporary harness layer.
 **Addendum:** 2026-05-25 — Changed default human `history summary` output from a full metric table to a compact operator summary with last-sample age/cadence, highlights, and `--verbose` for the detailed table. This addresses real-host validation feedback that repeated summaries within the one-minute daemon interval looked stuck and were too noisy by default.
+**Addendum:** 2026-05-28 — Made history-aware triage automatic when fresh daemon-backed history exists, with `--no-history` opt-out and `--use-history` retained as an explicit force mode for stale/empty history. JSON diagnostics now distinguish auto/forced/disabled history modes and skip reasons.
 
 ## Purpose
 
@@ -178,9 +179,9 @@ The daemon/history store is the substrate for:
 
 ### Milestone 5: Triage history integration
 
-- Add `descartes triage --use-history`.
-- Feed bounded summaries to the model as evidence envelopes.
-- Include history diagnostics in JSON output.
+- Add `descartes triage --use-history`. **Initial slice:** implemented; later changed default triage to auto-include fresh daemon-backed history.
+- Feed bounded summaries to the model as evidence envelopes. **Initial slice:** implemented via `history-summary` envelope; auto mode requires points, daemon `ok`, and freshness within the configured threshold.
+- Include history diagnostics in JSON output. **Initial slice:** includes `history_mode`, `history_used`, `history_skip_reason`, freshness/max-age, daemon status summary, and sanitized metric summary.
 
 ## Non-Goals
 

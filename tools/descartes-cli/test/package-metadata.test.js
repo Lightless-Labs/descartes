@@ -39,6 +39,7 @@ test("CLI version and help are generated from current metadata/options", () => {
   assert.match(help, /--thinking <LEVEL>/);
   assert.match(help, /--no-investigate/);
   assert.match(help, /--use-history/);
+  assert.match(help, /--no-history/);
   assert.match(help, /--history-window <DURATION>/);
   assert.match(help, /daemon install\|start\|status\|stop\|uninstall \[--json\]/);
   assert.match(help, /daemon run --foreground/);
