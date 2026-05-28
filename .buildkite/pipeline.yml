@@ -39,10 +39,10 @@ steps:
         node_dir="$$HOME/.local/node-v$$node_version-$$node_platform"
         if [[ ! -x "$$node_dir/bin/node" ]]; then
           mkdir -p "$$node_dir"
-          tmp_archive="$$(mktemp -t node.XXXXXX.tar.xz)"
+          tmp_archive="$$(mktemp)"
           archive_url="https://nodejs.org/dist/v$$node_version/node-v$$node_version-$$node_platform.$$archive_ext"
           curl --proto '=https' --tlsv1.2 -fsSL "$$archive_url" -o "$$tmp_archive"
-          tar -xf "$$tmp_archive" -C "$$node_dir" --strip-components=1
+          tar -xJf "$$tmp_archive" -C "$$node_dir" --strip-components=1
           rm -f "$$tmp_archive"
         fi
         export PATH="$$node_dir/bin:$$PATH"
@@ -94,7 +94,7 @@ steps:
         node_dir="$$HOME/.local/node-v$$node_version-$$node_platform"
         if [[ ! -x "$$node_dir/bin/node" ]]; then
           mkdir -p "$$node_dir"
-          tmp_archive="$$(mktemp -t node.XXXXXX.tar.gz)"
+          tmp_archive="$$(mktemp)"
           archive_url="https://nodejs.org/dist/v$$node_version/node-v$$node_version-$$node_platform.$$archive_ext"
           curl --proto '=https' --tlsv1.2 -fsSL "$$archive_url" -o "$$tmp_archive"
           tar -xzf "$$tmp_archive" -C "$$node_dir" --strip-components=1
