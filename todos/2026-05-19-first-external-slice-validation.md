@@ -2,7 +2,7 @@
 title: First External Slice Validation and Release Readiness
 created: 2026-05-19
 status: in_progress
-priority: immediate
+priority: medium
 area: release
 kind: todo
 owner: unassigned
@@ -15,13 +15,11 @@ related:
 
 ## Summary
 
-The LLM-backed local triage loop has now worked in a real macOS Anthropic subscription-auth field test. The highest-impact next step is not adding more collectors; it is validating and tightening the first external slice against the current plan's shippability criteria.
+The LLM-backed local triage loop has worked in real macOS subscription-auth field tests and the installable first slice has been substantially validated. This todo tracks the release-readiness pass for the installable `descartes` CLI; remaining Linux x86_64/full credentialed validation is deferred and should not block the next monitoring/alerting work.
 
-This todo tracks the release-readiness pass for the installable `descartes` CLI.
+## Current Priority
 
-## Why This Is Next
-
-The current plan is explicitly about shipping the first installable LLM-backed local triage slice. New tools like process inspection and temporal sampling are valuable next product work, but the current slice should first be made reliably installable, documentable, and verifiable.
+This is no longer the immediate next task. Keep it as the record of first-slice release readiness and deferred Linux validation follow-up.
 
 ## Validation Checklist
 
@@ -60,7 +58,7 @@ The current plan is explicitly about shipping the first installable LLM-backed l
 
 - [x] README accurately describes the current Node.js/JavaScript first slice and long-term Rust direction.
 - [x] README documents install, login, triage, JSON output, model/thinking overrides, `--no-investigate` if retained, supported platforms, limitations, safety, XDG paths, and Pi boundary.
-- [x] Plan/handoff reflects that the LLM-driven tool loop is complete and release validation is the immediate next task.
+- [x] Plan/handoff reflects that the LLM-driven tool loop and first-slice release-readiness pass are substantially complete; remaining Linux validation is deferred.
 
 ## Validation Notes
 
