@@ -320,6 +320,9 @@ export async function runTriage(paths, args) {
       history_daemon_status: historySelection.daemon_status,
       history_summary: historySummary ? {
         point_count: historySummary.point_count,
+        matched_point_count: historySummary.matched_point_count,
+        point_limit: historySummary.point_limit,
+        truncated: historySummary.truncated,
         metric_names: historySummary.metrics.map((metric) => metric.metric_name),
         since: historySummary.since,
         until: historySummary.until,

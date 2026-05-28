@@ -131,7 +131,7 @@ export async function readMetricPoints(descartesPaths, options = {}) {
   const sinceMs = options.since ? new Date(options.since).getTime() : undefined;
   const limit = options.limit ?? DEFAULT_HISTORY_POINT_LIMIT;
   const { records, corrupt_count } = await readJsonLines(storePaths.metricsFile);
-  const points = records
+  const matched = records
     .map((record) => {
       try {
         return normalizeMetricPoint(record);
@@ -141,9 +141,15 @@ export async function readMetricPoints(descartesPaths, options = {}) {
     })
     .filter(Boolean)
     .filter((point) => sinceMs === undefined || new Date(point.ts).getTime() >= sinceMs)
-    .sort((left, right) => new Date(left.ts).getTime() - new Date(right.ts).getTime())
-    .slice(-limit);
-  return { points, corrupt_count };
+    .sort((left, right) => new Date(left.ts).getTime() - new Date(right.ts).getTime());
+  const points = matched.slice(-limit);
+  return {
+    points,
+    corrupt_count,
+    matched_count: matched.length,
+    point_limit: limit,
+    truncated: matched.length > points.length,
+  };
 }
 
 function percentile(values, fraction) {
@@ -212,12 +218,15 @@ export async function buildHistorySummary(descartesPaths, options = {}) {
   const windowMs = options.windowMs ?? parseDurationMs(options.window ?? "1h");
   const now = options.now ? new Date(options.now) : new Date();
   const since = new Date(now.getTime() - windowMs).toISOString();
-  const { points, corrupt_count } = await readMetricPoints(descartesPaths, { since, limit: options.limit });
+  const { points, corrupt_count, matched_count, point_limit, truncated } = await readMetricPoints(descartesPaths, { since, limit: options.limit });
   return {
     window_ms: windowMs,
     since,
     until: now.toISOString(),
     point_count: points.length,
+    matched_point_count: matched_count,
+    point_limit,
+    truncated,
     corrupt_count,
     metrics: summarizeMetricPoints(points),
   };

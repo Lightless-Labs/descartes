@@ -106,6 +106,7 @@ export function renderVerboseHistorySummary(summary, daemonStatus) {
   const lines = [];
   lines.push(`History summary (${summary.point_count} points, window ${Math.round(summary.window_ms / 1000)}s)`);
   lines.push(`Range: ${summary.since} → ${summary.until}`);
+  if (summary.truncated) lines.push(`Point limit: showing newest ${summary.point_count} of ${summary.matched_point_count} matching points (limit ${summary.point_limit}).`);
   if (daemonStatus) lines.push(`Daemon status: ${daemonStatus.state ?? "unknown"} at ${daemonStatus.ts ?? "unknown time"}`);
   if (summary.corrupt_count > 0) lines.push(`Skipped corrupt history records: ${summary.corrupt_count}`);
   if (summary.metrics.length === 0) {
@@ -123,7 +124,7 @@ export function renderCompactHistorySummary(summary, daemonStatus) {
   const lines = [];
   const window = formatDuration(summary.window_ms);
   const cadence = cadenceDescription(daemonStatus);
-  lines.push(`History summary: ${summary.point_count} points over ${window}`);
+  lines.push(`History summary: ${summary.point_count} points over ${window}${summary.truncated ? ` (newest ${summary.point_count} of ${summary.matched_point_count}, limit ${summary.point_limit})` : ""}`);
   lines.push(`Last sample: ${lastSampleDescription(summary, daemonStatus)}${cadence ? ` (cadence ${cadence})` : ""}`);
   lines.push(`Daemon: ${daemonStatus?.state ?? "unknown"}${daemonStatus?.mode ? ` (${daemonStatus.mode})` : ""}`);
   if (summary.corrupt_count > 0) lines.push(`Skipped corrupt history records: ${summary.corrupt_count}`);

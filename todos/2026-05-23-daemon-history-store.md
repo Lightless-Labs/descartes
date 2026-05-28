@@ -59,6 +59,21 @@ Build the local background substrate before implementing agent-authored sensors.
 - [x] Initial `triage --use-history [--history-window <duration>]` exists and injects a bounded `history-summary` evidence envelope.
 - [x] Triage auto-includes fresh daemon-backed history by default, with `--no-history` opt-out and `--use-history` force mode.
 - [x] Default history window is 24h after field feedback that 1h was too short.
+- [x] History summaries expose point-limit/truncation diagnostics (`matched_point_count`, `point_limit`, `truncated`).
 - [x] Current retention is documented in handoff: 24h high-resolution JSONL, capped at 5 MiB.
 - [ ] Richer history-aware triage prompting/evaluation remains follow-on work.
 - [ ] Configurable retention and longer rollups remain follow-on work.
+
+## Next: Monitoring and Alerting Direction
+
+After the daemon/history substrate, move into actual monitoring/alerting before broader agent-authored sensors. Keep it deterministic first: periodic rule evaluation over recent metric summaries, explicit alert state, dedupe/cooldown, acknowledgements, and notification delivery adapters.
+
+Candidate notification surfaces by system:
+
+- macOS desktop: user notification via `osascript`/Notification Center where permissioned; fallback to menu-bar/CLI status later.
+- Linux desktop: `notify-send`/D-Bus desktop notifications when a graphical session is available.
+- Headless Linux/server: stdout/syslog/journald entries, optional email/webhook adapters only after explicit configuration.
+- CLI-only MVP: `descartes alerts list`, `descartes alerts watch`, nonzero exit/status for scripts, and concise summaries in `descartes history summary`.
+- Future integrations: Slack/Discord/webhook/mobile push only with explicit opt-in, redaction, routing policy, and rate limits.
+
+Initial alerts should be local/read-only and conservative: stale daemon/no samples, sustained high memory/load, disk pressure, repeated service failures where service collection exists, certificate expiry, and time-sync warnings. No remediation actions without separate policy/authority work.

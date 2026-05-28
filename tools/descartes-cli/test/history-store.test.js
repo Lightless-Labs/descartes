@@ -48,6 +48,9 @@ test("history store appends metrics and summarizes rollups", async () => {
   });
 
   assert.equal(summary.point_count, 3);
+  assert.equal(summary.matched_point_count, 3);
+  assert.equal(summary.point_limit, 10000);
+  assert.equal(summary.truncated, false);
   const load = summary.metrics.find((metric) => metric.metric_name === "system.load.1m");
   assert.equal(load.count, 2);
   assert.equal(load.min, 1);
@@ -78,6 +81,28 @@ test("history retention drops old and corrupt records", async () => {
   const { points, corrupt_count } = await readMetricPoints(paths);
   assert.equal(corrupt_count, 0);
   assert.deepEqual(points.map((point) => point.metric_name), ["fresh"]);
+});
+
+test("history summary exposes truncation diagnostics when point limit is hit", async () => {
+  const paths = await tempPaths();
+  const base = Date.parse("2026-05-24T00:00:00.000Z");
+  await appendMetricPoints(paths, [
+    { ts: new Date(base).toISOString(), metric_name: "metric.one", value: 1 },
+    { ts: new Date(base + 1000).toISOString(), metric_name: "metric.two", value: 2 },
+    { ts: new Date(base + 2000).toISOString(), metric_name: "metric.three", value: 3 },
+  ], { now: new Date(base + 3000).toISOString() });
+
+  const summary = await buildHistorySummary(paths, {
+    now: new Date(base + 3000).toISOString(),
+    windowMs: 60_000,
+    limit: 2,
+  });
+
+  assert.equal(summary.point_count, 2);
+  assert.equal(summary.matched_point_count, 3);
+  assert.equal(summary.point_limit, 2);
+  assert.equal(summary.truncated, true);
+  assert.deepEqual(summary.metrics.map((metric) => metric.metric_name), ["metric.three", "metric.two"]);
 });
 
 test("history retention enforces maximum bytes by keeping newest records", async () => {

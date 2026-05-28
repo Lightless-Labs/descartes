@@ -5,6 +5,7 @@
 **Addendum:** 2026-05-24 — Started the first Node.js implementation slice with a foreground daemon loop, JSONL metric store, and idempotent user-level service install/start/status/stop/uninstall commands. SQLite remains a likely later durable store, but JSONL is sufficient for the initial bounded system/process/disk history summary path and avoids adding runtime dependencies while the CLI remains a temporary harness layer.
 **Addendum:** 2026-05-25 — Changed default human `history summary` output from a full metric table to a compact operator summary with last-sample age/cadence, highlights, and `--verbose` for the detailed table. This addresses real-host validation feedback that repeated summaries within the one-minute daemon interval looked stuck and were too noisy by default.
 **Addendum:** 2026-05-28 — Made history-aware triage automatic when fresh daemon-backed history exists, with `--no-history` opt-out and `--use-history` retained as an explicit force mode for stale/empty history. JSON diagnostics now distinguish auto/forced/disabled history modes and skip reasons.
+**Addendum:** 2026-05-28 — Added point-limit/truncation diagnostics to history summaries so bounded query caps are visible to humans and JSON consumers before monitoring/alerting relies on those summaries.
 
 ## Purpose
 

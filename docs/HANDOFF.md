@@ -1,8 +1,10 @@
 # Descartes Handoff
 
-**Last updated:** 2026-05-25
+**Last updated:** 2026-05-28
 
 ## Current Status
+
+Current session update: added history truncation diagnostics and bumped package metadata to v0.0.40. `readMetricPoints`/`buildHistorySummary` now expose `matched_point_count`, `point_limit`, and `truncated`, human history summaries mention when only the newest bounded points are shown, and triage JSON diagnostics include the same fields in `history_summary`. This addresses the field observation where auto-history hit the 10,000 point query cap. Documented the next product step explicitly in `todos/2026-05-23-daemon-history-store.md`: move into deterministic monitoring/alerting with alert state, dedupe/cooldown, acknowledgements, and notification adapters (macOS Notification Center/osascript, Linux desktop notify-send/D-Bus, headless syslog/journald/email/webhook after opt-in, and CLI `alerts list/watch`).
 
 Current session update: made history-aware triage automatic by default and bumped package metadata to v0.0.39. `descartes triage` now auto-includes a bounded `history-summary` evidence envelope when the local daemon has fresh points, daemon status is `ok`, and the newest sample is within `max(5m, 3x daemon interval)`. `--no-history` opts out, while `--use-history` is retained as force mode for stale/empty history. JSON diagnostics now include `history_mode`, `history_used`, `history_skip_reason`, freshness/max-age, a daemon status summary, and sanitized history summary. README/help/tests/todo/plan were updated.
 
@@ -322,12 +324,12 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 152 Node test cases after the auto history-aware triage slice.
+- Current checked command: `npm test` passes 153 Node test cases after the history truncation diagnostics slice.
 - Current checked command: `git diff --check` passes after the compact history summary slice.
 - Current checked command: extracted `collector-smoke.mjs` snippets from both Linux validation briefs pass `node --check`.
 - Current checked command: two parallel Pi print-mode reviews completed with `PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi --no-session --tools read,grep,find,ls --model openai-codex/gpt-5.5 --thinking xhigh -p ...` and wrote reports under `docs/reviews/`.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `daemon.js`, `history-store.js`, `history.js`, `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.39.
+- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `daemon.js`, `history-store.js`, `history.js`, `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.40.
 - Current checked command: `git push origin main` succeeded after v0.0.31 review-finding fixes; public GitHub `main` should now expose package version 0.0.31 for the next Linux validation rerun.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.
