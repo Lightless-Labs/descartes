@@ -226,6 +226,19 @@ export function createEvidenceTools(paths) {
   ];
 }
 
+export function alertSystemPrompt() {
+  return `You are Descartes alert intelligence, a local-first monitoring adjudicator.
+
+Your job is to review bounded deterministic alert summaries and decide whether/how to notify the user.
+
+Hard rules:
+- Use only alert/history facts provided in the prompt.
+- Do not execute tools or request host actions.
+- Do not claim facts that are not present in alert/history summaries.
+- Do not recommend or imply remediation was taken.
+- Return only the structured notification decision requested by the prompt.`;
+}
+
 export function triageSystemPrompt() {
   return `You are Descartes, a local-first operations triage agent.
 
@@ -370,7 +383,7 @@ Avoid for now
 End with: No actions were taken.`;
 }
 
-export async function createPrivateTriageSession(paths, options = {}) {
+async function createPrivateSession(paths, options = {}) {
   const authStorage = AuthStorage.create(paths.authFile);
   const modelRegistry = ModelRegistry.create(authStorage, paths.modelsFile);
   const settingsManager = SettingsManager.inMemory({
@@ -387,7 +400,7 @@ export async function createPrivateTriageSession(paths, options = {}) {
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPromptOverride: () => triageSystemPrompt(),
+    systemPromptOverride: () => options.systemPrompt ?? triageSystemPrompt(),
     agentsFilesOverride: () => ({ agentsFiles: [] }),
     skillsOverride: () => ({ skills: [], diagnostics: [] }),
     promptsOverride: () => ({ prompts: [], diagnostics: [] }),
@@ -427,4 +440,12 @@ export async function createPrivateTriageSession(paths, options = {}) {
     selectedThinkingLevel: thinkingLevel,
     activeToolNames,
   };
+}
+
+export async function createPrivateTriageSession(paths, options = {}) {
+  return createPrivateSession(paths, { ...options, systemPrompt: triageSystemPrompt() });
+}
+
+export async function createPrivateAlertSession(paths, options = {}) {
+  return createPrivateSession(paths, { ...options, systemPrompt: alertSystemPrompt(), enableTools: false });
 }

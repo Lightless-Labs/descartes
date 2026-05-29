@@ -41,6 +41,11 @@ Usage:
   descartes daemon install|start|status|stop|uninstall [--json]
   descartes daemon run --foreground [--once] [--interval <duration>]
   descartes history summary [--json] [--verbose] [--window <duration>]
+  descartes alerts list [--json] [--all]
+  descartes alerts watch [--json] [--interval <duration>] [--once] [--all]
+  descartes alerts ack <alert-id> [--json]
+  descartes alerts intelligence status|enable|disable [--json]
+  descartes alerts notifications status|setup|test|disable [--json]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
@@ -98,6 +103,11 @@ async function main(argv) {
   if (command === "history") {
     const { runHistory } = await import("./history.js");
     await runHistory(paths, args);
+    return;
+  }
+  if (command === "alerts") {
+    const { runAlerts } = await import("./alerts.js");
+    await runAlerts(paths, args);
     return;
   }
 

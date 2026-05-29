@@ -1,8 +1,16 @@
 # Descartes Handoff
 
-**Last updated:** 2026-05-28
+**Last updated:** 2026-05-29
 
 ## Current Status
+
+Current session update: implemented opt-in notification delivery setup/test UX and bumped package metadata to v0.0.43. Added `notification-delivery.js` with config under Descartes XDG config, local JSONL delivery audit under XDG state, bounded payload normalization, macOS desktop (`osascript`), Linux desktop (`notify-send`), syslog (`logger`), and CLI-only delivery modes. Added `descartes alerts notifications status|setup|test|disable` CLI. Alert-intelligence decisions now attempt delivery only when the LLM returned `notify: true` and notification delivery has been explicitly enabled. Tests cover disabled-by-default behavior, fixed-command adapter invocation via injected runners, CLI setup/test/disable, and local delivery audit. `npm test` passes 177 Node test cases.
+
+Current session update: implemented opt-in alert intelligence and bumped package metadata to v0.0.42. Added `alert-intelligence.js` with config under Descartes XDG config, local JSONL decision audit under XDG state, bounded LLM notification decision schema, max wakeups/hour rate limiting, and daemon integration that only wakes the LLM when alert intelligence is explicitly enabled and deterministic alert transitions are due. Added `descartes alerts intelligence status|enable|disable` CLI. Added a no-tool private alert session/system prompt in `pi-harness.js`. Tests now cover disabled-by-default behavior, fake LLM adjudication, audit records, rate limiting, and CLI config.
+
+Current session update: product direction changed for alerting notifications: deterministic alerts should wake an explicitly opted-in LLM alert adjudicator, and the LLM should decide whether to notify and what bounded notification text to send. Updated `docs/plans/2026-05-28-monitoring-alerting.md` and `todos/2026-05-28-monitoring-alerting.md` with this addendum. Important design stance: no unconfigured background LLM calls; wakeups should be rate-limited/audited, receive bounded alert/history summaries rather than raw dumps by default, and have no remediation/action tools. CLI notification permission UX should likely be a `notifications setup/test` flow: macOS can trigger the OS prompt with a test notification but permission attribution for a pure CLI may attach to Terminal/osascript rather than a branded app; Linux desktop notifications generally rely on the session D-Bus/notify-send with no standard permission prompt; headless delivery needs explicit syslog/journald/email/webhook config.
+
+Current session update: implemented the first deterministic monitoring/alerting slice and bumped package metadata to v0.0.41. Added `alert-store.js` with local XDG alert persistence, deterministic rules for missing/stale daemon samples, sustained high memory pressure, sustained high load relative to CPU count, and disk pressure, plus dedupe/cooldown, acknowledged, and recovered state handling. Added CLI-only `descartes alerts list/watch/ack` with JSON support and daemon integration that evaluates/persists alerts after history collection. README/help/plan/todo/tests were updated. Notification adapters remain disabled/design follow-up work. `npm test` passes 163 Node test cases and `git diff --check` passes for this slice.
 
 Current session update: added history truncation diagnostics and bumped package metadata to v0.0.40. `readMetricPoints`/`buildHistorySummary` now expose `matched_point_count`, `point_limit`, and `truncated`, human history summaries mention when only the newest bounded points are shown, and triage JSON diagnostics include the same fields in `history_summary`. This addresses the field observation where auto-history hit the 10,000 point query cap. Field validation on a work Apple Silicon laptop showed v0.0.39 auto-history worked (`history_mode: auto`, `history_used: true`, fresh sample, model used `history-summary` alongside live tools). Created the next product step as `docs/plans/2026-05-28-monitoring-alerting.md` and `todos/2026-05-28-monitoring-alerting.md`: move into deterministic monitoring/alerting with alert state, dedupe/cooldown, acknowledgements, and notification adapters (macOS Notification Center/osascript, Linux desktop notify-send/D-Bus, headless syslog/journald/email/webhook after opt-in, and CLI `alerts list/watch`).
 
@@ -120,7 +128,8 @@ Existing files:
   - `src/pi-harness.js` wraps Pi SDK session creation with Descartes-owned auth/model paths, no default resource discovery, no built-in coding tools, and only explicit Descartes evidence tools.
   - `src/login.js` implements a first terminal OAuth/API-key login path storing under Descartes config.
   - `src/triage.js` implements human and JSON triage prompts around the private harness.
-  - `test/` covers XDG path resolution, Pi-path guardrails, deterministic finding thresholds, parser fixtures, tool policy, sampling, and fallback/guard diagnostics.
+  - `src/alert-store.js`, `src/alert-intelligence.js`, `src/notification-delivery.js`, and `src/alerts.js` implement local deterministic alert persistence/evaluation, opt-in LLM alert adjudication, opt-in notification setup/test/delivery, and `alerts list/watch/ack`.
+  - `test/` covers XDG path resolution, Pi-path guardrails, deterministic finding thresholds, parser fixtures, tool policy, sampling, history, alerts, notification delivery, and fallback/guard diagnostics.
 - `docs/ROADMAP.md` — roadmap for capability discovery, process/behavior understanding, temporal sampling, planning, inter-agent delegation/identity, policy-gated action, and learning. Includes the guiding future use case: “I need a quick Linux environment with npm,” where Descartes discovers Docker/Colima/Podman/Tart/Lima/UTM/Multipass/Buildkite/authenticated delegated-agent options, recommends a plan, asks approval, executes or delegates within scoped authority, verifies, and cleans up.
 - `docs/reference/collectors.md` — reference catalog for model-visible evidence tools, envelope IDs, parameters, sources, platform coverage, network behavior, and privacy notes.
 - `docs/reviews/2026-05-22-technical-implementation-codex-5.5-xhigh.md` — read-only Pi/Codex technical implementation review report.
@@ -133,7 +142,7 @@ Existing files:
 - `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` — **current implementation plan**, now in progress.
 - `docs/plans/2026-05-21-vm-container-resource-correlation.md` — in-progress follow-on plan for VM/container resource correlation; first VM process-hint correlation slice is implemented.
 - `docs/plans/2026-05-23-daemon-history-store.md` — active substrate plan for installing/running a local background daemon and bounded local history/metric store; mostly complete for the Node.js prototype.
-- `docs/plans/2026-05-28-monitoring-alerting.md` — **recommended next plan** for deterministic local monitoring/alerting over daemon history with alert state and optional notification adapters.
+- `docs/plans/2026-05-28-monitoring-alerting.md` — completed first Node.js monitoring/alerting slice over daemon history: deterministic alerts, opt-in LLM adjudication, and opt-in notification setup/test/delivery audit.
 - `docs/plans/2026-05-23-derived-collector-transformation-engine.md` — follow-on plan for agent-authored pure map/reduce/window derived collectors over stored data without arbitrary code/host execution.
 - `docs/plans/2026-05-23-agent-authored-sensor-toolkit.md` — proposed follow-on plan for a fact/rule/statistical-model workbench that lets background LLM agents author deterministic sensors/tools instead of humans hand-writing every signature.
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
@@ -146,7 +155,7 @@ Existing files:
   - `2026-05-19-macos-disk-evidence-classification.md` — completed; classifies pseudo/runtime filesystems, fixes macOS map row parsing, and reduces disk finding noise.
   - `2026-05-19-linux-ci-validation.md` — v0.0.31+ Linux rerun is deferred; public v0.0.30 direct collector/package validation passed on Linux ARM64 and x86_64.
   - `2026-05-23-daemon-history-store.md` — active task, mostly complete for the Node.js prototype: foreground loop, JSONL history, idempotent daemon lifecycle commands, compact history summaries, auto history-aware triage, truncation diagnostics, and macOS personal/work-laptop validation exist. Linux systemd-user validation and longer rollups/configurable retention remain follow-up.
-  - `2026-05-28-monitoring-alerting.md` — **recommended next task**: deterministic local monitoring/alerting over daemon history with alert state, dedupe/cooldown, CLI `alerts` commands, and notification adapter design.
+  - `2026-05-28-monitoring-alerting.md` — completed first Node.js monitoring/alerting slice over daemon history. Alert state, dedupe/cooldown, daemon evaluation, CLI `alerts` commands, opt-in alert intelligence, and opt-in notification setup/test/delivery audit are implemented.
   - `2026-05-23-derived-collector-transformation-engine.md` — follow-on: let agents author pure bounded map/reduce/window transformations over daemon history as derived collectors/sensors.
   - `2026-05-23-agent-authored-sensor-toolkit.md` — follow-on: build the fact/rule/metric-history/statistical-model substrate that lets background LLM agents author deterministic sensors/tools.
   - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
@@ -159,10 +168,10 @@ Existing files:
 ## Start Here In A New Session
 
 1. Read `README.md`, `AGENTS.md`, and this handoff.
-2. Treat `docs/plans/2026-05-28-monitoring-alerting.md` and `todos/2026-05-28-monitoring-alerting.md` as the active next implementation source of truth, while `docs/plans/2026-05-23-daemon-history-store.md` remains the daemon/history substrate baseline and `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` remains the current first-slice product baseline.
-3. Do **not** jump directly to broad agent-authored signatures or background LLM calls. The daemon/history substrate now exists for the Node.js prototype; the next task is deterministic monitoring/alerting over that substrate.
+2. Treat `docs/plans/2026-05-23-daemon-history-store.md` as the daemon/history substrate baseline and `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current first-slice product baseline. The first `docs/plans/2026-05-28-monitoring-alerting.md` slice is complete through opt-in notifications.
+3. Do **not** jump directly to broad agent-authored signatures or unsafe background actions. The daemon/history substrate, deterministic alert layer, opt-in LLM adjudication, and opt-in notification delivery setup/test now exist for the Node.js prototype.
 4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: pick up `docs/plans/2026-05-28-monitoring-alerting.md` / `todos/2026-05-28-monitoring-alerting.md`. Start with a local alert store schema, deterministic rule evaluator, and CLI-only `alerts list/watch/ack` before desktop/headless notification delivery.
+5. Recommended next task: either perform real-host notification validation (macOS permission attribution, Linux desktop/headless syslog behavior) or move to the next planned substrate, `docs/plans/2026-05-23-derived-collector-transformation-engine.md`, if validation infrastructure is not available.
 
 ## Current First Slice
 
@@ -303,7 +312,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: pick up `docs/plans/2026-05-28-monitoring-alerting.md` / `todos/2026-05-28-monitoring-alerting.md`. Build deterministic local alerts over daemon history first: alert store schema, rule evaluator, dedupe/cooldown, CLI list/watch/ack, then optional notification adapters.
+Recommended next task: the first Node.js monitoring/alerting slice is complete through deterministic alerts, opt-in LLM adjudication, and opt-in notification delivery setup/test. If real hosts are available, validate macOS notification permission attribution and Linux desktop/headless syslog delivery. Otherwise, move to `docs/plans/2026-05-23-derived-collector-transformation-engine.md` as the next composable capability layer.
 
 The v0.0.31+ Linux rerun and real-host VM/container correlation validation remain useful but deferred; do not block the daemon/history work on them.
 
@@ -326,12 +335,13 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 153 Node test cases after the history truncation diagnostics slice.
+- Current checked command: `npm test` passes 177 Node test cases after the opt-in notification delivery setup/test slice.
 - Current checked command: `git diff --check` passes after the compact history summary slice.
 - Current checked command: extracted `collector-smoke.mjs` snippets from both Linux validation briefs pass `node --check`.
 - Current checked command: two parallel Pi print-mode reviews completed with `PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi --no-session --tools read,grep,find,ls --model openai-codex/gpt-5.5 --thinking xhigh -p ...` and wrote reports under `docs/reviews/`.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current checked command: `npm run pack:dry-run` includes README, `docs/reference/collectors.md`, plus runtime `tools/descartes-cli/src` files (including `daemon.js`, `history-store.js`, `history.js`, `tools/network.js`, `tools/services.js`, `tools/logs.js`, `tools/containers.js`, `tools/vms.js`, `tools/scheduled-jobs.js`, `tools/time-sync.js`, `tools/certificates.js`, and the source-adjacent tools README) and excludes tests/local artifacts for v0.0.40.
+- Current check note: `npm run pack:dry-run` was attempted after the notification slice but local `npm pack --dry-run` hung and timed out before producing a manifest. Re-run before packaging/release. The package `files` list still includes README, `docs/reference`, and `tools/descartes-cli/src` so `notification-delivery.js` should be included with other runtime source files.
+- Current checked command: isolated-XDG `node tools/descartes-cli/src/index.js daemon run --foreground --once` followed by `descartes alerts list --json` writes/evaluates alert state successfully without using real user state.
 - Current checked command: `git push origin main` succeeded after v0.0.31 review-finding fixes; public GitHub `main` should now expose package version 0.0.31 for the next Linux validation rerun.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.
 - Current checked command: `npm install -g --prefix "$tmp" github:Lightless-Labs/descartes` installs from the public GitHub repo without cloning; installed `descartes --help` and `descartes --version` work.

@@ -44,6 +44,11 @@ test("CLI version and help are generated from current metadata/options", () => {
   assert.match(help, /daemon install\|start\|status\|stop\|uninstall \[--json\]/);
   assert.match(help, /daemon run --foreground/);
   assert.match(help, /history summary/);
+  assert.match(help, /alerts list/);
+  assert.match(help, /alerts watch/);
+  assert.match(help, /alerts ack/);
+  assert.match(help, /alerts intelligence status\|enable\|disable/);
+  assert.match(help, /alerts notifications status\|setup\|test\|disable/);
 });
 
 test("CLI entrypoint works when launched through an npm-style symlink", () => {

@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
+import { adjudicateAlertNotifications } from "./alert-intelligence.js";
+import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectProcessEvidence } from "./tools/processes.js";
@@ -59,6 +61,7 @@ export function metricPointsFromEvidence(evidence, options = {}) {
     pushFinite(points, metric({ ts, metric_name: "system.load.1m", value: load1, unit: "load_average", envelope: system }));
     pushFinite(points, metric({ ts, metric_name: "system.load.5m", value: load5, unit: "load_average", envelope: system }));
     pushFinite(points, metric({ ts, metric_name: "system.load.15m", value: load15, unit: "load_average", envelope: system }));
+    pushFinite(points, metric({ ts, metric_name: "system.cpu.count", value: result.cpu_count, unit: "count", envelope: system }));
     pushFinite(points, metric({ ts, metric_name: "system.memory.used_fraction", value: result.memory?.used_fraction, unit: "fraction", envelope: system }));
     pushFinite(points, metric({ ts, metric_name: "system.memory.free_bytes", value: result.memory?.free_bytes, unit: "bytes", envelope: system }));
     pushFinite(points, metric({ ts, metric_name: "system.swap.used_bytes", value: result.swap?.used_bytes, unit: "bytes", envelope: system }));
@@ -133,6 +136,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     now: options.now ?? ts,
   });
   const status = await writeDaemonStatus(descartesPaths, {
+    ts,
     state: "ok",
     mode: options.mode ?? "foreground",
     profile,
@@ -140,7 +144,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     points_written: write.written_count,
     retention: write.retention,
   });
-  return { evidence, points, write, status };
+  const alerts = options.evaluateAlerts === false
+    ? undefined
+    : await evaluateAndPersistAlerts(descartesPaths, { now: ts, daemonStatus: status, windowMs: options.alertWindowMs });
+  const alertIntelligence = alerts && options.adjudicateAlerts !== false
+    ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
+    : undefined;
+  return { evidence, points, write, status, alerts, alertIntelligence };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
@@ -445,7 +455,7 @@ function daemonUsage() {
   descartes daemon run --foreground [--once] [--interval <duration>]
 
 Install writes an idempotent user-level launchd/systemd service file. Start/stop load and unload it through the user service manager.
-The foreground daemon loop is read-only, performs no background LLM calls, and takes no host actions.`;
+The foreground daemon loop is read-only, performs background LLM calls only if alert intelligence is explicitly enabled, and takes no remediation actions.`;
 }
 
 function parseRunArgs(rest) {

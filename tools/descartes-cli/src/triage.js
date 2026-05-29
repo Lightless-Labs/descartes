@@ -1,4 +1,3 @@
-import { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } from "./pi-harness.js";
 import { buildHistorySummary, parseDurationMs, readDaemonStatus } from "./history-store.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { fallbackDiagnosis } from "./triage-fallback.js";
@@ -240,6 +239,7 @@ export async function runTriage(paths, args) {
   const historySummary = historySelection.summary;
   const historyBundle = historySelection.used && historySummary ? { evidence: [historyEnvelope(historySummary)], findings: [], actions_taken: [] } : undefined;
   let precollected = mergePrecollected(options.investigate ? undefined : await collectAllEvidence(), historyBundle);
+  const { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } = await import("./pi-harness.js");
   const { session, selectedModel, selectedThinkingLevel, activeToolNames } = await createPrivateTriageSession(paths, {
     modelPattern: options.modelPattern,
     thinkingLevel: options.thinkingLevel,
