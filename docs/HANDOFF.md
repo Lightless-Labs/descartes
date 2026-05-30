@@ -1,6 +1,6 @@
 # Descartes Handoff
 
-**Last updated:** 2026-05-29
+**Last updated:** 2026-05-30
 
 ## Current Status
 
@@ -172,10 +172,11 @@ Existing files:
 ## Start Here In A New Session
 
 1. Read `README.md`, `AGENTS.md`, and this handoff.
-2. Treat `docs/plans/2026-05-23-daemon-history-store.md` as the daemon/history substrate baseline and `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` as the current first-slice product baseline. The first `docs/plans/2026-05-28-monitoring-alerting.md` slice is complete through opt-in notifications.
-3. Do **not** jump directly to broad agent-authored signatures or unsafe background actions. The daemon/history substrate, deterministic alert layer, opt-in LLM adjudication, and opt-in notification delivery setup/test now exist for the Node.js prototype.
-4. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-5. Recommended next task: either perform real-host notification validation (macOS permission attribution, Linux desktop/headless syslog behavior) or move to the next planned substrate, `docs/plans/2026-05-23-derived-collector-transformation-engine.md`, if validation infrastructure is not available.
+2. Treat `docs/plans/2026-05-30-native-macos-notifications.md` and `todos/2026-05-30-native-macos-notifications.md` as the active implementation source of truth. The first `docs/plans/2026-05-28-monitoring-alerting.md` slice is complete through opt-in notifications; `docs/plans/2026-05-23-daemon-history-store.md` remains the daemon/history substrate baseline; `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` remains the first-slice product baseline.
+3. Do **not** make users build the native macOS helper. The native path must become a bundled release artifact; `--helper <path>` is only a development/advanced override.
+4. Do **not** jump directly to broad agent-authored signatures or unsafe background actions. The daemon/history substrate, deterministic alert layer, opt-in LLM adjudication, and opt-in notification delivery setup/test now exist for the Node.js prototype.
+5. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
+6. Recommended next task: package/sign the native macOS notification helper in a reproducible maintainer/release flow, then validate first-run permission attribution, Notification Center display name/icon, denied-permission behavior, and daemon-context delivery before making native delivery the default macOS desktop path.
 
 ## Current First Slice
 
@@ -316,7 +317,7 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: the first Node.js monitoring/alerting slice is complete through deterministic alerts, opt-in LLM adjudication, and opt-in notification delivery setup/test. If real hosts are available, validate macOS notification permission attribution and Linux desktop/headless syslog delivery. Otherwise, move to `docs/plans/2026-05-23-derived-collector-transformation-engine.md` as the next composable capability layer.
+Recommended next task: continue `docs/plans/2026-05-30-native-macos-notifications.md` / `todos/2026-05-30-native-macos-notifications.md` by adding maintainer/release packaging for the native macOS helper so users receive a bundled helper and never have to build it. Then validate first-run macOS permission attribution, Notification Center display name/icon, denied-permission behavior, and daemon-context delivery before making native delivery the default macOS desktop path.
 
 The v0.0.31+ Linux rerun and real-host VM/container correlation validation remain useful but deferred; do not block the daemon/history work on them.
 
