@@ -181,10 +181,12 @@ descartes alerts notifications status
 descartes alerts notifications setup --channel desktop   # macOS osascript or Linux notify-send when available
 descartes alerts notifications test                      # may trigger the platform permission prompt
 descartes alerts notifications setup --channel syslog    # headless/local log entry option
+# Experimental native macOS helper path; not the default until packaging/signing is validated:
+descartes alerts notifications setup --channel native --helper /path/to/DescartesNotifier
 descartes alerts notifications disable
 ```
 
-Platform caveat: a pure CLI may have desktop notification permission attributed to Terminal/osascript on macOS; Linux desktop notifications require a graphical session notification service.
+Platform caveat: a pure CLI may have desktop notification permission attributed to Terminal/osascript on macOS; Linux desktop notifications require a graphical session notification service. Experimental native macOS delivery requires a separately built/configured helper and still needs real-host validation before becoming the default.
 
 This daemon lifecycle is new and still needs broader real-host validation across launchd/systemd variants.
 

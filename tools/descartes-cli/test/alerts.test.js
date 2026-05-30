@@ -148,6 +148,13 @@ test("alerts notification setup status test and disable are explicit", async () 
   assert.equal(testOutputs[0].delivery.status, "delivered");
   assert.equal(calls[0][0], "notify-send");
 
+  const nativeOutputs = [];
+  await runAlerts(paths, ["notifications", "setup", "--json", "--channel", "native", "--helper", "/opt/descartes/DescartesNotifier"], {
+    output: (line) => nativeOutputs.push(JSON.parse(line)),
+  });
+  assert.equal(nativeOutputs[0].notifications.channel, "macos-native");
+  assert.equal(nativeOutputs[0].notifications.macos_native_helper_path, "/opt/descartes/DescartesNotifier");
+
   const disableOutputs = [];
   await runAlerts(paths, ["notifications", "disable", "--json"], { output: (line) => disableOutputs.push(JSON.parse(line)) });
   assert.equal(disableOutputs[0].notifications.enabled, false);

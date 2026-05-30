@@ -1,6 +1,6 @@
 {
   "name": "@lightless-labs/descartes",
-  "version": "0.0.43",
+  "version": "0.0.44",
   "description": "LLM-backed local operations triage CLI for Descartes",
   "type": "module",
   "bin": {
@@ -21,7 +21,8 @@
   "files": [
     "README.md",
     "docs/reference",
-    "tools/descartes-cli/src"
+    "tools/descartes-cli/src",
+    "tools/descartes-cli/native"
   ],
   "license": "UNLICENSED",
   "repository": {

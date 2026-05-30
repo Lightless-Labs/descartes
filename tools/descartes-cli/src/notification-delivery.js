@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export const NOTIFICATION_CHANNELS = new Set(["cli", "macos-desktop", "linux-desktop", "syslog"]);
+export const NOTIFICATION_CHANNELS = new Set(["cli", "macos-desktop", "macos-native", "linux-desktop", "syslog"]);
 
 export function resolveNotificationDeliveryPaths(descartesPaths) {
   return {
@@ -38,9 +38,11 @@ export function defaultNotificationChannel(platform = process.platform, env = pr
 
 export function normalizeNotificationDeliveryConfig(config = {}) {
   const channel = String(config.channel ?? "cli");
+  const helperPath = config.macos_native_helper_path ? String(config.macos_native_helper_path).trim() : undefined;
   return {
     enabled: config.enabled === true,
     channel: NOTIFICATION_CHANNELS.has(channel) ? channel : "cli",
+    macos_native_helper_path: helperPath || undefined,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
   };
 }
@@ -80,10 +82,34 @@ function appleScriptString(value) {
   return `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
 }
 
+function nativeMacosHelperPath(options = {}) {
+  const env = options.env ?? process.env;
+  return options.macosNativeHelperPath ?? options.config?.macos_native_helper_path ?? env.DESCARTES_MACOS_NOTIFICATION_HELPER;
+}
+
 function commandForPayload(channel, payload, options = {}) {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
   if (channel === "cli") return undefined;
+  if (channel === "macos-native") {
+    if (platform !== "darwin" && !options.allowPlatformMismatch) {
+      return { unavailable: "Native macOS notifications require macOS" };
+    }
+    const helperPath = nativeMacosHelperPath(options);
+    if (!helperPath) {
+      return { unavailable: "Native macOS notification helper is not configured" };
+    }
+    return {
+      command: helperPath,
+      args: [
+        "--title", payload.title,
+        "--body", payload.body,
+        "--severity", payload.severity,
+        "--alert-id", payload.alert_id ?? "",
+        "--rule-id", payload.rule_id ?? "",
+      ],
+    };
+  }
   if (channel === "macos-desktop") {
     if (platform !== "darwin" && !options.allowPlatformMismatch) {
       return { unavailable: "macOS desktop notifications require macOS" };
@@ -155,7 +181,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
   if (!config.enabled) {
     return appendDeliveryAudit(descartesPaths, { ts: now, status: "disabled", channel: config.channel, payload });
   }
-  const commandSpec = commandForPayload(config.channel, payload, options);
+  const commandSpec = commandForPayload(config.channel, payload, { ...options, config });
   if (!commandSpec) {
     return appendDeliveryAudit(descartesPaths, { ts: now, status: "cli_only", channel: config.channel, payload });
   }
@@ -185,6 +211,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
 }
 
 export function notificationPlatformNotes(channel) {
+  if (channel === "macos-native") return "Native macOS delivery requires a configured Descartes notification helper; keep osascript as fallback until signed packaging is validated.";
   if (channel === "macos-desktop") return "macOS may attribute CLI notifications to Terminal, your shell, or osascript rather than a branded Descartes app.";
   if (channel === "linux-desktop") return "Linux desktop notifications require a graphical session notification service; headless systems should use syslog.";
   if (channel === "syslog") return "Syslog delivery writes a bounded local log entry through logger; configure external forwarding separately if desired.";

@@ -22,7 +22,7 @@ function alertsUsage() {
   descartes alerts intelligence enable [--json] [--model <MODEL>] [--thinking <LEVEL>] [--max-per-hour <N>]
   descartes alerts intelligence disable [--json]
   descartes alerts notifications status [--json]
-  descartes alerts notifications setup [--json] [--channel cli|desktop|macos|linux|syslog]
+  descartes alerts notifications setup [--json] [--channel cli|desktop|macos|native|linux|syslog] [--helper <PATH>]
   descartes alerts notifications test [--json]
   descartes alerts notifications disable [--json]
 
@@ -74,6 +74,11 @@ function parseAlertsArgs(args) {
       if (!value) throw new Error("--channel requires a value");
       options.notificationChannel = value;
       index += 1;
+    } else if (arg === "--helper") {
+      const value = rest[index + 1];
+      if (!value) throw new Error("--helper requires a value");
+      options.notificationHelper = value;
+      index += 1;
     } else if (arg === "--help" || arg === "-h") {
       options.help = true;
     } else if (subcommand === "ack" && !options.alertId) {
@@ -86,8 +91,8 @@ function parseAlertsArgs(args) {
   if (subcommand !== "watch" && options.once) throw new Error(`--once is only supported for alerts watch\n\n${alertsUsage()}`);
   if (subcommand !== "intelligence" && (options.modelPattern || options.thinkingLevel || options.maxCallsPerHour !== undefined)) throw new Error(`Alert intelligence options require 'descartes alerts intelligence enable'\n\n${alertsUsage()}`);
   if (subcommand === "intelligence" && options.intelligenceCommand !== "enable" && (options.modelPattern || options.thinkingLevel || options.maxCallsPerHour !== undefined)) throw new Error(`Alert intelligence model/rate options are only supported with enable\n\n${alertsUsage()}`);
-  if (subcommand !== "notifications" && options.notificationChannel) throw new Error(`Notification channel options require 'descartes alerts notifications setup'\n\n${alertsUsage()}`);
-  if (subcommand === "notifications" && options.notificationsCommand !== "setup" && options.notificationChannel) throw new Error(`Notification channel options are only supported with setup\n\n${alertsUsage()}`);
+  if (subcommand !== "notifications" && (options.notificationChannel || options.notificationHelper)) throw new Error(`Notification options require 'descartes alerts notifications setup'\n\n${alertsUsage()}`);
+  if (subcommand === "notifications" && options.notificationsCommand !== "setup" && (options.notificationChannel || options.notificationHelper)) throw new Error(`Notification setup options are only supported with setup\n\n${alertsUsage()}`);
   if (!Number.isFinite(options.intervalMs) || options.intervalMs < 1000) throw new Error("Alert watch interval must be at least 1s");
   return options;
 }
@@ -139,6 +144,7 @@ function expandNotificationChannel(channel, runtime = {}) {
   const normalized = String(channel ?? "desktop").toLowerCase();
   if (normalized === "desktop") return defaultNotificationChannel(runtime.platform, runtime.env);
   if (normalized === "macos") return "macos-desktop";
+  if (normalized === "native") return "macos-native";
   if (normalized === "linux") return "linux-desktop";
   return normalized;
 }
@@ -146,6 +152,7 @@ function expandNotificationChannel(channel, runtime = {}) {
 function renderNotificationDeliveryStatus(config) {
   const lines = [`Notification delivery: ${config.enabled ? "enabled" : "disabled"}`];
   lines.push(`Channel: ${config.channel}`);
+  if (config.macos_native_helper_path) lines.push(`Native macOS helper: ${config.macos_native_helper_path}`);
   lines.push(notificationPlatformNotes(config.channel));
   if (config.enabled) lines.push("Notifications deliver bounded LLM alert decisions only; no raw alert dumps or remediation actions are sent.");
   else lines.push("Run `descartes alerts notifications setup` and then `descartes alerts notifications test` to opt in and trigger any platform permission prompt.");
@@ -189,6 +196,7 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
       config = await writeNotificationDeliveryConfig(descartesPaths, {
         enabled: true,
         channel: expandNotificationChannel(options.notificationChannel, runtime),
+        macos_native_helper_path: options.notificationHelper ?? existing.macos_native_helper_path,
       });
     } else if (options.notificationsCommand === "disable") {
       config = await writeNotificationDeliveryConfig(descartesPaths, { ...existing, enabled: false });

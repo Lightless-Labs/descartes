@@ -4,6 +4,8 @@
 
 ## Current Status
 
+Current session update: pushed `2b9c5cd` to `origin/main`, then started native macOS notification work and bumped package metadata to v0.0.44. Created `docs/plans/2026-05-30-native-macos-notifications.md` and `todos/2026-05-30-native-macos-notifications.md`. Added `macos-native` notification channel support with `descartes alerts notifications setup --channel native --helper <path>`, config persistence for the helper path, fixed-argument helper execution, fail-closed unavailable audit when the helper is missing/non-macOS, and a checked-in Swift `UserNotifications` helper prototype at `tools/descartes-cli/native/macos/DescartesNotifier.swift`. Native delivery is not the default; real-host packaging/signing/permission validation remains follow-up. Targeted tests pass for alerts/notification/package metadata.
+
 Current session update: implemented opt-in notification delivery setup/test UX and bumped package metadata to v0.0.43. Added `notification-delivery.js` with config under Descartes XDG config, local JSONL delivery audit under XDG state, bounded payload normalization, macOS desktop (`osascript`), Linux desktop (`notify-send`), syslog (`logger`), and CLI-only delivery modes. Added `descartes alerts notifications status|setup|test|disable` CLI. Alert-intelligence decisions now attempt delivery only when the LLM returned `notify: true` and notification delivery has been explicitly enabled. Tests cover disabled-by-default behavior, fixed-command adapter invocation via injected runners, CLI setup/test/disable, and local delivery audit. `npm test` passes 177 Node test cases.
 
 Current session update: implemented opt-in alert intelligence and bumped package metadata to v0.0.42. Added `alert-intelligence.js` with config under Descartes XDG config, local JSONL decision audit under XDG state, bounded LLM notification decision schema, max wakeups/hour rate limiting, and daemon integration that only wakes the LLM when alert intelligence is explicitly enabled and deterministic alert transitions are due. Added `descartes alerts intelligence status|enable|disable` CLI. Added a no-tool private alert session/system prompt in `pi-harness.js`. Tests now cover disabled-by-default behavior, fake LLM adjudication, audit records, rate limiting, and CLI config.
@@ -143,6 +145,7 @@ Existing files:
 - `docs/plans/2026-05-21-vm-container-resource-correlation.md` — in-progress follow-on plan for VM/container resource correlation; first VM process-hint correlation slice is implemented.
 - `docs/plans/2026-05-23-daemon-history-store.md` — active substrate plan for installing/running a local background daemon and bounded local history/metric store; mostly complete for the Node.js prototype.
 - `docs/plans/2026-05-28-monitoring-alerting.md` — completed first Node.js monitoring/alerting slice over daemon history: deterministic alerts, opt-in LLM adjudication, and opt-in notification setup/test/delivery audit.
+- `docs/plans/2026-05-30-native-macos-notifications.md` — in-progress native macOS notification helper plan; initial configured-helper adapter and Swift source prototype exist, real-host packaging/signing validation remains.
 - `docs/plans/2026-05-23-derived-collector-transformation-engine.md` — follow-on plan for agent-authored pure map/reduce/window derived collectors over stored data without arbitrary code/host execution.
 - `docs/plans/2026-05-23-agent-authored-sensor-toolkit.md` — proposed follow-on plan for a fact/rule/statistical-model workbench that lets background LLM agents author deterministic sensors/tools instead of humans hand-writing every signature.
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
@@ -156,6 +159,7 @@ Existing files:
   - `2026-05-19-linux-ci-validation.md` — v0.0.31+ Linux rerun is deferred; public v0.0.30 direct collector/package validation passed on Linux ARM64 and x86_64.
   - `2026-05-23-daemon-history-store.md` — active task, mostly complete for the Node.js prototype: foreground loop, JSONL history, idempotent daemon lifecycle commands, compact history summaries, auto history-aware triage, truncation diagnostics, and macOS personal/work-laptop validation exist. Linux systemd-user validation and longer rollups/configurable retention remain follow-up.
   - `2026-05-28-monitoring-alerting.md` — completed first Node.js monitoring/alerting slice over daemon history. Alert state, dedupe/cooldown, daemon evaluation, CLI `alerts` commands, opt-in alert intelligence, and opt-in notification setup/test/delivery audit are implemented.
+  - `2026-05-30-native-macos-notifications.md` — active follow-up: initial native macOS configured-helper adapter and Swift source prototype are implemented; compile/sign/package and real-host permission/display validation remain.
   - `2026-05-23-derived-collector-transformation-engine.md` — follow-on: let agents author pure bounded map/reduce/window transformations over daemon history as derived collectors/sensors.
   - `2026-05-23-agent-authored-sensor-toolkit.md` — follow-on: build the fact/rule/metric-history/statistical-model substrate that lets background LLM agents author deterministic sensors/tools.
   - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
@@ -335,12 +339,14 @@ Do not implement that broader artifact lifecycle before the first LLM-backed loc
 ## Repository Notes
 
 - This directory is now a git repository; `git status --short` works.
-- Current checked command: `npm test` passes 177 Node test cases after the opt-in notification delivery setup/test slice.
+- Current checked command: targeted native notification slice tests pass with `node --test tools/descartes-cli/test/notification-delivery.test.js tools/descartes-cli/test/alerts.test.js tools/descartes-cli/test/package-metadata.test.js`.
+- Current checked command: `npm test` passes 179 Node test cases after the initial native macOS notification configured-helper slice.
+- Current checked command: `swiftc -parse tools/descartes-cli/native/macos/DescartesNotifier.swift` succeeds on local macOS.
 - Current checked command: `git diff --check` passes after the compact history summary slice.
 - Current checked command: extracted `collector-smoke.mjs` snippets from both Linux validation briefs pass `node --check`.
 - Current checked command: two parallel Pi print-mode reviews completed with `PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi --no-session --tools read,grep,find,ls --model openai-codex/gpt-5.5 --thinking xhigh -p ...` and wrote reports under `docs/reviews/`.
 - Current checked command: direct local `collectProcessEvidence({ limit: 3 })` returns ok on macOS with `ps -axo ...`.
-- Current check note: `npm run pack:dry-run` was attempted after the notification slice but local `npm pack --dry-run` hung and timed out before producing a manifest. Re-run before packaging/release. The package `files` list still includes README, `docs/reference`, and `tools/descartes-cli/src` so `notification-delivery.js` should be included with other runtime source files.
+- Current checked command: `npm pack --dry-run --json` succeeds for v0.0.44 and includes README, `docs/reference/collectors.md`, runtime `tools/descartes-cli/src` files, and `tools/descartes-cli/native/macos/DescartesNotifier.swift`; tests/local artifacts are excluded.
 - Current checked command: isolated-XDG `node tools/descartes-cli/src/index.js daemon run --foreground --once` followed by `descartes alerts list --json` writes/evaluates alert state successfully without using real user state.
 - Current checked command: `git push origin main` succeeded after v0.0.31 review-finding fixes; public GitHub `main` should now expose package version 0.0.31 for the next Linux validation rerun.
 - Current checked command: local tarball install via `npm pack --pack-destination "$tmp"` + `npm install -g --prefix "$tmp/prefix" "$pkg"` works; installed `descartes --help` and `descartes --version` work.

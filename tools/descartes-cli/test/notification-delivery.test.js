@@ -28,7 +28,7 @@ async function tempPaths() {
 
 test("notification delivery config is disabled by default and persists under Descartes config", async () => {
   const paths = await tempPaths();
-  assert.deepEqual(await readNotificationDeliveryConfig(paths), { enabled: false, channel: "cli", updated_at: undefined });
+  assert.deepEqual(await readNotificationDeliveryConfig(paths), { enabled: false, channel: "cli", macos_native_helper_path: undefined, updated_at: undefined });
 
   const written = await writeNotificationDeliveryConfig(paths, { enabled: true, channel: "syslog" }, { now: "2026-05-29T00:00:00.000Z" });
   assert.equal(written.enabled, true);
@@ -100,4 +100,42 @@ test("notification test helper delivers bounded configured test payload", async 
   assert.equal(record.status, "delivered");
   assert.deepEqual(calls[0].slice(0, 3), ["logger", "-t", "descartes"]);
   assert.equal(record.payload.alert_id, "test");
+});
+
+test("native macOS delivery fails closed when helper is not configured", async () => {
+  const paths = await tempPaths();
+  const record = await deliverNotificationDecision(paths, { notify: true, title: "Alert", body: "Body" }, {
+    config: { enabled: true, channel: "macos-native" },
+    platform: "darwin",
+    now: "2026-05-29T00:03:00.000Z",
+  });
+  assert.equal(record.status, "unavailable");
+  assert.match(record.reason, /helper is not configured/);
+});
+
+test("native macOS delivery uses configured helper with fixed bounded arguments", async () => {
+  const paths = await tempPaths();
+  const calls = [];
+  const record = await deliverNotificationDecision(paths, {
+    notify: true,
+    severity: "critical",
+    title: "CPU alert",
+    body: "Load is high.",
+  }, {
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: "/opt/descartes/DescartesNotifier" },
+    alertId: "alert_cpu",
+    ruleId: "system.load.sustained_high",
+    platform: "darwin",
+    now: "2026-05-29T00:04:00.000Z",
+    runner: async (command, args) => calls.push([command, ...args]),
+  });
+  assert.equal(record.status, "delivered");
+  assert.equal(calls[0][0], "/opt/descartes/DescartesNotifier");
+  assert.deepEqual(calls[0].slice(1), [
+    "--title", "CPU alert",
+    "--body", "Load is high.",
+    "--severity", "critical",
+    "--alert-id", "alert_cpu",
+    "--rule-id", "system.load.sustained_high",
+  ]);
 });

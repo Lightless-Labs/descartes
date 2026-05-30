@@ -45,7 +45,7 @@ Usage:
   descartes alerts watch [--json] [--interval <duration>] [--once] [--all]
   descartes alerts ack <alert-id> [--json]
   descartes alerts intelligence status|enable|disable [--json]
-  descartes alerts notifications status|setup|test|disable [--json]
+  descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;

@@ -27,6 +27,8 @@ test("published package includes runtime files but not tests", () => {
   assert(rootPackage.files.includes("README.md"));
   assert(rootPackage.files.includes("docs/reference"));
   assert(rootPackage.files.includes("tools/descartes-cli/src"));
+  assert(rootPackage.files.includes("tools/descartes-cli/native"));
+  assert(nestedPackage.files.includes("native"));
   assert(!rootPackage.files.includes("tools/descartes-cli/test"));
 });
 
@@ -49,6 +51,7 @@ test("CLI version and help are generated from current metadata/options", () => {
   assert.match(help, /alerts ack/);
   assert.match(help, /alerts intelligence status\|enable\|disable/);
   assert.match(help, /alerts notifications status\|setup\|test\|disable/);
+  assert.match(help, /--channel cli\|desktop\|macos\|native\|linux\|syslog/);
 });
 
 test("CLI entrypoint works when launched through an npm-style symlink", () => {
