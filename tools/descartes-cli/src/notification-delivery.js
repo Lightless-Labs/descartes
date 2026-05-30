@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -82,9 +84,30 @@ function appleScriptString(value) {
   return `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
 }
 
+function isExecutableFile(candidate) {
+  try {
+    fsSync.accessSync(candidate, fsSync.constants.X_OK);
+    return fsSync.statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function resolveBundledMacosHelperPath(options = {}) {
+  const baseDir = options.nativeHelperBaseDir ?? path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(baseDir, "../native/macos/DescartesNotifier.app/Contents/MacOS/DescartesNotifier"),
+    path.resolve(baseDir, "../native/macos/DescartesNotifier"),
+  ];
+  return candidates.find(isExecutableFile);
+}
+
 function nativeMacosHelperPath(options = {}) {
   const env = options.env ?? process.env;
-  return options.macosNativeHelperPath ?? options.config?.macos_native_helper_path ?? env.DESCARTES_MACOS_NOTIFICATION_HELPER;
+  return options.macosNativeHelperPath
+    ?? options.config?.macos_native_helper_path
+    ?? env.DESCARTES_MACOS_NOTIFICATION_HELPER
+    ?? resolveBundledMacosHelperPath(options);
 }
 
 function commandForPayload(channel, payload, options = {}) {
@@ -97,7 +120,7 @@ function commandForPayload(channel, payload, options = {}) {
     }
     const helperPath = nativeMacosHelperPath(options);
     if (!helperPath) {
-      return { unavailable: "Native macOS notification helper is not configured" };
+      return { unavailable: "Native macOS notification helper is not packaged or configured" };
     }
     return {
       command: helperPath,
@@ -211,7 +234,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
 }
 
 export function notificationPlatformNotes(channel) {
-  if (channel === "macos-native") return "Native macOS delivery requires a configured Descartes notification helper; keep osascript as fallback until signed packaging is validated.";
+  if (channel === "macos-native") return "Native macOS delivery uses the bundled signed Descartes notification helper when available; --helper is for development or advanced overrides only.";
   if (channel === "macos-desktop") return "macOS may attribute CLI notifications to Terminal, your shell, or osascript rather than a branded Descartes app.";
   if (channel === "linux-desktop") return "Linux desktop notifications require a graphical session notification service; headless systems should use syslog.";
   if (channel === "syslog") return "Syslog delivery writes a bounded local log entry through logger; configure external forwarding separately if desired.";

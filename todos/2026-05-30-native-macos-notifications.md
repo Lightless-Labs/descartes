@@ -15,12 +15,13 @@ related:
 
 ## Summary
 
-Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. The first slice should be safe and incremental: support a configured helper path and checked-in Swift helper source, but do not make native notifications the default until packaging/signing and real-host behavior are validated.
+Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. Users must not have to build the helper. The product path is a bundled, release-built helper; the configured helper path is only a development/advanced override until packaging/signing and real-host behavior are validated.
 
 ## Scope
 
 - Add `macos-native` notification channel plus a CLI-friendly `native` alias.
-- Persist an optional native helper path in Descartes notification config.
+- Resolve a bundled native helper automatically when present.
+- Persist an optional native helper path in Descartes notification config for development/advanced overrides only.
 - Execute the helper using fixed arguments only.
 - Pass only bounded notification text and alert metadata.
 - Add a Swift `UserNotifications` helper prototype source file.
@@ -30,7 +31,7 @@ Add an explicit native macOS notification path so Descartes is not limited to th
 
 - [x] Create dedicated plan and todo.
 - [x] Add notification config support for native helper path.
-- [x] Add CLI setup UX for native helper path.
+- [x] Add CLI setup UX for native helper path as a development/advanced override.
 - [x] Add native adapter fixed-command execution and fail-closed audit behavior.
 - [x] Add Swift helper source prototype.
 - [x] Add tests for native setup, missing helper, and fixed command invocation.
@@ -38,7 +39,7 @@ Add an explicit native macOS notification path so Descartes is not limited to th
 
 ## Follow-up
 
-- [ ] Compile/sign/package the helper in a reproducible release flow.
+- [ ] Compile/sign/package the helper in a reproducible release flow so users receive a bundled helper and never have to build it.
 - [ ] Validate first-run macOS permission prompt attribution on real hosts.
 - [ ] Validate Notification Center display name/icon and denied-permission behavior.
 - [ ] Validate daemon-context delivery behavior before making native delivery the default macOS desktop path.

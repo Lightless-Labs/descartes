@@ -11,6 +11,7 @@ import {
   readNotificationDeliveryConfig,
   resolveNotificationDeliveryPaths,
   testNotificationDelivery,
+  resolveBundledMacosHelperPath,
   writeNotificationDeliveryConfig,
 } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -102,15 +103,26 @@ test("notification test helper delivers bounded configured test payload", async 
   assert.equal(record.payload.alert_id, "test");
 });
 
-test("native macOS delivery fails closed when helper is not configured", async () => {
+test("native macOS delivery fails closed when helper is not packaged or configured", async () => {
   const paths = await tempPaths();
   const record = await deliverNotificationDecision(paths, { notify: true, title: "Alert", body: "Body" }, {
     config: { enabled: true, channel: "macos-native" },
     platform: "darwin",
+    nativeHelperBaseDir: paths.cacheDir,
     now: "2026-05-29T00:03:00.000Z",
   });
   assert.equal(record.status, "unavailable");
-  assert.match(record.reason, /helper is not configured/);
+  assert.match(record.reason, /helper is not packaged or configured/);
+});
+
+test("native macOS helper resolution prefers a bundled executable", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-native-helper-test-"));
+  const srcDir = path.join(root, "src");
+  const helper = path.join(root, "native", "macos", "DescartesNotifier");
+  await fs.mkdir(path.dirname(helper), { recursive: true });
+  await fs.mkdir(srcDir, { recursive: true });
+  await fs.writeFile(helper, "#!/bin/sh\n", { mode: 0o755 });
+  assert.equal(resolveBundledMacosHelperPath({ nativeHelperBaseDir: srcDir }), helper);
 });
 
 test("native macOS delivery uses configured helper with fixed bounded arguments", async () => {
