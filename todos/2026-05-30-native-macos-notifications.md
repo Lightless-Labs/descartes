@@ -15,7 +15,7 @@ related:
 
 ## Summary
 
-Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. Users must not have to build the helper. The product path is a bundled, release-built helper; the configured helper path is only a development/advanced override until packaging/signing and real-host behavior are validated.
+Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. Users must not have to build the helper. The product path is a release-built helper delivered only through macOS-specific packaging or an explicit macOS setup/download flow; the configured helper path is only a development/advanced override until packaging/signing/notarization and real-host behavior are validated. Do not put a macOS `.app` payload in Linux/cross-platform installs.
 
 ## Scope
 
@@ -25,6 +25,8 @@ Add an explicit native macOS notification path so Descartes is not limited to th
 - Execute the helper using fixed arguments only.
 - Pass only bounded notification text and alert metadata.
 - Add a Swift `UserNotifications` helper prototype source file.
+- Use bundle identifier `com.bande-a-bonnot.lightless-labs.descartes.macos.notifier` for the native notifier bundle.
+- Keep the notarized `.app` out of the cross-platform npm package; use macOS-specific release/Homebrew/setup delivery.
 - Keep local delivery audit for delivered/error/unavailable outcomes.
 
 ## Acceptance Criteria
@@ -39,7 +41,10 @@ Add an explicit native macOS notification path so Descartes is not limited to th
 
 ## Follow-up
 
-- [ ] Compile/sign/package the helper in a reproducible release flow so users receive a bundled helper and never have to build it.
+- [x] Add maintainer-only scripts to compile an app bundle, sign/notarize/staple/verify it, and keep generated artifacts out of git/package output.
+- [x] Exclude native macOS helper sources/artifacts from the cross-platform npm package metadata so Linux installs do not carry the `.app`.
+- [ ] Wire real release credentials/CI or maintainer release process for signing/notarization.
+- [ ] Verify the release artifact passes Gatekeeper/notarization checks on a clean macOS host.
 - [ ] Validate first-run macOS permission prompt attribution on real hosts.
 - [ ] Validate Notification Center display name/icon and denied-permission behavior.
 - [ ] Validate daemon-context delivery behavior before making native delivery the default macOS desktop path.

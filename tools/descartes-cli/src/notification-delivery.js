@@ -234,7 +234,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
 }
 
 export function notificationPlatformNotes(channel) {
-  if (channel === "macos-native") return "Native macOS delivery uses the bundled signed Descartes notification helper when available; --helper is for development or advanced overrides only.";
+  if (channel === "macos-native") return "Native macOS delivery uses a signed/notarized Descartes notification helper when installed by macOS-specific packaging; --helper is for development or advanced overrides only.";
   if (channel === "macos-desktop") return "macOS may attribute CLI notifications to Terminal, your shell, or osascript rather than a branded Descartes app.";
   if (channel === "linux-desktop") return "Linux desktop notifications require a graphical session notification service; headless systems should use syslog.";
   if (channel === "syslog") return "Syslog delivery writes a bounded local log entry through logger; configure external forwarding separately if desired.";

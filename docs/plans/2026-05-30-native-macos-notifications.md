@@ -3,7 +3,11 @@
 **Created:** 2026-05-30
 **Status:** In Progress
 **Updated:** 2026-05-30 — initial native channel/config/adapter and Swift helper prototype implemented; real-host packaging/signing validation remains.
+**Updated:** 2026-05-30 — added maintainer-only `.app` bundle build/notarization scripts and excluded native macOS payloads from cross-platform npm packaging.
 **Addendum:** 2026-05-30 — users must not build the helper. Native delivery should use a bundled, release-built helper; `--helper` is only a development/advanced override.
+**Addendum:** 2026-05-30 — release packaging must include macOS Developer ID signing and notarization, not signing alone, so downloaded helpers pass Gatekeeper and behave predictably for end users.
+**Addendum:** 2026-05-30 — native notifier bundle identifier is `com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
+**Addendum:** 2026-05-30 — do not pollute Linux/cross-platform installs with a macOS `.app`; the notarized helper should be delivered only through macOS-specific packaging or an explicit macOS setup/download flow.
 
 ## Purpose
 
@@ -14,12 +18,13 @@ The current `osascript` path is acceptable as a conservative fallback, but permi
 ## Safety Boundaries
 
 - Notification delivery remains disabled by default.
-- Native delivery must be explicitly selected/configured by the user until the bundled helper is validated enough to become the macOS default.
+- Native delivery must be explicitly selected/configured by the user until the macOS-specific signed/notarized helper is validated enough to become the macOS default.
 - The helper receives only bounded notification payloads: title, body, severity, alert id, and rule id.
 - No raw logs, process dumps, history dumps, credentials, or arbitrary evidence blobs are passed to the helper.
 - No remediation/action authority.
-- No arbitrary shell execution; the Node adapter may execute only the bundled helper path, or an explicit development override, with fixed arguments.
-- Missing helper, permission denial, or platform errors must fail closed and produce local delivery audit records.
+- No arbitrary shell execution; the Node adapter may execute only an installed macOS helper path, a macOS-specific packaged helper path, or an explicit development override, with fixed arguments.
+- Cross-platform/Linux packages must not include a macOS `.app` payload.
+- Missing helper, permission denial, Gatekeeper/notarization failures, or platform errors must fail closed and produce local delivery audit records.
 
 ## Initial Implementation Slice
 
@@ -33,9 +38,12 @@ The current `osascript` path is acceptable as a conservative fallback, but permi
 
 ## Future Packaging Work
 
-- Decide packaging shape: signed helper app bundle, signed command-line helper, or LaunchServices-registered notification app.
-- Determine bundle identifier and display name behavior for Notification Center.
+- Decide packaging shape: signed and notarized helper app bundle, signed and notarized command-line helper, or LaunchServices-registered notification app.
+- Use bundle identifier `com.bande-a-bonnot.lightless-labs.descartes.macos.notifier` and determine display name/icon behavior for Notification Center.
 - Add repeatable build/release packaging without hidden local build steps; this is for maintainers/CI, not users.
+  - Current maintainer scripts: `scripts/build-macos-notifier.sh` creates `.build/macos-notifier/DescartesNotifier.app`; `scripts/notarize-macos-notifier.sh` signs, submits with `notarytool`, staples, and verifies.
+- Keep the signed/notarized `.app` out of the cross-platform npm payload; deliver it via macOS-specific release asset, future Homebrew formula/cask packaging, or an explicit macOS-only setup/download/install flow.
+- Add Developer ID signing, hardened runtime where applicable, `notarytool` submission, notarization polling, and stapling/verification to the maintainer release flow.
 - Validate on real macOS hosts:
   - first-run permission prompt attribution;
   - Notification Center display name/icon;
@@ -50,4 +58,7 @@ The current `osascript` path is acceptable as a conservative fallback, but permi
 - [x] Missing helper or non-macOS host fails closed with local audit, not daemon failure/spam.
 - [x] Swift helper source prototype exists and accepts bounded fixed arguments.
 - [x] Tests cover config normalization, CLI setup, missing-helper audit, and fixed native command invocation.
+- [x] Maintainer-only scripts exist to build an app bundle, sign/notarize/staple/verify it, and keep generated artifacts under ignored build output.
+- [x] Cross-platform npm package metadata excludes `tools/descartes-cli/native` so Linux installs do not carry a macOS `.app` payload.
+- [ ] Release credentials/CI flow signs and notarizes the helper, and verifies the notarized artifact before publication.
 - [ ] Real-host macOS validation is documented before making native delivery the default macOS desktop channel.
