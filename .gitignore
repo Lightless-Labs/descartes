@@ -13,5 +13,9 @@ node_modules/
 /tools/descartes-cli/node_modules/
 /tools/descartes-cli/package-lock.json
 
+# Local build/release output
+.build/
+dist/
+
 # Editor / OS noise
 .DS_Store

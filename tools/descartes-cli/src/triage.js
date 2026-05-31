@@ -1,5 +1,4 @@
-import { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } from "./pi-harness.js";
-import { buildHistorySummary, parseDurationMs } from "./history-store.js";
+import { buildHistorySummary, parseDurationMs, readDaemonStatus } from "./history-store.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { fallbackDiagnosis } from "./triage-fallback.js";
 import { assistantErrorFromMessages, assistantStopReasonFromMessages, createToolCallRecorder, modelDiagnostic } from "./triage-diagnostics.js";
@@ -15,23 +14,92 @@ import {
 } from "./triage-guard.js";
 
 export function parseTriageArgs(args) {
-  const options = { json: false, investigate: true, useHistory: false, historyWindow: "24h" };
+  const options = { json: false, investigate: true, historyMode: "auto", historyWindow: "24h" };
+  let forcedHistorySeen = false;
+  let disabledHistorySeen = false;
   const promptParts = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--json") options.json = true;
     else if (arg === "--no-investigate") options.investigate = false;
-    else if (arg === "--use-history") options.useHistory = true;
-    else if (arg === "--history-window") options.historyWindow = args[++i];
-    else if (arg === "--model") options.modelPattern = args[++i];
+    else if (arg === "--use-history") {
+      forcedHistorySeen = true;
+      options.historyMode = "forced";
+    } else if (arg === "--no-history") {
+      disabledHistorySeen = true;
+      options.historyMode = "disabled";
+    } else if (arg === "--history-window") {
+      const value = args[++i];
+      if (!value) throw new Error("--history-window requires a value");
+      options.historyWindow = value;
+    } else if (arg === "--model") options.modelPattern = args[++i];
     else if (arg === "--thinking") options.thinkingLevel = args[++i];
     else if (arg.startsWith("-")) throw new Error(`Unknown triage argument: ${arg}`);
     else promptParts.push(arg);
   }
+  if (forcedHistorySeen && disabledHistorySeen) throw new Error("Use either --use-history or --no-history, not both");
   const prompt = promptParts.join(" ").trim();
-  if (!prompt) throw new Error("Usage: descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate] [--use-history] [--history-window <DURATION>]");
-  if (options.useHistory) parseDurationMs(options.historyWindow);
-  return { ...options, prompt };
+  if (!prompt) throw new Error("Usage: descartes triage <PROMPT> [--json] [--model <MODEL>] [--thinking <LEVEL>] [--no-investigate] [--use-history|--no-history] [--history-window <DURATION>]");
+  parseDurationMs(options.historyWindow);
+  return { ...options, useHistory: options.historyMode === "forced", prompt };
+}
+
+const DEFAULT_AUTO_HISTORY_MAX_AGE_MS = 5 * 60 * 1000;
+
+function historyNewestMetricMs(summary) {
+  const timestamps = (summary?.metrics ?? [])
+    .map((metric) => new Date(metric.last_ts).getTime())
+    .filter(Number.isFinite);
+  if (timestamps.length === 0) return undefined;
+  return Math.max(...timestamps);
+}
+
+export function evaluateHistorySelection({ mode = "auto", summary, daemonStatus, now = new Date() } = {}) {
+  if (mode === "disabled") return { used: false, mode, skip_reason: "disabled" };
+  const newestMetricMs = historyNewestMetricMs(summary);
+  const nowMs = new Date(now).getTime();
+  const intervalMs = Number(daemonStatus?.profile?.interval_ms);
+  const maxAgeMs = Math.max(DEFAULT_AUTO_HISTORY_MAX_AGE_MS, Number.isFinite(intervalMs) ? intervalMs * 3 : 0);
+  const freshness_ms = Number.isFinite(newestMetricMs) && Number.isFinite(nowMs) ? Math.max(0, nowMs - newestMetricMs) : undefined;
+
+  if (mode === "forced") return { used: true, mode, freshness_ms, max_age_ms: maxAgeMs };
+  if (!summary || summary.point_count === 0) return { used: false, mode, skip_reason: "no_points", freshness_ms, max_age_ms: maxAgeMs };
+  if (!daemonStatus) return { used: false, mode, skip_reason: "no_daemon_status", freshness_ms, max_age_ms: maxAgeMs };
+  if (daemonStatus.state !== "ok") return { used: false, mode, skip_reason: "daemon_status_not_ok", freshness_ms, max_age_ms: maxAgeMs };
+  if (freshness_ms === undefined) return { used: false, mode, skip_reason: "no_recent_sample", max_age_ms: maxAgeMs };
+  if (freshness_ms > maxAgeMs) return { used: false, mode, skip_reason: "stale", freshness_ms, max_age_ms: maxAgeMs };
+  return { used: true, mode, freshness_ms, max_age_ms: maxAgeMs };
+}
+
+function sanitizeHistoryDaemonStatus(status) {
+  if (!status) return undefined;
+  return {
+    state: status.state,
+    mode: status.mode,
+    ts: status.ts,
+    interval_ms: status.profile?.interval_ms,
+    points_written: status.points_written,
+  };
+}
+
+export async function selectTriageHistory(paths, options = {}) {
+  const mode = options.historyMode ?? "auto";
+  const windowMs = parseDurationMs(options.historyWindow ?? "24h");
+  if (mode === "disabled") {
+    return { mode, used: false, skip_reason: "disabled", window_ms: windowMs };
+  }
+
+  const [summary, daemonStatus] = await Promise.all([
+    buildHistorySummary(paths, { windowMs }),
+    readDaemonStatus(paths),
+  ]);
+  const evaluation = evaluateHistorySelection({ mode, summary, daemonStatus, now: options.now });
+  return {
+    ...evaluation,
+    window_ms: windowMs,
+    summary,
+    daemon_status: sanitizeHistoryDaemonStatus(daemonStatus),
+  };
 }
 
 function historyEnvelope(summary) {
@@ -167,11 +235,11 @@ export async function runTriage(paths, args) {
   const toolResults = [];
   const toolCallRecorder = createToolCallRecorder();
   const evidenceGuard = createEvidenceGuardState({ investigationEnabled: options.investigate });
-  const historySummary = options.useHistory
-    ? await buildHistorySummary(paths, { windowMs: parseDurationMs(options.historyWindow) })
-    : undefined;
-  const historyBundle = historySummary ? { evidence: [historyEnvelope(historySummary)], findings: [], actions_taken: [] } : undefined;
+  const historySelection = await selectTriageHistory(paths, options);
+  const historySummary = historySelection.summary;
+  const historyBundle = historySelection.used && historySummary ? { evidence: [historyEnvelope(historySummary)], findings: [], actions_taken: [] } : undefined;
   let precollected = mergePrecollected(options.investigate ? undefined : await collectAllEvidence(), historyBundle);
+  const { createPrivateTriageSession, humanTriagePrompt, jsonTriagePrompt } = await import("./pi-harness.js");
   const { session, selectedModel, selectedThinkingLevel, activeToolNames } = await createPrivateTriageSession(paths, {
     modelPattern: options.modelPattern,
     thinkingLevel: options.thinkingLevel,
@@ -243,10 +311,18 @@ export async function runTriage(paths, args) {
       assistant_stop_reason: assistantStopReason,
       llm_error: llmError,
       fallback_used: Boolean(fallback),
-      history_used: options.useHistory,
-      history_window: options.useHistory ? options.historyWindow : undefined,
+      history_mode: historySelection.mode,
+      history_used: historySelection.used,
+      history_skip_reason: historySelection.skip_reason,
+      history_window: options.historyWindow,
+      history_freshness_ms: historySelection.freshness_ms,
+      history_max_age_ms: historySelection.max_age_ms,
+      history_daemon_status: historySelection.daemon_status,
       history_summary: historySummary ? {
         point_count: historySummary.point_count,
+        matched_point_count: historySummary.matched_point_count,
+        point_limit: historySummary.point_limit,
+        truncated: historySummary.truncated,
         metric_names: historySummary.metrics.map((metric) => metric.metric_name),
         since: historySummary.since,
         until: historySummary.until,

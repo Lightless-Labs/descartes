@@ -19,8 +19,8 @@ npm install -g github:Lightless-Labs/descartes
 descartes login
 descartes triage "my machine is slow"
 descartes triage "my machine is slow" --json
-# If the daemon has collected local history:
-descartes triage --use-history "How's my system doing?"
+# If fresh daemon history exists, triage includes a bounded history summary automatically:
+descartes triage "How's my system doing?"
 
 # Optional local history prototype, no background LLM calls:
 descartes daemon install       # idempotently writes a user launchd/systemd service file
@@ -29,6 +29,7 @@ descartes daemon status
 descartes daemon stop
 descartes daemon run --foreground --once
 descartes history summary          # compact local metric summary
+descartes alerts list              # deterministic local alerts, no LLM
 ```
 
 HTTPS tarball form:
@@ -88,11 +89,12 @@ See `docs/reference/collectors.md` for the full collector/tool reference.
 
 `--no-investigate` is a degraded escape hatch. It disables LLM-requested evidence tools and uses deterministic precollection for no-tool synthesis.
 
-If the local history daemon has collected metrics, `--use-history` includes a bounded history summary as another evidence envelope in the triage prompt. The default history window is `24h`; use `--history-window` to narrow or widen it within retained data:
+If the local history daemon has collected fresh metrics, triage automatically includes a bounded history summary as another evidence envelope in the prompt. The default history window is `24h`; use `--history-window` to narrow or widen it within retained data. Use `--no-history` to opt out, or `--use-history` to force including a history summary even when it is stale or empty:
 
 ```bash
-descartes triage --use-history "How's my system doing?"
-descartes triage --use-history --history-window 6h "Did anything change recently?" --json
+descartes triage "How's my system doing?"
+descartes triage --history-window 6h "Did anything change recently?" --json
+descartes triage --no-history "Ignore local history for this question"
 ```
 
 ## Local history daemon
@@ -126,7 +128,7 @@ descartes daemon run --foreground --once
 descartes daemon run --foreground --interval 60s
 ```
 
-Current daemon collection is deliberately conservative: system overview, top processes, and disk usage. It writes compact metric points and daemon status under Descartes-owned XDG state paths, then enforces retention/max-size bounds. It does **not** make background LLM calls, upload telemetry, expose shell tools, or take remediation actions.
+Current daemon collection is deliberately conservative: system overview, top processes, and disk usage. It writes compact metric points, daemon status, and deterministic alert state under Descartes-owned XDG state paths, then enforces retention/max-size bounds. It does **not** make background LLM calls unless alert intelligence is explicitly enabled, upload telemetry, expose shell tools, or take remediation actions.
 
 Service management is user-level only:
 
@@ -152,6 +154,40 @@ descartes history summary                 # compact operator summary
 descartes history summary --verbose       # full human metric table
 descartes history summary --json --window 1h
 ```
+
+Inspect deterministic local alerts without an LLM:
+
+```bash
+descartes alerts list
+descartes alerts list --json --all
+descartes alerts watch --interval 30s
+descartes alerts ack alert_...
+```
+
+Initial alert rules cover missing/stale daemon samples, sustained high memory pressure, sustained high load relative to CPU count, and disk pressure. Alert state is stored locally under Descartes-owned XDG state paths.
+
+Alert intelligence is explicit opt-in. When enabled, deterministic alert transitions may wake an LLM with bounded alert/history summaries so the model can decide whether/how to notify and write bounded notification text. It has no remediation/action tools:
+
+```bash
+descartes alerts intelligence status
+descartes alerts intelligence enable --max-per-hour 3
+descartes alerts intelligence disable
+```
+
+Desktop/headless notification delivery is separately explicit opt-in. Delivery adapters receive only the LLM's bounded notification decision text, not raw alert/evidence dumps:
+
+```bash
+descartes alerts notifications status
+descartes alerts notifications setup --channel desktop   # macOS osascript or Linux notify-send when available
+descartes alerts notifications test                      # may trigger the platform permission prompt
+descartes alerts notifications setup --channel syslog    # headless/local log entry option
+# Experimental native macOS path; uses a signed/notarized helper from macOS-specific packaging when available.
+# --helper is only for development/advanced overrides while packaging/signing/notarization is validated:
+descartes alerts notifications setup --channel native --helper /path/to/DescartesNotifier
+descartes alerts notifications disable
+```
+
+Platform caveat: a pure CLI may have desktop notification permission attributed to Terminal/osascript on macOS; Linux desktop notifications require a graphical session notification service. Experimental native macOS delivery is intended to use a macOS-specific signed/notarized release-built helper, without shipping a `.app` payload in Linux/cross-platform installs, but still needs packaging and real-host validation before becoming the default.
 
 This daemon lifecycle is new and still needs broader real-host validation across launchd/systemd variants.
 
@@ -190,8 +226,11 @@ Current v0 boundaries:
 - local evidence collection is read-only
 - triage takes no host actions
 - daemon lifecycle commands mutate only explicit Descartes user-level service files/service state
+- alert commands mutate only Descartes-owned alert acknowledgement/state files
+- notification delivery is disabled by default and requires explicit setup/test opt-in
 - no arbitrary shell/coding tools are exposed to the triage agent
 - no telemetry, background upload, or federation
+- alert-intelligence background LLM wakeups are disabled by default and require explicit opt-in
 - explicit `triage` requests may send collected evidence to the selected LLM provider
 - saved reports/session state are sensitive diagnostic artifacts
 
@@ -259,7 +298,7 @@ The model may route questions, request evidence, synthesize explanations, audit 
 
 ## Repository status
 
-The installable first slice lives under `tools/descartes-cli/`. It includes idempotent user-level daemon install/start/status/stop/uninstall commands, a foreground `descartes daemon run --foreground` development loop that stores bounded metric history under Descartes-owned XDG state paths, plus `descartes history summary` for deterministic local summaries.
+The installable first slice lives under `tools/descartes-cli/`. It includes idempotent user-level daemon install/start/status/stop/uninstall commands, a foreground `descartes daemon run --foreground` development loop that stores bounded metric history under Descartes-owned XDG state paths, `descartes history summary` for deterministic local summaries, deterministic alerts via `descartes alerts list/watch/ack`, opt-in alert intelligence, and opt-in notification setup/test commands.
 
 Rust remains the intended direction for durable collectors, stores, policy/audit machinery, and future native CLIs. When Rust crates are introduced, they should stay Bazel-friendly: explicit manifests, reproducible tests, no hidden generation steps, and a clean crate graph.
 

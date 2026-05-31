@@ -27,7 +27,24 @@ test("published package includes runtime files but not tests", () => {
   assert(rootPackage.files.includes("README.md"));
   assert(rootPackage.files.includes("docs/reference"));
   assert(rootPackage.files.includes("tools/descartes-cli/src"));
+  assert(!rootPackage.files.includes("tools/descartes-cli/native"));
+  assert(!nestedPackage.files.includes("native"));
   assert(!rootPackage.files.includes("tools/descartes-cli/test"));
+});
+
+test("macOS notifier release scripts are maintainer-only and use the assigned bundle id", () => {
+  const bundleId = "com.bande-a-bonnot.lightless-labs.descartes.macos.notifier";
+  const plist = fs.readFileSync(fileURLToPath(new URL("../native/macos/DescartesNotifier-Info.plist", import.meta.url)), "utf8");
+  const buildScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/build-macos-notifier.sh", import.meta.url)), "utf8");
+  const notarizeScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/notarize-macos-notifier.sh", import.meta.url)), "utf8");
+
+  assert.match(plist, new RegExp(bundleId.replaceAll(".", "\\.")));
+  assert.match(plist, /<key>LSUIElement<\/key>\s*<true\/>/);
+  assert.match(plist, /<key>CFBundlePackageType<\/key>\s*<string>APPL<\/string>/);
+  assert.match(buildScript, /\.build\/macos-notifier/);
+  assert.match(notarizeScript, /notarytool submit/);
+  assert.match(notarizeScript, /stapler staple/);
+  assert.match(notarizeScript, /spctl --assess/);
 });
 
 test("CLI version and help are generated from current metadata/options", () => {
@@ -39,10 +56,17 @@ test("CLI version and help are generated from current metadata/options", () => {
   assert.match(help, /--thinking <LEVEL>/);
   assert.match(help, /--no-investigate/);
   assert.match(help, /--use-history/);
+  assert.match(help, /--no-history/);
   assert.match(help, /--history-window <DURATION>/);
   assert.match(help, /daemon install\|start\|status\|stop\|uninstall \[--json\]/);
   assert.match(help, /daemon run --foreground/);
   assert.match(help, /history summary/);
+  assert.match(help, /alerts list/);
+  assert.match(help, /alerts watch/);
+  assert.match(help, /alerts ack/);
+  assert.match(help, /alerts intelligence status\|enable\|disable/);
+  assert.match(help, /alerts notifications status\|setup\|test\|disable/);
+  assert.match(help, /--channel cli\|desktop\|macos\|native\|linux\|syslog/);
 });
 
 test("CLI entrypoint works when launched through an npm-style symlink", () => {
