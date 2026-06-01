@@ -15,7 +15,7 @@ related:
 
 ## Summary
 
-Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. Users must not have to build the helper. The product path is a release-built helper delivered only through macOS-specific packaging or an explicit macOS setup/download flow; the configured helper path is only a development/advanced override until packaging/signing/notarization and real-host behavior are validated. Do not put a macOS `.app` payload in Linux/cross-platform installs.
+Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. Users must not have to build the helper. The product path is a release-built helper delivered only through macOS-specific packaging or an explicit macOS setup/download flow; the configured helper path is only a development/advanced override until packaging/signing/notarization and real-host behavior are validated. Do not put a macOS `.app` payload in Linux/cross-platform installs. Release automation should assume a tag-triggered Buildkite pipeline rather than GitHub Actions; GitHub Releases may still be used as the artifact publication surface.
 
 ## Scope
 
@@ -43,8 +43,9 @@ Add an explicit native macOS notification path so Descartes is not limited to th
 
 - [x] Add maintainer-only scripts to compile an app bundle, sign/notarize/staple/verify it, and keep generated artifacts out of git/package output.
 - [x] Exclude native macOS helper sources/artifacts from the cross-platform npm package metadata so Linux installs do not carry the `.app`.
-- [ ] Wire real release credentials/CI or maintainer release process for signing/notarization.
-- [ ] Verify the release artifact passes Gatekeeper/notarization checks on a clean macOS host.
+- [x] Add a tag-triggered Buildkite release pipeline/script for signing/notarization using ephemeral runner-local keychain material.
+- [ ] Seed Buildkite secrets for Developer ID signing and App Store Connect notarization: `CODESIGN_IDENTITY`, `MACOS_DEVELOPER_ID_CERT_P12_BASE64`, `MACOS_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`, and `APPLE_NOTARY_KEY_P8_BASE64`.
+- [ ] Run the tag-triggered Buildkite release and verify the release artifact passes Gatekeeper/notarization checks on a clean macOS host.
 - [ ] Validate first-run macOS permission prompt attribution on real hosts.
 - [ ] Validate Notification Center display name/icon and denied-permission behavior.
 - [ ] Validate daemon-context delivery behavior before making native delivery the default macOS desktop path.

@@ -112,3 +112,61 @@ steps:
       npm test
       npm run smoke:cli
       npm run pack:dry-run
+
+  - label: ":apple: Release macOS notifier"
+    key: release-macos-notifier
+    if: build.tag != null && build.tag =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+    depends_on:
+      - linux-arm64
+      - macos-apple-silicon
+    concurrency: 1
+    concurrency_group: "big-cabbage/descartes-release"
+    agents:
+      queue: "ci-macos-apple-silicon"
+    plugins:
+      - github.com/Bande-a-Bonnot/tart-ci#v0.1.1:
+          image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+          os: "macos"
+          always_pull: false
+          headless: true
+    command: |
+      set -euo pipefail
+
+      if [[ -z "$${HOME:-}" ]]; then
+        export HOME=/Users/admin
+      fi
+
+      install_node() {
+        local node_version="22.21.1"
+        local uname_s uname_m node_platform archive_ext archive_url node_dir tmp_archive
+        uname_s="$$(uname -s)"
+        uname_m="$$(uname -m)"
+
+        case "$$uname_s-$$uname_m" in
+          Darwin-arm64)
+            node_platform="darwin-arm64"
+            archive_ext="tar.gz"
+            ;;
+          *)
+            echo "Unsupported macOS Node.js platform: $$uname_s $$uname_m" >&2
+            exit 1
+            ;;
+        esac
+
+        node_dir="$$HOME/.local/node-v$$node_version-$$node_platform"
+        if [[ ! -x "$$node_dir/bin/node" ]]; then
+          mkdir -p "$$node_dir"
+          tmp_archive="$$(mktemp)"
+          archive_url="https://nodejs.org/dist/v$$node_version/node-v$$node_version-$$node_platform.$$archive_ext"
+          curl --proto '=https' --tlsv1.2 -fsSL "$$archive_url" -o "$$tmp_archive"
+          tar -xzf "$$tmp_archive" -C "$$node_dir" --strip-components=1
+          rm -f "$$tmp_archive"
+        fi
+        export PATH="$$node_dir/bin:$$PATH"
+      }
+
+      install_node
+      node --version
+      npm --version
+
+      scripts/release-macos-notifier-buildkite.sh

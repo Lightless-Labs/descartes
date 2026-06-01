@@ -1,6 +1,6 @@
 {
   "name": "@lightless-labs/descartes",
-  "version": "0.0.45",
+  "version": "0.0.46",
   "description": "LLM-backed local operations triage CLI for Descartes",
   "type": "module",
   "bin": {
@@ -11,7 +11,8 @@
     "smoke:cli": "node tools/descartes-cli/src/index.js --help",
     "pack:dry-run": "npm pack --dry-run",
     "build:macos-notifier": "scripts/build-macos-notifier.sh",
-    "notarize:macos-notifier": "scripts/notarize-macos-notifier.sh"
+    "notarize:macos-notifier": "scripts/notarize-macos-notifier.sh",
+    "release:macos-notifier:buildkite": "scripts/release-macos-notifier-buildkite.sh"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.75.3",

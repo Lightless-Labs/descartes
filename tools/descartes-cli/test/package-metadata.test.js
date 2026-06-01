@@ -37,14 +37,24 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   const plist = fs.readFileSync(fileURLToPath(new URL("../native/macos/DescartesNotifier-Info.plist", import.meta.url)), "utf8");
   const buildScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/build-macos-notifier.sh", import.meta.url)), "utf8");
   const notarizeScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/notarize-macos-notifier.sh", import.meta.url)), "utf8");
+  const buildkiteScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/release-macos-notifier-buildkite.sh", import.meta.url)), "utf8");
+  const buildkitePipeline = fs.readFileSync(fileURLToPath(new URL("../../../.buildkite/pipeline.yml", import.meta.url)), "utf8");
 
   assert.match(plist, new RegExp(bundleId.replaceAll(".", "\\.")));
   assert.match(plist, /<key>LSUIElement<\/key>\s*<true\/>/);
   assert.match(plist, /<key>CFBundlePackageType<\/key>\s*<string>APPL<\/string>/);
   assert.match(buildScript, /\.build\/macos-notifier/);
   assert.match(notarizeScript, /notarytool submit/);
+  assert.match(notarizeScript, /APPLE_NOTARY_KEY_PATH/);
   assert.match(notarizeScript, /stapler staple/);
   assert.match(notarizeScript, /spctl --assess/);
+  assert.match(buildkiteScript, /KEYCHAIN_PASSWORD="\$\(openssl rand -base64 48\)"/);
+  assert.match(buildkiteScript, /security create-keychain -p "\$KEYCHAIN_PASSWORD"/);
+  assert.match(buildkiteScript, /buildkite-agent artifact upload/);
+  assert.doesNotMatch(buildkiteScript, /KEYCHAIN_PASSWORD=\$\{[A-Z_]+:-/);
+  assert.match(buildkitePipeline, /build.tag != null/);
+  assert.match(buildkitePipeline, /key: release-macos-notifier/);
+  assert.match(buildkitePipeline, /queue: "ci-macos-apple-silicon"/);
 });
 
 test("CLI version and help are generated from current metadata/options", () => {

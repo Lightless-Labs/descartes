@@ -12,6 +12,7 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 BINARY_PATH="$MACOS_DIR/DescartesNotifier"
 INFO_PLIST_PATH="$CONTENTS_DIR/Info.plist"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+CODESIGN_KEYCHAIN="${CODESIGN_KEYCHAIN:-}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "error: macOS notifier app bundles must be built on macOS" >&2
@@ -42,7 +43,11 @@ sed \
   "$INFO_PLIST_TEMPLATE" > "$INFO_PLIST_PATH"
 
 if [[ -n "$CODESIGN_IDENTITY" ]]; then
-  codesign --force --timestamp --options runtime --sign "$CODESIGN_IDENTITY" "$APP_DIR"
+  codesign_args=(--force --timestamp --options runtime --sign "$CODESIGN_IDENTITY")
+  if [[ -n "$CODESIGN_KEYCHAIN" ]]; then
+    codesign_args+=(--keychain "$CODESIGN_KEYCHAIN")
+  fi
+  codesign "${codesign_args[@]}" "$APP_DIR"
   codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 fi
 
