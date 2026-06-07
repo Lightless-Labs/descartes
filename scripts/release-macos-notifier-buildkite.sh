@@ -24,12 +24,14 @@ Usage:
   scripts/release-macos-notifier-buildkite.sh
 
 Expected Buildkite secrets/environment:
-  CODESIGN_IDENTITY
   MACOS_DEVELOPER_ID_CERT_P12_BASE64
   MACOS_DEVELOPER_ID_CERT_PASSWORD
   APPLE_NOTARY_KEY_ID
   APPLE_NOTARY_ISSUER_ID
   APPLE_NOTARY_KEY_P8_BASE64
+
+Optional override:
+  CODESIGN_IDENTITY  Defaults to the first Developer ID Application identity imported from the p12.
 
 Optional publication environment:
   GITHUB_TOKEN         Upload the zip/checksum to the matching GitHub Release when gh is installed.
@@ -78,7 +80,6 @@ if [[ -n "$TAG" && "${TAG#v}" != "$PACKAGE_VERSION" ]]; then
   exit 2
 fi
 
-require_env CODESIGN_IDENTITY
 require_env MACOS_DEVELOPER_ID_CERT_P12_BASE64
 require_env MACOS_DEVELOPER_ID_CERT_PASSWORD
 require_env APPLE_NOTARY_KEY_ID
@@ -106,6 +107,17 @@ security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
+  CODESIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -n 1)"
+fi
+if [[ -z "$CODESIGN_IDENTITY" ]]; then
+  echo "error: no Developer ID Application signing identity found in imported p12" >&2
+  security find-identity -v -p codesigning "$KEYCHAIN_PATH" >&2 || true
+  exit 2
+fi
+
+echo "Using codesign identity: $CODESIGN_IDENTITY"
 
 DESCARTES_MACOS_NOTIFIER_BUILD_DIR="$BUILD_ROOT" \
 DESCARTES_MACOS_NOTIFIER_VERSION="$PACKAGE_VERSION" \

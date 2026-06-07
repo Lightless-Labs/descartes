@@ -50,7 +50,10 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(notarizeScript, /spctl --assess/);
   assert.match(buildkiteScript, /KEYCHAIN_PASSWORD="\$\(openssl rand -base64 48\)"/);
   assert.match(buildkiteScript, /security create-keychain -p "\$KEYCHAIN_PASSWORD"/);
+  assert.match(buildkiteScript, /security find-identity -v -p codesigning "\$KEYCHAIN_PATH"/);
+  assert.match(buildkiteScript, /Developer ID Application:/);
   assert.match(buildkiteScript, /buildkite-agent artifact upload/);
+  assert.doesNotMatch(buildkiteScript, /require_env CODESIGN_IDENTITY/);
   assert.doesNotMatch(buildkiteScript, /KEYCHAIN_PASSWORD=\$\{[A-Z_]+:-/);
   assert.match(buildkitePipeline, /build.tag != null/);
   assert.match(buildkitePipeline, /key: release-macos-notifier/);
