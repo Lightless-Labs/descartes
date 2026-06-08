@@ -10,10 +10,17 @@ SHA_PATH="$ZIP_PATH.sha256"
 TAG="${BUILDKITE_TAG:-}"
 ALLOW_UNTAGGED="${DESCARTES_ALLOW_UNTAGGED_RELEASE:-}"
 
-require_env() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    echo "error: $name is required" >&2
+require_release_env() {
+  local missing=()
+  for name in "$@"; do
+    if [[ -z "${!name:-}" ]]; then
+      missing+=("$name")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf 'error: missing required release environment variables:' >&2
+    printf ' %s' "${missing[@]}" >&2
+    printf '\n' >&2
     exit 2
   fi
 }
@@ -80,11 +87,12 @@ if [[ -n "$TAG" && "${TAG#v}" != "$PACKAGE_VERSION" ]]; then
   exit 2
 fi
 
-require_env MACOS_DEVELOPER_ID_CERT_P12_BASE64
-require_env MACOS_DEVELOPER_ID_CERT_PASSWORD
-require_env APPLE_NOTARY_KEY_ID
-require_env APPLE_NOTARY_ISSUER_ID
-require_env APPLE_NOTARY_KEY_P8_BASE64
+require_release_env \
+  MACOS_DEVELOPER_ID_CERT_P12_BASE64 \
+  MACOS_DEVELOPER_ID_CERT_PASSWORD \
+  APPLE_NOTARY_KEY_ID \
+  APPLE_NOTARY_ISSUER_ID \
+  APPLE_NOTARY_KEY_P8_BASE64
 
 mkdir -p "$RELEASE_DIR"
 KEYCHAIN_PATH="$BUILD_ROOT/descartes-signing.keychain-db"

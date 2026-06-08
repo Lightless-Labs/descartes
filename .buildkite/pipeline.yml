@@ -165,9 +165,15 @@ steps:
         export PATH="$$node_dir/bin:$$PATH"
       }
 
-      # The Tart guest command environment does not inherit Buildkite's tag env.
-      # Use Buildkite interpolation here so the guest sees the tag value.
+      # The Tart guest command environment does not inherit Buildkite env.
+      # Use Buildkite interpolation here so the guest sees the release inputs.
+      # Keep xtrace disabled: these values include signing/notary secrets.
       export BUILDKITE_TAG="$BUILDKITE_TAG"
+      export MACOS_DEVELOPER_ID_CERT_P12_BASE64="$MACOS_DEVELOPER_ID_CERT_P12_BASE64"
+      export MACOS_DEVELOPER_ID_CERT_PASSWORD="$MACOS_DEVELOPER_ID_CERT_PASSWORD"
+      export APPLE_NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID"
+      export APPLE_NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID"
+      export APPLE_NOTARY_KEY_P8_BASE64="$APPLE_NOTARY_KEY_P8_BASE64"
 
       install_node
       node --version
