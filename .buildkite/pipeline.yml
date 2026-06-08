@@ -165,6 +165,10 @@ steps:
         export PATH="$$node_dir/bin:$$PATH"
       }
 
+      # The Tart guest command environment does not inherit Buildkite's tag env.
+      # Use Buildkite interpolation here so the guest sees the tag value.
+      export BUILDKITE_TAG="$BUILDKITE_TAG"
+
       install_node
       node --version
       npm --version
