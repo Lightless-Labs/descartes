@@ -116,12 +116,23 @@ security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
+print_signing_diagnostics() {
+  echo "Imported certificate names:" >&2
+  security find-certificate -a -p "$KEYCHAIN_PATH" 2>/dev/null \
+    | openssl crl2pkcs7 -nocrl -certfile /dev/stdin 2>/dev/null \
+    | openssl pkcs7 -print_certs -noout -text 2>/dev/null \
+    | sed -n 's/^ *Subject:.*CN=\([^,\/]*\).*/  - \1/p' >&2 || true
+  echo "Codesigning identities visible to keychain:" >&2
+  security find-identity -v -p codesigning "$KEYCHAIN_PATH" >&2 || true
+}
+
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
   CODESIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -n 1)"
 fi
 if [[ -z "$CODESIGN_IDENTITY" ]]; then
   echo "error: no Developer ID Application signing identity found in imported p12" >&2
-  security find-identity -v -p codesigning "$KEYCHAIN_PATH" >&2 || true
+  echo "The p12 must contain both the Developer ID Application certificate and its private key; a downloaded .cer converted to p12 without the original private key will not work." >&2
+  print_signing_diagnostics
   exit 2
 fi
 
