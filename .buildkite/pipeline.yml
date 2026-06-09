@@ -123,18 +123,8 @@ steps:
     concurrency_group: "big-cabbage/descartes-release"
     agents:
       queue: "ci-macos-apple-silicon"
-    plugins:
-      - github.com/Bande-a-Bonnot/tart-ci#v0.1.1:
-          image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
-          os: "macos"
-          always_pull: false
-          headless: true
     command: |
       set -euo pipefail
-
-      if [[ -z "$${HOME:-}" ]]; then
-        export HOME=/Users/admin
-      fi
 
       install_node() {
         local node_version="22.21.1"
@@ -164,16 +154,6 @@ steps:
         fi
         export PATH="$$node_dir/bin:$$PATH"
       }
-
-      # The Tart guest command environment does not inherit Buildkite env.
-      # Use Buildkite interpolation here so the guest sees the release inputs.
-      # Keep xtrace disabled: these values include signing/notary secrets.
-      export BUILDKITE_TAG="$BUILDKITE_TAG"
-      export MACOS_DEVELOPER_ID_CERT_P12_BASE64="$MACOS_DEVELOPER_ID_CERT_P12_BASE64"
-      export MACOS_DEVELOPER_ID_CERT_PASSWORD="$MACOS_DEVELOPER_ID_CERT_PASSWORD"
-      export APPLE_NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID"
-      export APPLE_NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID"
-      export APPLE_NOTARY_KEY_P8_BASE64="$APPLE_NOTARY_KEY_P8_BASE64"
 
       install_node
       node --version

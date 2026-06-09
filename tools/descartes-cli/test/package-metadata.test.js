@@ -58,12 +58,9 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkitePipeline, /build.tag != null/);
   assert.match(buildkitePipeline, /key: release-macos-notifier/);
   assert.match(buildkitePipeline, /queue: "ci-macos-apple-silicon"/);
-  assert.match(buildkitePipeline, /export BUILDKITE_TAG="\$BUILDKITE_TAG"/);
-  assert.match(buildkitePipeline, /export MACOS_DEVELOPER_ID_CERT_P12_BASE64="\$MACOS_DEVELOPER_ID_CERT_P12_BASE64"/);
-  assert.match(buildkitePipeline, /export MACOS_DEVELOPER_ID_CERT_PASSWORD="\$MACOS_DEVELOPER_ID_CERT_PASSWORD"/);
-  assert.match(buildkitePipeline, /export APPLE_NOTARY_KEY_ID="\$APPLE_NOTARY_KEY_ID"/);
-  assert.match(buildkitePipeline, /export APPLE_NOTARY_ISSUER_ID="\$APPLE_NOTARY_ISSUER_ID"/);
-  assert.match(buildkitePipeline, /export APPLE_NOTARY_KEY_P8_BASE64="\$APPLE_NOTARY_KEY_P8_BASE64"/);
+  assert.match(buildkitePipeline, /scripts\/release-macos-notifier-buildkite\.sh/);
+  assert.doesNotMatch(buildkitePipeline, /export MACOS_DEVELOPER_ID_CERT_P12_BASE64/);
+  assert.doesNotMatch(buildkitePipeline, /Release macOS notifier[\s\S]*tart-ci#v0\.1\.1/);
 });
 
 test("CLI version and help are generated from current metadata/options", () => {
