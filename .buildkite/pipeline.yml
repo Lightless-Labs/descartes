@@ -6,7 +6,7 @@ steps:
     agents:
       queue: "ci-linux-arm64"
     plugins:
-      - github.com/Bande-a-Bonnot/tart-ci#v0.1.1:
+      - github.com/Lightless-Labs/tart-ci#v0.2.0:
           image: "ci-linux-arm64-rust-bazel"
           os: "linux"
           always_pull: false
@@ -63,7 +63,7 @@ steps:
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Bande-a-Bonnot/tart-ci#v0.1.1:
+      - github.com/Lightless-Labs/tart-ci#v0.2.0:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
@@ -123,8 +123,25 @@ steps:
     concurrency_group: "big-cabbage/descartes-release"
     agents:
       queue: "ci-macos-apple-silicon"
+    plugins:
+      - github.com/Lightless-Labs/tart-ci#v0.2.0:
+          image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+          os: "macos"
+          always_pull: false
+          headless: true
+          env:
+            - BUILDKITE_TAG
+            - MACOS_DEVELOPER_ID_CERT_P12_BASE64
+            - MACOS_DEVELOPER_ID_CERT_PASSWORD
+            - APPLE_NOTARY_KEY_ID
+            - APPLE_NOTARY_ISSUER_ID
+            - APPLE_NOTARY_KEY_P8_BASE64
     command: |
       set -euo pipefail
+
+      if [[ -z "$${HOME:-}" ]]; then
+        export HOME=/Users/admin
+      fi
 
       install_node() {
         local node_version="22.21.1"
