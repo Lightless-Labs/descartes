@@ -6,7 +6,7 @@ steps:
     agents:
       queue: "ci-linux-arm64"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.0:
+      - github.com/Lightless-Labs/tart-ci#v0.2.1:
           image: "ci-linux-arm64-rust-bazel"
           os: "linux"
           always_pull: false
@@ -74,7 +74,7 @@ steps:
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.0:
+      - github.com/Lightless-Labs/tart-ci#v0.2.1:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
@@ -146,7 +146,7 @@ steps:
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.0:
+      - github.com/Lightless-Labs/tart-ci#v0.2.1:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
