@@ -47,7 +47,18 @@ steps:
         export PATH="$$node_dir/bin:$$PATH"
       }
 
+      prepare_guest_checkout() {
+        local source_dir work_dir
+        source_dir="$$(pwd)"
+        work_dir="$$HOME/descartes-checkout"
+        rm -rf "$$work_dir"
+        mkdir -p "$$work_dir"
+        rsync -a --delete --exclude node_modules --exclude .git "$$source_dir/" "$$work_dir/"
+        cd "$$work_dir"
+      }
+
       install_node
+      prepare_guest_checkout
       node --version
       npm --version
 
@@ -104,7 +115,18 @@ steps:
         export PATH="$$node_dir/bin:$$PATH"
       }
 
+      prepare_guest_checkout() {
+        local source_dir work_dir
+        source_dir="$$(pwd)"
+        work_dir="$$HOME/descartes-checkout"
+        rm -rf "$$work_dir"
+        mkdir -p "$$work_dir"
+        rsync -a --delete --exclude node_modules --exclude .git "$$source_dir/" "$$work_dir/"
+        cd "$$work_dir"
+      }
+
       install_node
+      prepare_guest_checkout
       node --version
       npm --version
 
@@ -136,6 +158,8 @@ steps:
             - APPLE_NOTARY_KEY_ID
             - APPLE_NOTARY_ISSUER_ID
             - APPLE_NOTARY_KEY_P8_BASE64
+    artifact_paths:
+      - ".build/macos-notifier/release/*"
     command: |
       set -euo pipefail
 
@@ -172,8 +196,22 @@ steps:
         export PATH="$$node_dir/bin:$$PATH"
       }
 
+      prepare_guest_checkout() {
+        local source_dir work_dir
+        source_dir="$$(pwd)"
+        work_dir="$$HOME/descartes-release-checkout"
+        export DESCARTES_SHARED_CHECKOUT_DIR="$$source_dir"
+        rm -rf "$$work_dir"
+        mkdir -p "$$work_dir"
+        rsync -a --delete --exclude node_modules --exclude .git "$$source_dir/" "$$work_dir/"
+        cd "$$work_dir"
+      }
+
       install_node
+      prepare_guest_checkout
       node --version
       npm --version
 
       scripts/release-macos-notifier-buildkite.sh
+      mkdir -p "$$DESCARTES_SHARED_CHECKOUT_DIR/.build/macos-notifier/release"
+      rsync -a "$$HOME/descartes-release-checkout/.build/macos-notifier/release/" "$$DESCARTES_SHARED_CHECKOUT_DIR/.build/macos-notifier/release/"

@@ -59,6 +59,10 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkitePipeline, /key: release-macos-notifier/);
   assert.match(buildkitePipeline, /queue: "ci-macos-apple-silicon"/);
   assert.match(buildkitePipeline, /github\.com\/Lightless-Labs\/tart-ci#v0\.2\.0/);
+  assert.match(buildkitePipeline, /prepare_guest_checkout\(\)/);
+  assert.match(buildkitePipeline, /rsync -a --delete --exclude node_modules --exclude \.git/);
+  assert.match(buildkitePipeline, /artifact_paths:\n\s+- "\.build\/macos-notifier\/release\/\*"/);
+  assert.match(buildkitePipeline, /DESCARTES_SHARED_CHECKOUT_DIR/);
   assert.match(buildkitePipeline, /scripts\/release-macos-notifier-buildkite\.sh/);
   assert.match(buildkitePipeline, /env:\n\s+- BUILDKITE_TAG\n\s+- MACOS_DEVELOPER_ID_CERT_P12_BASE64\n\s+- MACOS_DEVELOPER_ID_CERT_PASSWORD\n\s+- APPLE_NOTARY_KEY_ID\n\s+- APPLE_NOTARY_ISSUER_ID\n\s+- APPLE_NOTARY_KEY_P8_BASE64/);
   assert.doesNotMatch(buildkitePipeline, /export MACOS_DEVELOPER_ID_CERT_P12_BASE64/);
