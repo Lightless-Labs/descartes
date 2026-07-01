@@ -30,12 +30,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Usage:
   scripts/release-macos-notifier-buildkite.sh
 
-Expected Buildkite secrets/environment:
+Expected release environment, either already set or fetched from Doppler when DOPPLER_TOKEN is present:
   MACOS_DEVELOPER_ID_CERT_P12_BASE64
   MACOS_DEVELOPER_ID_CERT_PASSWORD
   APPLE_NOTARY_KEY_ID
   APPLE_NOTARY_ISSUER_ID
   APPLE_NOTARY_KEY_P8_BASE64
+
+Doppler defaults used when DOPPLER_TOKEN is present:
+  DOPPLER_PROJECT=lightless-labs-descartes
+  DOPPLER_CONFIG=prd_notarisation
 
 Optional override:
   CODESIGN_IDENTITY  Defaults to the first Developer ID Application identity imported from the p12.
@@ -73,6 +77,36 @@ command -v security >/dev/null || { echo "error: security is required" >&2; exit
 command -v openssl >/dev/null || { echo "error: openssl is required" >&2; exit 2; }
 command -v shasum >/dev/null || { echo "error: shasum is required" >&2; exit 2; }
 
+fetch_release_secret_from_doppler() {
+  local name="$1"
+  if [[ -z "${DOPPLER_TOKEN:-}" || -n "${!name:-}" ]]; then
+    return 0
+  fi
+  command -v doppler >/dev/null || { echo "error: DOPPLER_TOKEN is set but doppler CLI is unavailable" >&2; exit 2; }
+  local project="${DOPPLER_PROJECT:-lightless-labs-descartes}"
+  local config="${DOPPLER_CONFIG:-prd_notarisation}"
+  local value
+  if ! value="$(doppler secrets get "$name" --project "$project" --config "$config" --plain)"; then
+    echo "error: failed to fetch Doppler release secret: $name" >&2
+    exit 2
+  fi
+  if [[ -z "$value" ]]; then
+    echo "error: Doppler release secret is empty: $name" >&2
+    exit 2
+  fi
+  printf -v "$name" '%s' "$value"
+  export "$name"
+}
+
+fetch_release_secrets_from_doppler() {
+  fetch_release_secret_from_doppler MACOS_DEVELOPER_ID_CERT_P12_BASE64
+  fetch_release_secret_from_doppler MACOS_DEVELOPER_ID_CERT_PASSWORD
+  fetch_release_secret_from_doppler APPLE_NOTARY_KEY_ID
+  fetch_release_secret_from_doppler APPLE_NOTARY_ISSUER_ID
+  fetch_release_secret_from_doppler APPLE_NOTARY_KEY_P8_BASE64
+  unset DOPPLER_TOKEN
+}
+
 base64_decode() {
   if base64 --help 2>&1 | grep -q -- '--decode'; then
     base64 --decode
@@ -86,6 +120,8 @@ if [[ -n "$TAG" && "${TAG#v}" != "$PACKAGE_VERSION" ]]; then
   echo "error: tag $TAG does not match package.json version $PACKAGE_VERSION" >&2
   exit 2
 fi
+
+fetch_release_secrets_from_doppler
 
 require_release_env \
   MACOS_DEVELOPER_ID_CERT_P12_BASE64 \

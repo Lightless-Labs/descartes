@@ -6,7 +6,7 @@ steps:
     agents:
       queue: "ci-linux-arm64"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.1:
+      - github.com/Lightless-Labs/tart-ci#v0.2.2:
           image: "ci-linux-arm64-rust-bazel"
           os: "linux"
           always_pull: false
@@ -74,7 +74,7 @@ steps:
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.1:
+      - github.com/Lightless-Labs/tart-ci#v0.2.2:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
@@ -146,18 +146,14 @@ steps:
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.1:
+      - github.com/Lightless-Labs/tart-ci#v0.2.2:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
           headless: true
+          doppler_token_secret: DOPPLER_DESCARTES_PRD_NOTARISATION
           env:
             - BUILDKITE_TAG
-            - MACOS_DEVELOPER_ID_CERT_P12_BASE64
-            - MACOS_DEVELOPER_ID_CERT_PASSWORD
-            - APPLE_NOTARY_KEY_ID
-            - APPLE_NOTARY_ISSUER_ID
-            - APPLE_NOTARY_KEY_P8_BASE64
     artifact_paths:
       - ".build/macos-notifier/release/*"
     command: |

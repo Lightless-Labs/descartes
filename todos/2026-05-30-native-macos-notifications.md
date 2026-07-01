@@ -44,14 +44,12 @@ Add an explicit native macOS notification path so Descartes is not limited to th
 - [x] Add maintainer-only scripts to compile an app bundle, sign/notarize/staple/verify it, and keep generated artifacts out of git/package output.
 - [x] Exclude native macOS helper sources/artifacts from the cross-platform npm package metadata so Linux installs do not carry the `.app`.
 - [x] Add a tag-triggered Buildkite release pipeline/script for signing/notarization inside Tart using ephemeral guest-local keychain material.
-- [ ] Replace the incorrect Buildkite-secrets/env passthrough approach with the established Doppler-token bootstrap pattern:
-  - extend/use `github.com/Lightless-Labs/tart-ci` with `doppler_token_path` support modeled after Foundry;
-  - host reads a scoped Doppler service-token file, e.g. `/Users/thomas/.config/descartes/doppler.token`;
-  - plugin passes that token to the Tart guest over SSH stdin, not via mounted checkout, Buildkite env, or command argv;
-  - guest fetches only required release keys from Doppler: `MACOS_DEVELOPER_ID_CERT_P12_BASE64`, `MACOS_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`, and `APPLE_NOTARY_KEY_P8_BASE64`;
+- [x] Replace the incorrect direct signing-secret passthrough approach with a scoped Doppler-token bootstrap pattern:
+  - `github.com/Lightless-Labs/tart-ci#v0.2.2` accepts `doppler_token_secret`;
+  - Buildkite secret `DOPPLER_DESCARTES_PRD_NOTARISATION` is exposed to the Tart guest as `DOPPLER_TOKEN`;
+  - guest release script fetches only required release keys from Doppler project `lightless-labs-descartes`, config `prd_notarisation`: `MACOS_DEVELOPER_ID_CERT_P12_BASE64`, `MACOS_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`, and `APPLE_NOTARY_KEY_P8_BASE64`;
   - guest unsets the Doppler token before running signing/notarization;
   - decoded cert/notary key files remain guest-local and are deleted by cleanup.
-- [ ] Seed a Descartes-scoped Doppler token file on the macOS Buildkite host after the plugin/pipeline expects it.
 - [ ] Run the tag-triggered Buildkite release and verify the release artifact passes Gatekeeper/notarization checks on a clean macOS host.
 - [ ] Validate first-run macOS permission prompt attribution on real hosts.
 - [ ] Validate Notification Center display name/icon and denied-permission behavior.
