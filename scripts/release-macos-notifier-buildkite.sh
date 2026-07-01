@@ -82,11 +82,59 @@ fetch_release_secret_from_doppler() {
   if [[ -z "${DOPPLER_TOKEN:-}" || -n "${!name:-}" ]]; then
     return 0
   fi
-  command -v doppler >/dev/null || { echo "error: DOPPLER_TOKEN is set but doppler CLI is unavailable" >&2; exit 2; }
+  command -v python3 >/dev/null || { echo "error: DOPPLER_TOKEN is set but python3 is unavailable for Doppler REST fetch" >&2; exit 2; }
   local project="${DOPPLER_PROJECT:-lightless-labs-descartes}"
   local config="${DOPPLER_CONFIG:-prd_notarisation}"
   local value
-  if ! value="$(doppler secrets get "$name" --project "$project" --config "$config" --plain)"; then
+  if ! value="$(DOPPLER_BOOTSTRAP_TOKEN="$DOPPLER_TOKEN" DOPPLER_PROJECT_NAME="$project" DOPPLER_CONFIG_NAME="$config" DOPPLER_SECRET_NAME="$name" python3 <<'PY'
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+name = os.environ.get("DOPPLER_SECRET_NAME", "")
+token = os.environ.get("DOPPLER_BOOTSTRAP_TOKEN", "")
+project = os.environ.get("DOPPLER_PROJECT_NAME", "")
+config = os.environ.get("DOPPLER_CONFIG_NAME", "")
+if not name or not token or not project or not config:
+    print("missing Doppler fetch environment", file=sys.stderr)
+    sys.exit(2)
+
+auth = base64.b64encode(f"{token}:".encode()).decode()
+qs = urllib.parse.urlencode({"project": project, "config": config, "name": name})
+req = urllib.request.Request(
+    f"https://api.doppler.com/v3/configs/config/secret?{qs}",
+    headers={
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "User-Agent": "descartes-macos-notifier-release/1",
+    },
+)
+try:
+    with urllib.request.urlopen(req, timeout=20) as res:
+        payload = json.load(res)
+except urllib.error.HTTPError as exc:
+    body = exc.read(300).decode(errors="replace")
+    print(f"Doppler read failed for {name}: HTTP {exc.code}: {body}", file=sys.stderr)
+    sys.exit(2)
+except Exception as exc:
+    print(f"Doppler read failed for {name}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+value = payload.get("value", {})
+if isinstance(value, dict):
+    secret_value = value.get("computed") or value.get("raw") or value.get("value")
+else:
+    secret_value = value
+if not isinstance(secret_value, str) or not secret_value:
+    print(f"Doppler read returned no value for {name}", file=sys.stderr)
+    sys.exit(2)
+print(secret_value, end="")
+PY
+)"; then
     echo "error: failed to fetch Doppler release secret: $name" >&2
     exit 2
   fi

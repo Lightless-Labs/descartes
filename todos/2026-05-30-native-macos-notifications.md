@@ -48,6 +48,7 @@ Add an explicit native macOS notification path so Descartes is not limited to th
   - `github.com/Lightless-Labs/tart-ci#v0.2.2` accepts `doppler_token_secret`;
   - Buildkite secret `DOPPLER_DESCARTES_PRD_NOTARISATION` is exposed to the Tart guest as `DOPPLER_TOKEN`;
   - guest release script fetches only required release keys from Doppler project `lightless-labs-descartes`, config `prd_notarisation`: `MACOS_DEVELOPER_ID_CERT_P12_BASE64`, `MACOS_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`, and `APPLE_NOTARY_KEY_P8_BASE64`;
+  - guest fetches Doppler secrets via Python stdlib / Doppler REST, not the Doppler CLI, so the base macOS image does not need `doppler` installed;
   - guest unsets the Doppler token before running signing/notarization;
   - decoded cert/notary key files remain guest-local and are deleted by cleanup.
 - [ ] Run the tag-triggered Buildkite release and verify the release artifact passes Gatekeeper/notarization checks on a clean macOS host.
