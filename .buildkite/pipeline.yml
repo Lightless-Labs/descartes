@@ -1,6 +1,7 @@
 steps:
   - label: ":linux: Linux ARM64"
     key: linux-arm64
+    if: build.tag == null
     concurrency: 2
     concurrency_group: "big-cabbage/tart-ci"
     agents:
@@ -69,6 +70,7 @@ steps:
 
   - label: ":mac: macOS Apple Silicon"
     key: macos-apple-silicon
+    if: build.tag == null
     concurrency: 2
     concurrency_group: "big-cabbage/tart-ci"
     agents:
@@ -138,9 +140,6 @@ steps:
   - label: ":apple: Release macOS notifier"
     key: release-macos-notifier
     if: build.tag != null && build.tag =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-    depends_on:
-      - linux-arm64
-      - macos-apple-silicon
     concurrency: 1
     concurrency_group: "big-cabbage/descartes-release"
     agents:
