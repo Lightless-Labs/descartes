@@ -175,10 +175,14 @@ sync_guest_clock() {
 }
 
 print_decoded_signing_certificate_diagnostics() {
+  echo "Decoded Developer ID p12 sha256: $(shasum -a 256 "$CERT_PATH" | awk '{print $1}')"
   echo "Decoded Developer ID certificate diagnostics:"
-  if ! openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_DEVELOPER_ID_CERT_PASSWORD -nokeys -clcerts 2>/dev/null \
-    | openssl x509 -noout -subject -issuer -dates -fingerprint -sha1; then
-    echo "warning: unable to print decoded Developer ID certificate diagnostics" >&2
+  local cert_pem="$BUILD_ROOT/developer-id-cert.pem"
+  if openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_DEVELOPER_ID_CERT_PASSWORD -nokeys -clcerts -out "$cert_pem" >/dev/null 2>&1; then
+    openssl x509 -in "$cert_pem" -noout -subject -issuer -dates -fingerprint -sha1 || true
+    rm -f "$cert_pem"
+  else
+    echo "warning: unable to extract decoded Developer ID certificate diagnostics" >&2
   fi
 }
 
