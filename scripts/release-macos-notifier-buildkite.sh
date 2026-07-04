@@ -163,6 +163,25 @@ base64_decode() {
   fi
 }
 
+sync_guest_clock() {
+  echo "Guest UTC before time sync: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if command -v sntp >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+    sudo -n sntp -sS time.apple.com >/dev/null 2>&1 || true
+  fi
+  if command -v systemsetup >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+    sudo -n systemsetup -setusingnetworktime on >/dev/null 2>&1 || true
+  fi
+  echo "Guest UTC after time sync: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+
+print_decoded_signing_certificate_diagnostics() {
+  echo "Decoded Developer ID certificate diagnostics:"
+  if ! openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_DEVELOPER_ID_CERT_PASSWORD -nokeys -clcerts 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates -fingerprint -sha1; then
+    echo "warning: unable to print decoded Developer ID certificate diagnostics" >&2
+  fi
+}
+
 PACKAGE_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('$ROOT_DIR/package.json', 'utf8')).version")"
 if [[ -n "$TAG" && "${TAG#v}" != "$PACKAGE_VERSION" ]]; then
   echo "error: tag $TAG does not match package.json version $PACKAGE_VERSION" >&2
@@ -190,9 +209,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+sync_guest_clock
+
 printf '%s' "$MACOS_DEVELOPER_ID_CERT_P12_BASE64" | base64_decode > "$CERT_PATH"
 printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64_decode > "$NOTARY_KEY_PATH"
 chmod 0600 "$CERT_PATH" "$NOTARY_KEY_PATH"
+print_decoded_signing_certificate_diagnostics
 
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"

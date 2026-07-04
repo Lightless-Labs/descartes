@@ -1,5 +1,6 @@
 # Local reference material / scratch inputs
 materials/
+.ignored/
 
 # Local logs and process output
 *.log
