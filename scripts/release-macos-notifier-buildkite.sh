@@ -178,12 +178,15 @@ print_decoded_signing_certificate_diagnostics() {
   echo "Decoded Developer ID p12 sha256: $(shasum -a 256 "$CERT_PATH" | awk '{print $1}')"
   echo "Decoded Developer ID certificate diagnostics:"
   local cert_pem="$BUILD_ROOT/developer-id-cert.pem"
-  if openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_DEVELOPER_ID_CERT_PASSWORD -nokeys -clcerts -out "$cert_pem" >/dev/null 2>&1; then
+  local pass_file="$BUILD_ROOT/developer-id-cert-password.txt"
+  printf '%s' "$MACOS_DEVELOPER_ID_CERT_PASSWORD" > "$pass_file"
+  chmod 0600 "$pass_file"
+  if openssl pkcs12 -in "$CERT_PATH" -passin "file:$pass_file" -nokeys -clcerts -out "$cert_pem" >/dev/null 2>&1; then
     openssl x509 -in "$cert_pem" -noout -subject -issuer -dates -fingerprint -sha1 || true
-    rm -f "$cert_pem"
   else
     echo "warning: unable to extract decoded Developer ID certificate diagnostics" >&2
   fi
+  rm -f "$cert_pem" "$pass_file"
 }
 
 PACKAGE_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('$ROOT_DIR/package.json', 'utf8')).version")"
@@ -206,8 +209,27 @@ KEYCHAIN_PATH="$BUILD_ROOT/descartes-signing.keychain-db"
 CERT_PATH="$BUILD_ROOT/developer-id.p12"
 NOTARY_KEY_PATH="$BUILD_ROOT/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
 KEYCHAIN_PASSWORD="$(openssl rand -base64 48)"
+ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user 2>/dev/null | tr -d '"' || true)"
+ORIGINAL_USER_KEYCHAINS="$(security list-keychains -d user 2>/dev/null | tr -d '"' || true)"
+
+restore_user_keychain_settings() {
+  if [[ -n "$ORIGINAL_DEFAULT_KEYCHAIN" ]]; then
+    security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$ORIGINAL_USER_KEYCHAINS" ]]; then
+    local keychains=()
+    local keychain
+    while IFS= read -r keychain; do
+      [[ -n "$keychain" ]] && keychains+=("$keychain")
+    done <<< "$ORIGINAL_USER_KEYCHAINS"
+    if (( ${#keychains[@]} > 0 )); then
+      security list-keychains -d user -s "${keychains[@]}" >/dev/null 2>&1 || true
+    fi
+  fi
+}
 
 cleanup() {
+  restore_user_keychain_settings
   security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
   rm -f "$CERT_PATH" "$NOTARY_KEY_PATH"
 }
@@ -223,6 +245,12 @@ print_decoded_signing_certificate_diagnostics
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+current_keychains=()
+while IFS= read -r keychain; do
+  [[ -n "$keychain" && "$keychain" != "$KEYCHAIN_PATH" ]] && current_keychains+=("$keychain")
+done < <(security list-keychains -d user 2>/dev/null | tr -d '"' || true)
+security list-keychains -d user -s "$KEYCHAIN_PATH" "${current_keychains[@]}"
+security default-keychain -d user -s "$KEYCHAIN_PATH"
 security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
@@ -232,8 +260,13 @@ print_signing_diagnostics() {
     | openssl crl2pkcs7 -nocrl -certfile /dev/stdin 2>/dev/null \
     | openssl pkcs7 -print_certs -noout -text 2>/dev/null \
     | sed -n 's/^ *Subject:.*CN=\([^,\/]*\).*/  - \1/p' >&2 || true
-  echo "Codesigning identities visible to keychain:" >&2
+  echo "Matching codesigning identities in keychain (including invalid):" >&2
+  security find-identity -p codesigning "$KEYCHAIN_PATH" >&2 || true
+  echo "Valid codesigning identities visible to keychain:" >&2
   security find-identity -v -p codesigning "$KEYCHAIN_PATH" >&2 || true
+  echo "Private-key items visible in keychain:" >&2
+  security dump-keychain "$KEYCHAIN_PATH" 2>/dev/null \
+    | awk '/class: 0x00000010/ {show=1; n=0; print; next} /class: / && show {show=0} show && n++<32 {print}' >&2 || true
 }
 
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
