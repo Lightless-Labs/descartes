@@ -12,6 +12,7 @@
 **Addendum:** 2026-05-30 — native notifier bundle identifier is `com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
 **Addendum:** 2026-05-30 — do not pollute Linux/cross-platform installs with a macOS `.app`; the notarized helper should be delivered only through macOS-specific packaging or an explicit macOS setup/download flow.
 **Addendum:** 2026-05-30 — release automation should assume a tag-triggered Buildkite pipeline rather than GitHub Actions; GitHub Releases may still be used as the artifact publication surface.
+**Addendum:** 2026-07-05 — macOS release signing is blocked on reproducing a valid Developer ID Application identity in a CI-style disposable keychain. The p12 imports, the private key is present and paired, and `verify-cert -p codeSign` can validate the certificate, but `security find-identity -v -p codesigning "$KEYCHAIN"` reports `0 valid identities found` and `codesign --keychain "$KEYCHAIN"` fails with `no identity found` when signing the real `DescartesNotifier.app`. Importing Apple Developer ID G1/G2 intermediates into the disposable keychain or login keychain did not make the disposable-keychain test pass locally; trust-setting changes require interactive/admin authorization. Do not update CI scripts or retag for this signing hypothesis until a local disposable-keychain run produces a valid identity and successful real-app codesign, or the release strategy is changed to use a pre-provisioned trusted keychain/Tart image.
 
 ## Purpose
 
