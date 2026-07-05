@@ -52,6 +52,11 @@ Add an explicit native macOS notification path so Descartes is not limited to th
   - guest unsets the Doppler token before running signing/notarization;
   - decoded cert/notary key files remain guest-local and are deleted by cleanup.
 - [ ] Run the tag-triggered Buildkite release and verify the release artifact passes Gatekeeper/notarization checks on a clean macOS host.
+  - [x] Apply the GitHub Actions-style ephemeral keychain pattern from IronsideXXVI/Hacker-News to `scripts/release-macos-notifier-buildkite.sh`: create/unlock, import p12, set partition list, add to search list, do not set as default keychain.
+  - [x] Stop passing `CODESIGN_KEYCHAIN` to `scripts/notarize-macos-notifier.sh` so `codesign` searches the full keychain list.
+  - [x] Import the Apple Developer ID intermediate certificate (matched by leaf issuer CN) from system root stores into the ephemeral keychain.
+  - [x] Add stapling retry to `scripts/notarize-macos-notifier.sh`.
+  - [ ] Validate the fix with a real tag-triggered Buildkite run using the actual Apple Developer ID p12.
 - [ ] Validate first-run macOS permission prompt attribution on real hosts.
 - [ ] Validate Notification Center display name/icon and denied-permission behavior.
 - [ ] Validate daemon-context delivery behavior before making native delivery the default macOS desktop path.

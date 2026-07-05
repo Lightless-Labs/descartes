@@ -209,13 +209,9 @@ KEYCHAIN_PATH="$BUILD_ROOT/descartes-signing.keychain-db"
 CERT_PATH="$BUILD_ROOT/developer-id.p12"
 NOTARY_KEY_PATH="$BUILD_ROOT/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
 KEYCHAIN_PASSWORD="$(openssl rand -base64 48)"
-ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user 2>/dev/null | tr -d '"' || true)"
 ORIGINAL_USER_KEYCHAINS="$(security list-keychains -d user 2>/dev/null | tr -d '"' || true)"
 
 restore_user_keychain_settings() {
-  if [[ -n "$ORIGINAL_DEFAULT_KEYCHAIN" ]]; then
-    security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
-  fi
   if [[ -n "$ORIGINAL_USER_KEYCHAINS" ]]; then
     local keychains=()
     local keychain
@@ -245,14 +241,80 @@ print_decoded_signing_certificate_diagnostics
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+# Import the Developer ID Application p12. The private key must be present;
+# a leaf certificate without its paired private key will not form a codesigning identity.
+security import "$CERT_PATH" \
+  -k "$KEYCHAIN_PATH" \
+  -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" \
+  -T /usr/bin/codesign \
+  -T /usr/bin/security \
+  -T /usr/bin/productbuild \
+  -T /usr/bin/productsign
+
+# Copy the Apple Developer ID intermediate certificate for the imported leaf cert
+# from the system root stores into the ephemeral keychain. A fresh CI macOS image
+# may not include the correct intermediate, and find-identity / codesign evaluate
+# the imported identity against the contents of the keychain when a keychain path is
+# supplied. Having the full chain in the same keychain avoids a broken chain without
+# requiring interactive trust-setting.
+extract_leaf_cert_issuer_cn() {
+  local cert_pem="$BUILD_ROOT/leaf-cert.pem"
+  local pass_file="$BUILD_ROOT/cert-password.txt"
+  printf '%s' "$MACOS_DEVELOPER_ID_CERT_PASSWORD" > "$pass_file"
+  chmod 0600 "$pass_file"
+  if openssl pkcs12 -in "$CERT_PATH" -passin "file:$pass_file" -nokeys -clcerts -out "$cert_pem" >/dev/null 2>&1; then
+    LC_ALL=C openssl x509 -in "$cert_pem" -noout -issuer -nameopt sep_comma_plus_space | LC_ALL=C awk -F', ' '/issuer=/{for(i=1;i<=NF;i++) if($i ~ /^CN=/) {sub(/^CN=/, "", $i); print $i; exit}}' | tr -d '\n'
+  fi
+  rm -f "$cert_pem" "$pass_file"
+}
+
+import_developer_id_intermediates() {
+  local issuer
+  issuer="$(extract_leaf_cert_issuer_cn)"
+  if [[ -z "$issuer" ]]; then
+    echo "warning: unable to extract issuer from Developer ID p12" >&2
+    return
+  fi
+  echo "Leaf certificate issuer CN: $issuer"
+  if security find-certificate -a -c "$issuer" -p "$KEYCHAIN_PATH" >/dev/null 2>&1; then
+    echo "Intermediate already present in ephemeral keychain: $issuer"
+    return
+  fi
+  local found=0
+  for system_keychain in \
+    "/System/Library/Keychains/SystemRootCertificates.keychain" \
+    "/Library/Keychains/System.keychain" \
+    "$(security login-keychain 2>/dev/null | tr -d '"' || true)"
+  do
+    [[ -f "$system_keychain" ]] || continue
+    local pem_file="$BUILD_ROOT/intermediate.pem"
+    if security find-certificate -a -c "$issuer" -p "$system_keychain" > "$pem_file" 2>/dev/null && [[ -s "$pem_file" ]]; then
+      if security import "$pem_file" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null; then
+        echo "Imported intermediate from $system_keychain: $issuer"
+        found=1
+      fi
+    fi
+    rm -f "$pem_file"
+  done
+  if (( found == 0 )); then
+    echo "warning: could not find intermediate certificate for issuer '$issuer' in system root stores; chain validation may fail" >&2
+  fi
+}
+import_developer_id_intermediates
+
+# Allow codesign to access the imported identity without an interactive prompt.
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+# Add the ephemeral keychain to the user search list. Do NOT make it the default keychain:
+# certificate validity is evaluated against the default keychain's trust store, and a fresh
+# ephemeral keychain lacks the Apple root/intermediate certificates needed to validate a
+# Developer ID Application chain. This ordering matches the working GitHub Actions pattern.
 current_keychains=()
 while IFS= read -r keychain; do
   [[ -n "$keychain" && "$keychain" != "$KEYCHAIN_PATH" ]] && current_keychains+=("$keychain")
 done < <(security list-keychains -d user 2>/dev/null | tr -d '"' || true)
 security list-keychains -d user -s "$KEYCHAIN_PATH" "${current_keychains[@]}"
-security default-keychain -d user -s "$KEYCHAIN_PATH"
-security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_DEVELOPER_ID_CERT_PASSWORD" -T /usr/bin/codesign
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
 print_signing_diagnostics() {
   echo "Imported certificate names:" >&2
@@ -262,15 +324,21 @@ print_signing_diagnostics() {
     | sed -n 's/^ *Subject:.*CN=\([^,\/]*\).*/  - \1/p' >&2 || true
   echo "Matching codesigning identities in keychain (including invalid):" >&2
   security find-identity -p codesigning "$KEYCHAIN_PATH" >&2 || true
-  echo "Valid codesigning identities visible to keychain:" >&2
-  security find-identity -v -p codesigning "$KEYCHAIN_PATH" >&2 || true
-  echo "Private-key items visible in keychain:" >&2
+  echo "Valid codesigning identities visible in the full search list:" >&2
+  security find-identity -v -p codesigning >&2 || true
+  echo "Matching (including invalid) codesigning identities in the ephemeral keychain:" >&2
+  security find-identity -p codesigning "$KEYCHAIN_PATH" >&2 || true
+  echo "Private-key items visible in the ephemeral keychain:" >&2
   security dump-keychain "$KEYCHAIN_PATH" 2>/dev/null \
     | awk '/class: 0x00000010/ {show=1; n=0; print; next} /class: / && show {show=0} show && n++<32 {print}' >&2 || true
 }
 
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
-  CODESIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -n 1)"
+  # Extract the exact identity name from the freshly imported p12 in the ephemeral keychain.
+  # A brand-new ephemeral keychain may not contain the Apple CA/root chain needed for a
+  # validity check, so do not require -v here. codesign will validate against the full
+  # search list (which includes the system/login trust anchors) when it runs.
+  CODESIGN_IDENTITY="$(security find-identity -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -n 1)"
 fi
 if [[ -z "$CODESIGN_IDENTITY" ]]; then
   echo "error: no Developer ID Application signing identity found in imported p12" >&2
@@ -281,12 +349,16 @@ fi
 
 echo "Using codesign identity: $CODESIGN_IDENTITY"
 
+# Verify the selected identity is valid somewhere in the search list before signing.
+if ! security find-identity -v -p codesigning | grep -F "$CODESIGN_IDENTITY" >/dev/null 2>&1; then
+  echo "warning: $CODESIGN_IDENTITY was not reported as valid in the full search list" >&2
+fi
+
 DESCARTES_MACOS_NOTIFIER_BUILD_DIR="$BUILD_ROOT" \
 DESCARTES_MACOS_NOTIFIER_VERSION="$PACKAGE_VERSION" \
 "$ROOT_DIR/scripts/build-macos-notifier.sh"
 
 CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
-CODESIGN_KEYCHAIN="$KEYCHAIN_PATH" \
 APPLE_NOTARY_KEY_PATH="$NOTARY_KEY_PATH" \
 APPLE_NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID" \
 APPLE_NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID" \

@@ -73,7 +73,19 @@ else
   exit 2
 fi
 
-xcrun stapler staple "$APP_DIR"
+xcrun stapler staple "$APP_DIR" || {
+  echo "Initial stapling failed; retrying for notary ticket propagation..." >&2
+  for i in 1 2 3 4; do
+    sleep 15
+    if xcrun stapler staple "$APP_DIR"; then
+      break
+    fi
+    if (( i == 4 )); then
+      echo "error: stapling failed after retries" >&2
+      exit 1
+    fi
+  done
+}
 xcrun stapler validate "$APP_DIR"
 spctl --assess --type execute --verbose=4 "$APP_DIR"
 
