@@ -271,6 +271,9 @@ security import "$CERT_PATH" \
 # Print diagnostics after the p12 has been imported into the keychain.
 print_decoded_signing_certificate_diagnostics
 
+# Ensure the system root store has the Apple root anchor for the G2 chain.
+ensure_apple_root_trusted
+
 # Copy the Apple Developer ID intermediate certificate for the imported leaf cert
 # from the system root stores into the ephemeral keychain. A fresh CI macOS image
 # may not include the correct intermediate, and find-identity / codesign evaluate
@@ -308,6 +311,42 @@ PY
   fi
   rm -f "$cert_bundle"
   printf '%s' "$issuer_cn"
+}
+
+
+# Ensure the Apple Root CA - G2 is trusted in the system root store. Minimal CI
+# macOS images (e.g., Cirrus Labs base images) may ship without the Apple root
+# certificates needed to validate a Developer ID (G2) certificate chain. Without
+# the root anchor, codesign cannot build a chain even when the leaf and
+# intermediate are present in the ephemeral keychain.
+ensure_apple_root_trusted() {
+  local root_label="Apple Root CA - G2"
+  local root_url="https://www.apple.com/certificateauthority/AppleRootCA-G2.cer"
+  local root_der="$BUILD_ROOT/apple-root-ca-g2.cer"
+
+  if security find-certificate -a -c "$root_label" -p /Library/Keychains/System.keychain >/dev/null 2>&1 ||      security find-certificate -a -c "$root_label" -p /System/Library/Keychains/SystemRootCertificates.keychain >/dev/null 2>&1; then
+    echo "Root certificate present in system root store: $root_label"
+    return 0
+  fi
+
+  echo "Root certificate $root_label not found in system root store; downloading from Apple..."
+  if ! curl -fsSL --max-time 30 "$root_url" -o "$root_der"; then
+    echo "warning: failed to download $root_label from $root_url" >&2
+    return 1
+  fi
+
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    echo "Installing $root_label into system root store with sudo..."
+    if sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$root_der"; then
+      echo "Installed $root_label into system root store"
+      return 0
+    fi
+    echo "warning: sudo security add-trusted-cert failed for $root_label" >&2
+  else
+    echo "warning: sudo not available; cannot install $root_label into system root store" >&2
+  fi
+
+  return 1
 }
 
 import_developer_id_intermediates() {
