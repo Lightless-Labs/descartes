@@ -177,16 +177,33 @@ sync_guest_clock() {
 print_decoded_signing_certificate_diagnostics() {
   echo "Decoded Developer ID p12 sha256: $(shasum -a 256 "$CERT_PATH" | awk '{print $1}')"
   echo "Decoded Developer ID certificate diagnostics:"
-  local cert_pem="$BUILD_ROOT/developer-id-cert.pem"
-  local pass_file="$BUILD_ROOT/developer-id-cert-password.txt"
-  printf '%s' "$MACOS_DEVELOPER_ID_CERT_PASSWORD" > "$pass_file"
-  chmod 0600 "$pass_file"
-  if openssl pkcs12 -in "$CERT_PATH" -passin "file:$pass_file" -nokeys -clcerts -out "$cert_pem" >/dev/null 2>&1; then
-    openssl x509 -in "$cert_pem" -noout -subject -issuer -dates -fingerprint -sha1 || true
+  local cert_bundle="$BUILD_ROOT/developer-id-certs.pem"
+  if security find-certificate -a -p "$KEYCHAIN_PATH" > "$cert_bundle" 2>/dev/null && [[ -s "$cert_bundle" ]]; then
+    python3 - "$cert_bundle" <<'PY'
+import re, subprocess, sys
+with open(sys.argv[1], "r") as f:
+    pem = f.read()
+certs = re.findall(r"-----BEGIN CERTIFICATE-----\n[\s\S]*?\n-----END CERTIFICATE-----", pem)
+for cert in certs:
+    try:
+        subject = subprocess.check_output(
+            ["openssl", "x509", "-noout", "-subject", "-nameopt", "sep_comma_plus_space"],
+            input=cert.encode(), stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if "Developer ID Application" in subject:
+            subprocess.run(
+                ["openssl", "x509", "-noout", "-subject", "-issuer", "-dates", "-fingerprint", "-sha1"],
+                input=cert.encode(), check=False,
+            )
+            sys.exit(0)
+    except Exception:
+        continue
+print("warning: no Developer ID Application certificate found in keychain")
+PY
   else
-    echo "warning: unable to extract decoded Developer ID certificate diagnostics" >&2
+    echo "warning: unable to extract decoded Developer ID certificate diagnostics from keychain" >&2
   fi
-  rm -f "$cert_pem" "$pass_file"
+  rm -f "$cert_bundle"
 }
 
 PACKAGE_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('$ROOT_DIR/package.json', 'utf8')).version")"
@@ -236,7 +253,6 @@ sync_guest_clock
 printf '%s' "$MACOS_DEVELOPER_ID_CERT_P12_BASE64" | base64_decode > "$CERT_PATH"
 printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64_decode > "$NOTARY_KEY_PATH"
 chmod 0600 "$CERT_PATH" "$NOTARY_KEY_PATH"
-print_decoded_signing_certificate_diagnostics
 
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
@@ -252,6 +268,9 @@ security import "$CERT_PATH" \
   -T /usr/bin/productbuild \
   -T /usr/bin/productsign
 
+# Print diagnostics after the p12 has been imported into the keychain.
+print_decoded_signing_certificate_diagnostics
+
 # Copy the Apple Developer ID intermediate certificate for the imported leaf cert
 # from the system root stores into the ephemeral keychain. A fresh CI macOS image
 # may not include the correct intermediate, and find-identity / codesign evaluate
@@ -259,46 +278,73 @@ security import "$CERT_PATH" \
 # supplied. Having the full chain in the same keychain avoids a broken chain without
 # requiring interactive trust-setting.
 extract_leaf_cert_issuer_cn() {
-  local cert_pem="$BUILD_ROOT/leaf-cert.pem"
-  local pass_file="$BUILD_ROOT/cert-password.txt"
-  printf '%s' "$MACOS_DEVELOPER_ID_CERT_PASSWORD" > "$pass_file"
-  chmod 0600 "$pass_file"
-  if openssl pkcs12 -in "$CERT_PATH" -passin "file:$pass_file" -nokeys -clcerts -out "$cert_pem" >/dev/null 2>&1; then
-    LC_ALL=C openssl x509 -in "$cert_pem" -noout -issuer -nameopt sep_comma_plus_space | LC_ALL=C awk -F', ' '/issuer=/{for(i=1;i<=NF;i++) if($i ~ /^CN=/) {sub(/^CN=/, "", $i); print $i; exit}}' | tr -d '\n'
+  local cert_bundle="$BUILD_ROOT/keychain-certs.pem"
+  local issuer_cn=""
+  if security find-certificate -a -p "$KEYCHAIN_PATH" > "$cert_bundle" 2>/dev/null && [[ -s "$cert_bundle" ]]; then
+    issuer_cn="$(python3 - "$cert_bundle" <<'PY'
+import re, subprocess, sys
+with open(sys.argv[1], "r") as f:
+    pem = f.read()
+certs = re.findall(r"-----BEGIN CERTIFICATE-----\n[\s\S]*?\n-----END CERTIFICATE-----", pem)
+for cert in certs:
+    try:
+        subject = subprocess.check_output(
+            ["openssl", "x509", "-noout", "-subject", "-nameopt", "sep_comma_plus_space"],
+            input=cert.encode(), stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if "Developer ID Application" in subject:
+            issuer = subprocess.check_output(
+                ["openssl", "x509", "-noout", "-issuer", "-nameopt", "sep_comma_plus_space"],
+                input=cert.encode(), stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            for part in issuer.replace("issuer=", "").strip().split(", "):
+                if part.startswith("CN="):
+                    sys.stdout.write(part[3:])
+                    sys.exit(0)
+    except Exception:
+        continue
+PY
+)"
   fi
-  rm -f "$cert_pem" "$pass_file"
+  rm -f "$cert_bundle"
+  printf '%s' "$issuer_cn"
 }
 
 import_developer_id_intermediates() {
   local issuer
   issuer="$(extract_leaf_cert_issuer_cn)"
-  if [[ -z "$issuer" ]]; then
-    echo "warning: unable to extract issuer from Developer ID p12" >&2
-    return
+  local candidates=()
+  if [[ -n "$issuer" ]]; then
+    candidates+=("$issuer")
+  else
+    echo "warning: unable to extract issuer from Developer ID p12; falling back to common intermediate names" >&2
   fi
-  echo "Leaf certificate issuer CN: $issuer"
-  if security find-certificate -a -c "$issuer" -p "$KEYCHAIN_PATH" >/dev/null 2>&1; then
-    echo "Intermediate already present in ephemeral keychain: $issuer"
-    return
-  fi
+  # Also try common Apple Developer ID intermediate names in case issuer extraction failed or the p12 omitted the leaf-only chain.
+  candidates+=("Developer ID Certification Authority" "Apple Developer ID Certification Authority" "Apple Worldwide Developer Relations Certification Authority")
   local found=0
-  for system_keychain in \
-    "/System/Library/Keychains/SystemRootCertificates.keychain" \
-    "/Library/Keychains/System.keychain" \
-    "$(security login-keychain 2>/dev/null | tr -d '"' || true)"
-  do
-    [[ -f "$system_keychain" ]] || continue
-    local pem_file="$BUILD_ROOT/intermediate.pem"
-    if security find-certificate -a -c "$issuer" -p "$system_keychain" > "$pem_file" 2>/dev/null && [[ -s "$pem_file" ]]; then
-      if security import "$pem_file" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null; then
-        echo "Imported intermediate from $system_keychain: $issuer"
-        found=1
-      fi
+  for issuer in "${candidates[@]}"; do
+    if security find-certificate -a -c "$issuer" -p "$KEYCHAIN_PATH" >/dev/null 2>&1; then
+      echo "Intermediate already present in ephemeral keychain: $issuer"
+      continue
     fi
-    rm -f "$pem_file"
+    for system_keychain in \
+      "/System/Library/Keychains/SystemRootCertificates.keychain" \
+      "/Library/Keychains/System.keychain" \
+      "$(security login-keychain 2>/dev/null | tr -d '"' || true)"
+    do
+      [[ -f "$system_keychain" ]] || continue
+      local pem_file="$BUILD_ROOT/intermediate.pem"
+      if security find-certificate -a -c "$issuer" -p "$system_keychain" > "$pem_file" 2>/dev/null && [[ -s "$pem_file" ]]; then
+        if security import "$pem_file" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null; then
+          echo "Imported intermediate from $system_keychain: $issuer"
+          found=1
+        fi
+      fi
+      rm -f "$pem_file"
+    done
   done
   if (( found == 0 )); then
-    echo "warning: could not find intermediate certificate for issuer '$issuer' in system root stores; chain validation may fail" >&2
+    echo "warning: could not find any Apple Developer ID intermediate certificate in system root stores; chain validation may fail" >&2
   fi
 }
 import_developer_id_intermediates
