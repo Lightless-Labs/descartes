@@ -281,28 +281,38 @@ ensure_apple_root_trusted() {
   local root_url="https://www.apple.com/certificateauthority/AppleRootCA-G2.cer"
   local root_der="$BUILD_ROOT/apple-root-ca-g2.cer"
 
-  if security find-certificate -a -c "$root_label" -p /Library/Keychains/System.keychain >/dev/null 2>&1 ||      security find-certificate -a -c "$root_label" -p /System/Library/Keychains/SystemRootCertificates.keychain >/dev/null 2>&1; then
+  local root_present=0
+  if security find-certificate -a -c "$root_label" -p /Library/Keychains/System.keychain >/dev/null 2>&1 || \
+     security find-certificate -a -c "$root_label" -p /System/Library/Keychains/SystemRootCertificates.keychain >/dev/null 2>&1; then
+    root_present=1
     echo "Root certificate present in system root store: $root_label"
+  fi
+
+  # Always re-apply trust settings when we have sudo. On minimal CI macOS images
+  # the root can be present in the system keychain without being marked as trusted,
+  # which causes codesign to fail with "unable to build chain to self-signed root".
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    echo "Ensuring $root_label is trusted in system root store with sudo..."
+    if ! [[ -f "$root_der" ]]; then
+      curl -fsSL --max-time 30 "$root_url" -o "$root_der" || true
+    fi
+    if [[ -f "$root_der" ]]; then
+      if sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$root_der" 2>/dev/null || \
+         sudo -n security add-trusted-cert -d -r trustRoot -k /System/Library/Keychains/SystemRootCertificates.keychain "$root_der" 2>/dev/null; then
+        echo "Ensured $root_label is trusted in system root store"
+        return 0
+      fi
+      echo "warning: sudo security add-trusted-cert failed for $root_label (may already be trusted)" >&2
+    else
+      echo "warning: failed to download $root_label from $root_url" >&2
+    fi
+  fi
+
+  if (( root_present == 1 )); then
     return 0
   fi
 
-  echo "Root certificate $root_label not found in system root store; downloading from Apple..."
-  if ! curl -fsSL --max-time 30 "$root_url" -o "$root_der"; then
-    echo "warning: failed to download $root_label from $root_url" >&2
-    return 1
-  fi
-
-  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    echo "Installing $root_label into system root store with sudo..."
-    if sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$root_der"; then
-      echo "Installed $root_label into system root store"
-      return 0
-    fi
-    echo "warning: sudo security add-trusted-cert failed for $root_label" >&2
-  else
-    echo "warning: sudo not available; cannot install $root_label into system root store" >&2
-  fi
-
+  echo "warning: $root_label not present and sudo unavailable; cannot install into system root store" >&2
   return 1
 }
 
@@ -364,6 +374,7 @@ import_developer_id_intermediates() {
   for issuer in "${candidates[@]}"; do
     if security find-certificate -a -c "$issuer" -p "$KEYCHAIN_PATH" >/dev/null 2>&1; then
       echo "Intermediate already present in ephemeral keychain: $issuer"
+      found=1
       continue
     fi
     for system_keychain in \
