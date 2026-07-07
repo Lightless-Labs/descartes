@@ -271,65 +271,24 @@ security import "$CERT_PATH" \
 # Print diagnostics after the p12 has been imported into the keychain.
 print_decoded_signing_certificate_diagnostics
 
-# Ensure the Apple Root CA - G2 is trusted in the system root store. Minimal CI
-# macOS images (e.g., Cirrus Labs base images) may ship without the Apple root
-# certificates needed to validate a Developer ID (G2) certificate chain. Without
-# the root anchor, codesign cannot build a chain even when the leaf and
-# intermediate are present in the ephemeral keychain.
-ensure_apple_root_trusted() {
-  local root_label="Apple Root CA - G2"
-  local root_url="https://www.apple.com/certificateauthority/AppleRootCA-G2.cer"
-  local root_der="$BUILD_ROOT/apple-root-ca-g2.cer"
+# Ensure the Apple Developer ID intermediate certificate that issued the leaf is
+# present in the ephemeral keychain. Fresh CI macOS images do not ship Developer ID
+# intermediates: the system stores carry only root certificates (plus the legacy G1
+# Developer ID CA); it is Xcode/developer tooling that installs intermediates on
+# developer machines. codesign builds its signing chain from the keychain search
+# list without fetching missing issuers over the network, so the intermediate must
+# sit next to the leaf. The chain terminates at the classic "Apple Root CA", which
+# every genuine macOS image already ships and trusts; no root-store installation or
+# trust-settings changes are needed.
+#
+# NOTE: `security find-certificate -a ... -p` exits 0 even when nothing matches, so
+# certificate presence checks must inspect the output, never the exit status.
 
-  local root_present=0
-  if security find-certificate -a -c "$root_label" -p /Library/Keychains/System.keychain >/dev/null 2>&1 || \
-     security find-certificate -a -c "$root_label" -p /System/Library/Keychains/SystemRootCertificates.keychain >/dev/null 2>&1; then
-    root_present=1
-    echo "Root certificate present in system root store: $root_label"
-  fi
-
-  # Always re-apply trust settings when we have sudo. On minimal CI macOS images
-  # the root can be present in the system keychain without being marked as trusted,
-  # which causes codesign to fail with "unable to build chain to self-signed root".
-  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    echo "Ensuring $root_label is trusted in system root store with sudo..."
-    if ! [[ -f "$root_der" ]]; then
-      curl -fsSL --max-time 30 "$root_url" -o "$root_der" || true
-    fi
-    if [[ -f "$root_der" ]]; then
-      if sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$root_der" 2>/dev/null || \
-         sudo -n security add-trusted-cert -d -r trustRoot -k /System/Library/Keychains/SystemRootCertificates.keychain "$root_der" 2>/dev/null; then
-        echo "Ensured $root_label is trusted in system root store"
-        return 0
-      fi
-      echo "warning: sudo security add-trusted-cert failed for $root_label (may already be trusted)" >&2
-    else
-      echo "warning: failed to download $root_label from $root_url" >&2
-    fi
-  fi
-
-  if (( root_present == 1 )); then
-    return 0
-  fi
-
-  echo "warning: $root_label not present and sudo unavailable; cannot install into system root store" >&2
-  return 1
-}
-
-# Ensure the system root store has the Apple root anchor for the G2 chain.
-ensure_apple_root_trusted
-
-# Copy the Apple Developer ID intermediate certificate for the imported leaf cert
-# from the system root stores into the ephemeral keychain. A fresh CI macOS image
-# may not include the correct intermediate, and find-identity / codesign evaluate
-# the imported identity against the contents of the keychain when a keychain path is
-# supplied. Having the full chain in the same keychain avoids a broken chain without
-# requiring interactive trust-setting.
-extract_leaf_cert_issuer_cn() {
+extract_leaf_cert_issuer() {
   local cert_bundle="$BUILD_ROOT/keychain-certs.pem"
-  local issuer_cn=""
+  local issuer=""
   if security find-certificate -a -p "$KEYCHAIN_PATH" > "$cert_bundle" 2>/dev/null && [[ -s "$cert_bundle" ]]; then
-    issuer_cn="$(python3 - "$cert_bundle" <<'PY'
+    issuer="$(python3 - "$cert_bundle" <<'PY'
 import re, subprocess, sys
 with open(sys.argv[1], "r") as f:
     pem = f.read()
@@ -345,59 +304,93 @@ for cert in certs:
                 ["openssl", "x509", "-noout", "-issuer", "-nameopt", "sep_comma_plus_space"],
                 input=cert.encode(), stderr=subprocess.DEVNULL,
             ).decode().strip()
-            for part in issuer.replace("issuer=", "").strip().split(", "):
-                if part.startswith("CN="):
-                    sys.stdout.write(part[3:])
-                    sys.exit(0)
+            sys.stdout.write(issuer.replace("issuer=", "").strip())
+            sys.exit(0)
     except Exception:
         continue
 PY
 )"
   fi
   rm -f "$cert_bundle"
-  printf '%s' "$issuer_cn"
+  printf '%s' "$issuer"
 }
 
-
-import_developer_id_intermediates() {
-  local issuer
-  issuer="$(extract_leaf_cert_issuer_cn)"
-  local candidates=()
-  if [[ -n "$issuer" ]]; then
-    candidates+=("$issuer")
-  else
-    echo "warning: unable to extract issuer from Developer ID p12; falling back to common intermediate names" >&2
-  fi
-  # Also try common Apple Developer ID intermediate names in case issuer extraction failed or the p12 omitted the leaf-only chain.
-  candidates+=("Developer ID Certification Authority" "Apple Developer ID Certification Authority" "Apple Worldwide Developer Relations Certification Authority")
-  local found=0
-  for issuer in "${candidates[@]}"; do
-    if security find-certificate -a -c "$issuer" -p "$KEYCHAIN_PATH" >/dev/null 2>&1; then
-      echo "Intermediate already present in ephemeral keychain: $issuer"
-      found=1
-      continue
+keychain_contains_certificate_subject() {
+  local cn_fragment="$1" ou_fragment="$2"
+  local cert_bundle="$BUILD_ROOT/keychain-certs.pem"
+  local result=1
+  if security find-certificate -a -p "$KEYCHAIN_PATH" > "$cert_bundle" 2>/dev/null && [[ -s "$cert_bundle" ]]; then
+    if python3 - "$cert_bundle" "$cn_fragment" "$ou_fragment" <<'PY'
+import re, subprocess, sys
+path, cn, ou = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "r") as f:
+    pem = f.read()
+certs = re.findall(r"-----BEGIN CERTIFICATE-----\n[\s\S]*?\n-----END CERTIFICATE-----", pem)
+for cert in certs:
+    try:
+        subject = subprocess.check_output(
+            ["openssl", "x509", "-noout", "-subject", "-nameopt", "sep_comma_plus_space"],
+            input=cert.encode(), stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if cn in subject and ou in subject:
+            sys.exit(0)
+    except Exception:
+        continue
+sys.exit(1)
+PY
+    then
+      result=0
     fi
-    for system_keychain in \
-      "/System/Library/Keychains/SystemRootCertificates.keychain" \
-      "/Library/Keychains/System.keychain" \
-      "$(security login-keychain 2>/dev/null | tr -d '"' || true)"
-    do
-      [[ -f "$system_keychain" ]] || continue
-      local pem_file="$BUILD_ROOT/intermediate.pem"
-      if security find-certificate -a -c "$issuer" -p "$system_keychain" > "$pem_file" 2>/dev/null && [[ -s "$pem_file" ]]; then
-        if security import "$pem_file" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null; then
-          echo "Imported intermediate from $system_keychain: $issuer"
-          found=1
-        fi
-      fi
-      rm -f "$pem_file"
-    done
-  done
-  if (( found == 0 )); then
-    echo "warning: could not find any Apple Developer ID intermediate certificate in system root stores; chain validation may fail" >&2
   fi
+  rm -f "$cert_bundle"
+  return "$result"
 }
-import_developer_id_intermediates
+
+import_developer_id_intermediate() {
+  local issuer intermediate_ou intermediate_url subject
+  local intermediate_der="$BUILD_ROOT/developer-id-intermediate.cer"
+  issuer="$(extract_leaf_cert_issuer)"
+  if [[ -z "$issuer" ]]; then
+    echo "error: unable to read the issuer of the imported Developer ID Application certificate" >&2
+    exit 2
+  fi
+  echo "Developer ID leaf issuer: $issuer"
+  if [[ "$issuer" != *"CN=Developer ID Certification Authority"* ]]; then
+    echo "error: unexpected Developer ID leaf issuer; cannot select an Apple intermediate: $issuer" >&2
+    exit 2
+  fi
+  # Apple PKI publishes both generations of the Developer ID CA. Leaves issued
+  # since ~2021 chain through the G2 intermediate (OU=G2); older ones through G1.
+  if [[ "$issuer" == *"OU=G2"* ]]; then
+    intermediate_ou="OU=G2"
+    intermediate_url="https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer"
+  else
+    intermediate_ou="OU=Apple Certification Authority"
+    intermediate_url="https://www.apple.com/certificateauthority/DeveloperIDCA.cer"
+  fi
+  if keychain_contains_certificate_subject "CN=Developer ID Certification Authority" "$intermediate_ou"; then
+    echo "Developer ID intermediate already present in ephemeral keychain ($intermediate_ou)"
+    return 0
+  fi
+  echo "Downloading Developer ID intermediate from Apple PKI: $intermediate_url"
+  if ! curl -fsSL --max-time 30 "$intermediate_url" -o "$intermediate_der"; then
+    echo "error: failed to download the Developer ID intermediate from $intermediate_url" >&2
+    exit 2
+  fi
+  subject="$(openssl x509 -inform DER -in "$intermediate_der" -noout -subject -nameopt sep_comma_plus_space 2>/dev/null || true)"
+  if [[ "$subject" != *"CN=Developer ID Certification Authority"* || "$subject" != *"$intermediate_ou"* ]]; then
+    echo "error: downloaded intermediate does not match the leaf issuer: ${subject:-<unparseable>}" >&2
+    exit 2
+  fi
+  security import "$intermediate_der" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
+  rm -f "$intermediate_der"
+  if ! keychain_contains_certificate_subject "CN=Developer ID Certification Authority" "$intermediate_ou"; then
+    echo "error: Developer ID intermediate import did not land in the ephemeral keychain" >&2
+    exit 2
+  fi
+  echo "Imported Developer ID intermediate into ephemeral keychain ($intermediate_ou)"
+}
+import_developer_id_intermediate
 
 # Allow codesign to access the imported identity without an interactive prompt.
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"

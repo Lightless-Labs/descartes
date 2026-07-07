@@ -57,12 +57,14 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkiteScript, /DOPPLER_PROJECT:-lightless-labs-descartes/);
   assert.match(buildkiteScript, /DOPPLER_CONFIG:-prd_notarisation/);
   assert.match(buildkiteScript, /unset DOPPLER_TOKEN/);
+  assert.match(buildkiteScript, /DeveloperIDG2CA\.cer/);
+  assert.doesNotMatch(buildkiteScript, /add-trusted-cert/);
   assert.doesNotMatch(buildkiteScript, /require_env CODESIGN_IDENTITY/);
   assert.doesNotMatch(buildkiteScript, /KEYCHAIN_PASSWORD=\$\{[A-Z_]+:-/);
   assert.match(buildkitePipeline, /build.tag != null/);
   assert.match(buildkitePipeline, /key: release-macos-notifier/);
   assert.match(buildkitePipeline, /queue: "ci-macos-apple-silicon"/);
-  assert.match(buildkitePipeline, /github\.com\/Lightless-Labs\/tart-ci#v0\.2\.2/);
+  assert.match(buildkitePipeline, /github\.com\/Lightless-Labs\/tart-ci#v0\.2\.3/);
   assert.match(buildkitePipeline, /prepare_guest_checkout\(\)/);
   assert.match(buildkitePipeline, /rsync -a --delete --exclude node_modules --exclude \.git/);
   assert.match(buildkitePipeline, /artifact_paths:\n\s+- "\.build\/macos-notifier\/release\/\*"/);
