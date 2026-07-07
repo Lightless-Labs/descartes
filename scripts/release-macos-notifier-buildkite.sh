@@ -507,7 +507,10 @@ DESCARTES_MACOS_NOTIFIER_ARTIFACT_DIR="$RELEASE_DIR" \
 
 shasum -a 256 "$ZIP_PATH" > "$SHA_PATH"
 
-if command -v buildkite-agent >/dev/null 2>&1; then
+# Upload directly only when running under a host-side Buildkite agent. Inside the
+# Tart guest there is no agent access token; there the pipeline rsyncs the release
+# directory back to the shared checkout and uploads via artifact_paths instead.
+if command -v buildkite-agent >/dev/null 2>&1 && [[ -n "${BUILDKITE_AGENT_ACCESS_TOKEN:-}" ]]; then
   buildkite-agent artifact upload "$ZIP_PATH"
   buildkite-agent artifact upload "$SHA_PATH"
 fi
