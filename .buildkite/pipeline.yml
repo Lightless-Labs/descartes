@@ -77,7 +77,10 @@ steps:
       queue: "ci-macos-apple-silicon"
     plugins:
       - github.com/Lightless-Labs/tart-ci#v0.2.4:
-          image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+          # Pin the source image digest so Tart can reuse the host cache across jobs.
+          # The plugin still clones this source to a fresh buildkite-tart-ci-* VM per job
+          # and deletes only that per-job clone during cleanup.
+          image: "ghcr.io/cirruslabs/macos-sequoia-base@sha256:fdd8b72a6ee46fc8ad35dc1b9f3b1f162b6607b82a584947d20bb28d3dcb99ed"
           os: "macos"
           always_pull: false
           headless: true
@@ -150,7 +153,10 @@ steps:
       queue: "ci-macos-apple-silicon"
     plugins:
       - github.com/Lightless-Labs/tart-ci#v0.2.4:
-          image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+          # Pin the source image digest so Tart can reuse the host cache across jobs.
+          # The plugin still clones this source to a fresh buildkite-tart-ci-* VM per job
+          # and deletes only that per-job clone during cleanup.
+          image: "ghcr.io/cirruslabs/macos-sequoia-base@sha256:fdd8b72a6ee46fc8ad35dc1b9f3b1f162b6607b82a584947d20bb28d3dcb99ed"
           os: "macos"
           always_pull: false
           headless: true
