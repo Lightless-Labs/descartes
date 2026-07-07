@@ -45,8 +45,11 @@ Optional override:
   CODESIGN_IDENTITY  Defaults to the first Developer ID Application identity imported from the p12.
 
 Optional publication environment:
-  GITHUB_TOKEN         Upload the zip/checksum to the matching GitHub Release when gh is installed.
-  GITHUB_REPOSITORY    owner/repo override for gh, otherwise inferred from git remote.
+  GITHUB_TOKEN         Upload the zip/checksum to the matching GitHub Release via the
+                       GitHub REST API (no gh dependency). Also fetched from Doppler
+                       when present there (optional secret).
+  GITHUB_REPOSITORY    owner/repo override; otherwise inferred from the git remote or
+                       package.json repository.url.
 
 This script is intended for tag-triggered Buildkite macOS jobs. It creates an
 ephemeral keychain with a runtime-generated password, builds the notifier app,
@@ -79,6 +82,7 @@ command -v shasum >/dev/null || { echo "error: shasum is required" >&2; exit 2; 
 
 fetch_release_secret_from_doppler() {
   local name="$1"
+  local optional="${2:-}"
   if [[ -z "${DOPPLER_TOKEN:-}" || -n "${!name:-}" ]]; then
     return 0
   fi
@@ -135,10 +139,18 @@ if not isinstance(secret_value, str) or not secret_value:
 print(secret_value, end="")
 PY
 )"; then
+    if [[ "$optional" == "optional" ]]; then
+      echo "note: optional Doppler release secret not available: $name" >&2
+      return 0
+    fi
     echo "error: failed to fetch Doppler release secret: $name" >&2
     exit 2
   fi
   if [[ -z "$value" ]]; then
+    if [[ "$optional" == "optional" ]]; then
+      echo "note: optional Doppler release secret is empty: $name" >&2
+      return 0
+    fi
     echo "error: Doppler release secret is empty: $name" >&2
     exit 2
   fi
@@ -152,6 +164,8 @@ fetch_release_secrets_from_doppler() {
   fetch_release_secret_from_doppler APPLE_NOTARY_KEY_ID
   fetch_release_secret_from_doppler APPLE_NOTARY_ISSUER_ID
   fetch_release_secret_from_doppler APPLE_NOTARY_KEY_P8_BASE64
+  # Optional: enables GitHub Release publication from inside the guest.
+  fetch_release_secret_from_doppler GITHUB_TOKEN optional
   unset DOPPLER_TOKEN
 }
 
@@ -515,13 +529,82 @@ if command -v buildkite-agent >/dev/null 2>&1 && [[ -n "${BUILDKITE_AGENT_ACCESS
   buildkite-agent artifact upload "$SHA_PATH"
 fi
 
-if [[ -n "${GITHUB_TOKEN:-}" && -n "$TAG" ]] && command -v gh >/dev/null 2>&1; then
-  export GH_TOKEN="$GITHUB_TOKEN"
+github_release_repository() {
   if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
-    gh repo set-default "$GITHUB_REPOSITORY" >/dev/null
+    printf '%s' "$GITHUB_REPOSITORY"
+    return 0
   fi
-  gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Descartes $TAG macOS notifier release"
-  gh release upload "$TAG" "$ZIP_PATH" "$SHA_PATH" --clobber
+  local url
+  url="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    # Tart guest checkouts are rsynced without .git; fall back to package metadata.
+    url="$(node -p "(JSON.parse(require('fs').readFileSync('$ROOT_DIR/package.json','utf8')).repository||{}).url||''" 2>/dev/null || true)"
+  fi
+  url="${url%.git}"
+  case "$url" in
+    *github.com:*) printf '%s' "${url##*github.com:}" ;;
+    *github.com/*) printf '%s' "${url##*github.com/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Publish the stapled zip + checksum to the matching GitHub Release via the REST
+# API (the vanilla guest image has no gh CLI). GITHUB_TOKEN arrives via Doppler
+# when provisioned there; without it this step is skipped.
+if [[ -n "${GITHUB_TOKEN:-}" && -n "$TAG" ]]; then
+  if GH_RELEASE_REPO="$(github_release_repository)" && [[ -n "$GH_RELEASE_REPO" ]]; then
+    echo "Publishing GitHub Release $TAG assets to $GH_RELEASE_REPO"
+    GH_RELEASE_REPO="$GH_RELEASE_REPO" GH_RELEASE_TAG="$TAG" python3 - "$ZIP_PATH" "$SHA_PATH" <<'PY'
+import json, os, sys, urllib.error, urllib.parse, urllib.request
+
+token = os.environ["GITHUB_TOKEN"]
+repo = os.environ["GH_RELEASE_REPO"]
+tag = os.environ["GH_RELEASE_TAG"]
+assets = sys.argv[1:]
+API = "https://api.github.com"
+
+def call(method, url, data=None, content_type="application/json"):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "descartes-macos-notifier-release/1",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if data is not None:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(url, method=method, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=120) as res:
+        body = res.read()
+    return json.loads(body) if body else {}
+
+try:
+    release = call("GET", f"{API}/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}")
+except urllib.error.HTTPError as exc:
+    if exc.code != 404:
+        print(f"GitHub release lookup failed for {repo}@{tag}: HTTP {exc.code}", file=sys.stderr)
+        sys.exit(2)
+    payload = json.dumps({
+        "tag_name": tag,
+        "name": tag,
+        "body": f"Descartes {tag} macOS notifier release",
+    }).encode()
+    release = call("POST", f"{API}/repos/{repo}/releases", payload)
+    print(f"created GitHub release {tag}")
+
+existing = {a["name"]: a["id"] for a in release.get("assets", [])}
+upload_base = release["upload_url"].split("{")[0]
+for path in assets:
+    name = os.path.basename(path)
+    if name in existing:
+        call("DELETE", f"{API}/repos/{repo}/releases/assets/{existing[name]}")
+    with open(path, "rb") as f:
+        data = f.read()
+    call("POST", f"{upload_base}?name={urllib.parse.quote(name)}", data, "application/octet-stream")
+    print(f"uploaded {name}")
+PY
+  else
+    echo "warning: GITHUB_TOKEN set but repository could not be determined; skipping GitHub Release upload" >&2
+  fi
 fi
 
 cat <<EOF
