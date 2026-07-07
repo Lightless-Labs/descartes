@@ -7,7 +7,7 @@ steps:
     agents:
       queue: "ci-linux-arm64"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.3:
+      - github.com/Lightless-Labs/tart-ci#v0.2.4:
           image: "ci-linux-arm64-rust-bazel"
           os: "linux"
           always_pull: false
@@ -76,7 +76,7 @@ steps:
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.3:
+      - github.com/Lightless-Labs/tart-ci#v0.2.4:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
@@ -140,12 +140,16 @@ steps:
   - label: ":apple: Release macOS notifier"
     key: release-macos-notifier
     if: build.tag != null && build.tag =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-    concurrency: 1
-    concurrency_group: "big-cabbage/descartes-release"
+    # Share the host-wide Tart cap with the CI jobs: macOS allows only two
+    # concurrent macOS guests per host, and a tag build can overlap a main
+    # build for the same commit (push then tag). A separate concurrency group
+    # would allow 2 CI VMs + 1 release VM on one host.
+    concurrency: 2
+    concurrency_group: "big-cabbage/tart-ci"
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
-      - github.com/Lightless-Labs/tart-ci#v0.2.3:
+      - github.com/Lightless-Labs/tart-ci#v0.2.4:
           image: "ghcr.io/cirruslabs/macos-sequoia-base:latest"
           os: "macos"
           always_pull: false
