@@ -225,6 +225,7 @@ mkdir -p "$RELEASE_DIR"
 KEYCHAIN_PATH="$BUILD_ROOT/descartes-signing.keychain-db"
 CERT_PATH="$BUILD_ROOT/developer-id.p12"
 NOTARY_KEY_PATH="$BUILD_ROOT/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+INTERMEDIATE_PEM="$BUILD_ROOT/developer-id-intermediate.pem"
 KEYCHAIN_PASSWORD="$(openssl rand -base64 48)"
 ORIGINAL_USER_KEYCHAINS="$(security list-keychains -d user 2>/dev/null | tr -d '"' || true)"
 
@@ -244,7 +245,7 @@ restore_user_keychain_settings() {
 cleanup() {
   restore_user_keychain_settings
   security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
-  rm -f "$CERT_PATH" "$NOTARY_KEY_PATH"
+  rm -f "$CERT_PATH" "$NOTARY_KEY_PATH" "$INTERMEDIATE_PEM"
 }
 trap cleanup EXIT
 
@@ -317,9 +318,10 @@ PY
 
 keychain_contains_certificate_subject() {
   local cn_fragment="$1" ou_fragment="$2"
+  local keychain="${3:-$KEYCHAIN_PATH}"
   local cert_bundle="$BUILD_ROOT/keychain-certs.pem"
   local result=1
-  if security find-certificate -a -p "$KEYCHAIN_PATH" > "$cert_bundle" 2>/dev/null && [[ -s "$cert_bundle" ]]; then
+  if security find-certificate -a -p "$keychain" > "$cert_bundle" 2>/dev/null && [[ -s "$cert_bundle" ]]; then
     if python3 - "$cert_bundle" "$cn_fragment" "$ou_fragment" <<'PY'
 import re, subprocess, sys
 path, cn, ou = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -383,12 +385,35 @@ import_developer_id_intermediate() {
     exit 2
   fi
   security import "$intermediate_der" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
-  rm -f "$intermediate_der"
   if ! keychain_contains_certificate_subject "CN=Developer ID Certification Authority" "$intermediate_ou"; then
     echo "error: Developer ID intermediate import did not land in the ephemeral keychain" >&2
     exit 2
   fi
   echo "Imported Developer ID intermediate into ephemeral keychain ($intermediate_ou)"
+
+  # Keep a PEM copy for chain diagnostics before signing.
+  openssl x509 -inform DER -in "$intermediate_der" -out "$INTERMEDIATE_PEM" 2>/dev/null || true
+
+  # codesign builds its signing chain through trustd, which is not guaranteed to
+  # consult a session-modified custom keychain search list on a fresh CI image
+  # (build #63 failed with "unable to build chain" despite the intermediate being
+  # in the search-listed ephemeral keychain). Provisioned developer machines and
+  # GitHub runner images both carry the Apple intermediates system-wide, so
+  # mirror that: install the public intermediate certificate into the system
+  # keychain. This adds a certificate only - no trust-settings changes.
+  if keychain_contains_certificate_subject "CN=Developer ID Certification Authority" "$intermediate_ou" /Library/Keychains/System.keychain; then
+    echo "Developer ID intermediate already present in system keychain ($intermediate_ou)"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    if sudo -n security add-certificates -k /Library/Keychains/System.keychain "$intermediate_der" 2>/dev/null && \
+       keychain_contains_certificate_subject "CN=Developer ID Certification Authority" "$intermediate_ou" /Library/Keychains/System.keychain; then
+      echo "Installed Developer ID intermediate into system keychain ($intermediate_ou)"
+    else
+      echo "warning: failed to install Developer ID intermediate into system keychain; codesign chain building may fail" >&2
+    fi
+  else
+    echo "warning: passwordless sudo unavailable; Developer ID intermediate only in ephemeral keychain" >&2
+  fi
+  rm -f "$intermediate_der"
 }
 import_developer_id_intermediate
 
@@ -438,9 +463,35 @@ fi
 
 echo "Using codesign identity: $CODESIGN_IDENTITY"
 
+print_chain_diagnostics() {
+  local leaf_pem="$BUILD_ROOT/leaf-diag.pem"
+  echo "Chain diagnostics:" >&2
+  echo "Keychain search list:" >&2
+  security list-keychains >&2 || true
+  if security find-certificate -c "Developer ID Application" -p "$KEYCHAIN_PATH" > "$leaf_pem" 2>/dev/null && grep -q "BEGIN CERTIFICATE" "$leaf_pem"; then
+    if [[ -s "$INTERMEDIATE_PEM" ]]; then
+      echo "verify-cert codeSign policy, local certs only (leaf + intermediate vs system anchors):" >&2
+      security verify-cert -L -c "$leaf_pem" -c "$INTERMEDIATE_PEM" -p codeSign >&2 2>&1 || true
+    fi
+    echo "verify-cert codeSign policy, default resolution:" >&2
+    security verify-cert -c "$leaf_pem" -p codeSign >&2 2>&1 || true
+  else
+    echo "warning: could not export leaf certificate for diagnostics" >&2
+  fi
+  rm -f "$leaf_pem"
+  if security find-certificate -c "Apple Root CA" -p /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null | grep -q "BEGIN CERTIFICATE"; then
+    echo "Apple Root CA present in system root store" >&2
+  else
+    echo "warning: Apple Root CA NOT found in system root store" >&2
+  fi
+}
+
 # Verify the selected identity is valid somewhere in the search list before signing.
-if ! security find-identity -v -p codesigning | grep -F "$CODESIGN_IDENTITY" >/dev/null 2>&1; then
+if security find-identity -v -p codesigning | grep -F "$CODESIGN_IDENTITY" >/dev/null 2>&1; then
+  echo "Identity reported valid in the full search list"
+else
   echo "warning: $CODESIGN_IDENTITY was not reported as valid in the full search list" >&2
+  print_chain_diagnostics
 fi
 
 DESCARTES_MACOS_NOTIFIER_BUILD_DIR="$BUILD_ROOT" \

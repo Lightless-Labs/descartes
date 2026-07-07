@@ -58,6 +58,7 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkiteScript, /DOPPLER_CONFIG:-prd_notarisation/);
   assert.match(buildkiteScript, /unset DOPPLER_TOKEN/);
   assert.match(buildkiteScript, /DeveloperIDG2CA\.cer/);
+  assert.match(buildkiteScript, /security add-certificates -k \/Library\/Keychains\/System\.keychain/);
   assert.doesNotMatch(buildkiteScript, /add-trusted-cert/);
   assert.doesNotMatch(buildkiteScript, /require_env CODESIGN_IDENTITY/);
   assert.doesNotMatch(buildkiteScript, /KEYCHAIN_PASSWORD=\$\{[A-Z_]+:-/);
