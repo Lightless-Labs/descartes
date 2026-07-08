@@ -16,24 +16,23 @@ related:
 
 ## Summary
 
-Deliver the notarized `DescartesNotifier.app` release asset to end users. Milestone 1:
-`descartes alerts notifications setup --channel native` downloads the version-matched
-asset from the GitHub Release, verifies sha256 + staple + Gatekeeper, installs to a
-stable per-user path, and persists the helper path in config. Milestone 2: add a
-`descartes` formula to the existing `Lightless-Labs/homebrew-tap` (currently `middens`
-only — Descartes is NOT on Homebrew today). See the plan for design bounds.
+Deliver the notarized `DescartesNotifier.app` release asset to end users via Homebrew
+(operator decision 2026-07-08; the in-CLI download flow is deferred). Milestone 1: a
+`descartes` formula in the existing `Lightless-Labs/homebrew-tap` installs the Node CLI
+plus the helper resource inside the npm package tree at the path the CLI's
+bundled-helper resolution already probes — no CLI code changes. Milestone 2: the
+release job bumps the formula on each tag. See the plan for design bounds.
 
 ## Acceptance criteria
 
-- [ ] `setup --channel native` on macOS installs the helper for the CLI's own version
-      with checksum + staple + Gatekeeper verification, failing closed with an audit
-      record on any error.
-- [ ] Stable install path preserves bundle identity across CLI reinstalls; idempotent
-      re-runs; atomic replacement on version change.
-- [ ] Tests cover URL derivation, checksum verification, install/replace via injected
-      fetcher, config persistence, and failure modes (no network, missing asset,
-      checksum mismatch).
+- [ ] `brew install lightless-labs/tap/descartes` on macOS yields a working
+      `descartes` CLI and a stapled, Gatekeeper-accepted helper that
+      `descartes alerts notifications setup --channel native` resolves without flags.
+- [ ] Formula `test` block passes; helper bundle survives brew staging with signature
+      and staple intact (`stapler validate`, `spctl --assess`).
+- [ ] README documents brew as the macOS install path, including the migration caveat
+      for prior `npm -g` installs sharing the Homebrew prefix.
 - [ ] Real-host validation: first-run Notification Center permission prompt attribution
-      and persistence with the downloaded helper.
-- [ ] Homebrew milestone decision recorded (ship Node-era formula now vs wait for Rust
-      binaries), with tap-bump automation and token scoping noted if shipped.
+      and persistence with the brew-installed helper.
+- [ ] Milestone 2 tap-bump automation implemented with a separately-scoped token, or
+      explicitly deferred with manual bump steps documented in the release flow.

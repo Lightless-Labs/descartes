@@ -1,7 +1,9 @@
 # macOS Notifier Helper Delivery
 
 **Created:** 2026-07-08
-**Status:** Proposed
+**Status:** In Progress
+**Updated:** 2026-07-08 — direction decision (operator): Homebrew is the primary macOS delivery channel. The tap formula installs the CLI and the notarized helper together; the in-CLI setup/download flow is deferred, not implemented.
+**Updated:** 2026-07-08 — Milestone 1 implemented and verified: `Formula/descartes.rb` pushed to `Lightless-Labs/homebrew-tap` (`e655211`). Local install verified end-to-end: CLI `--version` from the keg, helper stapled + Gatekeeper-accepted after ditto extraction (generic resource staging descends into the single top-level `.app` and breaks — the formula uses `resource.fetch` + `ditto -x -k`), and `resolveBundledMacosHelperPath()` resolves the helper from the installed tree with no configuration. The npm-shadow link caveat was confirmed live (brew leaves an existing npm-owned `descartes` symlink untouched and installs unlinked). Remaining: Milestone 2 (release-job tap bump) and real-host permission-prompt validation.
 
 ## Purpose
 
@@ -29,52 +31,45 @@ excludes macOS binaries), and `--helper <path>` is a development-only override.
   path stability matters (see 2026-07-07 addenda in
   `docs/plans/2026-05-30-native-macos-notifications.md`).
 
-## Milestone 1 — in-CLI setup/download flow (universal)
+## Milestone 1 — Homebrew tap formula: CLI + helper together (primary)
 
-Make `descartes alerts notifications setup --channel native` (without `--helper`) deliver
-the helper on macOS regardless of how the CLI was installed:
+Add `Formula/descartes.rb` to `Lightless-Labs/homebrew-tap`:
 
-1. Derive the asset URL from the CLI's own `package.json` version (fixed URL template,
-   HTTPS only, no user-supplied URLs).
-2. Download zip + `.sha256`; require checksum match before any extraction.
-3. Extract with `ditto -x -k`; install to a stable per-user path
-   (`~/Library/Application Support/descartes/DescartesNotifier.app`) so the bundle
-   identity — and therefore the user's notification permission grant — survives CLI
-   reinstalls/upgrades.
-4. Verify post-install: `xcrun stapler validate` and `spctl --assess --type execute`;
-   fail closed (keep `osascript` fallback, write a delivery-audit record) on any failure.
-5. Persist the helper path in notification config; send the standard test notification.
-6. Idempotent re-runs: if the installed helper version matches, no-op; if it differs,
-   replace atomically (extract to temp dir, swap) and note that a changed signing
-   identity resets the permission grant.
-
-Failure modes to handle explicitly: no network, release/asset missing for this version
-(e.g., installed from `main` between tags), checksum mismatch (delete download, fail
-closed), non-macOS invocation (unchanged fail-closed behavior).
-
-Tests: URL derivation from version, checksum verification, install/replace flow with an
-injected fetcher (no real network in tests), config persistence, audit records. Real-host
-validation checklist: first-run permission prompt attribution and persistence with the
-downloaded helper (this is also the outstanding item from the native-notifications plan).
-
-## Milestone 2 — Homebrew delivery via the existing tap
-
-Add `descartes` to `Lightless-Labs/homebrew-tap` as the macOS convenience channel:
-
-- Node era (now): a formula with `depends_on "node"`, `url` = release tag tarball, npm
-  install into libexec; on macOS, the notarized helper zip as a version+sha256-pinned
-  `resource` installed alongside, with the CLI's bundled-helper resolution taught to
-  check the brew install location before falling back to Milestone 1's download path.
+- `url` = release tag source tarball (sha256-pinned); `depends_on "node"`; install via
+  `std_npm_args` into `libexec`; symlink `bin/descartes`.
+- The notarized `DescartesNotifier.app.zip` release asset as a version+sha256-pinned
+  `resource`, installed (macOS only) inside the npm package tree at
+  `libexec/lib/node_modules/@lightless-labs/descartes/tools/descartes-cli/native/macos/DescartesNotifier.app`
+  — the exact relative path `resolveBundledMacosHelperPath` in
+  `tools/descartes-cli/src/notification-delivery.js` already probes, so the CLI needs
+  **no code changes**: `descartes alerts notifications setup --channel native` resolves
+  the helper out of the box.
+- Note `npm pack`'s `files` filter keeps `tools/descartes-cli/native` sources out of the
+  npm payload as before; only the brew resource places the built helper there.
+- Verification per install: `stapler validate` + `spctl --assess` on the installed
+  bundle; formula `test` block asserts `descartes --version`.
+- Known migration caveat: users who previously ran `npm install -g` with Homebrew's
+  node have an npm-owned `/opt/homebrew/bin/descartes` symlink; `brew link` will refuse
+  until `npm uninstall -g @lightless-labs/descartes` (document in README/caveats).
 - Rust era (later): the formula converges on the middens shape — per-platform binary
   tarballs from GitHub Releases (macOS binaries signed/notarized by the same pipeline)
-  plus the helper resource on macOS. Defer heavy formula investment until then if
-  Milestone 1 proves sufficient interim delivery.
-- Release automation follow-up: bump the tap formula from the release job (needs a token
-  scoped to `homebrew-tap`, separate from the descartes-repo `GITHUB_TOKEN` in Doppler —
-  do not widen the existing token's scope).
+  plus the helper resource on macOS.
 
-Milestone 1 ships first: it is small, channel-agnostic, and remains the fallback even
-for Homebrew installs.
+## Milestone 2 — release automation bumps the tap
+
+On each tag release, update `Formula/descartes.rb` (url version + both sha256 values)
+in `Lightless-Labs/homebrew-tap` from the release job. Needs a token scoped to
+`homebrew-tap` (separate from the descartes-repo `GITHUB_TOKEN` in Doppler — do not
+widen the existing token's scope). Until implemented, the formula is bumped manually
+per release.
+
+## Deferred — in-CLI setup/download flow
+
+The previously drafted Milestone 1 (CLI downloads the version-matched release asset,
+verifies sha256 + staple + Gatekeeper, installs to a stable per-user path) is deferred
+by operator decision in favor of Homebrew delivery. Revisit only if a meaningful
+population of macOS users stays on npm installs; those users retain the documented
+`--helper` override and can install the helper from the GitHub Release manually.
 
 ## Non-goals
 

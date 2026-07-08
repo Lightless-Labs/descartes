@@ -12,7 +12,23 @@ No host actions are taken.
 
 ## Quick start
 
-Requires Node.js 22.19.0+ and a writable npm global prefix.
+On macOS, install with Homebrew — this delivers the CLI together with the signed,
+notarized native notification helper:
+
+```bash
+brew install lightless-labs/tap/descartes
+```
+
+If you previously installed via `npm install -g` using Homebrew's Node.js, remove that
+install first so `brew link` can claim the `descartes` command:
+
+```bash
+npm uninstall -g @lightless-labs/descartes
+```
+
+Cross-platform install via npm requires Node.js 22.19.0+ and a writable npm global
+prefix. This path does not include the macOS native notification helper; the
+`osascript` fallback channel still works, and `--helper` remains a manual override.
 
 ```bash
 npm install -g github:Lightless-Labs/descartes
