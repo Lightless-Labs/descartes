@@ -50,6 +50,11 @@ Optional publication environment:
                        when present there (optional secret).
   GITHUB_REPOSITORY    owner/repo override; otherwise inferred from the git remote or
                        package.json repository.url.
+  HOMEBREW_TAP_GITHUB_TOKEN
+                       Bump Formula/descartes.rb in Lightless-Labs/homebrew-tap to this
+                       release (URLs + both sha256 values) after the GitHub Release is
+                       published. Contents R/W on homebrew-tap only; also fetched from
+                       Doppler when present there (optional secret).
 
 This script is intended for tag-triggered Buildkite macOS jobs. It creates an
 ephemeral keychain with a runtime-generated password, builds the notifier app,
@@ -166,6 +171,8 @@ fetch_release_secrets_from_doppler() {
   fetch_release_secret_from_doppler APPLE_NOTARY_KEY_P8_BASE64
   # Optional: enables GitHub Release publication from inside the guest.
   fetch_release_secret_from_doppler GITHUB_TOKEN optional
+  # Optional: enables the Homebrew tap formula bump after a published release.
+  fetch_release_secret_from_doppler HOMEBREW_TAP_GITHUB_TOKEN optional
   unset DOPPLER_TOKEN
 }
 
@@ -602,10 +609,157 @@ for path in assets:
     call("POST", f"{upload_base}?name={urllib.parse.quote(name)}", data, "application/octet-stream")
     print(f"uploaded {name}")
 PY
+    GITHUB_RELEASE_PUBLISHED=1
   else
     echo "warning: GITHUB_TOKEN set but repository could not be determined; skipping GitHub Release upload" >&2
   fi
 fi
+
+# Bump Formula/descartes.rb in the Homebrew tap to this release: tag tarball URL +
+# sha256 and helper zip URL + sha256. Runs only after the GitHub Release actually
+# published (otherwise the formula would point at assets that do not exist) and only
+# when the tap-scoped token is provisioned. Uses the GitHub Contents API so the guest
+# needs no git clone or gh CLI; a concurrent-edit conflict (HTTP 409) is retried once
+# against fresh content.
+#
+# This step is strictly best-effort: by the time it runs, the signed/notarized
+# artifacts and the GitHub Release are already out, so ANY failure here (network
+# blip, GitHub 5xx, rate limit, formula drift) must warn loudly and let the release
+# job finish green — failing would also skip the pipeline's artifact rsync-back.
+# A stale tap is recoverable with a manual formula bump.
+bump_homebrew_tap_formula() {
+  local tap_repo="Lightless-Labs/homebrew-tap"
+  local formula_path="Formula/descartes.rb"
+  local formula_source_repo="Lightless-Labs/descartes"
+  if [[ -z "$TAG" ]]; then
+    return 0
+  fi
+  if [[ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]]; then
+    echo "note: HOMEBREW_TAP_GITHUB_TOKEN not set; skipping Homebrew tap formula bump" >&2
+    return 0
+  fi
+  if [[ "${GITHUB_RELEASE_PUBLISHED:-0}" != "1" ]]; then
+    echo "warning: GitHub Release was not published this run; skipping Homebrew tap formula bump" >&2
+    return 0
+  fi
+  # The formula's pinned URLs point at the canonical repo permanently; bumping its
+  # checksums from a release published elsewhere (GITHUB_REPOSITORY override) would
+  # produce sha256 values that cannot match the formula's own URLs.
+  if [[ "${GH_RELEASE_REPO:-}" != "$formula_source_repo" ]]; then
+    echo "warning: release published to ${GH_RELEASE_REPO:-<unknown>} rather than $formula_source_repo; skipping Homebrew tap formula bump" >&2
+    return 0
+  fi
+
+  local zip_sha tarball_sha
+  local tarball_path="$BUILD_ROOT/descartes-src-$TAG.tar.gz"
+  zip_sha="$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')"
+  if ! curl -fsSL --max-time 120 "https://github.com/$formula_source_repo/archive/refs/tags/$TAG.tar.gz" -o "$tarball_path"; then
+    echo "warning: could not download the $TAG source tarball to compute its checksum; skipping Homebrew tap formula bump" >&2
+    echo "warning: bump manually: url version + tarball sha256 + helper zip sha256 ($zip_sha) in https://github.com/$tap_repo/blob/main/$formula_path" >&2
+    return 0
+  fi
+  tarball_sha="$(shasum -a 256 "$tarball_path" | awk '{print $1}')"
+  rm -f "$tarball_path"
+
+  echo "Bumping $tap_repo $formula_path to $TAG"
+  if ! TAP_REPO="$tap_repo" FORMULA_PATH="$formula_path" RELEASE_TAG="$TAG" \
+    TARBALL_SHA256="$tarball_sha" HELPER_SHA256="$zip_sha" \
+    python3 <<'PY'
+import base64, json, os, re, sys, urllib.error, urllib.parse, urllib.request
+
+token = os.environ["HOMEBREW_TAP_GITHUB_TOKEN"]
+repo = os.environ["TAP_REPO"]
+path = os.environ["FORMULA_PATH"]
+tag = os.environ["RELEASE_TAG"]
+version = tag.lstrip("v")
+tarball_sha = os.environ["TARBALL_SHA256"]
+helper_sha = os.environ["HELPER_SHA256"]
+API = "https://api.github.com"
+
+def call(method, url, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "descartes-macos-notifier-release/1",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, method=method, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as res:
+        return json.loads(res.read())
+
+def rewrite(text):
+    changed = re.sub(
+        r"(archive/refs/tags/v)[0-9][0-9A-Za-z.\-]*(\.tar\.gz)",
+        rf"\g<1>{version}\g<2>",
+        text,
+    )
+    changed = re.sub(
+        r"(releases/download/v)[0-9][0-9A-Za-z.\-]*(/DescartesNotifier\.app\.zip)",
+        rf"\g<1>{version}\g<2>",
+        changed,
+    )
+    # Each pinned URL line is followed by its sha256 line; replace pairwise so the
+    # tarball and helper checksums cannot be swapped.
+    lines = changed.split("\n")
+    pending = None
+    for i, line in enumerate(lines):
+        if "archive/refs/tags/" in line:
+            if pending:
+                break
+            pending = tarball_sha
+        elif "DescartesNotifier.app.zip" in line and "releases/download/" in line:
+            if pending:
+                break
+            pending = helper_sha
+        elif pending and re.search(r'sha256 "[0-9a-f]{64}"', line):
+            lines[i] = re.sub(r'sha256 "[0-9a-f]{64}"', f'sha256 "{pending}"', line)
+            pending = None
+    if pending:
+        raise RuntimeError("unexpected formula shape (pinned URL without a following sha256); not bumping")
+    return "\n".join(lines)
+
+def bump():
+    for attempt in range(2):
+        current = call("GET", f"{API}/repos/{repo}/contents/{urllib.parse.quote(path)}")
+        text = base64.b64decode(current["content"]).decode()
+        updated = rewrite(text)
+        if updated == text:
+            print(f"tap formula already current for {tag}; no bump needed")
+            return
+        payload = {
+            "message": f"descartes: update to {version}",
+            "content": base64.b64encode(updated.encode()).decode(),
+            "sha": current["sha"],
+        }
+        try:
+            result = call("PUT", f"{API}/repos/{repo}/contents/{urllib.parse.quote(path)}", payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409 and attempt == 0:
+                print("warning: tap formula changed concurrently; retrying once with fresh content", file=sys.stderr)
+                continue
+            raise
+        print(f"bumped {repo}/{path} to {version}: {result['commit']['sha'][:9]}")
+        return
+    raise RuntimeError("tap formula update conflicted twice")
+
+# Any failure exits nonzero; the calling shell treats that as a loud warning, never
+# a release failure — the artifacts and GitHub Release are already published.
+try:
+    bump()
+except Exception as exc:
+    print(f"error: tap formula bump failed: {exc}", file=sys.stderr)
+    sys.exit(3)
+PY
+  then
+    echo "warning: Homebrew tap formula bump FAILED; the tap is stale for $TAG (release artifacts are unaffected)" >&2
+    echo "warning: bump manually: url version + tarball sha256 ($tarball_sha) + helper zip sha256 ($zip_sha) in https://github.com/$tap_repo/blob/main/$formula_path" >&2
+    return 0
+  fi
+}
+bump_homebrew_tap_formula
 
 cat <<EOF
 macOS notifier release artifact:

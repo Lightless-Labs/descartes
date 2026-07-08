@@ -57,11 +57,26 @@ Add `Formula/descartes.rb` to `Lightless-Labs/homebrew-tap`:
 
 ## Milestone 2 — release automation bumps the tap
 
-On each tag release, update `Formula/descartes.rb` (url version + both sha256 values)
-in `Lightless-Labs/homebrew-tap` from the release job. Needs a token scoped to
-`homebrew-tap` (separate from the descartes-repo `GITHUB_TOKEN` in Doppler — do not
-widen the existing token's scope). Until implemented, the formula is bumped manually
-per release.
+**Implemented 2026-07-08** in `scripts/release-macos-notifier-buildkite.sh`
+(`bump_homebrew_tap_formula`): after the GitHub Release publishes (hard-gated on
+`GITHUB_RELEASE_PUBLISHED=1` so the formula can never point at assets that don't
+exist), the script downloads the tag's source tarball to checksum it, reuses the
+stapled zip's checksum, and rewrites `Formula/descartes.rb` via the GitHub Contents
+API (no git/gh in the guest): version in both pinned URLs plus pairwise sha256
+replacement (each URL line's following sha256 line, so tarball/helper checksums cannot
+swap), with a shape guard that refuses to PUT on unexpected formula structure and one
+retry on HTTP 409 (concurrent tap edit). The step is strictly best-effort: any failure
+warns loudly with manual-bump instructions and never fails the release job (the
+artifacts and GitHub Release are already out, and a job failure would also skip the
+pipeline's artifact rsync-back). Skipped with a note when `HOMEBREW_TAP_GITHUB_TOKEN`
+is not provisioned, and skipped when the release published to a repo other than the
+formula's canonical `Lightless-Labs/descartes` (its pinned URLs could never match).
+Manual bump remains the fallback (url version + tarball sha256 + helper zip sha256).
+Covered by `tools/descartes-cli/test/tap-bump.test.js`: the exact embedded python runs
+against a formula fixture with a mocked Contents API (bump/no-op/shape-guard). **Operator action to activate:** fine-grained PAT
+with Contents R/W on `Lightless-Labs/homebrew-tap` only, stored as
+`HOMEBREW_TAP_GITHUB_TOKEN` in Doppler project `lightless-labs-descartes`, config
+`prd_notarisation`. CI validation happens on the next tag release.
 
 ## Deferred — in-CLI setup/download flow
 

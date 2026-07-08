@@ -60,6 +60,9 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkiteScript, /DeveloperIDG2CA\.cer/);
   assert.match(buildkiteScript, /security add-certificates -k \/Library\/Keychains\/System\.keychain/);
   assert.match(buildkiteScript, /fetch_release_secret_from_doppler GITHUB_TOKEN optional/);
+  assert.match(buildkiteScript, /fetch_release_secret_from_doppler HOMEBREW_TAP_GITHUB_TOKEN optional/);
+  assert.match(buildkiteScript, /Lightless-Labs\/homebrew-tap/);
+  assert.match(buildkiteScript, /GITHUB_RELEASE_PUBLISHED/);
   assert.doesNotMatch(buildkiteScript, /gh release/);
   assert.doesNotMatch(buildkiteScript, /add-trusted-cert/);
   assert.doesNotMatch(buildkiteScript, /require_env CODESIGN_IDENTITY/);
