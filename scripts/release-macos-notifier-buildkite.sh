@@ -51,10 +51,10 @@ Optional publication environment:
   GITHUB_REPOSITORY    owner/repo override; otherwise inferred from the git remote or
                        package.json repository.url.
   HOMEBREW_TAP_GITHUB_TOKEN
-                       Bump Formula/descartes.rb in Lightless-Labs/homebrew-tap to this
-                       release (URLs + both sha256 values) after the GitHub Release is
-                       published. Contents R/W on homebrew-tap only; also fetched from
-                       Doppler when present there (optional secret).
+                       Optional override for the Homebrew tap formula bump. By default
+                       that bump reuses GITHUB_TOKEN (which must be able to write
+                       Lightless-Labs/homebrew-tap); set this only to use a narrower
+                       token. Also fetched from Doppler when present (optional secret).
 
 This script is intended for tag-triggered Buildkite macOS jobs. It creates an
 ephemeral keychain with a runtime-generated password, builds the notifier app,
@@ -617,16 +617,15 @@ fi
 
 # Bump Formula/descartes.rb in the Homebrew tap to this release: tag tarball URL +
 # sha256 and helper zip URL + sha256. Runs only after the GitHub Release actually
-# published (otherwise the formula would point at assets that do not exist) and only
-# when the tap-scoped token is provisioned. Uses the GitHub Contents API so the guest
-# needs no git clone or gh CLI; a concurrent-edit conflict (HTTP 409) is retried once
-# against fresh content.
+# published (otherwise the formula would point at assets that do not exist). Uses the
+# GitHub Contents API so the guest needs no git clone or gh CLI. Transient failures
+# (network, GitHub 5xx, rate limit) are retried with exponential backoff, and a
+# concurrent-edit conflict (HTTP 409) re-reads and retries once against fresh content.
 #
-# This step is strictly best-effort: by the time it runs, the signed/notarized
-# artifacts and the GitHub Release are already out, so ANY failure here (network
-# blip, GitHub 5xx, rate limit, formula drift) must warn loudly and let the release
-# job finish green — failing would also skip the pipeline's artifact rsync-back.
-# A stale tap is recoverable with a manual formula bump.
+# Only if retries are exhausted does this fall through to best-effort: by then the
+# signed/notarized artifacts and the GitHub Release are already out, so a hard failure
+# would redden an otherwise-successful release AND skip the pipeline's artifact
+# rsync-back. A stale tap is recoverable with a manual formula bump.
 bump_homebrew_tap_formula() {
   local tap_repo="Lightless-Labs/homebrew-tap"
   local formula_path="Formula/descartes.rb"
@@ -634,8 +633,12 @@ bump_homebrew_tap_formula() {
   if [[ -z "$TAG" ]]; then
     return 0
   fi
-  if [[ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]]; then
-    echo "note: HOMEBREW_TAP_GITHUB_TOKEN not set; skipping Homebrew tap formula bump" >&2
+  # Reuse the token that just published the release; it already writes to this org.
+  # HOMEBREW_TAP_GITHUB_TOKEN is only needed to override with a narrower token (e.g.
+  # if GITHUB_TOKEN is ever restricted to the descartes repo alone).
+  local tap_token="${HOMEBREW_TAP_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [[ -z "$tap_token" ]]; then
+    echo "note: no GitHub token available (GITHUB_TOKEN / HOMEBREW_TAP_GITHUB_TOKEN); skipping Homebrew tap formula bump" >&2
     return 0
   fi
   if [[ "${GITHUB_RELEASE_PUBLISHED:-0}" != "1" ]]; then
@@ -653,7 +656,9 @@ bump_homebrew_tap_formula() {
   local zip_sha tarball_sha
   local tarball_path="$BUILD_ROOT/descartes-src-$TAG.tar.gz"
   zip_sha="$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')"
-  if ! curl -fsSL --max-time 120 "https://github.com/$formula_source_repo/archive/refs/tags/$TAG.tar.gz" -o "$tarball_path"; then
+  # curl retries transient network/5xx itself (GitHub sometimes lags generating a
+  # freshly-pushed tag's archive) before we fall through to the manual-bump note.
+  if ! curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --max-time 180 "https://github.com/$formula_source_repo/archive/refs/tags/$TAG.tar.gz" -o "$tarball_path"; then
     echo "warning: could not download the $TAG source tarball to compute its checksum; skipping Homebrew tap formula bump" >&2
     echo "warning: bump manually: url version + tarball sha256 + helper zip sha256 ($zip_sha) in https://github.com/$tap_repo/blob/main/$formula_path" >&2
     return 0
@@ -662,12 +667,12 @@ bump_homebrew_tap_formula() {
   rm -f "$tarball_path"
 
   echo "Bumping $tap_repo $formula_path to $TAG"
-  if ! TAP_REPO="$tap_repo" FORMULA_PATH="$formula_path" RELEASE_TAG="$TAG" \
+  if ! TAP_TOKEN="$tap_token" TAP_REPO="$tap_repo" FORMULA_PATH="$formula_path" RELEASE_TAG="$TAG" \
     TARBALL_SHA256="$tarball_sha" HELPER_SHA256="$zip_sha" \
     python3 <<'PY'
-import base64, json, os, re, sys, urllib.error, urllib.parse, urllib.request
+import base64, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 
-token = os.environ["HOMEBREW_TAP_GITHUB_TOKEN"]
+token = os.environ["TAP_TOKEN"]
 repo = os.environ["TAP_REPO"]
 path = os.environ["FORMULA_PATH"]
 tag = os.environ["RELEASE_TAG"]
@@ -675,6 +680,25 @@ version = tag.lstrip("v")
 tarball_sha = os.environ["TARBALL_SHA256"]
 helper_sha = os.environ["HELPER_SHA256"]
 API = "https://api.github.com"
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 4
+
+def _http_retryable(exc):
+    if exc.code in RETRYABLE_STATUS:
+        return True
+    # Primary/secondary rate limits surface as 403 with a rate-limit signal.
+    return exc.code == 403 and (
+        exc.headers.get("Retry-After") is not None
+        or exc.headers.get("X-RateLimit-Remaining") == "0"
+    )
+
+def _backoff_seconds(exc, attempt):
+    if isinstance(exc, urllib.error.HTTPError):
+        after = exc.headers.get("Retry-After")
+        if after and after.isdigit():
+            return min(int(after), 30)
+    return min(2 ** attempt, 30)
 
 def call(method, url, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -686,9 +710,22 @@ def call(method, url, payload=None):
     }
     if data is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, method=method, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as res:
-        return json.loads(res.read())
+    for attempt in range(MAX_ATTEMPTS):
+        req = urllib.request.Request(url, method=method, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as res:
+                return json.loads(res.read())
+        except urllib.error.HTTPError as exc:
+            # 409 is a genuine edit conflict; the caller re-reads and retries it.
+            if exc.code != 409 and _http_retryable(exc) and attempt < MAX_ATTEMPTS - 1:
+                time.sleep(_backoff_seconds(exc, attempt))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(_backoff_seconds(exc, attempt))
+                continue
+            raise
 
 def rewrite(text):
     changed = re.sub(

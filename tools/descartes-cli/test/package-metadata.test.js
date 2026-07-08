@@ -63,6 +63,8 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkiteScript, /fetch_release_secret_from_doppler HOMEBREW_TAP_GITHUB_TOKEN optional/);
   assert.match(buildkiteScript, /Lightless-Labs\/homebrew-tap/);
   assert.match(buildkiteScript, /GITHUB_RELEASE_PUBLISHED/);
+  // The tap bump reuses GITHUB_TOKEN by default rather than requiring a second token.
+  assert.match(buildkiteScript, /HOMEBREW_TAP_GITHUB_TOKEN:-\$\{GITHUB_TOKEN/);
   assert.doesNotMatch(buildkiteScript, /gh release/);
   assert.doesNotMatch(buildkiteScript, /add-trusted-cert/);
   assert.doesNotMatch(buildkiteScript, /require_env CODESIGN_IDENTITY/);

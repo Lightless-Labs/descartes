@@ -35,11 +35,16 @@ end
 `;
 
 const URLLIB_STUB = `
-import base64, io, json, os
-import urllib.request
+import base64, io, json, os, time
+import urllib.error, urllib.request
+
+# Make backoff instantaneous so retry paths run without wall-clock delay.
+time.sleep = lambda *a, **k: None
 
 _formula = open(os.environ["FAKE_FORMULA_PATH"], "rb").read()
 _put_log = os.environ["FAKE_PUT_LOG"]
+_put_failures = int(os.environ.get("FAKE_PUT_FAILURES", "0"))
+_state = {"puts": 0}
 
 def _fake_urlopen(req, timeout=None):
     method = req.get_method()
@@ -51,6 +56,9 @@ def _fake_urlopen(req, timeout=None):
         }).encode()
         return io.BytesIO(body)
     if method == "PUT" and "/contents/" in url:
+        _state["puts"] += 1
+        if _state["puts"] <= _put_failures:
+            raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, io.BytesIO(b""))
         with open(_put_log, "ab") as f:
             f.write(req.data + b"\\n")
         return io.BytesIO(json.dumps({"commit": {"sha": "abc123def4567890"}}).encode())
@@ -72,7 +80,7 @@ const hasPython3 = (() => {
   return !probe.error && probe.status === 0;
 })();
 
-function runBump({ tag, tarballSha, helperSha, formula }) {
+function runBump({ tag, tarballSha, helperSha, formula, putFailures = 0 }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "descartes-tap-bump-"));
   try {
     const formulaPath = path.join(dir, "formula.rb");
@@ -84,7 +92,7 @@ function runBump({ tag, tarballSha, helperSha, formula }) {
       encoding: "utf8",
       env: {
         ...process.env,
-        HOMEBREW_TAP_GITHUB_TOKEN: "test-token",
+        TAP_TOKEN: "test-token",
         TAP_REPO: "Lightless-Labs/homebrew-tap",
         FORMULA_PATH: "Formula/descartes.rb",
         RELEASE_TAG: tag,
@@ -92,6 +100,7 @@ function runBump({ tag, tarballSha, helperSha, formula }) {
         HELPER_SHA256: helperSha,
         FAKE_FORMULA_PATH: formulaPath,
         FAKE_PUT_LOG: putLog,
+        FAKE_PUT_FAILURES: String(putFailures),
       },
     });
     const puts = fs.existsSync(putLog)
@@ -141,6 +150,31 @@ test("tap bump is a no-op when the formula already matches the release", { skip:
   assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
   assert.equal(puts.length, 0);
   assert.match(result.stdout, /already current/);
+});
+
+test("tap bump retries transient 5xx on the PUT with backoff and then succeeds", { skip: !hasPython3 && "python3 unavailable" }, () => {
+  const { result, puts } = runBump({
+    tag: "v0.1.0",
+    tarballSha: "a".repeat(64),
+    helperSha: "b".repeat(64),
+    formula: FIXTURE_FORMULA,
+    putFailures: 2, // first two PUTs return 503, third succeeds — within MAX_ATTEMPTS=4
+  });
+  assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+  assert.equal(puts.length, 1, "exactly one PUT should land after the transient failures");
+  const updated = Buffer.from(puts[0].content, "base64").toString("utf8");
+  assert.match(updated, /archive\/refs\/tags\/v0\.1\.0\.tar\.gz/);
+});
+
+test("tap bump gives up after exhausting retries on persistent 5xx", { skip: !hasPython3 && "python3 unavailable" }, () => {
+  const { result, puts } = runBump({
+    tag: "v0.1.0",
+    tarballSha: "a".repeat(64),
+    helperSha: "b".repeat(64),
+    formula: FIXTURE_FORMULA,
+    putFailures: 99, // never recovers
+  });
+  assert.notEqual(result.status, 0, "should exit nonzero so the shell falls back to best-effort warn");
 });
 
 test("tap bump refuses to PUT when the formula shape is unexpected", { skip: !hasPython3 && "python3 unavailable" }, () => {

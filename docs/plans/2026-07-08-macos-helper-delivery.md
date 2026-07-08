@@ -64,19 +64,25 @@ exist), the script downloads the tag's source tarball to checksum it, reuses the
 stapled zip's checksum, and rewrites `Formula/descartes.rb` via the GitHub Contents
 API (no git/gh in the guest): version in both pinned URLs plus pairwise sha256
 replacement (each URL line's following sha256 line, so tarball/helper checksums cannot
-swap), with a shape guard that refuses to PUT on unexpected formula structure and one
-retry on HTTP 409 (concurrent tap edit). The step is strictly best-effort: any failure
+swap), with a shape guard that refuses to PUT on unexpected formula structure.
+Transient failures (GitHub 5xx/429/rate-limited-403, network/timeout) are retried with
+exponential backoff — the Contents API calls in python, the tarball download via
+`curl --retry --retry-all-errors` — and a 409 edit conflict re-reads and retries once.
+Only after retries are exhausted does the step fall through to strictly best-effort: it
 warns loudly with manual-bump instructions and never fails the release job (the
 artifacts and GitHub Release are already out, and a job failure would also skip the
-pipeline's artifact rsync-back). Skipped with a note when `HOMEBREW_TAP_GITHUB_TOKEN`
-is not provisioned, and skipped when the release published to a repo other than the
-formula's canonical `Lightless-Labs/descartes` (its pinned URLs could never match).
+pipeline's artifact rsync-back). The bump reuses `GITHUB_TOKEN` by default (no second
+secret); `HOMEBREW_TAP_GITHUB_TOKEN` is only an optional narrower-token override. It is
+skipped when no token is available, and when the release published to a repo other than
+the formula's canonical `Lightless-Labs/descartes` (its pinned URLs could never match).
 Manual bump remains the fallback (url version + tarball sha256 + helper zip sha256).
 Covered by `tools/descartes-cli/test/tap-bump.test.js`: the exact embedded python runs
-against a formula fixture with a mocked Contents API (bump/no-op/shape-guard). **Operator action to activate:** fine-grained PAT
-with Contents R/W on `Lightless-Labs/homebrew-tap` only, stored as
-`HOMEBREW_TAP_GITHUB_TOKEN` in Doppler project `lightless-labs-descartes`, config
-`prd_notarisation`. CI validation happens on the next tag release.
+against a formula fixture with a mocked Contents API (bump / no-op / shape-guard /
+transient-retry-then-success / give-up-after-exhaustion). **Operator action to
+activate:** none beyond ensuring the `GITHUB_TOKEN` already in Doppler
+(`lightless-labs-descartes` / `prd_notarisation`) can write `Lightless-Labs/homebrew-tap`
+— the tap bump reuses it rather than requiring a second secret. CI validation happens on
+the next tag release.
 
 ## Deferred — in-CLI setup/download flow
 
