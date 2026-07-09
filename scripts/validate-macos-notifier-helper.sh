@@ -34,6 +34,8 @@ Options:
 
 Set DESCARTES_BIN=/path/to/descartes to validate a specific installed CLI.
 Set DESCARTES_VALIDATION_XDG_ROOT=/path to preserve/use a specific validation state root.
+The script refuses DESCARTES_MACOS_NOTIFICATION_HELPER because validation is intended
+for no-override Homebrew bundled-helper resolution.
 EOF
 }
 
@@ -47,6 +49,11 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ -n "${DESCARTES_MACOS_NOTIFICATION_HELPER:-}" ]]; then
+  echo "error: DESCARTES_MACOS_NOTIFICATION_HELPER is set; unset it to validate bundled Homebrew helper resolution" >&2
+  exit 2
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "error: native macOS notifier validation must run on macOS" >&2
@@ -72,6 +79,59 @@ else console.log(String(value));
 ' "$file" "$expr"
 }
 
+derive_bundled_helper_path() {
+  local cli_path="$1"
+  node -e '
+const fs = require("fs");
+const path = require("path");
+const cliPath = process.argv[1];
+const candidates = [];
+let realCliPath;
+try {
+  realCliPath = fs.realpathSync(cliPath);
+} catch {
+  realCliPath = cliPath;
+}
+if (realCliPath.endsWith("/tools/descartes-cli/src/index.js")) {
+  candidates.push(path.join(
+    path.dirname(realCliPath),
+    "..",
+    "native",
+    "macos",
+    "DescartesNotifier.app",
+    "Contents",
+    "MacOS",
+    "DescartesNotifier",
+  ));
+}
+if (realCliPath.endsWith("/bin/descartes")) {
+  candidates.push(path.join(
+    path.dirname(realCliPath),
+    "..",
+    "lib",
+    "node_modules",
+    "@lightless-labs",
+    "descartes",
+    "tools",
+    "descartes-cli",
+    "native",
+    "macos",
+    "DescartesNotifier.app",
+    "Contents",
+    "MacOS",
+    "DescartesNotifier",
+  ));
+}
+for (const candidate of candidates) {
+  if (fs.existsSync(candidate)) {
+    console.log(candidate);
+    process.exit(0);
+  }
+}
+process.exit(3);
+' "$cli_path"
+}
+
 VALIDATION_ROOT="${DESCARTES_VALIDATION_XDG_ROOT:-$(mktemp -d -t descartes-notifier-validation.XXXXXX)}"
 mkdir -p "$VALIDATION_ROOT/config" "$VALIDATION_ROOT/data" "$VALIDATION_ROOT/state" "$VALIDATION_ROOT/cache"
 
@@ -83,8 +143,10 @@ run_descartes() {
     "$DESCARTES_BIN" "$@"
 }
 
+resolved_cli_path="$(command -v "$DESCARTES_BIN")"
+
 echo "Descartes native macOS notifier validation"
-echo "CLI: $(command -v "$DESCARTES_BIN")"
+echo "CLI: $resolved_cli_path"
 echo "Version: $(run_descartes --version)"
 echo "Bundle ID: $BUNDLE_ID"
 echo "Validation XDG root: $VALIDATION_ROOT"
@@ -127,9 +189,20 @@ echo "Running native notification setup without an explicit helper override..."
 run_descartes alerts notifications setup --channel native --json > "$setup_json_file"
 cat "$setup_json_file"
 
-available="$(json_get "$setup_json_file" resolution.macos_native_helper_available)"
-source="$(json_get "$setup_json_file" resolution.macos_native_helper_source)"
-helper_path="$(json_get "$setup_json_file" resolution.resolved_macos_native_helper_path)"
+available="$(json_get "$setup_json_file" resolution.macos_native_helper_available 2>/dev/null || true)"
+source="$(json_get "$setup_json_file" resolution.macos_native_helper_source 2>/dev/null || true)"
+helper_path="$(json_get "$setup_json_file" resolution.resolved_macos_native_helper_path 2>/dev/null || true)"
+
+if [[ -z "$available" || -z "$source" || -z "$helper_path" ]]; then
+  echo "Setup JSON did not include native helper resolution; deriving bundled helper path from CLI location..."
+  helper_path="$(derive_bundled_helper_path "$resolved_cli_path" 2>/dev/null || true)"
+  source="bundled"
+  if [[ -n "$helper_path" && -x "$helper_path" ]]; then
+    available="true"
+  else
+    available="false"
+  fi
+fi
 
 if [[ "$available" != "true" ]]; then
   echo "error: native helper did not resolve as available" >&2

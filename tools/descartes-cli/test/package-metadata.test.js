@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -57,6 +57,9 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(validationScript, /spctl --assess/);
   assert.match(validationScript, /tccutil reset Notifications/);
   assert.match(validationScript, /XDG_CONFIG_HOME="\$VALIDATION_ROOT\/config"/);
+  assert.match(validationScript, /DESCARTES_MACOS_NOTIFICATION_HELPER is set/);
+  assert.match(validationScript, /derive_bundled_helper_path/);
+  assert.match(validationScript, /Setup JSON did not include native helper resolution/);
   assert.match(validationScript, /refusing to trigger a notification without interactive stdin/);
   assert.match(tokenCheckScript, /Lightless-Labs\/homebrew-tap/);
   assert.match(tokenCheckScript, /HOMEBREW_TAP_GITHUB_TOKEN/);
@@ -99,6 +102,21 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkitePipeline, /env:\n\s+- BUILDKITE_TAG/);
   assert.doesNotMatch(buildkitePipeline, /export MACOS_DEVELOPER_ID_CERT_P12_BASE64/);
   assert.doesNotMatch(buildkitePipeline, /Bande-a-Bonnot\/tart-ci/);
+});
+
+test("macOS notifier validation script refuses helper override environment", () => {
+  const validationScriptPath = fileURLToPath(new URL("../../../scripts/validate-macos-notifier-helper.sh", import.meta.url));
+  const result = spawnSync("bash", [validationScriptPath, "--skip-test"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      DESCARTES_BIN: process.execPath,
+      DESCARTES_MACOS_NOTIFICATION_HELPER: path.join(os.tmpdir(), "descartes-dev-helper"),
+    },
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /DESCARTES_MACOS_NOTIFICATION_HELPER is set/);
 });
 
 test("CLI version and help are generated from current metadata/options", () => {

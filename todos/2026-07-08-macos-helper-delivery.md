@@ -22,7 +22,9 @@ Deliver the notarized `DescartesNotifier.app` release asset to end users via Hom
 pieces are in place: the `descartes` formula in `Lightless-Labs/homebrew-tap` installs
 the Node CLI plus the helper resource inside the npm package tree at the path the CLI's
 bundled-helper resolution already probes, and the release job includes tap-bump
-automation. The next-tag tap token can be checked ahead of time with
+automation. Local Homebrew install/linkage/helper packaging validation passed after tap
+commit `75e886f`; see `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md`.
+The next-tag tap token can be checked ahead of time with
 `scripts/check-homebrew-tap-token.sh`. This is not fully release-validated yet: the
 remaining work is external validation on a real Mac and the next tagged release; see
 `todos/2026-07-08-macos-release-validation.md` for executable steps.
@@ -32,6 +34,9 @@ remaining work is external validation on a real Mac and the next tagged release;
 - [x] Homebrew formula exists and locally verified install yields a working `descartes`
       CLI plus a stapled, Gatekeeper-accepted helper that
       `descartes alerts notifications setup --channel native` resolves without flags.
+      Latest validation: tap commit `75e886f`, brewed `/opt/homebrew/bin/descartes`
+      reports 0.0.47, `brew linkage --test` and `brew test` pass, and helper
+      codesign/stapler/Gatekeeper checks pass.
 - [x] README documents brew as the macOS install path, including the migration caveat
       for prior `npm -g` installs sharing the Homebrew prefix.
 - [x] Milestone 2 tap-bump automation implemented with fixture tests and documented

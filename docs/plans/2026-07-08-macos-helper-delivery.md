@@ -7,6 +7,7 @@
 **Updated:** 2026-07-08 — Milestone 2 implemented and unit-tested: the release script now bumps `Lightless-Labs/homebrew-tap` through the GitHub Contents API after successful GitHub Release publication, reusing `GITHUB_TOKEN` by default with optional `HOMEBREW_TAP_GITHUB_TOKEN`. Remaining validation: first real-host Notification Center permission flow and first real tag run of the tap-bump step.
 **Updated:** 2026-07-09 — validation UX tightened: `descartes alerts notifications setup --channel native --json` and subsequent `descartes alerts notifications status --json` now report native-helper resolution details (`available`, `source`, executable path, and reason when unavailable), so the real-host brew validation can prove the bundled helper path before triggering the TCC prompt. Passing `--channel native` without `--helper` clears stale explicit helper overrides and prefers the bundled Homebrew helper; setup fails closed instead of persisting an unusable native channel when no executable helper is resolved. Added `scripts/validate-macos-notifier-helper.sh` as an optional checkout-only real-host runner for helper resolution, code-signature/staple/Gatekeeper checks, prompted TCC reset, and prompted notification testing with Descartes config/state/cache isolated under a temporary XDG root.
 **Updated:** 2026-07-09 — added `scripts/check-homebrew-tap-token.sh`, a read-only preflight for the next-tag tap bump token. It applies the release job's token precedence (dedicated `HOMEBREW_TAP_GITHUB_TOKEN` first, falling back to `GITHUB_TOKEN`, with either value optionally fetched from Doppler), verifies formula read access plus GitHub-reported push/write permission on `Lightless-Labs/homebrew-tap`, and fails before tagging if the token would not be able to commit the formula bump.
+**Updated:** 2026-07-09 — local Homebrew install/linkage/helper packaging validation found and fixed a tap formula issue. The formula now removes unused optional `@mariozechner` clipboard add-ons from Descartes' vendored/internal Pi dependency tree after npm install because their prebuilt Mach-O binaries can fail Homebrew install-name rewriting. Tap commit `75e886f` was pushed, and validation passed: audit, reinstall, `brew linkage --test`, `brew test`, brewed CLI v0.0.47 resolution, no `@mariozechner` packages in the keg, and helper codesign/stapler/Gatekeeper checks. Detailed record: `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md`.
 
 ## Purpose
 
@@ -58,6 +59,10 @@ Implemented by adding `Formula/descartes.rb` to `Lightless-Labs/homebrew-tap`:
 - Known migration caveat: users who previously ran `npm install -g` with Homebrew's
   node have an npm-owned `/opt/homebrew/bin/descartes` symlink; `brew link` will refuse
   until `npm uninstall -g @lightless-labs/descartes` (document in README/caveats).
+- The formula removes unused optional `@mariozechner` clipboard packages from Descartes'
+  vendored/internal Pi dependency tree before Homebrew linkage repair. Descartes does not
+  use that clipboard feature, and leaving those prebuilt add-ons in the keg caused
+  Homebrew to fail rewriting an arm64 Mach-O install name due insufficient header padding.
 - Rust era (later): the formula converges on the middens shape — per-platform binary
   tarballs from GitHub Releases (macOS binaries signed/notarized by the same pipeline)
   plus the helper resource on macOS.

@@ -20,11 +20,14 @@ related:
 
 The macOS notifier release pipeline is implemented and CI-validated through GitHub
 Release publication (Buildkite #67 signed/notarized/stapled; #73 auto-published the
-release). Two validations remain that require a real environment, plus one optional
-spike. Full executable steps: `macos-notifier-release-validation-brief.md`; the guided
-real-host helper runner is `scripts/validate-macos-notifier-helper.sh` (it isolates
-Descartes XDG config/state/cache and prompts before resetting TCC or sending a test
-notification unless `--yes` is passed). The tap token can now be preflighted before
+release). Local Homebrew install/linkage/helper packaging validation passed after tap
+commit `75e886f`; see `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md`.
+Remaining release-readiness work is external: first-run TCC/Notification Center behavior
+on a real Mac, first live next-tag tap-bump validation, and token confirmation around
+that tag. Full executable steps: `macos-notifier-release-validation-brief.md`; the
+guided real-host helper runner is `scripts/validate-macos-notifier-helper.sh` (it
+isolates Descartes XDG config/state/cache and prompts before resetting TCC or sending a
+test notification unless `--yes` is passed). The tap token can now be preflighted before
 cutting the next tag with `scripts/check-homebrew-tap-token.sh`; the check is read-only
 and proves formula read access plus GitHub-reported push/write permission for
 `Lightless-Labs/homebrew-tap`.
@@ -32,7 +35,8 @@ and proves formula read access plus GitHub-reported push/write permission for
 ## Acceptance criteria
 
 - [ ] **Real-host helper (Part A):** on a Mac with no prior grant, `brew install
-      lightless-labs/tap/descartes` then `descartes alerts notifications setup
+      lightless-labs/tap/descartes`, confirm `descartes` resolves to the brewed 0.0.47+
+      CLI rather than an older npm-global shim, then `descartes alerts notifications setup
       --channel native --json` resolves the bundled helper with no flags
       (`resolution.macos_native_helper_available: true`, source `bundled`, path inside
       the brew keg), or the guided runner verifies the same plus signature/staple/Gatekeeper

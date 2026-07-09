@@ -8,13 +8,15 @@
 
 The macOS notifier delivery implementation is **landed and v0.0.47 is shipped**: `v0.0.47` is signed, notarized, stapled, on GitHub Releases, and installable via `brew install lightless-labs/tap/descartes` (CLI + bundled helper). The release pipeline (sign → notarize → staple → Buildkite artifacts → GitHub Release → Homebrew tap bump) is implemented and CI-validated through GitHub Release publication, but is **not yet fully release-validated** for first-run Notification Center/TCC behavior or the first live tap-bump run. Everything below is validation or optional follow-up — no in-flight/broken work:
 
-1. **Real-host + first-tag validation** → `macos-notifier-release-validation-brief.md` and `todos/2026-07-08-macos-release-validation.md`. Part A: exercise the native notification helper's first-run permission prompt on a real Mac (best on your other laptop, which has never granted it). Part B: on the next `vX.Y.Z` tag, watch the first CI run of the Homebrew tap auto-bump (the release→GitHub-Release half is already CI-proven; the tap bump is not yet).
+1. **Real-host + first-tag validation** → `macos-notifier-release-validation-brief.md` and `todos/2026-07-08-macos-release-validation.md`. Part A: exercise the native notification helper's first-run permission prompt on a real Mac (best on your other laptop, which has never granted it). Local Homebrew install/linkage/helper packaging validation passed after tap commit `75e886f`; see `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md`. Part B: on the next `vX.Y.Z` tag, watch the first CI run of the Homebrew tap auto-bump (the release→GitHub-Release half is already CI-proven; the tap bump is not yet).
 2. **In-CLI helper download flow** — deferred by operator decision in favor of Homebrew; documented in `docs/plans/2026-07-08-macos-helper-delivery.md` (Deferred section). Only revisit if npm-install users need the helper.
 3. **rcodesign spike** (optional) → `todos/2026-07-07-rcodesign-investigation.md` and `docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md`: research is done; recommendation is to defer adoption until real-cert rcodesign signing/notarization/stapling/Gatekeeper parity is proven. The first practical win would be keychain-free signing inside the existing Tart release job; the Swift app build still requires macOS.
 
 Tooling notes for whoever picks this up: CI runs on host `big-cabbage` (this dev machine has no `tart`); set `export SSH_AUTH_SOCK=~/.ssh/agent.sock` before git pushes; the local `context-mode` Bash hook blocks any command whose text contains `curl`/`wget` (including `git commit -m` messages that mention curl — use `git commit -F <file>`). Older chronological entries below preserve past failed attempts and superseded facts (for example older `tart-ci` versions or pre-Homebrew delivery state); prefer this top status and the newest session updates for current next actions.
 
 ---
+
+Current session update (2026-07-09, latest local validation slice): performed partial local real-host Homebrew validation and fixed a tap install/linkage blocker. The local `/opt/homebrew/bin/descartes` was an old npm-global v0.0.25 shim, so `npm uninstall -g @lightless-labs/descartes` was required before validating the brewed binary. `brew install/reinstall lightless-labs/tap/descartes` then exposed a formula issue: Homebrew tried to rewrite an unused optional `@mariozechner/clipboard-darwin-arm64` native add-on from Descartes' vendored/internal Pi dependency tree and failed due insufficient Mach-O header padding. Fixed the separate `Lightless-Labs/homebrew-tap` repo in commit `75e886f` by removing unused `@mariozechner` clipboard packages from the keg after npm install; pushed that tap commit. Validation after the tap fix: `brew audit --strict --online lightless-labs/tap/descartes` exit 0, `brew reinstall --build-from-source lightless-labs/tap/descartes` success, `/opt/homebrew/bin/descartes --version` = 0.0.47, `brew linkage --test descartes` exit 0, `brew test lightless-labs/tap/descartes` success, and no `@mariozechner` packages remain in the keg. `scripts/validate-macos-notifier-helper.sh --skip-test` now handles released v0.0.47's lack of `resolution` JSON by deriving the bundled helper path from the Homebrew-installed CLI path; it also refuses `DESCARTES_MACOS_NOTIFICATION_HELPER` so no env helper override can masquerade as bundled-helper validation. It validated the helper's code signature, stapled ticket, and Gatekeeper acceptance. Results recorded in `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md`. Still not complete: first-run Notification Center/TCC prompt/display/persistence/denied-path/daemon-context validation and the next tag's live tap-bump run remain external.
 
 Current session update (2026-07-09, third goal continuation): audited the remaining unchecked handoff/todo boxes and kept the goal open because the release-readiness blockers are still external (fresh-real-Mac TCC/Notification Center validation and the next tag's first live tap-bump). Added `scripts/check-homebrew-tap-token.sh`, a read-only preflight for the next-tag Homebrew tap bump token: it applies the release job's precedence (dedicated `HOMEBREW_TAP_GITHUB_TOKEN` first, falling back to `GITHUB_TOKEN`, with either value optionally fetched from Doppler), verifies `Formula/descartes.rb` read access plus GitHub-reported push/write permission on `Lightless-Labs/homebrew-tap`, and does not print token values or mutate the tap. Updated the validation brief, helper-delivery plan/todos, and package tests to include the preflight. Marked `todos/2026-07-07-rcodesign-investigation.md` as deferred after the completed research recommendation; the real-cert rcodesign parity checks remain intentionally unchecked until the spike is reopened.
 
@@ -233,7 +235,7 @@ Existing files:
 - `docs/plans/2026-05-21-vm-container-resource-correlation.md` — in-progress follow-on plan for VM/container resource correlation; first VM process-hint correlation slice is implemented.
 - `docs/plans/2026-05-23-daemon-history-store.md` — active substrate plan for installing/running a local background daemon and bounded local history/metric store; mostly complete for the Node.js prototype.
 - `docs/plans/2026-05-28-monitoring-alerting.md` — completed first Node.js monitoring/alerting slice over daemon history: deterministic alerts, opt-in LLM adjudication, and opt-in notification setup/test/delivery audit.
-- `docs/plans/2026-05-30-native-macos-notifications.md` — in-progress native macOS notification helper plan; initial configured-helper adapter and Swift source prototype exist, real-host packaging/signing validation remains.
+- `docs/plans/2026-05-30-native-macos-notifications.md` — in-progress native macOS notification helper plan. The native adapter, release build/sign/notarize/staple flow, GitHub Release assets, Homebrew helper delivery, local install/linkage/helper packaging validation, and checkout validation scripts exist; first-run TCC/Notification Center behavior and daemon-context delivery remain external real-host validation.
 - `docs/plans/2026-05-23-derived-collector-transformation-engine.md` — follow-on plan for agent-authored pure map/reduce/window derived collectors over stored data without arbitrary code/host execution.
 - `docs/plans/2026-05-23-agent-authored-sensor-toolkit.md` — proposed follow-on plan for a fact/rule/statistical-model workbench that lets background LLM agents author deterministic sensors/tools instead of humans hand-writing every signature.
 - `todos/` — frontmatter-indexed work items for quick triage/sorting:
@@ -247,7 +249,7 @@ Existing files:
   - `2026-05-19-linux-ci-validation.md` — v0.0.31+ Linux rerun is deferred; public v0.0.30 direct collector/package validation passed on Linux ARM64 and x86_64.
   - `2026-05-23-daemon-history-store.md` — active task, mostly complete for the Node.js prototype: foreground loop, JSONL history, idempotent daemon lifecycle commands, compact history summaries, auto history-aware triage, truncation diagnostics, and macOS personal/work-laptop validation exist. Linux systemd-user validation and longer rollups/configurable retention remain follow-up.
   - `2026-05-28-monitoring-alerting.md` — completed first Node.js monitoring/alerting slice over daemon history. Alert state, dedupe/cooldown, daemon evaluation, CLI `alerts` commands, opt-in alert intelligence, and opt-in notification setup/test/delivery audit are implemented.
-  - `2026-05-30-native-macos-notifications.md` — active follow-up: initial native macOS configured-helper adapter and Swift source prototype are implemented; compile/sign/package and real-host permission/display validation remain.
+  - `2026-05-30-native-macos-notifications.md` — active follow-up: native macOS delivery is implemented and packaged through Homebrew, with local install/linkage/helper validation recorded. Real-host permission/display/denied-path/daemon-context validation remains before making native delivery the default.
   - `2026-05-23-derived-collector-transformation-engine.md` — follow-on: let agents author pure bounded map/reduce/window transformations over daemon history as derived collectors/sensors.
   - `2026-05-23-agent-authored-sensor-toolkit.md` — follow-on: build the fact/rule/metric-history/statistical-model substrate that lets background LLM agents author deterministic sensors/tools.
   - `2026-05-19-agent-delegation-identity-authority.md` — future design spike for inter-agent communication/delegation with identity, auth, scoped authority, policy, user validation, and audit.
@@ -264,7 +266,7 @@ Existing files:
 3. Do **not** make users build the native macOS helper. The native path must become a bundled release artifact; `--helper <path>` is only a development/advanced override.
 4. Do **not** jump directly to broad agent-authored signatures or unsafe background actions. The daemon/history substrate, deterministic alert layer, opt-in LLM adjudication, and opt-in notification delivery setup/test now exist for the Node.js prototype.
 5. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
-6. Recommended next task: seed Buildkite signing/notarization secrets, confirm the macOS agent queue, run a tag-triggered macOS notifier release, then validate Gatekeeper behavior, first-run permission attribution, Notification Center display name/icon, denied-permission behavior, and daemon-context delivery before making native delivery the default macOS desktop path.
+6. Recommended next task: complete the remaining external validations in `macos-notifier-release-validation-brief.md`: run the guided helper/TCC validation on a Mac with no prior notification grant, and on the next `vX.Y.Z` tag watch the first live Homebrew tap auto-bump. Before tagging, run `scripts/check-homebrew-tap-token.sh` from a trusted token-bearing environment. Do not make native delivery the default until first-run prompt attribution, display, persistence, denied-permission behavior, and daemon-context delivery are recorded.
 
 ## Current First Slice
 
@@ -337,7 +339,13 @@ https://github.com/lightless-labs/descartes
 
 The first install mechanism is an implementation decision, but it must include/private-vendor the agent harness. A Cargo-only CLI is not sufficient if it cannot provide the LLM-backed private harness and subscription login flow.
 
-Current distribution is a pragmatic GitHub npm install wrapper around the embedded Node/Pi harness:
+Current macOS distribution is Homebrew, which installs the Node/Pi harness CLI and the signed/notarized native notification helper together:
+
+```bash
+brew install lightless-labs/tap/descartes
+```
+
+The pragmatic cross-platform fallback remains GitHub npm install around the embedded Node/Pi harness, but it does not include the macOS native helper:
 
 ```bash
 npm install -g github:Lightless-Labs/descartes
@@ -405,9 +413,13 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: continue `docs/plans/2026-05-30-native-macos-notifications.md` / `todos/2026-05-30-native-macos-notifications.md` by replacing the wrong Buildkite-secret/env passthrough path with a Doppler-token bootstrap path for the Tart release job, modeled after Foundry. Extend/use `github.com/Lightless-Labs/tart-ci` with `doppler_token_path`, update the Descartes release job to pass only a scoped Doppler token over SSH stdin into Tart, fetch release secrets inside the guest, then run the tag-triggered macOS notifier release. Then validate Gatekeeper behavior, first-run macOS permission attribution, Notification Center display name/icon, denied-permission behavior, and daemon-context delivery before making native delivery the default macOS desktop path.
+Recommended next task: complete the external release-readiness validations tracked in `macos-notifier-release-validation-brief.md` / `todos/2026-07-08-macos-release-validation.md`:
 
-The v0.0.31+ Linux rerun and real-host VM/container correlation validation remain useful but deferred; do not block the daemon/history work on them.
+1. On a real Mac with no prior grant, run `scripts/validate-macos-notifier-helper.sh --reset-tcc` against the Homebrew-installed CLI and record first-run Notification Center prompt attribution, display, persistence, denied-path audit behavior, fallback behavior, and daemon-context delivery under `docs/reviews/`.
+2. Before the next `vX.Y.Z` tag, run `scripts/check-homebrew-tap-token.sh` from a trusted environment with the effective GitHub/Doppler token.
+3. On that next tag, watch the first live Buildkite release → GitHub Release → Homebrew tap-bump chain and verify `brew upgrade descartes` pulls the new CLI + helper.
+
+The v0.0.31+ Linux rerun and real-host VM/container correlation validation remain useful but deferred; do not block macOS release validation on them.
 
 ## Tests / Checks To Prioritize
 
