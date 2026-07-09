@@ -2,6 +2,7 @@
 
 **Created:** 2026-07-09
 **Status:** Draft plan
+**Tracking todo:** `todos/2026-07-09-witr-provenance-and-approval-notifications.md`
 **Research:** 2026-07-09 — inspected `https://github.com/pranshuparmar/witr` via a read-only scout pass plus direct checkout of README, `go.mod`, `LICENSE`, `internal/app/app.go`, `internal/pipeline/analyze.go`, `internal/proc/net_linux.go`, `internal/target/port_linux.go`, `internal/target/port_darwin.go`, `internal/source/detect.go`, `internal/source/systemd_linux.go`, `internal/source/launchd_darwin.go`, `internal/output/json.go`, and `pkg/model/*`.
 
 ## Purpose
