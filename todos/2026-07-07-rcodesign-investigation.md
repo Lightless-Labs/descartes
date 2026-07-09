@@ -1,7 +1,7 @@
 ---
 title: Investigate rcodesign for keychain-free macOS signing/notarization
 created: 2026-07-07
-status: in_progress
+status: deferred
 priority: medium
 area: release
 kind: todo
@@ -27,12 +27,13 @@ failure class:
 
 **Research update 2026-07-09:** Foundry-style research is recorded at
 `docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md`. Recommendation:
-do **not** replace the working Apple-toolchain release path yet. Keep rcodesign as an
-optional spike/fallback until it is proven with the real Descartes Developer ID p12 and
-App Store Connect API key, using the same Doppler-derived credential path as CI. The
-Swift app build still requires macOS today (`swiftc` + UserNotifications), so the first
-practical win would be keychain-free signing/notarization inside the existing Tart job,
-not eliminating the macOS VM end-to-end.
+do **not** replace the working Apple-toolchain release path yet. This todo is deferred,
+not actively incomplete: keep rcodesign as an optional spike/fallback until it can be
+proven with the real Descartes Developer ID p12 and App Store Connect API key, using the
+same Doppler-derived credential path as CI. The Swift app build still requires macOS
+today (`swiftc` + UserNotifications), so the first practical win would be keychain-free
+signing/notarization inside the existing Tart job, not eliminating the macOS VM
+end-to-end.
 
 - Signs directly from the `.p12` (`rcodesign sign --p12-file ... --p12-password-file ...`)
   with no keychain, trust store, partition list, or search list involvement.
@@ -58,10 +59,11 @@ not eliminating the macOS VM end-to-end.
 
 ## Acceptance criteria
 
-- [ ] Local rcodesign-signed app passes `codesign --verify --deep --strict` and Gatekeeper
-      assessment after notarization/stapling.
-- [ ] Signature attributes (hardened runtime, timestamp, identifier, team ID) match the
-      Apple-toolchain baseline.
+- [ ] Deferred until reopened: local rcodesign-signed app passes
+      `codesign --verify --deep --strict` and Gatekeeper assessment after
+      notarization/stapling.
+- [ ] Deferred until reopened: signature attributes (hardened runtime, timestamp,
+      identifier, team ID) match the Apple-toolchain baseline.
 - [x] Written recommendation (adopt/reject/fallback) recorded in
       `docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md` and this
       todo: defer adoption; keep as optional fallback until real-cert signing,

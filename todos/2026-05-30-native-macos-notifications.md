@@ -17,7 +17,7 @@ related:
 
 Add an explicit native macOS notification path so Descartes is not limited to the current `osascript` fallback. Users must not have to build the helper. The product path is a release-built helper delivered only through macOS-specific packaging or an explicit macOS setup/download flow; the configured helper path is only a development/advanced override until packaging/signing/notarization and real-host behavior are validated. Do not put a macOS `.app` payload in Linux/cross-platform installs. Release automation should assume a tag-triggered Buildkite pipeline rather than GitHub Actions; GitHub Releases may still be used as the artifact publication surface.
 
-Current state (2026-07-08): the native channel implementation, signing/notarization release automation, GitHub Release publication, Homebrew formula delivery, and tap-bump automation have landed or have CI/fixture evidence where possible. This is **not** fully release-ready yet; keep this todo open until the remaining real-host TCC/Notification Center validation and daemon-context delivery checks are recorded.
+Current state (2026-07-09): the native channel implementation, signing/notarization release automation, GitHub Release publication, Homebrew formula delivery, tap-bump automation, and local validation helper/preflight scripts have landed or have CI/fixture evidence where possible. This is **not** fully release-ready yet; keep this todo open until the remaining real-host TCC/Notification Center validation and daemon-context delivery checks are recorded.
 
 ## Scope
 
@@ -59,6 +59,6 @@ Current state (2026-07-08): the native channel implementation, signing/notarizat
   - [x] Import the Apple Developer ID intermediate certificate (matched by leaf issuer CN) from system root stores into the ephemeral keychain.
   - [x] Add stapling retry to `scripts/notarize-macos-notifier.sh`.
   - [x] Validate the fix with a real tag-triggered Buildkite run using the actual Apple Developer ID p12 (Buildkite #67 signed, notarized, stapled, and Gatekeeper-verified `v0.0.47`; Buildkite #73 validated GitHub Release publication).
-- [ ] Validate first-run macOS permission prompt attribution on real hosts.
-- [ ] Validate Notification Center display name/icon and denied-permission behavior.
-- [ ] Validate daemon-context delivery behavior before making native delivery the default macOS desktop path.
+- [ ] Validate first-run macOS permission prompt attribution on real hosts (external; use `macos-notifier-release-validation-brief.md` and `scripts/validate-macos-notifier-helper.sh`).
+- [ ] Validate Notification Center display name/icon and denied-permission behavior (external real-host check).
+- [ ] Validate daemon-context delivery behavior before making native delivery the default macOS desktop path (external real-host check).

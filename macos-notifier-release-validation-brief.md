@@ -48,6 +48,18 @@ Record results under `docs/reviews/` (follow the existing macOS/Linux validation
 
 **Why it needs the next tag:** the GitHub Release auto-publish was CI-validated in build #73, but the **Homebrew tap auto-bump has never run in CI** — it only fires on a real `vX.Y.Z` tag with `GITHUB_RELEASE_PUBLISHED=1` and a token that can write `Lightless-Labs/homebrew-tap`.
 
+Before the next version bump, preflight the effective tap token from a trusted shell:
+
+```bash
+scripts/check-homebrew-tap-token.sh
+```
+
+The preflight is read-only: it verifies the token can read `Formula/descartes.rb` and
+that GitHub reports push/write permission on `Lightless-Labs/homebrew-tap`. It uses the
+same precedence as the release job (dedicated `HOMEBREW_TAP_GITHUB_TOKEN` first,
+falling back to `GITHUB_TOKEN`, with either value optionally fetched from Doppler when
+`DOPPLER_TOKEN` is present) and does not print token values.
+
 On the next version bump (edit `package.json` version, commit, `git tag vX.Y.Z`, push tag — `export SSH_AUTH_SOCK=~/.ssh/agent.sock` first), watch the Buildkite `release-macos-notifier` job and confirm the full sequence:
 
 1. build → codesign (identity valid) → notarize **Accepted** → staple → `spctl` "Notarized Developer ID";
@@ -56,7 +68,7 @@ On the next version bump (edit `package.json` version, commit, `git tag vX.Y.Z`,
 4. **tap bump**: a `descartes: update to X.Y.Z` commit appears in `Lightless-Labs/homebrew-tap` with `Formula/descartes.rb` url version + BOTH sha256 values updated (tarball + helper zip), and the log line `bumped Lightless-Labs/homebrew-tap/Formula/descartes.rb to X.Y.Z: <sha>`.
 5. End-user check: `brew update && brew upgrade descartes` (or a fresh install) pulls the new version and its helper; `descartes --version` matches the tag.
 
-Token note: the tap bump reuses `GITHUB_TOKEN` (no separate secret). Confirm that token can write `homebrew-tap`; if the log shows `no GitHub token available` or an HTTP 403 warning + `bump manually:` instructions, the token lacks tap write access — either widen it or set a narrower `HOMEBREW_TAP_GITHUB_TOKEN` in Doppler (`lightless-labs-descartes` / `prd_notarisation`).
+Token note: the tap bump reuses `GITHUB_TOKEN` (no separate secret). Confirm that token can write `homebrew-tap` with `scripts/check-homebrew-tap-token.sh`; if the preflight fails, or if the release log shows `no GitHub token available` or an HTTP 403 warning + `bump manually:` instructions, the token lacks tap write access — either widen it or set a narrower `HOMEBREW_TAP_GITHUB_TOKEN` in Doppler (`lightless-labs-descartes` / `prd_notarisation`).
 
 Fallback: if the bump warns/skips (e.g. transient failure after retries), follow the script's printed manual-bump instructions — url version + tarball sha256 + helper zip sha256 in `Formula/descartes.rb`.
 

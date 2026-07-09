@@ -38,6 +38,7 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   const buildScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/build-macos-notifier.sh", import.meta.url)), "utf8");
   const notarizeScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/notarize-macos-notifier.sh", import.meta.url)), "utf8");
   const validationScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/validate-macos-notifier-helper.sh", import.meta.url)), "utf8");
+  const tokenCheckScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/check-homebrew-tap-token.sh", import.meta.url)), "utf8");
   const buildkiteScript = fs.readFileSync(fileURLToPath(new URL("../../../scripts/release-macos-notifier-buildkite.sh", import.meta.url)), "utf8");
   const buildkitePipeline = fs.readFileSync(fileURLToPath(new URL("../../../.buildkite/pipeline.yml", import.meta.url)), "utf8");
 
@@ -57,6 +58,12 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(validationScript, /tccutil reset Notifications/);
   assert.match(validationScript, /XDG_CONFIG_HOME="\$VALIDATION_ROOT\/config"/);
   assert.match(validationScript, /refusing to trigger a notification without interactive stdin/);
+  assert.match(tokenCheckScript, /Lightless-Labs\/homebrew-tap/);
+  assert.match(tokenCheckScript, /HOMEBREW_TAP_GITHUB_TOKEN/);
+  assert.match(tokenCheckScript, /GITHUB_TOKEN/);
+  assert.match(tokenCheckScript, /DOPPLER_PROJECT:-lightless-labs-descartes/);
+  assert.match(tokenCheckScript, /does not report push\/write permission/);
+  assert.doesNotMatch(tokenCheckScript, /HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy/);
   assert.match(buildkiteScript, /KEYCHAIN_PASSWORD="\$\(openssl rand -base64 48\)"/);
   assert.match(buildkiteScript, /security create-keychain -p "\$KEYCHAIN_PASSWORD"/);
   assert.match(buildkiteScript, /security find-identity -p codesigning "\$KEYCHAIN_PATH"/);

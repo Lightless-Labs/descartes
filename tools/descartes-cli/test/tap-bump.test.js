@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // Executes the exact python embedded in the release script's Homebrew tap bump
@@ -11,6 +12,9 @@ import { fileURLToPath } from "node:url";
 
 const scriptPath = fileURLToPath(
   new URL("../../../scripts/release-macos-notifier-buildkite.sh", import.meta.url),
+);
+const tokenCheckScriptPath = fileURLToPath(
+  new URL("../../../scripts/check-homebrew-tap-token.sh", import.meta.url),
 );
 
 const TARBALL_SHA_OLD = "1".repeat(64);
@@ -79,6 +83,70 @@ const hasPython3 = (() => {
   const probe = spawnSync("python3", ["--version"], { encoding: "utf8" });
   return !probe.error && probe.status === 0;
 })();
+
+async function withFakeGitHubTokenApi(permissions, fn, expectedToken = "test-token") {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push({ url: req.url, authorization: req.headers.authorization });
+    if (req.headers.authorization !== `Bearer ${expectedToken}`) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ message: "bad token" }));
+      return;
+    }
+    if (req.method === "GET" && req.url === "/repos/Lightless-Labs/homebrew-tap") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ full_name: "Lightless-Labs/homebrew-tap", permissions }));
+      return;
+    }
+    if (req.method === "GET" && req.url === "/repos/Lightless-Labs/homebrew-tap/contents/Formula/descartes.rb") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ type: "file", sha: "fixture-formula-sha" }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ message: `unexpected ${req.method} ${req.url}` }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  try {
+    return await fn(`http://127.0.0.1:${address.port}`, requests);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function runTokenCheck(apiUrl, envOverrides = {}) {
+  return new Promise((resolve) => {
+    const child = spawn("bash", [tokenCheckScriptPath], {
+      env: {
+        ...process.env,
+        GITHUB_TOKEN: "test-token",
+        HOMEBREW_TAP_GITHUB_TOKEN: "",
+        DOPPLER_TOKEN: "",
+        ...envOverrides,
+        DESCARTES_GITHUB_API_URL: apiUrl,
+        // The script itself must preserve normal proxy behavior; only the localhost
+        // fixture subprocess clears proxies so the request reaches the in-process server.
+        HTTP_PROXY: "",
+        HTTPS_PROXY: "",
+        ALL_PROXY: "",
+        http_proxy: "",
+        https_proxy: "",
+        all_proxy: "",
+        NO_PROXY: "127.0.0.1,localhost",
+        no_proxy: "127.0.0.1,localhost",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => resolve({ status: null, error, stdout, stderr }));
+    child.on("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+}
 
 function runBump({ tag, tarballSha, helperSha, formula, putFailures = 0 }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "descartes-tap-bump-"));
@@ -188,4 +256,40 @@ test("tap bump refuses to PUT when the formula shape is unexpected", { skip: !ha
   assert.notEqual(result.status, 0);
   assert.equal(puts.length, 0);
   assert.match(result.stderr, /unexpected formula shape/);
+});
+
+test("tap token preflight verifies formula read and write permission without leaking the token", { skip: !hasPython3 && "python3 unavailable" }, async () => {
+  await withFakeGitHubTokenApi({ pull: true, push: true }, async (apiUrl, requests) => {
+    const result = await runTokenCheck(apiUrl);
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /Homebrew tap token check OK/);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /test-token/);
+    assert.deepEqual(requests.map((r) => r.url), [
+      "/repos/Lightless-Labs/homebrew-tap",
+      "/repos/Lightless-Labs/homebrew-tap/contents/Formula/descartes.rb",
+    ]);
+  });
+});
+
+test("tap token preflight fails closed when write permission is not reported", { skip: !hasPython3 && "python3 unavailable" }, async () => {
+  await withFakeGitHubTokenApi({ pull: true, push: false }, async (apiUrl) => {
+    const result = await runTokenCheck(apiUrl);
+    assert.equal(result.status, 1, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stderr, /does not report push\/write permission/);
+    assert.match(result.stderr, /HOMEBREW_TAP_GITHUB_TOKEN/);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /test-token/);
+  });
+});
+
+test("tap token preflight prefers the dedicated tap token over the release token", { skip: !hasPython3 && "python3 unavailable" }, async () => {
+  await withFakeGitHubTokenApi({ pull: true, push: true }, async (apiUrl, requests) => {
+    const result = await runTokenCheck(apiUrl, {
+      GITHUB_TOKEN: "release-token-should-not-be-used",
+      HOMEBREW_TAP_GITHUB_TOKEN: "tap-token",
+    });
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /HOMEBREW_TAP_GITHUB_TOKEN/);
+    assert.deepEqual(requests.map((r) => r.authorization), ["Bearer tap-token", "Bearer tap-token"]);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /tap-token|release-token-should-not-be-used/);
+  }, "tap-token");
 });

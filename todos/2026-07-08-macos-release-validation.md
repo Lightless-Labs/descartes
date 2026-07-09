@@ -24,7 +24,10 @@ release). Two validations remain that require a real environment, plus one optio
 spike. Full executable steps: `macos-notifier-release-validation-brief.md`; the guided
 real-host helper runner is `scripts/validate-macos-notifier-helper.sh` (it isolates
 Descartes XDG config/state/cache and prompts before resetting TCC or sending a test
-notification unless `--yes` is passed).
+notification unless `--yes` is passed). The tap token can now be preflighted before
+cutting the next tag with `scripts/check-homebrew-tap-token.sh`; the check is read-only
+and proves formula read access plus GitHub-reported push/write permission for
+`Lightless-Labs/homebrew-tap`.
 
 ## Acceptance criteria
 
@@ -43,11 +46,15 @@ notification unless `--yes` is passed).
       `Lightless-Labs/homebrew-tap` with url version + both sha256 updated); and
       `brew upgrade descartes` pulls the new version + helper. This is the first CI run
       of the tap auto-bump.
-- [ ] **Token confirmation:** the tap bump succeeded reusing `GITHUB_TOKEN` (no separate
-      secret); if it warned/skipped on token access, resolved by widening that token or
-      setting `HOMEBREW_TAP_GITHUB_TOKEN` in Doppler.
-- [ ] (Optional) **rcodesign spike** progressed or explicitly deferred — see
-      `todos/2026-07-07-rcodesign-investigation.md`.
+- [ ] **Token confirmation:** before tagging, `scripts/check-homebrew-tap-token.sh`
+      reports that the effective token can read `Formula/descartes.rb` and has
+      push/write permission on `Lightless-Labs/homebrew-tap`; then the tap bump succeeds
+      reusing `GITHUB_TOKEN` (no separate secret). If preflight or CI warns/skips on
+      token access, resolve by widening that token or setting `HOMEBREW_TAP_GITHUB_TOKEN`
+      in Doppler.
+- [x] (Optional) **rcodesign spike** progressed or explicitly deferred — see
+      `todos/2026-07-07-rcodesign-investigation.md` and
+      `docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md`.
 
 ## Notes
 

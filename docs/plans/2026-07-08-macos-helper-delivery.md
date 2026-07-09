@@ -6,6 +6,7 @@
 **Updated:** 2026-07-08 — Milestone 1 implemented and verified: `Formula/descartes.rb` pushed to `Lightless-Labs/homebrew-tap` (`e655211`). Local install verified end-to-end: CLI `--version` from the keg, helper stapled + Gatekeeper-accepted after ditto extraction (generic resource staging descends into the single top-level `.app` and breaks — the formula uses `resource.fetch` + `ditto -x -k`), and `resolveBundledMacosHelperPath()` resolves the helper from the installed tree with no configuration. The npm-shadow link caveat was confirmed live (brew leaves an existing npm-owned `descartes` symlink untouched and installs unlinked).
 **Updated:** 2026-07-08 — Milestone 2 implemented and unit-tested: the release script now bumps `Lightless-Labs/homebrew-tap` through the GitHub Contents API after successful GitHub Release publication, reusing `GITHUB_TOKEN` by default with optional `HOMEBREW_TAP_GITHUB_TOKEN`. Remaining validation: first real-host Notification Center permission flow and first real tag run of the tap-bump step.
 **Updated:** 2026-07-09 — validation UX tightened: `descartes alerts notifications setup --channel native --json` and subsequent `descartes alerts notifications status --json` now report native-helper resolution details (`available`, `source`, executable path, and reason when unavailable), so the real-host brew validation can prove the bundled helper path before triggering the TCC prompt. Passing `--channel native` without `--helper` clears stale explicit helper overrides and prefers the bundled Homebrew helper; setup fails closed instead of persisting an unusable native channel when no executable helper is resolved. Added `scripts/validate-macos-notifier-helper.sh` as an optional checkout-only real-host runner for helper resolution, code-signature/staple/Gatekeeper checks, prompted TCC reset, and prompted notification testing with Descartes config/state/cache isolated under a temporary XDG root.
+**Updated:** 2026-07-09 — added `scripts/check-homebrew-tap-token.sh`, a read-only preflight for the next-tag tap bump token. It applies the release job's token precedence (dedicated `HOMEBREW_TAP_GITHUB_TOKEN` first, falling back to `GITHUB_TOKEN`, with either value optionally fetched from Doppler), verifies formula read access plus GitHub-reported push/write permission on `Lightless-Labs/homebrew-tap`, and fails before tagging if the token would not be able to commit the formula bump.
 
 ## Purpose
 
@@ -88,7 +89,9 @@ transient-retry-then-success / give-up-after-exhaustion). **Operator action to
 activate:** none beyond ensuring the `GITHUB_TOKEN` already in Doppler
 (`lightless-labs-descartes` / `prd_notarisation`) can write `Lightless-Labs/homebrew-tap`
 — the tap bump reuses it rather than requiring a second secret. CI validation happens on
-the next tag release.
+the next tag release. Before cutting that tag, run
+`scripts/check-homebrew-tap-token.sh` from a trusted environment (or with the effective
+token/Doppler token in env) to catch missing tap write permission before the release job.
 
 ## Deferred — in-CLI setup/download flow
 
