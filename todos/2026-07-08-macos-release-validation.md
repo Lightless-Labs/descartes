@@ -12,6 +12,7 @@ related:
   - docs/plans/2026-05-30-native-macos-notifications.md
   - docs/reviews/macos-notifier-real-host-validation-template.md
   - docs/reviews/macos-notifier-first-tag-tap-bump-validation-template.md
+  - docs/reviews/2026-07-09-macos-release-validation-blocker-audit.md
   - todos/2026-07-08-macos-helper-delivery.md
   - todos/2026-07-07-rcodesign-investigation.md
 ---
@@ -41,6 +42,12 @@ copy `docs/reviews/macos-notifier-first-tag-tap-bump-validation-template.md` int
 dated review file so the preflight, Buildkite release, GitHub Release, tap commit,
 formula URL/sha updates, and Homebrew upgrade evidence are captured before closing those
 criteria.
+
+Local stop-condition audit: `docs/reviews/2026-07-09-macos-release-validation-blocker-audit.md`
+records that the remaining acceptance criteria require external real-host, credential,
+or next-tag evidence. If the app repo and tap repo are clean, the latest tag remains
+`v0.0.47`, and no credential-bearing environment or suitable real-host evidence is
+available, do not reclassify this todo as complete; wait for those external inputs.
 
 ## Acceptance criteria
 
