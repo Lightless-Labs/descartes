@@ -2,7 +2,7 @@
 
 **Created:** 2026-07-08
 **For:** an agent/operator on a real macOS host (Part A) and watching the next tag release (Part B).
-**Status:** pending — the release *pipeline* is implemented and CI-validated through GitHub Release publication (Buildkite #73), and local Homebrew install/linkage/helper packaging validation is recorded below. Remaining release-readiness validation is the first-run Notification Center/TCC behavior plus the first live next-tag tap-bump run.
+**Status:** pending — the release *pipeline* is implemented and CI-validated through GitHub Release publication (Buildkite #73), and local Homebrew install/linkage/helper packaging validation is recorded below. Remaining release-readiness validation is the first-run Notification Center/TCC behavior, daemon-context native delivery, and the first live next-tag tap-bump run.
 
 Context: `v0.0.47` is signed, notarized, stapled, published to GitHub Releases, and installable via `brew install lightless-labs/tap/descartes` (CLI + bundled notarized helper). Local install/linkage/helper packaging validation is recorded in `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md` after tap commit `75e886f` removed unused optional clipboard add-ons from Descartes' vendored/internal Pi dependency tree in the keg. See `docs/plans/2026-07-08-macos-helper-delivery.md` and the 2026-07-07/08 entries in `docs/HANDOFF.md` for how it was built.
 
@@ -39,12 +39,13 @@ Steps:
    - after granting, the notification actually displays with the expected title/body/severity;
    - a second test does not re-prompt (grant persists).
 5. Confirm the grant **persists across a CLI restart** and a new shell session.
-6. Denied-permission path: deny (or `tccutil reset Notifications $BUNDLE_ID` then deny) and confirm delivery **fails closed** with a local delivery-audit record, and that the `osascript`/`macos-desktop` fallback channel still works.
-7. Reset helper (to re-test cleanly): `tccutil reset Notifications com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
+6. Daemon-context path: after the interactive grant succeeds, validate native delivery from Descartes' background context before making it the default. Prefer a normal user launchd daemon run with notification delivery configured to `macos-native`; record whether a daemon-triggered delivery displays and writes a `delivered` or `error` record in `notification-delivery.jsonl`. If you use a temporary one-shot LaunchAgent or other harness instead of the real alert-intelligence path, say so explicitly in the review so it does not masquerade as full daemon validation.
+7. Denied-permission path: deny (or `tccutil reset Notifications $BUNDLE_ID` then deny) and confirm delivery **fails closed** with a local delivery-audit record, and that the `osascript`/`macos-desktop` fallback channel still works.
+8. Reset helper (to re-test cleanly): `tccutil reset Notifications com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
 
 Gotcha: a Mac that previously ran an unsigned/dev build with the same bundle id may hold a stale TCC grant; reset before testing to see true first-run behavior.
 
-Record results under `docs/reviews/` (follow the existing macOS/Linux validation review docs), and check the acceptance boxes in `todos/2026-07-08-macos-helper-delivery.md`.
+Record results under `docs/reviews/` (follow the existing macOS/Linux validation review docs), then update `todos/2026-07-08-macos-release-validation.md` and the linked helper-delivery todo if the evidence satisfies their acceptance criteria.
 
 ---
 

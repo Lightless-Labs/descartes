@@ -23,8 +23,9 @@ Release publication (Buildkite #67 signed/notarized/stapled; #73 auto-published 
 release). Local Homebrew install/linkage/helper packaging validation passed after tap
 commit `75e886f`; see `docs/reviews/2026-07-09-homebrew-notifier-install-validation.md`.
 Remaining release-readiness work is external: first-run TCC/Notification Center behavior
-on a real Mac, first live next-tag tap-bump validation, and token confirmation around
-that tag. Full executable steps: `macos-notifier-release-validation-brief.md`; the
+on a real Mac, daemon-context native delivery, first live next-tag tap-bump validation,
+and token confirmation around that tag. Full executable steps:
+`macos-notifier-release-validation-brief.md`; the
 guided real-host helper runner is `scripts/validate-macos-notifier-helper.sh` (it
 isolates Descartes XDG config/state/cache and prompts before resetting TCC or sending a
 test notification unless `--yes` is passed). The tap token can now be preflighted before
@@ -42,8 +43,10 @@ and proves formula read access plus GitHub-reported push/write permission for
       the brew keg), or the guided runner verifies the same plus signature/staple/Gatekeeper
       checks; the first-run Notification Center prompt appears attributed to
       *DescartesNotifier* (not Terminal); the notification displays; the grant persists
-      across restart; the denied path fails closed with an audit record and the
-      osascript fallback still works. Results recorded under `docs/reviews/`.
+      across restart; daemon-context native delivery displays and records a local audit
+      result (or the review clearly states any narrower harness used); the denied path
+      fails closed with an audit record and the osascript fallback still works. Results
+      recorded under `docs/reviews/`.
 - [ ] **First-tag chain (Part B):** on the next `vX.Y.Z` tag, the Buildkite release job
       runs build → sign → notarize (Accepted) → staple → Buildkite artifacts → GitHub
       Release → **tap formula bump** (a `descartes: update to X.Y.Z` commit in

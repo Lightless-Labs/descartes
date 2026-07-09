@@ -43,7 +43,8 @@ remaining work is external validation on a real Mac and the next tagged release;
       fallback/manual bump behavior; it reuses `GITHUB_TOKEN` by default, with optional
       `HOMEBREW_TAP_GITHUB_TOKEN` for a narrower token. `scripts/check-homebrew-tap-token.sh`
       provides a read-only preflight for the token before the next tag.
-- [ ] Real-host validation: first-run Notification Center permission prompt attribution
-      and persistence with the brew-installed helper.
+- [ ] Real-host validation: first-run Notification Center permission prompt attribution,
+      persistence, denied-path behavior, and daemon-context native delivery with the
+      brew-installed helper.
 - [ ] First-tag validation: tap-bump automation runs successfully in CI on the next
       version tag and `brew upgrade descartes` pulls the new CLI + helper.
