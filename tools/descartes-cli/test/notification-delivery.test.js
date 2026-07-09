@@ -115,14 +115,17 @@ test("native macOS delivery fails closed when helper is not packaged or configur
   assert.match(record.reason, /helper is not packaged or configured/);
 });
 
-test("native macOS helper resolution prefers a bundled executable", async () => {
+test("native macOS helper resolution prefers the bundled app executable", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-native-helper-test-"));
   const srcDir = path.join(root, "src");
-  const helper = path.join(root, "native", "macos", "DescartesNotifier");
-  await fs.mkdir(path.dirname(helper), { recursive: true });
+  const appHelper = path.join(root, "native", "macos", "DescartesNotifier.app", "Contents", "MacOS", "DescartesNotifier");
+  const legacyHelper = path.join(root, "native", "macos", "DescartesNotifier");
+  await fs.mkdir(path.dirname(appHelper), { recursive: true });
+  await fs.mkdir(path.dirname(legacyHelper), { recursive: true });
   await fs.mkdir(srcDir, { recursive: true });
-  await fs.writeFile(helper, "#!/bin/sh\n", { mode: 0o755 });
-  assert.equal(resolveBundledMacosHelperPath({ nativeHelperBaseDir: srcDir }), helper);
+  await fs.writeFile(appHelper, "#!/bin/sh\n", { mode: 0o755 });
+  await fs.writeFile(legacyHelper, "#!/bin/sh\n", { mode: 0o755 });
+  assert.equal(resolveBundledMacosHelperPath({ nativeHelperBaseDir: srcDir }), appHelper);
 });
 
 test("native macOS delivery uses configured helper with fixed bounded arguments", async () => {

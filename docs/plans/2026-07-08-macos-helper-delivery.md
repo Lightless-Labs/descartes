@@ -1,31 +1,36 @@
 # macOS Notifier Helper Delivery
 
 **Created:** 2026-07-08
-**Status:** In Progress
+**Status:** In Progress — local delivery implementation has landed; release readiness remains blocked on external validation (real-host TCC behavior and the next tagged release's tap-bump run).
 **Updated:** 2026-07-08 — direction decision (operator): Homebrew is the primary macOS delivery channel. The tap formula installs the CLI and the notarized helper together; the in-CLI setup/download flow is deferred, not implemented.
-**Updated:** 2026-07-08 — Milestone 1 implemented and verified: `Formula/descartes.rb` pushed to `Lightless-Labs/homebrew-tap` (`e655211`). Local install verified end-to-end: CLI `--version` from the keg, helper stapled + Gatekeeper-accepted after ditto extraction (generic resource staging descends into the single top-level `.app` and breaks — the formula uses `resource.fetch` + `ditto -x -k`), and `resolveBundledMacosHelperPath()` resolves the helper from the installed tree with no configuration. The npm-shadow link caveat was confirmed live (brew leaves an existing npm-owned `descartes` symlink untouched and installs unlinked). Remaining: Milestone 2 (release-job tap bump) and real-host permission-prompt validation.
+**Updated:** 2026-07-08 — Milestone 1 implemented and verified: `Formula/descartes.rb` pushed to `Lightless-Labs/homebrew-tap` (`e655211`). Local install verified end-to-end: CLI `--version` from the keg, helper stapled + Gatekeeper-accepted after ditto extraction (generic resource staging descends into the single top-level `.app` and breaks — the formula uses `resource.fetch` + `ditto -x -k`), and `resolveBundledMacosHelperPath()` resolves the helper from the installed tree with no configuration. The npm-shadow link caveat was confirmed live (brew leaves an existing npm-owned `descartes` symlink untouched and installs unlinked).
+**Updated:** 2026-07-08 — Milestone 2 implemented and unit-tested: the release script now bumps `Lightless-Labs/homebrew-tap` through the GitHub Contents API after successful GitHub Release publication, reusing `GITHUB_TOKEN` by default with optional `HOMEBREW_TAP_GITHUB_TOKEN`. Remaining validation: first real-host Notification Center permission flow and first real tag run of the tap-bump step.
 
 ## Purpose
 
 Close the gap between the notarized helper release artifact and the user-facing
-`macos-native` notification channel. As of `v0.0.47`, every release tag publishes a
+`macos-native` notification channel. As of `v0.0.47`, release tags publish a
 Developer ID-signed, notarized, stapled `DescartesNotifier.app.zip` (+ `.sha256`) as a
-GitHub Release asset, but nothing delivers that helper to end users: the CLI's
-"bundled-helper resolution" has nothing to resolve (the npm payload intentionally
-excludes macOS binaries), and `--helper <path>` is a development-only override.
+GitHub Release asset, and the macOS Homebrew formula delivers that helper to the
+bundled-helper path the CLI already probes. npm installs still do not include macOS
+binaries; those users retain the development/advanced `--helper <path>` override unless
+an in-CLI download flow is revisited later.
 
 ## Current facts (verified 2026-07-08)
 
-- CLI delivery is `npm install -g github:Lightless-Labs/descartes`; the git tag is the
-  delivery vehicle for all JS code. npm registry publishing is explicitly a non-goal.
+- macOS CLI delivery is now primarily `brew install lightless-labs/tap/descartes`, which
+  installs both the Node CLI and the native helper. Cross-platform npm/GitHub install
+  remains available as `npm install -g github:Lightless-Labs/descartes`, without the
+  helper. npm registry publishing is explicitly a non-goal.
 - The release pipeline ties the tag to `package.json` version, so a CLI build can derive
   the exact release asset URL for its own version.
 - Helper asset: `https://github.com/Lightless-Labs/descartes/releases/download/v<version>/DescartesNotifier.app.zip`
   plus a `.sha256` sibling. Stapled, so Gatekeeper accepts it offline.
-- **Descartes is NOT currently on Homebrew.** `Lightless-Labs/homebrew-tap` exists but
-  carries only `middens` (per-platform GitHub-Release binary tarballs, version + sha256
-  pinned, `odie` on unsupported platforms). No descartes formula or cask exists anywhere.
-- Homebrew and GitHub Release binaries are the roadmap's preferred long-term channels,
+- **Descartes is now on Homebrew for macOS.** `Lightless-Labs/homebrew-tap` contains
+  `Formula/descartes.rb`; the formula installs the CLI from the tagged source tarball and
+  installs the notarized helper release asset as a macOS-only resource at the path the CLI
+  probes. This is the primary macOS delivery channel.
+- Homebrew and GitHub Release binaries remain the roadmap's preferred long-term channels,
   aligned with the future Rust core (see `docs/plans/2026-05-18-003-*` distribution notes).
 - Notification permission grants are keyed to the signed bundle identity and install
   path stability matters (see 2026-07-07 addenda in
@@ -33,7 +38,7 @@ excludes macOS binaries), and `--helper <path>` is a development-only override.
 
 ## Milestone 1 — Homebrew tap formula: CLI + helper together (primary)
 
-Add `Formula/descartes.rb` to `Lightless-Labs/homebrew-tap`:
+Implemented by adding `Formula/descartes.rb` to `Lightless-Labs/homebrew-tap`:
 
 - `url` = release tag source tarball (sha256-pinned); `depends_on "node"`; install via
   `std_npm_args` into `libexec`; symlink `bin/descartes`.
