@@ -27,11 +27,12 @@ spike. Full executable steps: `macos-notifier-release-validation-brief.md`.
 
 - [ ] **Real-host helper (Part A):** on a Mac with no prior grant, `brew install
       lightless-labs/tap/descartes` then `descartes alerts notifications setup
-      --channel native` resolves the bundled helper with no flags; the first-run
-      Notification Center prompt appears attributed to *DescartesNotifier* (not
-      Terminal); the notification displays; the grant persists across restart; the
-      denied path fails closed with an audit record and the osascript fallback still
-      works. Results recorded under `docs/reviews/`.
+      --channel native --json` resolves the bundled helper with no flags
+      (`resolution.macos_native_helper_available: true`, source `bundled`, path inside
+      the brew keg); the first-run Notification Center prompt appears attributed to
+      *DescartesNotifier* (not Terminal); the notification displays; the grant persists
+      across restart; the denied path fails closed with an audit record and the
+      osascript fallback still works. Results recorded under `docs/reviews/`.
 - [ ] **First-tag chain (Part B):** on the next `vX.Y.Z` tag, the Buildkite release job
       runs build → sign → notarize (Accepted) → staple → Buildkite artifacts → GitHub
       Release → **tap formula bump** (a `descartes: update to X.Y.Z` commit in

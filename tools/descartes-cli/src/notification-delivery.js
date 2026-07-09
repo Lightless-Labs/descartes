@@ -93,21 +93,66 @@ function isExecutableFile(candidate) {
   }
 }
 
-export function resolveBundledMacosHelperPath(options = {}) {
+function bundledMacosHelperCandidates(options = {}) {
   const baseDir = options.nativeHelperBaseDir ?? path.dirname(fileURLToPath(import.meta.url));
-  const candidates = [
+  return [
     path.resolve(baseDir, "../native/macos/DescartesNotifier.app/Contents/MacOS/DescartesNotifier"),
     path.resolve(baseDir, "../native/macos/DescartesNotifier"),
   ];
-  return candidates.find(isExecutableFile);
+}
+
+export function resolveBundledMacosHelperPath(options = {}) {
+  return bundledMacosHelperCandidates(options).find(isExecutableFile);
+}
+
+function macosNativeHelperResolution(options = {}) {
+  const env = options.env ?? process.env;
+  const explicitCandidates = [
+    ["override", options.macosNativeHelperPath],
+    ["config", options.config?.macos_native_helper_path],
+    ["env", env.DESCARTES_MACOS_NOTIFICATION_HELPER],
+  ];
+  for (const [source, candidate] of explicitCandidates) {
+    const helperPath = candidate ? String(candidate).trim() : "";
+    if (!helperPath) continue;
+    if (isExecutableFile(helperPath)) return { path: helperPath, source, available: true, reason: undefined };
+    return {
+      path: helperPath,
+      source,
+      available: false,
+      reason: "Native macOS notification helper path is not an executable file",
+    };
+  }
+  const bundled = resolveBundledMacosHelperPath(options);
+  if (bundled) return { path: bundled, source: "bundled", available: true, reason: undefined };
+  return {
+    path: undefined,
+    source: undefined,
+    available: false,
+    reason: "Native macOS notification helper is not packaged or configured",
+  };
 }
 
 function nativeMacosHelperPath(options = {}) {
-  const env = options.env ?? process.env;
-  return options.macosNativeHelperPath
-    ?? options.config?.macos_native_helper_path
-    ?? env.DESCARTES_MACOS_NOTIFICATION_HELPER
-    ?? resolveBundledMacosHelperPath(options);
+  const resolution = macosNativeHelperResolution(options);
+  return resolution.available ? resolution.path : undefined;
+}
+
+export function resolveMacosNativeHelperPath(options = {}) {
+  return nativeMacosHelperPath(options);
+}
+
+export function notificationDeliveryResolution(config = {}, options = {}) {
+  const normalized = normalizeNotificationDeliveryConfig(config);
+  if (normalized.channel !== "macos-native") return { resolved_macos_native_helper_path: undefined };
+  const resolution = macosNativeHelperResolution({ ...options, config: normalized });
+  return {
+    resolved_macos_native_helper_path: resolution.available ? resolution.path : undefined,
+    macos_native_helper_path: resolution.path,
+    macos_native_helper_source: resolution.source,
+    macos_native_helper_available: resolution.available,
+    macos_native_helper_reason: resolution.reason,
+  };
 }
 
 function commandForPayload(channel, payload, options = {}) {
@@ -118,12 +163,12 @@ function commandForPayload(channel, payload, options = {}) {
     if (platform !== "darwin" && !options.allowPlatformMismatch) {
       return { unavailable: "Native macOS notifications require macOS" };
     }
-    const helperPath = nativeMacosHelperPath(options);
-    if (!helperPath) {
-      return { unavailable: "Native macOS notification helper is not packaged or configured" };
+    const helperResolution = macosNativeHelperResolution(options);
+    if (!helperResolution.available) {
+      return { unavailable: helperResolution.reason };
     }
     return {
-      command: helperPath,
+      command: helperResolution.path,
       args: [
         "--title", payload.title,
         "--body", payload.body,

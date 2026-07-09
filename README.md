@@ -197,13 +197,15 @@ descartes alerts notifications status
 descartes alerts notifications setup --channel desktop   # macOS osascript or Linux notify-send when available
 descartes alerts notifications test                      # may trigger the platform permission prompt
 descartes alerts notifications setup --channel syslog    # headless/local log entry option
-# Experimental native macOS path; uses a signed/notarized helper from macOS-specific packaging when available.
-# --helper is only for development/advanced overrides while packaging/signing/notarization is validated:
+# Experimental native macOS path; Homebrew installs the signed/notarized helper.
+# Setup fails closed if no executable helper is resolved; --json includes the helper resolution.
+descartes alerts notifications setup --channel native --json
+# --helper remains a development/advanced override for non-Homebrew installs:
 descartes alerts notifications setup --channel native --helper /path/to/DescartesNotifier
 descartes alerts notifications disable
 ```
 
-Platform caveat: a pure CLI may have desktop notification permission attributed to Terminal/osascript on macOS; Linux desktop notifications require a graphical session notification service. Experimental native macOS delivery is intended to use a macOS-specific signed/notarized release-built helper, without shipping a `.app` payload in Linux/cross-platform installs, but still needs packaging and real-host validation before becoming the default.
+Platform caveat: a pure CLI may have desktop notification permission attributed to Terminal/osascript on macOS; Linux desktop notifications require a graphical session notification service. Experimental native macOS delivery uses a macOS-specific signed/notarized release-built helper when available (for example through Homebrew), without shipping a `.app` payload in Linux/cross-platform installs, but still needs real-host TCC/Notification Center validation before becoming the default.
 
 This daemon lifecycle is new and still needs broader real-host validation across launchd/systemd variants.
 

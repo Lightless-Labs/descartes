@@ -7,6 +7,7 @@ import { acknowledgeAlert, evaluateAndPersistAlerts, readAlertRecords } from "./
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
+  notificationDeliveryResolution,
   notificationPlatformNotes,
   readNotificationDeliveryConfig,
   testNotificationDelivery,
@@ -149,10 +150,26 @@ function expandNotificationChannel(channel, runtime = {}) {
   return normalized;
 }
 
-function renderNotificationDeliveryStatus(config) {
+function nativeNotificationSetupError(config, runtime = {}) {
+  if (config.channel !== "macos-native") return undefined;
+  const platform = runtime.platform ?? process.platform;
+  if (platform !== "darwin" && !runtime.allowPlatformMismatch) return "Native macOS notifications require macOS";
+  const resolution = notificationDeliveryResolution(config, runtime);
+  return resolution.macos_native_helper_available ? undefined : resolution.macos_native_helper_reason;
+}
+
+function renderNotificationDeliveryStatus(config, runtime = {}) {
+  const resolution = notificationDeliveryResolution(config, runtime);
   const lines = [`Notification delivery: ${config.enabled ? "enabled" : "disabled"}`];
   lines.push(`Channel: ${config.channel}`);
-  if (config.macos_native_helper_path) lines.push(`Native macOS helper: ${config.macos_native_helper_path}`);
+  if (config.macos_native_helper_path) lines.push(`Configured native macOS helper: ${config.macos_native_helper_path}`);
+  if (config.channel === "macos-native") {
+    if (resolution.macos_native_helper_available) {
+      lines.push(`Resolved native macOS helper: ${resolution.resolved_macos_native_helper_path} (${resolution.macos_native_helper_source})`);
+    } else {
+      lines.push(`Resolved native macOS helper: unavailable (${resolution.macos_native_helper_reason})`);
+    }
+  }
   lines.push(notificationPlatformNotes(config.channel));
   if (config.enabled) lines.push("Notifications deliver bounded LLM alert decisions only; no raw alert dumps or remediation actions are sent.");
   else lines.push("Run `descartes alerts notifications setup` and then `descartes alerts notifications test` to opt in and trigger any platform permission prompt.");
@@ -193,19 +210,23 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     let config = existing;
     let delivery;
     if (options.notificationsCommand === "setup") {
-      config = await writeNotificationDeliveryConfig(descartesPaths, {
+      const channel = expandNotificationChannel(options.notificationChannel, runtime);
+      const nextConfig = {
         enabled: true,
-        channel: expandNotificationChannel(options.notificationChannel, runtime),
-        macos_native_helper_path: options.notificationHelper ?? existing.macos_native_helper_path,
-      });
+        channel,
+        macos_native_helper_path: options.notificationHelper ?? (channel === "macos-native" ? undefined : existing.macos_native_helper_path),
+      };
+      const setupError = nativeNotificationSetupError(nextConfig, runtime);
+      if (setupError) throw new Error(`Native macOS notification setup unavailable: ${setupError}`);
+      config = await writeNotificationDeliveryConfig(descartesPaths, nextConfig);
     } else if (options.notificationsCommand === "disable") {
       config = await writeNotificationDeliveryConfig(descartesPaths, { ...existing, enabled: false });
     } else if (options.notificationsCommand === "test") {
-      delivery = await testNotificationDelivery(descartesPaths, { config, platform: runtime.platform, env: runtime.env, runner: runtime.runner });
+      delivery = await testNotificationDelivery(descartesPaths, { ...runtime, config });
     }
-    if (options.json) output(JSON.stringify({ notifications: config, delivery }, null, 2));
+    if (options.json) output(JSON.stringify({ notifications: config, resolution: notificationDeliveryResolution(config, runtime), delivery }, null, 2));
     else {
-      const lines = [renderNotificationDeliveryStatus(config)];
+      const lines = [renderNotificationDeliveryStatus(config, runtime)];
       if (delivery) lines.push(`Test delivery: ${delivery.status}${delivery.reason ? ` (${delivery.reason})` : ""}`);
       output(lines.join("\n"));
     }

@@ -18,8 +18,11 @@ Steps:
 
 1. Install: `brew install lightless-labs/tap/descartes`. If a prior `npm -g` install owns `/opt/homebrew/bin/descartes`, run `npm uninstall -g @lightless-labs/descartes` first (documented caveat).
 2. Confirm the CLI resolves the bundled helper with no `--helper` flag:
-   `descartes alerts notifications setup --channel native` — it should find the helper inside the brew keg, not report "not packaged or configured".
-3. Trigger a test notification (`descartes alerts notifications test` or the setup flow's built-in test) and confirm:
+   `descartes alerts notifications setup --channel native --json` — the JSON `resolution`
+   should report `macos_native_helper_available: true`,
+   `macos_native_helper_source: "bundled"`, and a
+   `resolved_macos_native_helper_path` inside the brew keg, not "not packaged or configured".
+3. Trigger a test notification (`descartes alerts notifications test`) and confirm:
    - the **first-run Notification Center permission prompt appears**, attributed to *DescartesNotifier* (branded), NOT Terminal/osascript;
    - after granting, the notification actually displays with the expected title/body/severity;
    - a second test does not re-prompt (grant persists).

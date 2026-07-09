@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { runAlerts, renderAlertList, visibleAlerts } from "../src/alerts.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
+import { readNotificationDeliveryConfig, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { writeAlertRecords } from "../src/alert-store.js";
 
@@ -148,14 +149,75 @@ test("alerts notification setup status test and disable are explicit", async () 
   assert.equal(testOutputs[0].delivery.status, "delivered");
   assert.equal(calls[0][0], "notify-send");
 
+  const helperRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-alerts-native-helper-"));
+  const srcDir = path.join(helperRoot, "src");
+  const appHelper = path.join(helperRoot, "native", "macos", "DescartesNotifier.app", "Contents", "MacOS", "DescartesNotifier");
+  await fs.mkdir(path.dirname(appHelper), { recursive: true });
+  await fs.mkdir(srcDir, { recursive: true });
+  await fs.writeFile(appHelper, "#!/bin/sh\n", { mode: 0o755 });
+  const bundledNativeOutputs = [];
+  await runAlerts(paths, ["notifications", "setup", "--json", "--channel", "native"], {
+    platform: "darwin",
+    nativeHelperBaseDir: srcDir,
+    output: (line) => bundledNativeOutputs.push(JSON.parse(line)),
+  });
+  assert.equal(bundledNativeOutputs[0].notifications.channel, "macos-native");
+  assert.equal(bundledNativeOutputs[0].resolution.resolved_macos_native_helper_path, appHelper);
+
   const nativeOutputs = [];
-  await runAlerts(paths, ["notifications", "setup", "--json", "--channel", "native", "--helper", "/opt/descartes/DescartesNotifier"], {
+  await runAlerts(paths, ["notifications", "setup", "--json", "--channel", "native", "--helper", appHelper], {
+    platform: "darwin",
     output: (line) => nativeOutputs.push(JSON.parse(line)),
   });
   assert.equal(nativeOutputs[0].notifications.channel, "macos-native");
-  assert.equal(nativeOutputs[0].notifications.macos_native_helper_path, "/opt/descartes/DescartesNotifier");
+  assert.equal(nativeOutputs[0].notifications.macos_native_helper_path, appHelper);
 
   const disableOutputs = [];
   await runAlerts(paths, ["notifications", "disable", "--json"], { output: (line) => disableOutputs.push(JSON.parse(line)) });
   assert.equal(disableOutputs[0].notifications.enabled, false);
+});
+
+test("native notification setup clears stale helper override in favor of bundled helper", async () => {
+  const paths = await tempPaths();
+  await writeNotificationDeliveryConfig(paths, {
+    enabled: true,
+    channel: "macos-native",
+    macos_native_helper_path: path.join(paths.cacheDir, "stale-helper"),
+  });
+  const helperRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-alerts-native-helper-"));
+  const srcDir = path.join(helperRoot, "src");
+  const appHelper = path.join(helperRoot, "native", "macos", "DescartesNotifier.app", "Contents", "MacOS", "DescartesNotifier");
+  await fs.mkdir(path.dirname(appHelper), { recursive: true });
+  await fs.mkdir(srcDir, { recursive: true });
+  await fs.writeFile(appHelper, "#!/bin/sh\n", { mode: 0o755 });
+
+  const outputs = [];
+  await runAlerts(paths, ["notifications", "setup", "--json", "--channel", "native"], {
+    platform: "darwin",
+    nativeHelperBaseDir: srcDir,
+    output: (line) => outputs.push(JSON.parse(line)),
+  });
+
+  assert.equal(outputs[0].notifications.macos_native_helper_path, undefined);
+  assert.equal(outputs[0].resolution.macos_native_helper_source, "bundled");
+  assert.equal(outputs[0].resolution.resolved_macos_native_helper_path, appHelper);
+  assert.equal((await readNotificationDeliveryConfig(paths)).macos_native_helper_path, undefined);
+});
+
+test("native notification setup rejects missing helper without persisting unusable config", async () => {
+  const paths = await tempPaths();
+  await assert.rejects(
+    () => runAlerts(paths, ["notifications", "setup", "--json", "--channel", "native"], {
+      platform: "darwin",
+      nativeHelperBaseDir: paths.cacheDir,
+      output: () => {},
+    }),
+    /Native macOS notification setup unavailable: Native macOS notification helper is not packaged or configured/,
+  );
+  assert.deepEqual(await readNotificationDeliveryConfig(paths), {
+    enabled: false,
+    channel: "cli",
+    macos_native_helper_path: undefined,
+    updated_at: undefined,
+  });
 });

@@ -7,6 +7,7 @@ import {
   defaultNotificationChannel,
   deliverNotificationDecision,
   normalizeNotificationPayload,
+  notificationDeliveryResolution,
   readNotificationDeliveryAudit,
   readNotificationDeliveryConfig,
   resolveNotificationDeliveryPaths,
@@ -130,6 +131,9 @@ test("native macOS helper resolution prefers the bundled app executable", async 
 
 test("native macOS delivery uses configured helper with fixed bounded arguments", async () => {
   const paths = await tempPaths();
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-configured-native-helper-"));
+  const helper = path.join(root, "DescartesNotifier");
+  await fs.writeFile(helper, "#!/bin/sh\n", { mode: 0o755 });
   const calls = [];
   const record = await deliverNotificationDecision(paths, {
     notify: true,
@@ -137,7 +141,7 @@ test("native macOS delivery uses configured helper with fixed bounded arguments"
     title: "CPU alert",
     body: "Load is high.",
   }, {
-    config: { enabled: true, channel: "macos-native", macos_native_helper_path: "/opt/descartes/DescartesNotifier" },
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: helper },
     alertId: "alert_cpu",
     ruleId: "system.load.sustained_high",
     platform: "darwin",
@@ -145,7 +149,7 @@ test("native macOS delivery uses configured helper with fixed bounded arguments"
     runner: async (command, args) => calls.push([command, ...args]),
   });
   assert.equal(record.status, "delivered");
-  assert.equal(calls[0][0], "/opt/descartes/DescartesNotifier");
+  assert.equal(calls[0][0], helper);
   assert.deepEqual(calls[0].slice(1), [
     "--title", "CPU alert",
     "--body", "Load is high.",
@@ -153,4 +157,27 @@ test("native macOS delivery uses configured helper with fixed bounded arguments"
     "--alert-id", "alert_cpu",
     "--rule-id", "system.load.sustained_high",
   ]);
+});
+
+test("native macOS helper resolution reports invalid configured helpers as unavailable", async () => {
+  const paths = await tempPaths();
+  const missingHelper = path.join(paths.cacheDir, "missing-helper");
+  const resolution = notificationDeliveryResolution({
+    enabled: true,
+    channel: "macos-native",
+    macos_native_helper_path: missingHelper,
+  }, { platform: "darwin", nativeHelperBaseDir: paths.cacheDir });
+  assert.equal(resolution.resolved_macos_native_helper_path, undefined);
+  assert.equal(resolution.macos_native_helper_path, missingHelper);
+  assert.equal(resolution.macos_native_helper_source, "config");
+  assert.equal(resolution.macos_native_helper_available, false);
+  assert.match(resolution.macos_native_helper_reason, /not an executable file/);
+
+  const record = await deliverNotificationDecision(paths, { notify: true, title: "Alert", body: "Body" }, {
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: missingHelper },
+    platform: "darwin",
+    now: "2026-05-29T00:05:00.000Z",
+  });
+  assert.equal(record.status, "unavailable");
+  assert.match(record.reason, /not an executable file/);
 });
