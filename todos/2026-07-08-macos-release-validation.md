@@ -21,7 +21,10 @@ related:
 The macOS notifier release pipeline is implemented and CI-validated through GitHub
 Release publication (Buildkite #67 signed/notarized/stapled; #73 auto-published the
 release). Two validations remain that require a real environment, plus one optional
-spike. Full executable steps: `macos-notifier-release-validation-brief.md`.
+spike. Full executable steps: `macos-notifier-release-validation-brief.md`; the guided
+real-host helper runner is `scripts/validate-macos-notifier-helper.sh` (it isolates
+Descartes XDG config/state/cache and prompts before resetting TCC or sending a test
+notification unless `--yes` is passed).
 
 ## Acceptance criteria
 
@@ -29,7 +32,8 @@ spike. Full executable steps: `macos-notifier-release-validation-brief.md`.
       lightless-labs/tap/descartes` then `descartes alerts notifications setup
       --channel native --json` resolves the bundled helper with no flags
       (`resolution.macos_native_helper_available: true`, source `bundled`, path inside
-      the brew keg); the first-run Notification Center prompt appears attributed to
+      the brew keg), or the guided runner verifies the same plus signature/staple/Gatekeeper
+      checks; the first-run Notification Center prompt appears attributed to
       *DescartesNotifier* (not Terminal); the notification displays; the grant persists
       across restart; the denied path fails closed with an audit record and the
       osascript fallback still works. Results recorded under `docs/reviews/`.

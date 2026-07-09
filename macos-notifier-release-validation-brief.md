@@ -17,18 +17,26 @@ Bundle identifier: `com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
 Steps:
 
 1. Install: `brew install lightless-labs/tap/descartes`. If a prior `npm -g` install owns `/opt/homebrew/bin/descartes`, run `npm uninstall -g @lightless-labs/descartes` first (documented caveat).
-2. Confirm the CLI resolves the bundled helper with no `--helper` flag:
+2. Optional guided runner: from a checkout, run
+   `scripts/validate-macos-notifier-helper.sh --reset-tcc` on the target Mac. It performs
+   the setup/signature checks below, prompts before any TCC reset or notification test,
+   isolates Descartes config/state/cache under a temporary XDG root, and prints the
+   observations to record below.
+3. Confirm the CLI resolves the bundled helper with no `--helper` flag:
    `descartes alerts notifications setup --channel native --json` — the JSON `resolution`
    should report `macos_native_helper_available: true`,
    `macos_native_helper_source: "bundled"`, and a
    `resolved_macos_native_helper_path` inside the brew keg, not "not packaged or configured".
-3. Trigger a test notification (`descartes alerts notifications test`) and confirm:
+   Also verify the resolved `.app` passes `codesign --verify --deep --strict`,
+   `xcrun stapler validate`, and `spctl --assess --type execute` (the guided runner does
+   this automatically when the tools are present).
+4. Trigger a test notification (`descartes alerts notifications test`) and confirm:
    - the **first-run Notification Center permission prompt appears**, attributed to *DescartesNotifier* (branded), NOT Terminal/osascript;
    - after granting, the notification actually displays with the expected title/body/severity;
    - a second test does not re-prompt (grant persists).
-4. Confirm the grant **persists across a CLI restart** and a new shell session.
-5. Denied-permission path: deny (or `tccutil reset Notifications $BUNDLE_ID` then deny) and confirm delivery **fails closed** with a local delivery-audit record, and that the `osascript`/`macos-desktop` fallback channel still works.
-6. Reset helper (to re-test cleanly): `tccutil reset Notifications com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
+5. Confirm the grant **persists across a CLI restart** and a new shell session.
+6. Denied-permission path: deny (or `tccutil reset Notifications $BUNDLE_ID` then deny) and confirm delivery **fails closed** with a local delivery-audit record, and that the `osascript`/`macos-desktop` fallback channel still works.
+7. Reset helper (to re-test cleanly): `tccutil reset Notifications com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
 
 Gotcha: a Mac that previously ran an unsigned/dev build with the same bundle id may hold a stale TCC grant; reset before testing to see true first-run behavior.
 

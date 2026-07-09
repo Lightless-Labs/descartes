@@ -200,6 +200,8 @@ descartes alerts notifications setup --channel syslog    # headless/local log en
 # Experimental native macOS path; Homebrew installs the signed/notarized helper.
 # Setup fails closed if no executable helper is resolved; --json includes the helper resolution.
 descartes alerts notifications setup --channel native --json
+# Maintainer/operator real-host validation helper from a checkout:
+scripts/validate-macos-notifier-helper.sh --reset-tcc
 # --helper remains a development/advanced override for non-Homebrew installs:
 descartes alerts notifications setup --channel native --helper /path/to/DescartesNotifier
 descartes alerts notifications disable
