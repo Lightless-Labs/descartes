@@ -202,6 +202,8 @@ descartes alerts notifications setup --channel syslog    # headless/local log en
 descartes alerts notifications setup --channel native --json
 # Maintainer/operator real-host validation helper from a checkout:
 scripts/validate-macos-notifier-helper.sh --reset-tcc
+# Or add --daemon-test for a prompted one-shot user LaunchAgent native-delivery smoke:
+scripts/validate-macos-notifier-helper.sh --reset-tcc --daemon-test
 # --helper remains a development/advanced override for non-Homebrew installs:
 descartes alerts notifications setup --channel native --helper /path/to/DescartesNotifier
 descartes alerts notifications disable

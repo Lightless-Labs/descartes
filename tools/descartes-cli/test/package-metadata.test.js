@@ -59,8 +59,18 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(validationScript, /XDG_CONFIG_HOME="\$VALIDATION_ROOT\/config"/);
   assert.match(validationScript, /DESCARTES_MACOS_NOTIFICATION_HELPER is set/);
   assert.match(validationScript, /derive_bundled_helper_path/);
+  assert.match(validationScript, /--daemon-test/);
+  assert.match(validationScript, /NODE_BIN/);
+  assert.match(validationScript, /resolved_node_path/);
+  assert.match(validationScript, /case "\$resolved_node_path"/);
+  assert.match(validationScript, /case "\$resolved_cli_path"/);
+  assert.match(validationScript, /ProgramArguments/);
+  assert.match(validationScript, /const args = \[nodePath, cliPath, "alerts", "notifications", "test", "--json"\]/);
+  assert.match(validationScript, /daemon-context notification smoke did not report delivered status/);
+  assert.doesNotMatch(validationScript, /\/bin\/sh.*-c/);
   assert.match(validationScript, /Setup JSON did not include native helper resolution/);
   assert.match(validationScript, /refusing to trigger a notification without interactive stdin/);
+  assert.match(validationScript, /refusing to trigger daemon-context notification test without interactive stdin/);
   assert.match(tokenCheckScript, /Lightless-Labs\/homebrew-tap/);
   assert.match(tokenCheckScript, /HOMEBREW_TAP_GITHUB_TOKEN/);
   assert.match(tokenCheckScript, /GITHUB_TOKEN/);
@@ -117,6 +127,21 @@ test("macOS notifier validation script refuses helper override environment", () 
 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /DESCARTES_MACOS_NOTIFICATION_HELPER is set/);
+});
+
+test("macOS notifier validation script rejects conflicting daemon smoke options", () => {
+  const validationScriptPath = fileURLToPath(new URL("../../../scripts/validate-macos-notifier-helper.sh", import.meta.url));
+  const result = spawnSync("bash", [validationScriptPath, "--skip-test", "--daemon-test"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      DESCARTES_BIN: process.execPath,
+      DESCARTES_MACOS_NOTIFICATION_HELPER: "",
+    },
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /--daemon-test cannot be combined with --skip-test/);
 });
 
 test("CLI version and help are generated from current metadata/options", () => {

@@ -18,11 +18,13 @@ Steps:
 
 1. Install: `brew install lightless-labs/tap/descartes`. If a prior `npm -g` install owns `/opt/homebrew/bin/descartes`, run `npm uninstall -g @lightless-labs/descartes` first (documented caveat). After install, verify `command -v descartes` and `descartes --version` are the Homebrew-provided CLI/version, not an older npm-global shim.
 2. Optional guided runner: from a checkout, run
-   `scripts/validate-macos-notifier-helper.sh --reset-tcc` on the target Mac. It performs
-   the setup/signature checks below, refuses `DESCARTES_MACOS_NOTIFICATION_HELPER` so no
+   `scripts/validate-macos-notifier-helper.sh --reset-tcc` on the target Mac. Add
+   `--daemon-test` after the interactive permission test succeeds if you also want the
+   script to run a one-shot user LaunchAgent native-delivery smoke. It performs the
+   setup/signature checks below, refuses `DESCARTES_MACOS_NOTIFICATION_HELPER` so no
    dev/env override can masquerade as bundled-helper validation, prompts before any TCC
-   reset or notification test, isolates Descartes config/state/cache under a temporary
-   XDG root, and prints the observations to record below.
+   reset, notification test, or daemon-context smoke, isolates Descartes config/state/cache
+   under a temporary XDG root, and prints the observations to record below.
 3. Confirm the CLI resolves the bundled helper with no `--helper` flag:
    `descartes alerts notifications setup --channel native --json` — on builds with the
    resolution UX, the JSON `resolution` should report
@@ -39,7 +41,7 @@ Steps:
    - after granting, the notification actually displays with the expected title/body/severity;
    - a second test does not re-prompt (grant persists).
 5. Confirm the grant **persists across a CLI restart** and a new shell session.
-6. Daemon-context path: after the interactive grant succeeds, validate native delivery from Descartes' background context before making it the default. Prefer a normal user launchd daemon run with notification delivery configured to `macos-native`; record whether a daemon-triggered delivery displays and writes a `delivered` or `error` record in `notification-delivery.jsonl`. If you use a temporary one-shot LaunchAgent or other harness instead of the real alert-intelligence path, say so explicitly in the review so it does not masquerade as full daemon validation.
+6. Daemon-context path: after the interactive grant succeeds, validate native delivery from Descartes' background context before making it the default. Prefer a normal user launchd daemon run with notification delivery configured to `macos-native`; record whether a daemon-triggered delivery displays and writes a `delivered` or `error` record in `notification-delivery.jsonl`. The guided runner's `--daemon-test` option is a narrower one-shot LaunchAgent smoke: it passes an absolute `node` path, the brewed CLI, and `alerts notifications test --json` as distinct `ProgramArguments` entries (no shell expansion), reuses the isolated XDG root, records the audit path it used, and fails unless the delivery status is `delivered`. If you use this or any other temporary harness instead of the real alert-intelligence path, say so explicitly in the review so it does not masquerade as full daemon validation.
 7. Denied-permission path: deny (or `tccutil reset Notifications $BUNDLE_ID` then deny) and confirm delivery **fails closed** with a local delivery-audit record, and that the `osascript`/`macos-desktop` fallback channel still works.
 8. Reset helper (to re-test cleanly): `tccutil reset Notifications com.bande-a-bonnot.lightless-labs.descartes.macos.notifier`.
 

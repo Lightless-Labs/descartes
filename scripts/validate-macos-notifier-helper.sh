@@ -3,13 +3,15 @@ set -euo pipefail
 
 BUNDLE_ID="com.bande-a-bonnot.lightless-labs.descartes.macos.notifier"
 DESCARTES_BIN="${DESCARTES_BIN:-descartes}"
+NODE_BIN="${NODE_BIN:-node}"
 SKIP_TEST=0
 YES=0
 RESET_TCC=0
+DAEMON_TEST=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/validate-macos-notifier-helper.sh [--yes] [--skip-test] [--reset-tcc]
+Usage: scripts/validate-macos-notifier-helper.sh [--yes] [--skip-test] [--reset-tcc] [--daemon-test]
 
 Real-host validation helper for the Homebrew-installed Descartes native macOS
 notification helper. Run on a macOS host after:
@@ -20,7 +22,8 @@ The script:
   1. runs native notification setup without an explicit helper override;
   2. verifies setup resolved an executable bundled helper;
   3. verifies the helper app signature/staple/Gatekeeper assessment when tools exist;
-  4. optionally triggers a test notification for the operator to observe TCC attribution.
+  4. optionally triggers a test notification for the operator to observe TCC attribution;
+  5. optionally runs a one-shot user LaunchAgent notification test for daemon-context smoke validation.
 
 Descartes config/state/cache are isolated under a temporary XDG root by default, so this
 helper does not overwrite the user's real notification configuration. TCC/Notification
@@ -29,10 +32,12 @@ confirmed or when the optional notification test is triggered.
 
 Options:
   --yes        Do not pause before resetting TCC or triggering the test notification.
-  --skip-test  Verify helper resolution/signature only; do not send a notification.
-  --reset-tcc  Prompt to reset Notification Center permission for the Descartes notifier bundle first.
+  --skip-test    Verify helper resolution/signature only; do not send a notification.
+  --reset-tcc    Prompt to reset Notification Center permission for the Descartes notifier bundle first.
+  --daemon-test  After the interactive test, prompt before running a one-shot user LaunchAgent test.
 
 Set DESCARTES_BIN=/path/to/descartes to validate a specific installed CLI.
+Set NODE_BIN=/path/to/node if the brewed CLI should run with a specific node executable.
 Set DESCARTES_VALIDATION_XDG_ROOT=/path to preserve/use a specific validation state root.
 The script refuses DESCARTES_MACOS_NOTIFICATION_HELPER because validation is intended
 for no-override Homebrew bundled-helper resolution.
@@ -45,10 +50,16 @@ while [[ $# -gt 0 ]]; do
     --yes) YES=1 ;;
     --skip-test) SKIP_TEST=1 ;;
     --reset-tcc) RESET_TCC=1 ;;
+    --daemon-test) DAEMON_TEST=1 ;;
     *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if (( SKIP_TEST && DAEMON_TEST )); then
+  echo "error: --daemon-test cannot be combined with --skip-test" >&2
+  exit 2
+fi
 
 if [[ -n "${DESCARTES_MACOS_NOTIFICATION_HELPER:-}" ]]; then
   echo "error: DESCARTES_MACOS_NOTIFICATION_HELPER is set; unset it to validate bundled Homebrew helper resolution" >&2
@@ -64,10 +75,19 @@ if ! command -v "$DESCARTES_BIN" >/dev/null 2>&1; then
   echo "error: descartes CLI not found: $DESCARTES_BIN" >&2
   exit 2
 fi
+if ! command -v "$NODE_BIN" >/dev/null 2>&1; then
+  echo "error: node executable not found: $NODE_BIN" >&2
+  exit 2
+fi
+resolved_node_path="$(command -v "$NODE_BIN")"
+case "$resolved_node_path" in
+  /*) ;;
+  *) resolved_node_path="$(pwd -P)/$resolved_node_path" ;;
+esac
 
 json_get() {
   local file="$1" expr="$2"
-  node -e '
+  "$resolved_node_path" -e '
 const fs = require("fs");
 const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 const parts = process.argv[2].split(".");
@@ -81,7 +101,7 @@ else console.log(String(value));
 
 derive_bundled_helper_path() {
   local cli_path="$1"
-  node -e '
+  "$resolved_node_path" -e '
 const fs = require("fs");
 const path = require("path");
 const cliPath = process.argv[1];
@@ -132,6 +152,110 @@ process.exit(3);
 ' "$cli_path"
 }
 
+write_daemon_test_plist() {
+  local plist_file="$1" label="$2" node_path="$3" cli_path="$4" stdout_file="$5" stderr_file="$6"
+  "$resolved_node_path" -e '
+const fs = require("fs");
+const [plistFile, label, nodePath, cliPath, stdoutFile, stderrFile, validationRoot] = process.argv.slice(1);
+const xml = (value) => String(value)
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll("\"", "&quot;")
+  .replaceAll(String.fromCharCode(39), "&apos;");
+const args = [nodePath, cliPath, "alerts", "notifications", "test", "--json"];
+const env = {
+  XDG_CONFIG_HOME: `${validationRoot}/config`,
+  XDG_DATA_HOME: `${validationRoot}/data`,
+  XDG_STATE_HOME: `${validationRoot}/state`,
+  XDG_CACHE_HOME: `${validationRoot}/cache`,
+};
+const argXml = args.map((arg) => `\t\t<string>${xml(arg)}</string>`).join("\n");
+const envXml = Object.entries(env).map(([key, value]) => `\t\t<key>${xml(key)}</key>\n\t\t<string>${xml(value)}</string>`).join("\n");
+fs.writeFileSync(plistFile, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>${xml(label)}</string>
+\t<key>ProgramArguments</key>
+\t<array>
+${argXml}
+\t</array>
+\t<key>EnvironmentVariables</key>
+\t<dict>
+${envXml}
+\t</dict>
+\t<key>RunAtLoad</key>
+\t<true/>
+\t<key>StandardOutPath</key>
+\t<string>${xml(stdoutFile)}</string>
+\t<key>StandardErrorPath</key>
+\t<string>${xml(stderrFile)}</string>
+</dict>
+</plist>
+`);
+' "$plist_file" "$label" "$node_path" "$cli_path" "$stdout_file" "$stderr_file" "$VALIDATION_ROOT"
+}
+
+run_daemon_context_test() {
+  local daemon_dir="$VALIDATION_ROOT/daemon-context"
+  mkdir -p "$daemon_dir"
+  local label="com.lightless-labs.descartes.notifier-validation.$$"
+  local plist_file="$daemon_dir/$label.plist"
+  local stdout_file="$daemon_dir/stdout.json"
+  local stderr_file="$daemon_dir/stderr.log"
+  local domain="gui/$(id -u)"
+
+  : > "$stdout_file"
+  : > "$stderr_file"
+  write_daemon_test_plist "$plist_file" "$label" "$resolved_node_path" "$resolved_cli_path" "$stdout_file" "$stderr_file"
+
+  echo "Running daemon-context notification smoke via one-shot user LaunchAgent..."
+  echo "LaunchAgent label: $label"
+  echo "LaunchAgent plist: $plist_file"
+  launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "$domain" "$plist_file"; then
+    echo "error: failed to bootstrap daemon-context LaunchAgent" >&2
+    return 1
+  fi
+
+  for _ in $(seq 1 40); do
+    if [[ -s "$stdout_file" ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+  launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+
+  echo "Daemon-context stdout: $stdout_file"
+  if [[ -s "$stdout_file" ]]; then
+    cat "$stdout_file"
+  else
+    echo "error: daemon-context notification test produced no stdout" >&2
+    if [[ -s "$stderr_file" ]]; then
+      echo "Daemon-context stderr:"
+      cat "$stderr_file"
+    fi
+    return 1
+  fi
+  if [[ -s "$stderr_file" ]]; then
+    echo "Daemon-context stderr:"
+    cat "$stderr_file"
+  fi
+
+  local daemon_delivery_status
+  daemon_delivery_status="$(json_get "$stdout_file" delivery.status 2>/dev/null || true)"
+  if [[ -n "$daemon_delivery_status" ]]; then
+    echo "Daemon-context delivery status: $daemon_delivery_status"
+  fi
+  echo "Daemon-context delivery audit: $VALIDATION_ROOT/state/alerts/notification-delivery.jsonl"
+  if [[ "$daemon_delivery_status" != "delivered" ]]; then
+    echo "error: daemon-context notification smoke did not report delivered status" >&2
+    return 1
+  fi
+}
+
 VALIDATION_ROOT="${DESCARTES_VALIDATION_XDG_ROOT:-$(mktemp -d -t descartes-notifier-validation.XXXXXX)}"
 mkdir -p "$VALIDATION_ROOT/config" "$VALIDATION_ROOT/data" "$VALIDATION_ROOT/state" "$VALIDATION_ROOT/cache"
 
@@ -144,9 +268,14 @@ run_descartes() {
 }
 
 resolved_cli_path="$(command -v "$DESCARTES_BIN")"
+case "$resolved_cli_path" in
+  /*) ;;
+  *) resolved_cli_path="$(pwd -P)/$resolved_cli_path" ;;
+esac
 
 echo "Descartes native macOS notifier validation"
 echo "CLI: $resolved_cli_path"
+echo "Node: $resolved_node_path"
 echo "Version: $(run_descartes --version)"
 echo "Bundle ID: $BUNDLE_ID"
 echo "Validation XDG root: $VALIDATION_ROOT"
@@ -278,6 +407,25 @@ if [[ -n "$delivery_status" ]]; then
   echo "Delivery status: $delivery_status"
 fi
 
+if (( DAEMON_TEST )); then
+  if (( ! YES )); then
+    if [[ ! -t 0 ]]; then
+      echo "error: refusing to trigger daemon-context notification test without interactive stdin; pass --yes or omit --daemon-test" >&2
+      exit 2
+    fi
+    cat <<EOF
+
+About to run a one-shot user LaunchAgent that invokes:
+  $DESCARTES_BIN alerts notifications test --json
+This is a daemon-context smoke test, not a full alert-intelligence daemon run.
+Watch whether the notification displays from the background context.
+Press Enter to trigger the daemon-context test, or Ctrl-C to stop.
+EOF
+    read -r _ || true
+  fi
+  run_daemon_context_test
+fi
+
 cat <<EOF
 
 Manual observations to record in docs/reviews/:
@@ -286,6 +434,7 @@ Manual observations to record in docs/reviews/:
 - Did the notification display with the expected title/body? yes/no
 - Did a second test avoid re-prompting? yes/no
 - Does the grant persist in a new shell? yes/no
+- Daemon-context smoke: did a LaunchAgent-triggered native delivery display and record an audit status? yes/no
 - Denied path: after resetting/denying, does delivery fail closed with an audit record? yes/no
 
 Validation state/audit root preserved at:
