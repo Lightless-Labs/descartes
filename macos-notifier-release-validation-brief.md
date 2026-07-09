@@ -79,6 +79,8 @@ Token note: the tap bump reuses `GITHUB_TOKEN` (no separate secret). Confirm tha
 
 Fallback: if the bump warns/skips (e.g. transient failure after retries), follow the script's printed manual-bump instructions — url version + tarball sha256 + helper zip sha256 in `Formula/descartes.rb`.
 
+Record Part B and token-confirmation results under `docs/reviews/` by copying `docs/reviews/macos-notifier-first-tag-tap-bump-validation-template.md` into a dated review file. The template is intentionally explicit about not recording token values or unsanitized CI logs.
+
 Retag caveat (learned this cycle): deleting a tag orphans its published GitHub Release into a *draft* invisible to `gh release list`; check `gh api repos/Lightless-Labs/descartes/releases` for drafts after any retag loop.
 
 ---

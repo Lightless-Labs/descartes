@@ -11,6 +11,7 @@ related:
   - docs/plans/2026-07-08-macos-helper-delivery.md
   - docs/plans/2026-05-30-native-macos-notifications.md
   - docs/reviews/macos-notifier-real-host-validation-template.md
+  - docs/reviews/macos-notifier-first-tag-tap-bump-validation-template.md
   - todos/2026-07-08-macos-helper-delivery.md
   - todos/2026-07-07-rcodesign-investigation.md
 ---
@@ -35,7 +36,11 @@ and proves formula read access plus GitHub-reported push/write permission for
 `Lightless-Labs/homebrew-tap`. For Part A, copy
 `docs/reviews/macos-notifier-real-host-validation-template.md` into a dated review file
 so every first-run, daemon-context, denied-path, fallback, and audit-record observation
-is captured before closing the acceptance criterion.
+is captured before closing the acceptance criterion. For Part B and token confirmation,
+copy `docs/reviews/macos-notifier-first-tag-tap-bump-validation-template.md` into a
+dated review file so the preflight, Buildkite release, GitHub Release, tap commit,
+formula URL/sha updates, and Homebrew upgrade evidence are captured before closing those
+criteria.
 
 ## Acceptance criteria
 
