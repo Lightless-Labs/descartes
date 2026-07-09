@@ -47,7 +47,7 @@ Steps:
 
 Gotcha: a Mac that previously ran an unsigned/dev build with the same bundle id may hold a stale TCC grant; reset before testing to see true first-run behavior.
 
-Record results under `docs/reviews/` (follow the existing macOS/Linux validation review docs), then update `todos/2026-07-08-macos-release-validation.md` and the linked helper-delivery todo if the evidence satisfies their acceptance criteria.
+Record results under `docs/reviews/` (copy `docs/reviews/macos-notifier-real-host-validation-template.md` for the Part A evidence checklist, and follow the existing macOS/Linux validation review docs), then update `todos/2026-07-08-macos-release-validation.md` and the linked helper-delivery todo if the evidence satisfies their acceptance criteria.
 
 ---
 
