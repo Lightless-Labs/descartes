@@ -1,0 +1,242 @@
+# Machine Nervous System — Learned-Artifact Substrate for Self-Monitoring, Self-Audit, and Compile-Down
+
+**Created:** 2026-07-09
+**Reviewed:** 2026-07-09 (via ultracode multi-agent design workflow — feasibility, scope-guardian, security-and-safety, coherence, project-standards lenses)
+**Status:** Proposed — **reconciling roadmap** (see §0 for commitment tiers)
+**Origin:** Produced by an ultracode multi-agent design workflow (Explore → 3 parallel Draft candidates → Judge → single-architect synthesis, then a five-lens review pass). Winning candidate: *Descartes Constraint Kernel* (overall 9.1), with grafts from *Provenance & Signature Reflex Stack* (8.9) and *Statistical Baseline Deck* (8.5). All three framings are treated here as complementary progressive layers of one nervous system, not rivals.
+**Supersedes / reconciles:** see §8 (Roadmap) and §9 (Reconciliation).
+
+---
+
+## 0. Scope, Commitment Tiers, and Process Discipline
+
+This document is the **reconciling roadmap** for the "learn the machine / self-monitor / self-audit / compile-down" north star. It is deliberately not a single implementation-ready plan for all 16 slices. Per the repo convention ("when picking up a milestone… a dedicated plan should be created"), work is committed in tiers:
+
+- **Committed / implementation-ready now:** Layer A Slices 1–2 (constraint scaffolding + pipeline integration) and the on-demand provenance collector scaffold (Slice 3). These are pure additive/data-layer or on-demand work with no daemon-loop coupling and are fully specified below.
+- **Design-sketch, dedicated plan required at pickup:** the remainder of Layer B (Slices 4–5), the mining/shadow/promotion machinery (Slices 6–7), self-audit (8–9), Layer C statistics (10–12), and L2/compile-down (13–16). File names, schemas, and CLI surfaces named below are **provisional design intent to be validated against real Slice 1–2/3 data**, not frozen contracts. Each layer (or slice-group) gets its own `docs/plans/` file when picked up, and this roadmap's header is updated only at layer boundaries (e.g. "Layer A started/completed"), not per slice.
+- **HANDOFF discipline:** `docs/HANDOFF.md` is updated per `AGENTS.md` at every layer boundary, on direction changes, and before any context compaction across this long-running roadmap.
+- **Language/runtime:** this roadmap knowingly treats **Node/JSONL as the durable substrate through at least Slice 16**, mirroring the reasoning of the deferred `2026-05-18-001` plan (the entire existing substrate is already Node). Rust migration is a later, explicitly-checkpointed re-anchoring (§12), not a blocker for this work.
+
+---
+
+## 1. Vision & the Absolution-Gap Framing
+
+Descartes should *learn* the machine — its structure, its uses, and its running processes — build its own deterministic and statistical models of them, wake *itself* only when its cheap reflexes cannot cope, and continuously **audit, verify, and maintain** those learned layers. The governing metaphor is the layered, self-auditing ship nervous system at the opening of Alastair Reynolds' *Absolution Gap*: higher, more expensive layers engage only when lower deterministic reflexes fail.
+
+The non-negotiable spine remains: **models route, narrate, audit, plan, and learn but are never the source of truth.** Every fact comes from a deterministic L0 collector; every learned artifact is compiled DOWN into a cheap deterministic check so future detection costs a hash/arithmetic comparison, not a reasoning call.
+
+The key synthesis insight: **statistical baselines, structural constraints, and provenance signatures are three *kinds* of the same thing — a learned artifact** that (a) is mined deterministically from data Descartes already collects, (b) is life-cycled through the same `draft → shadow → review-ready → active → retired` promotion gate, (c) is evaluated into the *exact same* alert-candidate contract the existing pipeline already consumes, and (d) is self-audited by deterministic arithmetic over its own health and calibration. One substrate, one lifecycle, one wakeup path, three model families layered in ascending order of difficulty and noise.
+
+The layers, in the order they engage and the order we build them:
+
+- **Reflex (L0 + fixed L1):** existing collectors + hand-authored fixed rules (already shipped) + zero-learning-period provenance "known-bad" signatures (deleted exe, public bind). No observation window needed.
+- **Constraint layer (L1a — build first):** mined structural invariants ("service X is always running", "port 5432 is always bound to postgres via launchd job Y — *where unprivileged resolution permits*"). High-signal, discrete, TDD-friendly.
+- **Provenance/identity layer (L1b — build second):** a witr-native stable `identity_signature` per process/port/container, a known-good identity baseline, and signature-regression self-audit.
+- **Statistical layer (L1c — build third):** Welford/EWMA per-metric and per-identity distributional baselines with confidence-gated z-score deviation rules, plus a downsampled long-horizon store *introduced only once mining proves the existing window insufficient*.
+- **Deliberative (L2 — reused, never reinvented):** the already-shipped opt-in / rate-limited / audited / no-tools LLM wakeup engages *only* on a deterministically-fired candidate the lower layers could not classify.
+
+## 2. Mapping onto L0/L1/L2 and the EXISTING Substrate
+
+This plan is **additive rule families + learned-artifact stores**, not a parallel engine. It plugs into named, load-bearing seams. Several of these seams require **explicit, reviewed signature changes to already-shipped safety-critical functions** — this is called out honestly rather than described as "extension":
+
+- **L0 fact source (11 collectors + 1 new):** there are **11 genuine L0 fact collectors** in `tools/descartes-cli/src/tools/*.js` (`system`, `processes`, `disks`, `network`, `services`, `logs`, `containers`, `vms`, `scheduled-jobs`, `time-sync`, `certificates`); the remaining files (`collect.js`, `envelope.js`, `findings.js`, `sampling.js`, plus inspection/derivation meta-tools) are shared infrastructure, not fact sources. **Only 3 of these 11 (`system`, `processes`, `disks`) are sampled by the daemon today** (`defaultDaemonProfile()`, `daemon.js` L19–34); the other 8 are on-demand/triage-only. We add **one** new collector, `tools/descartes-cli/src/tools/provenance.js`, following the exact `execFile`-fixed-arg/timeout pattern of `system.js`/`processes.js`, returning the uniform envelope from `envelope.js` (`timedEnvelope`, fail-closed `unable`/`confidence:0`/`missing_permission`).
+- **L1 alert evaluation — REQUIRES a signature change (not a hidden hook):** `alert-store.js` `evaluateAndPersistAlerts()` (L271–282) internally and exclusively calls `evaluateAlertRules(historySummary, daemonStatus, {…})`, then `applyAlertCandidates()` + `writeAlertRecords()` **once**. There is no candidate-injection seam. Slice 2 adds a small, deliberate `extraCandidates: []` (or `candidateSources: []`) option that is concatenated into the single candidate array before the one `applyAlertCandidates` call. `applyAlertCandidates` (dedupe / cooldown / active-recovered-acknowledged-suppressed state machine, `alertId()` hashing) is signal-source-agnostic and reused **verbatim** — but note its recovery logic marks any active alert id absent from the current candidate array as `recovered`, so **all** candidate sources MUST be merged into one array per iteration or a fixed-rule alert would spuriously recover. A regression test asserting fixed-rule alert behavior is byte-identical before/after the merge point is mandatory.
+- **L1 metric substrate (numeric only today):** `history-store.js` `normalizeMetricPoint()` (L35–52) **throws on any non-finite `value`** — it is a strictly numeric metric-point schema. `daemon.js` `metricPointsFromEvidence()` translates **only** `system-overview`, `top-processes`, `disk-usage` envelopes. There is currently **zero** path to persist the categorical/structural facts (service running, port bound to identity X) that constraint and identity mining need. A **distinct categorical fact-point schema + per-collector translators** is new infrastructure (Slice 6b), not a "rollup".
+- **L1 daemon loop — no multi-cadence primitive today:** `runDaemonIteration` sequences `collect → metricPoints → append → writeStatus → evaluateAndPersistAlerts → adjudicateAlertNotifications` at **one** `interval_ms` over the 3 hardcoded collectors. There is no scheduling primitive for a slow (hourly) sampling profile. Multi-cadence scheduling is its own tested prerequisite (Slice 6a) that must land and accumulate data **before** any multi-day miner can run.
+- **L2 deliberative wakeup — REQUIRES control-flow + prompt change (same safety bar as original):** `alert-intelligence.js` `alertIntelligencePrompt()` is a single hardcoded builder invoked uniformly in `adjudicateAlertNotifications`'s per-alert loop; `pi-harness.js` `createPrivateAlertSession(…, {enableTools:false})` forces `enableTools:false` last in the option spread (L449–451) so callers cannot override it. Slice 13 adds `rule_id`-namespace template *dispatch* (a small control-flow change to the safety-critical loop) plus per-namespace consent and per-severity budgeting — reviewed at the same bar as the original `alert-intelligence.js`.
+- **Tool-policy surface — atomic two-file edit:** `tool-policy.js` `assertSafeTriageToolNames()` enforces **exact set-equality** against the frozen `TRIAGE_TOOL_NAMES`. Registering `collect_provenance` as a model-visible triage tool is a synchronized edit to `TRIAGE_TOOL_NAMES` **and** `pi-harness.js` `createEvidenceTools()` in the same commit (plus the existing `tool-policy` test), or every private alert/triage session construction throws globally. This deliberately expands the read-only triage tool surface and is reviewed as such.
+- **Policy/authority plane (separate stores — merge declined):** artifact-promotion approval and witr risky-action approval are kept as **two separate, independently-scoped stores** (see §5, §6). We do **not** build a single shared `approvals.json` spanning both risk domains in this plan.
+
+## 3. The Learned-Artifact Model & XDG Storage
+
+### 3.1 Storage paths (corrected — no double-nesting)
+
+`resolveDescartesPaths()` (`paths.js` L14–31) already returns `stateDir = <XDG_STATE_HOME>/descartes` and `configDir = <XDG_CONFIG_HOME>/descartes`. Existing stores join a **bare** subdirectory onto `stateDir` (`stateDir/alerts`, `stateDir/history`, `stateDir/daemon`). New state therefore lives at `stateDir/learned/…` and `stateDir/authority/…` — **never** `stateDir/descartes/…` (that would double-nest). Enablement/config that gates a subsystem lives in **`configDir`**, mirroring `resolveAlertIntelligencePaths` (config file in `configDir`, data/audit in `stateDir`). Atomic tmp+rename, `0o600` files / `0o700` dirs, corrupt-file tolerance mirroring `history-store.js`, `assertNoPiOwnedPath`-style guard on every resolved path.
+
+| Path | Kind | Contents |
+|---|---|---|
+| `configDir/learned.json` | config | deterministic-emission on/off switch + params (default `enabled:false`) |
+| `stateDir/learned/constraints.json` | state | constraint artifacts (Layer A) |
+| `stateDir/learned/signatures.json` | state | provenance identity + known-good + **frequency** signature artifacts (Layer B) |
+| `stateDir/learned/baselines.json` | state | per-metric / per-identity **numeric distributional** records (Layer C) |
+| `stateDir/learned/facts/*.jsonl` | state | categorical/structural fact-history (Slice 6b), distinct from numeric metric-points |
+| `stateDir/learned/rollup/*.jsonl` | state | daily downsampled long-horizon rollups — **introduced only if Slice 6c mining proves the existing window insufficient** |
+| `stateDir/learned/shadow-violations.jsonl` | state | shadow-mode fires (never surfaced as alerts) |
+| `stateDir/learned/artifact-audit.jsonl` | state | self-audit + calibration records |
+| `stateDir/learned/tuning-candidates.json` | state | proposed threshold/param diffs (draft→review-ready→approved) |
+| `stateDir/authority/promotions.json` | state | artifact-promotion approval store (nonce, expiry, deny-by-default, audit) — **separate** from any witr risky-action store |
+
+### 3.2 The three model families
+
+All families share the lifecycle in §3.3 but use distinct records. **Frequency/set-membership provenance records are `kind:"signature"` (family `frequency`) stored in `signatures.json`** — resolving the earlier signature-vs-baseline ambiguity: `baselines.json` holds *numeric* distributional records only.
+
+- **Constraint (structural, discrete):** mined by `mineConstraintCandidates(factHistory, snapshots, options)` from the categorical fact-history (§Slice 6b) — a fact unchanged (or within a tight band) across `≥ minObservationDays` (default 7) and `≥ minSamples` with zero contradicting observations. Families: service-presence, port-binding-identity (subject to §11 UID-scoping limits), process-ancestry, mount/interface-presence, scheduled-job-cadence, resource-ceiling.
+- **Signature (identity, set-membership):** `identity_signature = hash(executable_path, exe_hash|codesign_identity, source_classification, owning_user)` (exact hashing inputs to be nailed with fixtures **before** Slice 5 — see §12). Known-good baseline promotes `provisional → known_good` after N stable samples across M iterations (grace window prevents day-1 storm). Deviation = pure set/pattern check. Also carries witr's zero-learning "known-bad" signatures (deleted exe, public bind) as **immediate fixed rules**, and frequency records `{key, count, first_seen, last_seen, sensitivity}`.
+- **Baseline (statistical, distributional):** `baseline-store` incremental **Welford** running mean/variance + **EWMA** (O(1) per point), one record per `metric_name + dimension_bucket + optional time-bucket`. `confidence_state:"provisional"|"established"` gates emission (`provisional` until `count ≥ min_sample_count`, default 30); fixed thresholds stay active during cold-start. Deviation = z-score beyond configurable k-sigma with a `minSustainedSamples` guard.
+
+### 3.3 Unified LearnedArtifact record (constraint-shaped first)
+
+The record below is the **shared lifecycle envelope**; Slice 1 implements only the constraint-relevant fields and adds signature/baseline-specific fields when those layers are actually built (generalize from real implementations, not zero). Note `confidence` here is the numeric stability score (0.0–1.0, consistent with the evidence-envelope contract) — the baseline record's `confidence_state` string is a **different field name on a different record** to avoid type collision.
+
+```
+LearnedArtifact {
+  id, kind: "constraint" | "signature" | "baseline",
+  family,                       // e.g. service-presence, port-binding, unknown-identity, frequency, memory-deviation
+  target,                       // canonical entity key
+  expected,                     // learned expectation (fact | signature pattern | {mean,stddev,ewma,k_sigma})
+  status: "draft" | "shadow" | "review-ready" | "active" | "retired",
+  confidence,                   // NUMERIC 0.0–1.0 stability/sample-gated score
+  provenance: { window, samples, source_collectors[], mined_at },
+  fixtures: [{ input, expect_match }],   // positive/negative replay cases (required to promote)
+  promotion_history: [{ ts, from, to, actor: "auto-shadow"|"human-cli", note }],
+  first_observed, last_verified, sensitivity, schema_version
+}
+```
+
+## 4. Self-Monitoring & the Safe Agent-Wakeup Mechanism
+
+Learned artifacts generate monitoring by cheap comparison, not model calls. Each daemon iteration, `evaluateLearnedArtifacts(activeArtifacts, latestFacts, historySummary, baselineStore)` runs pure per-family checks and emits candidates in the alert-store contract, **passed as `extraCandidates` into the single `evaluateAndPersistAlerts` merge** (§2). Examples: `constraint.violation.<family>`, `provenance.process.unknown_identity` / `deleted_exe` / `identity_drift`, `provenance.port.new_public_bind`, `baseline.<metric>.deviation`, `identity.behavior.drift`, `learned.health.degraded`, `learned.audit.regression`. `descartes alerts list/watch/ack` and `notification-delivery.js` surface all of them with zero new lifecycle code.
+
+**Diagnostics are sanitized at emission (code-enforced, not convention):** a shared `sanitizeDiagnostics()` gate (introduced in Slice 2, reusing the redaction/truncation pattern already implemented in `processes.js` — `args.redacted`/`args.truncated`/`args.original_length`) accepts **only** numeric values, closed-enum strings, and fixed-length hashes. Every `evaluate*()` family MUST route through it; a raw filesystem path, username, or command-line string in a candidate's `diagnostics` fails the build. This is the code-level enforcement of the "bounded context" invariant `compactAlert` does not currently provide. `review_hint` rides inside the existing `diagnostics` passthrough object (`diagnostics.review_hint`) — **no `normalizeAlertRecord` schema change**, since its field allowlist silently drops unknown top-level fields.
+
+The **agent wakeup is the already-shipped `alert-intelligence.js` path, unchanged in mechanism**, extended only as noted:
+
+- **Opt-in, two independent switches:** `configDir/learned.json` `enabled:false` gates deterministic emission; `alert-intelligence.json` gates any LLM call. Zero new behavior until both are flipped.
+- **Per-namespace re-consent (new, mandatory before Slice 13):** `alert-intelligence.json` gains `enabled_namespaces` (default `["metric"]`). Newly introduced namespaces (`constraint.*`, `provenance.*`, `baseline.*`, `identity.*`) default **excluded even when the top-level flag is already true**, requiring an explicit additive opt-in (`descartes config alert-intelligence enable-namespace provenance`). This prevents silently upgrading an existing metric-only user into transmitting higher-sensitivity provenance/identity data externally.
+- **Rate-limited with a critical reservation (new, before Slice 13):** the existing global `max_calls_per_hour` (default 3, `recentCallCount` over trailing-hour `llm-decisions.jsonl`) is retained but a guaranteed critical-severity slot is reserved so a burst of learned findings cannot starve a real emergency adjudication. A deterministic (non-LLM, never itself rate-limited) `adjudication.budget_exhausted` signal is emitted through `notification-delivery.js` so operators observe when findings are dropped from LLM review.
+- **Audited, including payload:** every call logged even on error/skip in `llm-decisions.jsonl`; the audit record additionally persists the compacted diagnostics object (or a stable hash of the exact prompt payload) so the "what left the machine" trail is complete.
+- **Bounded:** `compactAlert`/`compactHistory` truncation + `clampString`, now backed by the emission-time `sanitizeDiagnostics()` gate — never raw command lines, logs, or process trees.
+- **No action tools:** `createPrivateAlertSession` hardcodes `enableTools:false`. The only additions are the prompt-template dispatch and consent/budget checks above. The model may only emit a bounded JSON decision (`notify/severity/title/body/reason`, and for provenance optionally `suggested_signature_draft`). Any suggested draft is persisted `status:"draft"`, **inert** — never evaluated against live traffic until a human promotes it.
+- **Narrow trigger:** L2 fires only for a candidate already in `notification_due_ids` AND tagged `diagnostics.review_hint:novel_pattern` / no matching active artifact. **Self-audit findings (`learned.health.*`, `learned.audit.*`) never reach L2** — by construction they always have a matching active artifact and are handled deterministically. It never runs proactively or on its own schedule.
+
+## 5. Self-Audit / Verify / Maintain Loop (the Compile-Down Discipline)
+
+Three deterministic (no-LLM) mechanisms, all read-only, none may auto-mutate an active artifact:
+
+1. **Health monitoring (every tick, cheap):** per-artifact `chronically_firing` (violation present in ≥X% of last N ticks → deterministic code refuses to guess and raises a review-worthy finding rather than an infinite notify loop; Open Question §12 on whether to auto-bump warning→critical after N cycles), per-artifact `staleness` (reusing the `daemon.samples.stale` pattern), and `contradiction` (a freshly-mined candidate contradicting an active artifact → world changed → review). All emit through the same candidate pipeline as `learned.health.degraded`.
+2. **Signature/fixture regression replay (`descartes learned audit`):** every active artifact ships positive/negative fixtures; the audit re-evaluates each against its fixtures and a rolling sample of real snapshots, flagging `learned.audit.regression` if an active artifact no longer matches what it was confirmed against. A minimum-fixture bar is enforced **at promotion** (schema-level, Slice 7), not merely at authoring.
+3. **Calibration audit (periodic, read-only report):** joins learned-derived alert ids in `alerts.json` against outcomes (acked-fast / never-escalated / auto-recovered) and, where available, `llm-decisions.jsonl`, producing a precision/recall proxy per artifact, surfaced via `descartes learned calibration`.
+
+**Compile-down is explicit and human-gated.** The audit may only *propose* a config/threshold diff as a `tuning-candidates.json` entry (`draft → review-ready → approved/rejected`), backtested against historical outcomes with **no LLM call**. It never rewrites an active artifact or threshold. Promotion `review-ready → active` requires an explicit `descartes learned approve <id>` recorded in `authority/promotions.json` (deny-by-default, nonce, expiry, full audit). Retired artifacts are never deleted — full `promotion_history` kept. This is the mechanical realization of "compile confirmed learning DOWN into deterministic rules/signatures" and the `2026-05-18-001` lifecycle (mapping in §9).
+
+## 6. Witr-Provenance Integration Stance
+
+Borrow **architecture and signature vocabulary, not a Go dependency** — per `docs/plans/2026-07-09-witr-provenance-and-approval-notifications.md` (witr's useful packages are under `internal/`, unimportable; its JSON has no schema/version wrapper). **That plan retains authoritative ownership of Layer B's provenance/approval milestone numbering**; this roadmap's Slices 3–7 defer to it and are cross-referenced, not a replacement sequence.
+
+- **Native-first collector:** `tools/provenance.js` implements target-first resolution (pid/port/container → one provenance record), a deterministic source-classification chain (launchd/systemd/cron/shell/ssh/supervisor/container/init/unknown with confidence + `review_hint`), and warnings-as-signatures (public bind, deleted exe, no known supervisor, unexpected parent). Fixed-arg `execFile` with timeouts; command-line/args fields reuse the **shared `processes.js` redaction helper** (extracted to a shared utility). macOS uses `lsof`/`codesign -dv`/`spctl`; Linux uses `/proc/net/{tcp,udp}[6]` + `/proc/<pid>/fd` inode mapping. Failures degrade to `unable`/`confidence:0`/`missing_permission`.
+- **UID-scoping limitation (explicit, not assumed away):** unprivileged port→PID resolution **fails for processes owned by a different UID** than the Descartes daemon on Linux (`/proc/<pid>/fd` of other users) and is not guaranteed on macOS `lsof`. The **default is degraded, unprivileged coverage**: the collector resolves what it can and returns `missing_permission`/`confidence:0` for the rest (never invented facts). The headline "port 5432 always bound to postgres" example is therefore **only mineable when postgres runs under the daemon's UID or an elevated read path is configured** — Slice 5/6 examples are corrected to same-UID/launchd-labeled services resolvable unprivileged. Whether to add a privileged-read path (setgid helper / `CAP_SYS_PTRACE` / documented root-only mode) is an explicit Slice 3/5 decision, not a silent assumption.
+- **Two-tier contribution:** witr's known-bad warnings become immediate **fixed** L1 rules (zero learning). Its known-good facts become **mined constraints / identity baselines** once observed stable.
+- **Optional binary cross-check (late slice):** if a user-installed `witr` is on PATH, `witr --json --pid/--port <target>` may be shelled out as *supplemental* evidence merged into the envelope trace (version/args/exit-code/latency/bounded-stdout, tolerant parsing, schema-validated at the boundary as untrusted external data). Never required for install, never blocking.
+- **Approval-notifications (sibling, separate store):** witr's approval-store design becomes its own risky-action store owned by the witr plan; artifact promotion uses the **separate** `authority/promotions.json`. If a future merge is ever justified by observed duplication, it MUST introduce a closed `type` enum (`artifact_promotion` | `risky_action`) that participates in id/nonce derivation and is strictly checked by each executor. We do not merge now.
+
+## 7. Data Shapes Summary
+
+- **Alert candidate (reused verbatim):** `{rule_id, fingerprint, severity, title, summary, diagnostics, evidence_refs}` → merged `extraCandidates` → single `applyAlertCandidates` → `alerts.json`. `diagnostics` passes the `sanitizeDiagnostics()` gate; `diagnostics.review_hint` carries the L2-narrowing tag.
+- **LearnedArtifact:** see §3.3.
+- **Baseline record:** `{metric_name, dimension_bucket, time_bucket|null, stats:{count, mean, m2, variance, stddev, ewma, ewma_variance, min, max}, confidence_state:"provisional"|"established", first_seen, last_updated, sensitivity, schema_version}`.
+- **Frequency signature record:** `{key, count, first_seen, last_seen, sensitivity}` (in `signatures.json`, `kind:"signature"`, `family:"frequency"`).
+- **Categorical fact-point (new, Slice 6b):** `{ts, fact_name, entity_key, attributes:{…closed-enum/string…}, source_envelope_id, source_tool, sensitivity}` — distinct from the numeric metric-point schema (which throws on non-finite values).
+- **Evidence envelope (unchanged):** `{id, status, layer, source, result, confidence, review_hint, trace:{tool,target,latency_ms,ts}}`.
+- **Promotion approval record:** `{id, nonce, promotion_ref, bounded_summary, evidence_refs, expiry, status:deny-by-default, audit_transitions[]}`.
+
+## 8. Ordered, Sliced Roadmap
+
+Each slice is independently shippable, TDD-first, atomic-commit-sized, and honors every hard boundary. Slices 1–3 are committed (§0); the rest are design-sketch pending dedicated plans and Slice 1–2 lessons.
+
+**Layer A — Constraint Kernel (deterministic, no LLM, ships first)**
+
+- **Slice 1 — Learned-artifact store scaffolding + seed constraints (no mining).** Add `constraint-store.js`: constraint-shaped artifact schema (§3.3), atomic tmp+rename/`0o600` read/write mirroring `writeAlertRecords`, corrupt-file tolerance mirroring `history-store.js`, paths at `stateDir/learned/constraints.json` and `configDir/learned.json`. Ship 3–5 hand-authored `status:active` seed constraints (e.g. "daemon interval_ms ≥ 1000", "stateDir under expected XDG root"). **Pure data layer — no collectors, no daemon change, no alert wiring.** TDD: schema validation, atomic-write, corrupt-tolerance, path-no-double-nest, `assertNoPiOwnedPath`.
+- **Slice 2 — `evaluateConstraints()` + pipeline seam + diagnostics sanitizer.** Add `sanitizeDiagnostics()` shared gate (reuse `processes.js` redaction). Add `evaluateConstraints()` (pure, returns sanitized `constraint.violation.<family>` candidates). **Modify `evaluateAndPersistAlerts()` to accept `extraCandidates`**, merge into one array, single `applyAlertCandidates` call. Ship against Slice 1 seeds only. **Safety-critical proof:** regression test asserting fixed-rule alert behavior is byte-identical, and that a fixed-rule and a learned alert can be simultaneously active without one recovering the other.
+
+**Layer B — Provenance / Signature Reflex (witr-native; witr plan owns milestone numbering)**
+
+- **Slice 3 — Provenance L0 collector (native Node, on-demand).** `tools/provenance.js` (target-first resolution, source classification, warning signatures, shared redaction helper, UID-scoping degradation). **Atomic two-file registration** in `tool-policy.js` `TRIAGE_TOOL_NAMES` + `pi-harness.js` `createEvidenceTools()` (+ update the `tool-policy` test); update `docs/reference/collectors.md` with a `collect_provenance` entry. On-demand only (not in daemon loop). Per-platform macOS/Linux fixtures: clean / deleted-exe / public-bind / missing-permission; assert `unable`/`confidence:0` on permission failure; assert session construction still succeeds post-registration.
+- **Slice 4 — Immediate provenance-warning fixed rules (zero learning).** Additive `rule_id` blocks for known-bad signatures (deleted exe running, public bind with no supervisor), emitting sanitized candidates through the Slice 2 merge.
+- **Slice 5 — Identity baseline + deterministic deviation warnings.** `identity_signature` (inputs nailed by fixtures first) + `provisional → known_good` state machine (grace window, N-stable-samples); `provenance.process.unknown_identity`/`identity_drift`/`source_unknown`, `provenance.port.new_public_bind` (UID-scoped); `descartes provenance snapshot`/`baseline show`. Day-1 no-storm assertion.
+
+**Prerequisites for mining (must land before Slice 6c)**
+
+- **Slice 6a — Multi-cadence collector scheduling in `daemon.js`.** Own tests: two cadences firing independently, missed-tick handling, profile validation. No mining logic. Extends the active collector set to include services/network/scheduled-jobs at a slow (hourly) cadence.
+- **Slice 6b — Categorical fact-history schema + translators.** New `{ts, fact_name, entity_key, attributes, …}` fact-point schema (distinct from numeric metric-points) + per-collector translators for service-presence and port-binding facts + retention cap. This is the documented home for the miner's `snapshots`/`factHistory` input.
+
+**Layer A cont. — Mining, Shadow, Promotion**
+
+- **Slice 6c — Deterministic constraint miner (service-presence + port-binding first).** `mineConstraintCandidates` over the Slice 6b fact-history. First pass mines from whatever window the fact-history has accumulated; **the `learned/rollup/*.jsonl` long-horizon store is added only if a real mining run proves the accumulated window insufficient for 7-day stability** (Open Question §12). `descartes learned mine` (on-demand). Output `status:draft`, inert.
+- **Slice 7 — Shadow soak + deterministic promotion gate + human approve.** `draft → shadow` (fires only to `shadow-violations.jsonl`) for a soak period → deterministic promotion check (zero shadow false-fires, **minimum-fixture bar enforced schema-level**) → `review-ready`. `descartes learned review`/`approve`/`reject`, recorded in `authority/promotions.json`. **Load-bearing safety slice: artifacts never self-promote past review-ready; no LLM anywhere.**
+
+**Self-monitoring, Self-audit**
+
+- **Slice 8 — Artifact self-monitoring.** `chronically_firing`/per-artifact `staleness`/`contradiction` as another sanitized candidate source. These are `learned.health.*` and never reach L2.
+- **Slice 9 — Deterministic self-audit: fixture regression + coverage/staleness.** `descartes learned audit` re-evaluates active artifacts against fixtures + recent snapshots, emits `learned.audit.regression`, writes `artifact-audit.jsonl`. 100% deterministic; provably cannot mutate artifact status.
+
+**Layer C — Statistical Baselines**
+
+- **Slice 10 — Welford/EWMA per-metric baseline + z-score deviation (system/disk only).** `baseline-store.js`, `confidence_state`-gated, wired additively behind `configDir/learned.json`; `baseline.<metric>.deviation` candidates. Textbook Welford/EWMA unit tests; no deviation below `min_sample_count`.
+- **Slice 11 — Per-identity behavioral baseline (top-N ranked, cardinality-bounded).** Cardinality-bounded per-`identity_signature` metric points (top-N + "other" bucket); `identity.behavior.drift` rules. Realizes the derived-collector plan's `watch executable` precedent via a bounded join.
+- **Slice 12 — Time-of-day / day-type bucketing.** Hour-of-day × weekday/weekend buckets with hierarchical confidence fallback (specific → day-type → global).
+
+**L2 reuse, Compile-down, Optional cross-check**
+
+- **Slice 13 — Reuse `alert-intelligence.js` for learned-artifact wakeups.** `rule_id`-namespace prompt-template dispatch + **per-namespace opt-in (`enabled_namespaces`, new namespaces default off)** + **critical-severity budget reservation + `adjudication.budget_exhausted` signal** + payload-in-audit. **The only slice that reaches the LLM**, through the pre-existing `enableTools:false` path. Test: default (metric) template/behavior unchanged when no learned `rule_id` present.
+- **Slice 14 — Outcome-informed compile-down: reviewable tuning proposals.** `tuning-candidates.json` (`draft → review-ready → approved/rejected`) backtested against historical outcomes; **never auto-applied** — human `approve` required before thresholds read the new value. No LLM.
+- **Slice 15 — Calibration report.** `descartes learned calibration` read-only precision/recall proxy. Never auto-adjusts.
+- **Slice 16 (optional) — Bounded witr binary cross-check.** Detect `witr` on PATH; supplemental, tolerant, schema-validated, non-blocking, never required for install.
+
+## 9. Reconciliation with Existing Plans
+
+- `2026-05-28-monitoring-alerting.md` (**Completed**) — **REUSE.** Its alert-store / alert-intelligence / notification-delivery pipeline is the substrate; this plan adds rule families, one prompt-dispatch change, a diagnostics gate, and a documented `extraCandidates` seam — no new alert-lifecycle state machine.
+- `2026-05-18-003-first-external-slice-local-triage.md` (**In progress**) — the closest-to-ground-truth prior plan; the collectors/alert-store/daemon/pi-harness substrate this roadmap extends was built under it. This roadmap builds on top of it and does not alter its scope.
+- `2026-05-23-agent-authored-sensor-toolkit.md` (**Proposed**) — **SUBSUMED for near-term scope.** Mark *Superseded-in-part* once Slice 7 lands; its broad "workbench" ambition remains the north star beyond Slice 16.
+- `2026-05-23-derived-collector-transformation-engine.md` (**Proposed**) — **LEAVE ALONE / sequence later.** Slice 11 delivers its headline `watch executable` capability via a bounded join, not the general DSL.
+- `2026-05-23-daemon-history-store.md` — realized as `history-store.js`; this plan adds a **distinct** categorical fact-history store (Slice 6b), not a reimplementation.
+- `2026-05-18-001-descartes-pi-integration-and-runtime-plan.md` (**Deferred**) — **REUSE its lifecycle intent**, mapped to this plan's 5 states: its `observed gap → candidate artifact → generated tests/fixtures → replay/validation → human/policy review → active artifact → monitored outcome` maps to `draft (candidate+fixtures) → shadow (replay/validation) → review-ready (human/policy review) → active → retired (monitored-outcome exit)`. (The earlier draft misquoted this vocabulary; this mapping is authoritative.)
+- `2026-05-18-002-descartes-bootstrap-kernel-and-workbench-plan.md` (**Superseded**) — **LEAVE ALONE.** Salvage its `ArtifactManifest`/`ValidationReport` shapes only if a Rust core resumes.
+- `2026-07-09-witr-provenance-and-approval-notifications.md` (**Draft**) — **INTEGRATE; it retains ownership of Layer B provenance/approval milestone numbering.** Layer B Slices 3–7 defer to it; its approval store stays separate from `authority/promotions.json`.
+
+## 10. Carried-Forward External Codex Priorities
+
+Parallel tracks; they do **not** block the learning roadmap:
+
+- **macOS release validation (EXTERNAL, blocked on hardware):** fresh-Mac first-run TCC / Notification Center validation via `scripts/validate-macos-notifier-helper.sh --reset-tcc`, first live Homebrew tap auto-bump (run `scripts/check-homebrew-tap-token.sh` before tagging). Requires a physical never-granted Mac + a live `vX.Y.Z` tag. The tap-token preflight is doable now.
+- **witr approval-notifications:** the approval-store half of `2026-07-09-witr-…` proceeds under its own plan and its own risky-action store (kept **separate** from artifact-promotion approvals per §6).
+- **rcodesign spike:** **remains deferred** (`todos/2026-07-07-rcodesign-investigation.md`).
+
+## 11. Safety Model
+
+- **Read-only by default; no mutating host action in v0.** Every new collector is fixed-arg `execFile` with timeouts and zero mutating flags, wrapped in fail-closed `timedEnvelope`.
+- **Two independent off-switches** (`configDir/learned.json` gates deterministic emission; `alert-intelligence.json` gates any LLM call) **plus per-namespace opt-in** (new namespaces default off even when the top-level LLM flag is on). Zero new externalizing behavior until explicitly enabled per namespace.
+- **No new wakeup mechanism.** The only LLM touchpoint is the existing opt-in / rate-limited / audited / bounded / `enableTools:false` `adjudicateAlertNotifications`, extended by template dispatch + consent/budget checks reviewed at the original safety bar.
+- **Code-enforced bounded context.** `sanitizeDiagnostics()` allowlists numeric values / closed-enum strings / fixed-length hashes at emission time for **every** family; a raw path/username/command-line in `diagnostics` fails the build. Model input is never raw dumps.
+- **Critical-severity LLM reservation** so a burst of learned findings cannot starve a real emergency; a deterministic `adjudication.budget_exhausted` signal makes silent drops observable.
+- **No autonomous promotion.** Artifacts never self-promote past `review-ready`; shadow mode is observe-only; tuning proposals are never auto-applied. Explicit human CLI action, recorded in `authority/promotions.json` (deny-by-default), required for every `→ active`.
+- **Deterministic evidence before reasoning.** Layers A–C fully function with zero LLM; L2 fires only atop an already-fired candidate the lower layers could not classify, and never for self-audit findings.
+- **UID-scoping honesty.** Provenance resolution degrades to `missing_permission`/`confidence:0` for other-UID targets rather than inventing facts; constraint examples reflect what is unprivileged-resolvable.
+- **Descartes-owned XDG paths only.** All new state under `stateDir/…` (no double-nesting), config under `configDir/…`, atomic tmp+rename, `0o600`/`0o700`; `assertNoPiOwnedPath` guard; never `~/.pi`. Cross-cutting test asserts no new path escapes `stateDir/`/`configDir/`.
+- **Full audit trail** including the compacted payload actually transmitted; retired artifacts keep full `promotion_history`.
+- **Cardinality bounds** (top-N + "other" bucket) respecting the 5MiB/10k-point caps.
+- **Fixed rules never weakened** — cold-start safety net while any learned artifact is provisional.
+- **Witr output is untrusted external data**, schema-validated at the collector boundary; the binary is never a hard dependency.
+- **Two separate approval stores** — artifact-promotion and witr risky-action are not conflated; any future merge requires a closed `type` discriminant in id/nonce derivation.
+
+## 12. Open Questions
+
+- **Long-horizon store shape:** resolve *by attempting Slice 6c mining against the Slice 6b fact-history first* — introduce `learned/rollup/*.jsonl` only if that window proves insufficient. Do not scope the rollup store ahead of that evidence.
+- **`identity_signature` hashing inputs:** too coarse → collisions; too fine → never stabilizes. Nailed with fixtures **before** Slice 5.
+- **Provenance privilege path:** accept degraded unprivileged coverage as default, or add a setgid/`CAP_SYS_PTRACE`/root-only read path — decide in Slice 3/5.
+- **Chronic-fire escalation:** should `chronically_firing` deterministically bump warning→critical after N cycles so a genuinely broken invariant can't sit un-actioned?
+- **Rule-engine technology:** start with hand-written per-family JS miners/evaluators (the `evaluateAlertRules` pattern); defer a general Prolog/Datalog/DSL engine until family count justifies it — confirm this is the intended near-term resolution.
+- **Rubber-stamping risk:** minimum-fixture bar and shadow-precision floor are hard schema-level promotion gates, not conventions.
+- **Rust migration anchoring:** when durable compiled-down artifacts move to Rust, re-anchor `crates/descartes-core` type shapes against this mature Node substrate, not the superseded `2026-05-18-002` sequencing — with an explicit checkpoint at the Layer A→B boundary rather than left purely open.
+
+## 13. Tests / Checks to Prioritize
+
+- **Slice 1–2 (highest priority, safety-critical):** artifact schema validation; atomic-write + corrupt-file tolerance; **path-no-double-nest** (`stateDir/learned/…`, `configDir/learned.json`); `evaluateConstraints` candidate-shape parity with `evaluateAlertRules`; **byte-identical fixed-rule behavior before/after the `extraCandidates` merge**; simultaneous fixed+learned alert with no cross-recovery; `sanitizeDiagnostics()` rejects raw paths/usernames/command-lines (build fails).
+- **Provenance collector (Slice 3):** per-platform clean / deleted-exe / public-bind / missing-permission fixtures; `unable`/`confidence:0` on permission failure; **session construction succeeds after two-file `TRIAGE_TOOL_NAMES` registration**; `collectors.md` updated.
+- **Identity baseline (Slice 5):** `provisional → known_good` timing; day-1 no-storm; identity-collision and identity-instability regression fixtures.
+- **Multi-cadence + fact-history (Slice 6a–6b):** two cadences fire independently; missed-tick handling; categorical fact-point round-trips without hitting the numeric schema's non-finite throw.
+- **Mining + promotion gate (Slice 6c–7):** stability-ratio math on synthetic multi-day fixtures; shadow emits only to `shadow-violations.jsonl`; false-fire-during-shadow rejects promotion; minimum-fixture bar blocks promotion; promotion recorded in `authority/promotions.json`.
+- **Self-audit (Slice 8–9):** `chronically_firing`/`staleness`/`contradiction` generation; `learned.audit.regression` fires on drift; audit provably read-only; self-audit findings never reach L2.
+- **Statistical (Slice 10–12):** textbook Welford mean/variance; EWMA decay; `confidence_state` gate; cardinality cap (top-N + other); hierarchical time-bucket fallback.
+- **L2 reuse (Slice 13):** `enableTools:false` held; template selected by `rule_id` namespace; **default metric template/behavior unchanged**; new namespaces default excluded; critical reservation honored; `budget_exhausted` signal emitted; every call audited with payload even on error; `suggested_signature_draft` persists inert.
+- **Compile-down (Slice 14):** never auto-applied; backtest determinism; human-approve required before threshold read changes.
+- **Cross-cutting gates:** run existing suite + lint each slice; assert no new path escapes `stateDir/`/`configDir/`; assert no LLM call reachable when `alert-intelligence.json` disabled or the finding's namespace is not in `enabled_namespaces`.
