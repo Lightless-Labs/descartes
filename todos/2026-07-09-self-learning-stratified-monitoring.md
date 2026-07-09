@@ -15,7 +15,7 @@ Plan produced + adversarially reviewed via an ultracode multi-agent design workf
 
 ## Layer A — Constraint Kernel
 
-- [ ] **S1** Learned-artifact (constraint) store scaffolding + seed constraints (pure data layer; no daemon/collector/alert coupling).
+- [x] **S1** Learned-artifact (constraint) store scaffolding + seed constraints (pure data layer; no daemon/collector/alert coupling). — `constraint-store.js` + 16 tests; suite 210 green (commit).
 - [ ] **S2** `evaluateConstraints()` + `extraCandidates` pipeline seam + code-enforced `sanitizeDiagnostics()` gate (explicit reviewed change to `evaluateAndPersistAlerts`; byte-identical fixed-rule regression test).
 - [ ] **S6a** Multi-cadence collector scheduling in `daemon.js` (prerequisite for mining).
 - [ ] **S6b** Categorical fact-history schema + translators (distinct from numeric metric-point schema).
