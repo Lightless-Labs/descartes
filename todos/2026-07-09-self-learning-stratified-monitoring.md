@@ -16,7 +16,8 @@ Plan produced + adversarially reviewed via an ultracode multi-agent design workf
 ## Layer A — Constraint Kernel
 
 - [x] **S1** Learned-artifact (constraint) store scaffolding + seed constraints (pure data layer; no daemon/collector/alert coupling). — `constraint-store.js` + 16 tests; suite 210 green (commit).
-- [ ] **S2** `evaluateConstraints()` + `extraCandidates` pipeline seam + code-enforced `sanitizeDiagnostics()` gate (explicit reviewed change to `evaluateAndPersistAlerts`; byte-identical fixed-rule regression test).
+- [x] **S2** `evaluateConstraints()` + `extraCandidates` pipeline seam + code-enforced `sanitizeDiagnostics()` gate (explicit reviewed change to `evaluateAndPersistAlerts`; byte-identical fixed-rule regression test). — 3 new modules + adversarial verify (all 5 safety invariants CONFIRMED); the no-cross-recovery test caught a real self-recovery hazard (candidates missing `id`), hardened at the merge point; suite 229 green.
+  - **Hard gate before S6c mining:** the sanitizer gate covers only candidate `diagnostics`. `evaluateConstraints` interpolates `id`/`family`/`target` verbatim into `title`/`summary`/`fingerprint`. Safe today (trusted `SEED_CONSTRAINTS` only), but once mining derives `target` from raw facts, bound/sanitize those key fields (or canonicalize targets at mine time) so a raw path can't reach a persisted alert title/notification/LLM prompt.
 - [ ] **S6a** Multi-cadence collector scheduling in `daemon.js` (prerequisite for mining).
 - [ ] **S6b** Categorical fact-history schema + translators (distinct from numeric metric-point schema).
 - [ ] **S6c** Deterministic constraint miner (service-presence + port-binding).

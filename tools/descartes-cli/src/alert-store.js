@@ -24,7 +24,7 @@ function normalizeIso(ts, fieldName = "timestamp") {
   return date.toISOString();
 }
 
-function alertId(ruleId, fingerprint = "global") {
+export function alertId(ruleId, fingerprint = "global") {
   const digest = crypto.createHash("sha256").update(`${ruleId}\0${fingerprint}`).digest("hex").slice(0, 16);
   return `alert_${digest}`;
 }
@@ -276,7 +276,18 @@ export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
     readAlertRecords(descartesPaths),
   ]);
   const candidates = evaluateAlertRules(historySummary, daemonStatus, { now, thresholds: options.thresholds });
-  const applied = applyAlertCandidates(existing, candidates, { now, cooldownMs: options.cooldownMs });
+  const extraCandidates = Array.isArray(options.extraCandidates) ? options.extraCandidates : [];
+  // Both sources MUST be merged into one array before the single applyAlertCandidates call below:
+  // applyAlertCandidates' recovery logic marks any active alert id absent from the current candidate
+  // array as "recovered", so evaluating fixed rules and extra (e.g. constraint) candidates separately
+  // would cause each source to spuriously recover the other's alerts every iteration. Every fixed-rule
+  // candidate already carries an `id` (set by pushCandidate); defensively assign the same alertId()
+  // to any extraCandidates entry missing one, so a source that forgets to set `id` cannot desync
+  // applyAlertCandidates' recovery-detection set from the ids it actually persists under.
+  const mergedCandidates = [...candidates, ...extraCandidates].map((candidate) =>
+    candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
+  );
+  const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs });
   const alerts = await writeAlertRecords(descartesPaths, applied.alerts);
   return { alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
 }

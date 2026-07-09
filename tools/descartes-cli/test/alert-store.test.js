@@ -172,3 +172,97 @@ test("evaluate and persist alerts uses local history and daemon status without a
   assert(result.alerts.some((alert) => alert.rule_id === "system.memory.sustained_high"));
   assert(result.notification_due_ids.length > 0);
 });
+
+async function seededScenario(paths) {
+  await appendMetricPoints(paths, [
+    { ts: "2026-05-28T00:00:00.000Z", metric_name: "system.memory.used_fraction", value: 0.92, unit: "fraction" },
+    { ts: "2026-05-28T00:01:00.000Z", metric_name: "system.memory.used_fraction", value: 0.91, unit: "fraction" },
+  ], { now: "2026-05-28T00:01:00.000Z" });
+  await writeDaemonStatus(paths, { ts: "2026-05-28T00:01:00.000Z", state: "ok", profile: { interval_ms: 60_000 } });
+}
+
+test("evaluateAndPersistAlerts produces byte-identical alert records with extraCandidates omitted or empty", async () => {
+  const baselinePaths = await tempPaths();
+  await seededScenario(baselinePaths);
+  const baseline = await evaluateAndPersistAlerts(baselinePaths, { now: "2026-05-28T00:02:00.000Z", windowMs: 15 * 60 * 1000 });
+
+  const omittedPaths = await tempPaths();
+  await seededScenario(omittedPaths);
+  const omitted = await evaluateAndPersistAlerts(omittedPaths, { now: "2026-05-28T00:02:00.000Z", windowMs: 15 * 60 * 1000 });
+
+  const emptyPaths = await tempPaths();
+  await seededScenario(emptyPaths);
+  const empty = await evaluateAndPersistAlerts(emptyPaths, { now: "2026-05-28T00:02:00.000Z", windowMs: 15 * 60 * 1000, extraCandidates: [] });
+
+  assert.deepEqual(omitted.alerts, baseline.alerts);
+  assert.deepEqual(empty.alerts, baseline.alerts);
+  assert.deepEqual(omitted.notification_due_ids, baseline.notification_due_ids);
+  assert.deepEqual(empty.notification_due_ids, baseline.notification_due_ids);
+
+  // Round-trip through the store itself is also byte-identical.
+  const rereadBaseline = await readAlertRecords(baselinePaths);
+  const rereadEmpty = await readAlertRecords(emptyPaths);
+  assert.deepEqual(rereadEmpty, rereadBaseline);
+});
+
+test("a fixed-rule alert and an extraCandidates alert do not spuriously recover each other", async () => {
+  const paths = await tempPaths();
+  await seededScenario(paths); // drives the fixed system.memory.sustained_high rule active
+
+  const extraCandidate = {
+    rule_id: "constraint.violation.test-family",
+    fingerprint: "constraint.test.example",
+    severity: "warning",
+    title: "Constraint violated",
+    summary: "Test constraint violated",
+    diagnostics: { actual: 5 },
+    evidence_refs: ["constraint-store"],
+  };
+
+  const first = await evaluateAndPersistAlerts(paths, {
+    now: "2026-05-28T00:02:00.000Z",
+    windowMs: 15 * 60 * 1000,
+    extraCandidates: [extraCandidate],
+  });
+  const fixedAlert = first.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const extraAlert = first.alerts.find((alert) => alert.rule_id === "constraint.violation.test-family");
+  assert.ok(fixedAlert, "expected the fixed-rule alert to be active");
+  assert.ok(extraAlert, "expected the extraCandidates alert to be active");
+  assert.equal(fixedAlert.status, "active");
+  assert.equal(extraAlert.status, "active");
+
+  // Next iteration: extraCandidates is now absent (constraint resolved / no longer supplied).
+  // The fixed-rule alert must remain active, not spuriously recover.
+  const second = await evaluateAndPersistAlerts(paths, {
+    now: "2026-05-28T00:03:00.000Z",
+    windowMs: 15 * 60 * 1000,
+    extraCandidates: [],
+  });
+  const fixedAfter = second.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const extraAfter = second.alerts.find((alert) => alert.rule_id === "constraint.violation.test-family");
+  assert.equal(fixedAfter.status, "active");
+  assert.equal(extraAfter.status, "recovered");
+
+  // Symmetric case: fixed-rule condition clears (memory no longer sustained-high via a
+  // fresh window with no samples in range) while extraCandidates stays active — the
+  // extraCandidates alert must not be spuriously recovered by the fixed-rule source.
+  const thirdPaths = await tempPaths();
+  await seededScenario(thirdPaths);
+  const symmetricFirst = await evaluateAndPersistAlerts(thirdPaths, {
+    now: "2026-05-28T00:02:00.000Z",
+    windowMs: 15 * 60 * 1000,
+    extraCandidates: [extraCandidate],
+  });
+  assert.ok(symmetricFirst.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high" && alert.status === "active"));
+  assert.ok(symmetricFirst.alerts.find((alert) => alert.rule_id === "constraint.violation.test-family" && alert.status === "active"));
+
+  const symmetricSecond = await evaluateAndPersistAlerts(thirdPaths, {
+    now: "2026-05-28T00:20:00.000Z", // well past the metric window; fixed rule candidate drops out
+    windowMs: 60 * 1000,
+    extraCandidates: [extraCandidate],
+  });
+  const fixedSymmetric = symmetricSecond.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const extraSymmetric = symmetricSecond.alerts.find((alert) => alert.rule_id === "constraint.violation.test-family");
+  assert.equal(extraSymmetric.status, "active");
+  assert.equal(fixedSymmetric.status, "recovered");
+});
