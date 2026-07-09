@@ -1,7 +1,7 @@
 ---
 title: Investigate rcodesign for keychain-free macOS signing/notarization
 created: 2026-07-07
-status: pending
+status: in_progress
 priority: medium
 area: release
 kind: todo
@@ -9,6 +9,7 @@ owner: unassigned
 related:
   - docs/plans/2026-05-30-native-macos-notifications.md
   - todos/2026-05-30-native-macos-notifications.md
+  - docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md
 ---
 
 # TODO: Investigate rcodesign for keychain-free macOS signing/notarization
@@ -21,8 +22,17 @@ certificate chain (leaf + Apple Developer ID intermediate) is present in the key
 search list, and it took days of debugging keychain semantics (`security find-certificate -a`
 exit-code false positives, missing G2 intermediate on fresh CI images, partition lists,
 search-list ordering) to make it viable. `rcodesign` from the
-[apple-codesign](https://github.com/indygreg/apple-codesign) project removes that entire
+[apple-codesign](https://github.com/indygreg/apple-platform-rs) project removes that entire
 failure class:
+
+**Research update 2026-07-09:** Foundry-style research is recorded at
+`docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md`. Recommendation:
+do **not** replace the working Apple-toolchain release path yet. Keep rcodesign as an
+optional spike/fallback until it is proven with the real Descartes Developer ID p12 and
+App Store Connect API key, using the same Doppler-derived credential path as CI. The
+Swift app build still requires macOS today (`swiftc` + UserNotifications), so the first
+practical win would be keychain-free signing/notarization inside the existing Tart job,
+not eliminating the macOS VM end-to-end.
 
 - Signs directly from the `.p12` (`rcodesign sign --p12-file ... --p12-password-file ...`)
   with no keychain, trust store, partition list, or search list involvement.
@@ -52,8 +62,12 @@ failure class:
       assessment after notarization/stapling.
 - [ ] Signature attributes (hardened runtime, timestamp, identifier, team ID) match the
       Apple-toolchain baseline.
-- [ ] Written recommendation (adopt/reject/fallback) recorded in `docs/solutions/` or this
-      todo, with the CI implications (macOS VM still required or not).
+- [x] Written recommendation (adopt/reject/fallback) recorded in
+      `docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md` and this
+      todo: defer adoption; keep as optional fallback until real-cert signing,
+      notarization, stapling, and Gatekeeper parity are proven. CI implication: macOS VM
+      is still required for the Swift build; rcodesign would first remove keychain
+      fragility, not the Tart job.
 
 ## Notes
 

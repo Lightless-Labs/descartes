@@ -203,6 +203,18 @@ documented hard stop — was unreliable until the check was rewritten to parse o
   asserts the intermediate import happens and that `add-trusted-cert` is absent from the script,
   so a regression to the red-herring approach fails CI.
 
+### rcodesign follow-up (2026-07-09)
+
+A follow-up research pass captured the keychain-free alternative at
+`docs/research/2026-07-09-rcodesign-macos-notifier-release-research.md`. Recommendation:
+do not replace the now-working Apple-toolchain path until `rcodesign` is proven with the real
+Descartes Developer ID p12 and App Store Connect API key. The important CI implication is that
+`rcodesign` can remove the keychain/intermediate/trustd failure class, but it does **not** remove
+the macOS build requirement by itself: `scripts/build-macos-notifier.sh` still uses macOS `swiftc`
+and `UserNotifications` to build the `.app`. A first adoption would therefore be keychain-free
+signing/notarization inside the existing Tart release job, with Apple `codesign --verify`,
+`stapler validate`, and `spctl --assess` kept as parity checks.
+
 ### Secondary infra bugs found en route (each independently release-blocking)
 
 - **Shared-directory automount race.** tart-ci's macOS command hook ran
