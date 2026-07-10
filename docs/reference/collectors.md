@@ -31,6 +31,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 | `collect_certificates` | `certificates` | macOS, Linux | `warning_days?: 1..3650`, `certificate_limit?: 1..500` |
 | `inspect_process` | `process-<pid>` | macOS, Linux | `pid: number` |
 | `inspect_parent_tree` | `process-parent-tree-<pid>` | macOS, Linux | `pid: number`, `max_depth?: 1..64` |
+| `inspect_runtime_provenance` | `provenance-<pid\|port\|container>-<value>` | macOS, Linux | exactly one of `pid: number`, `port: 1..65535`, `container: string` |
 | `sample_dimension` | `sample-<dimension>` | macOS, Linux | `dimension`, `duration_seconds?: 1..60`, `interval_seconds?: 1..60`, `top_n?: 1..20`, `aggregation?: ...` |
 | `read_sampling_artifact` | `sampling-artifact-<id>` | macOS, Linux | `artifact_id: string`, `max_samples?: 1..25` |
 | `collect_triage_evidence` | bundle: `evidence[]`, `findings[]`, `actions_taken: []` | macOS, Linux | none |
@@ -82,6 +83,23 @@ Sources:
 - Linux `/proc` metadata where available.
 
 Privacy: can reveal parent command lines and user/session context; command lines are bounded/redacted best effort.
+
+### `inspect_runtime_provenance`
+
+Target-first provenance lookup: resolves exactly one of `pid`, `port`, or `container` (rejecting zero or multiple targets deterministically rather than guessing) into one provenance record: process/executable identity, a deterministic source classification (`launchd`/`systemd`/`cron`/`shell`/`ssh`/`supervisor`/`container`/`init`/`unknown`), listening socket context for port lookups, and fact-only warnings (not yet alerts).
+
+Sources:
+
+- Linux `pid`: `/proc/<pid>/exe` readlink (also the deleted-executable signal: a kernel-asserted `(deleted)` suffix), `/proc/<pid>/status` uid, fixed `ps -eo pid,ppid,uid,pcpu,pmem,rss,ucomm,args` for identity/ancestry.
+- macOS `pid`: fixed `ps -axo pid,ppid,uid,pcpu,pmem,rss,ucomm,args` for identity/ancestry, fixed `lsof -a -p <pid> -d txt` plus a targeted `fs.stat` for the executable path (a `stat` `ENOENT` while lsof still shows the FD open is the inferred, reduced-confidence deleted-executable signal — macOS has no kernel-provided suffix), fixed `codesign -dv` for signature identity, and fixed `spctl --assess -t execute` surfaced only as a low-confidence operator-facing signal (never a hard rule input).
+- Linux `port`: `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/net/udp`, `/proc/net/udp6` for the matching local port and owning uid/inode (a confident fact even when pid resolution fails), then an own-uid `/proc/<pid>/fd` inode walk to resolve the pid. Other-UID sockets return the owning uid as a fact and degrade the pid to unresolved rather than guessing.
+- macOS `port`: fixed `lsof -nP -iTCP:<port> -sTCP:LISTEN`, then delegates to the `pid` mechanics above.
+- `container`: fixed `docker inspect -f '{{.State.Pid}}' <id>` / `podman inspect -f '{{.State.Pid}}' <id>` to resolve the container's top pid, then delegates to the `pid` mechanics above.
+- uid→username: fixed `id -un <uid>`; a non-zero exit, timeout, or non-bare-token stdout yields `username_unavailable: true`, never a guessed username.
+
+Behavior: unprivileged only — never escalates privilege, never shells out (every command is a fixed argv with a timeout and bounded buffer). Cross-UID, unresolvable, or permission-limited facts degrade explicitly (`status: "unable"` or `"partial"`, `confidence: 0` or `0.4`, `review_hint: "missing_permission"`) and never fabricate a pid, owner, or identity. Warnings surfaced are facts only in this collector (`deleted_exe_running`, `public_bind_no_supervisor`, `unexpected_parent`); a public bind is recognized via the address literals `0.0.0.0`, `[::]`, and the bare `*` form.
+
+Privacy: process identity, executable paths, redacted/bounded command lines, usernames, and code-signing identities can be sensitive. Command/args fields reuse `processes.js`'s redaction helper verbatim.
 
 ### `collect_disks`
 

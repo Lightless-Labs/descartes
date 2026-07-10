@@ -12,6 +12,7 @@ export const TRIAGE_TOOL_NAMES = Object.freeze([
   "collect_certificates",
   "inspect_process",
   "inspect_parent_tree",
+  "inspect_runtime_provenance",
   "sample_dimension",
   "read_sampling_artifact",
   "collect_triage_evidence",

@@ -14,6 +14,7 @@ import { collectDiskEvidence } from "./tools/disks.js";
 import { collectRecentLogsEvidence } from "./tools/logs.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEvidence } from "./tools/processes.js";
+import { resolveProvenance } from "./tools/provenance.js";
 import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSystemEvidence } from "./tools/system.js";
@@ -186,6 +187,18 @@ export function createEvidenceTools(paths) {
       execute: async (_id, params) => jsonToolResult(await inspectParentTreeEvidence({ pid: params.pid, maxDepth: params.max_depth ?? 16 })),
     }),
     defineTool({
+      name: "inspect_runtime_provenance",
+      label: "Inspect runtime provenance",
+      description: "Inspect one target (pid, port, or container id — exactly one) using read-only local facts: process/executable identity, deterministic source classification (launchd/systemd/cron/shell/ssh/supervisor/container/init/unknown), listening socket context, and fact-only warnings (deleted/unlinked executable, public bind with no recognized supervisor, unexpected parent). Unprivileged only; cross-UID or unresolvable facts degrade explicitly rather than being guessed.",
+      parameters: Type.Object({
+        pid: Type.Optional(Type.Number({ minimum: 1 })),
+        port: Type.Optional(Type.Number({ minimum: 1, maximum: 65535 })),
+        container: Type.Optional(Type.String()),
+      }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await resolveProvenance({ pid: params.pid, port: params.port, container: params.container })),
+    }),
+    defineTool({
       name: "sample_dimension",
       label: "Sample a dimension over time",
       description: "Collect bounded read-only temporal samples for process CPU, process memory, or load/memory/swap and return aggregates.",
@@ -256,7 +269,7 @@ Hard rules:
 Preferred flow:
 1. Select the narrowest Descartes evidence tools that match the complaint.
 2. For broad slowness/resource-pressure triage, call collect_triage_evidence first.
-3. If a process looks important, call inspect_process and/or inspect_parent_tree for process identity and lineage before making claims about provenance.
+3. If a process looks important, call inspect_process and/or inspect_parent_tree for process identity and lineage before making claims about provenance. For a "why is this running" or "who owns this port/container" complaint shaped around a specific pid, port, or container id, call inspect_runtime_provenance instead of guessing at source classification.
 4. If the complaint involves connectivity, DNS, listening ports, or network reachability, call collect_network_basics rather than guessing.
 5. If the complaint involves a daemon, service, startup item, or repeated restart/failure, call collect_services rather than guessing.
 6. If the complaint involves crashes, reboots, authentication failures, fail2ban, firewall blocks, denied traffic, or recent error context, call collect_recent_logs with tight bounds rather than guessing. Treat log excerpts as sensitive.
