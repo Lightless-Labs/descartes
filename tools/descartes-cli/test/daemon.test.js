@@ -32,6 +32,7 @@ import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { readAlertRecords } from "../src/alert-store.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
+import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, writeSignatureStore } from "../src/provenance-store.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -1485,4 +1486,95 @@ test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a pro
   assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by either learned source clearing");
   assert.equal(constraintThird.status, "recovered");
   assert.equal(provenanceThird.status, "recovered");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice S5: identity-baseline deviation candidates wired into the same extraCandidates
+// concatenation. Full unit coverage (day-1 no-storm, grace-window boundary, UID-scoping,
+// identity_drift, CLI idempotency) lives in test/provenance-store.test.js and
+// test/provenance-identity.test.js; these tests confirm the daemon.js wiring itself: the third
+// source lands in the same array, is byte-identical when disabled, and coexists without
+// cross-recovering the other two sources.
+// ---------------------------------------------------------------------------------------------
+
+async function seedConfirmedUnknownIdentity(paths, ts) {
+  const observation = {
+    executablePath: "/opt/acme/bin/worker",
+    sourceClassification: "shell",
+    owningUser: "0",
+    portTargetKeys: ["tcp.9500"],
+  };
+  // Two distinct iterations, three total samples -- crosses the S5 grace window
+  // (DEFAULT_STABLE_SAMPLE_THRESHOLD=3, DEFAULT_STABLE_ITERATION_THRESHOLD=2) directly via the
+  // pure reconciliation helper, without needing several real daemon ticks.
+  let store = { version: 1, signatures: {} };
+  store = reconcileSignatures(store, [observation], { ts, iterationKey: "seed-t1" });
+  store = reconcileSignatures(store, [observation], { ts, iterationKey: "seed-t2" });
+  store = reconcileSignatures(store, [observation], { ts, iterationKey: "seed-t2" });
+  // bootstrapped_at + a fresh last_reconciled_at (== ts) mean computeProvenanceIdentityCandidates
+  // finds a baseline already established and is not due for fresh host I/O this tick -- pure
+  // re-derive only, so this test needs no collector fakes for the identity path.
+  await writeSignatureStore(paths, { ...store, bootstrapped_at: ts, last_reconciled_at: ts });
+}
+
+test("S5: byte-identical real alerts when the learned kill switch is off, even with a confirmed-unknown identity baseline present, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withIdentityPaths = await tempPaths();
+  await seedConfirmedUnknownIdentity(withIdentityPaths, S_LIVE_1_TICK_TS);
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the pre-S5 baseline above.
+  const withIdentity = await runIsolatedDaemonTick(withIdentityPaths);
+
+  assert.deepEqual(withIdentity.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withIdentity.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withIdentity.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+
+  const persisted = await readAlertRecords(withIdentityPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === UNKNOWN_IDENTITY_RULE_ID), false);
+});
+
+test("S5: a confirmed-unknown identity (grace window crossed, no snapshot baseline acceptance) produces a real, sanitized unknown_identity alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await seedConfirmedUnknownIdentity(paths, S_LIVE_1_TICK_TS);
+
+  const result = await runIsolatedDaemonTick(paths);
+  const alert = result.alerts.alerts.find((a) => a.rule_id === UNKNOWN_IDENTITY_RULE_ID);
+  assert.ok(alert, "expected a real alert for the confirmed-unknown identity");
+  assert.equal(alert.status, "active");
+  assert.match(alert.diagnostics.identity_hash, /^[0-9a-f]{16}$/);
+  assert.equal(JSON.stringify(alert.diagnostics).includes("/opt/acme"), false, "no raw path should ever reach a persisted identity diagnostics");
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+});
+
+test("S5 load-bearing: a fixed-rule alert and a confirmed-unknown-identity alert coexist across daemon iterations without either spuriously recovering the other", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await seedConfirmedUnknownIdentity(paths, "2026-05-24T00:00:00.000Z");
+
+  const highMemoryCollectors = {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0, 0, 0],
+      uptime_seconds: 1,
+      memory: { used_fraction: 0.95, free_bytes: 1 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+  const profile = slice6Profile();
+
+  await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:00:00.000Z", now: "2026-05-24T00:00:00.000Z" });
+  const second = await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:01:00.000Z", now: "2026-05-24T00:01:00.000Z" });
+
+  const fixedSecond = second.alerts.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const identitySecond = second.alerts.alerts.find((alert) => alert.rule_id === UNKNOWN_IDENTITY_RULE_ID);
+  assert.ok(fixedSecond, "expected the fixed-rule alert to be active after 2 sustained high-memory samples");
+  assert.equal(fixedSecond.status, "active");
+  assert.ok(identitySecond, "expected the identity alert to remain active");
+  assert.equal(identitySecond.status, "active");
 });

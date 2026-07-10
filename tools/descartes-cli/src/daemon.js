@@ -15,6 +15,7 @@ import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./histor
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence } from "./tools/processes.js";
+import { computeProvenanceIdentityCandidates } from "./tools/provenance-identity.js";
 import {
   collectProvenanceWarningsEvidence,
   computeProvenanceWarningCandidates,
@@ -435,6 +436,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         extraCandidates: [
           ...await computeActiveConstraintCandidates(descartesPaths, options),
           ...await computeProvenanceWarningCandidates(descartesPaths, options),
+          // Slice S5, additive: identity-baseline deviation candidates (unknown_identity/
+          // identity_drift/new_public_bind) land in the same concatenation, same commit
+          // discipline as S4's own addition above (plan section 5 / S-live-1 grounding).
+          ...await computeProvenanceIdentityCandidates(descartesPaths, options),
         ],
       });
   const alertIntelligence = alerts && options.adjudicateAlerts !== false

@@ -51,6 +51,8 @@ Usage:
   descartes learned review [--json]
   descartes learned approve <constraint-id> --nonce <nonce> [--note <text>] [--json]
   descartes learned reject <constraint-id> --nonce <nonce> [--note <text>] [--json]
+  descartes provenance snapshot [--json]
+  descartes provenance baseline show [--identity <hash>] [--json]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
@@ -145,6 +147,13 @@ async function main(argv) {
     }
     const { runLearned } = await import("./constraint-miner.js");
     await runLearned(paths, args);
+    return;
+  }
+  if (command === "provenance") {
+    // Slice S5: identity-baseline store CLI (`snapshot`/`baseline show`), mirroring every other
+    // top-level command's dedicated-module + run<Thing>(paths, args) dispatch pattern.
+    const { runProvenanceStore } = await import("./provenance-store.js");
+    await runProvenanceStore(paths, args);
     return;
   }
 

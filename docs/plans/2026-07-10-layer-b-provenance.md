@@ -328,6 +328,8 @@ Grace window: `provisional → known_good` requires `stable_sample_count ≥ 3` 
 
 Deterministic set/pattern matching only — this slice adds zero statistical inference (that's Layer C, out of scope). `identity_drift` on a legitimate software update is an expected, bounded false-positive class; documented as such (operator can `descartes provenance snapshot` again to re-baseline), not treated as a defect to eliminate in this slice.
 
+**Addendum (2026-07-10, as shipped — identity_drift fidelity gap, fail-safe):** `identity_hash` (the codesign/content-hash component) is **absent in this build** — computing it would be unbounded per-process I/O (a `codesign -dv` or full binary hash per observed process each reconciliation), exactly what S4's own addendum excluded from fixed-rule paths. So the `identity_signature` is derived from `executable_path + source_classification + owning_user` only. Consequence: `identity_drift` detects a target whose **launcher (source_classification) or owner changed**, but does **NOT** detect an in-place binary **swap** at the same path/launcher/owner (the signature is unchanged) — a **false-negative only** gap (never a false alarm, crash, or fabricated fact). Drift also is not instantaneous: for the natural (non-snapshot) case the replacement identity must itself cross the grace window before drift fires. Interim mitigation: S4's `deleted_exe_running` rule already catches the common "FD still open to a deleted inode" swap. **Tracked fast-follow (S5-follow-1):** wire `identity_hash` via a bounded `codesign`/content check on the narrowed candidate set (S4-style), pinned against real fixtures.
+
 ---
 
 ## 6. Doors-and-corners — the elevated read path (S3-priv), redesigned
