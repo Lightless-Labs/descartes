@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
+import { sanitizeDiagnostics, sanitizeIdentityString } from "../src/diagnostics-sanitizer.js";
 
 test("sanitizeDiagnostics passes finite numbers, booleans, short enum strings, and hex hashes through verbatim", () => {
   const sanitized = sanitizeDiagnostics({
@@ -120,4 +120,41 @@ test("sanitizeDiagnostics classifies an own '__proto__' key without corrupting t
   assert.equal(protoDesc.value.redacted, true);
   // And no global prototype pollution.
   assert.equal({}.nested, undefined);
+});
+
+// --- Slice S6b: sanitizeIdentityString (shared with fact-translators.js's sanitizeEntityKey) ---
+
+test("sanitizeIdentityString passes an already-safe enum-shaped identifier through unchanged", () => {
+  assert.equal(sanitizeIdentityString("nginx.service"), "nginx.service");
+  assert.equal(sanitizeIdentityString("com.example.running"), "com.example.running");
+  assert.equal(sanitizeIdentityString("tcp:0.0.0.0:8080"), "tcp:0.0.0.0:8080");
+});
+
+test("sanitizeIdentityString strips a path-like value down to a bounded safe string, never leaking raw path separators", () => {
+  const hostile = "/usr/local/bin/../../etc/passwd";
+  const sanitized = sanitizeIdentityString(hostile);
+  assert.notEqual(sanitized, undefined);
+  assert.equal(sanitized.includes("/"), false);
+  assert.equal(sanitized.includes("etc"), true); // truncated/redacted, not obliterated to nothing
+  assert.match(sanitized, /^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+});
+
+test("sanitizeIdentityString truncates an over-length value to the max length", () => {
+  const long = `service-${"a".repeat(200)}`;
+  const sanitized = sanitizeIdentityString(long);
+  assert(sanitized.length <= 64);
+  assert.match(sanitized, /^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+});
+
+test("sanitizeIdentityString returns undefined for empty, whitespace-only, or entirely-unsafe input", () => {
+  assert.equal(sanitizeIdentityString(""), undefined);
+  assert.equal(sanitizeIdentityString("   "), undefined);
+  assert.equal(sanitizeIdentityString("////"), undefined);
+  assert.equal(sanitizeIdentityString(undefined), undefined);
+  assert.equal(sanitizeIdentityString(null), undefined);
+});
+
+test("sanitizeIdentityString is pure and deterministic", () => {
+  const input = "/some/hostile/path";
+  assert.equal(sanitizeIdentityString(input), sanitizeIdentityString(input));
 });

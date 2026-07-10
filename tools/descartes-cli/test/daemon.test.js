@@ -26,6 +26,7 @@ import {
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
+import { readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 
@@ -400,6 +401,28 @@ function structuralCollectorFakes(calls = []) {
   };
 }
 
+function structuralCollectorFakesWithFacts(calls = []) {
+  return {
+    services: async () => {
+      calls.push("services");
+      return envelope("services", "collect_services", {
+        manager: "systemd",
+        services: [{ name: "nginx.service", running: true }],
+      });
+    },
+    network: async () => {
+      calls.push("network");
+      return envelope("network-basics", "collect_network", {
+        listening_sockets: [{ protocol: "tcp", state: "LISTEN", local_address: "0.0.0.0", local_port: 8080 }],
+      });
+    },
+    "scheduled-jobs": async () => {
+      calls.push("scheduled-jobs");
+      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] });
+    },
+  };
+}
+
 function structuralProfile(overrides = {}) {
   return {
     interval_ms: 60000,
@@ -718,6 +741,89 @@ test("kill switch: structural collection is skipped entirely while learned.json 
 
   const checkpointAfter = await readStructuralCheckpoint(paths);
   assert.equal(checkpointAfter.last_structural_run_ms, 0, "checkpoint must not advance while the kill switch is off");
+});
+
+// --- Slice S6b, additive follow-up: structural evidence -> fact-points -> facts.jsonl ---
+
+test("S6b wiring: structural evidence is translated into fact-points and persisted to facts.jsonl only when structural collection succeeds and the kill switch is enabled", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    // Non-zero `now`: history-store.js-style retention helpers treat `options.now ? … :
+    // Date.now()` as falsy-zero-means-"not provided" (mirrored verbatim in fact-store.js's
+    // enforceFactRetention) — `now: 0` would fall back to the real wall clock and age these
+    // fixture facts out of the default 30-day retention window immediately.
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.notEqual(result.structuralFacts, undefined);
+  assert.equal(result.structuralFacts.written_count, 2);
+
+  const { points } = await readFactPoints(paths);
+  assert.equal(points.length, 2);
+  assert(points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
+  assert(points.some((point) => point.fact_name === "network.listening_port.owner" && point.entity_key === "tcp:0.0.0.0:8080"));
+});
+
+test("S6b wiring: no fact-points are persisted while the learned.json kill switch is off, even with populated structural evidence available", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 0,
+    evaluateAlerts: false,
+    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
+    // behavior, which is enabled:false when configDir/learned.json is absent.
+  });
+
+  assert.equal(result.structuralFacts, undefined);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("S6b wiring: a timed-out structural tick discards its evidence entirely — no fact-points are persisted for a partial/timed-out tick", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    services: async () => envelope("services", "collect_services", {
+      manager: "systemd",
+      services: [{ name: "nginx.service", running: true }],
+    }),
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": () => new Promise(() => {}), // never resolves
+  };
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ deadline_ms: 25 }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.structuralEvidence, undefined);
+  assert.equal(result.structuralFacts, undefined);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("S6b wiring: no fact-points are persisted when profile.structural is absent (regression, matches S6a's byte-identical-fast-path guarantee)", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
+  const profile = { interval_ms: 60000, collectors: { system: { enabled: true }, processes: { enabled: true }, disks: { enabled: true } } };
+
+  const result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), ts, now: ts, evaluateAlerts: false });
+  assert.equal(result.structuralFacts, undefined);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
 });
 
 test("runForegroundDaemonLoop performs structural collection at the expected cadence across many iterations", async () => {

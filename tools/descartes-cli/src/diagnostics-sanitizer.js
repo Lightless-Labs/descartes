@@ -64,6 +64,38 @@ function redactionMarker(reason, rawValue) {
 }
 
 /**
+ * Bounds/allowlists a single identity-shaped string (a service name, process command,
+ * mined constraint id/target component, …) down to something that satisfies
+ * `isSafeEnumString` by construction, rather than merely validating and rejecting.
+ *
+ * Unlike `sanitizeDiagnostics` (which classifies-and-redacts each value to a marker
+ * object), callers of this function need a *string* back — entity keys and mined ids
+ * are embedded directly into other strings downstream. So instead of rejecting an
+ * unsafe value outright, every character outside the safe charset is replaced with
+ * "_", any resulting leading run of non-alnum characters is trimmed (the safe charset
+ * requires starting with an alnum), and the result is truncated to `maxLength`. This
+ * guarantees "no raw path/command-line reaches the output" without silently dropping
+ * the fact/record entirely just because one field needed sanitizing.
+ *
+ * Returns `undefined` (never a raw/partial value) when nothing safe survives — an
+ * entirely-unsafe or empty input (e.g. "////", "", whitespace-only) — signaling to the
+ * caller that the identity is unresolvable and the record should be dropped, matching
+ * the "degrade, never fabricate" convention used elsewhere in this module.
+ */
+export function sanitizeIdentityString(value, { maxLength = MAX_STRING_LENGTH } = {}) {
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value).trim();
+  if (!raw) return undefined;
+
+  const collapsed = raw
+    .replace(/[^A-Za-z0-9._:-]/g, "_")
+    .replace(/^[^A-Za-z0-9]+/, "");
+  const truncated = collapsed.slice(0, maxLength);
+
+  return isSafeEnumString(truncated) ? truncated : undefined;
+}
+
+/**
  * Sanitizes a candidate's `diagnostics` object down to only unambiguously-safe values.
  * Non-object input normalizes to `{}`. Every `evaluate*()` candidate family MUST route
  * its diagnostics through this gate before the candidate reaches the alert pipeline.

@@ -7,6 +7,8 @@ import { promisify } from "node:util";
 import { adjudicateAlertNotifications } from "./alert-intelligence.js";
 import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
+import { appendFactPoints } from "./fact-store.js";
+import { factPointsFromNetworkEvidence, factPointsFromServiceEvidence } from "./fact-translators.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
@@ -290,6 +292,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // (convention #4) — when disabled, this block reads nothing else and writes nothing.
   let structuralEvidence;
   let structuralCollectorStatuses;
+  let structuralFacts;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
@@ -314,6 +317,21 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         } else {
           structuralEvidence = outcome;
           structuralCollectorStatuses = structuralEvidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool }));
+
+          // Slice S6b, additive follow-up to S6a: translate this tick's structural evidence
+          // into categorical fact-points and persist them. Only reachable here — i.e. only
+          // when structural collection actually completed this tick (not timed out) and the
+          // learned kill switch is enabled (already gated by the enclosing `if
+          // (learnedConfig.enabled)` block above) — never on a timed-out/partial tick, which
+          // discards its evidence entirely rather than persisting a partial fact snapshot.
+          const factPoints = [
+            ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
+            ...factPointsFromNetworkEvidence(structuralEvidence, { ts }),
+          ];
+          if (factPoints.length > 0) {
+            const appendFacts = options.appendFactPoints ?? appendFactPoints;
+            structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts });
+          }
         }
         const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
         await writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts });
@@ -337,7 +355,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
     ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
     : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence, structuralEvidence };
+  return { evidence, points, write, status, alerts, alertIntelligence, structuralEvidence, structuralFacts };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
