@@ -17,8 +17,10 @@
 // classifySourceFromAncestry/isPublicBindAddress/resolveExecutableInfo (provenance.js),
 // buildParentTreeResult (processes.js).
 
+import fs from "node:fs/promises";
 import { loadLearnedConfig } from "../constraint-store.js";
 import {
+  computeExecutableStatFingerprint,
   computeIdentitySignature,
   deriveIdentityCandidates,
   loadSignatureStore,
@@ -44,6 +46,31 @@ function buildAncestryChain(processes, pid, maxDepth) {
   const treeResult = buildParentTreeResult(processes, pid, maxDepth);
   const chain = treeResult.result?.chain ?? [];
   return chain.map((item) => ({ pid: item.pid, ppid: item.ppid, comm: item.command }));
+}
+
+async function defaultStatExecutablePath(executablePath) {
+  return fs.stat(executablePath);
+}
+
+/**
+ * S5-follow-1: populates the identityHash input position (see provenance-store.js's module
+ * header) with a bounded, single-fs.stat CONTENT-CHANGE fingerprint of the already-resolved
+ * executable path of an already-own-UID-scoped, already-gathered identity -- no re-resolution of
+ * the path itself (resolveExecutableInfo has already run), no new per-fast-tick I/O (this only
+ * runs on gatherIdentityObservations' own rate-limited reconcile / explicit-snapshot path), and
+ * exactly one stat per gathered identity. DEGRADE-NOT-FABRICATE: any stat failure (ENOENT,
+ * EPERM, a TOCTOU race where the executable vanished between resolveExecutableInfo and here,
+ * etc.) yields `undefined` -- identical to today's always-absent behavior for that identity --
+ * never a fabricated/zero value, and never throws out of this function.
+ */
+async function computeIdentityHash(executablePath, options) {
+  const statExecutablePath = options.statExecutablePath ?? defaultStatExecutablePath;
+  try {
+    const statResult = await statExecutablePath(executablePath);
+    return computeExecutableStatFingerprint(statResult);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -107,11 +134,14 @@ export async function gatherIdentityObservations(options = {}) {
       ),
     ];
 
+    const identityHash = await computeIdentityHash(executablePath, options);
+
     observations.push({
       executablePath,
-      // See provenance-store.js's module header: always absent in this build (documented,
-      // bounded-I/O deviation), never fabricated.
-      identityHash: undefined,
+      // S5-follow-1: bounded fs.stat CONTENT-CHANGE fingerprint (see computeIdentityHash above +
+      // provenance-store.js's computeExecutableStatFingerprint). undefined only when the stat
+      // itself failed (degrade-not-fabricate) -- never a fabricated value.
+      identityHash,
       sourceClassification: source.type,
       owningUser: String(processRecord.uid),
       target: { kind: "pid", value: pid },

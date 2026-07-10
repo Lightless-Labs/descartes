@@ -18,17 +18,26 @@
 // imports this module's store/state-machine primitives).
 //
 // identity_signature DEVIATION (documented, not silent): the plan's data shape names
-// `identity_hash` as "codesign identity or exe content hash". This implementation always passes
-// that component as absent/undefined -- computing it would mean either hashing a binary's full
+// `identity_hash` as "codesign identity or exe content hash". S5 (which added this hash's INPUT
+// POSITION to computeIdentitySignature below) always passed that component as absent/undefined --
+// computing a true content hash or codesign identity would mean either hashing a binary's full
 // content (no such mechanism exists anywhere in this codebase) or invoking `codesign -dv` per
 // observed process every reconciliation, which is unbounded per-process I/O of exactly the kind
 // S4's own shipped addendum explicitly excluded from any fixed-rule path ("S4 as implemented
 // needs neither codesign nor spctl for its two rule_ids... codesign remains available in S3 for
-// on-demand triage but is not on any S4 fixed-rule path"). S5 follows that same bounded-I/O
-// precedent. The hash INPUT POSITION for this field is still fully honored (see
-// computeIdentitySignature below) -- it simply always serializes to an empty component in this
-// build, never a fabricated value. A future slice can populate it once validated against real
-// fixtures, exactly as the plan's own open item #7 treats spctl.
+// on-demand triage but is not on any S4 fixed-rule path").
+//
+// S5-follow-1 (tools/provenance-identity.js's gatherIdentityObservations) closes the resulting
+// identity_drift blind spot -- an in-place binary swap at the same path/launcher/owner previously
+// left identity_signature unchanged, since identity_hash was always undefined -- by populating
+// identity_hash with computeExecutableStatFingerprint below: a bounded, single-fs.stat
+// CONTENT-CHANGE proxy (`sha256(dev:ino:size:mtimeMs).slice(0,16)`), NOT a true content hash or
+// codesign identity. Still no unbounded per-process I/O (one fs.stat, reusing the already-resolved
+// executable path, only on the already-rate-limited reconcile path); still degrades to undefined
+// (never a fabricated value) whenever the executable path is unresolved or the stat itself fails.
+// A same-inode overwrite that preserves size AND resets mtime via `touch -r` can still evade this
+// pure-stat proxy -- a codesign CDHash / full content hash remains a future hardening for signed
+// binaries, exactly as the plan's own open item #7 treats spctl.
 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -114,6 +123,25 @@ export function computeIdentitySignature({ executablePath, identityHash, sourceC
     normalizeIdentityInput(owningUser),
   ].join(IDENTITY_SIGNATURE_DELIMITER);
   return sha256Hex(serialized, SIGNATURE_HASH_LENGTH);
+}
+
+/**
+ * S5-follow-1: bounded content-CHANGE fingerprint for identity_hash (see the module header
+ * above). Computed from a single fs.stat's `{ dev, ino, size, mtimeMs }` of the resolved
+ * executable path -- deliberately NOT a content hash or codesign identity:
+ * `sha256("${dev}:${ino}:${size}:${mtimeMs}")`, truncated to SIGNATURE_HASH_LENGTH (16) hex
+ * chars, exactly like computeIdentitySignature's own truncation and sanitizeDiagnostics' own
+ * fixed-length-hash allowlist. An in-place binary swap changes at least size/mtimeMs (usually
+ * dev/ino too), so this fingerprint changes -- which changes identity_signature -- which lets
+ * identity_drift fire for a same-path/launcher/owner swap (see deriveIdentityCandidates below).
+ * Pure and deterministic (same stat inputs -> same hash, always). The caller
+ * (tools/provenance-identity.js) is responsible for the DEGRADE-NOT-FABRICATE contract -- this
+ * function is only ever invoked with a real, successful stat result; a failed/unavailable stat
+ * must short-circuit to `identityHash: undefined` before reaching here, never a fabricated or
+ * zero-valued stat object.
+ */
+export function computeExecutableStatFingerprint({ dev, ino, size, mtimeMs } = {}) {
+  return sha256Hex(`${dev}:${ino}:${size}:${mtimeMs}`, SIGNATURE_HASH_LENGTH);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -423,14 +451,17 @@ function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
  * not instantaneous: for the natural (non-snapshot) case the replacement must cross the grace
  * window before drift fires.
  *
- * KNOWN FIDELITY GAP (documented, fail-safe -- false negatives only): because identity_hash is
- * always absent in this build (see the module header), the identity_signature is derived from
- * executable_path + source_classification + owning_user only. Drift therefore detects a target
- * whose LAUNCHER (source_classification) or OWNER changed, but does NOT detect an in-place
- * binary SWAP at the same path/launcher/owner -- the signature is unchanged in that case.
- * Wiring identity_hash (a bounded codesign/content check on the narrowed set, S4-style) is the
- * tracked fast-follow that closes this; in the interim S4's deleted_exe_running rule already
- * catches the common "FD still open to a deleted inode" swap.
+ * FIDELITY GAP CLOSED (S5-follow-1, see the module header above): identity_hash is now populated
+ * by the gatherer (tools/provenance-identity.js's gatherIdentityObservations, via
+ * computeExecutableStatFingerprint above) with a bounded fs.stat CONTENT-CHANGE fingerprint, so
+ * an in-place binary SWAP at the same path/launcher/owner now changes identity_signature and
+ * drift fires for it too -- previously, with identity_hash always undefined, the signature was
+ * derived from executable_path + source_classification + owning_user only and such a swap went
+ * undetected. REMAINING GAP (documented, fail-safe -- false negative only): a same-inode
+ * overwrite that preserves size AND resets mtime via `touch -r` can still evade this pure-stat
+ * proxy; a codesign CDHash / full content hash remains a future hardening for signed binaries.
+ * In the interim S4's deleted_exe_running rule already catches the common "FD still open to a
+ * deleted inode" swap.
  */
 export function deriveIdentityCandidates(store) {
   const signatures = store?.signatures ?? {};

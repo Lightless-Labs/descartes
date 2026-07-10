@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { loadSignatureStore, reconcileSignatures, writeSignatureStore } from "../src/provenance-store.js";
+import {
+  computeExecutableStatFingerprint,
+  computeIdentitySignature,
+  loadSignatureStore,
+  reconcileSignatures,
+  writeSignatureStore,
+} from "../src/provenance-store.js";
 import {
   DEFAULT_IDENTITY_RECONCILE_INTERVAL_MS,
   computeProvenanceIdentityCandidates,
@@ -35,6 +41,11 @@ const MIXED_SOCKETS = [
   { protocol: "tcp", local_address: "0.0.0.0", local_port: 9090, pid: 200 },
 ];
 
+// S5-follow-1 fixtures: two fs.stat-shaped fixtures for the identity_hash CONTENT-CHANGE
+// fingerprint -- STAT_B simulates an in-place binary swap at the same dev/inode (later mtime).
+const STAT_A = { dev: 1, ino: 111, size: 4096, mtimeMs: 1000 };
+const STAT_B = { dev: 1, ino: 111, size: 4096, mtimeMs: 2000 };
+
 function fakeCollectorOptions(overrides = {}) {
   return {
     ownUid: OWN_UID,
@@ -64,10 +75,88 @@ test("gatherIdentityObservations returns [] when ownUid cannot be determined, ne
 });
 
 test("gatherIdentityObservations never fabricates an identity around an unresolved executable path", async () => {
+  let statCalled = false;
   const observations = await gatherIdentityObservations(fakeCollectorOptions({
     resolveExecutableInfo: async () => ({ executable_path: undefined, executable_path_unavailable: true }),
+    statExecutablePath: async () => {
+      statCalled = true;
+      return STAT_A;
+    },
   }));
   assert.deepEqual(observations, []);
+  assert.equal(statCalled, false, "must never stat when the executable path itself is unresolved");
+});
+
+// ---------------------------------------------------------------------------------------------
+// S5-follow-1: identity_hash populated from a bounded, single-fs.stat CONTENT-CHANGE fingerprint
+// of the already-resolved executable path -- closes the identity_drift blind spot documented on
+// deriveIdentityCandidates (an in-place binary swap at the same path/launcher/owner previously
+// left identity_signature unchanged because identity_hash was always undefined).
+// ---------------------------------------------------------------------------------------------
+
+test("gatherIdentityObservations populates identityHash from a bounded fs.stat CONTENT-CHANGE fingerprint of the resolved executable path", async () => {
+  const observations = await gatherIdentityObservations(fakeCollectorOptions({
+    statExecutablePath: async () => STAT_A,
+  }));
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].identityHash, computeExecutableStatFingerprint(STAT_A));
+  assert.match(observations[0].identityHash, /^[0-9a-f]{16}$/);
+});
+
+test("gatherIdentityObservations: DEGRADE-NOT-FABRICATE -- a stat failure (ENOENT/permission/race) leaves identityHash undefined, never a fabricated value, and never throws", async () => {
+  const observations = await gatherIdentityObservations(fakeCollectorOptions({
+    statExecutablePath: async () => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].identityHash, undefined);
+});
+
+test("gatherIdentityObservations: BOUNDED I/O -- statExecutablePath is called exactly once per already-gathered own-UID identity, and never for an other-UID pid", async () => {
+  const statedPaths = [];
+  const observations = await gatherIdentityObservations(fakeCollectorOptions({
+    statExecutablePath: async (execPath) => {
+      statedPaths.push(execPath);
+      return STAT_A;
+    },
+  }));
+  assert.equal(observations.length, 1);
+  // Only the own-UID pid (100) is ever stat'd; pid 200 (other-UID) is excluded before any
+  // executable resolution or stat call happens for it at all.
+  assert.deepEqual(statedPaths, ["/opt/svc/100/bin"]);
+});
+
+test("GAP CLOSED: a same-path/launcher/owner observation with a CHANGED executable stat-fingerprint yields a DIFFERENT identity_signature (so identity_drift can fire on an in-place swap)", async () => {
+  const before = await gatherIdentityObservations(fakeCollectorOptions({
+    resolveExecutableInfo: async () => ({ executable_path: "/opt/svc/bin", executable_path_unavailable: false }),
+    statExecutablePath: async () => STAT_A,
+  }));
+  const after = await gatherIdentityObservations(fakeCollectorOptions({
+    resolveExecutableInfo: async () => ({ executable_path: "/opt/svc/bin", executable_path_unavailable: false }),
+    statExecutablePath: async () => STAT_B, // in-place swap: same dev/inode, later mtime
+  }));
+
+  assert.notEqual(before[0].identityHash, after[0].identityHash);
+  const signatureBefore = computeIdentitySignature(before[0]);
+  const signatureAfter = computeIdentitySignature(after[0]);
+  assert.notEqual(
+    signatureBefore,
+    signatureAfter,
+    "an in-place binary swap at the same path/launcher/owner must change identity_signature so identity_drift can fire",
+  );
+});
+
+test("no spurious drift: an IDENTICAL executable stat across two observations of the same path/launcher/owner yields an IDENTICAL identity_signature", async () => {
+  const first = await gatherIdentityObservations(fakeCollectorOptions({
+    resolveExecutableInfo: async () => ({ executable_path: "/opt/svc/bin", executable_path_unavailable: false }),
+    statExecutablePath: async () => STAT_A,
+  }));
+  const second = await gatherIdentityObservations(fakeCollectorOptions({
+    resolveExecutableInfo: async () => ({ executable_path: "/opt/svc/bin", executable_path_unavailable: false }),
+    statExecutablePath: async () => ({ ...STAT_A }), // stable binary, unchanged stat
+  }));
+  assert.equal(computeIdentitySignature(first[0]), computeIdentitySignature(second[0]));
 });
 
 // ---------------------------------------------------------------------------------------------
