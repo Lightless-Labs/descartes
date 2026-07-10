@@ -4,6 +4,20 @@
 
 ## Current Status
 
+### Active priority — self-learning stratified monitoring (2026-07-10)
+
+The active initiative is making Descartes *learn* the machine, build its own monitoring/alerting layers that wake the agent, and audit/verify/maintain those layers — the Absolution-Gap stratified nervous system. Roadmap + design: `docs/plans/2026-07-09-self-learning-stratified-monitoring.md` (produced and adversarially reviewed via an ultracode multi-agent design workflow); tracking todo: `todos/2026-07-09-self-learning-stratified-monitoring.md`. One **learned-artifact substrate**, three model families (constraint / provenance-signature / statistical) as progressive layers sharing one lifecycle (`draft → shadow → review-ready → active → retired`), all feeding the *existing* deterministic alert pipeline. The only LLM path is the already-shipped opt-in / rate-limited / audited / no-tools wakeup, hardened with a code-enforced diagnostics sanitizer + per-namespace re-consent. Compile-down is human-gated (the agent may *propose* tuning, never rewrite an active artifact).
+
+**Operator-chosen execution order (2026-07-10): Layer A (constraint mining) → Layer B (provenance / witr) → make it all live.**
+
+Shipped and pushed:
+- `72ba82c` **Slice 1** — constraint store (`tools/descartes-cli/src/constraint-store.js`): atomic/corrupt-tolerant XDG store at `stateDir/learned/constraints.json`, config switch at `configDir/learned.json` (default disabled), constraint-only schema validation, 4 seed constraints + fixtures.
+- `ccb6f29` **Slice 2** — `sanitizeDiagnostics()` (`diagnostics-sanitizer.js`) + `evaluateConstraints()` (`constraint-eval.js`) + the `extraCandidates` merge seam in `alert-store.js` (default `[]` = zero behavior change). Adversarially verified: byte-identical fixed-rule behavior, no cross-source spurious recovery, single `applyAlertCandidates` call, sanitizer allowlist. Suite 229 green. **Not yet wired into the daemon** (plumbing lands before behavior).
+
+Next: **Layer A constraint mining** — a dedicated plan for the fact-history prerequisites (S6a multi-cadence daemon sampling + S6b categorical fact schema, distinct from the numeric metric store), then the deterministic miner (S6c) and shadow/promotion gate (S7). Then **Layer B** provenance/witr (S3–S5). Then **make it all live** (daemon wiring + S13 LLM reuse + compile-down S14–S15).
+
+Pending operator decisions (plan §12; defaults assumed unless changed): rule engine = hand-written per-family JS (defer a Datalog/DSL engine); provenance privilege = unprivileged/degraded cross-UID coverage (never fabricate facts) unless an elevated read path is requested; `identity_signature` hashing inputs must be pinned with fixtures before S5. **Hard gate before S6c mining:** bound/sanitize constraint `id`/`family`/`target` so mined raw-fact targets can't reach alert `title`/`summary`/`fingerprint` (the sanitizer covers `diagnostics` only).
+
 ### Handoff — remaining macOS release work (for codex)
 
 The macOS notifier delivery implementation is **landed and v0.0.47 is shipped**: `v0.0.47` is signed, notarized, stapled, on GitHub Releases, and installable via `brew install lightless-labs/tap/descartes` (CLI + bundled helper). The release pipeline (sign → notarize → staple → Buildkite artifacts → GitHub Release → Homebrew tap bump) is implemented and CI-validated through GitHub Release publication, but is **not yet fully release-validated** for first-run Notification Center/TCC behavior, daemon-context delivery, or the first live tap-bump run. Current local stop-condition audit: `docs/reviews/2026-07-09-macos-release-validation-blocker-audit.md`. Everything below is validation or optional follow-up — no in-flight/broken work:
@@ -15,6 +29,8 @@ The macOS notifier delivery implementation is **landed and v0.0.47 is shipped**:
 Tooling notes for whoever picks this up: CI runs on host `big-cabbage` (this dev machine has no `tart`); set `export SSH_AUTH_SOCK=~/.ssh/agent.sock` before git pushes; the local `context-mode` Bash hook blocks any command whose text contains `curl`/`wget` (including `git commit -m` messages that mention curl — use `git commit -F <file>`). Older chronological entries below preserve past failed attempts and superseded facts (for example older `tart-ci` versions or pre-Homebrew delivery state); prefer this top status and the newest session updates for current next actions.
 
 ---
+
+Current session update (2026-07-10, self-learning initiative kickoff): new active priority is the self-learning stratified monitoring roadmap (see the Active-priority block at the top of Current Status). Produced + adversarially reviewed the roadmap `docs/plans/2026-07-09-self-learning-stratified-monitoring.md` via an ultracode multi-agent design workflow (winning architecture: a Constraint Kernel spine grafting the provenance/signature and statistical-baseline layers into one learned-artifact substrate). Shipped Layer A Slice 1 (`72ba82c`, constraint store) and Slice 2 (`ccb6f29`, `sanitizeDiagnostics` + `evaluateConstraints` + the `extraCandidates` alert-pipeline seam, adversarially verified — all five safety invariants CONFIRMED; the no-cross-recovery test caught a real self-recovery hazard for candidates missing an `id`, hardened at the merge point). Suite 229 green. Operator chose execution order **Layer A (mining) → Layer B (provenance/witr) → make it all live**. macOS release validation remains carried-forward/external (needs a physical fresh Mac + a live tag).
 
 Current session update (2026-07-09, Witr/provenance and approval-notification planning): created `docs/plans/2026-07-09-witr-provenance-and-approval-notifications.md` and tracking todo `todos/2026-07-09-witr-provenance-and-approval-notifications.md` after inspecting `pranshuparmar/witr`. Recommendation: borrow Witr's process/port/container provenance architecture and deterministic warning patterns first; do not take a hard library dependency because the useful Witr implementation packages are under Go `internal/`. Optional future integration can shell out to `witr --json --pid/--port` as bounded third-party evidence, treating exit code 1 as warning-bearing output and capturing version/timeout/output bounds because Witr JSON has no schema wrapper. The same plan sketches notification-based approval prompts: notifications may alert or collect low-risk responses, but authority lives in a persisted approval store with id/nonce, expiry, deny-by-default, audit trail, and CLI/TUI fallback.
 
@@ -267,6 +283,7 @@ Existing files:
 
 1. Read `README.md`, `AGENTS.md`, and this handoff.
 2. Treat `docs/plans/2026-05-30-native-macos-notifications.md` and `todos/2026-05-30-native-macos-notifications.md` as the active implementation source of truth. The first `docs/plans/2026-05-28-monitoring-alerting.md` slice is complete through opt-in notifications; `docs/plans/2026-05-23-daemon-history-store.md` remains the daemon/history substrate baseline; `docs/plans/2026-05-18-003-first-external-slice-local-triage.md` remains the first-slice product baseline.
+   **(2026-07-10 update)** The current active implementation source of truth is the self-learning roadmap `docs/plans/2026-07-09-self-learning-stratified-monitoring.md` + `todos/2026-07-09-self-learning-stratified-monitoring.md` (execution order Layer A → Layer B → live; Slices 1–2 shipped). The native-macOS-notifications plan and macOS release validation are carried-forward/external follow-ups, not the active build thread.
 3. Do **not** make users build the native macOS helper. The native path must become a bundled release artifact; `--helper <path>` is only a development/advanced override.
 4. Do **not** jump directly to broad agent-authored signatures or unsafe background actions. The daemon/history substrate, deterministic alert layer, opt-in LLM adjudication, and opt-in notification delivery setup/test now exist for the Node.js prototype.
 5. Do not restore unconditional precollection as the normal triage path. Normal `triage` should remain model-led tool investigation; `--no-investigate` is the degraded precollection path.
@@ -417,7 +434,9 @@ This shape is not mandatory. The mandatory part is the user-visible behavior and
 
 ## Suggested Next Action
 
-Recommended next task: complete the external release-readiness validations tracked in `macos-notifier-release-validation-brief.md` / `todos/2026-07-08-macos-release-validation.md`:
+**Primary (active build thread, 2026-07-10):** continue the self-learning roadmap in operator-chosen order — **Layer A constraint mining** next. Write + adversarially review a dedicated plan for the fact-history prerequisites (S6a multi-cadence daemon sampling + S6b categorical fact schema), then implement the deterministic miner (S6c) and shadow/promotion gate (S7), TDD-first, delegating to Sonnet and pushing atomically. Then Layer B provenance/witr (S3–S5), then make it all live. Track in `todos/2026-07-09-self-learning-stratified-monitoring.md`; keep the sanitizer gate before mining lands (see the Active-priority block).
+
+**Secondary (carried-forward / external):** complete the external release-readiness validations tracked in `macos-notifier-release-validation-brief.md` / `todos/2026-07-08-macos-release-validation.md`:
 
 1. On a real Mac with no prior grant, run `scripts/validate-macos-notifier-helper.sh --reset-tcc` against the Homebrew-installed CLI and record first-run Notification Center prompt attribution, display, persistence, denied-path audit behavior, fallback behavior, and daemon-context delivery under `docs/reviews/`.
 2. Before the next `vX.Y.Z` tag, run `scripts/check-homebrew-tap-token.sh` from a trusted environment with the effective GitHub/Doppler token.
