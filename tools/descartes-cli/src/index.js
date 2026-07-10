@@ -46,6 +46,7 @@ Usage:
   descartes alerts ack <alert-id> [--json]
   descartes alerts intelligence status|enable|disable [--json]
   descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
+  descartes learned mine [--json] [--window <duration>]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
@@ -108,6 +109,11 @@ async function main(argv) {
   if (command === "alerts") {
     const { runAlerts } = await import("./alerts.js");
     await runAlerts(paths, args);
+    return;
+  }
+  if (command === "learned") {
+    const { runLearned } = await import("./constraint-miner.js");
+    await runLearned(paths, args);
     return;
   }
 

@@ -34,11 +34,14 @@ const SAFE_STRING_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const HEX_HASH_LENGTHS = new Set([8, 16, 32, 40, 64]);
 const HEX_PATTERN = /^[0-9a-f]+$/i;
 
-function isFixedLengthHexHash(value) {
+// Exported (additive, S6c) so downstream sanitization-gate tests (constraint-miner.test.js)
+// can assert mined id/target strings satisfy the real allowlist predicates directly, rather
+// than re-deriving a parallel hand-rolled regex that could silently drift from this module's.
+export function isFixedLengthHexHash(value) {
   return typeof value === "string" && HEX_HASH_LENGTHS.has(value.length) && HEX_PATTERN.test(value);
 }
 
-function isSafeEnumString(value) {
+export function isSafeEnumString(value) {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_STRING_LENGTH && SAFE_STRING_PATTERN.test(value);
 }
 
