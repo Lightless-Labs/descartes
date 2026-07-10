@@ -25,10 +25,12 @@ import {
   validateDaemonProfile,
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
-import { writeLearnedConfig } from "../src/constraint-store.js";
+import { writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
 import { readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
+import { readAlertRecords } from "../src/alert-store.js";
+import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -824,6 +826,181 @@ test("S6b wiring: no fact-points are persisted when profile.structural is absent
   const result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), ts, now: ts, evaluateAlerts: false });
   assert.equal(result.structuralFacts, undefined);
   await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+// --- Slice S7a, additive: evaluateAndLogShadowConstraints wired into the structural tick ---
+
+function shadowConstraintFixture(overrides = {}) {
+  return {
+    id: "constraint.mined.service-presence.deadbeefdeadbeef",
+    kind: "constraint",
+    family: "service-presence",
+    target: "service.presence.nginx.service",
+    expected: { comparator: "eq", value: "true" },
+    status: "shadow",
+    confidence: 1,
+    provenance: { window: "7d", samples: 5, source_collectors: ["services"], mined_at: "2026-05-24T00:00:00.000Z" },
+    fixtures: [
+      { input: { "service.presence": "true" }, expect_match: true },
+      { input: { "service.presence": "false" }, expect_match: false },
+    ],
+    promotion_history: [{ ts: "2026-05-24T00:00:00.000Z", from: "draft", to: "shadow", actor: "deterministic-gate", note: "minimum-fixture bar met" }],
+    first_observed: "2026-05-24T00:00:00.000Z",
+    last_verified: "2026-05-24T00:00:00.000Z",
+    sensitivity: "operational",
+    schema_version: 1,
+    ...overrides,
+  };
+}
+
+test("S7a wiring: with zero shadow constraints, a structural tick produces no shadow-violations.jsonl file (cheap no-op, byte-identical to pre-S7a)", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.shadowEvaluation.evaluated_count, 0);
+  assert.equal(result.shadowEvaluation.appended_count, 0);
+  await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
+});
+
+test("S7a wiring: with one shadow constraint and a matching fact, exactly one shadow-violations.jsonl record is appended per structural tick", async () => {
+  const paths = await tempPaths();
+  await writeConstraints(paths, [shadowConstraintFixture()]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(), // service "nginx.service" running:true
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.shadowEvaluation.evaluated_count, 1);
+  assert.equal(result.shadowEvaluation.appended_count, 1);
+  assert.equal(result.shadowEvaluation.fired_count, 0); // running:"true" matches expected "true" -> satisfied, not fired
+
+  const { records } = await readShadowRecords(paths);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].constraint_id, "constraint.mined.service-presence.deadbeefdeadbeef");
+  assert.equal(records[0].fired, false);
+});
+
+test("S7a wiring: reuses the S6a structural-tick gate (structuralDue, kill switch) — no shadow evaluation runs while the kill switch is off, even with a shadow constraint present", async () => {
+  const paths = await tempPaths();
+  await writeConstraints(paths, [shadowConstraintFixture()]);
+
+  const result = await runDaemonIteration(paths, {
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    evaluateAlerts: false,
+    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
+    // behavior, which is enabled:false when configDir/learned.json is absent.
+  });
+
+  assert.equal(result.shadowEvaluation, undefined);
+  await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
+});
+
+test("S7a wiring: shadow evaluation only runs on a successful (non-timed-out) structural tick", async () => {
+  const paths = await tempPaths();
+  await writeConstraints(paths, [shadowConstraintFixture()]);
+  const structuralCollectors = {
+    services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": () => new Promise(() => {}), // never resolves
+  };
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ deadline_ms: 25 }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.shadowEvaluation, undefined);
+  await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
+});
+
+test("S7a wiring: over N simulated structural ticks spanning multiple days, one shadow coverage record accrues per tick (daily observation coverage, no human action required)", async () => {
+  const paths = await tempPaths();
+  await writeConstraints(paths, [shadowConstraintFixture()]);
+
+  const profile = structuralProfile({ interval_ms: 24 * 3600000 }); // one structural tick per day
+  let simulatedNowMs = 0;
+  for (let tick = 0; tick < 3; tick += 1) {
+    await runDaemonIteration(paths, {
+      profile,
+      collectors: fastCollectorFakes(),
+      structuralCollectors: structuralCollectorFakesWithFacts(),
+      evaluateAlerts: false,
+      ts: new Date(simulatedNowMs).toISOString(),
+      now: simulatedNowMs,
+      loadLearnedConfig: async () => ({ enabled: true }),
+    });
+    simulatedNowMs += profile.structural.interval_ms;
+  }
+
+  const { records } = await readShadowRecords(paths);
+  assert.equal(records.length, 3, "one shadow-violations.jsonl record must accrue per structural tick, unattended");
+});
+
+test("S7a load-bearing safety regression: a shadow constraint that would obviously fire never produces an alert candidate, never touches alerts.json", async () => {
+  const paths = await tempPaths();
+  // A shadow constraint whose fixed rule is obviously violated by the fixture facts below
+  // (running:"false" vs expected "true") — if shadow evaluation were ever mis-wired into the
+  // real alert pipeline, this would show up as an alert.
+  await writeConstraints(paths, [shadowConstraintFixture({ target: "service.presence.nginx.service" })]);
+  const structuralCollectorsViolating = {
+    services: async () => envelope("services", "collect_services", {
+      manager: "systemd",
+      services: [{ name: "nginx.service", running: false }],
+    }),
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": async () => envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }),
+  };
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorsViolating,
+    evaluateAlerts: true, // deliberately exercise the real alert pipeline, not bypass it
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  // The shadow record itself does fire (proves the fixture is meaningful, not a false negative).
+  assert.equal(result.shadowEvaluation.fired_count, 1);
+  const { records } = await readShadowRecords(paths);
+  assert.equal(records[0].fired, true);
+
+  // ...but it structurally cannot reach the real alert pipeline: zero alert candidates
+  // reference the constraint, and the persisted alert store contains nothing derived from it.
+  assert.equal(result.alerts.candidates.length, 0);
+  const persistedAlerts = await readAlertRecords(paths);
+  assert.equal(persistedAlerts.length, 0);
 });
 
 test("runForegroundDaemonLoop performs structural collection at the expected cadence across many iterations", async () => {

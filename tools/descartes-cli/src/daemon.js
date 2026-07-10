@@ -9,6 +9,7 @@ import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { appendFactPoints } from "./fact-store.js";
 import { factPointsFromNetworkEvidence, factPointsFromServiceEvidence } from "./fact-translators.js";
+import { evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
@@ -293,6 +294,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let structuralEvidence;
   let structuralCollectorStatuses;
   let structuralFacts;
+  let shadowEvaluation;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
@@ -332,6 +334,21 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
             structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts });
           }
+
+          // Slice S7a, additive: evaluate any status:"shadow" constraints against the
+          // accumulated fact-history and log the results (fired and non-fired) to
+          // shadow-violations.jsonl. Reuses this same structural-tick gate (structuralDue +
+          // loadLearnedConfig(...).enabled, both already checked above) and the same
+          // wall-clock cadence/checkpoint — no new timer, no new checkpoint. Only reached on
+          // a successful (non-timed-out) structural tick, matching the "partial results
+          // discarded, not partially persisted" discipline the timeout branch already
+          // follows. A cheap no-op whenever no constraint is status:"shadow" (true for the
+          // entire lifetime of this plan until S7a's own promoteDraftsToShadow first runs).
+          // Writes only to shadow-violations.jsonl — never constraints.json, never
+          // alerts.json/notifications (evaluateAndLogShadowConstraints never imports
+          // alert-store.js).
+          const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
+          shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts });
         }
         const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
         await writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts });
@@ -355,7 +372,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
     ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
     : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence, structuralEvidence, structuralFacts };
+  return { evidence, points, write, status, alerts, alertIntelligence, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

@@ -39,6 +39,18 @@ function evaluateExpected(expected, factValue) {
     return { supported: true, satisfied };
   }
 
+  // Categorical string-equality branch (S7a prerequisite fix, plan §5): S6c's miner emits
+  // {comparator:"eq", value:<string>} for non-numeric-looking categorical values (e.g.
+  // "true"/"false" for service.presence, an owner process name for port-binding-identity).
+  // Number(expected.value) is NaN for those, so the numeric branch above never matches them
+  // — this branch is additive and only reachable in exactly that case (comparator "eq" with a
+  // string value that failed the numeric-finite guard above). The existing numeric "eq"
+  // branch (a numeric-looking value, e.g. a port number as a string) is untouched and
+  // remains byte-identical, since it already short-circuits into the branch above.
+  if (expected.comparator === "eq" && typeof expected.value === "string") {
+    return { supported: true, satisfied: String(factValue) === expected.value };
+  }
+
   if (typeof expected.pattern === "string") {
     const match = expected.pattern.match(/^ends_with:(.*)$/);
     if (match) {
@@ -98,4 +110,42 @@ export function evaluateConstraints(activeConstraints, factLookup) {
     candidates.push(buildViolationCandidate(constraint, factValue));
   }
   return candidates;
+}
+
+/**
+ * Shadow-mode counterpart to evaluateConstraints (Slice S7a, plan §5): evaluates every
+ * status:"shadow" constraint (never "active") against `factLookup`, reusing evaluateExpected
+ * internally, but returns a record shape that is STRUCTURALLY distinct from an alert
+ * candidate: `{ ts, constraint_id, family, target, expected, actual, fired }` — no `id`, no
+ * `rule_id`, no `fingerprint`, no `diagnostics`, no `evidence_refs`. This function never
+ * calls alertId() or buildViolationCandidate(), so "a shadow fire can't accidentally become a
+ * real alert" is a property of the type signature itself, not a runtime check someone could
+ * get wrong. Same skip semantics as evaluateConstraints: an undefined fact (factLookup
+ * returns undefined) or an unsupported `expected` shape produces no record at all — not even
+ * a fired:false one — mirroring "no fact, no claim". Pure, no I/O; `options.ts` is the only
+ * source of "current time" (defaults to `new Date().toISOString()` for a bare call).
+ */
+export function evaluateShadowConstraints(shadowConstraints, factLookup, options = {}) {
+  const ts = options.ts ?? new Date().toISOString();
+  const records = [];
+  for (const constraint of shadowConstraints ?? []) {
+    if (!constraint || constraint.status !== "shadow") continue;
+
+    const factValue = factLookup(constraint.target);
+    if (factValue === undefined) continue;
+
+    const { supported, satisfied } = evaluateExpected(constraint.expected, factValue);
+    if (!supported) continue;
+
+    records.push({
+      ts,
+      constraint_id: constraint.id,
+      family: constraint.family,
+      target: constraint.target,
+      expected: constraint.expected,
+      actual: factValue,
+      fired: !satisfied,
+    });
+  }
+  return records;
 }

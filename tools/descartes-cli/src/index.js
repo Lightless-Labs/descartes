@@ -47,6 +47,7 @@ Usage:
   descartes alerts intelligence status|enable|disable [--json]
   descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
   descartes learned mine [--json] [--window <duration>]
+  descartes learned soak [--json]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
@@ -112,6 +113,16 @@ async function main(argv) {
     return;
   }
   if (command === "learned") {
+    // "soak" (Slice S7a, draft->shadow enrollment + shadow->review-ready promotion) is
+    // dispatched here rather than added to constraint-miner.js's runLearned — keeps
+    // constraint-miner.js's blast radius untouched by this slice. Every other learned
+    // subcommand (currently just "mine", plus bare/--help) is unchanged, delegated exactly
+    // as before.
+    if (args[0] === "soak") {
+      const { runLearnedSoak } = await import("./shadow-store.js");
+      await runLearnedSoak(paths, args.slice(1));
+      return;
+    }
     const { runLearned } = await import("./constraint-miner.js");
     await runLearned(paths, args);
     return;
