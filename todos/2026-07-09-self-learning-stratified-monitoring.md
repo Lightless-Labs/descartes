@@ -15,6 +15,9 @@ Plan produced + adversarially reviewed via an ultracode multi-agent design workf
 
 ## Layer A — Constraint Kernel
 
+Dedicated mining-pipeline plan (S6a–S7): `docs/plans/2026-07-10-constraint-mining-pipeline.md` (code-grounded, two-lens reviewed). Flagged defaults awaiting sign-off (plan §8): `MIN_FIXTURE_COUNT=2`, `soakDays=7`, 24h promotion nonce/expiry, `DEFAULT_STRUCTURAL_TICK_DEADLINE_MS=45s`. Port-binding-identity mining is effectively macOS-only for v1 (Linux socket collector resolves no owner/pid).
+
+
 - [x] **S1** Learned-artifact (constraint) store scaffolding + seed constraints (pure data layer; no daemon/collector/alert coupling). — `constraint-store.js` + 16 tests; suite 210 green (commit).
 - [x] **S2** `evaluateConstraints()` + `extraCandidates` pipeline seam + code-enforced `sanitizeDiagnostics()` gate (explicit reviewed change to `evaluateAndPersistAlerts`; byte-identical fixed-rule regression test). — 3 new modules + adversarial verify (all 5 safety invariants CONFIRMED); the no-cross-recovery test caught a real self-recovery hazard (candidates missing `id`), hardened at the merge point; suite 229 green.
   - **Hard gate before S6c mining:** the sanitizer gate covers only candidate `diagnostics`. `evaluateConstraints` interpolates `id`/`family`/`target` verbatim into `title`/`summary`/`fingerprint`. Safe today (trusted `SEED_CONSTRAINTS` only), but once mining derives `target` from raw facts, bound/sanitize those key fields (or canonicalize targets at mine time) so a raw path can't reach a persisted alert title/notification/LLM prompt.
