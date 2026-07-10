@@ -4,10 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  collectDaemonEvidence,
+  collectStructuralEvidence,
   daemonServiceStatus,
+  defaultDaemonProfile,
+  DEFAULT_STRUCTURAL_INTERVAL_MS,
+  DEFAULT_STRUCTURAL_TICK_DEADLINE_MS,
   installDaemonService,
   metricPointsFromEvidence,
   parseLaunchdPrintState,
+  readStructuralCheckpoint,
+  resolveStructuralCheckpointPath,
   startDaemonService,
   stopDaemonService,
   renderDaemonResult,
@@ -15,9 +22,12 @@ import {
   runDaemonIteration,
   runForegroundDaemonLoop,
   uninstallDaemonService,
+  validateDaemonProfile,
+  writeStructuralCheckpoint,
 } from "../src/daemon.js";
+import { writeLearnedConfig } from "../src/constraint-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
-import { resolveDescartesPaths } from "../src/paths.js";
+import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -356,4 +366,395 @@ test("daemon lifecycle renderer is human-readable and omits service file content
   assert.match(output, /Service manager: launchd-user/);
   assert.match(output, /Next: run `descartes daemon start`/);
   assert(!output.includes("<plist>"));
+});
+
+// --- Slice S6a: structural (services/network/scheduled-jobs) collection cadence ---
+
+function fastCollectorFakes() {
+  return {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0, 0, 0],
+      uptime_seconds: 1,
+      memory: { used_fraction: 0.1, free_bytes: 1 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+}
+
+function structuralCollectorFakes(calls = []) {
+  return {
+    services: async () => {
+      calls.push("services");
+      return envelope("services", "collect_services", { manager: "systemd", services: [] });
+    },
+    network: async () => {
+      calls.push("network");
+      return envelope("network-basics", "collect_network", { listening_sockets: [] });
+    },
+    "scheduled-jobs": async () => {
+      calls.push("scheduled-jobs");
+      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] });
+    },
+  };
+}
+
+function structuralProfile(overrides = {}) {
+  return {
+    interval_ms: 60000,
+    collectors: { system: { enabled: true }, processes: { enabled: true }, disks: { enabled: true } },
+    structural: {
+      interval_ms: 3600000,
+      collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true } },
+      ...overrides,
+    },
+  };
+}
+
+test("defaultDaemonProfile includes an hourly structural cadence with the documented default collectors", () => {
+  const profile = defaultDaemonProfile();
+  assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
+  assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
+  assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "scheduled-jobs", "services"]);
+  assert(profile.structural.collectors.services.enabled);
+  assert(profile.structural.collectors.network.enabled);
+  assert(profile.structural.collectors["scheduled-jobs"].enabled);
+});
+
+test("validateDaemonProfile accepts default and structural-less profiles, rejects malformed ones", () => {
+  assert.doesNotThrow(() => validateDaemonProfile(defaultDaemonProfile()));
+
+  const structuralLess = { interval_ms: 60000, collectors: { system: { enabled: true } } };
+  assert.doesNotThrow(() => validateDaemonProfile(structuralLess));
+
+  assert.throws(() => validateDaemonProfile({ collectors: {} }), /interval_ms/);
+  assert.throws(() => validateDaemonProfile({ interval_ms: "60000", collectors: {} }), /interval_ms/);
+  assert.throws(() => validateDaemonProfile({ interval_ms: 60000, collectors: null }), /collectors/);
+  assert.throws(() => validateDaemonProfile({ interval_ms: 60000, collectors: [] }), /collectors/);
+  assert.throws(
+    () => validateDaemonProfile({ interval_ms: 60000, collectors: {}, structural: { collectors: {} } }),
+    /structural\.interval_ms/,
+  );
+  assert.throws(
+    () => validateDaemonProfile({ interval_ms: 60000, collectors: {}, structural: { interval_ms: 3600000, collectors: null } }),
+    /structural\.collectors/,
+  );
+  assert.throws(
+    () => validateDaemonProfile({
+      interval_ms: 60000,
+      collectors: {},
+      structural: { interval_ms: 3600000, collectors: {}, deadline_ms: -1 },
+    }),
+    /structural\.deadline_ms/,
+  );
+});
+
+test("collectStructuralEvidence calls only enabled structural collectors in a stable order", async () => {
+  const calls = [];
+  const collectors = structuralCollectorFakes(calls);
+
+  const evidence = await collectStructuralEvidence(
+    { collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true } } },
+    collectors,
+  );
+  assert.deepEqual(calls, ["services", "network", "scheduled-jobs"]);
+  assert.deepEqual(evidence.map((e) => e.id), ["services", "network-basics", "scheduled-jobs"]);
+
+  calls.length = 0;
+  const noneEnabled = await collectStructuralEvidence({}, collectors);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(noneEnabled, []);
+
+  calls.length = 0;
+  const onlyNetwork = await collectStructuralEvidence(
+    { collectors: { services: { enabled: false }, network: { enabled: true }, "scheduled-jobs": { enabled: false } } },
+    collectors,
+  );
+  assert.deepEqual(calls, ["network"]);
+  assert.deepEqual(onlyNetwork.map((e) => e.id), ["network-basics"]);
+});
+
+test("collectDaemonEvidence and metricPointsFromEvidence remain untouched by structural additions", async () => {
+  const calls = [];
+  const collectors = {
+    system: async () => { calls.push("system"); return fastCollectorFakes().system(); },
+    processes: async () => { calls.push("processes"); return fastCollectorFakes().processes(); },
+    disks: async () => { calls.push("disks"); return fastCollectorFakes().disks(); },
+  };
+  const evidence = await collectDaemonEvidence(defaultDaemonProfile(), collectors);
+  assert.deepEqual(calls, ["system", "processes", "disks"]);
+  assert.deepEqual(evidence.map((e) => e.id), ["system-overview", "top-processes", "disk-usage"]);
+  const points = metricPointsFromEvidence(evidence, { ts: "2026-05-24T00:00:00.000Z" });
+  assert(points.some((point) => point.metric_name === "system.load.1m"));
+});
+
+test("structural checkpoint path stays under stateDir/daemon and passes the Pi-owned path guard", async () => {
+  const paths = await tempPaths();
+  const checkpointFile = resolveStructuralCheckpointPath(paths);
+  assert.equal(checkpointFile, path.join(paths.stateDir, "daemon", "structural-checkpoint.json"));
+  assert.doesNotThrow(() => assertNoPiOwnedPath({ structuralCheckpointFile: checkpointFile }));
+});
+
+test("structural checkpoint round-trips, defaults on ENOENT, and tolerates corruption", async () => {
+  const paths = await tempPaths();
+
+  const missing = await readStructuralCheckpoint(paths);
+  assert.equal(missing.last_structural_run_ms, undefined);
+
+  const written = await writeStructuralCheckpoint(paths, { last_structural_run_ms: 123456, now: "2026-05-24T00:00:00.000Z" });
+  assert.equal(written.last_structural_run_ms, 123456);
+  assert.equal(written.updated_at, "2026-05-24T00:00:00.000Z");
+
+  const readBack = await readStructuralCheckpoint(paths);
+  assert.equal(readBack.last_structural_run_ms, 123456);
+
+  const file = resolveStructuralCheckpointPath(paths);
+  await fs.writeFile(file, "{not json", { mode: 0o600 });
+  const corrupt = await readStructuralCheckpoint(paths);
+  assert.equal(corrupt.last_structural_run_ms, undefined);
+});
+
+test("runDaemonIteration with a structural-less profile writes no structural checkpoint and no structural status key", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
+  const profile = { interval_ms: 60000, collectors: { system: { enabled: true }, processes: { enabled: true }, disks: { enabled: true } } };
+
+  const result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), ts, now: ts, evaluateAlerts: false });
+  assert(!("structural_collector_statuses" in result.status));
+  assert.equal(result.structuralEvidence, undefined);
+
+  await assert.rejects(() => fs.access(resolveStructuralCheckpointPath(paths)));
+});
+
+test("default profile's structural block is inert without the learned.json kill switch (byte-identical fast path)", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
+  const neverCallStructural = {
+    services: async () => { throw new Error("structural collector must not run when the kill switch is off"); },
+    network: async () => { throw new Error("structural collector must not run when the kill switch is off"); },
+    "scheduled-jobs": async () => { throw new Error("structural collector must not run when the kill switch is off"); },
+  };
+
+  const result = await runDaemonIteration(paths, {
+    collectors: fastCollectorFakes(),
+    structuralCollectors: neverCallStructural,
+    ts,
+    now: ts,
+    evaluateAlerts: false,
+  });
+
+  assert(!("structural_collector_statuses" in result.status));
+  assert.equal(result.structuralEvidence, undefined);
+  assert.deepEqual(
+    Object.keys(result.status).sort(),
+    ["collector_statuses", "mode", "points_written", "profile", "retention", "state", "ts"].sort(),
+  );
+
+  await assert.rejects(() => fs.access(resolveStructuralCheckpointPath(paths)));
+});
+
+test("structural collection runs only when wall-clock due, using an injected checkpoint store", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+  let storedCheckpoint;
+  const baseOptions = {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakes(structuralCalls),
+    evaluateAlerts: false,
+    readStructuralCheckpoint: async () => storedCheckpoint ?? { last_structural_run_ms: undefined },
+    writeStructuralCheckpoint: async (_paths, checkpoint) => {
+      storedCheckpoint = { last_structural_run_ms: checkpoint.last_structural_run_ms };
+      return storedCheckpoint;
+    },
+    loadLearnedConfig: async () => ({ enabled: true }),
+  };
+
+  // First tick: no checkpoint yet -> due, runs structural collection.
+  await runDaemonIteration(paths, { ...baseOptions, ts: "2026-05-24T00:00:00.000Z", now: 0 });
+  assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs"]);
+  assert.equal(storedCheckpoint.last_structural_run_ms, 0);
+
+  // Second tick, well under the structural interval -> not due, no structural calls.
+  structuralCalls.length = 0;
+  await runDaemonIteration(paths, { ...baseOptions, ts: "2026-05-24T00:00:30.000Z", now: 30000 });
+  assert.deepEqual(structuralCalls, []);
+  assert.equal(storedCheckpoint.last_structural_run_ms, 0);
+
+  // Repeated calls within the same sub-threshold window still don't re-run (monotonic checkpoint).
+  await runDaemonIteration(paths, { ...baseOptions, ts: "2026-05-24T00:00:31.000Z", now: 31000 });
+  assert.deepEqual(structuralCalls, []);
+
+  // Third tick, at/after the structural interval -> due again, runs exactly once.
+  await runDaemonIteration(paths, { ...baseOptions, ts: "2026-05-24T01:00:00.000Z", now: 3600000 });
+  assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs"]);
+  assert.equal(storedCheckpoint.last_structural_run_ms, 3600000);
+});
+
+test("a large wall-clock gap triggers exactly one catch-up structural collection, not a backlog storm", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+  let storedCheckpoint = { last_structural_run_ms: 0 };
+  const baseOptions = {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakes(structuralCalls),
+    evaluateAlerts: false,
+    readStructuralCheckpoint: async () => storedCheckpoint,
+    writeStructuralCheckpoint: async (_paths, checkpoint) => {
+      storedCheckpoint = { last_structural_run_ms: checkpoint.last_structural_run_ms };
+      return storedCheckpoint;
+    },
+    loadLearnedConfig: async () => ({ enabled: true }),
+  };
+
+  // Simulate the process being "down" for 3x the structural interval.
+  await runDaemonIteration(paths, { ...baseOptions, ts: "2026-05-24T03:00:00.000Z", now: 3 * 3600000 });
+  assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs"]);
+  assert.equal(storedCheckpoint.last_structural_run_ms, 3 * 3600000);
+
+  // The very next tick a minute later must not re-run (checkpoint caught up to "now", not to a backlog of missed slots).
+  structuralCalls.length = 0;
+  await runDaemonIteration(paths, { ...baseOptions, ts: "2026-05-24T03:01:00.000Z", now: 3 * 3600000 + 60000 });
+  assert.deepEqual(structuralCalls, []);
+});
+
+test("writeDaemonStatus includes structural_collector_statuses only on a structural-due tick, with the correct shape", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakes(),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.deepEqual(result.status.structural_collector_statuses, [
+    { id: "services", status: "ok", tool: "collect_services" },
+    { id: "network-basics", status: "ok", tool: "collect_network" },
+    { id: "scheduled-jobs", status: "ok", tool: "collect_scheduled_jobs" },
+  ]);
+});
+
+test("a hung structural collector is bounded by its deadline, marked unable, and still advances the checkpoint", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": () => new Promise(() => {}), // never resolves
+  };
+  let storedCheckpoint;
+
+  const start = Date.now();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ deadline_ms: 25 }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => {
+      storedCheckpoint = checkpoint;
+      return checkpoint;
+    },
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+  const elapsedMs = Date.now() - start;
+
+  assert(elapsedMs < 2000, `expected the structural tick to be bounded by its deadline, took ${elapsedMs}ms`);
+  assert.deepEqual(result.status.structural_collector_statuses, [
+    { status: "unable", error: "structural_tick_deadline_exceeded" },
+  ]);
+  assert.equal(result.structuralEvidence, undefined);
+  assert.equal(storedCheckpoint.last_structural_run_ms, 1000);
+});
+
+test("a structural tick that completes well within its deadline is unaffected by the deadline machinery", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ deadline_ms: 5000 }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakes(),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.status.structural_collector_statuses.length, 3);
+  assert(result.status.structural_collector_statuses.every((entry) => entry.status === "ok"));
+});
+
+test("kill switch: structural collection is skipped entirely while learned.json enabled is false, even when due", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+
+  // Force "due" unambiguously via a real (uninjected) checkpoint far in the past.
+  await writeStructuralCheckpoint(paths, { last_structural_run_ms: 0, now: "2026-05-24T00:00:00.000Z" });
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakes(structuralCalls),
+    evaluateAlerts: false,
+    ts: "2026-05-25T00:00:00.000Z",
+    now: 24 * 3600000,
+    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
+    // behavior, which is enabled:false when configDir/learned.json is absent.
+  });
+
+  assert.deepEqual(structuralCalls, []);
+  assert.equal(result.structuralEvidence, undefined);
+  assert(!("structural_collector_statuses" in result.status));
+
+  const checkpointAfter = await readStructuralCheckpoint(paths);
+  assert.equal(checkpointAfter.last_structural_run_ms, 0, "checkpoint must not advance while the kill switch is off");
+});
+
+test("runForegroundDaemonLoop performs structural collection at the expected cadence across many iterations", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+
+  const structuralCalls = [];
+  const profile = structuralProfile({ interval_ms: 5 * 60000 });
+  let simulatedNowMs = 0;
+  let fastTicks = 0;
+  const outputs = [];
+
+  await runForegroundDaemonLoop(paths, {
+    intervalMs: profile.interval_ms,
+    sleep: async () => {},
+    shouldStop: () => fastTicks >= 12,
+    output: (line) => outputs.push(JSON.parse(line)),
+    iterate: async (iterationPaths) => {
+      fastTicks += 1;
+      const ts = new Date(simulatedNowMs).toISOString();
+      const result = await runDaemonIteration(iterationPaths, {
+        profile,
+        collectors: fastCollectorFakes(),
+        structuralCollectors: structuralCollectorFakes(structuralCalls),
+        evaluateAlerts: false,
+        ts,
+        now: simulatedNowMs,
+      });
+      simulatedNowMs += profile.interval_ms;
+      return result;
+    },
+  });
+
+  // 12 fast ticks at 60s each span 0..660000ms; structural (every 300000ms) is due at ticks
+  // 1 (now=0, no checkpoint), 6 (now=300000), and 11 (now=600000) -> exactly 3 structural runs.
+  assert.equal(fastTicks, 12);
+  assert.equal(outputs.length, 12);
+  assert.equal(structuralCalls.filter((call) => call === "services").length, 3);
+  assert.equal(structuralCalls.length, 9);
 });

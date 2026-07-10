@@ -6,15 +6,21 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications } from "./alert-intelligence.js";
 import { evaluateAndPersistAlerts } from "./alert-store.js";
+import { loadLearnedConfig } from "./constraint-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
+import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence } from "./tools/processes.js";
+import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
+import { collectServiceEvidence } from "./tools/services.js";
 import { collectSystemEvidence } from "./tools/system.js";
 
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_DAEMON_INTERVAL_MS = 60 * 1000;
 export const DEFAULT_DAEMON_PROCESS_LIMIT = 5;
+export const DEFAULT_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
+export const DEFAULT_STRUCTURAL_TICK_DEADLINE_MS = 45 * 1000;
 
 export function defaultDaemonProfile() {
   return {
@@ -24,6 +30,14 @@ export function defaultDaemonProfile() {
       processes: { enabled: true, limit: DEFAULT_DAEMON_PROCESS_LIMIT },
       disks: { enabled: true },
     },
+    structural: {
+      interval_ms: DEFAULT_STRUCTURAL_INTERVAL_MS,
+      collectors: {
+        services: { enabled: true },
+        network: { enabled: true },
+        "scheduled-jobs": { enabled: true },
+      },
+    },
     safety: {
       read_only: true,
       background_llm_calls: false,
@@ -31,6 +45,49 @@ export function defaultDaemonProfile() {
       host_mutation: false,
     },
   };
+}
+
+function isPositiveFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Throws a descriptive Error on the first invalid/missing required field, mirroring
+ * validateConstraint's throw-fast style. A profile that omits `structural` entirely is
+ * valid (structural cadence disabled) — every existing bare {interval_ms, collectors}
+ * profile literal remains accepted.
+ */
+export function validateDaemonProfile(profile) {
+  if (!isPlainObject(profile)) throw new Error("Daemon profile must be an object");
+
+  if (!isPositiveFiniteNumber(profile.interval_ms)) {
+    throw new Error(`Daemon profile interval_ms must be a positive finite number, got: ${JSON.stringify(profile.interval_ms)}`);
+  }
+  if (!isPlainObject(profile.collectors)) {
+    throw new Error("Daemon profile collectors must be an object");
+  }
+
+  if (profile.structural !== undefined) {
+    const structural = profile.structural;
+    if (!isPlainObject(structural)) {
+      throw new Error("Daemon profile structural must be an object when present");
+    }
+    if (!isPositiveFiniteNumber(structural.interval_ms)) {
+      throw new Error(`Daemon profile structural.interval_ms must be a positive finite number, got: ${JSON.stringify(structural.interval_ms)}`);
+    }
+    if (!isPlainObject(structural.collectors)) {
+      throw new Error("Daemon profile structural.collectors must be an object when present");
+    }
+    if (structural.deadline_ms !== undefined && !isPositiveFiniteNumber(structural.deadline_ms)) {
+      throw new Error(`Daemon profile structural.deadline_ms must be a positive finite number, got: ${JSON.stringify(structural.deadline_ms)}`);
+    }
+  }
+
+  return true;
 }
 
 function metric({ ts, metric_name, dimensions = {}, value, unit, envelope, sensitivity = "operational" }) {
@@ -124,9 +181,101 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
   return evidence;
 }
 
+/**
+ * Sibling to collectDaemonEvidence for the slower structural (services/network/scheduled-jobs)
+ * cadence — identical enabled-flag/injectable-collectors pattern, stable evidence ordering.
+ */
+export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}) {
+  const activeCollectors = {
+    services: collectors.services ?? collectServiceEvidence,
+    network: collectors.network ?? collectNetworkEvidence,
+    "scheduled-jobs": collectors["scheduled-jobs"] ?? collectScheduledJobsEvidence,
+  };
+  const evidence = [];
+  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
+  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network());
+  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
+  return evidence;
+}
+
+const STRUCTURAL_TICK_TIMED_OUT = Symbol("structural-tick-timed-out");
+
+/**
+ * Races `promise` against a `deadlineMs` timer. On timeout, resolves to `onTimeout()`'s result
+ * instead — the original promise is left to settle on its own (never awaited further here); its
+ * result, if any, is discarded by the caller. Always clears the timer so the timeout branch never
+ * outlives the race.
+ */
+async function withDeadline(promise, deadlineMs, onTimeout) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(onTimeout()), deadlineMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function structuralCheckpointDir(descartesPaths) {
+  return daemonLogDir(descartesPaths);
+}
+
+/**
+ * Daemon-loop-internal state, not a "learned" artifact — deliberately not folded into
+ * daemon-status.json (that would grow every consumer of readDaemonStatus's round-trip).
+ */
+export function resolveStructuralCheckpointPath(descartesPaths) {
+  return path.join(structuralCheckpointDir(descartesPaths), "structural-checkpoint.json");
+}
+
+/**
+ * ENOENT-tolerant and corrupt-tolerant (mirrors history-store.js's corrupt-tolerance philosophy
+ * even though this file is written atomically) — both cases are treated as "never run".
+ */
+export async function readStructuralCheckpoint(descartesPaths) {
+  const file = resolveStructuralCheckpointPath(descartesPaths);
+  let contents;
+  try {
+    contents = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { last_structural_run_ms: undefined };
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(contents);
+    const value = Number(parsed?.last_structural_run_ms);
+    return { last_structural_run_ms: Number.isFinite(value) ? value : undefined };
+  } catch {
+    return { last_structural_run_ms: undefined };
+  }
+}
+
+/**
+ * Atomic tmp+rename write (0o600 file / 0o700 dir), mirroring constraint-store.js's writers —
+ * deliberately atomic, unlike writeDaemonStatus's direct write, because a torn checkpoint write
+ * could cause structural collection to run every tick forever.
+ */
+export async function writeStructuralCheckpoint(descartesPaths, checkpoint = {}) {
+  const dir = structuralCheckpointDir(descartesPaths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const file = resolveStructuralCheckpointPath(descartesPaths);
+  const record = {
+    last_structural_run_ms: Number(checkpoint.last_structural_run_ms),
+    updated_at: checkpoint.now ? new Date(checkpoint.now).toISOString() : new Date().toISOString(),
+  };
+  const tmpFile = `${file}.${process.pid}.tmp`;
+  await fs.writeFile(tmpFile, JSON.stringify(record, null, 2), { mode: 0o600 });
+  await fs.rename(tmpFile, file);
+  return record;
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
+  validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
+  const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
   const write = await appendMetricPoints(descartesPaths, points, {
@@ -135,6 +284,43 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     maxBytes: options.maxBytes,
     now: options.now ?? ts,
   });
+
+  // Independent, slower structural (services/network/scheduled-jobs) cadence. Gated behind the
+  // already-shipped configDir/learned.json kill switch, checked before any work is attempted
+  // (convention #4) — when disabled, this block reads nothing else and writes nothing.
+  let structuralEvidence;
+  let structuralCollectorStatuses;
+  const structuralProfile = profile.structural;
+  if (structuralProfile?.interval_ms) {
+    const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
+    const learnedConfig = await loadConfig(descartesPaths);
+    if (learnedConfig.enabled) {
+      const readCheckpoint = options.readStructuralCheckpoint ?? readStructuralCheckpoint;
+      const checkpoint = await readCheckpoint(descartesPaths);
+      const lastRunMs = Number.isFinite(checkpoint?.last_structural_run_ms) ? checkpoint.last_structural_run_ms : -Infinity;
+      const structuralDue = nowMs - lastRunMs >= structuralProfile.interval_ms;
+      if (structuralDue) {
+        const deadlineMs = structuralProfile.deadline_ms ?? DEFAULT_STRUCTURAL_TICK_DEADLINE_MS;
+        const outcome = await withDeadline(
+          collectStructuralEvidence(structuralProfile, options.structuralCollectors),
+          deadlineMs,
+          () => STRUCTURAL_TICK_TIMED_OUT,
+        );
+        if (outcome === STRUCTURAL_TICK_TIMED_OUT) {
+          // Partial results (if any) are discarded, not partially persisted, to avoid an
+          // inconsistent fact snapshot. The checkpoint still advances below so a repeatedly-slow
+          // host retries at the next full structural interval, not on every fast tick.
+          structuralCollectorStatuses = [{ status: "unable", error: "structural_tick_deadline_exceeded" }];
+        } else {
+          structuralEvidence = outcome;
+          structuralCollectorStatuses = structuralEvidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool }));
+        }
+        const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
+        await writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts });
+      }
+    }
+  }
+
   const status = await writeDaemonStatus(descartesPaths, {
     ts,
     state: "ok",
@@ -143,6 +329,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),
     points_written: write.written_count,
     retention: write.retention,
+    ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
   });
   const alerts = options.evaluateAlerts === false
     ? undefined
@@ -150,7 +337,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
     ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
     : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence };
+  return { evidence, points, write, status, alerts, alertIntelligence, structuralEvidence };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
