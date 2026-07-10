@@ -225,6 +225,8 @@ Turn S3's `warnings[]` facts (deleted-exe running, public bind with no recognize
 - **New I/O, explicitly budgeted, not free:** the Linux `(deleted)`-suffix check is a cheap `readlink` per candidate process (negligible cost, fine to run per listener). The macOS `fs.stat`-after-`lsof` deleted-exe check and any `codesign` call **are** new per-process I/O in the structural tick, not reuse of anything S3 already computed for that tick. To bound this cost, S4 runs the macOS deleted-exe/codesign checks **only for sockets that are already public-bind warning candidates** (i.e., after the cheap address-literal + supervisor-classification filter has already narrowed the set), not for every listener on every tick. This is stated explicitly here so the "no duplicate calls" framing in the earlier draft is corrected rather than silently carried forward.
 - `spctl --assess` is **excluded from S4's fixed rule inputs for v1** per §2's noise concern; only `codesign -dv` identity/validity feeds any fixed rule, and only at the bounded, narrowed set described above.
 
+**Addendum (2026-07-10, as shipped):** S4 as implemented needs **neither** `codesign` **nor** `spctl` for its two `rule_id`s — the deleted-exe check is `readlink`/`fs.stat`-only (via S3's `resolveExecutableInfo`) and the public-bind check is address-literal + source-classification only. So the shipped structural sub-collector calls strictly *less* per-tick I/O than this section budgets for; `codesign` remains available in S3 for on-demand triage but is not on any S4 fixed-rule path. Additionally, the emitted executable path is **sha256-hashed (16 hex) before it ever reaches a warning entry, fact point, or candidate** — no raw path is persisted or surfaced.
+
 Add `computeProvenanceWarningCandidates(descartesPaths, options)`, structurally mirroring `computeActiveConstraintCandidates` (same `loadLearnedConfig(...).enabled` short-circuit-to-`[]` first). Wire into `runDaemonIteration`'s existing `extraCandidates` array: `extraCandidates: [...await computeActiveConstraintCandidates(descartesPaths, options), ...await computeProvenanceWarningCandidates(descartesPaths, options)]` — **both sources land in the same concatenation in the same commit**.
 
 Candidates route through the existing `sanitizeDiagnostics()` gate — no raw paths/usernames/command lines in `diagnostics`, only numeric/closed-enum/fixed-length-hash fields.
@@ -256,6 +258,8 @@ This slice reuses the **existing** structural-tick cadence and gating; it does *
 ### Safety notes
 
 Deterministic only — no LLM involvement anywhere in this slice. Any given warning fires the same candidate every time given the same facts (pure function, testable without a model).
+
+**Recovery/staleness note (as shipped):** `public_bind_no_supervisor` facts refresh (explicit `active` true/false) for every checked socket each structural tick, so they self-heal on the next tick. `deleted_exe_running` facts are only re-emitted for the *narrowed* candidate set that tick (per the bounded-I/O directive), so if a pid silently leaves the narrowed set while still flagged, its last `active:"true"` fact goes stale rather than explicitly clearing — bounded by `DEFAULT_PROVENANCE_FACT_WINDOW_MS` (3h) read window, after which the candidate stops being produced and `applyAlertCandidates` recovers the alert. Worst case is a stale-but-self-clearing alert lingering ≤3h past the real condition ending; never permanently stuck.
 
 ---
 

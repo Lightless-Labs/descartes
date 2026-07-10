@@ -15,6 +15,11 @@ import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./histor
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence } from "./tools/processes.js";
+import {
+  collectProvenanceWarningsEvidence,
+  computeProvenanceWarningCandidates,
+  provenanceWarningFactPoints,
+} from "./tools/provenance-warnings.js";
 import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSystemEvidence } from "./tools/system.js";
@@ -40,6 +45,11 @@ export function defaultDaemonProfile() {
         services: { enabled: true },
         network: { enabled: true },
         "scheduled-jobs": { enabled: true },
+        // Slice S4: default true, matching its siblings exactly — still safe/byte-identical
+        // for any operator who hasn't opted into learned features at all, because the outer
+        // configDir/learned.json {enabled:false} kill switch gates the entire structural tick
+        // (including this sub-collector) before any of it runs. See plan section 4.
+        provenance: { enabled: true },
       },
     },
     safety: {
@@ -194,11 +204,16 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     services: collectors.services ?? collectServiceEvidence,
     network: collectors.network ?? collectNetworkEvidence,
     "scheduled-jobs": collectors["scheduled-jobs"] ?? collectScheduledJobsEvidence,
+    // Slice S4, additive fourth structural sub-collector: gated identically to its siblings
+    // (structuralProfile.collectors.provenance.enabled), on the same slow cadence, subject to
+    // the same structural-tick deadline/discard discipline below. See plan section 4.
+    provenance: collectors.provenance ?? collectProvenanceWarningsEvidence,
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
   if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network());
   if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
+  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
   return evidence;
 }
 
@@ -366,6 +381,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           const factPoints = [
             ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
             ...factPointsFromNetworkEvidence(structuralEvidence, { ts }),
+            // Slice S4, additive: structural provenance-warning evidence -> fact-points, same
+            // discipline as its siblings above — only reachable on a successful (non-timed-out)
+            // structural tick, never for a partial/timed-out one (plan section 4).
+            ...provenanceWarningFactPoints(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
@@ -409,7 +428,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         now: ts,
         daemonStatus: status,
         windowMs: options.alertWindowMs,
-        extraCandidates: await computeActiveConstraintCandidates(descartesPaths, options),
+        // Slice S4, additive: both sources land in the same concatenation before the one
+        // evaluateAndPersistAlerts/applyAlertCandidates call, in the same commit as the
+        // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
+        // section 4 / S-live-1 grounding).
+        extraCandidates: [
+          ...await computeActiveConstraintCandidates(descartesPaths, options),
+          ...await computeProvenanceWarningCandidates(descartesPaths, options),
+        ],
       });
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
     ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })

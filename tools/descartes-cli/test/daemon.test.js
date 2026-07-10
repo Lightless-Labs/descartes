@@ -31,6 +31,7 @@ import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { readAlertRecords } from "../src/alert-store.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
+import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -442,10 +443,13 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "scheduled-jobs", "services"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services"]);
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
+  // Slice S4 sibling-default consistency (plan section 4): provenance defaults true, matching
+  // its three siblings exactly — still gated end-to-end by the outer learned.json kill switch.
+  assert(profile.structural.collectors.provenance.enabled);
 });
 
 test("validateDaemonProfile accepts default and structural-less profiles, rejects malformed ones", () => {
@@ -1226,4 +1230,259 @@ test("S-live-1: a fixed-rule alert and an active-constraint alert coexist across
   const constraintThird = third.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
   assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by the constraint source clearing");
   assert.equal(constraintThird.status, "recovered");
+});
+
+// --- Slice S4, additive: provenance-warning candidates wired into the real
+// (evaluateAndPersistAlerts) path via computeProvenanceWarningCandidates, structurally
+// mirroring S-live-1's own computeActiveConstraintCandidates wiring above. ---
+
+function publicBindWarningFactFixture(overrides = {}) {
+  return {
+    fact_name: "provenance.warning",
+    entity_key: "public_bind_no_supervisor.socket.tcp.8080.ipv4_any",
+    attributes: {
+      rule_id: "public_bind_no_supervisor",
+      active: "true",
+      protocol: "tcp",
+      local_port: "8080",
+      bind_address_family: "ipv4_any",
+      source_type: "unknown",
+      confidence: "0.8",
+      severity: "medium",
+      ...overrides,
+    },
+  };
+}
+
+function deletedExeWarningFactFixture(overrides = {}) {
+  return {
+    fact_name: "provenance.warning",
+    entity_key: "deleted_exe_running.process.4821",
+    attributes: {
+      rule_id: "deleted_exe_running",
+      active: "true",
+      pid: "4821",
+      executable_path_hash: "abc0123456789def",
+      source_type: "shell",
+      confidence: "1",
+      severity: "high",
+      ...overrides,
+    },
+  };
+}
+
+test("S4: byte-identical real alerts when the learned kill switch is off, even with an active provenance-warning fact present, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withWarningPaths = await tempPaths();
+  await appendFactPoints(withWarningPaths, [publicBindWarningFactFixture(), deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
+  // configDir/learned.json intentionally never written here -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the pre-S4 baseline above — computeProvenanceWarningCandidates
+  // must short-circuit to [] before ever calling readFactPoints.
+  let readFactsCalled = false;
+  const withWarning = await runDaemonIteration(withWarningPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    readFactPoints: async (...args) => {
+      readFactsCalled = true;
+      return readFactPoints(...args);
+    },
+  });
+
+  assert.deepEqual(withWarning.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withWarning.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withWarning.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+
+  const persisted = await readAlertRecords(withWarningPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === PUBLIC_BIND_RULE_ID || alert.rule_id === DELETED_EXE_RULE_ID), false);
+});
+
+test("S4: an active public_bind_no_supervisor provenance-warning fact produces a real, sanitized alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await appendFactPoints(paths, [publicBindWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runIsolatedDaemonTick(paths);
+  const alert = result.alerts.alerts.find((a) => a.rule_id === PUBLIC_BIND_RULE_ID);
+  assert.ok(alert, "expected a real alert for the active public_bind_no_supervisor warning");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.diagnostics.local_port, 8080);
+  assert.equal(alert.diagnostics.protocol, "tcp");
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+});
+
+test("S4: an active deleted_exe_running provenance-warning fact produces a real, sanitized alert record with a hashed (never raw) executable path", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await appendFactPoints(paths, [deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runIsolatedDaemonTick(paths);
+  const alert = result.alerts.alerts.find((a) => a.rule_id === DELETED_EXE_RULE_ID);
+  assert.ok(alert, "expected a real alert for the active deleted_exe_running warning");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.diagnostics.pid, 4821);
+  assert.equal(alert.diagnostics.executable_path_hash, "abc0123456789def");
+  assert.equal(Object.keys(alert.diagnostics).sort().join(","), "confidence,executable_path_hash,pid,source_type");
+  assert.equal(JSON.stringify(alert.diagnostics).includes("/"), false, "no raw path separator should ever reach persisted provenance diagnostics");
+});
+
+test("S4: a cleared (active:\"false\") provenance-warning fact does not fire", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await appendFactPoints(paths, [publicBindWarningFactFixture({ active: "false" })], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runIsolatedDaemonTick(paths);
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === PUBLIC_BIND_RULE_ID), false);
+});
+
+test("S4: a provenance-warning fact whose target has no fact at all does not fire (no fact, no claim)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // No facts.jsonl at all.
+  const result = await runIsolatedDaemonTick(paths);
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === PUBLIC_BIND_RULE_ID || a.rule_id === DELETED_EXE_RULE_ID), false);
+});
+
+test("S4 structural wiring: the provenance sub-collector runs on a structural-due tick alongside its siblings, and its warnings are translated into fact-points", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+  const structuralCollectors = {
+    services: async () => {
+      structuralCalls.push("services");
+      return envelope("services", "collect_services", { manager: "systemd", services: [] });
+    },
+    network: async () => {
+      structuralCalls.push("network");
+      return envelope("network-basics", "collect_network", { listening_sockets: [] });
+    },
+    "scheduled-jobs": async () => {
+      structuralCalls.push("scheduled-jobs");
+      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] });
+    },
+    provenance: async () => {
+      structuralCalls.push("provenance");
+      return envelope("provenance-warnings", "collect_provenance_warnings", {
+        platform: "darwin",
+        checked_socket_count: 1,
+        narrowed_candidate_count: 1,
+        warnings: [
+          { rule_id: "public_bind_no_supervisor", active: true, severity: "medium", confidence: 0.8, source_type: "unknown", protocol: "tcp", local_port: 8080, bind_address_family: "ipv4_any" },
+        ],
+      });
+    },
+  };
+  const profile = structuralProfile({ collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, provenance: { enabled: true } } });
+
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "provenance"]);
+  assert.deepEqual(result.status.structural_collector_statuses, [
+    { id: "services", status: "ok", tool: "collect_services" },
+    { id: "network-basics", status: "ok", tool: "collect_network" },
+    { id: "scheduled-jobs", status: "ok", tool: "collect_scheduled_jobs" },
+    { id: "provenance-warnings", status: "ok", tool: "collect_provenance_warnings" },
+  ]);
+
+  const { points } = await readFactPoints(paths);
+  const warningPoint = points.find((point) => point.fact_name === "provenance.warning");
+  assert.ok(warningPoint, "expected the structural provenance warning to be translated into a fact-point");
+  assert.equal(warningPoint.attributes.rule_id, "public_bind_no_supervisor");
+  assert.equal(warningPoint.attributes.active, "true");
+});
+
+test("S4 structural wiring: a timed-out structural tick (provenance hangs) discards its evidence entirely — no provenance fact-points are persisted", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": async () => envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }),
+    provenance: () => new Promise(() => {}), // never resolves
+  };
+  const profile = structuralProfile({ deadline_ms: 25, collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, provenance: { enabled: true } } });
+
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => checkpoint,
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
+  assert.equal(result.structuralEvidence, undefined);
+  assert.equal(result.structuralFacts, undefined);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a provenance-warning alert coexist across daemon iterations without any one spuriously recovering another (S2 cross-recovery pattern extended to a third source)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+    publicBindWarningFactFixture(),
+  ], { now: "2026-05-24T00:00:00.000Z" });
+
+  const highMemoryCollectors = {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0, 0, 0],
+      uptime_seconds: 1,
+      memory: { used_fraction: 0.95, free_bytes: 1 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+  const profile = slice6Profile();
+
+  await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:00:00.000Z", now: "2026-05-24T00:00:00.000Z" });
+  const second = await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:01:00.000Z", now: "2026-05-24T00:01:00.000Z" });
+
+  const fixedSecond = second.alerts.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const constraintSecond = second.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  const provenanceSecond = second.alerts.alerts.find((alert) => alert.rule_id === PUBLIC_BIND_RULE_ID);
+  assert.ok(fixedSecond, "expected the fixed-rule alert to be active after 2 sustained high-memory samples");
+  assert.equal(fixedSecond.status, "active");
+  assert.ok(constraintSecond, "expected the constraint alert to remain active");
+  assert.equal(constraintSecond.status, "active");
+  assert.ok(provenanceSecond, "expected the provenance-warning alert to remain active");
+  assert.equal(provenanceSecond.status, "active");
+
+  // Third iteration: the service-presence fact now satisfies the constraint (recovered), and
+  // the provenance-warning fact clears (active:"false") — the constraint and provenance-warning
+  // alerts must both recover, while the still-sustained-high-memory fixed alert must NOT be
+  // spuriously recovered by either of the other two sources disappearing from extraCandidates,
+  // and neither of the two learned sources may spuriously recover the other.
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } },
+    publicBindWarningFactFixture({ active: "false" }),
+  ], { now: "2026-05-24T00:02:00.000Z" });
+  const third = await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:02:00.000Z", now: "2026-05-24T00:02:00.000Z" });
+
+  const fixedThird = third.alerts.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const constraintThird = third.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  const provenanceThird = third.alerts.alerts.find((alert) => alert.rule_id === PUBLIC_BIND_RULE_ID);
+  assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by either learned source clearing");
+  assert.equal(constraintThird.status, "recovered");
+  assert.equal(provenanceThird.status, "recovered");
 });

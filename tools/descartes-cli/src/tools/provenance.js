@@ -175,6 +175,24 @@ export function isPublicBindAddress(address) {
   return PUBLIC_BIND_ADDRESSES.has(String(address));
 }
 
+// Exported (additive, S4) so callers that need to know "is this source type a recognized
+// supervisor" without re-deriving the classification (e.g. the structural provenance-warning
+// sub-collector's own per-socket narrowing step) can reuse the exact same set detectWarnings
+// itself is built on, rather than maintaining a second copy.
+export function isRecognizedSupervisorSourceType(sourceType) {
+  return RECOGNIZED_SUPERVISOR_SOURCE_TYPES.has(sourceType);
+}
+
+// Exported (additive, S4): the "public bind with no recognized supervisor" predicate,
+// extracted out of detectWarnings so a caller that needs to gate expensive per-process I/O
+// (S4's bounded deleted-exe check, see provenance-warnings.js) on exactly this condition can
+// call the same pure, no-I/O logic detectWarnings uses internally — never a re-derived copy.
+export function hasPublicBindNoSupervisor(sourceType, sockets = []) {
+  return (sockets ?? []).some(
+    (socket) => isPublicBindAddress(socket?.local_address) && !isRecognizedSupervisorSourceType(sourceType)
+  );
+}
+
 export function detectWarnings(record = {}, sockets = []) {
   const warnings = [];
   const resolved = record.resolved ?? {};
@@ -191,10 +209,7 @@ export function detectWarnings(record = {}, sockets = []) {
     });
   }
 
-  const hasPublicBindNoSupervisor = (sockets ?? []).some(
-    (socket) => isPublicBindAddress(socket?.local_address) && !RECOGNIZED_SUPERVISOR_SOURCE_TYPES.has(source.type)
-  );
-  if (hasPublicBindNoSupervisor) {
+  if (hasPublicBindNoSupervisor(source.type, sockets)) {
     warnings.push({
       rule_id: "public_bind_no_supervisor",
       message: "Socket is bound to a public address with no recognized supervising source.",
@@ -286,7 +301,10 @@ export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
   return { status: "unknown", pid: undefined, confidence: 0 };
 }
 
-async function listProcPids() {
+// Exported (additive, S4): the structural provenance-warning collector needs to enumerate all
+// pids once and fd-scan them once (bounded, see plan section 4) to resolve Linux socket owners
+// across every listener in a single pass, reusing this exactly rather than re-deriving it.
+export async function listProcPids() {
   // Deliberately not wrapped in try/catch: a Linux port-resolution code path running without
   // /proc mounted (e.g. an unusual chroot/container) is a genuinely exceptional condition this
   // module has no graceful degrade for; timedEnvelope's fail-closed contract covers it.
@@ -294,7 +312,7 @@ async function listProcPids() {
   return entries.filter((name) => /^\d+$/.test(name)).map(Number).slice(0, MAX_LINUX_FD_SCAN_PIDS);
 }
 
-async function scanProcFdForInode(candidatePids) {
+export async function scanProcFdForInode(candidatePids) {
   const results = [];
   for (const pid of candidatePids) {
     try {
@@ -398,7 +416,10 @@ export function parseContainerInspectPid(stdout) {
 // command/args field in the result matches processes.js's redaction shape exactly.
 // ---------------------------------------------------------------------------------------------
 
-function provenancePsArgsForPlatform(platform = process.platform) {
+// Exported (additive, S4): the structural provenance-warning collector needs the exact same
+// `ps` argv this module uses so its own single, shared process-table snapshot (reused across
+// every listening pid in one tick) parses identically via parseProvenancePs below.
+export function provenancePsArgsForPlatform(platform = process.platform) {
   return platform === "linux" ? ["-eo", PROVENANCE_PS_COLUMNS] : ["-axo", PROVENANCE_PS_COLUMNS];
 }
 
@@ -487,7 +508,10 @@ function finalizeProvenanceResult({ targetSelection, core, sockets }) {
   };
 }
 
-async function resolveExecutableInfo(pid) {
+// Exported (additive, S4): the structural provenance-warning collector's bounded deleted-exe
+// check (narrowed-candidate-only, see plan section 4) reuses this exact
+// lsof/fs.stat-on-macOS / readlink-on-linux orchestration rather than re-implementing it.
+export async function resolveExecutableInfo(pid) {
   if (process.platform === "linux") {
     try {
       const target = await readlink(`/proc/${pid}/exe`);
