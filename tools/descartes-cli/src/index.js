@@ -48,6 +48,9 @@ Usage:
   descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
   descartes learned mine [--json] [--window <duration>]
   descartes learned soak [--json]
+  descartes learned review [--json]
+  descartes learned approve <constraint-id> --nonce <nonce> [--note <text>] [--json]
+  descartes learned reject <constraint-id> --nonce <nonce> [--note <text>] [--json]
   descartes --version
 
 Safety: v0 local evidence collection is read-only. No actions are taken.`;
@@ -121,6 +124,23 @@ async function main(argv) {
     if (args[0] === "soak") {
       const { runLearnedSoak } = await import("./shadow-store.js");
       await runLearnedSoak(paths, args.slice(1));
+      return;
+    }
+    // "review"/"approve"/"reject" (Slice S7b, the human authority gate) live in
+    // promotion-store.js — the only module that can advance a constraint past review-ready.
+    if (args[0] === "review") {
+      const { runLearnedReview } = await import("./promotion-store.js");
+      await runLearnedReview(paths, args.slice(1));
+      return;
+    }
+    if (args[0] === "approve") {
+      const { runLearnedApprove } = await import("./promotion-store.js");
+      await runLearnedApprove(paths, args.slice(1));
+      return;
+    }
+    if (args[0] === "reject") {
+      const { runLearnedReject } = await import("./promotion-store.js");
+      await runLearnedReject(paths, args.slice(1));
       return;
     }
     const { runLearned } = await import("./constraint-miner.js");

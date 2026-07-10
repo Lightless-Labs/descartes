@@ -362,3 +362,39 @@ export const SEED_CONSTRAINTS = [
     schema_version: SCHEMA_VERSION,
   },
 ];
+
+// --- Slice S7b, additive: the ONLY code path that ever sets a mined/reviewed constraint to
+// status:"active" (SEED_CONSTRAINTS above are hand-authored static data, not a code path). Pure,
+// no I/O. This function is reachable ONLY through promotion-store.js's decideConstraintPromotion,
+// itself only invoked by the human-gated `descartes learned approve` CLI command — never by
+// soak/mine/daemon/shadow (see the S7a doc comments above: promoteDraftsToShadow and
+// promoteShadowToReviewReady both stop at "review-ready" by design). Fail-closed by
+// construction: a constraint is left completely untouched unless it matches the given id AND is
+// currently status:"review-ready" — never activates a draft/shadow/already-active/retired
+// constraint, and never activates any constraint other than the one named by id.
+
+/**
+ * Flips exactly one review-ready constraint (matched by id) to status:"active", appending a
+ * promotion_history entry. Every other constraint in the array (including one with a matching
+ * id but a different status) passes through unchanged. Returns { constraints, activated } so
+ * the caller (promotion-store.js) can distinguish "transitioned" from "fail-closed no-op"
+ * without re-scanning the result.
+ */
+export function promoteReviewReadyToActive(constraints, constraintId, options = {}) {
+  const ts = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const note = options.note ?? "human-approved via descartes learned approve";
+  let activated = false;
+  const updated = (constraints ?? []).map((constraint) => {
+    if (!constraint || constraint.id !== constraintId || constraint.status !== "review-ready") return constraint;
+    activated = true;
+    return {
+      ...constraint,
+      status: "active",
+      promotion_history: [
+        ...(constraint.promotion_history ?? []),
+        { ts, from: "review-ready", to: "active", actor: "human-cli", note },
+      ],
+    };
+  });
+  return { constraints: updated, activated };
+}

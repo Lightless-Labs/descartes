@@ -12,6 +12,7 @@ import {
   loadConstraints,
   loadLearnedConfig,
   promoteDraftsToShadow,
+  promoteReviewReadyToActive,
   promoteShadowToReviewReady,
   resolveConstraintStorePaths,
   validateConstraint,
@@ -377,4 +378,68 @@ test("no exported transition helper in constraint-store.js ever sets status to \
   );
   assert.equal(/["']active["']/.test(promoteDraftsToShadowSrc), false);
   assert.equal(/["']active["']/.test(promoteShadowToReviewReadySrc), false);
+});
+
+// --- S7b: additive review-ready->active transition helper (plan §5, the human authority gate) ---
+// This is the ONLY function in the codebase that writes status:"active" via a code path
+// (SEED_CONSTRAINTS above is hand-authored static data, not a code path). It is reachable only
+// through promotion-store.js's decideConstraintPromotion, itself only invoked by the
+// human-gated `descartes learned approve` CLI command — see promotion-store.test.js for the
+// end-to-end proof and the whole-src-tree "only one activation path" regression.
+
+test("promoteReviewReadyToActive activates a matching review-ready constraint and appends promotion_history", () => {
+  const constraint = draftConstraint({ status: "review-ready", promotion_history: [{ ts: "2026-07-08T00:00:00.000Z", from: "shadow", to: "review-ready", actor: "deterministic-gate" }] });
+  const { constraints, activated } = promoteReviewReadyToActive([constraint], constraint.id, { now: "2026-07-10T00:00:00.000Z", note: "approved via test" });
+
+  assert.equal(activated, true);
+  assert.equal(constraints[0].status, "active");
+  assert.equal(constraints[0].promotion_history.length, 2);
+  assert.deepEqual(constraints[0].promotion_history.at(-1), {
+    ts: "2026-07-10T00:00:00.000Z",
+    from: "review-ready",
+    to: "active",
+    actor: "human-cli",
+    note: "approved via test",
+  });
+});
+
+test("promoteReviewReadyToActive fails closed (no-op) on every non-review-ready status", () => {
+  for (const status of ["draft", "shadow", "active", "retired"]) {
+    const constraint = draftConstraint({ status, promotion_history: [] });
+    const { constraints, activated } = promoteReviewReadyToActive([constraint], constraint.id, { now: "2026-07-10T00:00:00.000Z" });
+    assert.equal(activated, false, `must not activate from status "${status}"`);
+    assert.deepEqual(constraints[0], constraint);
+  }
+});
+
+test("promoteReviewReadyToActive fails closed (no-op) when the id does not match any constraint", () => {
+  const constraint = draftConstraint({ status: "review-ready" });
+  const { constraints, activated } = promoteReviewReadyToActive([constraint], "constraint.does.not.exist", { now: "2026-07-10T00:00:00.000Z" });
+  assert.equal(activated, false);
+  assert.deepEqual(constraints[0], constraint);
+});
+
+test("promoteReviewReadyToActive only touches the named constraint, leaving every other constraint (even other review-ready ones) untouched", () => {
+  const target = draftConstraint({ id: "constraint.target", status: "review-ready" });
+  const other = draftConstraint({ id: "constraint.other", status: "review-ready" });
+  const { constraints, activated } = promoteReviewReadyToActive([target, other], target.id, { now: "2026-07-10T00:00:00.000Z" });
+  assert.equal(activated, true);
+  assert.equal(constraints.find((c) => c.id === "constraint.target").status, "active");
+  assert.equal(constraints.find((c) => c.id === "constraint.other").status, "review-ready");
+});
+
+test("promoteReviewReadyToActive's function body contains exactly one status:\"active\" literal (source-level proof there is no second, stray writer inside it)", async () => {
+  const source = await fs.readFile(path.resolve(import.meta.dirname, "../src/constraint-store.js"), "utf8");
+  const helperStart = source.indexOf("export function promoteReviewReadyToActive");
+  assert(helperStart >= 0, "constraint-store.js must define promoteReviewReadyToActive");
+  // promoteReviewReadyToActive is the last export in the file (Slice S7b, appended after
+  // SEED_CONSTRAINTS), so slicing to end-of-file captures exactly its body and nothing else —
+  // no other code follows it. Doc comments ABOVE this marker (which legitimately describe the
+  // function in prose, e.g. "the ONLY code path that ... status:\"active\"") are excluded by
+  // construction, mirroring the existing S7a test's function-boundary-slicing technique above.
+  const helperSrc = source.slice(helperStart);
+  // Match the `status` key specifically (not the promotion_history entry's `to: "active"`,
+  // which legitimately co-occurs as part of describing that same single transition).
+  const matches = helperSrc.match(/status:\s*["']active["']/g) ?? [];
+  assert.equal(matches.length, 1, `expected exactly one status:"active" assignment inside promoteReviewReadyToActive's body, found ${matches.length}`);
 });
