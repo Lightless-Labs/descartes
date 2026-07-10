@@ -28,8 +28,8 @@ Dedicated mining-pipeline plan (S6a–S7): `docs/plans/2026-07-10-constraint-min
 - [x] **S7b** Human authority gate: `learned review/approve/reject` → `authority/promotions.json` (deny-by-default, single-use nonce, expiry, audit) → review-ready→`active`. `promoteReviewReadyToActive` is the SOLE `active`-writer; the gate is the only path to live monitoring. Adversarially verified (empirical probes): sole activation path, fail-closed at every denial, nonce single-use (two independent layers), strict expiry — all CONFIRMED, `OVERALL_SAFE: yes`. Fixed the flagged audit-misattribution (spot B: `logDenial` no longer attaches a denial to an already-decided record; +lock test). Suite 384 green.
   - **Deferred (minor, spot C):** non-transactional cross-file write (constraints.json then promotions.json) can leave an orphaned `pending` promotion record after a crash mid-write — no safety bypass (the constraint's own `promotion_history` records the approval; replay denies), but a `learned review` reconciliation/purge of orphaned pendings whose constraint is already active would close the gap.
 
-**Make it all live (phase 3) — gaps surfaced during Layer A:**
-- Wire the *active* `evaluateConstraints` output into the daemon's `evaluateAndPersistAlerts` via the `extraCandidates` seam — the daemon's call site does NOT pass `extraCandidates` today, so even an activated constraint won't fire real alerts until this wiring lands.
+**Make it live — operator pulled the constraint-firing wiring forward (2026-07-10), BEFORE Layer B:**
+- [x] **S-live-1** Wire the *active* `evaluateConstraints` output into the daemon's `evaluateAndPersistAlerts` via the `extraCandidates` seam, gated by the learned kill-switch, byte-identical when disabled — so an approved/active constraint actually fires a real alert. Reuses the now-exported `buildShadowFactLookup` so active + shadow evaluation stay consistent (same degraded-exclusion, latest-wins). Two `[]` short-circuits (disabled; no-active) keep the alert output byte-identical when off; `alert-store.js` untouched (S2 merge intact). 8 new tests (byte-identical ×2, fires-when-violated, no-spurious ×3, no-cross-recovery); suite 392 green. **An approved constraint now produces a real alert end-to-end.**
 - S13 LLM-wakeup reuse (per-namespace opt-in) + S14/S15 compile-down/calibration.
 - Optional defense-in-depth: sanitize `buildViolationCandidate` `title`/`summary` (mined targets are already bounded; this covers hand-authored active constraints).
 
@@ -60,7 +60,7 @@ Dedicated mining-pipeline plan (S6a–S7): `docs/plans/2026-07-10-constraint-min
 ## Decisions needed from operator before Layer B
 
 - Rule-engine tech: hand-written per-family JS now, defer a general Datalog/DSL engine? (plan assumes yes.)
-- Provenance privilege path: accept degraded unprivileged cross-UID coverage, or add an elevated read path (setgid helper / CAP_SYS_PTRACE / root-only mode)?
+- Provenance privilege path: **DECIDED 2026-07-10 — build an opt-in elevated read path** (setgid helper / CAP_SYS_PTRACE on Linux; documented root-only mode) so cross-UID port→process ownership resolves, explicitly opt-in, still deny-by-default + never-fabricate. Build it as part of Layer B (after the live-wiring below).
 - `identity_signature` hashing inputs (pin with fixtures before S5).
 
 ## Carried-forward external (codex) priorities — not blocked by the above

@@ -6,10 +6,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications } from "./alert-intelligence.js";
 import { evaluateAndPersistAlerts } from "./alert-store.js";
-import { loadLearnedConfig } from "./constraint-store.js";
-import { appendFactPoints } from "./fact-store.js";
+import { evaluateConstraints } from "./constraint-eval.js";
+import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
+import { appendFactPoints, readFactPoints } from "./fact-store.js";
 import { factPointsFromNetworkEvidence, factPointsFromServiceEvidence } from "./fact-translators.js";
-import { evaluateAndLogShadowConstraints } from "./shadow-store.js";
+import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
@@ -274,6 +275,42 @@ export async function writeStructuralCheckpoint(descartesPaths, checkpoint = {})
   return record;
 }
 
+/**
+ * Slice S-live-1, additive: evaluates any `status:"active"` constraint against the latest
+ * fact-history and returns alert-store candidate objects for evaluateAndPersistAlerts'
+ * `extraCandidates` option (Slice 2). Gated by the same learned.json kill switch the S6a
+ * structural tick uses (loadLearnedConfig(...).enabled) — checked independently here (rather
+ * than reusing the structural block's own read) because this must run on every daemon tick,
+ * not just on a structural-due tick: an already-collected fact must be able to fire an alert
+ * without waiting for the next hourly structural collection.
+ *
+ * Two cheap short-circuits, both returning `[]` without further I/O, guarantee this tick's
+ * alert output stays byte-identical to the pre-S-live-1 baseline:
+ *   - learned is disabled (the default) -> `[]` immediately, no loadConstraints/readFactPoints.
+ *   - learned is enabled but there is no `status:"active"` constraint -> `[]`, no readFactPoints.
+ *
+ * Reuses shadow-store.js's exported `buildShadowFactLookup` (not duplicated) so ACTIVE and
+ * SHADOW evaluation reconstruct constraint targets identically, including excluding degraded
+ * (owner_known:"false"/confidence:0) observations. `evaluateConstraints` itself already skips
+ * any target whose lookup returns `undefined` ("no fact, no claim") and routes candidate
+ * `diagnostics` through `sanitizeDiagnostics` — nothing further is needed here.
+ */
+async function computeActiveConstraintCandidates(descartesPaths, options) {
+  const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
+  const learnedConfig = await loadConfig(descartesPaths);
+  if (!learnedConfig.enabled) return [];
+
+  const loadConstraintsFn = options.loadConstraints ?? loadConstraints;
+  const { constraints } = await loadConstraintsFn(descartesPaths);
+  const activeConstraints = constraints.filter((constraint) => constraint?.status === "active");
+  if (activeConstraints.length === 0) return [];
+
+  const readFacts = options.readFactPoints ?? readFactPoints;
+  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs, now: options.now });
+  const factLookup = buildShadowFactLookup(points);
+  return evaluateConstraints(activeConstraints, factLookup);
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
@@ -368,7 +405,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   });
   const alerts = options.evaluateAlerts === false
     ? undefined
-    : await evaluateAndPersistAlerts(descartesPaths, { now: ts, daemonStatus: status, windowMs: options.alertWindowMs });
+    : await evaluateAndPersistAlerts(descartesPaths, {
+        now: ts,
+        daemonStatus: status,
+        windowMs: options.alertWindowMs,
+        extraCandidates: await computeActiveConstraintCandidates(descartesPaths, options),
+      });
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
     ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
     : undefined;

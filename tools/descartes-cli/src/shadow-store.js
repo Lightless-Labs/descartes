@@ -192,8 +192,12 @@ function isDegradedFactPoint(point) {
  * confidence:0) are excluded entirely — never used as evidence, mirroring the miner's own
  * degrade-don't-fabricate exclusion. When multiple fact points map to the same target, the
  * most recent (by ts) wins.
+ *
+ * Exported additively (Slice S-live-1): daemon.js's active-constraint evaluation reuses this
+ * exact function so ACTIVE and SHADOW evaluation reconstruct constraint targets identically
+ * (same degraded-observation exclusion, same latest-wins tie-break) — never duplicated.
  */
-function buildShadowFactLookup(factPoints) {
+export function buildShadowFactLookup(factPoints) {
   const latestByTarget = new Map();
   for (const point of factPoints ?? []) {
     if (!point || isDegradedFactPoint(point)) continue;

@@ -26,7 +26,7 @@ import {
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
-import { readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { readAlertRecords } from "../src/alert-store.js";
@@ -1040,4 +1040,190 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
   assert.equal(outputs.length, 12);
   assert.equal(structuralCalls.filter((call) => call === "services").length, 3);
   assert.equal(structuralCalls.length, 9);
+});
+
+// --- Slice S-live-1, additive: active constraints wired into the real (evaluateAndPersistAlerts) path ---
+
+function activeConstraintFixture(overrides = {}) {
+  return {
+    id: "constraint.mined.service-presence.cafebabecafebabe",
+    kind: "constraint",
+    family: "service-presence",
+    target: "service.presence.nginx.service",
+    expected: { comparator: "eq", value: "true" },
+    status: "active",
+    confidence: 1,
+    provenance: { window: "7d", samples: 5, source_collectors: ["services"], mined_at: "2026-05-24T00:00:00.000Z" },
+    fixtures: [
+      { input: { "service.presence": "true" }, expect_match: true },
+      { input: { "service.presence": "false" }, expect_match: false },
+    ],
+    promotion_history: [
+      { ts: "2026-05-22T00:00:00.000Z", from: "draft", to: "shadow", actor: "deterministic-gate", note: "minimum-fixture bar met" },
+      { ts: "2026-05-23T00:00:00.000Z", from: "shadow", to: "review-ready", actor: "deterministic-gate", note: "soak complete" },
+      { ts: "2026-05-24T00:00:00.000Z", from: "review-ready", to: "active", actor: "human:alice", note: "approved" },
+    ],
+    first_observed: "2026-05-22T00:00:00.000Z",
+    last_verified: "2026-05-24T00:00:00.000Z",
+    sensitivity: "operational",
+    schema_version: 1,
+    ...overrides,
+  };
+}
+
+const S_LIVE_1_TICK_TS = "2026-05-24T00:00:00.000Z";
+
+// A structural-less profile (mirrors the pre-existing "structural-less profile" tests above):
+// keeps this slice's assertions decoupled from the S6a structural-tick cadence entirely, since
+// the design requires active-constraint evaluation to run every daemon tick, not just on a
+// structural-due tick.
+function slice6Profile() {
+  return { interval_ms: 60000, collectors: { system: { enabled: true }, processes: { enabled: true }, disks: { enabled: true } } };
+}
+
+function runIsolatedDaemonTick(paths, ts = S_LIVE_1_TICK_TS) {
+  return runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts, now: ts });
+}
+
+test("S-live-1: byte-identical real alerts when the learned kill switch is off, even with a violated active constraint and a matching current fact present", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withConstraintPaths = await tempPaths();
+  await writeConstraints(withConstraintPaths, [activeConstraintFixture()]);
+  await appendFactPoints(withConstraintPaths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+  // configDir/learned.json intentionally never written here -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the pre-S-live-1 baseline above.
+  const withConstraint = await runIsolatedDaemonTick(withConstraintPaths);
+
+  assert.deepEqual(withConstraint.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withConstraint.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withConstraint.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+
+  const persisted = await readAlertRecords(withConstraintPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id.startsWith("constraint.violation.")), false);
+});
+
+test("S-live-1: byte-identical real alerts when learned is enabled but there are zero active constraints", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const enabledPaths = await tempPaths();
+  await writeLearnedConfig(enabledPaths, { enabled: true });
+  // No constraints.json written at all -> loadConstraints() resolves { constraints: [] }.
+  const enabled = await runIsolatedDaemonTick(enabledPaths);
+
+  assert.deepEqual(enabled.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(enabled.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(enabled.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+});
+
+test("S-live-1: an active constraint violated by a current fact produces a real alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runIsolatedDaemonTick(paths);
+  const constraintAlert = result.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(constraintAlert, "expected a real alert for the violated active constraint");
+  assert.equal(constraintAlert.status, "active");
+  assert.equal(constraintAlert.fingerprint, activeConstraintFixture().id);
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((alert) => alert.id === constraintAlert.id && alert.status === "active"));
+});
+
+test("S-live-1: an active constraint whose target has no current fact does not fire (no fact, no claim)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  // No facts.jsonl at all -> readFactPoints returns an empty set -> factLookup(target) is undefined.
+
+  const result = await runIsolatedDaemonTick(paths);
+  assert.equal(result.alerts.alerts.some((alert) => alert.rule_id === "constraint.violation.service-presence"), false);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("S-live-1: a satisfied active constraint does not fire", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } }, // satisfies expected "true"
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runIsolatedDaemonTick(paths);
+  assert.equal(result.alerts.alerts.some((alert) => alert.rule_id === "constraint.violation.service-presence"), false);
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.some((alert) => alert.rule_id.startsWith("constraint.violation.")), false);
+});
+
+test("S-live-1: draft, shadow, and review-ready constraints are never evaluated for real alerts here, even when violated and learned is enabled", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [
+    activeConstraintFixture({ id: "constraint.mined.service-presence.draft00000000", status: "draft" }),
+    activeConstraintFixture({ id: "constraint.mined.service-presence.shadow0000000", status: "shadow" }),
+    activeConstraintFixture({ id: "constraint.mined.service-presence.reviewready00", status: "review-ready" }),
+  ]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } }, // violates all three, if evaluated
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runIsolatedDaemonTick(paths);
+  assert.equal(result.alerts.alerts.some((alert) => alert.rule_id === "constraint.violation.service-presence"), false);
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.some((alert) => alert.rule_id.startsWith("constraint.violation.")), false);
+});
+
+test("S-live-1: a fixed-rule alert and an active-constraint alert coexist across daemon iterations without spuriously recovering each other (Slice 2 cross-recovery pattern, driven end-to-end)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: "2026-05-24T00:00:00.000Z" });
+
+  // Sustained high memory across >=2 samples is required for system.memory.sustained_high to
+  // fire (alert-store.js's thresholds.minSustainedSamples); fastCollectorFakes() reports a low,
+  // non-alerting used_fraction, so a dedicated high-memory collector fake is used here instead.
+  const highMemoryCollectors = {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0, 0, 0],
+      uptime_seconds: 1,
+      memory: { used_fraction: 0.95, free_bytes: 1 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+  const profile = slice6Profile();
+
+  await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:00:00.000Z", now: "2026-05-24T00:00:00.000Z" });
+  const second = await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:01:00.000Z", now: "2026-05-24T00:01:00.000Z" });
+
+  const fixedSecond = second.alerts.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const constraintSecond = second.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(fixedSecond, "expected the fixed-rule alert to be active after 2 sustained high-memory samples");
+  assert.equal(fixedSecond.status, "active");
+  assert.ok(constraintSecond, "expected the constraint alert to remain active");
+  assert.equal(constraintSecond.status, "active");
+
+  // Third iteration: the fact now satisfies the constraint (service recovered) — the constraint
+  // alert must recover, while the still-sustained-high-memory fixed alert must NOT be
+  // spuriously recovered by the constraint source disappearing from extraCandidates.
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } },
+  ], { now: "2026-05-24T00:02:00.000Z" });
+  const third = await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:02:00.000Z", now: "2026-05-24T00:02:00.000Z" });
+
+  const fixedThird = third.alerts.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
+  const constraintThird = third.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by the constraint source clearing");
+  assert.equal(constraintThird.status, "recovered");
 });

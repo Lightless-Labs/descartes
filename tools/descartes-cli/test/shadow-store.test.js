@@ -10,6 +10,7 @@ import {
   DEFAULT_SHADOW_MAX_BYTES,
   DEFAULT_SHADOW_RETENTION_MS,
   appendShadowRecords,
+  buildShadowFactLookup,
   enforceShadowRetention,
   evaluateAndLogShadowConstraints,
   normalizeShadowRecord,
@@ -225,6 +226,30 @@ test("evaluateAndLogShadowConstraints never writes to constraints.json (read-onl
   assert.equal(constraints.length, 1);
   assert.equal(constraints[0].status, "shadow");
   assert.deepEqual(constraints[0].promotion_history, shadowConstraint().promotion_history);
+});
+
+// --- buildShadowFactLookup export (Slice S-live-1, additive: daemon.js reuses this for
+// active-constraint evaluation so ACTIVE and SHADOW evaluation reconstruct targets identically) ---
+
+test("buildShadowFactLookup is exported and behaves identically to its existing internal use: target reconstruction, latest-wins, and degraded-observation exclusion", () => {
+  assert.equal(typeof buildShadowFactLookup, "function");
+
+  const points = [
+    { ts: "2026-07-10T00:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } },
+    { ts: "2026-07-10T00:05:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }, // latest wins
+    {
+      ts: "2026-07-10T00:00:00.000Z",
+      fact_name: "network.listening_port.owner",
+      entity_key: "tcp:0.0.0.0:5432",
+      attributes: { owner_known: "false" },
+      confidence: 0,
+    }, // degraded -> excluded entirely
+  ];
+
+  const lookup = buildShadowFactLookup(points);
+  assert.equal(lookup("service.presence.nginx"), "true");
+  assert.equal(lookup("network.listening_port.owner.tcp:0.0.0.0:5432"), undefined);
+  assert.equal(lookup("nonexistent.target"), undefined);
 });
 
 // --- No LLM anywhere (grep-able absence, mirrors S6c's/S7's planned regression) ---
