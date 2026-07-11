@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
+import { isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import {
   DEFAULT_SOAK_DAYS,
   MIN_FIXTURE_COUNT,
   SEED_CONSTRAINTS,
+  buildConstraintTarget,
   checkShadowSoak,
   loadConstraints,
   loadLearnedConfig,
@@ -15,6 +17,7 @@ import {
   promoteReviewReadyToActive,
   promoteShadowToReviewReady,
   resolveConstraintStorePaths,
+  runLearnedConfigCommand,
   validateConstraint,
   writeConstraints,
   writeLearnedConfig,
@@ -190,6 +193,42 @@ test("resolved constraint store paths pass the Pi-owned path guard", async () =>
   assert.doesNotThrow(() => assertNoPiOwnedPath(resolved));
 });
 
+// --- buildConstraintTarget: shared target-builder (Codex review finding #8, target-truncation
+// collision) — the ONE place (fact_name, entity_key) -> target is ever computed, used by both
+// constraint-miner.js's buildMinedConstraint and shadow-store.js's buildShadowFactLookup so
+// they can never diverge. ---
+
+test("buildConstraintTarget: two entity_keys sharing an identical 64-char sanitized prefix but different tails produce DIFFERENT targets", () => {
+  const sharedPrefix = "a".repeat(64);
+  const entityKeyOne = `${sharedPrefix}-service-one`;
+  const entityKeyTwo = `${sharedPrefix}-service-two`;
+
+  const targetOne = buildConstraintTarget("service.presence", entityKeyOne);
+  const targetTwo = buildConstraintTarget("service.presence", entityKeyTwo);
+
+  assert.notEqual(targetOne, undefined);
+  assert.notEqual(targetTwo, undefined);
+  assert.notEqual(targetOne, targetTwo, "distinct entity_keys sharing a 64-char sanitized prefix must not collide onto the same target");
+});
+
+test("buildConstraintTarget produces a safe, bounded string (isSafeEnumString) even for a hostile/overlong entity_key", () => {
+  const target = buildConstraintTarget("service.presence", `/usr/local/${"x".repeat(100)}/../../etc/passwd`);
+  assert.notEqual(target, undefined);
+  assert(target.length <= 64);
+  assert.equal(target.includes("/"), false);
+  assert(isSafeEnumString(target), `expected ${target} to be a safe enum string`);
+});
+
+test("buildConstraintTarget is deterministic: same (fact_name, entity_key) in yields the same target out", () => {
+  const first = buildConstraintTarget("network.listening_port.owner", "tcp:0.0.0.0:5432");
+  const second = buildConstraintTarget("network.listening_port.owner", "tcp:0.0.0.0:5432");
+  assert.equal(first, second);
+});
+
+test("buildConstraintTarget returns undefined when nothing safe survives sanitization (degrade, never fabricate)", () => {
+  assert.equal(buildConstraintTarget("service.presence", "////"), undefined);
+});
+
 test("enablement switch defaults to disabled when learned.json is absent", async () => {
   const paths = await tempPaths();
   const config = await loadLearnedConfig(paths);
@@ -200,6 +239,92 @@ test("enablement switch reads back a present learned.json", async () => {
   const paths = await tempPaths();
   const written = await writeLearnedConfig(paths, { enabled: true });
   assert.equal(written.enabled, true);
+
+  const reread = await loadLearnedConfig(paths);
+  assert.equal(reread.enabled, true);
+});
+
+test("loadLearnedConfig fails closed to disabled (does not throw) when learned.json contains malformed JSON", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveConstraintStorePaths(paths);
+  await fs.mkdir(path.dirname(configFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(configFile, "{ not json", { mode: 0o600 });
+
+  const config = await loadLearnedConfig(paths);
+  assert.equal(config.enabled, false);
+});
+
+// --- descartes learned enable | disable | status (CLI) — the kill switch is operationally
+// load-bearing but had no command to flip it; users had to hand-edit learned.json. ---
+
+test("descartes learned status reports disabled and the config path when learned.json is absent, without throwing", async () => {
+  const paths = await tempPaths();
+  const lines = [];
+  const result = await runLearnedConfigCommand(paths, "status", [], { output: (line) => lines.push(line) });
+
+  assert.equal(result.enabled, false);
+  assert.equal(result.config_path, resolveConstraintStorePaths(paths).configFile);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /disabled/);
+  assert.match(lines[0], new RegExp(resolveConstraintStorePaths(paths).configFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("descartes learned enable flips learned.json to enabled:true and prints confirmation", async () => {
+  const paths = await tempPaths();
+  const lines = [];
+  const result = await runLearnedConfigCommand(paths, "enable", [], { now: "2026-07-11T00:00:00.000Z", output: (line) => lines.push(line) });
+
+  assert.equal(result.enabled, true);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /enabled/);
+
+  const reread = await loadLearnedConfig(paths);
+  assert.equal(reread.enabled, true);
+});
+
+test("descartes learned disable flips learned.json to enabled:false and prints confirmation", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+
+  const lines = [];
+  const result = await runLearnedConfigCommand(paths, "disable", [], { now: "2026-07-11T00:00:00.000Z", output: (line) => lines.push(line) });
+
+  assert.equal(result.enabled, false);
+  assert.match(lines[0], /disabled/);
+
+  const reread = await loadLearnedConfig(paths);
+  assert.equal(reread.enabled, false);
+});
+
+test("descartes learned enable/disable are idempotent (repeated calls settle on the same state without throwing)", async () => {
+  const paths = await tempPaths();
+  await runLearnedConfigCommand(paths, "enable", [], { output: () => {} });
+  const second = await runLearnedConfigCommand(paths, "enable", [], { output: () => {} });
+  assert.equal(second.enabled, true);
+
+  await runLearnedConfigCommand(paths, "disable", [], { output: () => {} });
+  const fourth = await runLearnedConfigCommand(paths, "disable", [], { output: () => {} });
+  assert.equal(fourth.enabled, false);
+});
+
+test("descartes learned enable/disable/status --json print machine-readable payloads", async () => {
+  const paths = await tempPaths();
+  const enableLines = [];
+  await runLearnedConfigCommand(paths, "enable", ["--json"], { output: (line) => enableLines.push(line) });
+  const enablePayload = JSON.parse(enableLines[0]);
+  assert.equal(enablePayload.learned_config.enabled, true);
+  assert.equal(typeof enablePayload.learned_config.config_path, "string");
+
+  const statusLines = [];
+  await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => statusLines.push(line) });
+  const statusPayload = JSON.parse(statusLines[0]);
+  assert.equal(statusPayload.learned_config.enabled, true);
+});
+
+test("descartes learned status never mutates learned.json (read-only)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await runLearnedConfigCommand(paths, "status", [], { output: () => {} });
 
   const reread = await loadLearnedConfig(paths);
   assert.equal(reread.enabled, true);
@@ -322,6 +447,30 @@ test("checkShadowSoak: not eligible before soakDays has elapsed, even with clean
   }));
 
   const now = shadowSinceMs + 5 * DAY_MS; // only 5 of 7 required days have elapsed
+  assert.equal(checkShadowSoak(constraint, records, { soakDays: 7, now }), false);
+});
+
+test("checkShadowSoak: a fire AFTER the first soak window (e.g. day 8, following a clean days 0-6) still blocks promotion when checked later (e.g. day 10) — a fire anywhere since shadow enrollment blocks promotion, not just within the fixed first-window", () => {
+  const shadowSince = "2026-07-01T00:00:00.000Z";
+  const shadowSinceMs = Date.parse(shadowSince);
+  const constraint = draftConstraint({
+    status: "shadow",
+    promotion_history: [{ ts: shadowSince, from: "draft", to: "shadow", actor: "deterministic-gate", note: "minimum-fixture bar met" }],
+  });
+  // Clean, fully-covered days 0-6 (would satisfy the fixed first soak window on its own)...
+  const cleanDays0to6 = Array.from({ length: 7 }, (_, day) => shadowRecord({
+    ts: new Date(shadowSinceMs + day * DAY_MS + 3600000).toISOString(),
+    fired: false,
+  }));
+  // ...but the constraint fires on day 8, AFTER that fixed window closes.
+  const firedOnDay8 = shadowRecord({
+    ts: new Date(shadowSinceMs + 8 * DAY_MS + 3600000).toISOString(),
+    fired: true,
+  });
+  const records = [...cleanDays0to6, firedOnDay8];
+
+  // `learned soak` is finally run on day 10 — well past the day-8 fire.
+  const now = shadowSinceMs + 10 * DAY_MS;
   assert.equal(checkShadowSoak(constraint, records, { soakDays: 7, now }), false);
 });
 

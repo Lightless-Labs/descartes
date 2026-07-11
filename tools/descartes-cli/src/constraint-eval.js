@@ -6,7 +6,7 @@
 // new `extraCandidates` option (see alert-store.js).
 
 import { alertId } from "./alert-store.js";
-import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
+import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 
 function evaluateNumericComparator(comparator, factValue, expectedValue) {
   switch (comparator) {
@@ -65,7 +65,22 @@ function evaluateExpected(expected, factValue) {
 
 function buildViolationCandidate(constraint, factValue) {
   const ruleId = `constraint.violation.${constraint.family}`;
-  const fingerprint = String(constraint.id ?? constraint.target ?? "global");
+
+  // Codex review Blocker 1 (real part): title/summary/fingerprint used to interpolate
+  // constraint.id/family/target directly — only `diagnostics` was sanitized. A mined
+  // constraint's id/target are already bounded/safe by construction (constraint-miner.js
+  // routes them through sanitizeIdentityString/buildConstraintTarget at mining time), so
+  // sanitizeIdentityString is a no-op on them here (idempotent on an already-safe string) —
+  // mined/seed candidates are byte-identical to before this change. A HAND-AUTHORED active
+  // constraint carries no such guarantee, so every one of these three fields is bounded and
+  // sanitized here, exactly like diagnostics already is, before it can reach title/summary
+  // (which alert-intelligence.js copies verbatim into its LLM prompt) or fingerprint (an
+  // outward-facing alert-store field).
+  const safeId = sanitizeIdentityString(constraint.id);
+  const safeFamily = sanitizeIdentityString(constraint.family) ?? "unknown";
+  const safeTarget = sanitizeIdentityString(constraint.target);
+  const fingerprint = String(safeId ?? safeTarget ?? "global");
+
   const diagnostics = sanitizeDiagnostics({
     constraint_id: constraint.id,
     family: constraint.family,
@@ -80,8 +95,8 @@ function buildViolationCandidate(constraint, factValue) {
     rule_id: ruleId,
     fingerprint,
     severity: "warning",
-    title: `Constraint violated: ${constraint.id}`,
-    summary: `Learned constraint "${constraint.id}" (family: ${constraint.family}) is violated for target "${constraint.target}".`,
+    title: `Constraint violated: ${safeId ?? "unknown"}`,
+    summary: `Learned constraint "${safeId ?? "unknown"}" (family: ${safeFamily}) is violated for target "${safeTarget ?? "unknown"}".`,
     diagnostics,
     evidence_refs: ["constraint-store"],
   };

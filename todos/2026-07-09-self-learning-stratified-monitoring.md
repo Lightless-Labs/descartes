@@ -51,12 +51,12 @@ Dedicated plan: `docs/plans/2026-07-10-layer-b-provenance.md` (code-grounded, tw
 Full review: `docs/reviews/2026-07-11-codex-gpt5.6-sol-review.md` (Codex gpt-5.6-sol, xhigh). Confirmed the safety spine holds (read-only, no privilege escalation, no LLM in learned modules, single-merge/no-cross-recovery, day-1 no-storm). No shipped path bypasses human approval; whole subsystem default-OFF.
 
 **Fixing now (operator: "fix all the real bugs now"):**
-- [ ] #4 shadow-soak window — a fire AFTER the fixed window doesn't block promotion (block any fire since enrollment).
-- [ ] #5 identity alerts never recover — gate candidate emission on `last_seen` recency so unknown_identity/new_public_bind/identity_drift recover when the process/socket disappears; also a transient stat-failure identityHash shouldn't stabilize as a distinct identity.
-- [ ] #8 target-truncation collision — 64-char-prefix-sharing entities collide on one eval target; use a full-entity hash + a shared `buildConstraintTarget` used by miner + `buildShadowFactLookup`.
-- [ ] constraint `title`/`summary`/`fingerprint` sanitization — a hand-authored active constraint's raw target reaches the alert title → background adjudicator; route id/family/target through `sanitizeIdentityString` at emission.
-- [ ] `loadLearnedConfig` fail-closed on corrupt JSON (return disabled, don't throw).
-- [ ] `descartes learned enable|disable|status` CLI (kill switch is load-bearing but hand-edited today).
+- [x] #4 shadow-soak window — fired-check now spans [enrollment, now], so a fire after the first window still blocks promotion. (constraint-store `checkShadowSoak`.)
+- [ ] #5 identity alerts never recover — gate candidate emission on `last_seen` recency so unknown_identity/new_public_bind/identity_drift recover when the process/socket disappears; also a transient stat-failure identityHash shouldn't stabilize as a distinct identity. **(next batch)**
+- [x] #8 target-truncation collision — shared `buildConstraintTarget(factName, entityKey)` (in constraint-store) appends a 16-hex sha256 of the FULL fact_name\0entity_key; used by BOTH the miner and `buildShadowFactLookup` (round-trip test) so they can't diverge or collide.
+- [x] constraint `title`/`summary`/`fingerprint` sanitization — id/family/target routed through `sanitizeIdentityString` at emission (idempotent → mined/seed byte-identical; hand-authored raw target no longer reaches the alert title / adjudicator).
+- [x] `loadLearnedConfig` fail-closed on corrupt JSON (returns `{enabled:false, corrupt:true}`, no throw).
+- [x] `descartes learned enable|disable|status` CLI added (`runLearnedConfigCommand` + index.js dispatch).
 - [x] stale `HANDOFF.md` line (identity_hash "absent") + header date — fixed.
 
 **Tracked (real, larger/architectural — deferred):**

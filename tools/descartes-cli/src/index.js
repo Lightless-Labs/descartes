@@ -51,6 +51,9 @@ Usage:
   descartes learned review [--json]
   descartes learned approve <constraint-id> --nonce <nonce> [--note <text>] [--json]
   descartes learned reject <constraint-id> --nonce <nonce> [--note <text>] [--json]
+  descartes learned enable [--json]
+  descartes learned disable [--json]
+  descartes learned status [--json]
   descartes provenance snapshot [--json]
   descartes provenance baseline show [--identity <hash>] [--json]
   descartes --version
@@ -143,6 +146,13 @@ async function main(argv) {
     if (args[0] === "reject") {
       const { runLearnedReject } = await import("./promotion-store.js");
       await runLearnedReject(paths, args.slice(1));
+      return;
+    }
+    // "enable"/"disable"/"status" (minor Codex review finding): the configDir/learned.json
+    // kill switch had no dedicated command — see constraint-store.js's runLearnedConfigCommand.
+    if (args[0] === "enable" || args[0] === "disable" || args[0] === "status") {
+      const { runLearnedConfigCommand } = await import("./constraint-store.js");
+      await runLearnedConfigCommand(paths, args[0], args.slice(1));
       return;
     }
     const { runLearned } = await import("./constraint-miner.js");

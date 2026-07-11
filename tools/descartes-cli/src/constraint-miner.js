@@ -9,8 +9,7 @@
 // the filesystem, mirroring evaluateConstraints()'s "pure, no I/O" contract.
 
 import crypto from "node:crypto";
-import { loadConstraints, SCHEMA_VERSION, writeConstraints } from "./constraint-store.js";
-import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
+import { buildConstraintTarget, loadConstraints, SCHEMA_VERSION, writeConstraints } from "./constraint-store.js";
 import { parseDurationMs } from "./history-store.js";
 import { readFactPoints } from "./fact-store.js";
 
@@ -111,14 +110,15 @@ function minedId(family, entityKey) {
 function buildMinedConstraint(group, { minObservationDays, nowIso }) {
   const { family, fact_name, entity_key, confirming, all } = group;
 
-  // Pre-mining sanitization gate, defense-in-depth (plan §6 point 2): re-apply the same
-  // sanitizer the S6b translator already ran at emission time. Never trust that facts.jsonl
-  // stayed clean (hand-edited file, future translator regression, ...).
-  const sanitizedEntityKey = sanitizeIdentityString(entity_key);
-  if (!sanitizedEntityKey) return undefined; // entirely-unsafe identity — drop, never fabricate
-
-  const target = sanitizeIdentityString(`${fact_name}.${sanitizedEntityKey}`);
-  if (!target) return undefined; // defensive; should not happen given fact_name/sanitizedEntityKey are already safe
+  // Pre-mining sanitization gate, defense-in-depth (plan §6 point 2): buildConstraintTarget
+  // (constraint-store.js, the ONE shared target-builder — also used by shadow-store.js's
+  // buildShadowFactLookup so the two can never diverge) re-applies the same sanitizer the S6b
+  // translator already ran at emission time, AND hashes the full, untruncated (fact_name,
+  // entity_key) pair so two distinct long entity_keys can never collide onto the same target
+  // even when their sanitized prefixes match (Codex review finding #8). Never trust that
+  // facts.jsonl stayed clean (hand-edited file, future translator regression, ...).
+  const target = buildConstraintTarget(fact_name, entity_key);
+  if (!target) return undefined; // entirely-unsafe identity — drop, never fabricate
 
   const attributeKey = KEY_ATTRIBUTE_BY_FACT_NAME[fact_name];
   const observedValue = confirming[0]?.attributes?.[attributeKey];

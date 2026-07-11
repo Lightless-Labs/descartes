@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  buildConstraintTarget,
   loadConstraints,
   promoteDraftsToShadow,
   promoteShadowToReviewReady,
@@ -8,7 +9,6 @@ import {
   DEFAULT_SOAK_DAYS,
 } from "./constraint-store.js";
 import { evaluateShadowConstraints } from "./constraint-eval.js";
-import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 
 // Shadow evaluation is structurally separate from real alerting — not a flag, a different
@@ -186,12 +186,13 @@ function isDegradedFactPoint(point) {
 
 /**
  * Builds a `target -> current value` lookup from a fact-history window, reconstructing each
- * fact point's target the same way constraint-miner.js's buildMinedConstraint does
- * (`${fact_name}.${sanitizeIdentityString(entity_key)}`, itself sanitized) so a shadow
- * constraint's `target` field matches. Degraded observations (owner_known:"false"/
- * confidence:0) are excluded entirely — never used as evidence, mirroring the miner's own
- * degrade-don't-fabricate exclusion. When multiple fact points map to the same target, the
- * most recent (by ts) wins.
+ * fact point's target via constraint-store.js's shared buildConstraintTarget — the same
+ * function constraint-miner.js's buildMinedConstraint uses — so a shadow/active constraint's
+ * `target` field always matches (Codex review finding #8: the two must never diverge or two
+ * distinct long entity_keys can collide onto the same target). Degraded observations
+ * (owner_known:"false"/confidence:0) are excluded entirely — never used as evidence, mirroring
+ * the miner's own degrade-don't-fabricate exclusion. When multiple fact points map to the same
+ * target, the most recent (by ts) wins.
  *
  * Exported additively (Slice S-live-1): daemon.js's active-constraint evaluation reuses this
  * exact function so ACTIVE and SHADOW evaluation reconstruct constraint targets identically
@@ -203,9 +204,7 @@ export function buildShadowFactLookup(factPoints) {
     if (!point || isDegradedFactPoint(point)) continue;
     const keyAttribute = SHADOW_KEY_ATTRIBUTE_BY_FACT_NAME[point.fact_name];
     if (!keyAttribute) continue;
-    const sanitizedEntityKey = sanitizeIdentityString(point.entity_key);
-    if (!sanitizedEntityKey) continue;
-    const target = sanitizeIdentityString(`${point.fact_name}.${sanitizedEntityKey}`);
+    const target = buildConstraintTarget(point.fact_name, point.entity_key);
     if (!target) continue;
     const value = point.attributes?.[keyAttribute];
     if (value === undefined) continue;

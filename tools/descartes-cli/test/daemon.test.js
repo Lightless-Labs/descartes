@@ -25,7 +25,7 @@ import {
   validateDaemonProfile,
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
-import { writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
+import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
 import { appendFactPoints, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
@@ -840,7 +840,7 @@ function shadowConstraintFixture(overrides = {}) {
     id: "constraint.mined.service-presence.deadbeefdeadbeef",
     kind: "constraint",
     family: "service-presence",
-    target: "service.presence.nginx.service",
+    target: buildConstraintTarget("service.presence", "nginx.service"),
     expected: { comparator: "eq", value: "true" },
     status: "shadow",
     confidence: 1,
@@ -974,7 +974,7 @@ test("S7a load-bearing safety regression: a shadow constraint that would obvious
   // A shadow constraint whose fixed rule is obviously violated by the fixture facts below
   // (running:"false" vs expected "true") — if shadow evaluation were ever mis-wired into the
   // real alert pipeline, this would show up as an alert.
-  await writeConstraints(paths, [shadowConstraintFixture({ target: "service.presence.nginx.service" })]);
+  await writeConstraints(paths, [shadowConstraintFixture({ target: buildConstraintTarget("service.presence", "nginx.service") })]);
   const structuralCollectorsViolating = {
     services: async () => envelope("services", "collect_services", {
       manager: "systemd",
@@ -1054,7 +1054,7 @@ function activeConstraintFixture(overrides = {}) {
     id: "constraint.mined.service-presence.cafebabecafebabe",
     kind: "constraint",
     family: "service-presence",
-    target: "service.presence.nginx.service",
+    target: buildConstraintTarget("service.presence", "nginx.service"),
     expected: { comparator: "eq", value: "true" },
     status: "active",
     confidence: 1,

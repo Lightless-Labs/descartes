@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { appendFactPoints } from "../src/fact-store.js";
-import { loadConstraints, writeConstraints } from "../src/constraint-store.js";
+import { buildConstraintTarget, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import {
   DEFAULT_SHADOW_MAX_BYTES,
   DEFAULT_SHADOW_RETENTION_MS,
@@ -35,7 +35,7 @@ function shadowConstraint(overrides = {}) {
     id: "constraint.mined.service-presence.deadbeefdeadbeef",
     kind: "constraint",
     family: "service-presence",
-    target: "service.presence.nginx",
+    target: buildConstraintTarget("service.presence", "nginx"),
     expected: { comparator: "eq", value: "true" },
     status: "shadow",
     confidence: 1,
@@ -247,8 +247,8 @@ test("buildShadowFactLookup is exported and behaves identically to its existing 
   ];
 
   const lookup = buildShadowFactLookup(points);
-  assert.equal(lookup("service.presence.nginx"), "true");
-  assert.equal(lookup("network.listening_port.owner.tcp:0.0.0.0:5432"), undefined);
+  assert.equal(lookup(buildConstraintTarget("service.presence", "nginx")), "true");
+  assert.equal(lookup(buildConstraintTarget("network.listening_port.owner", "tcp:0.0.0.0:5432")), undefined);
   assert.equal(lookup("nonexistent.target"), undefined);
 });
 

@@ -59,6 +59,36 @@ test("evaluateConstraints emits a constraint.violation.<family> candidate for a 
   assert.equal(candidate.diagnostics.actual, 500);
 });
 
+test("evaluateConstraints/buildViolationCandidate: a hand-authored active constraint with a raw path as its id/target cannot leak the raw path into title/summary/fingerprint (Codex review Blocker 1, real part)", () => {
+  const rawPath = "/Users/alice/.ssh/id_rsa";
+  const constraint = {
+    id: rawPath,
+    kind: "constraint",
+    family: "path-invariant",
+    target: rawPath,
+    expected: { pattern: "ends_with:/nonexistent" }, // never satisfied -> always violated
+    status: "active",
+    confidence: 1,
+    schema_version: 1,
+  };
+
+  const candidates = evaluateConstraints([constraint], () => rawPath);
+  assert.equal(candidates.length, 1);
+  const [candidate] = candidates;
+
+  assert.equal(candidate.title.includes("/Users"), false);
+  assert.equal(candidate.summary.includes("/Users"), false);
+  assert.equal(candidate.fingerprint.includes("/Users"), false);
+  assert.equal(candidate.title.includes(rawPath), false);
+  assert.equal(candidate.summary.includes(rawPath), false);
+  assert.equal(candidate.fingerprint.includes(rawPath), false);
+
+  // diagnostics stays routed through sanitizeDiagnostics — unaffected by, and unchanged by,
+  // this fix.
+  assert.equal(candidate.diagnostics.constraint_id.redacted, true);
+  assert.equal(candidate.diagnostics.target.redacted, true);
+});
+
 test("evaluateConstraints emits a violation for a synthetic violating pattern constraint and sanitizes the raw actual value", () => {
   const constraint = patternConstraint();
   const candidates = evaluateConstraints([constraint], () => "/home/alice/.local/state"); // does not end with /descartes

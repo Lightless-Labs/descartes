@@ -1,8 +1,51 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 
 export const SCHEMA_VERSION = 1;
 export const CONSTRAINT_STATUSES = ["draft", "shadow", "review-ready", "active", "retired"];
+
+// Fixed-length hex digest suffix length for buildConstraintTarget (below) — matches
+// constraint-miner.js's own minedId()/alert-store.js's alertId() truncated-sha256-hex
+// convention, so the suffix always satisfies diagnostics-sanitizer.js's isFixedLengthHexHash.
+const TARGET_HASH_LENGTH = 16;
+
+/**
+ * Builds the single canonical `target` string for a (fact_name, entity_key) pair. This is the
+ * ONLY place that construction happens — constraint-miner.js's buildMinedConstraint and
+ * shadow-store.js's buildShadowFactLookup both call this so the two can never diverge (Codex
+ * review finding #8, target-truncation collision).
+ *
+ * The old approach sanitized+truncated entity_key to 64 chars, then sanitized+truncated
+ * `${fact_name}.${sanitizedEntityKey}` to 64 chars AGAIN: two distinct entity_keys sharing an
+ * identical 64-char sanitized prefix (long systemd unit paths, IPv6 socket keys) collided onto
+ * the exact same target, so "latest wins" evaluation silently mixed up two constraints. Here,
+ * a fixed-length hex digest of the FULL, UNTRUNCATED `fact_name\0entity_key` pair is always
+ * appended as a suffix — regardless of how much of the human-readable prefix truncation ends up
+ * discarding, two distinct entities always hash to two distinct suffixes, so they can never
+ * collide onto the same target.
+ *
+ * Returns `undefined` (never a raw/partial value) when nothing safe survives sanitization,
+ * mirroring sanitizeIdentityString's own "degrade, never fabricate" contract.
+ */
+export function buildConstraintTarget(factName, entityKey) {
+  const rawFactName = String(factName ?? "");
+  const rawEntityKey = String(entityKey ?? "");
+
+  const sanitizedEntityKey = sanitizeIdentityString(rawEntityKey);
+  if (!sanitizedEntityKey) return undefined; // entirely-unsafe identity — drop, never fabricate
+
+  const digest = crypto.createHash("sha256").update(`${rawFactName}\0${rawEntityKey}`).digest("hex").slice(0, TARGET_HASH_LENGTH);
+  // Reserve room for ".{digest}" so the digest suffix itself is never truncated away — all
+  // truncation lands on the human-readable prefix instead, exactly as before, but two distinct
+  // entities can no longer collide even when that prefix collides.
+  const prefixMaxLength = Math.max(1, MAX_STRING_LENGTH - digest.length - 1);
+  const humanReadable = sanitizeIdentityString(`${rawFactName}.${sanitizedEntityKey}`, { maxLength: prefixMaxLength });
+  if (!humanReadable) return undefined; // defensive; should not happen given the pieces above are already safe
+
+  return `${humanReadable}.${digest}`;
+}
 
 export function resolveConstraintStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "learned");
@@ -143,11 +186,21 @@ export function normalizeLearnedConfig(config = {}) {
  */
 export async function loadLearnedConfig(descartesPaths) {
   const { configFile } = resolveConstraintStorePaths(descartesPaths);
+  let contents;
   try {
-    return normalizeLearnedConfig(JSON.parse(await fs.readFile(configFile, "utf8")));
+    contents = await fs.readFile(configFile, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") return normalizeLearnedConfig();
     throw error;
+  }
+  try {
+    return normalizeLearnedConfig(JSON.parse(contents));
+  } catch {
+    // Malformed JSON: fail CLOSED to the disabled default rather than throwing out of a daemon
+    // iteration (Codex review minor finding) — mirrors loadConstraints()'s own corrupt-file
+    // tolerance above. `corrupt: true` is an additive marker only; callers that only read
+    // `.enabled` (daemon.js) are unaffected.
+    return { ...normalizeLearnedConfig(), corrupt: true };
   }
 }
 
@@ -159,6 +212,73 @@ export async function writeLearnedConfig(descartesPaths, config, options = {}) {
   await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
   await fs.rename(tmpFile, configFile);
   return normalized;
+}
+
+// --- CLI: descartes learned enable | disable | status ---
+//
+// The configDir/learned.json { enabled } kill switch is operationally load-bearing (it gates
+// ALL automatic/background learned-constraint work: shadow evaluation logging, active-constraint
+// alerting) but previously had no dedicated command — users had to hand-edit the JSON file
+// directly (Codex review minor finding). Additive only: loadLearnedConfig/writeLearnedConfig
+// above are unchanged; this just gives them a CLI face, mirroring alerts.js's
+// `alerts intelligence status|enable|disable` shape.
+
+function learnedConfigUsage() {
+  return `Usage:
+  descartes learned enable [--json]
+  descartes learned disable [--json]
+  descartes learned status [--json]
+
+Flips or reports configDir/learned.json's { enabled } kill switch, which gates ALL automatic/
+background learned-constraint work (shadow evaluation logging, active-constraint real alerting).
+'enable'/'disable' are idempotent — flipping to the state it's already in is a no-op status-wise
+(still refreshes updated_at) and always prints a confirmation.`;
+}
+
+function renderLearnedConfigStatus(config, configFile) {
+  const lines = [`Learned emission: ${config.enabled ? "enabled" : "disabled"}`];
+  lines.push(`Config path: ${configFile}`);
+  if (config.updated_at) lines.push(`Last updated: ${config.updated_at}`);
+  return lines.join("\n");
+}
+
+/**
+ * Shared implementation for the `descartes learned enable|disable|status` subcommands
+ * (dispatched from index.js). `enable`/`disable` write configDir/learned.json's `enabled` field
+ * idempotently via writeLearnedConfig; `status` is read-only via loadLearnedConfig. Always
+ * prints a confirmation/summary and returns `{ ...config, config_path }` for JSON/programmatic
+ * callers.
+ */
+export async function runLearnedConfigCommand(descartesPaths, subcommand, args, runtime = {}) {
+  const output = runtime.output ?? console.log;
+  let json = false;
+  for (const arg of args ?? []) {
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--help" || arg === "-h") {
+      output(learnedConfigUsage());
+      return undefined;
+    } else {
+      throw new Error(`Unexpected learned ${subcommand} argument: ${arg}\n\n${learnedConfigUsage()}`);
+    }
+  }
+
+  const { configFile } = resolveConstraintStorePaths(descartesPaths);
+  let config;
+  if (subcommand === "enable") {
+    config = await writeLearnedConfig(descartesPaths, { enabled: true }, { now: runtime.now });
+  } else if (subcommand === "disable") {
+    config = await writeLearnedConfig(descartesPaths, { enabled: false }, { now: runtime.now });
+  } else if (subcommand === "status") {
+    config = await loadLearnedConfig(descartesPaths);
+  } else {
+    throw new Error(`Unsupported learned command: ${subcommand}\n\n${learnedConfigUsage()}`);
+  }
+
+  const result = { ...config, config_path: configFile };
+  if (json) output(JSON.stringify({ learned_config: result }, null, 2));
+  else output(renderLearnedConfigStatus(config, configFile));
+  return result;
 }
 
 // --- Slice S7a, additive: draft->shadow / shadow->review-ready status-transition helpers ---
@@ -226,14 +346,27 @@ export function checkShadowSoak(constraint, shadowRecords, options = {}) {
   const soakWindowMs = soakDays * DAY_MS;
   if (nowMs - shadowSinceMs < soakWindowMs) return false;
 
-  const inWindow = (shadowRecords ?? [])
+  // Fired-record check spans the ENTIRE lifetime since shadow enrollment (shadowSince -> now),
+  // not just the first fixed soak window (Codex review finding #4): a constraint that stays
+  // clean for the first soakDays but then fires on, say, day 8 must still be blocked from
+  // promotion when `learned soak` finally runs on day 10 — one fire leaves it shadow
+  // indefinitely, regardless of when it happened relative to the fixed window.
+  const sinceEnrollment = (shadowRecords ?? [])
     .filter((record) => record?.constraint_id === constraint.id)
     .filter((record) => {
       const tsMs = new Date(record.ts).getTime();
-      return Number.isFinite(tsMs) && tsMs >= shadowSinceMs && tsMs < shadowSinceMs + soakWindowMs;
+      return Number.isFinite(tsMs) && tsMs >= shadowSinceMs && tsMs <= nowMs;
     });
 
-  if (inWindow.some((record) => record.fired === true)) return false;
+  if (sinceEnrollment.some((record) => record.fired === true)) return false;
+
+  // Daily-coverage ("was it actually checked every day") is still evaluated only over the
+  // fixed first soak window — that's the qualifying window a constraint must prove it was
+  // observed daily within, not its entire (potentially much longer) shadow lifetime.
+  const inWindow = sinceEnrollment.filter((record) => {
+    const tsMs = new Date(record.ts).getTime();
+    return tsMs < shadowSinceMs + soakWindowMs;
+  });
 
   const coveredDays = new Set();
   for (const record of inWindow) {

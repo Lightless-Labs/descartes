@@ -14,6 +14,7 @@ import {
   runLearned,
 } from "../src/constraint-miner.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
+import { buildShadowFactLookup } from "../src/shadow-store.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-constraint-miner-test-"));
@@ -225,6 +226,37 @@ test("an entirely-unsafe entity_key (nothing survives sanitization) is dropped r
   const factHistory = stableServiceHistory({ entityKey: "////" });
   const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
   assert.deepEqual(candidates, []);
+});
+
+// --- Target-truncation collision (Codex review finding #8): two long entity_keys sharing a
+// 64-char sanitized prefix used to collide onto the SAME constraint target, so "latest wins"
+// evaluation silently evaluated two distinct constraints against one fact. ---
+
+test("two entity_keys sharing an identical 64-char sanitized prefix (but different tails) mine into two DISTINCT drafts with two DISTINCT targets — no target collision", () => {
+  const sharedPrefix = `systemd-unit-${"x".repeat(60)}`; // 73 chars, > 64: identical after any 64-char truncation
+  const entityKeyOne = `${sharedPrefix}-alpha`;
+  const entityKeyTwo = `${sharedPrefix}-beta`;
+  assert.equal(entityKeyOne.slice(0, 64), entityKeyTwo.slice(0, 64), "test setup must actually share a 64-char prefix");
+
+  const historyOne = stableServiceHistory({ entityKey: entityKeyOne, running: "true" });
+  const historyTwo = stableServiceHistory({ entityKey: entityKeyTwo, running: "false" });
+  const candidates = mineConstraintCandidates([...historyOne, ...historyTwo], [], { now: BASE_TS + 8 * DAY_MS });
+
+  assert.equal(candidates.length, 2, "two distinct long entity_keys must mine into two distinct drafts, not collide into one");
+  assert.notEqual(candidates[0].target, candidates[1].target);
+  assert.notEqual(candidates[0].id, candidates[1].id);
+});
+
+test("target round-trip agreement: the miner's emitted target for a fact EXACTLY equals buildShadowFactLookup's reconstructed target for the same fact", () => {
+  const factHistory = stableServiceHistory({ entityKey: "nginx.service", running: "true" });
+  const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
+  assert.equal(candidates.length, 1);
+
+  // The shared buildConstraintTarget helper (constraint-store.js) guarantees this by
+  // construction: constraint-miner.js's buildMinedConstraint and shadow-store.js's
+  // buildShadowFactLookup must never diverge on what target a given fact maps to.
+  const lookup = buildShadowFactLookup(factHistory);
+  assert.equal(lookup(candidates[0].target), "true");
 });
 
 // --- Draft inertness (HARD REQUIREMENT) ---
