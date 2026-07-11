@@ -464,8 +464,24 @@ export function computeProvenanceEnvelopeFields(resolvedStatus, sourceType) {
 // Orchestration (I/O-performing).
 // ---------------------------------------------------------------------------------------------
 
-function emptyPrivilege() {
-  return { mechanism: "unprivileged", elevated_available: false, elevated_used: false };
+// S3-priv Slice 1 (pure, behavior-preserving extraction): the old hardcoded emptyPrivilege()
+// literal, unified into one shared builder so all three call sites below can never diverge.
+// Called with no arguments (or all-default/false inputs — no elevated attempt made), this is
+// byte-identical to the pre-S3-priv `{ mechanism: 'unprivileged', elevated_available: false,
+// elevated_used: false }`. `elevatedConfigEnabled` is accepted here for S3-priv Slice 2+ to wire
+// real values through later; nothing in this file passes anything but the defaults yet — this
+// slice adds zero elevated invocation/probe/privilege behavior.
+export function computePrivilege({
+  mechanism = "unprivileged",
+  elevatedAvailable = false,
+  elevatedUsed = false,
+  elevatedConfigEnabled = false,
+} = {}) {
+  return {
+    mechanism,
+    elevated_available: elevatedAvailable,
+    elevated_used: elevatedUsed,
+  };
 }
 
 function buildInvalidTargetResult(targetSelection) {
@@ -476,7 +492,7 @@ function buildInvalidTargetResult(targetSelection) {
     source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: targetSelection.error } },
     sockets: [],
     warnings: [],
-    privilege: emptyPrivilege(),
+    privilege: computePrivilege(),
   };
 }
 
@@ -488,7 +504,7 @@ function buildNotFoundResult(kind, value, probe) {
     source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: "target_not_found" } },
     sockets: [],
     warnings: [],
-    privilege: emptyPrivilege(),
+    privilege: computePrivilege(),
   };
 }
 
@@ -503,7 +519,7 @@ function finalizeProvenanceResult({ targetSelection, core, sockets }) {
       source: core.source,
       sockets,
       warnings,
-      privilege: emptyPrivilege(),
+      privilege: computePrivilege(),
     },
   };
 }
