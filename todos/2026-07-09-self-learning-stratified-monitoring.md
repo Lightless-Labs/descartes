@@ -46,6 +46,32 @@ Dedicated plan: `docs/plans/2026-07-10-layer-b-provenance.md` (code-grounded, tw
 - [x] **S5** Identity baseline + deterministic deviation warnings. — `provenance-store.js` (golden-fixture-pinned `identity_signature`, atomic corrupt-tolerant `signatures.json`, `provisional→known_good` grace window ≥3 samples/≥2 ticks, `descartes provenance snapshot`/`baseline show` CLI) + `provenance-identity.js` (own-UID gatherer + fast-tick candidates). Day-1 no-storm (nothing fires until an explicit snapshot); UID-scoped (other-UID fires silence, not degraded); `unknown_identity`/`identity_drift`/`new_public_bind`. Adversarially verified OVERALL_SAFE (golden hashes independently recomputed; day-1/UID/byte-identical/sanitize/atomic/idempotent all CONFIRMED). Fixed a NUL byte that made the golden-fixture test file binary + corrected an overclaiming drift comment. 32 new tests; suite 486 green.
   - [x] **S5-follow-1** Wired `identity_hash` = bounded `sha256(dev:ino:size:mtimeMs).slice(0,16)` content-change fingerprint (one `fs.stat` on the rate-limited reconcile path, own-UID-scoped, degrade-not-fabricate) so `identity_drift` now catches an in-place binary swap at the same path/launcher/owner. Signature algorithm + golden fixture byte-unchanged (only the gatherer populates the existing `identityHash` slot); cross-platform (no `execFile`). 5 new tests incl. the gap-closing case; suite 491 green. (Residual: a same-inode overwrite with preserved size + `touch -r` mtime reset still evades a pure stat proxy — codesign CDHash / full content hash is a future hardening for signed binaries.)
 
+## Codex external review (2026-07-11) — disposition
+
+Full review: `docs/reviews/2026-07-11-codex-gpt5.6-sol-review.md` (Codex gpt-5.6-sol, xhigh). Confirmed the safety spine holds (read-only, no privilege escalation, no LLM in learned modules, single-merge/no-cross-recovery, day-1 no-storm). No shipped path bypasses human approval; whole subsystem default-OFF.
+
+**Fixing now (operator: "fix all the real bugs now"):**
+- [ ] #4 shadow-soak window — a fire AFTER the fixed window doesn't block promotion (block any fire since enrollment).
+- [ ] #5 identity alerts never recover — gate candidate emission on `last_seen` recency so unknown_identity/new_public_bind/identity_drift recover when the process/socket disappears; also a transient stat-failure identityHash shouldn't stabilize as a distinct identity.
+- [ ] #8 target-truncation collision — 64-char-prefix-sharing entities collide on one eval target; use a full-entity hash + a shared `buildConstraintTarget` used by miner + `buildShadowFactLookup`.
+- [ ] constraint `title`/`summary`/`fingerprint` sanitization — a hand-authored active constraint's raw target reaches the alert title → background adjudicator; route id/family/target through `sanitizeIdentityString` at emission.
+- [ ] `loadLearnedConfig` fail-closed on corrupt JSON (return disabled, don't throw).
+- [ ] `descartes learned enable|disable|status` CLI (kill switch is load-bearing but hand-edited today).
+- [x] stale `HANDOFF.md` line (identity_hash "absent") + header date — fixed.
+
+**Tracked (real, larger/architectural — deferred):**
+- Approval non-atomicity + concurrency (== spot C, already tracked under S7b; Codex elevated it — cross-file write ordering + no lock; fail-safe, no unauthorized activation).
+- #6 Linux FD-scan not truly bounded (per-pid FD cap) + the daemon deadline abandons but doesn't CANCEL the scan (wall-clock wait cap, not work cap).
+- #7 per-namespace LLM re-consent (`enabled_namespaces`) — belongs to the not-yet-built S13 (LLM-wakeup reuse); gate learned/provenance→adjudicator before S13.
+- multi-owner same-port attribution (SO_REUSEPORT/dual-stack should be ambiguous, not first-PID-wins).
+- #9 service-presence can't detect disappearance (missing fact = "no claim"); Linux port-binding mining unavailable (base collector has no owner) — partly documented.
+- Strengthen the source-regex "single-writer"/"no-LLM-import" tests to behavioral call-graph/e2e assertions (done opportunistically where fixes touch those files).
+
+**Reviewed, by-design (pushback — no change):**
+- Provenance tool returning raw data to the LLM: the `triage` path is an explicit user request; the privacy boundary permits transmitting to the chosen provider for that explicit request — same as every other evidence collector. Sanitization applies to the background alert/notification path (covered above).
+- "Cross-UID provenance fabricates": the on-demand tool returns real world-readable `ps` data for a pid the user asked about — not fabrication. (Multi-owner ports tracked above.)
+- Exported `writeConstraints`/`promoteReviewReadyToActive` + seed constraints being `active`: API-exposure critique, not a shipped bypass; seeds are trusted bootstrap constants targeting config invariants that never fire.
+
 ## Self-audit
 
 - [ ] **S8** Artifact self-monitoring (chronically-firing / staleness / contradiction).

@@ -1,6 +1,6 @@
 # Descartes Handoff
 
-**Last updated:** 2026-07-09
+**Last updated:** 2026-07-11
 
 ## Current Status
 
@@ -23,7 +23,7 @@ The active initiative is making Descartes *learn* the machine, build its own mon
 - `e33ea1b` **S3** — unprivileged provenance collector `tools/provenance.js` (`inspect_runtime_provenance`, model-invokable): target-first pid|port|container resolution, deterministic source classification (pure `classifySourceFromAncestry`), warnings (pure `detectWarnings`), degrade-not-fabricate, single fixed-argv `execFile` (no shell/escalation), atomic tool-surface registration + set-equality test.
 - `81b7cdd` **S4** — provenance-warning fixed rules → real sanitized alerts via the live merge (`provenance.process.deleted_exe_running`, `provenance.socket.public_bind_no_supervisor`); structural sub-collector → facts → per-tick candidates, bounded I/O, exe paths hashed.
 - `70fdff2` **S5** — identity baseline (`provenance-store.js` + `provenance-identity.js`): golden-fixture-pinned `identity_signature`, `provisional→known_good` grace window, day-1 no-storm (nothing until `descartes provenance snapshot`), UID-scoped `unknown_identity`/`identity_drift`/`new_public_bind`, `descartes provenance snapshot|baseline show` CLI.
-  - **S5-follow-1 (fast-follow, fail-safe):** `identity_hash` (codesign/content) is absent this build, so `identity_drift` misses an in-place binary swap at the same path/launcher/owner (false-negative only). Wire it via a bounded S4-style `codesign` check on the narrowed set.
+  - `e580fa5` **S5-follow-1 (done)** — `identity_hash` now = a bounded `sha256(dev:ino:size:mtimeMs).slice(0,16)` content-change fingerprint (one `fs.stat` on the reconcile path), so `identity_drift` catches an in-place binary swap that changes mtime/size/inode. Residual (documented): a same-inode overwrite preserving size AND resetting mtime via `touch -r` still evades a pure stat proxy — a codesign CDHash / full content hash is the future hardening for signed binaries.
 
 Descartes now fires FOUR deterministic alert sources through the one merged pipeline: fixed resource rules, active learned constraints (`a6dde51`), provenance known-bad warnings, and identity deviations — all gated behind the single `learned.json` kill switch (default off), all sanitized, no LLM.
 
