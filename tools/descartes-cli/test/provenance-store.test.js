@@ -263,7 +263,10 @@ test("deriveIdentityCandidates fires unknown_identity only for a known_good/grac
       },
     },
   };
-  assert.deepEqual(deriveIdentityCandidates(bootstrappedNoDeviation), []);
+  // "now" pinned close to the fixtures' own last_seen timestamps -- deriveIdentityCandidates'
+  // presence-window recovery gate (S5-follow-2) filters by (now - last_seen), so an explicit,
+  // nearby "now" is required for these fixed-date fixtures regardless of wall-clock time.
+  assert.deepEqual(deriveIdentityCandidates(bootstrappedNoDeviation, { now: "2026-07-10T00:30:00.000Z" }), []);
 
   const withConfirmedUnknown = {
     ...bootstrappedNoDeviation,
@@ -280,7 +283,7 @@ test("deriveIdentityCandidates fires unknown_identity only for a known_good/grac
       },
     },
   };
-  const candidates = deriveIdentityCandidates(withConfirmedUnknown);
+  const candidates = deriveIdentityCandidates(withConfirmedUnknown, { now: "2026-07-10T02:15:00.000Z" });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].rule_id, "provenance.process.unknown_identity");
   assert.equal(candidates[0].diagnostics.identity_hash, "confirmed_unknown");
@@ -307,10 +310,133 @@ test("deriveIdentityCandidates: a raw path smuggled into source_classification i
       },
     },
   };
-  const [candidate] = deriveIdentityCandidates(store);
+  const [candidate] = deriveIdentityCandidates(store, { now: "2026-07-10T02:10:00.000Z" });
   assert.ok(candidate);
   assert.equal(candidate.diagnostics.source_type.redacted, true);
   assert.equal(JSON.stringify(candidate.diagnostics).includes("/usr/local/bin"), false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Codex review finding #5, Part A -- recovery via presence/last_seen gating. A candidate must
+// only fire while its record is currently present (recent last_seen); once unseen for longer than
+// DEFAULT_IDENTITY_PRESENCE_WINDOW_MS, it must stop firing (the process exited / the socket
+// closed), and a still-present identity must never falsely recover between reconciles.
+// ---------------------------------------------------------------------------------------------
+
+test("deriveIdentityCandidates: recovery -- unknown_identity/new_public_bind stop firing once the record's last_seen ages past the presence window (process exited / socket closed)", () => {
+  const record = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T00:00:00.000Z",
+    stable_sample_count: 3,
+    stable_iteration_count: 2,
+    inputs_hash: { executable_path_hash: "cccc000000000000", source_classification: "shell" },
+    port_target_keys: ["tcp.8080"],
+  };
+  const store = { version: 1, bootstrapped_at: "2026-07-09T00:00:00.000Z", signatures: { confirmed_unknown: record } };
+
+  const present = deriveIdentityCandidates(store, { now: "2026-07-10T00:30:00.000Z" });
+  assert.equal(present.filter((c) => c.rule_id === "provenance.process.unknown_identity").length, 1);
+  assert.equal(present.filter((c) => c.rule_id === "provenance.port.new_public_bind").length, 1);
+
+  // 10h later: well past the (default 3h) presence window -- the process/socket has presumably
+  // disappeared, so both candidates must recover to nothing.
+  const gone = deriveIdentityCandidates(store, { now: "2026-07-10T10:00:00.000Z" });
+  assert.deepEqual(gone, [], "once unseen for longer than the presence window, both candidates must recover to nothing");
+});
+
+test("deriveIdentityCandidates: identity_drift recovers once the stale (superseded) identity ages out of the presence window", () => {
+  const stale = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T00:00:00.000Z",
+    stable_sample_count: 3,
+    stable_iteration_count: 2,
+    inputs_hash: { executable_path_hash: "shared0000000000", source_classification: "launchd" },
+    port_target_keys: [],
+  };
+  const currentEarly = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T01:00:00.000Z",
+    stable_sample_count: 3,
+    stable_iteration_count: 2,
+    inputs_hash: { executable_path_hash: "shared0000000000", source_classification: "shell" },
+    port_target_keys: [],
+  };
+  const storeAfterSwap = {
+    version: 1,
+    bootstrapped_at: "2026-07-09T00:00:00.000Z",
+    signatures: { stale_identity: stale, current_identity: currentEarly },
+  };
+
+  // Shortly after the swap: both the stale and the current identity are still within the
+  // presence window -> drift fires.
+  const driftPresent = deriveIdentityCandidates(storeAfterSwap, { now: "2026-07-10T01:15:00.000Z" });
+  assert.equal(driftPresent.filter((c) => c.rule_id === "provenance.process.identity_drift").length, 1);
+
+  // Later: several more reconciles have kept refreshing current_identity's last_seen, but
+  // stale_identity was never observed again -- once its last_seen ages past the window, drift
+  // must resolve (only one present identity remains in the target-key group).
+  const storeLater = {
+    ...storeAfterSwap,
+    signatures: {
+      stale_identity: stale, // unchanged -- last_seen frozen at 00:00:00, never re-observed.
+      current_identity: { ...currentEarly, last_seen: "2026-07-10T05:00:00.000Z" },
+    },
+  };
+  const driftRecovered = deriveIdentityCandidates(storeLater, { now: "2026-07-10T05:05:00.000Z" });
+  assert.deepEqual(driftRecovered.filter((c) => c.rule_id === "provenance.process.identity_drift"), []);
+});
+
+test("deriveIdentityCandidates: a still-present identity (last reconciled just under one reconcile cadence ago) keeps firing -- no false recovery between reconciles", () => {
+  const record = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T00:00:00.000Z",
+    stable_sample_count: 3,
+    stable_iteration_count: 2,
+    inputs_hash: { executable_path_hash: "dddd000000000000", source_classification: "shell" },
+    port_target_keys: [],
+  };
+  const store = { version: 1, bootstrapped_at: "2026-07-09T00:00:00.000Z", signatures: { still_here: record } };
+  // 55 minutes later -- just under the ~1h daemon-wired reconcile cadence, comfortably inside the
+  // (default 3h) presence window.
+  const candidates = deriveIdentityCandidates(store, { now: "2026-07-10T00:55:00.000Z" });
+  assert.equal(candidates.filter((c) => c.rule_id === "provenance.process.unknown_identity").length, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Codex review finding #5, Part B -- a transient stat failure (identityHash undefined) must not
+// flip an already-fingerprinted identity's signature into a different store bucket. Detected at
+// the reconcileSignatures fold boundary (isTransientStatFailureOfKnownIdentity).
+// ---------------------------------------------------------------------------------------------
+
+test("reconcileSignatures: a transient stat failure (identityHash undefined) for an already-fingerprinted identity is skipped, not folded as a new/updated signature", () => {
+  const withFingerprint = reconcileSignatures(
+    { version: 1, signatures: {} },
+    [{ executablePath: "/opt/svc/bin", identityHash: "aaaa1111bbbb2222", sourceClassification: "launchd", owningUser: "0" }],
+    { ts: "2026-07-10T00:00:00.000Z", iterationKey: "i1" },
+  );
+  const [originalHash] = Object.keys(withFingerprint.signatures);
+  const before = withFingerprint.signatures[originalHash];
+
+  const afterTransientFailure = reconcileSignatures(
+    withFingerprint,
+    [{ executablePath: "/opt/svc/bin", identityHash: undefined, sourceClassification: "launchd", owningUser: "0" }],
+    { ts: "2026-07-10T01:00:00.000Z", iterationKey: "i2" },
+  );
+  assert.deepEqual(Object.keys(afterTransientFailure.signatures), [originalHash], "no new signature bucket must be created for the transient-failure observation");
+  assert.deepEqual(afterTransientFailure.signatures[originalHash], before, "the transient-failure observation must be skipped entirely, leaving the existing record (including last_seen) untouched");
+});
+
+test("reconcileSignatures: a first-ever sighting with identityHash undefined still folds in normally (no matching fingerprinted record exists yet) -- degrade-not-invisible", () => {
+  const store = reconcileSignatures(
+    { version: 1, signatures: {} },
+    [{ executablePath: "/opt/svc/never-fingerprinted", identityHash: undefined, sourceClassification: "launchd", owningUser: "0" }],
+    { ts: "2026-07-10T00:00:00.000Z", iterationKey: "i1" },
+  );
+  assert.equal(Object.keys(store.signatures).length, 1, "an identity with no fingerprint history must still be tracked (DEGRADE-NOT-FABRICATE must not become DEGRADE-TO-INVISIBLE)");
 });
 
 // ---------------------------------------------------------------------------------------------

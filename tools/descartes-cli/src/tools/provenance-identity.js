@@ -62,6 +62,15 @@ async function defaultStatExecutablePath(executablePath) {
  * EPERM, a TOCTOU race where the executable vanished between resolveExecutableInfo and here,
  * etc.) yields `undefined` -- identical to today's always-absent behavior for that identity --
  * never a fabricated/zero value, and never throws out of this function.
+ *
+ * S5-follow-2 (Codex review finding #5, Part B): this function still intentionally returns
+ * `undefined` on a stat failure -- DEGRADE-NOT-FABRICATE is preserved here unchanged. The
+ * follow-up problem ("a TRANSIENT failure flips an already-stable identity's signature") is fixed
+ * one layer up, at the fold boundary: provenance-store.js's reconcileSignatures (via its
+ * isTransientStatFailureOfKnownIdentity helper) is what decides whether an
+ * identityHash:undefined observation should be skipped for this reconcile (already-fingerprinted
+ * identity, matching path/source/owner) or folded in as usual (first-ever sighting, no
+ * fingerprint history to protect).
  */
 async function computeIdentityHash(executablePath, options) {
   const statExecutablePath = options.statExecutablePath ?? defaultStatExecutablePath;
@@ -166,6 +175,12 @@ export async function gatherIdentityObservations(options = {}) {
  * Only once both gates pass does this function perform its own (rate-limited, own-UID-only,
  * bounded) host I/O to reconcile signatures.json, then derives candidates purely from the
  * resulting store state.
+ *
+ * S5-follow-2 (Codex review finding #5, Part A): the same `now` this function already computes
+ * for its own rate-limit due-check is also threaded into deriveIdentityCandidates as its presence
+ * reference point, so a candidate recovers once its record's last_seen falls outside
+ * provenance-store.js's DEFAULT_IDENTITY_PRESENCE_WINDOW_MS -- see that function's own doc
+ * comment for the recovery mechanism itself.
  */
 export async function computeProvenanceIdentityCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
@@ -192,7 +207,7 @@ export async function computeProvenanceIdentityCandidates(descartesPaths, option
     await writeStore(descartesPaths, currentStore);
   }
 
-  return deriveIdentityCandidates(currentStore);
+  return deriveIdentityCandidates(currentStore, { now: nowMs, presenceWindowMs: options.identityPresenceWindowMs });
 }
 
 // Additive, exported for test-fixture reuse/clarity (mirrors provenance-store.js's own export of

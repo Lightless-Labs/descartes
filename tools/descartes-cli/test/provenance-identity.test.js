@@ -329,3 +329,84 @@ test("re-running snapshot on the currently-observed identity clears a previously
   const afterResnapshot = await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T05:00:05.000Z" });
   assert.deepEqual(afterResnapshot.filter((c) => c.rule_id === "provenance.process.unknown_identity"), []);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Codex review finding #5, Part A -- end-to-end recovery: once the gatherer stops observing an
+// identity (the process exits / the socket closes, so it no longer appears in
+// listListeningSocketsWithPid's output), its last_seen stops advancing and, once the presence
+// window elapses, computeProvenanceIdentityCandidates stops emitting a candidate for it.
+// ---------------------------------------------------------------------------------------------
+
+test("computeProvenanceIdentityCandidates: recovery end-to-end -- once a confirmed-unknown identity's process disappears (gatherer stops observing it), the candidate stops firing after the presence window elapses", async () => {
+  const paths = await tempPaths();
+  const bootstrapped = reconcileSignatures({ version: 1, signatures: {} }, [], { ts: "2026-07-10T00:00:00.000Z", seedKnownGood: true });
+  await writeSignatureStore(paths, { ...bootstrapped, bootstrapped_at: "2026-07-10T00:00:00.000Z" });
+
+  let sockets = MIXED_SOCKETS;
+  const options = fakeCollectorOptions({
+    identityReconcileIntervalMs: 0, // always due, for a deterministic test
+    loadLearnedConfig: async () => ({ enabled: true }),
+    listListeningSocketsWithPid: async () => sockets,
+  });
+
+  // 3 ticks to cross the grace window -> confirmed unknown_identity.
+  await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T01:00:00.000Z" });
+  await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T02:00:00.000Z" });
+  const tick3 = await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T03:00:00.000Z" });
+  assert.ok(tick3.some((c) => c.rule_id === "provenance.process.unknown_identity"), "expected the identity to be confirmed unknown after crossing the grace window");
+
+  // The process exits: no more sockets/pids observed from here on.
+  sockets = [];
+
+  const stillWithinWindow = await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T04:00:00.000Z" });
+  assert.ok(
+    stillWithinWindow.some((c) => c.rule_id === "provenance.process.unknown_identity"),
+    "must still fire while within the presence window even though the process just disappeared this tick",
+  );
+
+  // last_seen is frozen at tick3's ts (03:00) since no observation was folded for it after that;
+  // 4h later is past the default 3h presence window.
+  const afterWindow = await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T07:00:00.000Z" });
+  assert.deepEqual(afterWindow.filter((c) => c.rule_id === "provenance.process.unknown_identity"), [], "the candidate must recover once the process has been gone for longer than the presence window");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Codex review finding #5, Part B -- end-to-end: a single transient stat failure on an
+// already-confirmed identity must not flip its stored signature or spuriously fire drift/unknown.
+// ---------------------------------------------------------------------------------------------
+
+test("computeProvenanceIdentityCandidates: a single transient stat failure on an already-confirmed identity does not flip its signature or spuriously fire drift/unknown", async () => {
+  const paths = await tempPaths();
+  const bootstrapped = reconcileSignatures({ version: 1, signatures: {} }, [], { ts: "2026-07-10T00:00:00.000Z", seedKnownGood: true });
+  await writeSignatureStore(paths, { ...bootstrapped, bootstrapped_at: "2026-07-10T00:00:00.000Z" });
+
+  let statShouldFail = false;
+  const options = fakeCollectorOptions({
+    identityReconcileIntervalMs: 0,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    statExecutablePath: async () => {
+      if (statShouldFail) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      return STAT_A;
+    },
+  });
+
+  await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T01:00:00.000Z" });
+  await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T02:00:00.000Z" });
+  const tick3 = await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T03:00:00.000Z" });
+  assert.ok(tick3.some((c) => c.rule_id === "provenance.process.unknown_identity"), "expected the identity to be confirmed unknown after crossing the grace window");
+
+  const { store: beforeFailure } = await loadSignatureStore(paths);
+  const hashesBefore = Object.keys(beforeFailure.signatures).sort();
+
+  statShouldFail = true; // a single transient stat failure begins this tick
+  const tick4 = await computeProvenanceIdentityCandidates(paths, { ...options, now: "2026-07-10T04:00:00.000Z" });
+
+  const { store: afterFailure } = await loadSignatureStore(paths);
+  const hashesAfter = Object.keys(afterFailure.signatures).sort();
+  assert.deepEqual(hashesAfter, hashesBefore, "a transient stat failure must not create a new signature bucket for an already-fingerprinted identity");
+  assert.deepEqual(tick4.filter((c) => c.rule_id === "provenance.process.identity_drift"), [], "a transient stat failure must never itself be reported as identity_drift");
+  // The original identity's own unknown_identity candidate must still be present too (last_seen
+  // frozen at tick3's ts, well within the presence window) -- proves the observation was skipped
+  // for this reconcile, not treated as "a different identity appeared".
+  assert.ok(tick4.some((c) => c.rule_id === "provenance.process.unknown_identity"));
+});

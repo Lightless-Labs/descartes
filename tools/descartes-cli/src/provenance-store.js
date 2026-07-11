@@ -54,6 +54,21 @@ export const SCHEMA_VERSION = 1;
 export const DEFAULT_STABLE_SAMPLE_THRESHOLD = 3;
 export const DEFAULT_STABLE_ITERATION_THRESHOLD = 2;
 
+// S5-follow-2 (Codex review finding #5, Part A -- "identity alerts never age out"): bounds how
+// long a known_good/grace_window identity (or a known_good entry inside an identity_drift
+// target-key group) keeps producing a candidate after its last successfully-reconciled
+// observation. Must comfortably exceed tools/provenance-identity.js's own
+// DEFAULT_IDENTITY_RECONCILE_INTERVAL_MS (1h, the daemon-wired reconcile cadence) so a genuinely
+// still-present identity is never dropped merely because it happens to land between two reconcile
+// ticks. 3x that cadence (3h) gives headroom for at least two consecutive missed/delayed ticks
+// (daemon downtime, a slow/loaded host, a skipped tick) before an identity is ever treated as
+// gone. Once a process exits or a socket closes, its record's last_seen stops advancing (see
+// applyIdentityObservation below, which always sets last_seen := the current reconcile's own ts
+// on every fold) -- once this window elapses without a fresh observation,
+// deriveIdentityCandidates stops emitting a candidate for it, and applyAlertCandidates recovers
+// the alert on the following tick (see deriveIdentityCandidates below).
+export const DEFAULT_IDENTITY_PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
+
 // Bounded, operator-introspection-only lists on each signature record -- never authoritative,
 // never unbounded (plan's own "bounded list" wording for target_examples).
 export const MAX_TARGET_EXAMPLES = 5;
@@ -295,6 +310,51 @@ export async function writeSignatureStore(descartesPaths, store) {
 // constraint-store.js).
 // ---------------------------------------------------------------------------------------------
 
+// S5-follow-2 (Codex review finding #5, Part B -- "transient stat failure flips the signature"):
+// a transient fs.stat failure (EPERM/ENOENT/a TOCTOU race -- see
+// tools/provenance-identity.js's computeIdentityHash and its own DEGRADE-NOT-FABRICATE contract)
+// makes the gatherer emit identityHash:undefined for a pid that normally DOES carry a
+// fingerprint. Since identity_hash is one of computeIdentitySignature's four joined inputs,
+// folding that observation as-is would compute a DIFFERENT identity_signature than the identity's
+// own already-tracked record -- i.e. a stable identity's signature would flip
+// (fingerprint-present -> "") purely because of one bad stat, which looks exactly like a brand
+// new identity appearing (spurious unknown_identity) or the existing one drifting away (spurious
+// identity_drift).
+//
+// Detected here, at the FOLD boundary (reconcileSignatures), not in the gatherer: if an
+// identityHash:undefined observation's other three raw inputs (path/source/owner -- compared via
+// the SAME hashed fields already persisted in inputs_hash, since raw fields are never kept
+// un-hashed in the store) match an EXISTING record that already carries a real (defined)
+// identity_hash, this observation is treated as "can't currently verify this identity, not a
+// different one" and is skipped entirely for this reconcile -- the existing record (and its
+// last_seen) is left exactly as it was. This degrades to NOT-OBSERVING this tick, never to
+// observing-as-different (the two options the fix note called out; skip-at-the-fold is chosen
+// over "carry forward the last-known identityHash" because the store only ever persists identity
+// hashes in already-HASHED form -- there is no raw value left anywhere to carry forward without
+// re-exposing it, which the sanitization invariant forbids).
+//
+// A genuinely first-ever sighting with no fingerprint capability (no matching fingerprinted
+// record exists yet -- e.g. a stat that has ever only failed) is NOT skipped: it folds in with
+// identityHash:undefined exactly as before S5-follow-2, preserving S5-follow-1's own
+// DEGRADE-NOT-FABRICATE contract (still tracked, still eligible to promote/fire like any other
+// identity -- degrade-to-unfingerprinted, never degrade-to-invisible).
+function isTransientStatFailureOfKnownIdentity(signatures, observation) {
+  if (observation?.identityHash !== undefined) return false;
+  const executablePathHash = hashIdentityField(observation?.executablePath);
+  if (!executablePathHash) return false;
+  const owningUserHash = hashIdentityField(observation?.owningUser);
+  const sourceClassification = observation?.sourceClassification;
+  return Object.values(signatures ?? {}).some((record) => {
+    const inputs = record?.inputs_hash ?? {};
+    return (
+      inputs.identity_hash !== undefined
+      && inputs.executable_path_hash === executablePathHash
+      && inputs.owning_user_hash === owningUserHash
+      && inputs.source_classification === sourceClassification
+    );
+  });
+}
+
 /**
  * Folds this-tick's observations into `store`. `options.seedKnownGood: true` is set ONLY by the
  * operator-invoked `descartes provenance snapshot` CLI (never automatically, never by the daemon
@@ -311,6 +371,10 @@ export function reconcileSignatures(store, observations = [], options = {}) {
   const seededHashes = new Set();
 
   for (const observation of observations ?? []) {
+    // S5-follow-2, Part B (see isTransientStatFailureOfKnownIdentity above): a transient stat
+    // failure on an already-fingerprinted identity is skipped entirely for this reconcile, rather
+    // than folded in as a differently-signatured (and therefore spuriously new/drifted) identity.
+    if (isTransientStatFailureOfKnownIdentity(signatures, observation)) continue;
     const identityHash = computeIdentitySignature(observation);
     seededHashes.add(identityHash);
     const existing = signatures[identityHash];
@@ -462,14 +526,35 @@ function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
  * proxy; a codesign CDHash / full content hash remains a future hardening for signed binaries.
  * In the interim S4's deleted_exe_running rule already catches the common "FD still open to a
  * deleted inode" swap.
+ *
+ * RECOVERY (S5-follow-2, Codex review finding #5, Part A): a candidate is only ever emitted for a
+ * record (or, for identity_drift, for EACH SIDE of the comparison) whose `last_seen` is recent --
+ * within `options.presenceWindowMs` (default DEFAULT_IDENTITY_PRESENCE_WINDOW_MS, see its own doc
+ * comment) of `options.now` (default Date.now()). applyIdentityObservation always refreshes
+ * last_seen on every successful fold, so a still-running process/still-open socket keeps its
+ * record's last_seen current every reconcile; once a process exits or a socket closes, that
+ * record simply stops being observed, last_seen stops advancing, and once it falls outside the
+ * presence window this function stops emitting a candidate for it -- which is what lets
+ * applyAlertCandidates recover the corresponding alert on the next tick. For identity_drift
+ * specifically, BOTH sides of a target-key group must be currently present for drift to fire --
+ * once the stale (superseded) identity ages out of the window, drift resolves even if the current
+ * identity is still very much present.
  */
-export function deriveIdentityCandidates(store) {
+export function deriveIdentityCandidates(store, options = {}) {
   const signatures = store?.signatures ?? {};
   if (!store?.bootstrapped_at) return [];
+
+  const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const presenceWindowMs = options.presenceWindowMs ?? DEFAULT_IDENTITY_PRESENCE_WINDOW_MS;
+  const isPresent = (record) => {
+    const lastSeenMs = new Date(record?.last_seen ?? Number.NaN).getTime();
+    return Number.isFinite(lastSeenMs) && nowMs - lastSeenMs <= presenceWindowMs;
+  };
 
   const candidates = [];
   for (const [identityHash, record] of Object.entries(signatures)) {
     if (record.state !== "known_good" || record.origin !== "grace_window") continue;
+    if (!isPresent(record)) continue; // Recovered: unseen for longer than the presence window.
     candidates.push(buildUnknownIdentityCandidate(identityHash, record));
     for (const portKey of record.port_target_keys ?? []) {
       candidates.push(buildNewPublicBindCandidate(identityHash, record, portKey));
@@ -478,8 +563,9 @@ export function deriveIdentityCandidates(store) {
 
   const groups = groupKnownGoodByTargetKey(signatures);
   for (const [targetKey, entries] of groups) {
-    if (entries.length < 2) continue;
-    const sorted = [...entries].sort((a, b) => new Date(b.record.last_seen).getTime() - new Date(a.record.last_seen).getTime());
+    const presentEntries = entries.filter((entry) => isPresent(entry.record));
+    if (presentEntries.length < 2) continue;
+    const sorted = [...presentEntries].sort((a, b) => new Date(b.record.last_seen).getTime() - new Date(a.record.last_seen).getTime());
     const current = sorted[0];
     const stale = sorted.find((entry) => entry.identityHash !== current.identityHash);
     if (stale) candidates.push(buildIdentityDriftCandidate(targetKey, stale, current));
