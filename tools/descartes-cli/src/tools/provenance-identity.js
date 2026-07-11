@@ -109,7 +109,12 @@ export async function gatherIdentityObservations(options = {}) {
   const processes = await snapshotProcesses(platform, options);
   const processByPid = new Map(processes.map((item) => [item.pid, item]));
 
-  const ownUid = options.ownUid !== undefined
+  // Object.hasOwn, not a `!== undefined` check: an EXPLICIT `ownUid: undefined` means "the uid
+  // could not be determined" and must be honored (downstream skips every pid), never silently
+  // replaced by the real process.getuid(). A `!== undefined` check made that injection
+  // impossible and left the test environment-dependent (passed on uid!=fixture hosts, failed on
+  // the uid-501 CI macOS guest).
+  const ownUid = Object.hasOwn(options, "ownUid")
     ? options.ownUid
     : (typeof process.getuid === "function" ? process.getuid() : undefined);
 
