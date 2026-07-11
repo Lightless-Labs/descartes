@@ -483,6 +483,21 @@ test("defaultProbeElevatedHelper and defaultInvokeElevatedHelper pass an explici
 });
 
 // ---------------------------------------------------------------------------------------------
+// Shared fixture contract (pre-flight checklist item): the exact bytes the Rust helper emits and
+// the exact bytes parseAndVerifyHelperResponse must accept live in ONE file, read by both sides --
+// see crates/descartes-root-helper/src/json.rs's `emit_response_matches_the_shared_golden_fixture_byte_for_byte`
+// for the Rust-side reader of this same fixture.
+// ---------------------------------------------------------------------------------------------
+
+test("parseAndVerifyHelperResponse accepts the shared echo-back-contract.json fixture the Rust helper is pinned against", async () => {
+  const fixturePath = path.join(import.meta.dirname, "../../../crates/descartes-root-helper/tests/fixtures/echo-back-contract.json");
+  const rawStdout = (await fs.readFile(fixturePath, "utf8")).trim();
+
+  const parsed = parseAndVerifyHelperResponse(rawStdout, { kind: "port", value: 8080 });
+  assert.deepEqual(parsed, { pid: 4242, uid: 997, executable_path: "/opt/svc/bin/app", command: "app --serve" });
+});
+
+// ---------------------------------------------------------------------------------------------
 // Additional structural coverage.
 // ---------------------------------------------------------------------------------------------
 

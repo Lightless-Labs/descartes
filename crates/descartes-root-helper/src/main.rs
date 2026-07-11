@@ -1,0 +1,146 @@
+//! descartes-root-helper -- fixed-argv `/proc` resolver for descartes-cli's opt-in elevated
+//! read path (S3-priv). Slice 3: skeleton, argv contract, JSON stdout. NOT YET PRIVILEGED --
+//! this binary is granted no capability by anything in this crate; Slice 5 documents the
+//! (manual, out-of-code) `setcap cap_sys_ptrace=ep` install step, and Slice 4 adds the
+//! seccomp/no-new-privs/cap-drop hardening a capability-bearing build of this binary requires.
+//!
+//! Contract (authoritative source: `tools/descartes-cli/src/tools/provenance-elevated.js`,
+//! docs/plans/2026-07-11-s3-priv-elevated-read-path.md Slice 3):
+//!   - argv is EXACTLY `--probe` | `--resolve-pid <digits>` | `--resolve-port <digits>`.
+//!   - `--probe`: exit 0 means "available", nothing is ever printed to stdout. On a non-Linux
+//!     build this can never be true (there is no resolution mechanism), so `--probe` exits
+//!     nonzero -- reporting available would be a lie.
+//!   - A successful resolution prints ONE line of JSON to stdout and exits 0.
+//!   - ANY failure (bad argv, not-found, unreadable /proc, non-Linux) exits nonzero and prints
+//!     NOTHING to stdout -- never partial/malformed output. A short diagnostic on stderr is fine;
+//!     bad argv prints the literal `argv::USAGE` string to stderr.
+//!   - No env-based or config-file-based behavior of any kind.
+
+#![forbid(unsafe_code)]
+
+mod argv;
+mod json;
+#[cfg(target_os = "linux")]
+mod proc_linux;
+
+use argv::Command;
+
+// EXIT_SUCCESS is only ever returned on Linux (a --probe or successful resolution); on a
+// non-Linux build every path is a resolution failure by design (see run_probe below), so this
+// constant is legitimately unused there outside #[cfg(test)].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EXIT_SUCCESS: i32 = 0;
+const EXIT_RESOLUTION_FAILURE: i32 = 1;
+const EXIT_USAGE_ERROR: i32 = 2;
+
+fn main() {
+    // args_os, not args: std::env::args() panics on non-UTF-8 argv, which would exit 101 with a
+    // raw panic message instead of the contract's usage-error path (exit 2, USAGE on stderr).
+    let mut args: Vec<String> = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        match arg.into_string() {
+            Ok(arg) => args.push(arg),
+            Err(_) => {
+                eprintln!("{}", argv::USAGE);
+                std::process::exit(EXIT_USAGE_ERROR);
+            }
+        }
+    }
+    std::process::exit(run(&args));
+}
+
+fn run(args: &[String]) -> i32 {
+    match argv::parse(args) {
+        Err(()) => {
+            eprintln!("{}", argv::USAGE);
+            EXIT_USAGE_ERROR
+        }
+        Ok(Command::Probe) => run_probe(),
+        Ok(Command::ResolvePid(pid)) => run_resolve_pid(pid),
+        Ok(Command::ResolvePort(port)) => run_resolve_port(port),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_probe() -> i32 {
+    // Print NOTHING on --probe, per contract -- the Node side's defaultProbeElevatedHelper only
+    // ever inspects the exit status.
+    EXIT_SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_probe() -> i32 {
+    eprintln!("descartes-root-helper: elevated /proc resolution is only implemented on Linux");
+    EXIT_RESOLUTION_FAILURE
+}
+
+#[cfg(target_os = "linux")]
+fn run_resolve_pid(pid: u32) -> i32 {
+    match proc_linux::resolve_pid(pid) {
+        Some(resolved) => {
+            println!(
+                "{}",
+                json::emit_response(json::Requested::Pid(pid), &resolved)
+            );
+            EXIT_SUCCESS
+        }
+        None => {
+            eprintln!("descartes-root-helper: could not resolve pid {pid}");
+            EXIT_RESOLUTION_FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_resolve_pid(_pid: u32) -> i32 {
+    eprintln!("descartes-root-helper: elevated /proc resolution is only implemented on Linux");
+    EXIT_RESOLUTION_FAILURE
+}
+
+#[cfg(target_os = "linux")]
+fn run_resolve_port(port: u32) -> i32 {
+    match proc_linux::resolve_port(port) {
+        Some(resolved) => {
+            println!(
+                "{}",
+                json::emit_response(json::Requested::Port(port), &resolved)
+            );
+            EXIT_SUCCESS
+        }
+        None => {
+            eprintln!("descartes-root-helper: could not resolve port {port}");
+            EXIT_RESOLUTION_FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_resolve_port(_port: u32) -> i32 {
+    eprintln!("descartes-root-helper: elevated /proc resolution is only implemented on Linux");
+    EXIT_RESOLUTION_FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bad_argv_never_reaches_a_command_variant() {
+        assert_eq!(run(&[]), EXIT_USAGE_ERROR);
+        assert_eq!(run(&["--nonsense".to_string()]), EXIT_USAGE_ERROR);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_probe_and_resolve_are_always_a_resolution_failure_never_a_lie() {
+        assert_eq!(run_probe(), EXIT_RESOLUTION_FAILURE);
+        assert_eq!(run_resolve_pid(1), EXIT_RESOLUTION_FAILURE);
+        assert_eq!(run_resolve_port(1), EXIT_RESOLUTION_FAILURE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_probe_succeeds_silently() {
+        assert_eq!(run_probe(), EXIT_SUCCESS);
+    }
+}

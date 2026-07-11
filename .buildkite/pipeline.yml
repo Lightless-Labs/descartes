@@ -70,6 +70,11 @@ steps:
       npm run smoke:cli
       npm run pack:dry-run
 
+      # Rust workspace (crates/descartes-root-helper, S3-priv). Toolchain presence was
+      # verified by the capability probe (build #123); fail loudly if it regresses.
+      cargo --version
+      cargo test --workspace --locked
+
   - label: ":mac: macOS Apple Silicon"
     key: macos-apple-silicon
     if: build.tag == null
