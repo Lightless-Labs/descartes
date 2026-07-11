@@ -196,7 +196,7 @@ export function createEvidenceTools(paths) {
         container: Type.Optional(Type.String()),
       }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(await resolveProvenance({ pid: params.pid, port: params.port, container: params.container })),
+      execute: async (_id, params) => jsonToolResult(await resolveProvenance({ pid: params.pid, port: params.port, container: params.container }, { paths })),
     }),
     defineTool({
       name: "sample_dimension",

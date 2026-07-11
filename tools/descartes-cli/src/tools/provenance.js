@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
+import { resolveElevated } from "./provenance-elevated.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -468,14 +469,12 @@ export function computeProvenanceEnvelopeFields(resolvedStatus, sourceType) {
 // literal, unified into one shared builder so all three call sites below can never diverge.
 // Called with no arguments (or all-default/false inputs — no elevated attempt made), this is
 // byte-identical to the pre-S3-priv `{ mechanism: 'unprivileged', elevated_available: false,
-// elevated_used: false }`. `elevatedConfigEnabled` is accepted here for S3-priv Slice 2+ to wire
-// real values through later; nothing in this file passes anything but the defaults yet — this
-// slice adds zero elevated invocation/probe/privilege behavior.
+// elevated_used: false }`. On a verified elevated success (Slice 2), the resolved mechanism plus
+// elevatedAvailable/elevatedUsed:true are threaded through.
 export function computePrivilege({
   mechanism = "unprivileged",
   elevatedAvailable = false,
   elevatedUsed = false,
-  elevatedConfigEnabled = false,
 } = {}) {
   return {
     mechanism,
@@ -508,7 +507,11 @@ function buildNotFoundResult(kind, value, probe) {
   };
 }
 
-function finalizeProvenanceResult({ targetSelection, core, sockets }) {
+// S3-priv Slice 2 (additive): `privilege` is an optional override so a caller that has already
+// computed a real elevated-path privilege value (resolveCrossUidPortResult, below) can supply it.
+// Every pre-existing call site omits it, so `computePrivilege()`'s byte-identical default is
+// unaffected.
+function finalizeProvenanceResult({ targetSelection, core, sockets, privilege }) {
   const warnings = core.resolvedStatus !== "unknown" ? detectWarnings({ resolved: core.resolved, ancestry: core.ancestry, source: core.source }, sockets) : [];
   return {
     resolvedStatus: core.resolvedStatus,
@@ -519,7 +522,7 @@ function finalizeProvenanceResult({ targetSelection, core, sockets }) {
       source: core.source,
       sockets,
       warnings,
-      privilege: computePrivilege(),
+      privilege: privilege ?? computePrivilege(),
     },
   };
 }
@@ -671,7 +674,75 @@ async function resolveByPortMac(port) {
   });
 }
 
-async function resolveByPortLinux(port) {
+// S3-priv Slice 2: the cross-UID (or fd-walk-unresolved) degrade, extracted into its own small
+// function so the elevated *upgrade* (provenance-elevated.js's resolveElevated) can be layered on
+// top without disturbing resolveByPortLinux's /proc-parsing body. Computes the graceful
+// unprivileged partial/0.4/missing_permission baseline FIRST and unconditionally -- the owning UID
+// is a free confident fact the unprivileged path already has -- then, only when a `paths` carrier
+// was actually threaded through from the caller, offers that baseline to resolveElevated as the
+// exact value to fall back to on ANY non-success exit path. THE LOAD-BEARING DEGRADE INVARIANT
+// (plan §0): every elevated-path failure mode returns this unprivileged outcome UNCHANGED --
+// never the more-degraded `unable`/`0` shape (that's timedEnvelope's thrown-exception contract
+// only, untouched here).
+export async function resolveCrossUidPortResult({ port, primary, sockets }, options = {}) {
+  const unprivilegedCore = {
+    resolvedStatus: "partial",
+    resolved: {
+      status: "partial",
+      pid: undefined,
+      user: { uid: primary.uid, username: undefined, username_unavailable: true },
+      reason: "cross_uid_or_unresolved_pid",
+    },
+    ancestry: [],
+    source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: "cross_uid_or_unresolved_pid" } },
+  };
+  const unprivilegedOutcome = finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core: unprivilegedCore, sockets });
+
+  if (!options.paths) return unprivilegedOutcome;
+
+  const upgrade = await resolveElevated({ target: { kind: "port", value: port, uid: primary.uid }, paths: options.paths }, options);
+  if (!upgrade) return unprivilegedOutcome;
+
+  // Trust model: the owning uid is a FREE, confident fact the unprivileged path already resolved
+  // (primary.uid). The helper is trusted ONLY for the NEW fact it provides (the pid + exe/command),
+  // never to re-assert a fact we already hold. If the helper self-reports a uid that DISAGREES with
+  // the known-good one, it resolved the wrong socket/process (or is compromised), so its pid is also
+  // suspect: degrade to the unprivileged baseline rather than merge an untrusted, contradictory fact.
+  if (upgrade.uid !== undefined && Number(upgrade.uid) !== Number(primary.uid)) return unprivilegedOutcome;
+
+  // Bound the untrusted helper's path/command exactly like the unprivileged path (resolvePidCore
+  // truncates executable_path) before either reaches the evidence envelope / triage LLM.
+  const elevatedExecutablePath = truncate(upgrade.executablePath);
+  const elevatedCommand = truncate(upgrade.command);
+  const upgradedCore = {
+    resolvedStatus: "ok",
+    resolved: {
+      status: "ok",
+      pid: upgrade.pid,
+      executable_path: elevatedExecutablePath,
+      executable_path_unavailable: !upgrade.executablePath,
+      command: elevatedCommand,
+      // Always the trusted, unprivileged-derived owning uid — never the helper's self-report.
+      user: { uid: primary.uid, username: undefined, username_unavailable: true },
+    },
+    ancestry: [],
+    source: {
+      type: "elevated",
+      name: elevatedCommand,
+      confidence: 1,
+      review_hint: "none",
+      details: { reason: "resolved_via_elevated_helper", mechanism: upgrade.mechanism },
+    },
+  };
+  return finalizeProvenanceResult({
+    targetSelection: { kind: "port", value: port },
+    core: upgradedCore,
+    sockets,
+    privilege: computePrivilege({ mechanism: upgrade.mechanism, elevatedAvailable: true, elevatedUsed: true }),
+  });
+}
+
+async function resolveByPortLinux(port, options = {}) {
   const sources = [
     ["tcp", "/proc/net/tcp"],
     ["tcp6", "/proc/net/tcp6"],
@@ -712,24 +783,14 @@ async function resolveByPortLinux(port) {
   }
 
   // Cross-UID, or fd-walk could not resolve a pid: the owning UID is a confident fact; the pid
-  // itself is never fabricated.
-  const core = {
-    resolvedStatus: "partial",
-    resolved: {
-      status: "partial",
-      pid: undefined,
-      user: { uid: primary.uid, username: undefined, username_unavailable: true },
-      reason: "cross_uid_or_unresolved_pid",
-    },
-    ancestry: [],
-    source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: "cross_uid_or_unresolved_pid" } },
-  };
-  return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+  // itself is never fabricated. See resolveCrossUidPortResult above for the S3-priv Slice 2
+  // elevated-upgrade wrap.
+  return resolveCrossUidPortResult({ port, primary, sockets }, options);
 }
 
-async function resolveByPort(port) {
+async function resolveByPort(port, options = {}) {
   if (process.platform === "darwin") return resolveByPortMac(port);
-  if (process.platform === "linux") return resolveByPortLinux(port);
+  if (process.platform === "linux") return resolveByPortLinux(port, options);
   return { resolvedStatus: "unknown", result: buildNotFoundResult("port", port) };
 }
 
@@ -758,9 +819,9 @@ async function resolveByContainer(containerId) {
   return { resolvedStatus: "unknown", result: buildNotFoundResult("container", containerId, lastProbe) };
 }
 
-async function resolveByTarget(targetSelection) {
+async function resolveByTarget(targetSelection, options = {}) {
   if (targetSelection.kind === "pid") return resolveByPid(targetSelection.value);
-  if (targetSelection.kind === "port") return resolveByPort(targetSelection.value);
+  if (targetSelection.kind === "port") return resolveByPort(targetSelection.value, options);
   if (targetSelection.kind === "container") return resolveByContainer(targetSelection.value);
   return { resolvedStatus: "unknown", result: buildNotFoundResult(targetSelection.kind, targetSelection.value) };
 }
@@ -769,7 +830,14 @@ function provenanceEnvelopeId(targetSelection) {
   return `provenance-${targetSelection.kind}-${targetSelection.value ?? "unknown"}`;
 }
 
-export async function resolveProvenance(params = {}) {
+// S3-priv Slice 2 (additive): `options` is a new, optional second argument carrying `paths` (the
+// resolved Descartes XDG paths, needed to load configDir/provenance.json) plus DI overrides
+// (probeElevatedHelper, invokeElevatedHelper, loadProvenanceConfig, statFn, helperPath, ...)
+// threaded down through resolveByTarget -> resolveByPort -> resolveByPortLinux ->
+// resolveCrossUidPortResult -> provenance-elevated.js's resolveElevated. Every pre-existing
+// single-arg call site continues to produce byte-identical output: with no `options.paths`,
+// resolveCrossUidPortResult never even calls resolveElevated (see its own guard).
+export async function resolveProvenance(params = {}, options = {}) {
   let targetSelection;
   return timedEnvelope(async () => {
     // Target normalization runs inside the timedEnvelope-wrapped closure (not before it) so that
@@ -781,7 +849,7 @@ export async function resolveProvenance(params = {}) {
       return { status: "unknown", confidence: 0, reviewHint: "ambiguous", result: buildInvalidTargetResult(targetSelection) };
     }
 
-    const { resolvedStatus, result } = await resolveByTarget(targetSelection);
+    const { resolvedStatus, result } = await resolveByTarget(targetSelection, options);
     const fields = computeProvenanceEnvelopeFields(resolvedStatus, result.source?.type);
     return { status: fields.status, confidence: fields.confidence, reviewHint: fields.reviewHint, result };
   }, (built) => evidenceEnvelope({
