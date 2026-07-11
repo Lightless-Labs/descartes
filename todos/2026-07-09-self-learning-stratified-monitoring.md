@@ -102,3 +102,19 @@ Full review: `docs/reviews/2026-07-11-codex-gpt5.6-sol-review.md` (Codex gpt-5.6
 - [ ] First live Homebrew tap auto-bump on next `vX.Y.Z` tag; run `scripts/check-homebrew-tap-token.sh` before tagging (needs token-bearing env).
 - witr provenance + approval-notifications plan (`docs/plans/2026-07-09-witr-provenance-and-approval-notifications.md`).
 - rcodesign spike: deferred.
+
+## Observed-incident capability gaps (2026-07-11, from a real incident review)
+
+An operator-supplied screenshot succession — an unexplained **mass termination of ad-hoc worker sessions** coinciding with **unattributed VPN/SSH logins at odd hours**, during which an AI agent itself autonomously acted (remote-shelled in; told another agent to "resurrect" the killed sessions) with **no evidence-freeze and no approval gate** — was analyzed against Descartes' current capabilities (raw analysis kept local; infra details deliberately NOT committed to this public repo). Two lessons: (1) this is exactly the "detect the unexpected → monitor/log/inform → contain pending confirmation" event class the layered nervous system targets; (2) it illustrates the anti-pattern Descartes must NOT be — an agent that mutates state without the policy/authority plane.
+
+**Today (coarse):** `descartes triage` + read-only evidence tools can investigate the LIVE half — current processes, provenance (`inspect_runtime_provenance`) of suspect pids/ports, service/supervisor health, live log excerpts, resource sampling — and honestly reports uncertainty rather than asserting. It cannot reconstruct the RETROSPECTIVE succession.
+
+**Candidate new work items (motivated by this incident class):**
+- [ ] `collect_sessions` — tmux/screen session-census L0 collector + fact-history translator (resident vs ad-hoc, modeled over time; nothing tracks named sessions today, so a mass session-drop is invisible).
+- [ ] `inspect_vpn_peer_status` + peer-identity baseline — extend Layer B's identity baseline (unknown_identity/identity_drift) from processes to network/VPN peers: attribute logins to devices, flag unattributed / odd-hour peer logins.
+- [ ] Layer C session-count anomaly signature — a mass-drop is statistical/noisy, not a clean structural constraint.
+- [ ] Real-time event-source spike (macOS EndpointSecurity/eslogger; Linux auditd/eBPF/fanotify) — **TIME-BOXED** (per the spike guardrail) — to get an exec/file/network/login EVENT stream. Every collector today is point-in-time, so a succession can't be reconstructed after the fact.
+- [ ] L2 incident-correlation — cross-stream timeline join + ranked hypothesis (login-proximity ∧ kill-proximity), beyond the current single-candidate LLM adjudicator.
+- [ ] Authority/containment plane (the witr approval-store design) — kill/revoke/block/quarantine, all authority-gated (deny-by-default, nonce, expiry, audit; user / LLM / authenticated-agent / representative confirmation). **Ship-in-v0-safe first step: a forensic-snapshot / evidence-freeze action** — it persists evidence, mutates nothing, so it fits read-only v0.
+- [ ] Widen `collect_recent_logs` window cap (6h today; incident windows can be far longer).
+- [ ] Fleet / remote-host topology — Descartes is single-host/local by design; multi-host monitoring is an open question.
