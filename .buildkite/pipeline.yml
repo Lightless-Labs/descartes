@@ -2,8 +2,10 @@ steps:
   - label: ":linux: Linux ARM64"
     key: linux-arm64
     if: build.tag == null
+    # Linux guests are cheap (~20s per job) and don't count toward the macOS
+    # two-guest license limit, so they get their own group.
     concurrency: 2
-    concurrency_group: "big-cabbage/tart-ci"
+    concurrency_group: "big-cabbage/tart-ci-linux"
     agents:
       queue: "ci-linux-arm64"
     plugins:
@@ -71,8 +73,13 @@ steps:
   - label: ":mac: macOS Apple Silicon"
     key: macos-apple-silicon
     if: build.tag == null
-    concurrency: 2
-    concurrency_group: "big-cabbage/tart-ci"
+    # Exactly ONE macOS guest at a time (shared with the release job). Two
+    # concurrent macOS VMs starve each other on big-cabbage: solo runs take
+    # ~34 min, paired runs ~77+ min and die with shared-mount races, npm
+    # ENOENT crashes, or SSH reset-by-peer — builds #108-#120 (2026-07-10/11)
+    # were all red this way while Linux stayed green.
+    concurrency: 1
+    concurrency_group: "big-cabbage/tart-ci-macos"
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
@@ -143,12 +150,12 @@ steps:
   - label: ":apple: Release macOS notifier"
     key: release-macos-notifier
     if: build.tag != null && build.tag =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-    # Share the host-wide Tart cap with the CI jobs: macOS allows only two
-    # concurrent macOS guests per host, and a tag build can overlap a main
-    # build for the same commit (push then tag). A separate concurrency group
-    # would allow 2 CI VMs + 1 release VM on one host.
-    concurrency: 2
-    concurrency_group: "big-cabbage/tart-ci"
+    # Share the single macOS slot with the CI job: a tag build can overlap a
+    # main build for the same commit (push then tag), and big-cabbage cannot
+    # sustain two concurrent macOS guests (see the CI job's comment). One
+    # macOS VM at a time, period.
+    concurrency: 1
+    concurrency_group: "big-cabbage/tart-ci-macos"
     agents:
       queue: "ci-macos-apple-silicon"
     plugins:
