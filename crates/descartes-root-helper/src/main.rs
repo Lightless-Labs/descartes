@@ -1,8 +1,9 @@
 //! descartes-root-helper -- fixed-argv `/proc` resolver for descartes-cli's opt-in elevated
-//! read path (S3-priv). Slice 3: skeleton, argv contract, JSON stdout. NOT YET PRIVILEGED --
-//! this binary is granted no capability by anything in this crate; Slice 5 documents the
-//! (manual, out-of-code) `setcap cap_sys_ptrace=ep` install step, and Slice 4 adds the
-//! seccomp/no-new-privs/cap-drop hardening a capability-bearing build of this binary requires.
+//! read path (S3-priv). Slice 3 built the skeleton, argv contract, and JSON stdout. Slice 4
+//! (`hardening::engage()`, called first thing below) adds the seccomp/no-new-privs/cap-drop
+//! confinement a capability-bearing build of this binary requires. This binary is STILL granted
+//! no capability by anything in this crate -- Slice 5 documents the (manual, out-of-code)
+//! `setcap cap_sys_ptrace=ep` install step that will eventually make the hardening below matter.
 //!
 //! Contract (authoritative source: `tools/descartes-cli/src/tools/provenance-elevated.js`,
 //! docs/plans/2026-07-11-s3-priv-elevated-read-path.md Slice 3):
@@ -16,6 +17,9 @@
 //!     bad argv prints the literal `argv::USAGE` string to stderr.
 //!   - No env-based or config-file-based behavior of any kind.
 
+// This bin crate (main.rs + argv.rs + json.rs + proc_linux.rs) contains zero unsafe blocks --
+// all unsafe lives in the lib's hardening module and the separate probe bin -- so `forbid` (the
+// strictest of the two, unlike lib.rs's `deny`, it can never be locally relaxed) compiles clean.
 #![forbid(unsafe_code)]
 
 mod argv;
@@ -24,6 +28,12 @@ mod json;
 mod proc_linux;
 
 use argv::Command;
+use descartes_root_helper::hardening;
+
+// INVARIANT: every Linux exit path from this binary drops capabilities before terminating, not
+// just the two --resolve-* paths that actually did anything with the (future) capability --
+// `drop_capabilities()` is a documented no-op on non-Linux and a clean no-op when unprivileged, so
+// calling it uniformly costs nothing and removes "which exit paths are covered" as a question.
 
 // EXIT_SUCCESS is only ever returned on Linux (a --probe or successful resolution); on a
 // non-Linux build every path is a resolution failure by design (see run_probe below), so this
@@ -34,6 +44,10 @@ const EXIT_RESOLUTION_FAILURE: i32 = 1;
 const EXIT_USAGE_ERROR: i32 = 2;
 
 fn main() {
+    // FIRST statement, unconditionally, before any argv logic: fail-closed by construction (see
+    // hardening.rs) -- there is no code path in this binary that runs before confinement engages.
+    hardening::engage();
+
     // args_os, not args: std::env::args() panics on non-UTF-8 argv, which would exit 101 with a
     // raw panic message instead of the contract's usage-error path (exit 2, USAGE on stderr).
     let mut args: Vec<String> = Vec::new();
@@ -41,6 +55,7 @@ fn main() {
         match arg.into_string() {
             Ok(arg) => args.push(arg),
             Err(_) => {
+                hardening::drop_capabilities();
                 eprintln!("{}", argv::USAGE);
                 std::process::exit(EXIT_USAGE_ERROR);
             }
@@ -52,6 +67,7 @@ fn main() {
 fn run(args: &[String]) -> i32 {
     match argv::parse(args) {
         Err(()) => {
+            hardening::drop_capabilities();
             eprintln!("{}", argv::USAGE);
             EXIT_USAGE_ERROR
         }
@@ -63,6 +79,9 @@ fn run(args: &[String]) -> i32 {
 
 #[cfg(target_os = "linux")]
 fn run_probe() -> i32 {
+    // --probe never reads anything a future capability would gate, but it still drops per the
+    // "every Linux exit path drops" invariant above.
+    hardening::drop_capabilities();
     // Print NOTHING on --probe, per contract -- the Node side's defaultProbeElevatedHelper only
     // ever inspects the exit status.
     EXIT_SUCCESS
@@ -76,7 +95,11 @@ fn run_probe() -> i32 {
 
 #[cfg(target_os = "linux")]
 fn run_resolve_pid(pid: u32) -> i32 {
-    match proc_linux::resolve_pid(pid) {
+    let resolved = proc_linux::resolve_pid(pid);
+    // Drop right after the reads that need the (future) capability, before ANY output -- success
+    // or failure, per hardening.rs's documented sequence: resolve -> drop -> emit.
+    hardening::drop_capabilities();
+    match resolved {
         Some(resolved) => {
             println!(
                 "{}",
@@ -99,7 +122,11 @@ fn run_resolve_pid(_pid: u32) -> i32 {
 
 #[cfg(target_os = "linux")]
 fn run_resolve_port(port: u32) -> i32 {
-    match proc_linux::resolve_port(port) {
+    let resolved = proc_linux::resolve_port(port);
+    // Drop right after the reads that need the (future) capability, before ANY output -- success
+    // or failure, per hardening.rs's documented sequence: resolve -> drop -> emit.
+    hardening::drop_capabilities();
+    match resolved {
         Some(resolved) => {
             println!(
                 "{}",

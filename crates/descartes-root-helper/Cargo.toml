@@ -6,10 +6,19 @@ rust-version = "1.85"
 publish = false
 description = "Fixed-argv /proc resolver invoked by descartes-cli's opt-in elevated read path (S3-priv)."
 
-# ZERO runtime dependencies. This binary will later carry CAP_SYS_PTRACE (Slice 5); the
-# supply-chain surface of a capability-bearing binary must be nil. Do not add a dependency here
-# without revisiting that decision explicitly -- see docs/plans/2026-07-11-s3-priv-elevated-read-path.md.
+# Zero-runtime-dep policy, with ONE explicit exception. This binary will later carry
+# CAP_SYS_PTRACE (Slice 5); the supply-chain surface of a capability-bearing binary must stay
+# minimal. Do not add another dependency here without revisiting that decision explicitly -- see
+# docs/plans/2026-07-11-s3-priv-elevated-read-path.md.
+#
+# libc (Slice 4, S3-priv hardening): rust-lang-maintained, has no transitive deps of its own, and
+# gives arch-correct syscall numbers/constants (SYS_*, PR_*, BPF_*, SECCOMP_*) at compile time via
+# cfg -- hand-writing those per architecture is exactly the kind of mistake seccomp hardening
+# exists to prevent. NOTE: libc does NOT expose the capset(2) structs
+# (__user_cap_header_struct/__user_cap_data_struct) or the AUDIT_ARCH_* constants -- those are
+# hand-defined in src/hardening.rs from the kernel UAPI headers they come from.
 [dependencies]
+libc = "0.2"
 
 # serde_json is dev-only: it parses/validates JSON inside tests, it never ships in the binary.
 [dev-dependencies]

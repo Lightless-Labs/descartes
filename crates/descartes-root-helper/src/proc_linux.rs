@@ -14,6 +14,10 @@ use std::fs;
 
 use crate::json::Resolved;
 
+// Uses std free functions only (fs::read/read_to_string/read_dir/read_link), never `Read` trait
+// methods on an open `File` -- the trait's read_to_* methods issue lseek, see the allowlist note
+// on SYS_lseek in hardening.rs for why that distinction matters under the seccomp filter.
+
 /// Upper bound on file-descriptor symlinks scanned per candidate process while hunting for the
 /// socket inode that owns a requested port. Bounds worst-case syscall cost against a process with
 /// a huge (possibly adversarial) fd table -- CAP_SYS_PTRACE will later let this scan reach
