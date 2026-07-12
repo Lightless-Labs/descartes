@@ -3,8 +3,10 @@
 # read path (docs/plans/2026-07-11-s3-priv-elevated-read-path.md, pre-flight checklist).
 #
 # It answers: does the CI Linux guest have a Rust toolchain, passwordless sudo, and the
-# sysadmin binaries (setcap/useradd/...) needed to grant CAP_SYS_PTRACE and spawn a second
-# UID for the Slice 6 cross-UID validation? Mutates nothing. Safe to run anywhere.
+# sysadmin binaries (setcap/useradd/...) needed to grant the cap_sys_ptrace,cap_dac_read_search
+# file-capability UNION (2026-07-12 fix: cap_sys_ptrace alone is insufficient for cross-UID PORT
+# resolution -- see scripts/ci-elevated-provenance.sh's header comment) and spawn a second UID for
+# the Slice 6 cross-UID validation? Mutates nothing. Safe to run anywhere.
 #
 # HOW TO RUN: add a temporary, non-blocking Buildkite step (paste the snippet in the
 # S3-priv plan / the PR that adds this), or SSH into a tart-ci Linux guest and run it.
@@ -37,7 +39,7 @@ for b in setcap getcap capsh useradd groupadd setpriv runuser; do
   if command -v "$b" >/dev/null; then echo "  $b: $(command -v "$b")"; else echo "  $b: MISSING"; fi
 done
 
-echo "----- Yama ptrace_scope (affects whether CAP_SYS_PTRACE actually works) -----"
+echo "----- Yama ptrace_scope (affects whether CAP_SYS_PTRACE/CAP_DAC_READ_SEARCH actually work) -----"
 if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
   ps="$(cat /proc/sys/kernel/yama/ptrace_scope)"
   echo "  ptrace_scope=$ps  (0=classic,1=restricted-but-capable-ok,2=admin-only,3=disabled-even-for-capable)"

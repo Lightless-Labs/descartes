@@ -2,8 +2,11 @@
 //! read path (S3-priv). Slice 3 built the skeleton, argv contract, and JSON stdout. Slice 4
 //! (`hardening::engage()`, called first thing below) adds the seccomp/no-new-privs/cap-drop
 //! confinement a capability-bearing build of this binary requires. This binary is STILL granted
-//! no capability by anything in this crate -- Slice 5 documents the (manual, out-of-code)
-//! `setcap cap_sys_ptrace=ep` install step that will eventually make the hardening below matter.
+//! no capability by anything in this crate -- Slice 5/6 document (and, in CI, actually perform)
+//! the (manual, out-of-code) `setcap cap_sys_ptrace,cap_dac_read_search=ep` install step -- the
+//! minimal sufficient capability UNION for cross-UID `/proc/<pid>/fd` enumeration, not
+//! `cap_sys_ptrace` alone (see `proc_linux.rs`'s module doc) -- that will eventually make the
+//! hardening below matter.
 //!
 //! Contract (authoritative source: `tools/descartes-cli/src/tools/provenance-elevated.js`,
 //! docs/plans/2026-07-11-s3-priv-elevated-read-path.md Slice 3):

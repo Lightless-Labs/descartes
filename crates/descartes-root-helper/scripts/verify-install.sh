@@ -30,7 +30,19 @@ set -euo pipefail
 readonly EXPECTED_OWNER="root"
 readonly EXPECTED_GROUP="descartes-provenance"
 readonly EXPECTED_MODE="750"
-readonly EXPECTED_CAP_LINE="cap_sys_ptrace=ep"
+# S3-priv Slice 6 fix (2026-07-12): a real privileged CI run proved cap_sys_ptrace ALONE is
+# insufficient for cross-UID PORT resolution -- /proc/<pid>/fd is a DIRECTORY whose kernel
+# permission hook (proc_fd_permission) is DAC-gated, not ptrace_may_access-gated, so enumerating
+# another UID's fd table needs cap_dac_read_search; cap_sys_ptrace alone only covers the readlink
+# of the fd targets + /exe. The minimal sufficient grant is the UNION of both (cap_dac_override
+# confirmed NOT needed). getcap prints capability names in CAPABILITY-NUMBER order
+# (DAC_READ_SEARCH=2 before SYS_PTRACE=19), regardless of the order setcap was given -- hence this
+# exact ordering, used only for operator-facing messages below; the actual PASS/FAIL check (5,
+# below) compares a SORTED capability-name SET, not this literal string, so it is insensitive to
+# getcap's own ordering.
+readonly EXPECTED_CAP_LINE="cap_dac_read_search,cap_sys_ptrace=ep"
+readonly EXPECTED_CAP_NAMES_SORTED="cap_dac_read_search,cap_sys_ptrace"
+readonly EXPECTED_CAP_FLAGS="ep"
 readonly WRITABLE_MASK=$((8#022)) # group- or world-writable bits.
 
 HELPER_PATH="${1:-/usr/local/libexec/descartes/descartes-root-helper}"
@@ -160,25 +172,55 @@ fi
 
 CAP_OUTPUT="$(getcap "$TARGET" 2>/dev/null || true)"
 if [ -z "$CAP_OUTPUT" ]; then
-  fail "getcap reported no capabilities on $TARGET -- the cap_sys_ptrace grant is missing (run: setcap cap_sys_ptrace=ep $TARGET)"
+  fail "getcap reported no capabilities on $TARGET -- the cap_sys_ptrace,cap_dac_read_search grant is missing (run: setcap \"cap_sys_ptrace,cap_dac_read_search=ep\" $TARGET)"
 fi
 
 # libcap's `getcap` has shipped two output formats across versions:
-#   older:  "<path> = cap_sys_ptrace+ep"
-#   newer:  "<path> cap_sys_ptrace=ep"
+#   older:  "<path> = cap_dac_read_search,cap_sys_ptrace+ep"
+#   newer:  "<path> cap_dac_read_search,cap_sys_ptrace=ep"
 # Strip the leading "<path>" (and, for the older format, the " = "), normalize the older format's
-# '+' (add-to-existing at grant time) to '=' for comparison purposes, then require the REMAINDER
-# to be exactly "cap_sys_ptrace=ep". Any broader capability set, any other capability name, or an
-# unparseable/unexpected line fails this comparison (the prefix-strip is a no-op when it doesn't
-# match, which correctly leaves the comparison failing rather than silently accepting garbage).
+# '+' (add-to-existing at grant time) to '=' for comparison purposes. The REMAINDER is then
+# parsed, not string-equal-compared: split into whitespace-separated CLAUSES (a getcap line can in
+# general carry more than one differently-flagged capability group -- collapsing that into a
+# single "clause count must be exactly 1" check below fails closed on anything unexpected rather
+# than silently mashing clauses together), then the one clause is split on its FIRST '=' into a
+# comma-separated capability-NAME list and a FLAGS string. The name list is sorted (getcap prints
+# names in capability-number order, which happens to already be alphabetical for this pair, but
+# the sort makes the comparison independent of that) and compared as a SET against
+# EXPECTED_CAP_NAMES_SORTED, and the flags are compared to EXPECTED_CAP_FLAGS exactly. This
+# REJECTS: any extra capability (e.g. cap_dac_override, cap_sys_admin -- broader), any missing
+# capability (e.g. the stale single-cap cap_sys_ptrace=ep grant from before this fix -- narrower),
+# any flags other than "ep" (e.g. "eip", "p"), and any unparseable/multi-clause line.
 CAP_REMAINDER="${CAP_OUTPUT#"$TARGET"}"
 CAP_REMAINDER="${CAP_REMAINDER# }"
 CAP_REMAINDER="${CAP_REMAINDER#= }"
 CAP_REMAINDER="${CAP_REMAINDER//+/=}"
-CAP_REMAINDER="$(printf '%s' "$CAP_REMAINDER" | tr -d '[:space:]')"
+# Collapse any run of whitespace to a single space and trim the ends, so a legitimate single-clause
+# line normalizes cleanly while a multi-clause line still yields more than one word below (rather
+# than being accidentally glued into one unparseable token by a later blanket whitespace-strip).
+CAP_REMAINDER="$(printf '%s' "$CAP_REMAINDER" | tr -s '[:space:]' ' ')"
+CAP_REMAINDER="${CAP_REMAINDER# }"
+CAP_REMAINDER="${CAP_REMAINDER% }"
 
-if [ "$CAP_REMAINDER" != "$EXPECTED_CAP_LINE" ]; then
-  fail "getcap output for $TARGET is '$CAP_OUTPUT', expected exactly '$EXPECTED_CAP_LINE' and nothing broader (parsed remainder: '$CAP_REMAINDER')"
+CAP_CLAUSE_COUNT="$(printf '%s' "$CAP_REMAINDER" | wc -w | tr -d '[:space:]')"
+if [ "$CAP_CLAUSE_COUNT" != "1" ]; then
+  fail "getcap output for $TARGET is '$CAP_OUTPUT', expected exactly one capability clause (got $CAP_CLAUSE_COUNT) -- expected '$EXPECTED_CAP_LINE'"
+fi
+CAP_CLAUSE="$CAP_REMAINDER"
+
+CAP_NAMES_PART="${CAP_CLAUSE%%=*}"
+CAP_FLAGS_PART="${CAP_CLAUSE#*=}"
+if [ "$CAP_NAMES_PART" = "$CAP_CLAUSE" ] || [ -z "$CAP_NAMES_PART" ] || [ -z "$CAP_FLAGS_PART" ]; then
+  fail "getcap output for $TARGET is '$CAP_OUTPUT', could not parse a '<names>=<flags>' clause out of '$CAP_CLAUSE' -- expected '$EXPECTED_CAP_LINE'"
+fi
+if [ "$CAP_FLAGS_PART" != "$EXPECTED_CAP_FLAGS" ]; then
+  fail "getcap output for $TARGET is '$CAP_OUTPUT', expected flags '$EXPECTED_CAP_FLAGS' (Effective+Permitted), got '$CAP_FLAGS_PART' -- expected exactly '$EXPECTED_CAP_LINE'"
+fi
+
+CAP_NAMES_SORTED="$(printf '%s' "$CAP_NAMES_PART" | tr ',' '\n' | sort | tr '\n' ',')"
+CAP_NAMES_SORTED="${CAP_NAMES_SORTED%,}"
+if [ "$CAP_NAMES_SORTED" != "$EXPECTED_CAP_NAMES_SORTED" ]; then
+  fail "getcap output for $TARGET is '$CAP_OUTPUT', expected exactly the capability set {cap_dac_read_search, cap_sys_ptrace} and nothing broader or narrower (parsed, sorted: '$CAP_NAMES_SORTED') -- expected '$EXPECTED_CAP_LINE'"
 fi
 
 # --- 6. nosuid mount check ---------------------------------------------------------------------
@@ -234,14 +276,23 @@ if [ -n "$SYSTEMD_SERVICE_UNIT" ] && [ -n "$SYSTEMD_SOCKET_UNIT" ]; then
   if [ "$SERVICE_USER" != "root" ]; then
     fail "systemd unit $SYSTEMD_SERVICE_UNIT has User='$SERVICE_USER', expected 'root'"
   fi
-  # systemd's --value output for CapabilityBoundingSet is a space-separated cap-name list;
-  # require it to be exactly the single CAP_SYS_PTRACE entry (collapse repeated separators first
-  # so trivial whitespace differences never cause a false FAIL/PASS).
-  SERVICE_CAPS_NORMALIZED="$(printf '%s' "$SERVICE_CAPS" | tr -s '[:space:]' ' ')"
-  SERVICE_CAPS_NORMALIZED="${SERVICE_CAPS_NORMALIZED# }"
-  SERVICE_CAPS_NORMALIZED="${SERVICE_CAPS_NORMALIZED% }"
-  if [ "$SERVICE_CAPS_NORMALIZED" != "CAP_SYS_PTRACE" ]; then
-    fail "systemd unit $SYSTEMD_SERVICE_UNIT has CapabilityBoundingSet='$SERVICE_CAPS', expected exactly 'CAP_SYS_PTRACE'"
+  # systemd's --value output for CapabilityBoundingSet is a space-separated cap-name list.
+  # S3-priv Slice 6 fix (2026-07-12): this mechanism runs the helper as literal root, but a
+  # process's EFFECTIVE capabilities are still bounded by its capability BOUNDING SET even as
+  # root -- so a bounding set restricted to CAP_SYS_PTRACE alone reproduces the exact same
+  # cross-UID /proc/<pid>/fd enumeration failure the stale single-cap file-capability grant does
+  # (see the getcap check above / docs/plans/2026-07-10-layer-b-provenance.md's 2026-07-12
+  # addendum). Required set is therefore the same 2-capability UNION as the primary mechanism.
+  # Compared as a SORTED WORD SET, never assuming order -- `systemctl show` prints capabilities in
+  # capability-number order (DAC_READ_SEARCH=2 before SYS_PTRACE=19), which this repo's own fixture
+  # shim happens to already emit in that order, but the comparison below does not rely on that:
+  # `tr -s`+`tr ' ' '\n'`+`sort` makes it order-independent by construction. This still REJECTS a
+  # broader bounding set (e.g. an added CAP_SYS_ADMIN), a narrower/missing one (e.g. the old
+  # single-cap CAP_SYS_PTRACE-only unit), or an empty one.
+  SERVICE_CAPS_SORTED="$(printf '%s' "$SERVICE_CAPS" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort | tr '\n' ' ')"
+  SERVICE_CAPS_SORTED="${SERVICE_CAPS_SORTED% }"
+  if [ "$SERVICE_CAPS_SORTED" != "CAP_DAC_READ_SEARCH CAP_SYS_PTRACE" ]; then
+    fail "systemd unit $SYSTEMD_SERVICE_UNIT has CapabilityBoundingSet='$SERVICE_CAPS', expected exactly the set {CAP_DAC_READ_SEARCH, CAP_SYS_PTRACE} (parsed, sorted: '$SERVICE_CAPS_SORTED')"
   fi
   if [ "$SERVICE_NNP" != "yes" ]; then
     fail "systemd unit $SYSTEMD_SERVICE_UNIT has NoNewPrivileges='$SERVICE_NNP', expected 'yes'"

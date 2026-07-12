@@ -5,9 +5,15 @@
 //! uid, executable path, AND cmdline all read successfully. In particular, a status file that
 //! reads fine but an unreadable `exe` symlink (EACCES on another UID's process today) still fails
 //! the whole lookup -- we never emit a partial resolution. Cross-UID reads are exactly the gap
-//! Slice 5's CAP_SYS_PTRACE grant unlocks; until then, this binary can only ever fully resolve
-//! processes it already shares a UID with, which is also all that's needed for the unit/
-//! integration tests in this crate (they resolve the test's own process).
+//! Slice 5/6's grant unlocks -- empirically the UNION `cap_sys_ptrace,cap_dac_read_search=ep`, not
+//! `cap_sys_ptrace` alone (a real privileged CI run proved `cap_sys_ptrace`-only insufficient for
+//! `find_owning_pid` below). `/proc/<pid>/fd` is a DIRECTORY whose kernel permission hook
+//! (`proc_fd_permission`) is DAC/same-thread-group gated, NOT `ptrace_may_access` -- so
+//! *enumerating* another UID's fd table (this module's `getdents64` via
+//! `procfs::read_dir_entries_at`) needs `cap_dac_read_search`; `cap_sys_ptrace` only covers the
+//! subsequent `readlinkat` of the fd targets and of `exe`. Until the grant, this binary can only
+//! ever fully resolve processes it already shares a UID with, which is also all that's needed for
+//! the unit/integration tests in this crate (they resolve the test's own process).
 //!
 //! Slice 5 Part A: every per-pid read (status/cmdline/exe, and the `"fd"` table walked below)
 //! goes through a `/proc/<pid>` DIRFD pinned ONCE via `descartes_root_helper::procfs::open_pid_dir`
@@ -41,9 +47,10 @@ use crate::json::Resolved;
 
 /// Upper bound on file-descriptor symlinks scanned per candidate process while hunting for the
 /// socket inode that owns a requested port. Bounds worst-case syscall cost against a process with
-/// a huge (possibly adversarial) fd table -- CAP_SYS_PTRACE will later let this scan reach
-/// other-UID processes, so the bound also caps how much of another user's fd table this helper
-/// will ever walk on their behalf in a single call.
+/// a huge (possibly adversarial) fd table -- the `cap_sys_ptrace,cap_dac_read_search` grant
+/// (Slice 5/6; see the module doc for why both capabilities, not `cap_sys_ptrace` alone) will
+/// later let this scan reach other-UID processes, so the bound also caps how much of another
+/// user's fd table this helper will ever walk on their behalf in a single call.
 const MAX_FDS_PER_PROCESS: usize = 4096;
 
 /// Upper bound on the number of numeric `/proc/<pid>` directories scanned while hunting for a
@@ -192,10 +199,13 @@ fn listening_inodes_for_port(port: u32) -> HashSet<String> {
 /// just likely.
 ///
 /// Unreadable/vanished `/proc/<pid>` or `/proc/<pid>/fd` (EACCES on another UID's process today,
-/// or ESRCH because the process already exited) are skipped SILENTLY -- EACCES is exactly the gap
-/// CAP_SYS_PTRACE unlocks in a later slice, not an error condition here, and a since-exited
-/// process is precisely the reuse hazard this module defends against, so it fails closed the same
-/// way. First match wins (see `resolve_port`'s doc on the multi-owner limitation).
+/// or ESRCH because the process already exited) are skipped SILENTLY -- EACCES on `/proc/<pid>/fd`
+/// is exactly the gap `cap_dac_read_search` unlocks in a later slice (the fd DIRECTORY's
+/// permission check, `proc_fd_permission`, is DAC-gated, not `ptrace_may_access` -- `cap_sys_ptrace`
+/// alone does not reach it; `cap_sys_ptrace` covers the readlink of what's found once the
+/// directory can be enumerated -- see the module doc), not an error condition here, and a
+/// since-exited process is precisely the reuse hazard this module defends against, so it fails
+/// closed the same way. First match wins (see `resolve_port`'s doc on the multi-owner limitation).
 fn find_owning_pid(inodes: &HashSet<String>) -> Option<Resolved> {
     let proc_dir = fs::read_dir("/proc").ok()?;
     let mut scanned_processes = 0usize;

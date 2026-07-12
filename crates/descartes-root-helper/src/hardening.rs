@@ -1,9 +1,11 @@
 //! Kernel-level defensive hardening for descartes-root-helper (S3-priv Slice 4). This crate is
 //! currently unprivileged and stays that way in this slice (see `main.rs`'s module doc). The
-//! properties installed here exist so that WHEN Slice 5 manually grants `cap_sys_ptrace=ep` (a
-//! `setcap` step outside this repo's code), that capability's blast radius is structurally
-//! confined: `ptrace(2)` and everything that shares its threat model become unreachable syscalls,
-//! not merely policy the binary promises not to use.
+//! properties installed here exist so that WHEN Slice 5 manually grants
+//! `cap_sys_ptrace,cap_dac_read_search=ep` (a `setcap` step outside this repo's code -- see
+//! `proc_linux.rs`'s module doc for why the grant is that 2-capability UNION, not `cap_sys_ptrace`
+//! alone), that capability pair's blast radius is structurally confined: `ptrace(2)`,
+//! `open_by_handle_at(2)`, and everything that shares either capability's threat model become
+//! unreachable syscalls, not merely policy the binary promises not to use.
 //!
 //! Three properties, all KERNEL-enforced (never code-review-assumed):
 //!   1. `PR_SET_NO_NEW_PRIVS` (`engage()`) -- this process can never gain privilege beyond what it
@@ -12,8 +14,12 @@
 //!   2. A seccomp-bpf syscall ALLOWLIST (`engage()`, default action `SECCOMP_RET_KILL_PROCESS`,
 //!      the process-scoped kill, not the legacy thread-scoped `SECCOMP_RET_KILL`) that makes
 //!      `ptrace`, `process_vm_readv`, `process_vm_writev`, and `pidfd_getfd` -- the whole
-//!      CAP_SYS_PTRACE blast radius, not just `ptrace` itself -- unreachable. Requires a Linux
-//!      kernel >= 4.14 (KILL_PROCESS's introduction); this repo's CI runs 6.17.
+//!      CAP_SYS_PTRACE blast radius, not just `ptrace` itself -- unreachable, AND makes
+//!      `open_by_handle_at` -- CAP_DAC_READ_SEARCH's own blast-radius amplifier (opens an
+//!      arbitrary file by opaque on-disk handle, bypassing the normal directory-permission walk)
+//!      -- unreachable too, even though the real grant (Slice 5/6) is the union of both
+//!      capabilities. Requires a Linux kernel >= 4.14 (KILL_PROCESS's introduction); this repo's
+//!      CI runs 6.17.
 //!   3. A capability drop (`drop_capabilities()`, called separately by `main.rs` AFTER the /proc
 //!      reads that need the future capability and BEFORE any output) that zeroes the
 //!      effective/permitted/inheritable sets and the ambient set.
@@ -121,9 +127,11 @@ mod linux {
     ///     dies to SIGSYS instead of SIGABRT -- still loud, still a nonzero exit, but a SIGSYS core
     ///     from this binary should be read as "maybe just a panic", not only "attack".
     ///
-    /// ptrace, process_vm_readv, process_vm_writev, pidfd_getfd, socket, and everything else are
-    /// deliberately ABSENT here -- caught by the default KILL_PROCESS action, not an explicit deny
-    /// (see `tests/hardening.rs`, which regression-proofs several of these by name).
+    /// ptrace, process_vm_readv, process_vm_writev, pidfd_getfd, open_by_handle_at, socket, and
+    /// everything else are deliberately ABSENT here -- caught by the default KILL_PROCESS action,
+    /// not an explicit deny (see `tests/hardening.rs`, which regression-proofs several of these by
+    /// name, including `open_by_handle_at` -- CAP_DAC_READ_SEARCH's own amplifier syscall, added
+    /// as a deny-probe for the Slice 6 grant that adds that capability).
     fn allowed_syscalls() -> Vec<libc::c_long> {
         // `mut` is only exercised on x86_64 (the push below); aarch64 has no such syscall to add.
         #[allow(unused_mut)]
@@ -299,16 +307,18 @@ mod linux {
     /// `capset(2)`, ambient set via `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)`.
     ///
     /// Deliberately NOT `PR_CAPBSET_DROP`: that needs `CAP_SETPCAP`, which this binary never holds
-    /// (EPERM both unprivileged today and under the real cap_sys_ptrace-only grant Slice 5 adds).
-    /// Deliberately does not touch the bounding set at all: it only constrains capability GAIN
-    /// across execve, and this process can never execve -- no exec* syscall is allowlisted above,
-    /// and NO_NEW_PRIVS is set regardless.
+    /// (EPERM both unprivileged today and under the real `cap_sys_ptrace,cap_dac_read_search`
+    /// grant Slice 5/6 add). Deliberately does not touch the bounding set at all: it only
+    /// constrains capability GAIN across execve, and this process can never execve -- no exec*
+    /// syscall is allowlisted above, and NO_NEW_PRIVS is set regardless.
     ///
     /// Called by the production binary right after a resolve attempt (success or failure) and
     /// before any output -- see `main.rs`. Unprivileged (this crate, today), this is a verified
     /// no-op: a thread may always shrink its own capability sets, so dropping an already-empty set
     /// always succeeds -- which is exactly what makes this genuinely uniform between CI (no caps
-    /// at all) and the real Slice-5 grant (cap_sys_ptrace only).
+    /// at all) and the real Slice-5/6 grant (`cap_sys_ptrace,cap_dac_read_search` -- the minimal
+    /// sufficient union for cross-UID `/proc/<pid>/fd` enumeration; see `proc_linux.rs`'s module
+    /// doc for why both capabilities, not `cap_sys_ptrace` alone, are required).
     pub fn drop_capabilities() {
         // Version probe: confirm the running kernel accepts the version this file hand-rolled the
         // two-element CapUserData array for, rather than assume it. A null second argument is the

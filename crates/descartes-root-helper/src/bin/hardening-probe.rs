@@ -49,6 +49,11 @@ mod linux_probe {
                 do_process_vm_writev();
                 1
             }
+            "--do-open-by-handle-at" => {
+                hardening::engage();
+                do_open_by_handle_at();
+                1
+            }
             "--check-nnp" => {
                 hardening::engage();
                 check_nnp()
@@ -176,6 +181,31 @@ mod linux_probe {
                 &remote as *const libc::iovec,
                 1u64,
                 0u64,
+            );
+        }
+    }
+
+    /// crit5 (S3-priv Slice 6 fix, `cap_dac_read_search`'s own amplifier): `open_by_handle_at`
+    /// opens an arbitrary file by an opaque on-disk handle, bypassing the normal directory-path
+    /// permission walk that would otherwise gate access -- in the kernel it is gated by
+    /// `capable(CAP_DAC_READ_SEARCH)` (see `fs/fhandle.c`), the exact capability the Slice 6 fix
+    /// adds to this binary's file-capability grant (`cap_sys_ptrace,cap_dac_read_search=ep`) for
+    /// cross-UID `/proc/<pid>/fd` enumeration. It is deliberately NOT in `allowed_syscalls()`, so
+    /// the default `SECCOMP_RET_KILL_PROCESS` action must still apply even though this binary now
+    /// actually holds the capability that would otherwise make the syscall usable -- regression-
+    /// proofing that the seccomp allowlist, not just "we don't call it," is what keeps this
+    /// amplifier unreachable. The seccomp filter kills this at syscall ENTRY, before the kernel
+    /// even inspects the arguments, so the dummy `mount_fd`/`handle`/`flags` below are never
+    /// touched -- same reasoning as `do_process_vm_readv`/`do_process_vm_writev` above.
+    fn do_open_by_handle_at() {
+        // SAFETY: under the filter this never executes past syscall entry -- the kernel never
+        // dereferences the null `handle` pointer or does anything with the dummy `mount_fd`/flags.
+        unsafe {
+            libc::syscall(
+                libc::SYS_open_by_handle_at,
+                -1,
+                ptr::null::<libc::c_void>(),
+                0,
             );
         }
     }

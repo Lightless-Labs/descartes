@@ -19,18 +19,24 @@ the pid/executable/command — it returns `status:"partial"`, `confidence:0.4`,
 document.
 
 The elevated read path closes that gap by using a tiny, purpose-built helper binary
-(`crates/descartes-root-helper`) that holds **only** `CAP_SYS_PTRACE` (never full root, unless you
-explicitly choose the named systemd fallback below) and does nothing but resolve a pid or port to
-`{pid, uid, executable_path, command}` on a fixed, bounded argv. It is gated behind **two
+(`crates/descartes-root-helper`) that holds **only the minimal capability union
+`CAP_SYS_PTRACE,CAP_DAC_READ_SEARCH`** (never full root, unless you explicitly choose the named
+systemd fallback below) and does nothing but resolve a pid or port to
+`{pid, uid, executable_path, command}` on a fixed, bounded argv. (Both capabilities are required —
+see Step 4 below for why `CAP_SYS_PTRACE` alone is insufficient.) It is gated behind **two
 independent opt-ins**, both required:
 
 1. **This document's OS-level grant** (out-of-code, manual, one-time).
 2. **`configDir/provenance.json`'s `elevated.enabled:true`** (Descartes's own config, Slice 1).
 
 Either absent, the feature degrades silently back to the unprivileged `partial`/`0.4` baseline
-above. Nothing in Descartes's own code path ever escalates privilege or shells out to `sudo`,
-`pkexec`, `setcap`, or any other privilege-escalation mechanism — that invariant is enforced by a
-standing CI lint. This document is the **only** place a human runs those commands.
+above. Nothing in the daemon/provenance runtime's own code path (`tools/descartes-cli/src/**/*.js`)
+ever escalates privilege or shells out to `sudo`, `pkexec`, `setcap`, or any other
+privilege-escalation mechanism — that invariant is enforced by
+`tools/descartes-cli/test/escalation-lint.test.js`, a standing lint that scans that source tree for
+escalation shell-outs and macOS privileged-helper API references (comment- and string-safe, so it
+does not false-positive on prose describing the invariant) and runs as part of `npm test` on every
+build and every local run. This document is the **only** place a human runs those commands.
 
 ## Prerequisites
 
@@ -98,12 +104,23 @@ slip through undetected.
 ### 4. Grant the capability
 
 ```bash
-setcap cap_sys_ptrace=ep /usr/local/libexec/descartes/descartes-root-helper
+setcap "cap_sys_ptrace,cap_dac_read_search=ep" /usr/local/libexec/descartes/descartes-root-helper
 ```
 
-This is the **primary** mechanism. `ep` = Effective + Permitted (the capability is active on
-exec, not merely inheritable). Do **not** grant a broader capability set — `verify-install.sh`
-below rejects anything except exactly `cap_sys_ptrace=ep`.
+This is the **primary** mechanism, and it is a **union of two capabilities, both required**. A
+real privileged CI run (2026-07-12) proved `cap_sys_ptrace` **alone is insufficient** for cross-UID
+**port** resolution: `--resolve-port` enumerates `/proc/<pid>/fd` (mode `0500`, owner = the target
+uid) to match a listening socket's inode to its owning pid. The fd **directory's** kernel
+permission check (`proc_fd_permission`) is DAC/same-thread-group gated — **not**
+`ptrace_may_access` — so *enumerating* another user's fd table needs `cap_dac_read_search`;
+`cap_sys_ptrace` only covers the subsequent `readlink` of the fd targets and of `/exe`. (Cross-UID
+`--resolve-pid` alone needs only `cap_sys_ptrace`, since `status`/`cmdline` are world-readable —
+but the file-capability grant is per-binary, so it must always carry the union.) `cap_dac_override`
+was tested and confirmed **not** needed. `ep` = Effective + Permitted (both capabilities are active
+on exec, not merely inheritable). Do **not** grant a broader capability set —
+`verify-install.sh` below rejects anything except exactly this 2-capability set with `ep` flags —
+and do **not** leave a narrower one in place (e.g. the stale single-cap `cap_sys_ptrace=ep` grant
+from before 2026-07-12): see the upgrade warning below.
 
 ### 5. Add the daemon's account to the group
 
@@ -152,11 +169,24 @@ fine but the capability-requiring syscalls will fail), with no loud error — it
 the unprivileged baseline. Re-running `verify-install.sh` after every upgrade is how you catch
 this before it becomes a surprise.
 
+**If this host still carries the OLD single-capability grant (`cap_sys_ptrace=ep`, from before
+2026-07-12), that is also a silent degrade — and a more insidious one than a missing grant.**
+`--probe` (what the daemon uses to decide `elevated_available`) only checks that the helper is
+invocable at all, not what a specific cross-UID resolution actually needs — so a host on the old
+grant reports `available:true` and *looks* healthy from Descartes's own perspective. But any
+cross-UID **port** resolution silently falls back to the unprivileged `partial`/`0.4`/
+`missing_permission` baseline, with no loud error anywhere in the daemon's own logs.
+`verify-install.sh` is what catches this (it fails closed on the old single-cap grant — see Step
+4). **Action: on every host set up before 2026-07-12, re-run Step 4's `setcap` with the
+2-capability set above, then re-run `verify-install.sh`, and confirm it reports PASS before
+trusting cross-UID port resolutions from that host.**
+
 ## `nosuid` mounts silently void the grant
 
 If `/usr/local` (or wherever you install the helper) is mounted `nosuid`, `setcap` will still
-succeed, the xattr will still be written, and `getcap` will still report `cap_sys_ptrace=ep`
-correctly — **but the kernel ignores the capability at exec time on a `nosuid` mount.** This is a
+succeed, the xattr will still be written, and `getcap` will still report
+`cap_dac_read_search,cap_sys_ptrace=ep` correctly — **but the kernel ignores the capability at exec
+time on a `nosuid` mount.** This is a
 classic, easy-to-miss trap: everything *looks* correctly configured, and only a live invocation
 would reveal the capability isn't actually active. Install the helper on a filesystem that is
 **not** mounted `nosuid`. `verify-install.sh` checks this via `findmnt` and fails loudly if the
@@ -208,13 +238,19 @@ User=root
 ExecStart=/usr/local/libexec/descartes/descartes-root-helper
 NoNewPrivileges=yes
 ProtectSystem=strict
-CapabilityBoundingSet=CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
 ```
 
-`CapabilityBoundingSet=CAP_SYS_PTRACE` — **only** — bounds what the root-running process could
-ever gain, even though it starts as root; this is not optional hardening, it's the whole point of
-choosing this fallback instead of granting broader root access. `NoNewPrivileges=yes` and
-`ProtectSystem=strict` are required alongside it.
+`CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE` — **exactly this set, no more** — bounds
+what the root-running process could ever gain, even though it starts as root. Both capabilities are
+required for the same reason the primary file-capability grant is a union (see Step 4): a
+process's *effective* capabilities are bounded by its capability bounding set even when it runs as
+literal root, so a bounding set restricted to `CAP_SYS_PTRACE` alone reproduces the **exact same**
+cross-UID `/proc/<pid>/fd`-enumeration failure the stale single-cap file-capability grant does —
+plain, unrestricted root "just works" here only because it isn't bounding-set-restricted at all,
+which is precisely what this hardening deliberately narrows away. This is not optional hardening,
+it's the whole point of choosing this fallback instead of granting broader root access.
+`NoNewPrivileges=yes` and `ProtectSystem=strict` are required alongside it.
 
 **`descartes-root-helper.socket`** (audience-scoped — **this is the load-bearing hardening for
 this mechanism**, equivalent to the primary binary's `0750` mode):
@@ -240,7 +276,8 @@ unit names are passed to it.
 - [ ] `groupadd --system descartes-provenance` (dedicated group)
 - [ ] Helper installed at exactly `/usr/local/libexec/descartes/descartes-root-helper`
 - [ ] `chown root:descartes-provenance` + `chmod 0750` on that exact path
-- [ ] `setcap cap_sys_ptrace=ep` on that exact path
+- [ ] `setcap "cap_sys_ptrace,cap_dac_read_search=ep"` on that exact path (both capabilities — see
+      Step 4)
 - [ ] Install target is **not** on a `nosuid` mount
 - [ ] Daemon's account is a member of `descartes-provenance`
 - [ ] `configDir/provenance.json`: `elevated.enabled:true`, `mechanism` set explicitly

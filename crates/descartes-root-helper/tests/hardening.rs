@@ -87,6 +87,24 @@ fn process_vm_writev_is_killed_by_seccomp() {
     );
 }
 
+/// crit5 regression-proof (S3-priv Slice 6 fix): `open_by_handle_at` is `CAP_DAC_READ_SEARCH`'s
+/// own blast-radius amplifier -- it opens an arbitrary file by opaque handle, bypassing the normal
+/// directory-permission walk, and is gated in the kernel by `capable(CAP_DAC_READ_SEARCH)`
+/// (`fs/fhandle.c`) -- the exact capability Slice 6 adds to this binary's file-capability grant
+/// (`cap_sys_ptrace,cap_dac_read_search=ep`) for cross-UID `/proc/<pid>/fd` enumeration (see
+/// `proc_linux.rs`'s module doc). It is NOT in `allowed_syscalls()`, so the default
+/// `KILL_PROCESS` action must still deny it even though this binary now actually holds the
+/// capability that would otherwise make the syscall usable.
+#[test]
+fn open_by_handle_at_is_killed_by_seccomp() {
+    let status = run_probe("--do-open-by-handle-at");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGSYS),
+        "expected SIGSYS (31), got {status:?}"
+    );
+}
+
 /// crit2 (NNP): PR_SET_NO_NEW_PRIVS is actually set after engage(), read back from the kernel via
 /// /proc/self/status rather than trusted from prctl()'s own return value.
 #[test]

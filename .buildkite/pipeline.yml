@@ -75,6 +75,21 @@ steps:
       cargo --version
       cargo test --workspace --locked
 
+  - label: ":linux: Linux ARM64 (elevated provenance)"
+    key: linux-arm64-elevated
+    if: build.tag == null
+    concurrency: 2
+    concurrency_group: "big-cabbage/tart-ci-linux"
+    agents:
+      queue: "ci-linux-arm64"
+    plugins:
+      - github.com/Lightless-Labs/tart-ci#v0.2.4:
+          image: "ci-linux-arm64-rust-bazel"
+          os: "linux"
+          always_pull: false
+          headless: true
+    command: bash scripts/ci-elevated-provenance.sh
+
   - label: ":mac: macOS Apple Silicon"
     key: macos-apple-silicon
     if: build.tag == null

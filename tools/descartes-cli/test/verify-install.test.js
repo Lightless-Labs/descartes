@@ -150,7 +150,13 @@ function buildMinimalPathDir(names, shims = {}) {
 }
 
 // Every check past "does getcap/findmnt/stat exist" needs these base tools resolvable via PATH.
-const BASE_TOOLS = ["bash", "sh", "uname", "realpath", "stat", "dirname", "tr", "cat"];
+// Every non-shimmed, non-optional external command verify-install.sh may invoke before/through the
+// checks these tests exercise. getcap/findmnt/systemctl are provided as shims per-test; getfacl is
+// optional (absent -> the script skips its ACL check, which the guest itself does). The 2-cap getcap
+// parser added `wc`/`sort`, and the script also uses `grep`/`sed`/`readlink` -- all must resolve on
+// the deliberately-minimal test PATH or the script dies with "command not found" (a prior run failed
+// exactly this way: "wc: command not found").
+const BASE_TOOLS = ["bash", "sh", "uname", "realpath", "stat", "dirname", "tr", "cat", "wc", "sort", "grep", "sed", "readlink"];
 
 // A deterministic "not nosuid" findmnt shim. Deliberately NOT the real findmnt binary for any
 // test that needs the nosuid check to cleanly PASS: many modern Linux distros (including
@@ -171,7 +177,11 @@ const PASSING_FINDMNT_SHIM = '#!/bin/sh\necho "rw,relatime"\n';
 function buildSystemctlShim(overrides = {}) {
   const values = {
     User: "root",
-    CapabilityBoundingSet: "CAP_SYS_PTRACE",
+    // S3-priv Slice 6 fix (2026-07-12): the 2-capability union, cap-number order (DAC_READ_SEARCH=2
+    // before SYS_PTRACE=19) -- matching what a real `systemctl show` prints, though
+    // verify-install.sh's own comparison is order-independent (a sorted-word-set compare; see the
+    // dedicated order-independence test below).
+    CapabilityBoundingSet: "CAP_DAC_READ_SEARCH CAP_SYS_PTRACE",
     NoNewPrivileges: "yes",
     ProtectSystem: "strict",
     SocketMode: "0660",
@@ -316,17 +326,67 @@ test("verify-install.sh exits nonzero when getcap reports empty output (no capab
   cleanup(binDir);
 });
 
-test("verify-install.sh exits nonzero when getcap reports a broader capability set than cap_sys_ptrace=ep", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
+test("verify-install.sh exits nonzero when getcap reports a broader capability set than the required cap_dac_read_search,cap_sys_ptrace union (extra cap_dac_override)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
   const { root, helperDir } = mkTrustedHelperTree();
   const helperPath = path.join(helperDir, "descartes-root-helper");
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir([...BASE_TOOLS, "findmnt"], {
-    getcap: `#!/bin/sh\necho "$1 cap_net_raw,cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_override,cap_dac_read_search,cap_sys_ptrace=ep"\n`,
   });
   const result = runVerify([helperPath], { env: { PATH: binDir } });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /expected exactly/);
+  cleanup(root);
+  cleanup(binDir);
+});
+
+// S3-priv Slice 6 fix (2026-07-12) regression test: a real privileged CI run proved the OLD
+// single-cap grant (cap_sys_ptrace=ep alone, with no cap_dac_read_search) is insufficient for
+// cross-UID PORT resolution -- verify-install.sh must fail closed on exactly this stale-grant
+// shape, not just on an unrelated "broader" one, so a host that never re-ran setcap after the fix
+// is caught, not silently accepted as still-correctly-scoped.
+test("verify-install.sh exits nonzero when getcap reports only the OLD single-cap grant (cap_sys_ptrace=ep, missing cap_dac_read_search)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
+  const { root, helperDir } = mkTrustedHelperTree();
+  const helperPath = path.join(helperDir, "descartes-root-helper");
+  assert.equal(buildTrustedLeaf(helperPath), true);
+  assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
+  const binDir = buildMinimalPathDir([...BASE_TOOLS, "findmnt"], {
+    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+  });
+  const result = runVerify([helperPath], { env: { PATH: binDir } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /expected exactly/);
+  cleanup(root);
+  cleanup(binDir);
+});
+
+test("verify-install.sh exits nonzero when getcap reports the wrong single cap (cap_dac_read_search=ep alone, missing cap_sys_ptrace)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
+  const { root, helperDir } = mkTrustedHelperTree();
+  const helperPath = path.join(helperDir, "descartes-root-helper");
+  assert.equal(buildTrustedLeaf(helperPath), true);
+  assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
+  const binDir = buildMinimalPathDir([...BASE_TOOLS, "findmnt"], {
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search=ep"\n`,
+  });
+  const result = runVerify([helperPath], { env: { PATH: binDir } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /expected exactly/);
+  cleanup(root);
+  cleanup(binDir);
+});
+
+test("verify-install.sh exits nonzero when getcap reports the correct capability names but wrong flags (eip instead of ep)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
+  const { root, helperDir } = mkTrustedHelperTree();
+  const helperPath = path.join(helperDir, "descartes-root-helper");
+  assert.equal(buildTrustedLeaf(helperPath), true);
+  assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
+  const binDir = buildMinimalPathDir([...BASE_TOOLS, "findmnt"], {
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=eip"\n`,
+  });
+  const result = runVerify([helperPath], { env: { PATH: binDir } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /expected/);
   cleanup(root);
   cleanup(binDir);
 });
@@ -349,8 +409,8 @@ test("verify-install.sh exits nonzero when getcap output is unparseable garbage"
 test("verify-install.sh accepts BOTH real getcap output formats (older '= cap+ep', newer 'cap=ep') as PASSING that one check", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
   const { root, helperDir } = mkTrustedHelperTree();
   const cases = [
-    ["older", `#!/bin/sh\necho "$1 = cap_sys_ptrace+ep"\n`],
-    ["newer", `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`],
+    ["older", `#!/bin/sh\necho "$1 = cap_dac_read_search,cap_sys_ptrace+ep"\n`],
+    ["newer", `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`],
   ];
   // Both leaves are written (as this unprivileged process) BEFORE the tree is sealed to root --
   // sealing must happen exactly once, after every leaf inside it already exists.
@@ -368,13 +428,33 @@ test("verify-install.sh accepts BOTH real getcap output formats (older '= cap+ep
   cleanup(root);
 });
 
+// S3-priv Slice 6 fix (2026-07-12), Fable robustness requirement: verify-install.sh's getcap check
+// must compare a SORTED capability-name SET, not a literal string -- so it must PASS even if the
+// two capability names appear in a non-canonical order (a real `getcap` always prints
+// capability-number order, DAC_READ_SEARCH=2 before SYS_PTRACE=19, but the script's own logic must
+// not silently depend on that).
+test("verify-install.sh accepts the capability names in either order (order-independent set compare)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
+  const { root, helperDir } = mkTrustedHelperTree();
+  const helperPath = path.join(helperDir, "descartes-root-helper");
+  assert.equal(buildTrustedLeaf(helperPath), true);
+  assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
+  const binDir = buildMinimalPathDir(BASE_TOOLS, {
+    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace,cap_dac_read_search=ep"\n`, // reversed vs. canonical order.
+    findmnt: PASSING_FINDMNT_SHIM,
+  });
+  const result = runVerify([helperPath], { env: { PATH: binDir } });
+  assert.equal(result.status, 0, `expected PASS; stderr: ${result.stderr}`);
+  cleanup(root);
+  cleanup(binDir);
+});
+
 test("verify-install.sh exits nonzero when the target filesystem is mounted nosuid (findmnt shim)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
   const { root, helperDir } = mkTrustedHelperTree();
   const helperPath = path.join(helperDir, "descartes-root-helper");
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     findmnt: `#!/bin/sh\necho "rw,nosuid,relatime"\n`, // always reports nosuid, regardless of target.
   });
   const result = runVerify([helperPath], { env: { PATH: binDir } });
@@ -390,7 +470,7 @@ test("verify-install.sh HARD FAILS when findmnt is not present on PATH (fails cl
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     // deliberately no findmnt shim, and BASE_TOOLS excludes the real one.
   });
   const result = runVerify([helperPath], { env: { PATH: binDir } });
@@ -413,7 +493,7 @@ test("verify-install.sh exits nonzero when the provided config file is group/wor
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     findmnt: PASSING_FINDMNT_SHIM,
   });
   const configDir = mkScratchDir();
@@ -438,7 +518,7 @@ test("verify-install.sh skips the config check (does not fail) when no config_fi
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     findmnt: PASSING_FINDMNT_SHIM,
   });
   const result = runVerify([helperPath], { env: { PATH: binDir } });
@@ -459,7 +539,7 @@ test("verify-install.sh exits zero (PASS) for a fully-correct fixture, using a g
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     findmnt: PASSING_FINDMNT_SHIM,
   });
   const result = runVerify([helperPath], { env: { PATH: binDir } });
@@ -484,7 +564,7 @@ test("verify-install.sh exits zero (PASS) when the named systemd fallback units 
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     findmnt: PASSING_FINDMNT_SHIM,
     systemctl: buildSystemctlShim(),
   });
@@ -495,11 +575,35 @@ test("verify-install.sh exits zero (PASS) when the named systemd fallback units 
   cleanup(binDir);
 });
 
+// S3-priv Slice 6 fix (2026-07-12), Fable robustness requirement: the CapabilityBoundingSet check
+// must compare a SORTED WORD SET, not assume `systemctl show`'s printed order -- so it must PASS
+// even when the fake systemctl reports the two caps in a non-canonical order.
+test("verify-install.sh accepts the systemd CapabilityBoundingSet in either word order (order-independent set compare)", { skip: !IS_LINUX || !HAVE_GROUP }, () => {
+  const { root, helperDir } = mkTrustedHelperTree();
+  const helperPath = path.join(helperDir, "descartes-root-helper");
+  assert.equal(buildTrustedLeaf(helperPath), true);
+  assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
+  const binDir = buildMinimalPathDir(BASE_TOOLS, {
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
+    findmnt: PASSING_FINDMNT_SHIM,
+    systemctl: buildSystemctlShim({ CapabilityBoundingSet: "CAP_SYS_PTRACE CAP_DAC_READ_SEARCH" }), // reversed vs. canonical order.
+  });
+  const result = runVerify([helperPath, "", SERVICE_UNIT, SOCKET_UNIT], { env: { PATH: binDir } });
+  assert.equal(result.status, 0, `expected PASS; stderr: ${result.stderr}`);
+  cleanup(root);
+  cleanup(binDir);
+});
+
 // One property wrong at a time -- every other property keeps its passing default from
 // buildSystemctlShim, isolating each failure mode exactly like the getcap/findmnt cases above.
 const SYSTEMD_FAILURE_CASES = [
   ["the service unit's User is not root", { User: "someoneelse" }, /User='someoneelse'/],
-  ["the service unit's CapabilityBoundingSet is broader than CAP_SYS_PTRACE", { CapabilityBoundingSet: "CAP_SYS_PTRACE CAP_SYS_ADMIN" }, /CapabilityBoundingSet=/],
+  ["the service unit's CapabilityBoundingSet is broader than the required {CAP_DAC_READ_SEARCH, CAP_SYS_PTRACE} set", { CapabilityBoundingSet: "CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_PTRACE" }, /CapabilityBoundingSet=/],
+  // S3-priv Slice 6 fix (2026-07-12): the OLD single-cap bounding set (CAP_SYS_PTRACE alone) is
+  // now a FAIL, not a PASS -- a process's effective capabilities are bounded by this set even
+  // when it runs as literal root, so a bounding-set-restricted root would reproduce the exact
+  // same cross-UID /proc/<pid>/fd enumeration failure the stale file-capability grant does.
+  ["the service unit's CapabilityBoundingSet is only the OLD single-cap CAP_SYS_PTRACE (missing CAP_DAC_READ_SEARCH)", { CapabilityBoundingSet: "CAP_SYS_PTRACE" }, /CapabilityBoundingSet=/],
   ["the service unit's NoNewPrivileges is not yes", { NoNewPrivileges: "no" }, /NoNewPrivileges='no'/],
   ["the service unit's ProtectSystem is 'full' instead of 'strict'", { ProtectSystem: "full" }, /ProtectSystem='full'/],
   ["the service unit's ProtectSystem is unset (empty)", { ProtectSystem: "" }, /ProtectSystem=''/],
@@ -514,7 +618,7 @@ for (const [label, overrides, stderrPattern] of SYSTEMD_FAILURE_CASES) {
     assert.equal(buildTrustedLeaf(helperPath), true);
     assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
     const binDir = buildMinimalPathDir(BASE_TOOLS, {
-      getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+      getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
       findmnt: PASSING_FINDMNT_SHIM,
       systemctl: buildSystemctlShim(overrides),
     });
@@ -532,7 +636,7 @@ test("verify-install.sh skips the systemd fallback checks (does not fail) when u
   assert.equal(buildTrustedLeaf(helperPath), true);
   assert.equal(sealTrustedHelperTree({ root, helperDir }), true);
   const binDir = buildMinimalPathDir(BASE_TOOLS, {
-    getcap: `#!/bin/sh\necho "$1 cap_sys_ptrace=ep"\n`,
+    getcap: `#!/bin/sh\necho "$1 cap_dac_read_search,cap_sys_ptrace=ep"\n`,
     findmnt: PASSING_FINDMNT_SHIM,
   });
   const result = runVerify([helperPath], { env: { PATH: binDir } });
