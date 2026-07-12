@@ -27,6 +27,7 @@ import {
   defaultInvokeElevatedHelper,
   defaultProbeElevatedHelper,
   parseAndVerifyHelperResponse,
+  readPtraceScopeDiagnostic,
   resolveElevated,
   verifyTrustBoundary,
 } from "../src/tools/provenance-elevated.js";
@@ -148,7 +149,7 @@ test("resolveElevated returns a verified success descriptor when config is enabl
   assert.deepEqual(result, { pid: 4242, uid: 1000, executablePath: "/opt/svc/bin/app", command: "app", mechanism: "cap_sys_ptrace" });
 });
 
-test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved ok/1 pid record on a verified elevated success", async () => {
+test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved ok/1 pid record on a verified elevated success, with the real ptrace_scope diagnostic attached", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
   const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
@@ -156,6 +157,11 @@ test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved 
     paths,
     probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080 }) }),
+    // DI'd rather than left to the real host's /proc/sys/kernel/yama/ptrace_scope -- this
+    // repo's tests never depend on real host state (see fakeElevatedOptions's own statFn
+    // precedent), and a Linux CI host's real value (non-undefined) would otherwise silently
+    // change this assertion depending on where the suite runs.
+    readFile: async () => "1\n",
   });
 
   const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
@@ -163,13 +169,13 @@ test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved 
   assert.equal(outcome.result.resolved.status, "ok");
   assert.equal(outcome.result.resolved.pid, 4242);
   assert.equal(outcome.result.resolved.executable_path, "/opt/svc/bin/app");
-  assert.deepEqual(outcome.result.privilege, { mechanism: "cap_sys_ptrace", elevated_available: true, elevated_used: true });
+  assert.deepEqual(outcome.result.privilege, { mechanism: "cap_sys_ptrace", elevated_available: true, elevated_used: true, ptrace_scope: "1" });
 
   const fields = computeProvenanceEnvelopeFields(outcome.resolvedStatus, outcome.result.source.type);
   assert.deepEqual(fields, { status: "ok", confidence: 1, reviewHint: "none" }, "upgrade must reach the same ok/1/none envelope shape as an own-uid resolution");
 });
 
-test("resolveCrossUidPortResult degrades when the helper's self-reported uid disagrees with the trusted owning uid (never overwrites a free fact)", async () => {
+test("resolveCrossUidPortResult degrades when the helper's self-reported uid disagrees with the trusted owning uid (never overwrites a free fact), with the real ptrace_scope diagnostic attached", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
   const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
@@ -178,13 +184,17 @@ test("resolveCrossUidPortResult degrades when the helper's self-reported uid dis
     probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
     // Helper self-reports uid 4242, contradicting the trusted primary.uid 1000.
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, uid: 4242 }) }),
+    readFile: async () => "2\n",
   });
 
   const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "partial", "a helper uid contradicting the known-good owning uid must degrade, not upgrade");
   assert.equal(outcome.result.resolved.pid, undefined, "the contradictory helper's pid is not trusted either");
   assert.equal(outcome.result.resolved.user.uid, 1000, "the trusted unprivileged-derived owning uid is preserved");
-  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false });
+  // Most valuable ON FAILURE: an elevated attempt was genuinely configured and reached a real
+  // helper response, but degraded anyway -- the ptrace_scope value is surfaced here precisely
+  // because this is a case an operator would want to correlate against.
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "2" });
 });
 
 test("resolveCrossUidPortResult bounds the untrusted helper's executable_path (truncated) before it reaches the envelope/LLM", async () => {
@@ -495,6 +505,94 @@ test("parseAndVerifyHelperResponse accepts the shared echo-back-contract.json fi
 
   const parsed = parseAndVerifyHelperResponse(rawStdout, { kind: "port", value: 8080 });
   assert.deepEqual(parsed, { pid: 4242, uid: 997, executable_path: "/opt/svc/bin/app", command: "app --serve" });
+});
+
+// ---------------------------------------------------------------------------------------------
+// S3-priv Slice 5 Phase 2 Part B: real (non-mock) ptrace_scope diagnostic. Pure unit coverage of
+// readPtraceScopeDiagnostic itself (DI'd readFile, no real /proc/sys read anywhere in this
+// file), plus caller-level coverage (resolveCrossUidPortResult) proving the CRITICAL attachment
+// point: NOT on resolveElevated's own return value (its undefined-on-failure contract is
+// untouched), but layered on by the caller, on both a successful elevated upgrade (already
+// covered above) and a generic degrade-to-unprivileged outcome below -- and proving the
+// byte-identical guarantee that a disabled (default) config never surfaces the field, even when
+// paths is present and the real ptrace_scope value would otherwise be readable.
+// ---------------------------------------------------------------------------------------------
+
+test("readPtraceScopeDiagnostic returns the trimmed raw value for each member of the closed 0-3 set", async () => {
+  for (const value of ["0", "1", "2", "3"]) {
+    const result = await readPtraceScopeDiagnostic({ readFile: async () => `${value}\n` });
+    assert.equal(result, value);
+  }
+});
+
+test("readPtraceScopeDiagnostic returns undefined on ENOENT (non-Linux, or an unusual kernel without this sysctl), never throws", async () => {
+  const result = await readPtraceScopeDiagnostic({
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+  });
+  assert.equal(result, undefined);
+});
+
+test("readPtraceScopeDiagnostic returns undefined on EACCES, never throws", async () => {
+  const result = await readPtraceScopeDiagnostic({
+    readFile: async () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); },
+  });
+  assert.equal(result, undefined);
+});
+
+test("readPtraceScopeDiagnostic rejects any value outside the closed 0-3 set (garbage/negative/multi-digit/empty/multi-line), never passes a raw unvalidated string through", async () => {
+  for (const garbage of ["banana", "9", "", "-1", "10", "1\n2", "  "]) {
+    const result = await readPtraceScopeDiagnostic({ readFile: async () => garbage });
+    assert.equal(result, undefined, `expected undefined for garbage value ${JSON.stringify(garbage)}`);
+  }
+});
+
+test("readPtraceScopeDiagnostic defaults readFile to fs.promises.readFile (no DI override) and honors the closed-set contract on any host", async () => {
+  // No readFile override: exercises the real default-parameter wiring end-to-end against the
+  // actual /proc. The result is host-dependent -- undefined where the sysctl is absent (macOS,
+  // a Linux host without Yama) OR the real "0".."3" value where it is readable (Linux CI, where
+  // Yama ptrace_scope exists). Assert the diagnostic's CONTRACT (never throws; returns either
+  // undefined or a validated closed-set value), not a host-specific outcome -- the earlier
+  // hardcoded `undefined` failed on the Linux CI guest, which returns "1".
+  const result = await readPtraceScopeDiagnostic();
+  assert.ok(
+    result === undefined || /^[0-3]$/.test(result),
+    `expected undefined or a "0".."3" value, got ${JSON.stringify(result)}`,
+  );
+});
+
+test("resolveCrossUidPortResult attaches ptrace_scope on a generic degrade-to-unprivileged outcome (config configured, probe unavailable) -- most valuable exactly on this failure path", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  let probeCalls = 0;
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => { probeCalls++; return { available: false }; }, // helper absent/unavailable.
+    invokeElevatedHelper: async () => { throw new Error("must not be called when the probe is unavailable"); },
+    readFile: async () => "3\n",
+  });
+
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  assert.equal(probeCalls, 1, "the elevated attempt was genuinely made (config enabled) -- this is the FAILURE case the diagnostic exists for");
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "3" });
+});
+
+test("resolveCrossUidPortResult never attaches ptrace_scope when config is disabled (default), even if paths is present and ptrace_scope is readable (byte-identical-by-default)", async () => {
+  const paths = await tempPaths(); // no writeProvenanceConfig call -> defaults to disabled.
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  let readFileCalls = 0;
+  let probeCalls = 0;
+  const options = fakeElevatedOptions({
+    paths,
+    readFile: async () => { readFileCalls++; return "1\n"; }, // proves this is gated, not opportunistic.
+    probeElevatedHelper: async () => { probeCalls++; return { available: true }; },
+  });
+
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  assert.equal(probeCalls, 0, "config disabled must short-circuit before ever probing (pre-existing gate, unaffected)");
+  assert.equal(readFileCalls, 0, "the ptrace_scope diagnostic must never even be read when elevation was never configured");
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false });
 });
 
 // ---------------------------------------------------------------------------------------------

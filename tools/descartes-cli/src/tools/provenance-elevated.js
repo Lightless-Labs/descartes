@@ -16,7 +16,7 @@
 // `const fn = options.fn ?? defaultFn;` -- no mocking library anywhere in this repo's tests.
 
 import { execFile } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { readFile as fsReadFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig, resolveProvenanceConfigPaths } from "../provenance-elevated-config.js";
@@ -40,6 +40,34 @@ const MAX_RESPONSE_BYTES = 8 * 1024;
 export const DEFAULT_HELPER_PATH = "/usr/local/libexec/descartes/descartes-root-helper";
 
 const UNSAFE_MODE_BITS = 0o022; // group- or world-writable
+
+// ---------------------------------------------------------------------------------------------
+// S3-priv Slice 5 Phase 2 Part B: real (non-mock) ptrace_scope diagnostic, deferred from Slice 2.
+// A pure, standalone, NEVER-THROWING surface -- deliberately NOT wired into resolveElevated's
+// return value below. resolveElevated's contract is undefined-on-every-non-success-path (see its
+// own doc comment further down); a diagnostic field can't be hung off "undefined" without either
+// breaking that contract or requiring every caller to unpack a richer shape just to reach a field
+// that's absent on the one path (success) where it isn't needed. The diagnostic is most valuable
+// ON FAILURE ("elevated didn't upgrade -- is ptrace_scope=2 why?"), so the CALLER
+// (provenance.js's resolveCrossUidPortResult) invokes this directly and attaches the result to
+// its own privilege block on both a successful elevated upgrade and a degrade-to-unprivileged
+// outcome. Closed-set validation (`^[0-3]$`) matches Yama's only four documented ptrace_scope
+// values (0=classic, 1=restricted, 2=admin-only, 3=no-attach); anything else -- ENOENT
+// (non-Linux, or an unusual kernel config without this sysctl), EACCES, a multi-line/garbage
+// read, or any other error -- degrades identically to "unreadable": `undefined`, never a raw
+// unvalidated string, never thrown.
+const PTRACE_SCOPE_PATH = "/proc/sys/kernel/yama/ptrace_scope";
+const PTRACE_SCOPE_PATTERN = /^[0-3]$/;
+
+export async function readPtraceScopeDiagnostic({ readFile = fsReadFile } = {}) {
+  try {
+    const raw = await readFile(PTRACE_SCOPE_PATH, "utf8");
+    const trimmed = String(raw).trim();
+    return PTRACE_SCOPE_PATTERN.test(trimmed) ? trimmed : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Fixed-argv probe + invoke. Mirrors provenance.js's runFixedExecFile (array-argv, bounded

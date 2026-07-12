@@ -16,7 +16,8 @@ import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
-import { resolveElevated } from "./provenance-elevated.js";
+import { readPtraceScopeDiagnostic, resolveElevated } from "./provenance-elevated.js";
+import { loadProvenanceConfig as defaultLoadProvenanceConfig } from "../provenance-elevated-config.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -700,15 +701,47 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
 
   if (!options.paths) return unprivilegedOutcome;
 
-  const upgrade = await resolveElevated({ target: { kind: "port", value: port, uid: primary.uid }, paths: options.paths }, options);
-  if (!upgrade) return unprivilegedOutcome;
+  // S3-priv Slice 5 Phase 2 Part B: observe the config resolveElevated actually loaded, via a
+  // thin wrapper around the exact same `loadProvenanceConfig` DI hook resolveElevated already
+  // calls exactly once internally -- zero extra I/O, just a side-channel capture -- so the
+  // ptrace_scope diagnostic below can be gated on "an elevation attempt was genuinely
+  // CONFIGURED" (config.elevated.enabled===true), never on mere paths-presence. Every real
+  // production call site threads `paths` unconditionally (pi-harness.js's createEvidenceTools),
+  // so paths-presence alone is not a safe "an attempt happened" signal: the common real-world
+  // state today is paths-present-but-disabled (no operator has run Slice 5's manual grant yet),
+  // and that state must stay byte-identical to pre-Slice-5 output -- no `ptrace_scope` key at
+  // all, on any host, Linux CI included (where the sysctl is actually readable).
+  let observedConfig;
+  const loadConfig = options.loadProvenanceConfig ?? defaultLoadProvenanceConfig;
+  const upgrade = await resolveElevated(
+    { target: { kind: "port", value: port, uid: primary.uid }, paths: options.paths },
+    {
+      ...options,
+      loadProvenanceConfig: async (paths) => {
+        observedConfig = await loadConfig(paths);
+        return observedConfig;
+      },
+    },
+  );
+
+  // Most valuable ON FAILURE ("elevated didn't upgrade -- is ptrace_scope=2 why?"), but attached
+  // on the success path too so an operator can see the value that let it work. Pure diagnostic:
+  // computed only after the real attempt already ran, and it never gates resolution either way.
+  const elevationWasConfigured = observedConfig?.elevated?.enabled === true;
+  const ptraceScope = elevationWasConfigured ? await readPtraceScopeDiagnostic({ readFile: options.readFile }) : undefined;
+  const withPtraceScopeDiagnostic = (outcome) => {
+    if (ptraceScope === undefined) return outcome; // byte-identical: field simply absent.
+    return { ...outcome, result: { ...outcome.result, privilege: { ...outcome.result.privilege, ptrace_scope: ptraceScope } } };
+  };
+
+  if (!upgrade) return withPtraceScopeDiagnostic(unprivilegedOutcome);
 
   // Trust model: the owning uid is a FREE, confident fact the unprivileged path already resolved
   // (primary.uid). The helper is trusted ONLY for the NEW fact it provides (the pid + exe/command),
   // never to re-assert a fact we already hold. If the helper self-reports a uid that DISAGREES with
   // the known-good one, it resolved the wrong socket/process (or is compromised), so its pid is also
   // suspect: degrade to the unprivileged baseline rather than merge an untrusted, contradictory fact.
-  if (upgrade.uid !== undefined && Number(upgrade.uid) !== Number(primary.uid)) return unprivilegedOutcome;
+  if (upgrade.uid !== undefined && Number(upgrade.uid) !== Number(primary.uid)) return withPtraceScopeDiagnostic(unprivilegedOutcome);
 
   // Bound the untrusted helper's path/command exactly like the unprivileged path (resolvePidCore
   // truncates executable_path) before either reaches the evidence envelope / triage LLM.
@@ -734,12 +767,12 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       details: { reason: "resolved_via_elevated_helper", mechanism: upgrade.mechanism },
     },
   };
-  return finalizeProvenanceResult({
+  return withPtraceScopeDiagnostic(finalizeProvenanceResult({
     targetSelection: { kind: "port", value: port },
     core: upgradedCore,
     sockets,
     privilege: computePrivilege({ mechanism: upgrade.mechanism, elevatedAvailable: true, elevatedUsed: true }),
-  });
+  }));
 }
 
 async function resolveByPortLinux(port, options = {}) {
