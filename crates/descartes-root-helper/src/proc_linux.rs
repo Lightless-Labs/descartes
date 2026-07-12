@@ -8,15 +8,36 @@
 //! Slice 5's CAP_SYS_PTRACE grant unlocks; until then, this binary can only ever fully resolve
 //! processes it already shares a UID with, which is also all that's needed for the unit/
 //! integration tests in this crate (they resolve the test's own process).
+//!
+//! Slice 5 Part A: every per-pid read (status/cmdline/exe, and the `"fd"` table walked below)
+//! goes through a `/proc/<pid>` DIRFD pinned ONCE via `descartes_root_helper::procfs::open_pid_dir`
+//! -- never by re-opening `/proc/<pid>/...` by absolute path a second time. A bare pid number is
+//! reusable by the kernel the instant its owning process is reaped; a multi-read window keyed
+//! only on that number could silently read a mix of two different processes' data, or a fully
+//! self-consistent record for the WRONG process. Pinning a dirfd at first contact and doing every
+//! subsequent read relative to it removes that window: once the process behind a pinned dirfd
+//! exits, `/proc` invalidates that directory's entries and every relative read fails closed (see
+//! `procfs`'s dead-pid test) -- it can never start resolving a DIFFERENT process that later
+//! reuses the same numeric pid. `find_owning_pid` in particular is PIN-THEN-VERIFY: it opens each
+//! candidate's dirfd before it ever inspects that candidate's fd table, and on a match resolves
+//! identity off that SAME dirfd -- it never returns a bare pid for a second, independent lookup.
 
 use std::collections::HashSet;
 use std::fs;
+use std::os::fd::{AsFd, BorrowedFd};
+
+use descartes_root_helper::procfs;
 
 use crate::json::Resolved;
 
-// Uses std free functions only (fs::read/read_to_string/read_dir/read_link), never `Read` trait
-// methods on an open `File` -- the trait's read_to_* methods issue lseek, see the allowlist note
-// on SYS_lseek in hardening.rs for why that distinction matters under the seccomp filter.
+// This file itself still uses std free functions only (fs::read_to_string/read_dir), never `Read`
+// trait methods on an open `File`, for the two things that are NOT per-pid identity data: the
+// global /proc/net/tcp[6] listen-socket tables and the top-level /proc/[0-9]* directory listing
+// (just pid numbers -- not that pid's own files). See the allowlist note on SYS_lseek in
+// hardening.rs for why the free-functions-vs-Read-trait distinction matters under the seccomp
+// filter. Every per-pid read (status/cmdline/exe/fd) is delegated to `procfs`, which uses raw
+// `libc::read`/`readlinkat`/`getdents64` internally -- not `std::fs` at all -- see that module's
+// doc for why (CLOEXEC-via-open-flag, not fcntl; bounded reads; dirfd-relative, never by path).
 
 /// Upper bound on file-descriptor symlinks scanned per candidate process while hunting for the
 /// socket inode that owns a requested port. Bounds worst-case syscall cost against a process with
@@ -35,9 +56,18 @@ const MAX_PROCESSES_SCANNED: usize = 65536;
 /// failure (no such pid, unreadable status/exe/cmdline, empty cmdline) -- see the module doc for
 /// why this is intentionally all-or-nothing.
 pub fn resolve_pid(pid: u32) -> Option<Resolved> {
-    let uid = read_uid(pid)?;
-    let executable_path = read_exe(pid)?;
-    let command = read_cmdline(pid)?;
+    let pid_dir = procfs::open_pid_dir(pid).ok()?;
+    resolve_from_pid_dir(pid, pid_dir.as_fd())
+}
+
+/// Reads uid/exe/cmdline relative to an already-pinned `pid_dir`, all-or-nothing (see the module
+/// doc). Shared by `resolve_pid` (which pins its own dirfd) and `find_owning_pid` (which pins a
+/// dirfd while scanning for the owning pid and, on a match, resolves identity off that SAME
+/// dirfd -- see that function for why never re-opening by pid number matters here).
+fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Option<Resolved> {
+    let uid = read_uid(pid_dir)?;
+    let executable_path = read_exe(pid_dir)?;
+    let command = read_cmdline(pid_dir)?;
     Some(Resolved {
         pid,
         uid,
@@ -57,15 +87,16 @@ pub fn resolve_port(port: u32) -> Option<Resolved> {
     if inodes.is_empty() {
         return None;
     }
-    let owning_pid = find_owning_pid(&inodes)?;
-    resolve_pid(owning_pid)
+    find_owning_pid(&inodes)
 }
 
 /// Reads the real uid from `/proc/<pid>/status`'s `Uid:` line, whose format is
 /// `Uid:\t<real>\t<effective>\t<saved>\t<fs>` -- the real uid is the first whitespace-separated
-/// field after the label.
-fn read_uid(pid: u32) -> Option<u32> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+/// field after the label. Reads relative to `pid_dir`, the dirfd pinned once for this whole
+/// resolution -- see the module doc.
+fn read_uid(pid_dir: BorrowedFd<'_>) -> Option<u32> {
+    let status = procfs::read_file_at(pid_dir, "status").ok()?;
+    let status = String::from_utf8_lossy(&status);
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {
             let real = rest.split_whitespace().next()?;
@@ -75,8 +106,9 @@ fn read_uid(pid: u32) -> Option<u32> {
     None
 }
 
-fn read_exe(pid: u32) -> Option<String> {
-    let target = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+/// Reads relative to `pid_dir` -- see the module doc.
+fn read_exe(pid_dir: BorrowedFd<'_>) -> Option<String> {
+    let target = procfs::read_link_at(pid_dir, "exe").ok()?;
     // Non-UTF-8 path bytes are lossily replaced with U+FFFD -- documented here rather than
     // rejecting the whole resolution over an unusual filename.
     Some(target.to_string_lossy().into_owned())
@@ -84,9 +116,10 @@ fn read_exe(pid: u32) -> Option<String> {
 
 /// Reads `/proc/<pid>/cmdline` (NUL-separated argv, lossily decoded) and space-joins it into a
 /// single display string. An empty cmdline (kernel threads, or a zombie mid-reap) is treated as a
-/// failed resolution, not an empty-string success.
-fn read_cmdline(pid: u32) -> Option<String> {
-    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+/// failed resolution, not an empty-string success. Reads relative to `pid_dir` -- see the module
+/// doc.
+fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<String> {
+    let raw = procfs::read_file_at(pid_dir, "cmdline").ok()?;
     let parts: Vec<String> = raw
         .split(|&b| b == 0)
         .filter(|part| !part.is_empty())
@@ -141,11 +174,29 @@ fn listening_inodes_for_port(port: u32) -> HashSet<String> {
     inodes
 }
 
-/// Scans `/proc/[0-9]*/fd/*` symlinks for a `socket:[<inode>]` target matching one of `inodes`.
-/// Unreadable `/proc/<pid>/fd` directories (EACCES on another UID's process today) are skipped
-/// SILENTLY -- that gap is exactly what CAP_SYS_PTRACE unlocks in a later slice, not an error
-/// condition here. First match wins (see `resolve_port`'s doc on the multi-owner limitation).
-fn find_owning_pid(inodes: &HashSet<String>) -> Option<u32> {
+/// Scans `/proc/[0-9]*/fd/*` symlinks for a `socket:[<inode>]` target matching one of `inodes`,
+/// and returns the FULLY RESOLVED record of the first match -- never a bare pid number that a
+/// caller would then have to re-look-up.
+///
+/// PIN-THEN-VERIFY: each candidate's `/proc/<pid>` dirfd is opened (`pid_dir`) BEFORE its fd
+/// table is ever inspected, and `"fd"` is opened (`fd_dir`) relative to THAT dirfd, once, and
+/// reused for every `readlinkat` in the inner loop. On a match, identity is resolved off the SAME
+/// `pid_dir` (`resolve_from_pid_dir`), never a fresh `/proc/<pid>` lookup by number. The earlier
+/// shape here -- match a socket inode to a bare pid, then separately re-resolve that pid -- had a
+/// reuse window right at the boundary between those two steps: the pid could be recycled in
+/// between, producing a fully self-consistent record for the WRONG process at "confidence 1".
+/// Pinning first removes that window entirely: everything below reads through ONE open directory
+/// description per candidate, so a pid recycled mid-scan either keeps resolving against the
+/// process this fd was opened for, or (once that process has actually exited) fails closed on the
+/// very next relative read -- see `procfs`'s dead-pid test for why that failure is guaranteed, not
+/// just likely.
+///
+/// Unreadable/vanished `/proc/<pid>` or `/proc/<pid>/fd` (EACCES on another UID's process today,
+/// or ESRCH because the process already exited) are skipped SILENTLY -- EACCES is exactly the gap
+/// CAP_SYS_PTRACE unlocks in a later slice, not an error condition here, and a since-exited
+/// process is precisely the reuse hazard this module defends against, so it fails closed the same
+/// way. First match wins (see `resolve_port`'s doc on the multi-owner limitation).
+fn find_owning_pid(inodes: &HashSet<String>) -> Option<Resolved> {
     let proc_dir = fs::read_dir("/proc").ok()?;
     let mut scanned_processes = 0usize;
 
@@ -163,15 +214,26 @@ fn find_owning_pid(inodes: &HashSet<String>) -> Option<u32> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        let Ok(fd_entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+
+        // Pin identity FIRST -- see the function doc.
+        let Ok(pid_dir) = procfs::open_pid_dir(pid) else {
+            continue; // gone or inaccessible by the time we got here -- skip, not fatal.
+        };
+
+        // "fd" opened and scanned ONCE per candidate, off the same pinned `pid_dir`; `fd_dir` is
+        // reused for every `read_link_at` call below so the whole fd-table walk for this
+        // candidate stays pinned to one open directory description.
+        let Ok((fd_dir, fd_names)) =
+            procfs::read_dir_entries_at(pid_dir.as_fd(), "fd", MAX_FDS_PER_PROCESS)
+        else {
             continue;
         };
 
-        for (scanned_fds, fd_entry) in fd_entries.flatten().enumerate() {
-            if scanned_fds >= MAX_FDS_PER_PROCESS {
-                break;
-            }
-            let Ok(target) = fs::read_link(fd_entry.path()) else {
+        for fd_name in &fd_names {
+            let Some(fd_name) = fd_name.to_str() else {
+                continue;
+            };
+            let Ok(target) = procfs::read_link_at(fd_dir.as_fd(), fd_name) else {
                 continue;
             };
             let Some(target) = target.to_str() else {
@@ -182,7 +244,9 @@ fn find_owning_pid(inodes: &HashSet<String>) -> Option<u32> {
                 .and_then(|s| s.strip_suffix(']'))
                 .is_some_and(|inode| inodes.contains(inode));
             if matches {
-                return Some(pid);
+                // Resolve off the SAME already-open `pid_dir` -- never a fresh lookup by the bare
+                // `pid` number. See the function doc.
+                return resolve_from_pid_dir(pid, pid_dir.as_fd());
             }
         }
     }
@@ -201,7 +265,8 @@ mod tests {
         assert_eq!(resolved.pid, own_pid);
         // SAFETY-free: geteuid via std would need libc; comparing against /proc/self/status's own
         // reported uid is equivalent and dependency-free.
-        let self_uid = read_uid(std::process::id()).expect("self status must be readable");
+        let pid_dir = procfs::open_pid_dir(own_pid).expect("self /proc/<pid> dir must open");
+        let self_uid = read_uid(pid_dir.as_fd()).expect("self status must be readable");
         assert_eq!(resolved.uid, self_uid);
         assert!(!resolved.executable_path.is_empty());
         assert!(!resolved.command.is_empty());

@@ -28,9 +28,12 @@
 //! is the only oracle available (this dev host has no Linux virtualization) -- and any future
 //! addition to it is a security-review-required change, not a routine one.
 //!
-//! ALL unsafe code in this crate's production path lives in this file (the other production
-//! modules -- `main.rs`, `argv.rs`, `json.rs`, `proc_linux.rs` -- stay `#![deny(unsafe_code)]`
-//! clean, i.e. would fail to compile if any of them grew an unsafe block).
+//! ALL unsafe code in this crate's production path lives in this file AND `src/procfs.rs`
+//! (S3-priv Slice 5 Part A's `/proc/<pid>` dirfd-pinning primitives -- see that module's doc). The
+//! other production modules -- `main.rs`, `argv.rs`, `json.rs`, `proc_linux.rs` -- stay
+//! `#![deny(unsafe_code)]`/`#![forbid(unsafe_code)]` clean, i.e. would fail to compile if any of
+//! them grew an unsafe block; `proc_linux.rs` calls into `procfs`'s safe-signature functions
+//! exactly as it calls into this file's `engage()`/`drop_capabilities()`.
 //! `src/bin/hardening-probe.rs` is the one other file in this crate with unsafe, and it is
 //! test-support only, never shipped as the helper -- see its module doc.
 
@@ -104,6 +107,16 @@ mod linux {
     ///     (or a std-internal change) would otherwise self-SIGSYS -- repositioning an fd this
     ///     process already owns is harmless. See `proc_linux.rs`'s module doc for the matching note
     ///     on that side of this coupling.
+    ///   - fcntl: never emitted by a RELEASE build. std's `OwnedFd` `Drop`, in debug-assertions
+    ///     builds ONLY, issues `fcntl(fd, F_GETFD)` as an fd-validity assertion before `close` -- so
+    ///     every `cargo test` (debug) run of anything that drops an `OwnedFd` (`procfs.rs`, i.e. all
+    ///     of resolution) self-SIGSYSed without this (empirically pinned by strace on the aarch64 CI
+    ///     guest). Allowlisted number-only like every other entry: all fcntl cmds act only on fds
+    ///     this process already owns, and with no `exec*` and no `socket*` allowlisted, an fd
+    ///     stripped of CLOEXEC can never leave this process -- so the cmd breadth adds nothing to the
+    ///     blast radius this filter confines. The "O_CLOEXEC via open flag, never fcntl(F_SETFD)"
+    ///     rule (`procfs.rs` module doc) is enforced by review + the security-review-required rule on
+    ///     any `allowed_syscalls()` addition from here on, not by this filter.
     ///   - rt_sigprocmask, getpid, gettid, tgkill: a Rust panic's abort path. Without these a panic
     ///     dies to SIGSYS instead of SIGABRT -- still loud, still a nonzero exit, but a SIGSYS core
     ///     from this binary should be read as "maybe just a panic", not only "attack".
@@ -118,6 +131,7 @@ mod linux {
             libc::SYS_openat,
             libc::SYS_read,
             libc::SYS_close,
+            libc::SYS_fcntl,
             libc::SYS_write,
             libc::SYS_writev,
             libc::SYS_getdents64,

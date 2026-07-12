@@ -18,8 +18,9 @@
 //!   - No env-based or config-file-based behavior of any kind.
 
 // This bin crate (main.rs + argv.rs + json.rs + proc_linux.rs) contains zero unsafe blocks --
-// all unsafe lives in the lib's hardening module and the separate probe bin -- so `forbid` (the
-// strictest of the two, unlike lib.rs's `deny`, it can never be locally relaxed) compiles clean.
+// all unsafe lives in the lib's `hardening`/`procfs` modules and the separate probe bin -- so
+// `forbid` (the strictest of the two, unlike lib.rs's `deny`, it can never be locally relaxed)
+// compiles clean.
 #![forbid(unsafe_code)]
 
 mod argv;
