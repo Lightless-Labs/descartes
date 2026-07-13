@@ -56,9 +56,12 @@ Usage:
   descartes learned status [--json]
   descartes provenance snapshot [--json]
   descartes provenance baseline show [--identity <hash>] [--json]
+  descartes incident freeze [--reason <text>] [--json]
   descartes --version
 
-Safety: v0 local evidence collection is read-only. No actions are taken.`;
+Safety: v0 local evidence collection is read-only. No actions are taken. "descartes incident
+freeze" persists a Descartes-owned forensic evidence bundle by calling only already-registered
+read-only evidence tools -- it still mutates nothing on the monitored host.`;
 }
 
 function packageVersion() {
@@ -164,6 +167,15 @@ async function main(argv) {
     // top-level command's dedicated-module + run<Thing>(paths, args) dispatch pattern.
     const { runProvenanceStore } = await import("./provenance-store.js");
     await runProvenanceStore(paths, args);
+    return;
+  }
+  if (command === "incident") {
+    // Observed-incident collectors plan, Slice 2: evidence-freeze/forensic-snapshot action --
+    // read-only against the monitored host (see evidence-freeze.js's module header), mirroring
+    // the same dedicated-module + run<Thing>(paths, args) dispatch pattern as every other
+    // top-level command above.
+    const { runIncident } = await import("./evidence-freeze.js");
+    await runIncident(paths, args);
     return;
   }
 

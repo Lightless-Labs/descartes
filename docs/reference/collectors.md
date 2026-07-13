@@ -6,6 +6,8 @@ This is the reference catalog for Descartes' current read-only evidence collecto
 
 Normal `descartes triage` is model-led: the model chooses among these guarded tools, and each tool returns structured local evidence. `collect_triage_evidence` is intentionally still only the compact resource-pressure bundle, not an all-collectors bundle.
 
+`descartes incident freeze` reuses this same registered collector set (the broad `collect_*` tools) to persist a Descartes-owned forensic snapshot on demand, without adding any new evidence-collection surface. It is documented separately at `docs/reference/incident-freeze.md` since it is an action, not a collector.
+
 ## Safety and privacy notes
 
 - Collectors are read-only and must not mutate host state.

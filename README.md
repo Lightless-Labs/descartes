@@ -255,6 +255,7 @@ Current v0 boundaries:
 - alert-intelligence background LLM wakeups are disabled by default and require explicit opt-in
 - explicit `triage` requests may send collected evidence to the selected LLM provider
 - saved reports/session state are sensitive diagnostic artifacts
+- `descartes incident freeze` persists a Descartes-owned forensic evidence bundle by calling only already-registered read-only evidence tools; it mutates nothing on the monitored host, is operator-invoked only (no automatic trigger), and the bundle is never sent to an LLM — see `docs/reference/incident-freeze.md`
 
 Descartes may use Pi internally as a private harness, but it does not require, read, import, or modify the user's personal Pi setup (`~/.pi`, project `.pi`, sessions, settings, auth, skills, prompts, themes, or model config).
 
