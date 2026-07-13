@@ -1,0 +1,342 @@
+# Observed-Incident Collectors
+
+**Created:** 2026-07-13
+**Status:** Proposed — sequenced, locally-testable-first slice plan. Slices 0–2 implementation-ready now; Slices 3–6 design-sketch pending Slice 0–2 lessons (same commitment-tier discipline as the parent roadmap); Slice 7 is design-only and explicitly NOT scheduled for implementation.
+**Reviewed:** 2026-07-13 (via Fable subagent) — 7 must-fixes incorporated below.
+**Extends:** `docs/plans/2026-07-09-self-learning-stratified-monitoring.md` — this plan supersedes-in-detail the parent roadmap's placeholder for the 8 candidate work items originally listed under "Observed-incident capability gaps" in `todos/2026-07-09-self-learning-stratified-monitoring.md` (lines 114–128 — that list lives in the todo file, not in the parent plan document itself; corrected citation, must-fix 7b); the parent roadmap keeps ownership of Layers A/C general architecture (constraint kernel, general Welford/EWMA baseline engine) and the S13 LLM-adjudication mechanism, which this plan reuses verbatim.
+**Origin:** `todos/2026-07-09-self-learning-stratified-monitoring.md` lines 114–129 — an operator-reviewed real incident: a mass termination of ad-hoc worker sessions coincided with unattributed VPN/SSH logins at odd hours, during which an AI agent itself autonomously acted (remote-shelled in, told another agent to "resurrect" the killed sessions) with **no evidence-freeze and no approval gate**. Two lessons drive this plan: (1) this is exactly the "detect the unexpected → monitor/log/inform → contain pending confirmation" event class the layered nervous system targets; (2) it illustrates the anti-pattern Descartes must never become — an agent that mutates state without the policy/authority plane.
+**Conventions followed:** dated header + addenda (mirrors `docs/plans/2026-07-11-s3-priv-elevated-read-path.md`); each slice states Goal / Files / TDD surface / Safety checks / Definition of Done, plus an explicit `locallyTestable` line (same plan mirrors this practice for cross-platform work).
+
+---
+
+## 0. What this plan does NOT do (read this first)
+
+This plan sequences 7 buildable work items plus 1 open question, all drawn from the todo's "Observed-incident capability gaps" list:
+
+| Todo item | Disposition |
+|---|---|
+| `collect_sessions` L0 collector + fact translator | Slice 1 |
+| `inspect_vpn_peer_status` + peer-identity baseline | Slice 3 |
+| Layer C session-count anomaly signature | Slice 4 |
+| Real-time event-source spike (ES/eslogger, auditd/eBPF/fanotify) | Slice 5 — **TIME-BOXED spike, not a build** |
+| L2 incident-correlation (cross-stream timeline join) | Slice 6 |
+| Authority/containment plane | Split: evidence-freeze ships in **Slice 2** (read-only); every actual containment verb (kill/revoke/block/quarantine) is **Slice 7, design-only, NOT implemented here** |
+| Widen `collect_recent_logs` window cap | Slice 0 |
+| Fleet/multi-host topology | **Open Question**, not a slice — Descartes stays single-host |
+
+**The one sentence that matters most in this document:** every slice in this plan (0–6) is read-only against the monitored host — it collects facts, persists Descartes-owned state, or calls the LLM through the existing gated path. Nothing in Slices 0–6 kills a process, revokes a credential, blocks a peer, or quarantines anything. That capability class is scoped, not built, in Slice 7.
+
+---
+
+## 1. Safety spine (applies to every slice below unless a slice explicitly overrides — none do)
+
+Restating `AGENTS.md`'s Safety Invariants against this plan's specifics:
+
+- **Read-only by default.** Every new collector (Slices 1, 3) is fixed-argv `execFile` with timeouts, zero mutating flags, wrapped in the existing `timedEnvelope` fail-closed pattern (`tools/descartes-cli/src/tools/envelope.js:19-34`). Slice 2's evidence-freeze writes new Descartes-owned state but issues **zero new execFile calls** — it only invokes the already-registered, already-reviewed evidence-tool set.
+- **Degrade-not-fabricate.** A collector that can't resolve a fact returns `unable`/`confidence:0`/`missing_permission` (or `partial`/`confidence:0.4` for the graceful cross-UID case, per `tools/descartes-cli/src/tools/provenance.js:458-461`, corrected path — must-fix 7a) — never a fabricated "0 sessions" or "no peers." This is asserted by a fixture per platform per collector, matching the existing per-platform clean/deleted-exe/public-bind/missing-permission fixture pattern from Slice 3/S3 of the parent roadmap.
+- **No privilege escalation.** Slices 1–4 and 6 are same-UID, unprivileged, mirroring the existing provenance UID-scoping stance (`tools/descartes-cli/src/tools/provenance-identity.js:100-167`, corrected path — must-fix 7a: "asserts silence, not degraded confidence" for other-UID entities). If a slice's implementation turns up a genuine need for elevated reads (flagged as a live risk for Slice 3's VPN/peer status and Slice 5's event sources), the **only** acceptable model is the already-shipped S3-priv opt-in/audience-scoped/deny-by-default mechanism (`docs/plans/2026-07-11-s3-priv-elevated-read-path.md`) — flag it in the slice, do not design a new privilege mechanism in v0.
+- **Sanitized, bounded output — hash-at-source is a hard requirement; this is NOT a property `sanitizeDiagnostics()` provides on its own (corrected claim, must-fix 3).** `sanitizeDiagnostics()` is a **syntactic** gate only (`^[A-Za-z0-9][A-Za-z0-9._:-]*$`, ≤64 chars) — it does not, and structurally cannot, distinguish a raw IP (`10.0.0.5`), a raw hostname (`host-01.internal`), a raw username (`thomas`), a charset-safe session name, or an ISO timestamp from any other charset-safe string: **all of these pass it unchanged.** Fact-record `attributes` in `fact-store.js` are only `String(value).slice(0,160)` — no sanitization at all — and `alert-store.js`'s `normalizeAlertRecord` plus `alert-intelligence.js`'s `compactAlert` (`:264`) pass stored `diagnostics` **verbatim** into the LLM prompt. Given this, every new identifier class this plan introduces (session names, peer hostnames/IPs/pubkeys, usernames from `who`/`last`) **must** be reduced to a fixed-length hex hash or a closed-enum bucket **in the translator/candidate-builder itself**, before the value ever reaches a fact record or a diagnostics payload — restated as a hard requirement with negative tests in Slices 1, 3, and 6 below. Entity keys that could carry operator-chosen free text (a tmux session named after a project, a VPN peer hostname) are additionally bounded via the existing `sanitizeIdentityString` helper — note this is **charset-substitution plus 64-char truncation, not hashing** (`diagnostics-sanitizer.js:88-99`, corrected description — must-fix 7d) — which bounds an entity key's shape but is not itself a confidentiality control and does not substitute for the hash-at-source requirement above.
+- **Behind the kill switch.** All persisted fact-history and all learned-artifact-shaped emission (Slices 1, 3, 4, 6) is gated on `configDir/learned.json.enabled` (default `false`), reusing the exact structural-tick gate already wired in `daemon.js`. Slice 2 (evidence-freeze) is deliberately **not** gated on `learned.json` — it is an on-demand action like `descartes triage`, not an inference artifact, and has no draft/shadow/review-ready lifecycle because it captures facts rather than asserting a conclusion.
+- **Day-1 no-storm.** Every new collector's first observation seeds a baseline/signature; nothing alerts on tick 1. Explicit test per slice.
+- **Learned-artifact lifecycle where applicable.** Slice 4 (session-count baseline) is a `baseline` (statistical) family record under the existing `LearnedArtifact` envelope and `confidence_state:"provisional"|"established"` gate — no artifact self-promotes, no new lifecycle code. Slices 1, 2, 3, 6 do not mint learned artifacts themselves (1/3 are L0 facts; 2 is an action; 6 is a correlation rule evaluated fresh each tick, not a mined/promoted artifact in this pass).
+- **The authority/containment boundary is unmissable.** See §0's table and Slice 7. No slice in this plan implements, stubs, or partially wires a mutating action against the monitored host.
+
+---
+
+## 2. Local testability model (why this is buildable on a macOS-only, no-VM dev machine)
+
+Per the operator's dev-machine constraint (no `Virtualization.framework`, cannot run Linux/other VMs locally): every collector in Slices 0, 1, 2, 3, 4, 6 is **Node.js, `execFile`-based, and cross-platform-tested by dependency-injecting/mocking `execFile`'s output** — this is the established pattern already used by the existing dual-platform collectors (`network.js` exercises both the Linux `/proc/net/*` path and the macOS `lsof`/`scutil` path; `services.js` exercises both `systemctl` and `launchctl` branches) without ever touching a real Linux host. New collectors in this plan follow the identical pattern: real macOS execution is testable directly on this dev machine; the Linux branch is testable via mocked `execFile` fixtures pinned to real command output shapes, with CI (`.buildkite/pipeline.yml`'s `linux-arm64` job) providing the actual cross-platform execution proof, same division of labor as every existing collector.
+
+**Only Slice 5 breaks this model** — if its spike concludes "go" on a privileged event-source build (auditd/eBPF/fanotify), that follow-on work is Rust, Linux-only, and privileged, requiring the exact `crates/descartes-root-helper` model already proven end-to-end in this repo: local `cargo check --tests` (cross-target, no execution) + real hardening/behavior tests gated to Linux CI (`tests/hardening.rs`, `tests/linux_resolution.rs` are both whole-file `#![cfg(target_os = "linux")]`). That is explicitly **out of scope for this plan** — Slice 5 itself ships only a decision document, never daemon-loop code.
+
+---
+
+## Slice 0 — Widen `collect_recent_logs` window cap
+
+**locallyTestable:** true.
+
+**Goal:** raise the current 6-hour ceiling on `collect_recent_logs` so a retrospective incident review isn't structurally capped below the incident's actual duration. This is a narrow, near-zero-risk quick win, not architecturally representative of the rest of the milestone — it precedes Slice 1 in the plan but is not "the first slice" for the purposes of the milestone's recommended starting point (see §3).
+
+**Files to change:**
+- `tools/descartes-cli/src/tools/logs.js` — raise `MAX_WINDOW_MINUTES` (currently `360`, `logs.js:9`) to a new ceiling; `DEFAULT_WINDOW_MINUTES` (`:6`) stays unchanged so default behavior for existing callers is unaffected.
+- `tools/descartes-cli/src/pi-harness.js:88-98` — the `Type.Object` schema's `window_minutes` `{minimum:1, maximum:360}` bound must move in lockstep with `logs.js`'s constant, since both currently enforce `360` independently (double-enforced, must-match).
+
+**TDD test surface:**
+- Existing `normalizeLogRequest` clamp tests extended to assert clamping at the *new* ceiling, not the old one.
+- A new regression test asserting the `pi-harness.js` schema bound and the `logs.js` constant are equal (a single source of truth would be better — flag as a possible follow-up refactor, but not required for this slice since the double-enforcement pattern already exists elsewhere in the codebase and a regression test closes the drift risk cheaply).
+- `MAX_EVENT_LIMIT` (`logs.js:10`, currently `200`) is unchanged — this slice widens the *time window*, not the *event count cap*; a wider window with the same event cap means sparser sampling over a longer window, which is an acceptable, explicitly documented tradeoff (not silently degraded).
+
+**Safety checks:** still read-only, zero new `execFile` arguments, zero privilege change, output still bounded by the unchanged `MAX_EVENT_LIMIT`. Not gated by `learned.json` (this is an existing on-demand triage tool, unaffected by the learned-artifact kill switch). **Nice-to-have:** macOS's `log show` is known to become CPU-expensive at large time windows (predicate-evaluation cost scales with window size) — sanity-check the chosen new ceiling (see Open question below) against real `log show` CPU cost on macOS at that ceiling, not just against Linux log-file/journalctl cost, before finalizing the value; this also strengthens the case for the single-source-of-truth refactor already flagged above for the `360` bound.
+
+**Definition of done:** new cap shipped, schema/constant parity test green, `docs/reference/collectors.md`'s `collect_recent_logs` entry updated with the new ceiling, full `tools/descartes-cli` suite green.
+
+**Open question (deferred to §7):** what should the new ceiling actually be, and should it become operator-configurable (read from `configDir`) rather than a second hardcoded magic number? This plan does not resolve the exact value — it's an operator input.
+
+---
+
+## Slice 1 — Session-census L0 collector + fact-history translator
+
+**locallyTestable:** true (both macOS and Linux branches, via mocked `execFile`; real execution testable directly on this dev machine since tmux/screen run natively on macOS).
+
+**Recommended FIRST substantive slice of this milestone — see §3 for the validated justification.**
+
+**Goal:** enumerate resident tmux/screen sessions (multiplexer, session name, attached/detached, window count, created-at) as a new L0 collector, and translate observations into the existing categorical fact-history so a session's presence — and its churn — is tracked over time, closing the "nothing tracks named sessions today, so a mass session-drop is invisible" gap named in the incident review. **Hard requirement (must-fix 6):** the collector captures a bucketed `created_at` attribute (see Files to add below) specifically so that a same-hour kill-then-resurrect — the actual shape of the motivating incident — surfaces as attribute churn (a session's `created_at` bucket changing between two ticks even though the session count is unchanged) rather than being invisible to a count-only hourly census.
+
+**Files to add:**
+- `tools/descartes-cli/src/tools/sessions.js` — new collector. `execFile('tmux', ['list-sessions', '-F', '...'])` and `execFile('screen', ['-ls'])`, wrapped in `timedEnvelope` exactly like `system.js`/`processes.js`. Degrade rule: neither binary present → `unable`/`confidence:0` (never "0 sessions"); binary present but genuinely zero sessions → `status:"ok"`, empty result (a real, distinguishable fact). **Hard requirement (must-fix 5):** bound the per-tick enumerated session count, mirroring `DEFAULT_DAEMON_PROCESS_LIMIT`'s existing cap pattern — a pathological session flood (e.g. a runaway script spawning thousands of tmux sessions) must not be allowed to blow past a fixed per-tick entity limit, because an unbounded fact-count from this one collector could evict *other* collectors' fact-history out of the shared 30-day/5MB `fact-store.js` cap and blind Slices 4/6 to unrelated signal. When the real count exceeds the cap, emit the cap's worth of entities plus an explicit `overflow:true`/truncated-count marker — never silently drop entities with no indication anything was truncated. **Nice-to-have:** `screen -ls` is known to exit with a non-zero status even when it succeeds and sessions exist — pin a fixture for this exit-code quirk so the collector doesn't misclassify a healthy `screen -ls` as a failure.
+- `tools/descartes-cli/src/fact-translators.js` — add `factPointsFromSessionEvidence(envelope)`, mirroring `factPointsFromServiceEvidence` (`:25-49`). **Hash-at-source hard requirement (must-fix 3):** `sanitizeIdentityString` alone is charset-substitution + truncation, not a confidentiality control (see §1) — it bounds shape but does not stop an operator-chosen session name (a project name, a hostname pasted into a tmux session title, etc.) from surviving as recognizable text. This translator must reduce the session name to a fixed-length hex hash before it becomes part of `entity_key` (e.g. `entity_key = `${multiplexer}:${sha256(session_name).slice(0,16)}``, exact hash length TBD at implementation time) rather than merely pass it through `sanitizeIdentityString`. `attributes: {attached, window_count_bucket, created_at_bucket, ...}` — closed-enum/bucketed, never a raw free-text session name or raw timestamp reaching a fact record. **`created_at_bucket` (must-fix 6):** an hour-granularity (or finer, TBD) bucketed creation-time attribute, captured specifically so a same-hour kill-then-resurrect changes this attribute between ticks even when the session count alone would look unchanged.
+- `docs/reference/collectors.md` — new `collect_sessions` entry.
+
+**Files to change (registration seam — atomic, per the existing pattern):**
+- `tools/descartes-cli/src/tool-policy.js` — add `collect_sessions` to `TRIAGE_TOOL_NAMES`. **Note (nice-to-have):** this makes the collector's raw, un-hashed session names visible to the operator-invoked `descartes triage` LLM session (unlike the persisted fact-history, raw triage-tool output is not translated/hashed before reaching that session) — this matches the existing consent posture for every other `TRIAGE_TOOL_NAMES` collector (triage is operator-invoked and already sees raw process/service data), so it is not a new exposure class, but it should be stated explicitly rather than left implicit.
+- `tools/descartes-cli/src/pi-harness.js`'s `createEvidenceTools()` (`:36-239`) — add the matching `defineTool({...})`.
+- `tools/descartes-cli/test/pi-harness.test.js:15-20`'s set-equality assertion will fail until both edits land in the same commit — this is the existing enforcement mechanism, not new test-writing.
+- `daemon.js` — add `sessions` to the **structural (hourly)** collector set: `defaultDaemonProfile().structural.collectors` (`:45-54`) + `collectStructuralEvidence`'s `activeCollectors` map (`:203-218`); fact-history append point already exists at `daemon.js:382-392`.
+
+**Cadence decision (explicit, flagged):** v0 samples sessions on the existing **hourly structural tick**, reusing 100% of existing daemon wiring with zero new plumbing. This is a deliberate tradeoff: a mass session-drop happening in seconds will be visible only at ≤1-hour resolution ("N sessions existed at tick T, near-zero at tick T+1hr") rather than pinpointed to the minute. **Must-fix 6 — stated precisely, not merely as "coarse":** a count-only hourly census is not merely lower-resolution, it is structurally **invisible** to a kill-then-resurrect that completes within a single tick window — which is the actual shape of the motivating incident (a mass termination followed by an agent-initiated "resurrect" shortly after). Both tick boundaries would show the same session count and nothing would fire. This is why the bucketed `created_at` attribute above is a hard requirement of this slice, not a nice-to-have: it is what makes same-hour churn detectable at all, given the hourly cadence decision. Tightening the cadence itself to the fast tick is possible but requires extending fact-history persistence beyond the structural-tick branch (new daemon plumbing, not currently wired) — deferred as a documented follow-up (Slice 1b) rather than bundled into v0, to keep this slice's diff minimal and its risk low.
+
+**TDD test surface:**
+- Per-platform fixtures: tmux present/absent, screen present/absent, both present, malformed/truncated output, permission-denied degrade, zero-sessions-but-binary-present (ok/empty, not unable).
+- `factPointsFromSessionEvidence`: entity-key stability across repeated ticks (same session → same key), attribute bounding (a session named with shell-injection-looking characters or 500 chars of garbage still produces a bounded fact record), round-trip through `fact-store.js`'s schema.
+- Registration parity: existing `pi-harness.test.js` set-equality test extended automatically once both files are edited.
+- Daemon structural-tick activation test mirroring the existing "two cadences fire independently" pattern from S6a; a byte-identical-when-`learned.json`-disabled test (no fact-history writes, existing daemon behavior unchanged) mirroring the S6a/S6b precedent.
+- Day-1 no-storm: first session observation seeds fact-history, emits no alert (alerting is Slice 4's job, not this collector's).
+- **Per-tick entity cap (must-fix 5, hard requirement):** a fixture simulating a session count above the cap asserts (a) the emitted fact count is bounded at the cap, and (b) an overflow marker is present and asserted on — silently truncating with no marker is a test failure.
+- **Kill-then-resurrect churn (must-fix 6, hard requirement):** a fixture asserting that when a session is killed and a same-keyed session is resurrected within the same hourly tick window, the `created_at_bucket` attribute differs from the prior tick's fact record even though session count nets to unchanged — proving the churn is detectable rather than invisible.
+- **Hash-at-source negative tests (must-fix 3, hard requirement):** feed the translator realistic raw identifiers — an IP-shaped session name, a hostname-shaped session name, a plain username-shaped session name, and an ISO-8601 timestamp string — and assert none of them survive verbatim into the resulting fact record's `entity_key` or `attributes`.
+
+**Safety checks:** read-only, fixed-argv, no shell strings; degrade-not-fabricate; same-UID only (v0 explicitly does not attempt to enumerate other users' sessions — an explicit UID-scoping-honesty note, matching provenance's stance); sanitized bounded output — session identifiers are reduced to a fixed-length hex hash at translation time (must-fix 3), not merely bounded via `sanitizeIdentityString`'s charset-substitution+truncation (which is not a confidentiality control, see §1); per-tick entity count bounded with an overflow marker (must-fix 5); behind `learned.json` kill switch for fact-history persistence (the raw collector itself, like every L0 tool, is usable on-demand via `triage` regardless of the kill switch — only the *persisted history* is gated); day-1 no-storm; no learned-artifact lifecycle entered by this slice (pure L0 fact source, same category as `processes.js`).
+
+**Definition of done:** collector + translator shipped, 2-file registration + parity test green, structural-tick wiring + byte-identical-when-disabled test green, **per-tick entity cap + overflow-marker test green (must-fix 5)**, **bucketed `created_at` churn-detection test green (must-fix 6)**, **hash-at-source negative tests green (must-fix 3)**, `docs/reference/collectors.md` updated, full suite green.
+
+**Platform coverage:** macOS and Linux both fully supported (tmux and screen are available on both; tested via mocked `execFile` for whichever platform isn't the dev machine, per §2). No Windows target (repo doesn't target Windows per `AGENTS.md`).
+
+---
+
+## Slice 2 — Evidence-freeze / forensic-snapshot action
+
+**locallyTestable:** true.
+
+**This is the slice that defines the read-only/mutating boundary in concrete code — read it even if skimming the rest.**
+
+**Goal:** give the operator a single command that **persists** a timestamped, integrity-checksummed evidence bundle by calling the already-registered, already-reviewed on-demand evidence-tool set (the same tools `descartes triage` already uses, plus the new `collect_sessions`) — and **mutates nothing on the monitored host**. This is the ship-in-v0-safe first step of the "authority/containment plane" todo item: it answers "what should Descartes have done the moment the incident started" without touching the authority-gated mutation problem at all.
+
+**Files to add:**
+- `tools/descartes-cli/src/evidence-freeze.js` — `runEvidenceFreeze(paths, {reason, triggeredBy})`: invokes the existing evidence-tool registry (no new `execFile` surface — this is the load-bearing constraint), writes an atomic tmp+rename bundle to `stateDir/evidence/<timestamp>-<reason-hash>.json`, `0o600`, with a `sha256` integrity digest over its own contents, mirroring the atomic-write convention already used by `alert-store.js`/`constraint-store.js`. **Nice-to-have:** two freezes triggered within the same timestamp-resolution window (e.g. two rapid operator invocations) must not collide on the same filename — add a random nonce to the filename and open with `O_EXCL` (fail loudly on an actual collision rather than silently overwriting a prior bundle).
+- CLI wiring in `index.js`: `descartes incident freeze [--reason <text>]`, following the existing subcommand-dispatch pattern (mirrors the `learned`/`provenance` blocks; the `provenance` dispatch itself is at `index.js:162-168`, not `:123-161` — corrected citation, must-fix 7c).
+
+**Files to change:** none of the existing collectors. This is purely a new orchestration layer over the already-registered tool set — explicitly **not** adding new execution surface.
+
+**TDD test surface:**
+- Atomic write (tmp+rename), corrupt-tolerant read-back, `0o600`/`0o700` permissions.
+- Graceful partial-degrade: if one evidence source is unavailable, the bundle still writes with that source marked `unable` rather than failing the whole freeze (a forensic snapshot with 9/10 sources beats no snapshot).
+- `reason` string sanitized/bounded (reused `sanitizeIdentityString`) before it reaches a filename or manifest field.
+- **A regression test asserting `runEvidenceFreeze` performs zero `execFile` calls beyond the already-registered `createEvidenceTools()` set** — enforced in CI, not left to convention, keeping "reuses read-only tools, adds no new mutating/privileged surface" a checked invariant rather than a promise.
+- A test asserting the bundle is never auto-deleted by any existing retention mechanism (it must NOT inherit `fact-store.js`'s 30-day/5MB cap by accident — evidence is potentially legal-hold material; retention policy itself is an explicit open question, see §7).
+
+**Safety checks (the boundary, stated explicitly):**
+- **Read-only against the monitored host.** Zero mutating flags, zero new `execFile` calls, calls only the already-reviewed evidence-tool registry. This is the concrete distinction between this slice and every verb in Slice 7.
+- Sanitized bounded output, same gate as everywhere else.
+- No privilege escalation — same-UID as its constituent collectors.
+- **Not gated by `learned.json`.** This is an on-demand action like `triage`, not an inference artifact — it has no draft/shadow/review-ready lifecycle because it captures facts, it doesn't assert a conclusion. State this exemption explicitly so it isn't mistaken for an oversight.
+- Full audit trail: every invocation logs who/what triggered it, timestamp, and which evidence sources succeeded/degraded — mirroring the `llm-decisions.jsonl` audit discipline.
+- **Explicitly not wired to any automatic trigger in v0.** No daemon-initiated auto-freeze on alert. v0 is operator-invoked only. Coupling a freeze to an automatic trigger (e.g. "auto-freeze on a critical correlation candidate") is a natural next step but is deliberately deferred — it starts to brush against the authority plane (who/what is allowed to trigger persistent forensic capture automatically) and deserves its own review once Slice 6 exists to produce a trigger worth reacting to.
+- **Invariant (nice-to-have, worth pinning as a one-liner):** evidence bundles never enter any LLM prompt — they are pure operator-facing forensic artifacts, unlike alert `diagnostics`/`compactAlert` payloads (see Slice 6's note) which are the only things ever handed to the S13 LLM path.
+- **Evidence-dir growth (nice-to-have):** unbounded growth of `stateDir/evidence/` is acceptable only because this slice is strictly operator-invoked (no automatic trigger, per the bullet above) — if a future slice ever wires an automatic freeze trigger, the retention/growth question (§7 open question 8) stops being purely hypothetical and must be revisited before that trigger ships.
+
+**Definition of done:** `descartes incident freeze` ships, produces a bundle, zero-new-execFile regression test green, documented as read-only/non-mutating in `docs/reference/`, full suite green.
+
+**Platform coverage:** platform-agnostic — it orchestrates already-cross-platform tools, no new platform-specific code.
+
+---
+
+## Slice 3 — VPN/peer identity baseline (`inspect_vpn_peer_status`)
+
+**locallyTestable:** true for the collector's parsing/degrade logic via mocked `execFile`; real end-to-end fixtures depend on the operator actually running a VPN technology on the dev machine (see open question in §7).
+
+**Goal:** extend the already-shipped Layer B identity-signature/baseline state machine (`provenance-store.js`'s `computeIdentitySignature`/`applyIdentityObservation`, `provisional → known_good`) from processes/ports to VPN/SSH peers — attribute logins to devices/keys, flag unattributed or odd-hour peer logins, closing the "unattributed odd-hour VPN/SSH logins" half of the incident.
+
+**Alert-emission scope decision (hard requirement, must-fix 2):** this Goal talks about "flagging" unattributed/odd-hour peer logins, but that must not be read as licensing a silent ride on an already-consented alert namespace — this slice has the exact same consent-reuse exposure as must-fix 1 (an `identity.`/`provenance.` prefixed rule_id would ride existing consents with zero new wiring). Before any alert candidate ships from this slice, pick explicitly one of:
+1. **Preferred default:** Slice 3 emits **no alert candidates at all** in v0 — it only accumulates the peer-identity baseline/fact-history (mirroring Slice 1's pure-fact posture); any actual alerting on unattributed/odd-hour peer logins is deferred to Slice 4 (statistical) and/or Slice 6 (correlation), both of which are already subject to must-fix 1's fail-closed namespace rule; or
+2. if this slice does emit its own candidates, its rule_ids are subject to the **exact same fail-closed rule as must-fix 1**: they must NOT begin with any currently-known consented prefix (`daemon.`, `system.`, `disk.`, `constraint.`, `provenance.`, `baseline.`, `identity.`) and must map to `classifyAlertNamespace(...) === undefined` unless a deliberate new namespace is added to `KNOWN_ALERT_NAMESPACES`/`PROMPT_TEMPLATES` in the same commit, default-excluded.
+This decision must be made and recorded — not left implicit — before implementation, and is part of this slice's Definition of Done.
+
+**Files to add:**
+- `tools/descartes-cli/src/tools/vpn-peer-status.js` — new collector. Platform-specific, degrade-not-guess: probe for `wg show` (WireGuard, if present) on both macOS and Linux; `who`/`last`/utmp-style parsing for SSH logins on both; explicitly **do not assume** any specific VPN technology is in use — absence of a recognized VPN tool degrades to `unable`, never "no peers."
+- A peer-identity extension reusing `provenance-store.js`'s exact hashing/state-machine shape, keyed on peer pubkey/IP/hostname instead of `executable_path` — a **new, fixture-pinned hashing variant**, not a reuse of the existing golden fixture (peers and processes are different entity kinds and must not collide in the same signature space). **Nice-to-have (domain separation):** the peer-signature preimage must include a scheme-specific domain-separation prefix (e.g. `"peer:"`, distinct from the process/executable scheme's own prefix), plus a test asserting the process-scheme hash and the peer-scheme hash of otherwise-identical input bytes **differ** — this is what actually prevents the two entity kinds from colliding in the same signature space, not merely calling it "a new hashing variant" by convention.
+- `fact-translators.js`: `factPointsFromVpnPeerEvidence`. **Hash-at-source hard requirement (must-fix 3):** this translator's `entity_key` must be built from the new peer-identity hash described above — **not** `sanitizeIdentityString(raw_host)` or any other pass-through of the raw hostname/IP/pubkey. `sanitizeIdentityString` alone does not stop a raw, recognizable hostname or IP from surviving into a fact record (see §1) — the peer-identity hash is the actual confidentiality control here, and `sanitizeIdentityString`-only bounding is explicitly insufficient for this fact family.
+
+**Files to change:** `tool-policy.js` + `pi-harness.js` (2-file registration, same pattern as Slice 1); `daemon.js` structural-tick wiring (same pattern as Slice 1).
+
+**TDD test surface:**
+- Per-VPN-technology fixtures: WireGuard present/absent, SSH-only, no VPN at all (graceful `unable`, never fabricated "no peers").
+- A **golden fixture test** for the peer identity-signature hashing scheme, mirroring `provenance-store.js`'s own golden-hash discipline — nail the hashing inputs with fixtures before this ships, per the parent roadmap's explicit caution (`identity_signature hashing inputs... too coarse → collisions; too fine → never stabilizes`).
+- Day-1 no-storm: first peer observation seeds baseline, no alert.
+- Odd-hour classification via a **closed-enum, local-timezone hour-of-day bucket** — never a raw timestamp in `diagnostics`. **Correction (must-fix 3):** `sanitizeDiagnostics()` is a syntactic gate only (`^[A-Za-z0-9][A-Za-z0-9._:-]*$`, ≤64 chars) and would in fact **accept** a raw ISO timestamp string unchanged — it does not provide this protection automatically. The hour-of-day bucket must be enforced by the candidate-builder itself, not assumed to be caught downstream; add a negative test feeding a raw ISO timestamp and asserting it does not survive into the candidate's diagnostics.
+- **Hash-at-source negative tests (must-fix 3, hard requirement):** feed the translator/candidate-builder a realistic raw peer IP, a raw peer hostname, and a raw username (from `who`/`last` parsing) and assert none survive verbatim into the fact record or any alert candidate's diagnostics.
+
+**Safety checks:** read-only, **status only, never payload** — this collector reports connected/disconnected/handshake-age, never inspects traffic content; UID/permission-scoping honesty — if a peer-status command requires elevated read on some platform, that is flagged as an S3-priv-style opt-in elevated-path candidate, **not** silently escalated and **not** designed here (reuse the shipped mechanism or defer, don't invent a third privilege model). **Nice-to-have:** `wg show` typically requires root/elevated privilege even for read-only status queries on both macOS and Linux — this is a concrete, likely-to-actually-trigger instance of the elevated-read flag above, strengthening the case that Slice 3 should expect to invoke the S3-priv path rather than treat elevation as a hypothetical edge case. **Corrected sanitization claim (must-fix 3):** peer hostnames/IPs/usernames are exactly the class of raw identifier `sanitizeDiagnostics()` does **NOT** reject on its own (it is syntactic-only and passes charset-safe raw identifiers through unchanged) — bucketing/hashing them is a hard requirement enforced in the translator/candidate-builder (see Files to add and TDD above), not a downstream guarantee to rely on; behind `learned.json` kill switch (same gate as the existing identity baseline it extends).
+
+**Sequencing note (why this is 3rd, not earlier):** this slice has no hard dependency on Slices 1–2 — it only needs the already-shipped Layer B machinery (S3/S4/S5, complete per the tracking todo). It is sequenced after the session collector deliberately: it requires its own fixture-pinning exercise for a brand-new hashing scheme (higher design risk than Slice 1's zero-new-hashing collector) and VPN-technology detection is inherently more environment-fragmented than tmux/screen — banking a lower-risk win first (Slice 1) before taking on this slice's extra unknowns is the safer sequencing call.
+
+**Definition of done:** collector + peer-identity extension shipped, golden fixture pinned (including the process-vs-peer domain-separation differentiation test), 2-file registration + parity test green, structural-tick wiring, day-1 no-storm test, **alert-emission scope decision made and recorded per must-fix 2 (no-alert-candidates default, or fail-closed-namespace candidates)**, **hash-at-source negative tests green (must-fix 3)**, full suite green.
+
+**Platform coverage:** macOS and Linux both targeted; real-world VPN-technology coverage depends on what the operator actually runs (open question, §7) rather than attempting universal coverage of every VPN product.
+
+---
+
+## Slice 4 — Layer C session-count anomaly signature
+
+**locallyTestable:** true (synthetic fixtures; no real accumulated data needed for code/tests, though real alerting needs real elapsed ticks — see cold-start note).
+
+**Goal:** detect a mass session-drop (or a mass odd-hour peer-login burst) as a **statistical deviation**, not a hand-authored threshold — reusing the Welford/EWMA baseline math design specified for the parent roadmap's general Layer C (S10, not yet shipped), scoped narrowly to session-count so this slice does not block on the general per-metric baseline engine landing first. **Must-fix 6 note:** because Slice 1's hourly census is blind to a same-hour kill-then-resurrect on count alone, this slice's deviation detection should also consider Slice 1's bucketed `created_at_bucket` churn attribute (an entity's created-at bucket changing between ticks) as a second signal alongside raw session-count, not rely on count-deviation exclusively — the exact churn-detection logic can be scoped at implementation time, but it is explicitly in this Goal's scope, not a future add-on.
+
+**Hard dependency:** Slice 1's session fact-history must exist and accumulate real samples before a baseline is meaningful — this slice ships code + tests against synthetic fixtures immediately, but the first real deviation alert on live data won't fire until enough real samples accumulate past `min_sample_count` (cold-start honesty, identical posture to every other baseline in the parent roadmap).
+
+**Explicit check before starting:** if the parent roadmap's general S10 `baseline-store.js` has shipped by the time this slice is picked up, **consume it directly** instead of duplicating Welford/EWMA math in a new file — this slice's own scoped math implementation is a fallback for if S10 has not yet landed, not a permanent parallel engine.
+
+**Files to add:**
+- `tools/descartes-cli/src/session-baseline.js` (or the equivalent consumption of `baseline-store.js` if it exists by pickup time) — scoped Welford mean/variance + EWMA over per-tick session counts, `confidence_state:"provisional"|"established"` gate at `min_sample_count` (default 30, matching the parent roadmap's stated default), z-score deviation candidate emission.
+
+**Files to change:** `daemon.js` (evaluate the session-count baseline each tick alongside the existing `extraCandidates` sources at `daemon.js:436-443`); consumes Slice 1's fact-history, no new collector.
+
+**TDD test surface:**
+- Textbook Welford mean/variance unit tests against known sequences; EWMA decay unit tests.
+- `confidence_state` gate: no deviation candidates emitted below `min_sample_count`.
+- Synthetic mass-drop fixture (steady N sessions for many ticks, then a near-zero drop in one tick) asserts a deviation candidate fires.
+- Synthetic gradual-drift fixture (sessions slowly decline over days) asserts **no** false alarm — z-score against trailing distribution, not naive tick-over-tick delta.
+- Day-1/cold-start no-storm.
+
+**Safety checks:** fully deterministic, zero LLM in this slice's own emission logic; sanitized diagnostics (counts/z-scores are already an allowed `sanitizeDiagnostics()` numeric type — no raw session names in the alert); behind `learned.json` kill switch.
+
+**HARD REQUIREMENT — namespace scoping is currently INERT and must be fixed in this slice, not merely "decided" (must-fix 1):** `baseline` is already a member of `alert-intelligence.js`'s `KNOWN_ALERT_NAMESPACES` (`:15`). Naively adding a `baseline.session` string to an operator's `enabled_namespaces` **does nothing** as things stand today: `normalizeEnabledNamespaces` (`alert-intelligence.js:40-54`) filters unknown entries out entirely, and `classifyAlertNamespace` (`alert-intelligence.js:394-406`) maps any `baseline.session.*` rule_id to plain `baseline` via its `startsWith("baseline.")` check — so a session-count deviation candidate would silently ride an operator's **existing** `baseline` opt-in (say, one granted for CPU/disk metric deviations) with zero new consent wiring, regardless of what a future author believes they've scoped separately. Session-count is arguably more sensitive (an occupancy/headcount signal) than a CPU metric, and S13's design did not anticipate this when it defined the `baseline` namespace. This is not a nice-to-have to flag — it is a consent-reuse bug this slice must not ship with. Pick one of the following two designs, both acceptable, and implement it in this slice:
+
+1. **v0 default (SAFE, recommended):** emit session-count (and churn) deviation candidates under a rule_id prefix that `classifyAlertNamespace` maps to **`undefined`** — e.g. `session.count_drop` — so that S13's eligibility check fails closed (`unknown_namespace` → never LLM-adjudicated) regardless of what the operator has enabled, while the deterministic alert is still generated and persisted **locally** (it is not silently dropped — only LLM adjudication is withheld). This ships a working, safe deviation signal in v0 without opening any new consent surface, and is the default posture until a deliberate namespace decision is made.
+2. **Full-machinery alternative (acceptable in this same slice, higher effort):** add a `baseline.session.` classifier branch to `classifyAlertNamespace`, **ordered BEFORE the existing `baseline.` prefix check** (longest-prefix-first matching — this ordering is load-bearing, since the current `startsWith("baseline.")` check would otherwise shadow it), add `baseline.session` to `KNOWN_ALERT_NAMESPACES` (`:15`) and to `PROMPT_TEMPLATES` (`:381-387`), and default it **excluded** from `enabled_namespaces` (matching S13's stated privacy-forward default-off-for-new-namespaces posture).
+
+**Either way, TWO mandatory regression tests are part of this slice's Definition of Done, not optional:**
+(a) `classifyAlertNamespace(sessionRuleId)` must **NOT** return plain `baseline` for any session-related rule_id this slice introduces;
+(b) a test asserting eligibility is **denied** when `enabled_namespaces` is exactly `["baseline"]` (i.e. the pre-existing coarse opt-in) for a session-count candidate — proving the consent-reuse leak is closed, not merely renamed.
+
+**Explicitly FORBIDDEN:** shipping any interim rule_id that begins with a currently-known consented prefix — `daemon.`, `system.`, `disk.`, `constraint.`, `provenance.`, `baseline.`, `identity.` — as a stopgap before the real namespace decision lands. Any such rule_id rides an existing consent by construction and is exactly the bug this must-fix exists to prevent.
+
+**Definition of done:** baseline math shipped (or S10 consumed), deviation candidate wired through `extraCandidates`, **must-fix 1's fail-closed namespace design implemented (session-prefix-mapping-to-`undefined` v0 default, or the full `baseline.session.` branch-plus-registration alternative) — not merely "decided"**, **both must-fix 1 regression tests green** ((a) `classifyAlertNamespace` never returns plain `baseline` for a session rule_id; (b) eligibility denied under `enabled_namespaces:["baseline"]`), **no interim rule_id uses a currently-consented prefix**, full suite green.
+
+**Platform coverage:** platform-agnostic (pure math over already-persisted fact-history).
+
+---
+
+## Slice 5 — Real-time event-source spike (TIME-BOXED, decision-aid only)
+
+**locallyTestable:** the macOS half is investigable on this dev machine; the Linux half is NOT (no local VM) — constrained to documentation/community-report research plus, if warranted, a disposable Linux CI probe step mirroring the already-proven `scripts/probe-linux-ci-capability.sh` precedent. This asymmetry should tighten the Linux half's time-box further, not loosen the macOS half's.
+
+**This is explicitly a spike, per the project's spike guardrail: a decision aid ending in a written go/no-go, not a battle-hardened prototype. "Skip it, gap too narrow" is a valid, successful outcome** — exactly the posture the S3-priv macOS spike already modeled in this repo (`docs/plans/2026-07-11-s3-priv-elevated-read-path.md` §"macOS go/no-go spike").
+
+**Goal:** determine whether Descartes should invest in a real **event stream** (macOS EndpointSecurity/`eslogger`; Linux auditd/eBPF/fanotify) to reconstruct a succession of events after the fact — every collector in Slices 0–4 is point-in-time/polling and cannot answer "what exactly happened between tick T and T+1hr," which is precisely the retrospective-reconstruction gap the incident review named as unclosed.
+
+**Doors-and-corners flag (mandatory before any follow-on build, not just at the end):**
+- **macOS EndpointSecurity** requires a system extension, an Apple-approved `com.apple.developer.endpoint-security.client` entitlement (not self-grantable), and notarization implications for a background daemon running in an elevated launch context — a large lift. **`eslogger`** (Apple's own EndpointSecurity-backed CLI, ships with macOS, readable without a custom entitlement if the invoking process/user has appropriate access) may be a far lower-lift substitute worth spiking *first*, before considering a custom ES client at all.
+- **Linux auditd** is a system-level configuration Descartes would either need to *configure* (a mutating action — explicitly out of scope for a read-only agent) or passively *consume* if the operator has already configured it (read-only, acceptable). **Nice-to-have (degrade case for the spike doc):** even the read-only `auditctl -l` (listing existing audit rules) typically requires `CAP_AUDIT_CONTROL`/root on most distributions — passive consumption is not automatically unprivileged just because it's read-only; the spike's decision document should record this as an expected degrade case (non-root operator sees `unable`/permission-denied) rather than assuming passive auditd read is always available. **eBPF/fanotify** require `CAP_BPF`/`CAP_SYS_ADMIN`-class privilege — this entire branch of the spike lives in "privileged elevated path" territory akin to S3-priv, and if the spike concludes "go," the resulting build must reuse that plan's opt-in/audience-scoped/deny-by-default model, not invent a new privilege mechanism.
+
+**Time-box:** propose a strict bound (e.g. 1–2 investigation sessions). Output: a written go/no-go document (mirroring the S3-priv spike doc's own structure — a handful of real captures + a decision, not a hardened POC). Decision criteria to record: (a) does `eslogger`/passive-auditd-read already cover the incident's actual gap (exec + network + login events) without new entitlements/privilege; (b) operational cost (log volume, always-on daemon, CPU/battery) versus the marginal forensic value over Slices 1–4's polling approach; (c) an explicit recommendation — proceed to a real build slice, defer, or decline.
+
+**Safety checks for the spike itself:** read-only investigation only — use already-installed OS tools (`eslogger`, `auditctl -l` in read mode) to observe; do **not** configure new audit rules or install a system extension during the spike — that is itself an install-time decision requiring its own review, at the same bar as S3-priv's `root_helper`. No code from this slice runs by default. A fresh `doors-and-corners` pass is required before any follow-on build slice even begins design, not merely before it ships.
+
+**Definition of done:** a written go/no-go decision document under `docs/plans/` or `docs/solutions/`, explicitly time-boxed, zero daemon-loop code shipped from this slice.
+
+**Platform coverage:** macOS and Linux investigated in parallel; the Linux half is documentation/CI-probe-only given the dev-machine constraint.
+
+---
+
+## Slice 6 — L2 incident-correlation (reuses the S13 gated LLM path — no new externalization surface)
+
+**locallyTestable:** true.
+
+**Goal:** cross-stream timeline join — correlate Slice 1's session-drop fact-history against Slice 3's peer-login fact-history (and existing provenance/process signals) within a bounded time window (the incident's own shape: "login-proximity ∧ kill-proximity") — producing a ranked hypothesis. This is **mostly deterministic L0/L1 correlation logic**; the LLM is used **only** as the final gated adjudicator over an already-assembled, already-sanitized candidate, reusing `alert-intelligence.js` verbatim.
+
+**Does not depend on Slice 5.** The correlation join operates over already-persisted fact-history deltas (a session disappearing between two ticks is itself a fact-history event; no continuous event stream is required to detect that it happened, only to pinpoint exactly when within the tick window). Slice 5's outcome would enrich a future correlation pass's time resolution, not gate this one.
+
+**Files to add:**
+- `tools/descartes-cli/src/incident-correlation.js` — pure function `correlateIncidentCandidates(factHistory, alertHistory, options)`: a deterministic windowed join emitting a `correlation` namespace candidate through the **same** `extraCandidates` seam as constraint/provenance/baseline candidates (`daemon.js:436-443`).
+- A new template branch in `alert-intelligence.js`'s `alertIntelligencePrompt` dispatch for the `correlation` namespace — **follow the exact precedent** of how `provenance`/`baseline`/`identity` templates were added in S13; do not reinvent the dispatch mechanism.
+
+**Files to change:** `alert-intelligence.js` — add `correlation` to `KNOWN_ALERT_NAMESPACES` (`:15`), defaulting **excluded** from `enabled_namespaces` like every other non-metric namespace (S13's stated privacy-forward default); `daemon.js` — wire `correlateIncidentCandidates` into `extraCandidates`.
+
+**TDD test surface:**
+- Byte-identical-when-`correlation`-namespace-disabled, mirroring S13's own byte-identity discipline.
+- A synthetic fixture reproducing the real incident's shape (session-drop + unattributed odd-hour login within a bounded window) asserts a correlation candidate fires.
+- A fixture with the two events far apart in time asserts **no** spurious correlation — the bounded-window discipline must be tested, not assumed.
+- `sanitizeDiagnostics()` gate applies to correlation diagnostics like every other family — **plus a defense-in-depth test (must-fix 3):** a fixture that writes an alert record with a diagnostics value that should not be prompt-facing (simulating an upstream gap in Slice 1/3's hash-at-source enforcement) and asserts `compactAlert`'s re-run of `sanitizeDiagnostics()` catches it before it would reach the LLM prompt.
+- The existing single-alert-per-prompt guard (`alertIntelligencePrompt` already throws if `alerts.length !== 1`, S13) is asserted to still hold for the new template — a correlation finding stays exactly one bounded alert per LLM call, never a batch dump of raw joined events.
+- **A regression test enforcing exactly one LLM call site must be WRITTEN AS NEW in this slice (must-fix 4 — correction):** an earlier draft of this plan cited this as an "existing sole-call-site assertion" test for `enableTools`/`createPrivateAlertSession`/`createPrivateTriageSession` — no such test currently exists anywhere in the suite (no test today references `enableTools` or either session constructor). This slice must author that test from scratch: assert that `createPrivateAlertSession` and `createPrivateTriageSession` (`pi-harness.js`) remain the only two constructors reaching `enableTools`, and that this slice does not add a third call site. This test is genuinely worth backfilling **sooner than this slice** — it pins S13's own boundary, not just Slice 6's — but at minimum it is part of this slice's Definition of Done.
+
+**Safety checks:**
+- **No new LLM entry point.** `createPrivateAlertSession(..., {enableTools:false})` (`pi-harness.js:462-464`) is the only path; this slice adds a prompt-template branch and a namespace flag, nothing else, at the exact same review bar S13 itself was held to.
+- Namespace defaults excluded (opt-in required, same S13 default-off-for-new-namespaces posture).
+- Critical-budget-reservation invariant untouched by default — correlation candidates compete for the **same shared hourly budget** as every other namespace unless a later, explicit decision carves out its own reservation (flagged as an open question below, since a correlation finding is arguably higher-value than a routine metric deviation).
+- L2 never invents evidence — the correlation candidate handed to the LLM is already a fully-formed deterministic hypothesis with bounded diagnostics; the model's role is adjudication (`notify`/`severity`/`title`/`body`/`reason`) exactly as in every other namespace, never additional fact-gathering (`enableTools:false` holds).
+- **Defense-in-depth re-sanitization at the prompt boundary (must-fix 3, hard requirement):** stored `diagnostics` currently reach the LLM prompt **verbatim** via `alert-intelligence.js`'s `compactAlert` (`:264`) — there is no re-validation between what was written to `alert-store.js` at candidate-creation time and what is read back and interpolated into the prompt at adjudication time. Since this slice is the first to introduce a fully deterministic, no-`enableTools` join over two other collectors' fact-history, `compactAlert` must re-run `sanitizeDiagnostics()` (or an equivalent boundary check) on the assembled correlation diagnostics immediately before prompt construction, as a defense-in-depth backstop against any upstream hash-at-source gap in Slice 1 or Slice 3 — do not rely solely on the candidate-builder having sanitized correctly at write time.
+
+**Definition of done:** correlation module + template branch shipped, byte-identical-disabled test green, **sole-call-site regression test authored from scratch and green (must-fix 4 — this test does not exist yet anywhere in the suite)**, **defense-in-depth `sanitizeDiagnostics()` re-run at the `compactAlert` prompt boundary implemented and tested (must-fix 3)**, day-1/no-spurious-correlation tests green, full suite green.
+
+**Platform coverage:** platform-agnostic (operates over already-persisted, already-cross-platform fact-history).
+
+---
+
+## Slice 7 — Authority/containment plane (DESIGN-ONLY — explicitly NOT implemented in this plan)
+
+**locallyTestable:** N/A — no code ships from this slice.
+
+This slice exists in this document only to **scope** the remaining todo item, following the parent roadmap's own "design-sketch, dedicated plan required at pickup" discipline (the same discipline that governed Layer B before it got its own dedicated plan). It is a placeholder for a **future, separately-reviewed plan** — do not begin implementation from this section.
+
+**Verbs explicitly out of scope for this entire milestone:** kill (terminate a process/session), revoke (invalidate a credential/session token), block (firewall/deny a peer), quarantine (isolate a container/process). None of these are implemented, designed-in-detail, or stubbed anywhere in Slices 0–6. The **only** action this milestone ships is Slice 2's evidence-freeze, which is explicitly not a containment verb — it mutates nothing on the monitored system.
+
+**Design intent to record for future pickup (not decided here):**
+- A **new, separate** store, e.g. `authority/containment.json` — separate from `authority/promotions.json` per the parent roadmap's explicit "two separate stores, not merged" decision (§6/§11 of the parent plan), since containment risk (killing/blocking on a live host) is categorically different from artifact-promotion risk.
+- Template the mechanics on `promotion-store.js`'s already-shipped pattern: nonce (32-hex random), expiry (`DEFAULT_PROMOTION_EXPIRY_MS`-equivalent), deny-by-default matching (`findValidPendingPromotion`), full `audit_transitions`.
+- **The genuinely harder, unresolved problem:** the todo's own language calls for "user / LLM / authenticated-agent / representative confirmation" — this is materially harder than `promotion-store.js`'s single-actor CLI `approve`, and needs its own research before any design is locked: where do confirmation identities come from? Multi-device (push-approval to a phone)? Out-of-band (a second human operator)? Purely time-delayed (a cooling-off window with no real second party, which is weaker than true multi-party confirmation and should not be dressed up as equivalent)? **This plan does not answer this — it is the single most important open question below.**
+
+**Safety note (unmissable):** every mutating verb, when eventually designed, must go through deny-by-default + nonce + expiry + audit, mirroring `promotion-store.js`, plus whichever multi-party mechanism is decided — and requires its own dedicated plan, a `doors-and-corners` pass, and an adversarial safety review at least as strict as S3-priv's `root_helper` review (arguably stricter: a root helper reads facts; a containment action mutates live infrastructure and kills real sessions) before a single line ships.
+
+---
+
+## 3. Recommended first slice — validated against the code
+
+**Recommendation: Slice 1 (session-census collector), not Slice 0 or Slice 2.**
+
+Validating against the survey rather than assuming:
+
+- **Slice 0** (log-window widen) is smaller and lower-risk, and can genuinely ship first as a quick win — but it is a one-constant change, not architecturally representative of this milestone, and delivers the least incident-review value of anything in this plan. It's sequenced first in the document for convenience, not recommended as *the* milestone-defining first slice.
+- **Slice 2** (evidence-freeze) is the most operator-urgent capability — it's the direct "what should have happened during the real incident" answer. It was seriously considered for the first slot. It is sequenced second rather than first for a specific reason: it is the first time this codebase deliberately writes a persisted *forensic action bundle* rather than a fact collector, and the plan wants that new "action" pattern built on top of an already-reviewed collector-registration seam (Slice 1), not introduced as the very first new thing in the milestone. Building the lowest-risk collector first keeps the review of the higher-stakes "action" pattern clean and isolated.
+- **Slice 1** (session census) has **zero dependencies** on any other new work in this plan — a true leaf node in the slice dependency graph. It mirrors two seams already proven end-to-end in this exact codebase (the 3-point collector registration in `tool-policy.js`/`pi-harness.js`/`daemon.js`, and the `fact-translators.js` categorical-fact pattern from S6b). It requires no new privilege model, no new hashing scheme (unlike Slice 3), and no new LLM-adjacent surface (unlike Slice 6). And it closes the single most repeated, most concrete gap named in the incident review: "nothing tracks named sessions today, so a mass session-drop is invisible." Every one of Slices 3, 4, and 6 either directly consumes Slice 1's fact-history or is easier to reason about once the collector+fact-translator pattern has been exercised once on new ground.
+
+This confirms rather than overturns the task's suggested candidate.
+
+---
+
+## 4. Cross-platform coverage summary
+
+| Slice | macOS | Linux | Notes |
+|---|---|---|---|
+| 0 (log window) | full | full | no platform-specific code changed |
+| 1 (sessions) | full (tmux/screen native) | full (mocked-execFile-tested) | hourly cadence, degrade if neither binary present |
+| 2 (evidence-freeze) | full | full | platform-agnostic orchestration |
+| 3 (VPN/peer) | full, degrades per-VPN-tech | full, degrades per-VPN-tech | real coverage bounded by what the operator actually runs |
+| 4 (session-count baseline) | full | full | pure math over fact-history |
+| 5 (event-source spike) | investigable locally (`eslogger`) | CI-probe/docs-only, no local VM | tightly time-boxed on both, tighter on Linux |
+| 6 (correlation) | full | full | pure fact-history join + gated LLM reuse |
+| 7 (containment) | N/A | N/A | design-only |
+
+---
+
+## 5. Open Questions (operator input needed)
+
+1. **Fleet/multi-host topology.** Descartes is single-host by design. Does "VPN peer" in Slice 3 stay scoped to peers observed *from this host's* VPN interface, or is there a latent multi-host correlation need (e.g. correlating logins across several monitored Descartes instances)? Recommendation: stay single-host; flag if that's wrong.
+2. **`collect_recent_logs` new ceiling (Slice 0).** What's the right new cap, and should it become operator-configurable rather than a second hardcoded constant? Depends on an operator judgment about log-volume/retention tradeoffs this plan can't make unilaterally.
+3. **Authority-store confirmation identities (Slice 7).** The hardest unresolved question in this whole plan: where do "multi-party confirmation" identities actually come from for a future containment action? Multi-device push, a second human operator, or a time-delay proxy? This blocks any real Slice 7 design, not just its implementation.
+4. **Session-census sampling cadence (Slice 1).** Hourly structural tick (v0 default, zero new plumbing) vs. fast tick (better time-resolution for pinpointing a mass-drop, requires new daemon plumbing). **Sharpened per must-fix 6:** a count-only hourly census is not merely coarse but structurally **invisible** to a same-hour kill-then-resurrect — the actual shape of the motivating incident. Slice 1's bucketed `created_at` attribute (must-fix 6) gives the hourly cadence a way to detect that *some* churn happened within the tick even without a faster sampling rate, but it does not restore minute-level timing precision. Worth revisiting whether bucketed-attribute churn detection is sufficient or whether the fast-tick plumbing is still needed, once real hourly-resolution data is examined against a real (or simulated) incident timeline.
+5. **Session-count baseline namespace scoping (Slice 4).** **No longer a soft recommendation — must-fix 1 makes closing the consent-reuse leak a hard requirement of Slice 4 itself** (a session-count deviation candidate must not silently ride an operator's existing `baseline` opt-in). What remains genuinely open is *which* of must-fix 1's two acceptable designs to ship: the v0-default fail-closed `session.` rule_id prefix (simpler, ships a safe local alert immediately, no LLM adjudication until a deliberate namespace exists) versus the full `baseline.session.` classifier-branch-plus-registration alternative (more machinery, enables LLM adjudication sooner but requires the longest-prefix-first ordering fix). This plan defaults to the v0 fail-closed design as the safer starting point but leaves the timing of the full-machinery alternative as an operator call.
+6. **VPN technology scope (Slice 3).** Which VPN technologies does the operator actually run (WireGuard? something else? none)? The collector's real-world coverage should be driven by this rather than attempting universal support speculatively.
+7. **Real-time event-source priority (Slice 5).** Is the spike scheduled now, or deferred until Slices 1–4/6 are further along and the actual residual retrospective-reconstruction gap can be assessed against real usage?
+8. **Evidence-bundle retention (Slice 2).** Should evidence-freeze bundles ever expire/roll off like fact-history's existing 30-day/5MB cap, or are they exempt as potential legal-hold material? This plan defaults to "never auto-delete" but flags it as a decision, not a settled policy.
+9. **Correlation-candidate LLM budget (Slice 6).** Should `correlation` namespace candidates compete for the shared hourly S13 budget, or warrant their own reservation (mirroring the existing critical-severity carve-out), given a correlation finding is plausibly higher-value per call than a routine metric deviation?
