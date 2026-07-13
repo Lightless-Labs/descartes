@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { readAlertIntelligenceConfig } from "../src/alert-intelligence.js";
 import { runAlerts, renderAlertList, visibleAlerts } from "../src/alerts.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
 import { readNotificationDeliveryConfig, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
@@ -125,6 +126,51 @@ test("alerts intelligence status enable and disable are explicit", async () => {
   const disableOutputs = [];
   await runAlerts(paths, ["intelligence", "disable", "--json"], { output: (line) => disableOutputs.push(JSON.parse(line)) });
   assert.equal(disableOutputs[0].alert_intelligence.enabled, false);
+});
+
+test("alerts intelligence status renders enabled namespaces, critical reservation, and a corrupt marker", async () => {
+  const paths = await tempPaths();
+  const textOutputs = [];
+  await runAlerts(paths, ["intelligence", "status"], { output: (line) => textOutputs.push(line) });
+  assert.match(textOutputs[0], /Critical-severity reservation: 1/);
+  assert.match(textOutputs[0], /Enabled namespaces: metric/);
+  assert.doesNotMatch(textOutputs[0], /WARNING: alert-intelligence\.json was corrupt/);
+
+  await fs.mkdir(paths.configDir, { recursive: true });
+  await fs.writeFile(path.join(paths.configDir, "alert-intelligence.json"), "{not valid json", "utf8");
+  const corruptOutputs = [];
+  await runAlerts(paths, ["intelligence", "status"], { output: (line) => corruptOutputs.push(line) });
+  assert.match(corruptOutputs[0], /WARNING: alert-intelligence\.json was corrupt/);
+});
+
+test("alerts intelligence enable-namespace validates the namespace, rejects learned, and round-trips via normalize", async () => {
+  const paths = await tempPaths();
+
+  await assert.rejects(
+    () => runAlerts(paths, ["intelligence", "enable-namespace", "learned"], { output: () => {} }),
+    /self-audit-only and can never be enabled/,
+  );
+  await assert.rejects(
+    () => runAlerts(paths, ["intelligence", "enable-namespace", "provenence"], { output: () => {} }),
+    /Unknown alert intelligence namespace: provenence/,
+  );
+
+  const enableOutputs = [];
+  await runAlerts(paths, ["intelligence", "enable-namespace", "provenance", "--json"], { output: (line) => enableOutputs.push(JSON.parse(line)) });
+  assert.deepEqual(enableOutputs[0].alert_intelligence.enabled_namespaces, ["metric", "provenance"]);
+
+  const textOutputs = [];
+  await runAlerts(paths, ["intelligence", "enable-namespace", "constraint"], { output: (line) => textOutputs.push(line) });
+  assert.match(textOutputs[0], /Namespace 'constraint' enabled for alert intelligence/);
+  assert.match(textOutputs[0], /mined structural constraint-violation diagnostics/);
+  assert.match(textOutputs[0], /Enabled namespaces: metric, provenance, constraint/);
+
+  // Round-trips through normalizeAlertIntelligenceConfig on read.
+  assert.deepEqual((await readAlertIntelligenceConfig(paths)).enabled_namespaces, ["metric", "provenance", "constraint"]);
+
+  const disableOutputs = [];
+  await runAlerts(paths, ["intelligence", "disable-namespace", "provenance", "--json"], { output: (line) => disableOutputs.push(JSON.parse(line)) });
+  assert.deepEqual(disableOutputs[0].alert_intelligence.enabled_namespaces, ["metric", "constraint"]);
 });
 
 test("alerts notification setup status test and disable are explicit", async () => {

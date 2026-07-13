@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import {
+  KNOWN_ALERT_NAMESPACES,
   readAlertIntelligenceConfig,
   writeAlertIntelligenceConfig,
 } from "./alert-intelligence.js";
@@ -22,6 +23,8 @@ function alertsUsage() {
   descartes alerts intelligence status [--json]
   descartes alerts intelligence enable [--json] [--model <MODEL>] [--thinking <LEVEL>] [--max-per-hour <N>]
   descartes alerts intelligence disable [--json]
+  descartes alerts intelligence enable-namespace <namespace> [--json]
+  descartes alerts intelligence disable-namespace <namespace> [--json]
   descartes alerts notifications status [--json]
   descartes alerts notifications setup [--json] [--channel cli|desktop|macos|native|linux|syslog] [--helper <PATH>]
   descartes alerts notifications test [--json]
@@ -29,6 +32,7 @@ function alertsUsage() {
 
 Lists and acknowledges deterministic local alerts without invoking an LLM.
 Alert intelligence is explicit opt-in; when enabled, deterministic alert transitions may wake an LLM to decide whether/how to notify.
+Alert intelligence is further gated per-namespace: only alert families in enabled_namespaces (default: metric only) may wake the LLM, even when alert intelligence itself is enabled. Use enable-namespace/disable-namespace to opt individual families in or out; "learned" self-audit findings can never be enabled.
 Notification delivery is separately opt-in and only sends bounded LLM-authored notification text.`;
 }
 
@@ -39,7 +43,7 @@ function parseAlertsArgs(args) {
   const options = { subcommand, json: false, all: false, intervalMs: 5000, once: false };
   if (subcommand === "intelligence") {
     options.intelligenceCommand = rest.shift() ?? "status";
-    if (!["status", "enable", "disable"].includes(options.intelligenceCommand)) throw new Error(`Unsupported alerts intelligence command: ${options.intelligenceCommand}\n\n${alertsUsage()}`);
+    if (!["status", "enable", "disable", "enable-namespace", "disable-namespace"].includes(options.intelligenceCommand)) throw new Error(`Unsupported alerts intelligence command: ${options.intelligenceCommand}\n\n${alertsUsage()}`);
   }
   if (subcommand === "notifications") {
     options.notificationsCommand = rest.shift() ?? "status";
@@ -84,11 +88,14 @@ function parseAlertsArgs(args) {
       options.help = true;
     } else if (subcommand === "ack" && !options.alertId) {
       options.alertId = arg;
+    } else if (subcommand === "intelligence" && ["enable-namespace", "disable-namespace"].includes(options.intelligenceCommand) && !options.namespaceArg) {
+      options.namespaceArg = arg;
     } else {
       throw new Error(`Unexpected alerts ${subcommand} argument: ${arg}\n\n${alertsUsage()}`);
     }
   }
   if (subcommand === "ack" && !options.alertId && !options.help) throw new Error(`alerts ack requires an alert id\n\n${alertsUsage()}`);
+  if (subcommand === "intelligence" && ["enable-namespace", "disable-namespace"].includes(options.intelligenceCommand) && !options.namespaceArg && !options.help) throw new Error(`alerts intelligence ${options.intelligenceCommand} requires a namespace\n\n${alertsUsage()}`);
   if (subcommand !== "watch" && options.once) throw new Error(`--once is only supported for alerts watch\n\n${alertsUsage()}`);
   if (subcommand !== "intelligence" && (options.modelPattern || options.thinkingLevel || options.maxCallsPerHour !== undefined)) throw new Error(`Alert intelligence options require 'descartes alerts intelligence enable'\n\n${alertsUsage()}`);
   if (subcommand === "intelligence" && options.intelligenceCommand !== "enable" && (options.modelPattern || options.thinkingLevel || options.maxCallsPerHour !== undefined)) throw new Error(`Alert intelligence model/rate options are only supported with enable\n\n${alertsUsage()}`);
@@ -132,13 +139,32 @@ function jsonAlertPayload(alerts, options = {}) {
   return { alerts: visibleAlerts(alerts, options) };
 }
 
+// S13 nice-to-have: surface enabled_namespaces + critical_reservation + a corrupt-config marker,
+// so which alert families may reach the LLM (and whether the on-disk config was corrupt and fell
+// back to disabled defaults) is always visible, not just the top-level enabled flag.
 function renderAlertIntelligenceStatus(config) {
   const lines = [`Alert intelligence: ${config.enabled ? "enabled" : "disabled"}`];
   lines.push(`Max LLM wakeups/hour: ${config.max_calls_per_hour}`);
+  lines.push(`Critical-severity reservation: ${config.critical_reservation}`);
+  lines.push(`Enabled namespaces: ${(config.enabled_namespaces ?? []).join(", ") || "(none)"}`);
   if (config.model_pattern) lines.push(`Model override: ${config.model_pattern}`);
   if (config.thinking_level) lines.push(`Thinking override: ${config.thinking_level}`);
+  if (config.corrupt) lines.push("WARNING: alert-intelligence.json was corrupt on disk; treated as disabled defaults until rewritten.");
   lines.push("No remediation/action tools are available to alert intelligence sessions.");
   return lines.join("\n");
+}
+
+const NAMESPACE_DATA_CLASS_NOTES = {
+  metric: "system/daemon/disk metric summaries",
+  constraint: "mined structural constraint-violation diagnostics",
+  provenance: "process/port provenance and identity diagnostics",
+  baseline: "statistical metric-baseline deviation diagnostics",
+  identity: "identity-signature baseline deviation diagnostics",
+};
+
+function requireKnownEnableableNamespace(namespace) {
+  if (namespace === "learned") throw new Error(`The "learned" namespace is self-audit-only and can never be enabled for LLM adjudication\n\n${alertsUsage()}`);
+  if (!KNOWN_ALERT_NAMESPACES.includes(namespace)) throw new Error(`Unknown alert intelligence namespace: ${namespace}\n\nKnown namespaces: ${KNOWN_ALERT_NAMESPACES.join(", ")}\n\n${alertsUsage()}`);
 }
 
 function expandNotificationChannel(channel, runtime = {}) {
@@ -189,6 +215,7 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
   if (options.subcommand === "intelligence") {
     const existing = await readAlertIntelligenceConfig(descartesPaths);
     let config = existing;
+    let namespaceNotice;
     if (options.intelligenceCommand === "enable") {
       config = await writeAlertIntelligenceConfig(descartesPaths, {
         ...existing,
@@ -199,9 +226,20 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
       });
     } else if (options.intelligenceCommand === "disable") {
       config = await writeAlertIntelligenceConfig(descartesPaths, { ...existing, enabled: false });
+    } else if (options.intelligenceCommand === "enable-namespace") {
+      const namespace = options.namespaceArg;
+      requireKnownEnableableNamespace(namespace);
+      const nextNamespaces = [...new Set([...(existing.enabled_namespaces ?? []), namespace])];
+      config = await writeAlertIntelligenceConfig(descartesPaths, { ...existing, enabled_namespaces: nextNamespaces });
+      namespaceNotice = `Namespace '${namespace}' enabled for alert intelligence -- this externalizes ${NAMESPACE_DATA_CLASS_NOTES[namespace]} to the configured LLM when alert intelligence is enabled and a due alert in this namespace is adjudicated.`;
+    } else if (options.intelligenceCommand === "disable-namespace") {
+      const namespace = options.namespaceArg;
+      requireKnownEnableableNamespace(namespace);
+      const nextNamespaces = (existing.enabled_namespaces ?? []).filter((entry) => entry !== namespace);
+      config = await writeAlertIntelligenceConfig(descartesPaths, { ...existing, enabled_namespaces: nextNamespaces });
     }
     if (options.json) output(JSON.stringify({ alert_intelligence: config }, null, 2));
-    else output(renderAlertIntelligenceStatus(config));
+    else output([namespaceNotice, renderAlertIntelligenceStatus(config)].filter(Boolean).join("\n"));
     return;
   }
 
