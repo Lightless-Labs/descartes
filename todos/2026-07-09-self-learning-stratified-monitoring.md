@@ -92,7 +92,8 @@ Full review: `docs/reviews/2026-07-11-codex-gpt5.6-sol-review.md` (Codex gpt-5.6
 
 ## L2 reuse + compile-down
 
-- [ ] **S13** Reuse `alert-intelligence.js` for learned-artifact wakeups (per-namespace opt-in; critical-severity budget reservation). Only slice that reaches the LLM.
+- [x] **S13** Reuse `alert-intelligence.js` for learned-artifact wakeups (per-namespace opt-in; critical-severity budget reservation). Only slice that reaches the LLM. — DONE `bc407e2` (2026-07-13). Fable-reviewed plan (6 safety must-fixes) → Sonnet TDD → 3-lens adversarial review (LLM-leak/consent, budget arithmetic, determinism/gating) all OVERALL_SAFE → one CONFIRMED reliability finding fixed (guarded budget_exhausted emit I/O so ENOSPC can't crash-loop the daemon) + single-alert-per-prompt internal guard (defense-in-depth) + dispose guard. Closed-map namespace classification (`learned.*` hard-excluded, unknown prefixes fail closed); metric-only users unchanged; per-namespace enable-namespace/disable-namespace CLI; audit records carry namespace/alert_severity/prompt_hash/template_version. 635 tests, 0 fail; escalation-lint unweakened.
+  - **Deferred follow-up (own slice):** fail-closed I/O hardening of `readAuditRecords` / `readAlertIntelligenceConfig` (non-ENOENT) / per-alert `appendAuditRecord` — must be fail-closed (skip adjudication that tick) or write-ahead, NOT empty-default (empty-default under-counts → over-calls, breaking the total ≤ max budget invariant). Documented inline in `alert-intelligence.js`.
 - [ ] **S14** Outcome-informed compile-down: reviewable tuning proposals (never auto-applied).
 - [ ] **S15** Calibration report (read-only precision/recall proxy).
 - [ ] **S16** Optional bounded `witr` binary cross-check.
