@@ -6,6 +6,7 @@ import test from "node:test";
 import { createEvidenceTools } from "../src/pi-harness.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { assertSafeTriageToolNames, TRIAGE_TOOL_NAMES } from "../src/tool-policy.js";
+import { MAX_WINDOW_MINUTES } from "../src/tools/logs.js";
 
 // Session-construction test (closes the gap noted in docs/plans/2026-07-10-layer-b-provenance.md
 // section 1: no existing test cross-checked pi-harness.js's tool names against tool-policy.js's
@@ -19,6 +20,16 @@ test("createEvidenceTools' tool names are exactly Descartes' TRIAGE_TOOL_NAMES",
 
   assert.deepEqual([...toolNames].sort(), [...TRIAGE_TOOL_NAMES].sort());
   assert.doesNotThrow(() => assertSafeTriageToolNames(toolNames));
+});
+
+test("collect_recent_logs window_minutes schema bound stays in lockstep with logs.js MAX_WINDOW_MINUTES (Slice 0, single source of truth)", () => {
+  // The window bound is double-enforced (the pi-harness Type.Number schema AND logs.js's
+  // normalizeLogRequest clamp). Slice 0 wired the schema to import the logs.js constant so the two
+  // can never drift; this pins that wiring so a future edit re-hardcoding a literal is caught.
+  const paths = resolveDescartesPaths();
+  const logsTool = createEvidenceTools(paths).find((tool) => tool.name === "collect_recent_logs");
+  assert.ok(logsTool, "expected collect_recent_logs to be registered");
+  assert.equal(logsTool.parameters.properties.window_minutes.maximum, MAX_WINDOW_MINUTES);
 });
 
 test("createEvidenceTools includes inspect_runtime_provenance with a single-target parameter contract", () => {

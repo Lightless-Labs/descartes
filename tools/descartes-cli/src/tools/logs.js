@@ -6,7 +6,14 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_WINDOW_MINUTES = 30;
 const DEFAULT_EVENT_LIMIT = 80;
 const DEFAULT_MESSAGE_CHARS = 500;
-const MAX_WINDOW_MINUTES = 360;
+// 72h ceiling (widened from 6h, Slice 0) so a retrospective incident review isn't structurally
+// capped below the incident's actual duration. DEFAULT_WINDOW_MINUTES stays 30 so existing callers
+// are unaffected. Exported as the single source of truth for the pi-harness collect_recent_logs
+// schema bound (which imports it) so the two enforcement points can never drift. NOTE: output is
+// still bounded by MAX_EVENT_LIMIT, so a wider window samples more sparsely — a genuinely useful
+// 7-day window would need pre-computed aggregates rather than a raw event cap (deferred, see the
+// plan's open questions).
+export const MAX_WINDOW_MINUTES = 4320;
 const MAX_EVENT_LIMIT = 200;
 
 function clampNumber(value, fallback, min, max) {

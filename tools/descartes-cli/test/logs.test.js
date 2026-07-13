@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   categorizeLogEntry,
+  MAX_WINDOW_MINUTES,
   normalizeLogRequest,
   parseJournalctlJsonLines,
   parseMacUnifiedLogJson,
@@ -9,9 +10,16 @@ import {
   redactAndBoundLogMessage,
 } from "../src/tools/logs.js";
 
+test("MAX_WINDOW_MINUTES is the widened 72h ceiling (Slice 0)", () => {
+  // Slice 0 widened this from 360 (6h) to 4320 (72h) for retrospective incident review. Pinned so a
+  // change is a deliberate, reviewed act — the pi-harness collect_recent_logs schema imports this
+  // same constant, so this value is the single source of truth for the double-enforced bound.
+  assert.equal(MAX_WINDOW_MINUTES, 4320);
+});
+
 test("normalizeLogRequest clamps time, event, and message bounds", () => {
-  assert.deepEqual(normalizeLogRequest({ windowMinutes: 999, eventLimit: 999, messageChars: 9999, includeSecurity: false }), {
-    window_minutes: 360,
+  assert.deepEqual(normalizeLogRequest({ windowMinutes: 99999, eventLimit: 999, messageChars: 9999, includeSecurity: false }), {
+    window_minutes: MAX_WINDOW_MINUTES,
     event_limit: 200,
     message_chars: 1200,
     include_security: false,

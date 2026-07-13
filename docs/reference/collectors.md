@@ -25,7 +25,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 | `collect_disks` | `disk-usage` | macOS, Linux | none |
 | `collect_network_basics` | `network-basics` | macOS, Linux | `check_dns_reachability?: boolean`, `socket_limit?: 1..200` |
 | `collect_services` | `services` | macOS launchd, Linux systemd | `service_limit?: 1..200` |
-| `collect_recent_logs` | `recent-logs` | macOS unified log, Linux journal/log files | `window_minutes?: 1..360`, `event_limit?: 1..200`, `include_security?: boolean` |
+| `collect_recent_logs` | `recent-logs` | macOS unified log, Linux journal/log files | `window_minutes?: 1..4320` (72h ceiling; default 30min), `event_limit?: 1..200`, `include_security?: boolean` |
 | `collect_containers` | `containers` | macOS, Linux | `container_limit?: 1..200`, `host_limit?: 1..100`, `include_stopped?: boolean`, `collect_stats?: boolean` |
 | `collect_vms` | `vms` | macOS, Linux | `vm_limit?: 1..200` |
 | `collect_scheduled_jobs` | `scheduled-jobs` | macOS, Linux | `job_limit?: 1..200`, `include_system?: boolean`, `include_user?: boolean` |

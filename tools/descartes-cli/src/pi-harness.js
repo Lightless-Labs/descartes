@@ -11,7 +11,7 @@ import {
 import { collectCertificateEvidence } from "./tools/certificates.js";
 import { collectContainerEvidence } from "./tools/containers.js";
 import { collectDiskEvidence } from "./tools/disks.js";
-import { collectRecentLogsEvidence } from "./tools/logs.js";
+import { collectRecentLogsEvidence, MAX_WINDOW_MINUTES } from "./tools/logs.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEvidence } from "./tools/processes.js";
 import { resolveProvenance } from "./tools/provenance.js";
@@ -87,7 +87,7 @@ export function createEvidenceTools(paths) {
       label: "Collect recent logs",
       description: "Collect bounded read-only recent warning/error logs plus fail2ban/firewall-oriented signals where available. Log excerpts are sensitive diagnostic artifacts.",
       parameters: Type.Object({
-        window_minutes: Type.Optional(Type.Number({ minimum: 1, maximum: 360 })),
+        window_minutes: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_WINDOW_MINUTES })),
         event_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
         include_security: Type.Optional(Type.Boolean()),
       }),
