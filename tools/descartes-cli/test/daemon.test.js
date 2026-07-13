@@ -444,13 +444,17 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services", "sessions"]);
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
   // Slice S4 sibling-default consistency (plan section 4): provenance defaults true, matching
   // its three siblings exactly — still gated end-to-end by the outer learned.json kill switch.
   assert(profile.structural.collectors.provenance.enabled);
+  // Slice 1 (observed-incident collectors plan) sibling-default consistency: sessions defaults
+  // true, matching its siblings exactly — still gated end-to-end by the outer learned.json kill
+  // switch, and this collector itself never emits an alert candidate (pure L0 fact source).
+  assert(profile.structural.collectors.sessions.enabled);
 });
 
 test("validateDaemonProfile accepts default and structural-less profiles, rejects malformed ones", () => {
@@ -1433,6 +1437,125 @@ test("S4 structural wiring: a timed-out structural tick (provenance hangs) disca
   assert.equal(result.structuralEvidence, undefined);
   assert.equal(result.structuralFacts, undefined);
   await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 1 (observed-incident collectors plan): session-census structural wiring. Pure L0 fact
+// source — this collector deliberately has NO extraCandidates counterpart (unlike S4/S5 above),
+// so its own coverage here is limited to the structural evidence -> fact-point path, the
+// byte-identical-when-disabled path, and an explicit day-1 no-storm assertion.
+// ---------------------------------------------------------------------------------------------
+
+test("Slice 1: the sessions sub-collector runs on a structural-due tick alongside its siblings, and its census is translated into a hashed, bucketed fact-point", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+  const structuralCollectors = {
+    services: async () => { structuralCalls.push("services"); return envelope("services", "collect_services", { manager: "systemd", services: [] }); },
+    network: async () => { structuralCalls.push("network"); return envelope("network-basics", "collect_network", { listening_sockets: [] }); },
+    "scheduled-jobs": async () => { structuralCalls.push("scheduled-jobs"); return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }); },
+    sessions: async () => {
+      structuralCalls.push("sessions");
+      return envelope("sessions", "collect_sessions", {
+        platform: "darwin",
+        multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+        any_binary_available: true,
+        total_count: 1,
+        sessions: [{ multiplexer: "tmux", session_name: "deploy-worker", attached: true, window_count: 2, created_at_epoch_seconds: 1720000000 }],
+        truncated: false,
+        cap: 200,
+      });
+    },
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, sessions: { enabled: true } },
+  });
+
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "sessions"]);
+  assert(result.status.structural_collector_statuses.some((entry) => entry.id === "sessions" && entry.status === "ok" && entry.tool === "collect_sessions"));
+
+  const { points } = await readFactPoints(paths);
+  const sessionPoint = points.find((point) => point.fact_name === "session.presence");
+  assert.ok(sessionPoint, "expected the structural session census to be translated into a fact-point");
+  assert.match(sessionPoint.entity_key, /^session\.tmux\.[0-9a-f]{16}$/);
+  assert.equal(sessionPoint.entity_key.includes("deploy-worker"), false, "raw session name must never reach persisted fact-history");
+  assert.equal(JSON.stringify(points).includes("deploy-worker"), false, "raw session name must never reach persisted fact-history");
+  assert.equal(sessionPoint.attributes.attached, "true");
+  assert.equal(sessionPoint.attributes.window_count_bucket, "2-4");
+});
+
+test("Slice 1: no session fact-points are persisted while the learned.json kill switch is off, even with populated session evidence available (byte-identical fast path)", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    sessions: async () => envelope("sessions", "collect_sessions", {
+      any_binary_available: true,
+      total_count: 1,
+      sessions: [{ multiplexer: "tmux", session_name: "deploy-worker", attached: true, window_count: 2, created_at_epoch_seconds: 1720000000 }],
+      truncated: false,
+      cap: 200,
+    }),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, sessions: { enabled: true } },
+  });
+
+  const result = await runDaemonIteration(paths, {
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    profile,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 0,
+    evaluateAlerts: false,
+    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
+    // behavior, which is enabled:false when configDir/learned.json is absent.
+  });
+
+  assert.equal(result.structuralFacts, undefined);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("Slice 1 day-1 no-storm: the first-ever session observation seeds fact-history and emits no alert (this collector has no alert-candidate path at all)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    sessions: async () => envelope("sessions", "collect_sessions", {
+      any_binary_available: true,
+      total_count: 1,
+      sessions: [{ multiplexer: "tmux", session_name: "first-ever-session", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 }],
+      truncated: false,
+      cap: 200,
+    }),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, sessions: { enabled: true } },
+  });
+
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+  });
+
+  const { points } = await readFactPoints(paths);
+  assert(points.some((point) => point.fact_name === "session.presence"), "expected fact-history to be seeded on first observation");
+  assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("session")), false, "Slice 1 must never emit a session-related alert candidate");
 });
 
 test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a provenance-warning alert coexist across daemon iterations without any one spuriously recovering another (S2 cross-recovery pattern extended to a third source)", async () => {

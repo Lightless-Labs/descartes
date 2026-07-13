@@ -9,7 +9,7 @@ import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
-import { factPointsFromNetworkEvidence, factPointsFromServiceEvidence } from "./fact-translators.js";
+import { factPointsFromNetworkEvidence, factPointsFromServiceEvidence, factPointsFromSessionEvidence } from "./fact-translators.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -23,6 +23,7 @@ import {
 } from "./tools/provenance-warnings.js";
 import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
+import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
 
 const execFileAsync = promisify(execFile);
@@ -51,6 +52,14 @@ export function defaultDaemonProfile() {
         // configDir/learned.json {enabled:false} kill switch gates the entire structural tick
         // (including this sub-collector) before any of it runs. See plan section 4.
         provenance: { enabled: true },
+        // Slice 1 (observed-incident collectors plan): default true, matching its siblings
+        // exactly — still safe/byte-identical for any operator who hasn't opted into learned
+        // features, because the outer configDir/learned.json {enabled:false} kill switch gates
+        // the entire structural tick (including this sub-collector) before any of it runs. Pure
+        // read-only L0 fact source (tmux/screen census) — this slice emits NO alert candidates
+        // (no extraCandidates addition below; see docs/plans/2026-07-13-observed-incident-
+        // collectors.md Slice 1). Alerting on session-count deviation/churn is Slice 4's job.
+        sessions: { enabled: true },
       },
     },
     safety: {
@@ -209,12 +218,18 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     // (structuralProfile.collectors.provenance.enabled), on the same slow cadence, subject to
     // the same structural-tick deadline/discard discipline below. See plan section 4.
     provenance: collectors.provenance ?? collectProvenanceWarningsEvidence,
+    // Slice 1 (observed-incident collectors plan), additive fifth structural sub-collector:
+    // gated identically to its siblings (structuralProfile.collectors.sessions.enabled), on the
+    // same slow cadence, subject to the same structural-tick deadline/discard discipline below.
+    // Read-only tmux/screen census; NO alert candidates emitted by this slice.
+    sessions: collectors.sessions ?? collectSessionEvidence,
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
   if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network());
   if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
   if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
+  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions());
   return evidence;
 }
 
@@ -386,6 +401,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // discipline as its siblings above — only reachable on a successful (non-timed-out)
             // structural tick, never for a partial/timed-out one (plan section 4).
             ...provenanceWarningFactPoints(structuralEvidence, { ts }),
+            // Slice 1 (observed-incident collectors plan), additive: session-census structural
+            // evidence -> fact-points, same discipline as its siblings above — only reachable on
+            // a successful (non-timed-out) structural tick. Pure L0 fact source: deliberately NOT
+            // paired with any extraCandidates addition below — this slice emits NO alert
+            // candidates (alerting on session-count deviation/churn is Slice 4's job).
+            ...factPointsFromSessionEvidence(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;

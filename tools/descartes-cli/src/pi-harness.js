@@ -17,6 +17,7 @@ import { collectProcessEvidence, inspectParentTreeEvidence, inspectProcessEviden
 import { resolveProvenance } from "./tools/provenance.js";
 import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
+import { collectSessionEvidence, DEFAULT_SESSION_ENTITY_LIMIT } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectTimeSyncEvidence } from "./tools/time-sync.js";
 import { collectVmEvidence } from "./tools/vms.js";
@@ -166,6 +167,14 @@ export function createEvidenceTools(paths) {
         warningDays: params.warning_days ?? 30,
         certificateLimit: params.certificate_limit ?? 80,
       })),
+    }),
+    defineTool({
+      name: "collect_sessions",
+      label: "Collect session census",
+      description: "Collect read-only tmux/screen session inventory for the invoking user: session name, attached/detached state, window count, and creation time where the multiplexer exposes it. Same-UID only — does not enumerate other users' sessions.",
+      parameters: Type.Object({ session_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectSessionEvidence({ sessionLimit: params.session_limit ?? DEFAULT_SESSION_ENTITY_LIMIT })),
     }),
     defineTool({
       name: "inspect_process",

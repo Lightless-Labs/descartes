@@ -29,6 +29,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 | `collect_scheduled_jobs` | `scheduled-jobs` | macOS, Linux | `job_limit?: 1..200`, `include_system?: boolean`, `include_user?: boolean` |
 | `collect_time_sync` | `time-sync` | macOS, Linux | `check_offset?: boolean`, `server?: string` |
 | `collect_certificates` | `certificates` | macOS, Linux | `warning_days?: 1..3650`, `certificate_limit?: 1..500` |
+| `collect_sessions` | `sessions` | macOS, Linux | `session_limit?: 1..500` |
 | `inspect_process` | `process-<pid>` | macOS, Linux | `pid: number` |
 | `inspect_parent_tree` | `process-parent-tree-<pid>` | macOS, Linux | `pid: number`, `max_depth?: 1..64` |
 | `inspect_runtime_provenance` | `provenance-<pid\|port\|container>-<value>` | macOS, Linux | exactly one of `pid: number`, `port: 1..65535`, `container: string` |
@@ -217,6 +218,21 @@ Sources:
 Behavior: file reads are regular-file checked, byte bounded, count bounded, and selected results prioritize expired/soon-expiring certificates. Missing common paths are represented per source. Private-key filenames such as `privkey.pem` are intentionally skipped.
 
 Privacy: certificate subjects, issuers, serial/fingerprint prefixes, keychain names, and local certificate paths can reveal domains, organizations, host roles, and internal infrastructure names.
+
+### `collect_sessions`
+
+Collects a read-only census of resident tmux/screen sessions for the invoking user: session name, attached/detached state, window count, and creation time where the multiplexer exposes it. Same-UID only — v0 does not attempt to enumerate other users' sessions.
+
+Sources:
+
+- Fixed `tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}'`.
+- Fixed `screen -ls`. `screen -ls` is known to exit non-zero on some versions even when it succeeds and sessions exist; the collector inspects stdout/stderr for screen's own recognizable session-listing content before treating a non-zero exit as a real failure, rather than misclassifying a healthy listing as unavailable.
+
+Behavior: degrade-not-fabricate — when neither `tmux` nor `screen` is present on the host, the envelope reports `status: "unable"`, `confidence: 0`; this is never conflated with "0 sessions". A multiplexer that IS present and genuinely reports zero sessions (tmux with no server running, screen's "No Sockets found") is a real, distinguishable fact: `status: "ok"`, an empty session list. Per-tick session entities are bounded at `DEFAULT_SESSION_ENTITY_LIMIT` (200); a count above the cap is truncated with an explicit `truncated: true` marker and the real `total_count` preserved, rather than silently dropping entities.
+
+Fact-history: on the daemon's hourly structural tick (gated behind the `learned.json` kill switch, like every other structural sub-collector), `factPointsFromSessionEvidence` (`fact-translators.js`) translates this census into `session.presence` fact-points. The persisted `entity_key` is a fixed-length (16-char) hex SHA-256 hash of a domain-separated preimage (`descartes.fact.session.v1:<multiplexer>:<session_name>`) — never the raw or charset-substituted session name. Persisted `attributes` are closed-enum/bucketed only: `attached` (`"true"`/`"false"`), `window_count_bucket` (`"0"`/`"1"`/`"2-4"`/`"5-9"`/`"10+"`/`"unknown"`), and `created_at_bucket` (an opaque 10-minute epoch-bucket index, or `"unknown"` for screen sessions, whose `-ls` output does not reliably expose a creation time) — never a raw session name or raw timestamp. A truncated tick additionally emits one `confidence: 0` overflow-marker fact so a session flood is visible as "truncation happened" rather than silently dropped. This collector emits fact-history only — no alert candidates; alerting on session-count deviation/churn is a separate, later slice.
+
+Privacy: the raw, un-hashed session name IS visible in this tool's on-demand `descartes triage` response (matching the existing consent posture of every other `TRIAGE_TOOL_NAMES` collector — triage is operator-invoked and already sees raw process/service data). Only the *persisted* fact-history is hashed/bucketed.
 
 ### `sample_dimension`
 
