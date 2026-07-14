@@ -319,8 +319,11 @@ export function factPointsFromSessionEvidence(evidence, { ts } = {}) {
 const PEER_FACT_NAME = "peer.presence";
 
 // Marker entity_key for the overflow fact — carries no peer identity at all, so no hash is
-// computed for it (mirrors SESSION_OVERFLOW_ENTITY_KEY's convention exactly).
-const PEER_OVERFLOW_ENTITY_KEY = "peer.overflow-marker.v1";
+// computed for it (mirrors SESSION_OVERFLOW_ENTITY_KEY's convention exactly). Exported (Slice 6,
+// observed-incident collectors plan, must-fix 5) so incident-correlation.js's overflow-degraded-
+// window gate can import and compare against it directly, rather than duplicating the
+// "peer.overflow-marker.v1" literal.
+export const PEER_OVERFLOW_ENTITY_KEY = "peer.overflow-marker.v1";
 
 const CLOSED_PEER_SOURCE_TYPES = new Set(["wireguard", "ssh", "vpn_service"]);
 

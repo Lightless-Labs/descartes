@@ -173,6 +173,25 @@ test("alerts intelligence enable-namespace validates the namespace, rejects lear
   assert.deepEqual(disableOutputs[0].alert_intelligence.enabled_namespaces, ["metric", "constraint"]);
 });
 
+// Slice 6 (observed-incident collectors plan) must-fix 3: without a NAMESPACE_DATA_CLASS_NOTES
+// entry for "correlation", the enable-namespace disclosure prints the literal string "undefined"
+// as the externalized data class — the first cross-stream namespace in this milestone, the one
+// place informed consent matters most.
+test("alerts intelligence enable-namespace correlation prints a real data-class disclosure, never the literal string 'undefined'", async () => {
+  const paths = await tempPaths();
+
+  const textOutputs = [];
+  await runAlerts(paths, ["intelligence", "enable-namespace", "correlation"], { output: (line) => textOutputs.push(line) });
+  assert.match(textOutputs[0], /Namespace 'correlation' enabled for alert intelligence/);
+  assert.match(textOutputs[0], /correlated session-anomaly and peer-login events \(hashed\/bucketed, temporally joined\)/);
+  assert.equal(textOutputs[0].includes("undefined"), false, "the disclosure must never print the literal string 'undefined' as the externalized data class");
+  assert.match(textOutputs[0], /Enabled namespaces: metric, correlation/);
+
+  const jsonOutputs = [];
+  await runAlerts(paths, ["intelligence", "status", "--json"], { output: (line) => jsonOutputs.push(JSON.parse(line)) });
+  assert.deepEqual(jsonOutputs[0].alert_intelligence.enabled_namespaces, ["metric", "correlation"]);
+});
+
 test("alerts notification setup status test and disable are explicit", async () => {
   const paths = await tempPaths();
   const setupOutputs = [];

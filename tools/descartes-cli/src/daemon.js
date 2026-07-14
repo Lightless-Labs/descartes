@@ -15,6 +15,7 @@ import {
   factPointsFromSessionEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
+import { computeCorrelationCandidates } from "./incident-correlation.js";
 import { computeSessionBaselineCandidates } from "./session-baseline.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
@@ -494,6 +495,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // new execFile/host I/O. Gated identically to its siblings by
           // computeSessionBaselineCandidates' own loadLearnedConfig(...).enabled short-circuit.
           ...await computeSessionBaselineCandidates(descartesPaths, options),
+          // Slice 6 (observed-incident collectors plan), additive fifth extraCandidates entry:
+          // the deterministic cross-stream login/kill-proximity join (correlation.
+          // login_kill_proximity), derived purely from Slice 3's/Slice 4's already-persisted
+          // peer.presence fact-history and session.count_drop/session.churn alert-history — no
+          // new execFile/host I/O. Gated identically to its siblings by
+          // computeCorrelationCandidates' own loadLearnedConfig(...).enabled short-circuit. The
+          // resulting candidate is 100% deterministic (Decision 4) -- it reaches the LLM only
+          // through the unmodified S13 gate, via the new default-off "correlation" namespace.
+          ...await computeCorrelationCandidates(descartesPaths, options),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace

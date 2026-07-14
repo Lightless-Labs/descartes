@@ -45,6 +45,45 @@ export function isSafeEnumString(value) {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_STRING_LENGTH && SAFE_STRING_PATTERN.test(value);
 }
 
+// Slice 6 (observed-incident collectors plan) must-fix 1(ii): the exact set of keys a
+// redactionMarker() object can ever carry -- used both to recognize an already-well-formed marker
+// (the idempotency passthrough below) and to build one.
+const REDACTION_MARKER_KEYS = new Set(["redacted", "reason", "original_length"]);
+
+function redactionMarker(reason, rawValue) {
+  return {
+    redacted: true,
+    reason,
+    original_length: typeof rawValue === "string" ? rawValue.length : undefined,
+  };
+}
+
+/**
+ * Slice 6 must-fix 1(ii) (idempotency passthrough, hard requirement): alert-intelligence.js's
+ * compactAlert re-runs sanitizeDiagnostics() as a defense-in-depth measure immediately before a
+ * stored alert's diagnostics reach the LLM prompt (Decision 3). Without this check, re-running
+ * classifyValue against an ALREADY-redacted marker object (produced by an earlier
+ * sanitizeDiagnostics() call, then round-tripped through alerts.json) would fall through to the
+ * generic "unsupported_type" object branch and get rewritten into a SECOND, generic redaction
+ * marker -- losing the original reason/original_length and making the re-sanitization not a fixed
+ * point. Recognizing the well-formed marker SHAPE explicitly (exactly the three keys above,
+ * `redacted:true`, a safe-enum-string `reason`, and an `original_length` that is either absent,
+ * undefined, or a finite number) and passing it through BY REFERENCE, unchanged, restores true
+ * idempotency: a redacted value re-sanitizes to the identical marker, never a re-redacted one.
+ */
+function isWellFormedRedactionMarker(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length === 0 || !keys.every((key) => REDACTION_MARKER_KEYS.has(key))) return false;
+  if (value.redacted !== true) return false;
+  if (!isSafeEnumString(value.reason)) return false;
+  if ("original_length" in value) {
+    const originalLength = value.original_length;
+    if (originalLength !== undefined && !(typeof originalLength === "number" && Number.isFinite(originalLength))) return false;
+  }
+  return true;
+}
+
 function classifyValue(value) {
   if (typeof value === "number") {
     return Number.isFinite(value) ? { safe: true, value } : { safe: false, reason: "non_finite_number" };
@@ -55,15 +94,8 @@ function classifyValue(value) {
     if (isSafeEnumString(value)) return { safe: true, value };
     return { safe: false, reason: value.length > MAX_STRING_LENGTH ? "string_too_long" : "unsafe_string_shape" };
   }
+  if (isWellFormedRedactionMarker(value)) return { safe: true, value };
   return { safe: false, reason: value === null ? "null_value" : "unsupported_type" };
-}
-
-function redactionMarker(reason, rawValue) {
-  return {
-    redacted: true,
-    reason,
-    original_length: typeof rawValue === "string" ? rawValue.length : undefined,
-  };
 }
 
 /**

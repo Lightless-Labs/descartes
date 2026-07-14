@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
+  DEFAULT_ENABLED_NAMESPACES,
   KNOWN_ALERT_NAMESPACES,
   adjudicateAlertNotifications,
   alertIntelligencePrompt,
@@ -16,6 +17,7 @@ import {
   resolveAlertIntelligencePaths,
   writeAlertIntelligenceConfig,
 } from "../src/alert-intelligence.js";
+import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
@@ -965,4 +967,189 @@ test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS matches the two session rule_ids exa
   for (const ruleId of DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS) {
     assert.equal(classifyAlertNamespace(ruleId).namespace, undefined);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 6 (observed-incident collectors plan) — the new, real, default-off "correlation"
+// namespace. Unlike session.*'s permanent unknown_namespace, "correlation" is a genuine,
+// registered, consentable namespace: classified, but excluded by DEFAULT_ENABLED_NAMESPACES
+// until the operator explicitly opts in.
+// ---------------------------------------------------------------------------------------------
+
+function extractPromptContext(promptText) {
+  const match = promptText.match(/Context:\n([\s\S]*?)\n\nReturn only valid JSON/);
+  assert.ok(match, "expected a Context JSON block in the prompt");
+  return JSON.parse(match[1]);
+}
+
+test("classifyAlertNamespace('correlation.login_kill_proximity') classifies as the new, real 'correlation' namespace (not hard-excluded, not unknown)", () => {
+  assert.deepEqual(classifyAlertNamespace(CORRELATION_RULE_ID), { namespace: "correlation", hardExcluded: false });
+});
+
+test("KNOWN_ALERT_NAMESPACES gained 'correlation'; DEFAULT_ENABLED_NAMESPACES stays exactly ['metric'] — structural default-off, not a documentation promise", () => {
+  assert.ok(KNOWN_ALERT_NAMESPACES.includes("correlation"));
+  assert.deepEqual(DEFAULT_ENABLED_NAMESPACES, ["metric"]);
+});
+
+test("Slice 6: with default config (metric-only), a due correlation.* candidate is NOT LLM-eligible — status not_consented, zero sessions, zero audit records", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5 }, { now: "2026-07-14T00:00:00.000Z" });
+  const correlationAlert = alert({
+    id: "alert_correlation",
+    rule_id: CORRELATION_RULE_ID,
+    severity: "warning",
+    diagnostics: {
+      kill_rule_id: SESSION_COUNT_DROP_RULE_ID,
+      anchor_fingerprint: "global",
+      peer_entity_key: "peer.wireguard.9999999999999999",
+      peer_source_type: "wireguard",
+      peer_observed_hour_bucket: "02",
+      proximity_seconds: 60,
+      peer_novelty_prior_tick_count: 0,
+      candidate_pool_size: 1,
+      anchor_severity: "critical",
+    },
+  });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [correlationAlert],
+    notification_due_ids: [correlationAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must not create a session for an un-consented correlation candidate"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.not_consented, 1);
+  assert.equal((await readAlertIntelligenceAudit(paths)).length, 0);
+});
+
+test("Slice 6: only after enable-namespace correlation (enabled_namespaces includes 'correlation') does a due correlation.* candidate become LLM-eligible, adjudicated exactly once via buildCorrelationAlertPrompt", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: ["metric", "correlation"] }, { now: "2026-07-14T00:00:00.000Z" });
+  const correlationAlert = alert({
+    id: "alert_correlation",
+    rule_id: CORRELATION_RULE_ID,
+    severity: "warning",
+    diagnostics: {
+      kill_rule_id: SESSION_COUNT_DROP_RULE_ID,
+      anchor_fingerprint: "global",
+      peer_entity_key: "peer.wireguard.9999999999999999",
+      peer_source_type: "wireguard",
+      peer_observed_hour_bucket: "02",
+      proximity_seconds: 60,
+      peer_novelty_prior_tick_count: 0,
+      candidate_pool_size: 3,
+      anchor_severity: "critical",
+    },
+  });
+  const prompts = [];
+  let sessionCreateCount = 0;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [correlationAlert],
+    notification_due_ids: [correlationAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async (...args) => {
+      sessionCreateCount += 1;
+      return fakeCreateSession(prompts, { notify: false })(...args);
+    },
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(sessionCreateCount, 1, "exactly one session must be constructed");
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /"correlation" learned-artifact family woke you up/);
+  assert.match(prompts[0], /DETERMINISTIC TEMPORAL CORRELATION/);
+  assert.match(prompts[0], /"namespace": "correlation"/);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].namespace, "correlation");
+  assert.equal(audit[0].status, "ok");
+});
+
+test("Slice 6: buildCorrelationAlertPrompt's hard rules cover causation, the novelty-count's real meaning, and the observed-hour-bucket-is-not-a-login-instant distinction (must-fixes 2/6, prompt-side)", () => {
+  const correlationAlert = alert({ id: "alert_correlation", rule_id: CORRELATION_RULE_ID, severity: "warning" });
+  const prompt = alertIntelligencePrompt({ alerts: [correlationAlert] });
+  assert.match(prompt, /DETERMINISTIC TEMPORAL CORRELATION/);
+  assert.match(prompt, /not proof of a causal/);
+  assert.match(prompt, /causally connected\./);
+  assert.match(prompt, /candidate_pool_size in the context indicates/);
+  assert.match(prompt, /RARELY OBSERVED RECENTLY/);
+  assert.match(prompt, /"unauthenticated," "unauthorized,"/);
+  assert.match(prompt, /attribution" -- describe it only as infrequently observed/);
+  assert.match(prompt, /OBSERVATION TICK/);
+  assert.match(prompt, /Describe it as "observed at/);
+  assert.match(prompt, /NEVER as "logged in at hour X\."/);
+  assert.match(prompt, /Treat the value "unknown" as no signal at all/);
+});
+
+test("Slice 6: single-alert-per-prompt guard still holds for the correlation namespace", () => {
+  const first = alert({ id: "alert_correlation_a", rule_id: CORRELATION_RULE_ID, fingerprint: "one" });
+  const second = alert({ id: "alert_correlation_b", rule_id: CORRELATION_RULE_ID, fingerprint: "two" });
+  assert.throws(() => alertIntelligencePrompt({ alerts: [first, second] }), /requires exactly one alert, got 2/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 6, Decision 3 / Fable review must-fix 1: compactAlert's defense-in-depth
+// sanitizeDiagnostics() re-run. NOT a no-op for every existing family — see the corrected fixtures
+// below (undefined-value, already-redacted-marker), and the one true no-op case (already-safe
+// values, including an ISO-8601 timestamp).
+// ---------------------------------------------------------------------------------------------
+
+test("Slice 6 must-fix 1: compactAlert's re-sanitization round-trips an already-safe diagnostics object (numbers, closed-enum strings, a hex hash, and an ISO-8601 newest_sample_ts) byte-identical — the one true no-op case", () => {
+  const staleAlert = alert({
+    id: "alert_stale",
+    rule_id: "daemon.samples.stale",
+    severity: "warning",
+    diagnostics: {
+      newest_sample_ts: "2026-05-28T00:01:00.000Z",
+      stale_ms: 300000,
+      age_ms: 900000,
+      confidence_state: "established",
+      short_hash: "a3f2b8c9d1e4f567",
+    },
+  });
+  const prompt = alertIntelligencePrompt({ alerts: [staleAlert] });
+  const context = extractPromptContext(prompt);
+  assert.deepEqual(context.alerts[0].diagnostics, staleAlert.diagnostics);
+});
+
+test("Slice 6 must-fix 1: compactAlert's re-sanitization surfaces a NEW redaction marker for an undefined-valued diagnostics key (daemon.samples.missing's real window_ms:undefined shape) — documented as a real behavior change, not a no-op", () => {
+  const missingAlert = alert({
+    id: "alert_missing",
+    rule_id: "daemon.samples.missing",
+    severity: "warning",
+    diagnostics: { window_ms: undefined, point_count: 0 },
+  });
+  const prompt = alertIntelligencePrompt({ alerts: [missingAlert] });
+  const context = extractPromptContext(prompt);
+  assert.equal(context.alerts[0].diagnostics.window_ms.redacted, true);
+  assert.equal(context.alerts[0].diagnostics.window_ms.reason, "unsupported_type");
+  assert.equal(context.alerts[0].diagnostics.point_count, 0);
+});
+
+test("Slice 6 must-fix 1(ii): compactAlert's re-sanitization passes an already-well-formed redaction marker through UNCHANGED, preserving its original reason and original_length rather than rewriting it to a generic unsupported_type marker", () => {
+  const alreadyRedacted = { redacted: true, reason: "unsafe_string_shape", original_length: 12 };
+  const hostnameAlert = alert({
+    id: "alert_identity",
+    rule_id: "provenance.process.unknown_identity",
+    severity: "warning",
+    diagnostics: { owner: alreadyRedacted, identity_hash: "abc123def4567890" },
+  });
+  const prompt = alertIntelligencePrompt({ alerts: [hostnameAlert] });
+  const context = extractPromptContext(prompt);
+  assert.deepEqual(context.alerts[0].diagnostics.owner, alreadyRedacted);
+  assert.equal(context.alerts[0].diagnostics.identity_hash, "abc123def4567890");
+});
+
+test("Slice 6, Decision 3 negative test: compactAlert's re-sanitization redacts an unsafe (space/slash-shaped) diagnostics value that bypassed write-time sanitization, before it would ever reach the rendered prompt text", () => {
+  const unsafeValue = "rm -rf /tmp/data --force --user=alice";
+  const leakyAlert = alert({
+    id: "alert_leaky",
+    rule_id: "provenance.process.unknown_identity",
+    severity: "warning",
+    diagnostics: { args: unsafeValue },
+  });
+  const prompt = alertIntelligencePrompt({ alerts: [leakyAlert] });
+  assert.equal(prompt.includes(unsafeValue), false, "the raw unsafe value must never reach the rendered prompt text");
+  const context = extractPromptContext(prompt);
+  assert.equal(context.alerts[0].diagnostics.args.redacted, true);
 });

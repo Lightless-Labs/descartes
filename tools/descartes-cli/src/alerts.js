@@ -160,6 +160,11 @@ const NAMESPACE_DATA_CLASS_NOTES = {
   provenance: "process/port provenance and identity diagnostics",
   baseline: "statistical metric-baseline deviation diagnostics",
   identity: "identity-signature baseline deviation diagnostics",
+  // Slice 6 (observed-incident collectors plan) must-fix 3: without this entry,
+  // NAMESPACE_DATA_CLASS_NOTES["correlation"] is undefined and the enable-namespace disclosure
+  // below prints the literal string "undefined" as the externalized data class -- the first
+  // cross-stream namespace in this milestone, the one place informed consent matters most.
+  correlation: "correlated session-anomaly and peer-login events (hashed/bucketed, temporally joined)",
 };
 
 function requireKnownEnableableNamespace(namespace) {

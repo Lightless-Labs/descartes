@@ -37,6 +37,7 @@ import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-ide
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
+import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -2128,4 +2129,112 @@ test("Slice 4: computeSessionBaselineCandidates candidate shape matches the exis
   const { state } = await loadSessionBaselineStore(paths);
   assert.equal(state.confidence_state, "established");
   assert.equal(state.stats.count, 31);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 6 (observed-incident collectors plan): L2 incident-correlation wiring
+// (computeCorrelationCandidates as the daemon's fifth extraCandidates entry).
+// ---------------------------------------------------------------------------------------------
+
+function peerFactPoint(ts, entityKey, { hourBucket = "02", sourceType = "wireguard" } = {}) {
+  return {
+    ts,
+    fact_name: "peer.presence",
+    entity_key: entityKey,
+    attributes: {
+      source_type: sourceType,
+      presence_state: "observed_active",
+      login_hour_bucket: hourBucket,
+      handshake_age_bucket: sourceType === "wireguard" ? "lt_1h" : "n/a",
+    },
+    source_envelope_id: "vpn-peer-status",
+    source_tool: "collect_vpn_peer_status",
+    sensitivity: "operational",
+  };
+}
+
+function correlationFixtureFactPoints() {
+  const sessionTicks = [];
+  for (let i = 0; i < 30; i += 1) sessionTicks.push(...completeSessionTick(hour(i), 20));
+  sessionTicks.push(...completeSessionTick(hour(30), 0));
+  // A "regular" peer observed daily at an ordinary hour establishes stream-wide maturity (the
+  // must-fix 4 cold-start gate) without itself ever qualifying as odd-hour/novel.
+  const peerTicks = [];
+  for (let day = 0; day < 5; day += 1) {
+    const ts = new Date(Date.parse(hour(30)) - day * 24 * 60 * 60 * 1000).toISOString();
+    peerTicks.push(peerFactPoint(ts, "peer.ssh.1111111111111111", { hourBucket: "12", sourceType: "ssh" }));
+  }
+  // The rare/odd-hour peer, observed exactly at the anchor's own tick.
+  peerTicks.push(peerFactPoint(hour(30), "peer.wireguard.9999999999999999"));
+  return [...sessionTicks, ...peerTicks];
+}
+
+test("Slice 6 wiring: computeCorrelationCandidates is the daemon's fifth extraCandidates entry — once the session.count_drop anchor has been persisted by a prior tick, a following tick joins it against an odd-hour/novel peer login and produces a real, sanitized correlation.login_kill_proximity alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await appendFactPoints(paths, correlationFixtureFactPoints(), { now: hour(30) });
+
+  // Tick 1: computeSessionBaselineCandidates first derives and PERSISTS the session.count_drop
+  // anchor. computeCorrelationCandidates reads alert-HISTORY from disk independently (Decision 1)
+  // — it never sees this same tick's own in-memory candidate array — so no correlation candidate
+  // exists yet after this first tick alone (an intentional, documented one-tick lag, off by at
+  // most one structural-tick cadence, per the plan's Decision 1).
+  const tick1 = await runIsolatedDaemonTick(paths, hour(30));
+  const anchor = tick1.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(anchor, "expected the session.count_drop anchor to fire on tick 1");
+  assert.equal(tick1.alerts.alerts.some((a) => a.rule_id === CORRELATION_RULE_ID), false, "no correlation candidate yet — the anchor was only just persisted by this same tick");
+
+  // Tick 2, a few minutes later: the now-persisted anchor is visible to computeCorrelationCandidates'
+  // own readAlertRecords call, and the join fires.
+  const tick2Ts = new Date(Date.parse(hour(30)) + 5 * 60 * 1000).toISOString();
+  const tick2 = await runIsolatedDaemonTick(paths, tick2Ts);
+  const persistedAnchor = tick2.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(persistedAnchor, "expected the session.count_drop anchor to still be active on tick 2");
+
+  const correlation = tick2.alerts.alerts.find((a) => a.rule_id === CORRELATION_RULE_ID);
+  assert.ok(correlation, "expected a real correlation.login_kill_proximity alert record on tick 2");
+  assert.equal(correlation.status, "active");
+  assert.equal(correlation.severity, "warning", "stored severity is capped at warning even for a critical anchor");
+  assert.equal(correlation.diagnostics.peer_entity_key, "peer.wireguard.9999999999999999");
+  assert.equal(correlation.diagnostics.anchor_severity, persistedAnchor.severity);
+  assert.equal(JSON.stringify(correlation.diagnostics).includes("redacted"), false);
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === correlation.id && a.status === "active"));
+});
+
+test("Slice 6: byte-identical real alerts when the learned kill switch is off, even with peer/session fact-history present that would otherwise correlate, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withHistoryPaths = await tempPaths();
+  await appendFactPoints(withHistoryPaths, correlationFixtureFactPoints(), { now: hour(30) });
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the baseline above — computeCorrelationCandidates must
+  // short-circuit to [] before ever calling readFactPoints/readAlertRecords.
+  let readFactsCalled = false;
+  let readAlertsCalled = false;
+  const withHistory = await runDaemonIteration(withHistoryPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    readFactPoints: async (...args) => {
+      readFactsCalled = true;
+      return readFactPoints(...args);
+    },
+    readAlertRecords: async (...args) => {
+      readAlertsCalled = true;
+      return readAlertRecords(...args);
+    },
+  });
+
+  assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+  assert.equal(readAlertsCalled, false, "readAlertRecords (the correlation module's own hook) must never be called while the learned.json kill switch is off");
+
+  const persisted = await readAlertRecords(withHistoryPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === CORRELATION_RULE_ID), false);
 });

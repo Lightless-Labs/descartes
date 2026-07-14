@@ -158,3 +158,54 @@ test("sanitizeIdentityString is pure and deterministic", () => {
   const input = "/some/hostile/path";
   assert.equal(sanitizeIdentityString(input), sanitizeIdentityString(input));
 });
+
+// --- Slice 6 (observed-incident collectors plan) must-fix 1(ii): redaction-marker passthrough ---
+// (restores idempotency for alert-intelligence.js's compactAlert defense-in-depth re-sanitization)
+
+test("sanitizeDiagnostics passes an already-well-formed redaction marker through UNCHANGED (by reference), preserving its original reason and original_length", () => {
+  const marker = { redacted: true, reason: "unsafe_string_shape", original_length: 12 };
+  const sanitized = sanitizeDiagnostics({ owner: marker });
+  assert.equal(sanitized.owner, marker, "expected the exact same marker object, not a rebuilt one");
+  assert.deepEqual(sanitized.owner, { redacted: true, reason: "unsafe_string_shape", original_length: 12 });
+});
+
+test("sanitizeDiagnostics passes a well-formed redaction marker through unchanged even when original_length is undefined (the non-string-original-value case)", () => {
+  const marker = { redacted: true, reason: "unsupported_type", original_length: undefined };
+  const sanitized = sanitizeDiagnostics({ window_ms: marker });
+  assert.deepEqual(sanitized.window_ms, { redacted: true, reason: "unsupported_type", original_length: undefined });
+});
+
+test("sanitizeDiagnostics passes a well-formed redaction marker through unchanged when original_length is entirely absent (round-tripped through JSON, which drops undefined-valued keys)", () => {
+  // Mirrors what a marker actually looks like after a real round-trip through alerts.json's
+  // JSON.stringify/JSON.parse: an undefined-valued original_length key is dropped entirely, not
+  // preserved as a literal `undefined`.
+  const marker = JSON.parse(JSON.stringify({ redacted: true, reason: "unsupported_type", original_length: undefined }));
+  assert.deepEqual(Object.keys(marker), ["redacted", "reason"]);
+  const sanitized = sanitizeDiagnostics({ window_ms: marker });
+  assert.deepEqual(sanitized.window_ms, { redacted: true, reason: "unsupported_type" });
+});
+
+test("sanitizeDiagnostics does NOT treat an object merely resembling a marker (wrong reason type, extra keys, or redacted:false) as well-formed — it is redacted like any other unsupported object", () => {
+  const wrongReasonType = sanitizeDiagnostics({ owner: { redacted: true, reason: 123, original_length: 5 } });
+  assert.equal(wrongReasonType.owner.redacted, true);
+  assert.notDeepEqual(wrongReasonType.owner, { redacted: true, reason: 123, original_length: 5 });
+
+  const extraKey = sanitizeDiagnostics({ owner: { redacted: true, reason: "unsafe_string_shape", original_length: 5, extra: "nope" } });
+  assert.equal(extraKey.owner.redacted, true);
+  assert.notDeepEqual(extraKey.owner, { redacted: true, reason: "unsafe_string_shape", original_length: 5, extra: "nope" });
+
+  const notActuallyRedacted = sanitizeDiagnostics({ owner: { redacted: false, reason: "unsafe_string_shape", original_length: 5 } });
+  assert.equal(notActuallyRedacted.owner.redacted, true);
+  assert.notDeepEqual(notActuallyRedacted.owner, { redacted: false, reason: "unsafe_string_shape", original_length: 5 });
+});
+
+test("sanitizeDiagnostics re-run on its own output is a true fixed point for a mix of already-safe values and an already-redacted marker", () => {
+  const input = {
+    count: 3,
+    hash: "a3f2b8c9d1e4f567",
+    home: "/Users/alice/data", // will be redacted on the FIRST pass
+  };
+  const once = sanitizeDiagnostics(input);
+  const twice = sanitizeDiagnostics(once);
+  assert.deepEqual(twice, once, "re-sanitizing an already-sanitized object (including its redaction marker) must be a no-op");
+});

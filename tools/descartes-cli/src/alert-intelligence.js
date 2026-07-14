@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -17,12 +18,21 @@ export const DEFAULT_ALERT_INTELLIGENCE_CRITICAL_RESERVATION = 1;
 // S13 must-fix 1: the CLOSED set of namespaces that MAY ever be opted into LLM adjudication.
 // "learned" is deliberately never a member of this list -- it is hard-excluded below, not merely
 // defaulted off, and `normalizeEnabledNamespaces`/the alerts.js CLI reject it explicitly.
-export const KNOWN_ALERT_NAMESPACES = ["metric", "constraint", "provenance", "baseline", "identity"];
+//
+// "correlation" (Slice 6, observed-incident collectors plan): a new, real, consentable namespace
+// for the cross-stream login/kill-proximity join (incident-correlation.js). Unlike Slice 4's
+// session.*/unknown_namespace rule_ids (permanently un-consentable), this IS a genuine opt-in
+// surface -- see the DEFAULT_ENABLED_NAMESPACES comment directly below for why it stays off by
+// default regardless of this registration.
+export const KNOWN_ALERT_NAMESPACES = ["metric", "constraint", "provenance", "baseline", "identity", "correlation"];
 
 // S13 must-fix 1: metric-only users (the entire installed base pre-S13) see ZERO behavior change --
 // every fixed/legacy alert (daemon./system./disk.) classifies as "metric" and stays enabled by
-// default; every learned namespace (constraint/provenance/baseline/identity) defaults OFF even
-// when alert-intelligence.json has enabled:true.
+// default; every learned namespace (constraint/provenance/baseline/identity/correlation) defaults
+// OFF even when alert-intelligence.json has enabled:true. Slice 6 (observed-incident collectors
+// plan), hard requirement: "correlation" joining KNOWN_ALERT_NAMESPACES above must NOT change this
+// list -- a metric-only/default user's enabled_namespaces never contains "correlation" unless they
+// explicitly run `descartes alerts intelligence enable-namespace correlation`.
 export const DEFAULT_ENABLED_NAMESPACES = ["metric"];
 
 export function resolveAlertIntelligencePaths(descartesPaths) {
@@ -329,6 +339,30 @@ function buildSessionAlertNotificationDecision(alert) {
   return { notify: true, severity: "warning", title: "Descartes: session alert", body: `rule_id=${alert?.rule_id}` };
 }
 
+// Slice 6 (observed-incident collectors plan) Decision 3, must-fix 3/1, defense-in-depth: re-runs
+// sanitizeDiagnostics() on stored diagnostics immediately before they reach the prompt, rather
+// than trusting the candidate builder's own write-time sanitization alone. Module-wide (every
+// namespace's compactAlert output is re-sanitized, not just "correlation"'s), since Slice 6 is the
+// first slice whose candidate diagnostics are assembled from two independently-hashed upstream
+// streams (Slice 3's peer facts, Slice 4's session-baseline alert).
+//
+// SCOPE (honest, per adversarial review): sanitizeDiagnostics is a CHARSET/shape/type gate -- it
+// redacts unsafe-charset or over-length strings, non-finite numbers, and unsupported types, and
+// restores idempotency for already-redacted markers. It is NOT a semantic hash/enum check: a
+// charset-safe raw identifier (a dotted hostname like "host.example.com" or an IP "10.0.0.1")
+// would PASS it. So this re-run is a shape backstop, NOT a hash-at-source enforcer -- the real
+// confidentiality control is upstream, where the translators hash every entity_key/fingerprint at
+// source. Every field a correlation candidate emits is a hash / number / closed-enum by
+// construction (pinned by the schema-level negative test in test/incident-correlation.test.js).
+//
+// NOT a no-op for every existing namespace (corrected during Fable review, must-fix 1): the
+// `metric` family's evaluateAlertRules (alert-store.js) never calls sanitizeDiagnostics at write
+// time, so an `undefined`-valued diagnostics key (e.g. daemon.samples.missing's window_ms when
+// historySummary is absent) now surfaces as a real redaction-marker key where JSON.stringify used
+// to silently drop it. diagnostics-sanitizer.js's isWellFormedRedactionMarker passthrough (added
+// in the same change) keeps this re-run a true fixed point for already-redacted values, and
+// already-safe diagnostics (numbers, closed-enum strings, hex hashes, ISO timestamps) round-trip
+// byte-identical -- see test/alert-intelligence.test.js's compactAlert idempotency fixtures.
 function compactAlert(alert) {
   return {
     id: alert.id,
@@ -339,7 +373,7 @@ function compactAlert(alert) {
     summary: alert.summary,
     first_seen: alert.first_seen,
     last_seen: alert.last_seen,
-    diagnostics: alert.diagnostics,
+    diagnostics: sanitizeDiagnostics(alert.diagnostics),
   };
 }
 
@@ -451,17 +485,76 @@ Return only valid JSON with this shape:
   };
 }
 
+// Slice 6 (observed-incident collectors plan) Decision 2: a BESPOKE prompt template, not the
+// generic buildLearnedNamespaceAlertPrompt factory. A correlation finding carries a different
+// epistemic status than every other learned namespace's "this one signal looks anomalous" framing
+// -- it is TWO independently-true facts placed near each other in time, not a single confirmed
+// anomaly -- so the prompt must say so explicitly, or the model's freeform body/reason text could
+// overclaim causation from what is actually only a timing coincidence with a bounded pool size.
+// Same contract/shape as buildLearnedNamespaceAlertPrompt's output (same context keys, same
+// bounded JSON response schema, same hard-rules block) plus three additional hard rules:
+// causation, the novelty-count's real meaning, and the observed-hour-bucket-is-not-a-login-
+// instant distinction (must-fix 6).
+function buildCorrelationAlertPrompt({ alerts, historySummary, daemonStatus }) {
+  return `You are Descartes alert intelligence. A deterministic local monitoring rule from the "correlation" learned-artifact family woke you up.
+
+Decide whether the user should receive a notification now and write the exact bounded notification content.
+
+Hard rules:
+- Use only the alert records and summaries in this prompt.
+- Do not claim facts not present here.
+- Do not recommend or imply that any remediation action was taken.
+- Prefer not notifying for stale/low-confidence/noisy alerts unless the user likely needs attention.
+- This finding comes from a mined/learned artifact, not a hand-authored fixed rule; prefer a
+  conservative severity and prefer not notifying when uncertain.
+- This finding is a DETERMINISTIC TEMPORAL CORRELATION between two independently-observed
+  signals (a session-count/churn deviation and a peer login), not proof of a causal
+  relationship or a confirmed security incident. Do not state or imply the two events are
+  causally connected. Describe them as temporally correlated and let the operator judge
+  causation. candidate_pool_size in the context indicates how many peer logins matched
+  this same window -- a larger pool means a weaker, more ambiguous hypothesis.
+- peer_novelty_prior_tick_count means this peer was RARELY OBSERVED RECENTLY in the read
+  window, NOT that any login attempt was investigated and failed to attribute to a known
+  identity. Do not describe this peer as "unauthenticated," "unauthorized," or "failed
+  attribution" -- describe it only as infrequently observed.
+- peer_observed_hour_bucket is the hour of the OBSERVATION TICK that recorded this peer's
+  presence, not necessarily the peer's actual login instant. Describe it as "observed at
+  hour X", NEVER as "logged in at hour X." Treat the value "unknown" as no signal at all.
+- Keep notification title <= 80 chars and body <= 240 chars.
+
+Context:
+${JSON.stringify({
+  namespace: "correlation",
+  alerts: alerts.map(compactAlert),
+  history_summary: compactHistory(historySummary),
+  daemon_status: daemonStatusContext(daemonStatus),
+}, null, 2)}
+
+Return only valid JSON with this shape:
+{
+  "notify": boolean,
+  "severity": "info" | "warning" | "critical",
+  "title": string,
+  "body": string,
+  "reason": string,
+  "evidence_refs": string[],
+  "next_check_hint": string
+}`;
+}
+
 // S13 must-fix 6: template dispatch REGISTRY, keyed by namespace. Registry membership doubles as
 // the reviewed-namespace allowlist for must-fix 1's eligibility rule -- a namespace with no entry
 // here is excluded from LLM adjudication even if a future classification map or enabled_namespaces
 // entry names it, so an un-reviewed namespace's data can never ship under another namespace's
-// framing.
+// framing. "correlation" is added in the SAME commit as its classifyAlertNamespace branch and
+// KNOWN_ALERT_NAMESPACES entry (Slice 6, per this same discipline).
 const PROMPT_TEMPLATES = {
   metric: buildMetricAlertPrompt,
   constraint: buildLearnedNamespaceAlertPrompt("constraint"),
   provenance: buildLearnedNamespaceAlertPrompt("provenance"),
   baseline: buildLearnedNamespaceAlertPrompt("baseline"),
   identity: buildLearnedNamespaceAlertPrompt("identity"),
+  correlation: buildCorrelationAlertPrompt,
 };
 
 export const ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION = "s13.namespace-dispatch.v1";
@@ -479,6 +572,11 @@ export function classifyAlertNamespace(ruleId) {
   if (id.startsWith("provenance.")) return { namespace: "provenance", hardExcluded: false };
   if (id.startsWith("baseline.")) return { namespace: "baseline", hardExcluded: false };
   if (id.startsWith("identity.")) return { namespace: "identity", hardExcluded: false };
+  // Slice 6 (observed-incident collectors plan) Decision 2: every existing branch's prefix is a
+  // disjoint single token, so this cannot collide with or shadow any of them -- order within the
+  // chain is a style choice here (placed after identity., before the fallback), not a correctness
+  // requirement.
+  if (id.startsWith("correlation.")) return { namespace: "correlation", hardExcluded: false };
   // Anything else (unrecognized prefix): fail closed, not a generic "metric" fallback.
   return { namespace: undefined, hardExcluded: false };
 }
