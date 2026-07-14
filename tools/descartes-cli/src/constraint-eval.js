@@ -27,8 +27,13 @@ function evaluateNumericComparator(comparator, factValue, expectedValue) {
  *   - { pattern: "ends_with:<suffix>" }
  * Returns { supported: false } for any other/malformed shape (deterministic code refuses
  * to guess) and { supported: true, satisfied } otherwise.
+ *
+ * Exported additively (S14, plan §5.3): tuning-store.js's backtestRetune reuses this EXACT
+ * comparator logic (not a re-derived copy) so a tuning backtest's would_fire counts are computed
+ * by the same function the live daemon tick uses. Zero logic change from the private version --
+ * see the byte-identical regression test for evaluateConstraints/evaluateShadowConstraints.
  */
-function evaluateExpected(expected, factValue) {
+export function evaluateExpected(expected, factValue) {
   if (!expected || typeof expected !== "object") return { supported: false };
 
   if (typeof expected.comparator === "string" && Number.isFinite(Number(expected.value))) {

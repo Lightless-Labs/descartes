@@ -531,3 +531,103 @@ export function promoteReviewReadyToActive(constraints, constraintId, options = 
   });
   return { constraints: updated, activated };
 }
+
+// --- S14 (outcome-informed compile-down), additive: the ONLY two functions in the entire
+// codebase that can ever change an already-ACTIVE constraint's status-to-retired or `expected`
+// value. Both are reachable ONLY through tuning-authority.js's decideTuningApproval "approved"
+// branch, itself only invoked by the human-gated `descartes learned tuning approve` CLI command
+// -- never by the miner, never by promoteTuningDraftsToReviewReady, never by any CLI `list`/
+// `review` command (see docs/plans/2026-07-14-compile-down-calibration.md §5.7/§6.2). Both throw
+// (rather than returning an { activated: false } sentinel like promoteReviewReadyToActive above)
+// on a precondition failure -- the caller (tuning-authority.js) treats a thrown error as "the
+// whole approval attempt fails closed, no partial write of any kind", which is the correct
+// posture here since there is no "unreachable given an upstream check" analogue: the target
+// constraint's OWN status can independently have changed since the candidate was mined (e.g. a
+// concurrent manual retire), so both functions defend their own precondition at write time.
+
+/**
+ * active -> retired. Disjoint precondition from promotion-store.js's existing reject path
+ * (review-ready -> retired, for a constraint never promoted) -- these are two independent
+ * retirement paths for two disjoint lifecycle stages, not duplicate logic. Throws unless the
+ * matched record has status === "active"; every other constraint in the array (including one
+ * with a matching id but a different status) passes through unchanged.
+ */
+export function retireActiveConstraint(constraints, constraintId, options = {}) {
+  const ts = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const note = options.note ?? "tuning-approved retirement (chronically noisy)";
+  let retired = false;
+  const updated = (constraints ?? []).map((constraint) => {
+    if (!constraint || constraint.id !== constraintId || constraint.status !== "active") return constraint;
+    retired = true;
+    return {
+      ...constraint,
+      status: "retired",
+      promotion_history: [
+        ...(constraint.promotion_history ?? []),
+        { ts, from: "active", to: "retired", actor: "human-cli", note },
+      ],
+    };
+  });
+  if (!retired) {
+    throw new Error(`retireActiveConstraint: no status:"active" constraint found with id ${JSON.stringify(constraintId)}`);
+  }
+  return { constraints: updated, retired };
+}
+
+// Shape-validation citation, CORRECTED per the plan's 2026-07-14 review must-fix: this is NOT a
+// reuse of validateConstraint's expected check (validateConstraint, above, only asserts
+// `expected` is PRESENT -- it has no numeric-shape check at all). Left unvalidated, a malformed
+// proposedExpected (a stray "eq" comparator, a non-finite value, a missing `value` field) would
+// persist into constraints.json fine, then evaluateExpected (constraint-eval.js) would return
+// { supported: false } on every subsequent live tick -- silently DISABLING a live,
+// already-promoted monitor via what looks like a routine tuning approval. This is therefore a
+// NEW, dedicated check, matching exactly the numeric shape evaluateExpected supports: comparator
+// === "gte" or "lte" (never "eq"/pattern -- categorical targets have no retune path), and a
+// finite numeric `value` (Number.isFinite, which -- unlike coercing Number(value) first --
+// rejects a string/NaN/Infinity/undefined outright rather than silently coercing a string).
+function isValidNumericExpected(expected) {
+  return !!expected
+    && typeof expected === "object"
+    && !Array.isArray(expected)
+    && (expected.comparator === "gte" || expected.comparator === "lte")
+    && Number.isFinite(expected.value);
+}
+
+/**
+ * The ONLY code path in the entire codebase that mutates `expected` on an already-active
+ * constraint record without a status transition (a logged self-loop, from "active" to "active" --
+ * see the promotion_history entry below -- not a silent, untracked write). Throws / REJECTS (no
+ * write, no promotion_history entry appended) unless:
+ *   (a) the matched record has status === "active", and
+ *   (b) proposedExpected is exactly the numeric shape evaluateExpected supports (see
+ *       isValidNumericExpected above).
+ * A malformed shape is rejected outright rather than persisted, so a bad retune approval can
+ * never silently stop the constraint from firing.
+ */
+export function applyApprovedRetune(constraints, constraintId, proposedExpected, options = {}) {
+  if (!isValidNumericExpected(proposedExpected)) {
+    throw new Error(
+      `applyApprovedRetune: proposedExpected must be { comparator: "gte"|"lte", value: <finite number> }, got: ${JSON.stringify(proposedExpected)}`,
+    );
+  }
+
+  const ts = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const note = options.note ?? "tuning-approved retune";
+  let updatedAny = false;
+  const updated = (constraints ?? []).map((constraint) => {
+    if (!constraint || constraint.id !== constraintId || constraint.status !== "active") return constraint;
+    updatedAny = true;
+    return {
+      ...constraint,
+      expected: { comparator: proposedExpected.comparator, value: Number(proposedExpected.value) },
+      promotion_history: [
+        ...(constraint.promotion_history ?? []),
+        { ts, from: "active", to: "active", actor: "human-cli", note },
+      ],
+    };
+  });
+  if (!updatedAny) {
+    throw new Error(`applyApprovedRetune: no status:"active" constraint found with id ${JSON.stringify(constraintId)}`);
+  }
+  return { constraints: updated, updated: updatedAny };
+}

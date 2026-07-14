@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
-import { evaluateConstraints, evaluateShadowConstraints } from "../src/constraint-eval.js";
+import { evaluateConstraints, evaluateExpected, evaluateShadowConstraints } from "../src/constraint-eval.js";
 import { SEED_CONSTRAINTS } from "../src/constraint-store.js";
 
 function numericConstraint(overrides = {}) {
@@ -237,4 +239,28 @@ test("evaluateShadowConstraints is pure: repeated calls with the same input prod
   const first = evaluateShadowConstraints([constraint], () => "false", { ts: "2026-07-10T00:00:00.000Z" });
   const second = evaluateShadowConstraints([constraint], () => "false", { ts: "2026-07-10T00:00:00.000Z" });
   assert.deepEqual(first, second);
+});
+
+// --- S14 (plan §5.3/§5.8): evaluateExpected export is byte-identical-behavior ---
+// (the export-only change: constraint-eval.js's currently-private evaluateExpected gains an
+// `export` keyword, zero logic change. Every test above already re-exercises evaluateConstraints/
+// evaluateShadowConstraints, which call evaluateExpected internally, unmodified and still passing
+// -- this section additionally exercises the newly-exported function DIRECTLY, since S14's
+// backtestRetune (tuning-store.js) calls it as a library function.)
+
+test("evaluateExpected is exported and usable directly (numeric gte/lte, categorical eq, ends_with pattern, unsupported shape)", () => {
+  assert.deepEqual(evaluateExpected({ comparator: "gte", value: 1000 }, 1000), { supported: true, satisfied: true });
+  assert.deepEqual(evaluateExpected({ comparator: "gte", value: 1000 }, 999), { supported: true, satisfied: false });
+  assert.deepEqual(evaluateExpected({ comparator: "lte", value: 10 }, 10), { supported: true, satisfied: true });
+  assert.deepEqual(evaluateExpected({ comparator: "lte", value: 10 }, 11), { supported: true, satisfied: false });
+  assert.deepEqual(evaluateExpected({ comparator: "eq", value: "true" }, "true"), { supported: true, satisfied: true });
+  assert.deepEqual(evaluateExpected({ pattern: "ends_with:/descartes" }, "/home/alice/.config/descartes"), { supported: true, satisfied: true });
+  assert.deepEqual(evaluateExpected({ comparator: "between", value: 10 }, 5), { supported: false });
+});
+
+test("evaluateExpected export: source-level proof this is the SAME function evaluateConstraints/evaluateShadowConstraints already call internally (not a second, divergent copy)", async () => {
+  const source = await fs.readFile(path.resolve(import.meta.dirname, "../src/constraint-eval.js"), "utf8");
+  const defs = source.match(/\bfunction evaluateExpected\b/g) ?? [];
+  assert.equal(defs.length, 1, "expected exactly one evaluateExpected definition in constraint-eval.js");
+  assert.match(source, /export function evaluateExpected/);
 });

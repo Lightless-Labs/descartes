@@ -55,6 +55,12 @@ Usage:
   descartes learned enable [--json]
   descartes learned disable [--json]
   descartes learned status [--json]
+  descartes learned tuning mine [--json] [--window <duration>]
+  descartes learned tuning promote [--json]
+  descartes learned tuning review [--json]
+  descartes learned tuning approve <tuning-id> --nonce <nonce> [--note <text>] [--json]
+  descartes learned tuning reject <tuning-id> --nonce <nonce> [--note <text>] [--json]
+  descartes learned tuning list [--json]
   descartes provenance snapshot [--json]
   descartes provenance baseline show [--identity <hash>] [--json]
   descartes incident freeze [--reason <text>] [--json]
@@ -144,6 +150,49 @@ async function main(argv) {
       const { runLearnedCalibration } = await import("./calibration.js");
       await runLearnedCalibration(paths, args.slice(1));
       return;
+    }
+    // "tuning" (Slice S14, outcome-informed compile-down): reviewable, backtested tuning
+    // proposals built ADDITIVELY on top of S15's calibration report. "mine"/"promote"/"list" live
+    // in tuning-store.js (mining + the deterministic draft->review-ready gate + display);
+    // "review"/"approve"/"reject" live in tuning-authority.js -- a SEPARATE deny-by-default
+    // authority store (stateDir/authority/tuning-decisions.json, never promotions.json) cloned
+    // from, but independent of, promotion-store.js's constraint-promotion gate. A proposal is
+    // NEVER auto-applied: a live threshold changes only after an explicit
+    // `descartes learned tuning approve` through this gate.
+    if (args[0] === "tuning") {
+      const sub = args[1];
+      const rest = args.slice(2);
+      if (sub === "mine") {
+        const { runLearnedTuningMine } = await import("./tuning-store.js");
+        await runLearnedTuningMine(paths, rest);
+        return;
+      }
+      if (sub === "promote") {
+        const { runLearnedTuningPromote } = await import("./tuning-store.js");
+        await runLearnedTuningPromote(paths, rest);
+        return;
+      }
+      if (sub === "list") {
+        const { runLearnedTuningList } = await import("./tuning-store.js");
+        await runLearnedTuningList(paths, rest);
+        return;
+      }
+      if (sub === "review") {
+        const { runLearnedTuningReview } = await import("./tuning-authority.js");
+        await runLearnedTuningReview(paths, rest);
+        return;
+      }
+      if (sub === "approve") {
+        const { runLearnedTuningApprove } = await import("./tuning-authority.js");
+        await runLearnedTuningApprove(paths, rest);
+        return;
+      }
+      if (sub === "reject") {
+        const { runLearnedTuningReject } = await import("./tuning-authority.js");
+        await runLearnedTuningReject(paths, rest);
+        return;
+      }
+      throw new Error(`Unsupported learned tuning command: ${sub}\n\n${usage()}`);
     }
     // "review"/"approve"/"reject" (Slice S7b, the human authority gate) live in
     // promotion-store.js — the only module that can advance a constraint past review-ready.

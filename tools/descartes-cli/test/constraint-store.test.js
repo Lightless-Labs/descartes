@@ -9,6 +9,7 @@ import {
   DEFAULT_SOAK_DAYS,
   MIN_FIXTURE_COUNT,
   SEED_CONSTRAINTS,
+  applyApprovedRetune,
   buildConstraintTarget,
   checkShadowSoak,
   loadConstraints,
@@ -17,11 +18,13 @@ import {
   promoteReviewReadyToActive,
   promoteShadowToReviewReady,
   resolveConstraintStorePaths,
+  retireActiveConstraint,
   runLearnedConfigCommand,
   validateConstraint,
   writeConstraints,
   writeLearnedConfig,
 } from "../src/constraint-store.js";
+import { evaluateConstraints } from "../src/constraint-eval.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -581,14 +584,158 @@ test("promoteReviewReadyToActive's function body contains exactly one status:\"a
   const source = await fs.readFile(path.resolve(import.meta.dirname, "../src/constraint-store.js"), "utf8");
   const helperStart = source.indexOf("export function promoteReviewReadyToActive");
   assert(helperStart >= 0, "constraint-store.js must define promoteReviewReadyToActive");
-  // promoteReviewReadyToActive is the last export in the file (Slice S7b, appended after
-  // SEED_CONSTRAINTS), so slicing to end-of-file captures exactly its body and nothing else —
-  // no other code follows it. Doc comments ABOVE this marker (which legitimately describe the
-  // function in prose, e.g. "the ONLY code path that ... status:\"active\"") are excluded by
-  // construction, mirroring the existing S7a test's function-boundary-slicing technique above.
-  const helperSrc = source.slice(helperStart);
+  // promoteReviewReadyToActive is no longer the last export in the file (S14 appends
+  // retireActiveConstraint/applyApprovedRetune after it) -- bound the slice at the next
+  // top-level `export function`/`export const` (or EOF if none) so it still captures exactly
+  // this function's body and nothing appended after it, rather than assuming EOF. Doc comments
+  // ABOVE this marker (which legitimately describe the function in prose, e.g. "the ONLY code
+  // path that ... status:\"active\"") are excluded by construction, mirroring the existing S7a
+  // test's function-boundary-slicing technique above.
+  const afterStart = source.slice(helperStart + 1);
+  const nextExportMatch = afterStart.match(/\nexport (function|const)\s/);
+  const helperEnd = nextExportMatch ? helperStart + 1 + nextExportMatch.index : source.length;
+  const helperSrc = source.slice(helperStart, helperEnd);
   // Match the `status` key specifically (not the promotion_history entry's `to: "active"`,
   // which legitimately co-occurs as part of describing that same single transition).
   const matches = helperSrc.match(/status:\s*["']active["']/g) ?? [];
   assert.equal(matches.length, 1, `expected exactly one status:"active" assignment inside promoteReviewReadyToActive's body, found ${matches.length}`);
+});
+
+// ============================================================================================
+// S14 (outcome-informed compile-down, docs/plans/2026-07-14-compile-down-calibration.md §5.7):
+// retireActiveConstraint / applyApprovedRetune -- the ONLY two functions in the codebase that can
+// ever change an already-ACTIVE constraint's status-to-retired or `expected` value. Both are
+// reachable ONLY through tuning-authority.js's decideTuningApproval "approved" branch (see
+// test/tuning-authority.test.js's sole-caller proof) -- this file exercises them as pure,
+// standalone functions.
+// ============================================================================================
+
+function activeNumericConstraint(overrides = {}) {
+  return {
+    id: "constraint.mined.daemon-config.aaaaaaaaaaaaaaaa",
+    kind: "constraint",
+    family: "daemon-config",
+    target: "daemon.profile.interval_ms",
+    expected: { comparator: "gte", value: 1000 },
+    status: "active",
+    confidence: 1,
+    provenance: { window: "static", samples: 1, source_collectors: ["hand-authored"], mined_at: "2026-07-01T00:00:00.000Z" },
+    fixtures: [],
+    promotion_history: [{ ts: "2026-07-01T00:00:00.000Z", from: "review-ready", to: "active", actor: "human-cli", note: "approved" }],
+    first_observed: "2026-07-01T00:00:00.000Z",
+    last_verified: "2026-07-01T00:00:00.000Z",
+    sensitivity: "operational",
+    schema_version: 1,
+    ...overrides,
+  };
+}
+
+test("retireActiveConstraint: active -> retired, appends promotion_history, leaves other constraints untouched", () => {
+  const target = activeNumericConstraint();
+  const other = activeNumericConstraint({ id: "constraint.other", status: "active" });
+  const { constraints, retired } = retireActiveConstraint([target, other], target.id, { now: "2026-07-10T00:00:00.000Z", note: "chronically noisy" });
+
+  assert.equal(retired, true);
+  const updatedTarget = constraints.find((c) => c.id === target.id);
+  assert.equal(updatedTarget.status, "retired");
+  assert.equal(updatedTarget.promotion_history.at(-1).from, "active");
+  assert.equal(updatedTarget.promotion_history.at(-1).to, "retired");
+  assert.equal(updatedTarget.promotion_history.at(-1).note, "chronically noisy");
+
+  const untouched = constraints.find((c) => c.id === "constraint.other");
+  assert.equal(untouched.status, "active");
+});
+
+test("retireActiveConstraint throws (does not silently no-op) when the id does not match any constraint", () => {
+  const target = activeNumericConstraint();
+  assert.throws(() => retireActiveConstraint([target], "constraint.does.not.exist"), /no status:"active" constraint found/);
+});
+
+test("retireActiveConstraint throws on a non-active constraint (e.g. still review-ready) -- precondition is status===\"active\", not just a matching id", () => {
+  const reviewReady = activeNumericConstraint({ status: "review-ready" });
+  assert.throws(() => retireActiveConstraint([reviewReady], reviewReady.id), /no status:"active" constraint found/);
+});
+
+test("applyApprovedRetune: a VALID loosened gte value persists and changes evaluateConstraints' live output", () => {
+  const target = activeNumericConstraint({ expected: { comparator: "gte", value: 1000 } });
+  const factLookup = () => 800; // violates the current gte:1000 floor
+
+  const before = evaluateConstraints([target], factLookup);
+  assert.equal(before.length, 1, "800 violates the original gte:1000 floor");
+
+  const { constraints, updated } = applyApprovedRetune([target], target.id, { comparator: "gte", value: 750 }, { now: "2026-07-10T00:00:00.000Z" });
+  assert.equal(updated, true);
+  const updatedConstraint = constraints.find((c) => c.id === target.id);
+  assert.deepEqual(updatedConstraint.expected, { comparator: "gte", value: 750 });
+  assert.equal(updatedConstraint.promotion_history.at(-1).from, "active");
+  assert.equal(updatedConstraint.promotion_history.at(-1).to, "active"); // self-loop, logged not silent
+
+  const after = evaluateConstraints(constraints, factLookup);
+  assert.equal(after.length, 0, "800 no longer violates the loosened gte:750 floor");
+});
+
+test("applyApprovedRetune throws (does not silently no-op) when the id does not match any constraint", () => {
+  const target = activeNumericConstraint();
+  assert.throws(() => applyApprovedRetune([target], "constraint.does.not.exist", { comparator: "gte", value: 1 }), /no status:"active" constraint found/);
+});
+
+test("applyApprovedRetune throws on a non-active constraint -- precondition is status===\"active\"", () => {
+  const shadow = activeNumericConstraint({ status: "shadow" });
+  assert.throws(() => applyApprovedRetune([shadow], shadow.id, { comparator: "gte", value: 1 }), /no status:"active" constraint found/);
+});
+
+// --- MUST-FIX 4 (plan §5.7/§5.9): shape validation prevents a silent live-monitor disable ---
+
+test("applyApprovedRetune REJECTS a non-finite value (NaN/Infinity/string/undefined) -- no write, no promotion_history entry, constraint keeps firing exactly as before", () => {
+  const target = activeNumericConstraint({ expected: { comparator: "gte", value: 1000 } });
+  const factLookup = () => 500; // violates gte:1000
+
+  for (const malformedValue of [Number.NaN, Infinity, -Infinity, "750", undefined, null]) {
+    assert.throws(
+      () => applyApprovedRetune([target], target.id, { comparator: "gte", value: malformedValue }),
+      /proposedExpected must be/,
+      `expected applyApprovedRetune to reject value ${JSON.stringify(malformedValue)}`,
+    );
+  }
+
+  // Byte-identical before/after every rejected attempt: nothing was written.
+  const stillFiring = evaluateConstraints([target], factLookup);
+  assert.equal(stillFiring.length, 1);
+  assert.deepEqual(target.expected, { comparator: "gte", value: 1000 });
+  assert.equal(target.promotion_history?.length ?? 0, 1, "no promotion_history entry appended by a rejected attempt");
+});
+
+test("applyApprovedRetune REJECTS an eq/pattern comparator -- categorical targets have no numeric retune path", () => {
+  const target = activeNumericConstraint();
+  assert.throws(() => applyApprovedRetune([target], target.id, { comparator: "eq", value: "true" }), /proposedExpected must be/);
+  assert.throws(() => applyApprovedRetune([target], target.id, { pattern: "ends_with:/descartes" }), /proposedExpected must be/);
+});
+
+test("applyApprovedRetune REJECTS a malformed proposedExpected even when the target constraint IS active and otherwise eligible (order of checks does not matter)", () => {
+  const target = activeNumericConstraint();
+  assert.throws(() => applyApprovedRetune([target], target.id, {}), /proposedExpected must be/);
+  assert.throws(() => applyApprovedRetune([target], target.id, undefined), /proposedExpected must be/);
+});
+
+// --- Sole-caller proof (plan §5.7/§6.2 layer 2) ---
+
+test("retireActiveConstraint/applyApprovedRetune: the only call site in src/ is tuning-authority.js's approved-decision dispatch", async () => {
+  const srcDir = path.resolve(import.meta.dirname, "../src");
+  const files = await fs.readdir(srcDir, { recursive: true });
+  const callers = [];
+  for (const relFile of files) {
+    if (!relFile.endsWith(".js") || relFile.endsWith(".test.js")) continue;
+    const fullPath = path.join(srcDir, relFile);
+    const stat = await fs.stat(fullPath);
+    if (!stat.isFile()) continue;
+    const source = await fs.readFile(fullPath, "utf8");
+    if (/\bretireActiveConstraint\s*\(/.test(source) || /\bapplyApprovedRetune\s*\(/.test(source)) {
+      callers.push(relFile.replaceAll(path.sep, "/"));
+    }
+  }
+  // Both functions are DEFINED in constraint-store.js (their own declaration also matches
+  // `functionName(` as `export function retireActiveConstraint(`) -- the only other file allowed
+  // to reference the call form is tuning-authority.js's dispatch.
+  const nonDefinitionCallers = callers.filter((file) => file !== "constraint-store.js");
+  assert.deepEqual(nonDefinitionCallers, ["tuning-authority.js"], `expected the only external caller to be tuning-authority.js, found: ${JSON.stringify(callers)}`);
 });
