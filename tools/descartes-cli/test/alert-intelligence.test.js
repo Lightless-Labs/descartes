@@ -5,8 +5,11 @@ import path from "node:path";
 import test from "node:test";
 import {
   ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
+  KNOWN_ALERT_NAMESPACES,
   adjudicateAlertNotifications,
   alertIntelligencePrompt,
+  classifyAlertNamespace,
+  emitSessionAlertSignals,
   normalizeAlertNotificationDecision,
   readAlertIntelligenceAudit,
   readAlertIntelligenceConfig,
@@ -15,6 +18,11 @@ import {
 } from "../src/alert-intelligence.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
+import {
+  DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
+  SESSION_CHURN_RULE_ID,
+  SESSION_COUNT_DROP_RULE_ID,
+} from "../src/session-baseline.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-alert-intelligence-test-"));
@@ -790,4 +798,171 @@ test("alertIntelligencePrompt still returns a string for exactly one valid metri
   const prompt = alertIntelligencePrompt({ alerts: [alert()] });
   assert.equal(typeof prompt, "string");
   assert.match(prompt, /Return only valid JSON/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4 (observed-incident collectors plan) — Decision 2, must-fix 6: strengthened fail-closed
+// namespace regression tests for the session.* rule_ids.
+// ---------------------------------------------------------------------------------------------
+
+test("(a) classifyAlertNamespace returns undefined (not 'baseline' or any other known namespace) for both session.* rule_ids", () => {
+  assert.deepEqual(classifyAlertNamespace(SESSION_COUNT_DROP_RULE_ID), { namespace: undefined, hardExcluded: false });
+  assert.deepEqual(classifyAlertNamespace(SESSION_CHURN_RULE_ID), { namespace: undefined, hardExcluded: false });
+});
+
+test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAMESPACES enabled and one due session.count_drop, is no_eligible_alerts / excluded.unknown_namespace / zero LLM calls", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: [...KNOWN_ALERT_NAMESPACES] }, { now: "2026-07-14T00:00:00.000Z" });
+  const sessionAlert = alert({ id: "alert_session_count_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical", diagnostics: { observed_count: 0, mean_before: 20, stddev_before: 0.5, z_score: -40, confidence_state: "established" } });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [sessionAlert],
+    notification_due_ids: [sessionAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for session.count_drop — it is unknown_namespace, fail-closed"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.unknown_namespace, 1);
+  assert.equal((await readAlertIntelligenceAudit(paths)).length, 0);
+});
+
+test("(b') the same holds separately for a due session.churn alert", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: [...KNOWN_ALERT_NAMESPACES] }, { now: "2026-07-14T00:00:00.000Z" });
+  const churnAlert = alert({ id: "alert_session_churn", rule_id: SESSION_CHURN_RULE_ID, severity: "warning", diagnostics: { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" } });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [churnAlert],
+    notification_due_ids: [churnAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for session.churn — it is unknown_namespace, fail-closed"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.unknown_namespace, 1);
+});
+
+test("(c) invariant: every exported SESSION_*_RULE_ID classifies to namespace undefined — a future session-family rule_id inherits fail-closed by construction", () => {
+  for (const ruleId of [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID]) {
+    const { namespace, hardExcluded } = classifyAlertNamespace(ruleId);
+    assert.equal(namespace, undefined, `expected ${ruleId} to classify as unknown_namespace`);
+    assert.equal(hardExcluded, false);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4, Decision 2b / must-fix 3 — emitSessionAlertSignals: deterministic, non-LLM local
+// delivery for the fail-closed session.* rule_ids.
+// ---------------------------------------------------------------------------------------------
+
+test("emitSessionAlertSignals delivers a due session.count_drop through deliverNotificationDecision with a counts/hash-only body, never via a session/LLM", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const sessionAlert = alert({
+    id: "alert_session_count_drop",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: "critical",
+    diagnostics: { observed_count: 0, mean_before: 20, stddev_before: 0.5, z_score: -40, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [sessionAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [sessionAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(deliveries[0].opts.alertId, sessionAlert.id);
+  assert.equal(deliveries[0].decision.notify, true);
+  assert.equal(deliveries[0].decision.severity, "critical");
+  assert.equal(/deploy-worker|first-ever-session/.test(JSON.stringify(deliveries[0].decision)), false, "no raw session name in the delivered body");
+  assert.match(deliveries[0].decision.body, /^Session count 0 vs baseline mean 20/);
+});
+
+test("emitSessionAlertSignals delivers a due session.churn through deliverNotificationDecision with a hash-only body", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const churnAlert = alert({
+    id: "alert_session_churn",
+    rule_id: SESSION_CHURN_RULE_ID,
+    severity: "warning",
+    diagnostics: { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [churnAlert], notification_due_ids: [churnAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [churnAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, SESSION_CHURN_RULE_ID);
+  assert.match(deliveries[0].decision.body, /session\.tmux\.aaaaaaaaaaaaaaaa/);
+  assert.match(deliveries[0].decision.body, /1{16}/);
+  assert.match(deliveries[0].decision.body, /2{16}/);
+});
+
+test("emitSessionAlertSignals fires ONLY for session.* rule_ids — a due non-session alert (even if present alongside a due session alert) is never delivered by this branch", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const sessionAlert = alert({ id: "alert_session_count_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "warning", diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" } });
+  const metricAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await emitSessionAlertSignals(paths, { alerts: [sessionAlert, metricAlert], notification_due_ids: [sessionAlert.id, metricAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [sessionAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].ruleId, SESSION_COUNT_DROP_RULE_ID);
+});
+
+test("emitSessionAlertSignals respects cooldown: an alert absent from notification_due_ids (a second tick within the cooldown window, per applyAlertCandidates) does not re-deliver", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const sessionAlert = alert({ id: "alert_session_count_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "warning", diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" } });
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
+
+  const first = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [sessionAlert.id] }, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+  assert.deepEqual(first.fired, [sessionAlert.id]);
+
+  // A second tick within cooldown: applyAlertCandidates would NOT include this id in
+  // notification_due_ids again (see alert-store.js's notificationDue) — simulated here directly.
+  const second = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [] }, { now: "2026-07-14T00:05:00.000Z", deliverNotification });
+  assert.deepEqual(second.fired, []);
+  assert.equal(deliveries.length, 1, "must not re-deliver within the cooldown window");
+});
+
+test("emitSessionAlertSignals: last_notified/cooldown_until being present on the alert record is NOT itself treated as delivery evidence — only an actual deliverNotification call counts", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  // An alert record that ALREADY carries last_notified/cooldown_until (as applyAlertCandidates
+  // stamps on every processed candidate, whether or not anything was actually delivered) but is
+  // NOT present in notification_due_ids for this tick.
+  const sessionAlert = alert({
+    id: "alert_session_count_drop",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    last_notified: "2026-07-14T00:00:00.000Z",
+    cooldown_until: "2026-07-14T00:15:00.000Z",
+    diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, []);
+  assert.equal(deliverCalled, false, "a stamped last_notified/cooldown_until must not be mistaken for delivery");
+});
+
+test("emitSessionAlertSignals: zero due ids -> [] with no deliverNotification call at all", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await emitSessionAlertSignals(paths, { alerts: [], notification_due_ids: [] }, {
+    deliverNotification: async () => { deliverCalled = true; },
+  });
+  assert.deepEqual(result, { fired: [] });
+  assert.equal(deliverCalled, false);
+});
+
+test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS matches the two session rule_ids exactly, both classifying to unknown_namespace", () => {
+  assert.deepEqual(DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID]);
+  for (const ruleId of DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS) {
+    assert.equal(classifyAlertNamespace(ruleId).namespace, undefined);
+  }
 });

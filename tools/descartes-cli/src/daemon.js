@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import { adjudicateAlertNotifications } from "./alert-intelligence.js";
+import { adjudicateAlertNotifications, emitSessionAlertSignals } from "./alert-intelligence.js";
 import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
@@ -15,6 +15,7 @@ import {
   factPointsFromSessionEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
+import { computeSessionBaselineCandidates } from "./session-baseline.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -487,12 +488,28 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // identity_drift/new_public_bind) land in the same concatenation, same commit
           // discipline as S4's own addition above (plan section 5 / S-live-1 grounding).
           ...await computeProvenanceIdentityCandidates(descartesPaths, options),
+          // Slice 4 (observed-incident collectors plan), additive fourth extraCandidates entry:
+          // session-count deviation (session.count_drop) + churn (session.churn) candidates,
+          // derived purely from Slice 1's already-persisted session.presence fact-history — no
+          // new execFile/host I/O. Gated identically to its siblings by
+          // computeSessionBaselineCandidates' own loadLearnedConfig(...).enabled short-circuit.
+          ...await computeSessionBaselineCandidates(descartesPaths, options),
         ],
       });
+  // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
+  // (Decision 2) and therefore structurally can NEVER reach adjudicateAlertNotifications' LLM path
+  // below — left unmitigated, this milestone's first alerting slice would never actively notify the
+  // operator. This deterministic, non-LLM delivery branch (mirrors emitBudgetExhaustedSignal's own
+  // "straight through deliverNotificationDecision, NEVER through the LLM" precedent) reuses the
+  // notification_due_ids/cooldown bookkeeping applyAlertCandidates already computed inside
+  // evaluateAndPersistAlerts above — no new cooldown machinery, no session/LLM construction.
+  const sessionAlertDelivery = alerts && options.deliverSessionAlerts !== false
+    ? await emitSessionAlertSignals(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification })
+    : undefined;
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
     ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
     : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence, structuralEvidence, structuralFacts, shadowEvaluation };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

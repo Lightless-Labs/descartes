@@ -35,6 +35,8 @@ import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenanc
 import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
 import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
+import { SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
+import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -1874,4 +1876,256 @@ test("S5 load-bearing: a fixed-rule alert and a confirmed-unknown-identity alert
   assert.equal(fixedSecond.status, "active");
   assert.ok(identitySecond, "expected the identity alert to remain active");
   assert.equal(identitySecond.status, "active");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4 (observed-incident collectors plan): session-count anomaly signature wiring
+// (computeSessionBaselineCandidates as the fourth extraCandidates entry) + Decision 2b's
+// deterministic, non-LLM local delivery branch (emitSessionAlertSignals) wired in the daemon tick.
+// ---------------------------------------------------------------------------------------------
+
+function sessionFactPoint(ts, entityKey, fingerprint = "abababababababab") {
+  return {
+    ts,
+    fact_name: "session.presence",
+    entity_key: entityKey,
+    attributes: { multiplexer: "tmux", attached: "true", window_count_bucket: "1", created_at_fingerprint: fingerprint },
+    source_envelope_id: "sessions",
+    source_tool: "collect_sessions",
+    sensitivity: "operational",
+  };
+}
+
+function censusMarkerFactPoint(ts, state = "complete") {
+  return {
+    ts,
+    fact_name: "session.presence",
+    entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: state },
+    source_envelope_id: "sessions",
+    source_tool: "collect_sessions",
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+function completeSessionTick(ts, count, entityPrefix = "e") {
+  const points = [];
+  for (let i = 0; i < count; i += 1) points.push(sessionFactPoint(ts, `${entityPrefix}-${i}`));
+  points.push(censusMarkerFactPoint(ts, "complete"));
+  return points;
+}
+
+function hour(index) {
+  return new Date(Date.parse("2026-06-10T00:00:00.000Z") + index * 60 * 60 * 1000).toISOString();
+}
+
+test("Slice 4: byte-identical real alerts when the learned kill switch is off, even with session fact-history present that would otherwise deviate, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withSessionsPaths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(withSessionsPaths, ticks, { now: hour(30) });
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the baseline above — computeSessionBaselineCandidates must
+  // short-circuit to [] before ever calling readFactPoints.
+  let readFactsCalled = false;
+  const withSessions = await runDaemonIteration(withSessionsPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    readFactPoints: async (...args) => {
+      readFactsCalled = true;
+      return readFactPoints(...args);
+    },
+  });
+
+  assert.deepEqual(withSessions.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withSessions.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withSessions.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+
+  const persisted = await readAlertRecords(withSessionsPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID || alert.rule_id === SESSION_CHURN_RULE_ID), false);
+});
+
+test("Slice 4 wiring: computeSessionBaselineCandidates is the daemon's fourth extraCandidates entry — a pre-seeded mass-drop fact-history produces a real, sanitized session.count_drop alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(30));
+  const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(alert, "expected a real alert for the session-count mass drop");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "critical");
+  assert.equal(alert.diagnostics.observed_count, 0);
+  assert.equal(alert.diagnostics.mean_before, 20);
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+});
+
+test("Slice 4 wiring: a fingerprint change on the latest tick-group produces a real session.churn alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [
+    sessionFactPoint(hour(0), "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerFactPoint(hour(0), "complete"),
+    sessionFactPoint(hour(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerFactPoint(hour(1), "complete"),
+  ];
+  await appendFactPoints(paths, ticks, { now: hour(1) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(1));
+  const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_CHURN_RULE_ID);
+  assert.ok(alert, "expected a real alert for the churned entity");
+  assert.equal(alert.diagnostics.entity_key, "session.tmux.aaaaaaaaaaaaaaaa");
+  assert.equal(alert.diagnostics.prior_fingerprint, "1111111111111111");
+  assert.equal(alert.diagnostics.current_fingerprint, "2222222222222222");
+});
+
+test("Slice 4 ts-cohesion (integration): every session.* fact point emitted within one structural-tick iteration — including the new census marker — shares a byte-identical ts", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    sessions: async () => envelope("sessions", "collect_sessions", {
+      platform: "darwin",
+      multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+      any_binary_available: true,
+      total_count: 2,
+      sessions: [
+        { multiplexer: "tmux", session_name: "alpha", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 },
+        { multiplexer: "tmux", session_name: "beta", attached: false, window_count: 2, created_at_epoch_seconds: 1720000001 },
+      ],
+      truncated: false,
+      cap: 200,
+    }),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, sessions: { enabled: true } },
+  });
+
+  await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    ts: "2026-06-11T00:00:00.000Z",
+    now: Date.parse("2026-06-11T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+  });
+
+  const { points } = await readFactPoints(paths);
+  const sessionPoints = points.filter((point) => point.fact_name === "session.presence");
+  assert.ok(sessionPoints.length >= 3, "expected 2 session facts + 1 census marker");
+  const distinctTimestamps = new Set(sessionPoints.map((point) => point.ts));
+  assert.equal(distinctTimestamps.size, 1, `expected every session.* fact point to share one ts, got ${JSON.stringify([...distinctTimestamps])}`);
+  assert.equal([...distinctTimestamps][0], "2026-06-11T00:00:00.000Z");
+  assert(sessionPoints.some((point) => point.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY), "expected the census marker fact point to be present and share the same ts");
+});
+
+test("Slice 4, Decision 2b: a due session.count_drop is delivered through the deterministic local delivery branch wired into the daemon tick, and never reaches the LLM path", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const deliveries = [];
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  assert.ok(result.sessionAlertDelivery, "expected a sessionAlertDelivery result on the daemon iteration");
+  const sessionDeliveries = deliveries.filter((entry) => entry.opts.ruleId === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionDeliveries.length, 1, "expected exactly one deterministic delivery for the due session.count_drop candidate");
+  assert.equal(sessionDeliveries[0].decision.notify, true);
+  assert.equal(sessionDeliveries[0].decision.severity, "critical");
+
+  // Never via the LLM path: session.* is unknown_namespace, so adjudicateAlertNotifications must
+  // never have constructed a session for it (alert-intelligence.json defaults to disabled anyway,
+  // giving a doubly-enforced guarantee here).
+  assert.equal(result.alertIntelligence.status, "disabled");
+});
+
+test("Slice 4, Decision 2b: the deterministic delivery respects cooldown — a second daemon tick within the cooldown window does not re-deliver the same session.count_drop", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const deliveries = [];
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
+
+  await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: hour(30), now: hour(30), deliverNotification });
+  const afterFirst = deliveries.filter((entry) => entry.ruleId === SESSION_COUNT_DROP_RULE_ID).length;
+  assert.equal(afterFirst, 1);
+
+  // A second tick moments later (same fact-history, no new tick-group) — well within the default
+  // 15-minute alert cooldown.
+  const secondTs = new Date(Date.parse(hour(30)) + 60 * 1000).toISOString();
+  await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: secondTs, now: secondTs, deliverNotification });
+  const afterSecond = deliveries.filter((entry) => entry.ruleId === SESSION_COUNT_DROP_RULE_ID).length;
+  assert.equal(afterSecond, 1, "must not re-deliver within the cooldown window");
+});
+
+test("Slice 4, Decision 2b: deliverSessionAlerts:false opts the daemon tick out of the deterministic delivery branch entirely (no sessionAlertDelivery, no deliverNotification call for session.*)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const deliveries = [];
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    deliverSessionAlerts: false,
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+
+  assert.equal(result.sessionAlertDelivery, undefined);
+  assert.equal(deliveries.some((entry) => entry.ruleId === SESSION_COUNT_DROP_RULE_ID), false);
+  // The candidate is still persisted (visible via `descartes alerts`) -- only active delivery is skipped.
+  const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(alert);
+});
+
+test("Slice 4: computeSessionBaselineCandidates candidate shape matches the existing extraCandidates sources (byte-identical structural key set)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(30));
+  const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(alert);
+  assert.equal(typeof alert.id, "string");
+  assert.equal(typeof alert.diagnostics, "object");
+  assert.equal(JSON.stringify(alert.diagnostics).includes("redacted"), false);
+
+  const { state } = await loadSessionBaselineStore(paths);
+  assert.equal(state.confidence_state, "established");
+  assert.equal(state.stats.count, 31);
 });

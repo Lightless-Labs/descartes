@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
+  SESSION_CHURN_RULE_ID,
+  SESSION_COUNT_DROP_RULE_ID,
+} from "./session-baseline.js";
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
 
@@ -249,6 +254,79 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
   };
   await deliverNotification(descartesPaths, decision, { now, ruleId: BUDGET_EXHAUSTED_RULE_ID });
   return { fired: true };
+}
+
+// Slice 4 (observed-incident collectors plan), Decision 2b / must-fix 3: a deterministic,
+// non-LLM local delivery branch for the fail-closed session.* rule_ids (session.count_drop,
+// session.churn — see classifyAlertNamespace below: both are unknown_namespace and therefore
+// structurally can NEVER reach LLM adjudication, regardless of enabled_namespaces). Left
+// unmitigated, this milestone's first alerting slice — including a CRITICAL mass-drop, the exact
+// motivating incident — would never actively notify the operator; it would only be visible to an
+// operator who proactively ran `descartes alerts`.
+//
+// Mirrors emitBudgetExhaustedSignal's own "straight through deliverNotificationDecision, NEVER
+// through the LLM, a session, or enableTools" precedent:
+//   - scoped by an explicit rule_id ALLOWLIST (DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, imported
+//     from session-baseline.js rather than restated here) — never a general unknown-namespace
+//     bypass, so this cannot silently swallow some future, unrelated fail-closed namespace;
+//   - the decision handed to deliverNotificationDecision is hand-built and deterministic — never
+//     a session, never an LLM call;
+//   - reuses the notification_due_ids/cooldown state applyAlertCandidates already computed for
+//     every candidate (including these two rule_ids) inside evaluateAndPersistAlerts — no new
+//     cooldown machinery. Correction, load-bearing (must-fix 3): applyAlertCandidates stamps
+//     last_notified/cooldown_until on a candidate even when nothing is actually delivered
+//     downstream — that stamp reflects only that the candidate was processed, not that any
+//     human-visible delivery happened. This function's own tests assert on an actual call into
+//     (or mock of) deliverNotificationDecision, never merely on the cooldown/last_notified fields;
+//   - the delivered body is counts/hash-only — never a raw session name, matching the sanitized
+//     diagnostics shape session-baseline.js's candidate builders already produce.
+export async function emitSessionAlertSignals(descartesPaths, evaluation, options = {}) {
+  const dueIds = new Set(evaluation?.notification_due_ids ?? []);
+  if (dueIds.size === 0) return { fired: [] };
+
+  const dueSessionAlerts = (evaluation.alerts ?? []).filter(
+    (alert) => dueIds.has(alert.id) && DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
+  );
+  if (dueSessionAlerts.length === 0) return { fired: [] };
+
+  const deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
+  const now = options.now ?? new Date().toISOString();
+
+  const fired = [];
+  for (const alert of dueSessionAlerts) {
+    const decision = buildSessionAlertNotificationDecision(alert);
+    await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
+    fired.push(alert.id);
+  }
+  return { fired };
+}
+
+// Counts/hash-only body (must-fix 3): every field interpolated below is a finite number or a
+// short closed-enum/hash string already produced by session-baseline.js's sanitizeDiagnostics-gated
+// candidate builders — never a raw session name, which never reaches this layer's inputs at all
+// (session-baseline.js's diagnostics only ever carry counts/z-scores/confidence_state or hashed
+// entity_key/fingerprints).
+function buildSessionAlertNotificationDecision(alert) {
+  const diagnostics = alert?.diagnostics ?? {};
+  if (alert?.rule_id === SESSION_COUNT_DROP_RULE_ID) {
+    return {
+      notify: true,
+      severity: alert.severity === "critical" ? "critical" : "warning",
+      title: "Descartes: session count deviation",
+      body: `Session count ${diagnostics.observed_count} vs baseline mean ${diagnostics.mean_before} (z=${diagnostics.z_score}, ${diagnostics.confidence_state}).`,
+    };
+  }
+  if (alert?.rule_id === SESSION_CHURN_RULE_ID) {
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: session churn detected",
+      body: `Session ${diagnostics.entity_key} fingerprint changed (${diagnostics.prior_fingerprint} -> ${diagnostics.current_fingerprint}).`,
+    };
+  }
+  // Unreachable in normal operation (the caller already filters to DETERMINISTIC_LOCAL_DELIVERY_
+  // RULE_IDS) — fails closed to a generic, still counts/enum-only body rather than throwing.
+  return { notify: true, severity: "warning", title: "Descartes: session alert", body: `rule_id=${alert?.rule_id}` };
 }
 
 function compactAlert(alert) {

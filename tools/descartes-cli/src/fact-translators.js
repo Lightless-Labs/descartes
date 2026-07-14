@@ -120,8 +120,37 @@ export const SESSION_ENTITY_HASH_DOMAIN = "descartes.fact.session.v1";
 
 // A session-identity hash is intentionally NOT emitted for this fixed marker — it carries no
 // session identity at all (see buildSessionOverflowMarkerFactPoint below), so it is a plain,
-// versioned closed-enum string rather than a hash of anything.
-const SESSION_OVERFLOW_ENTITY_KEY = "session.overflow-marker.v1";
+// versioned closed-enum string rather than a hash of anything. Exported (Slice 4, observed-
+// incident collectors plan, Decision 3) so session-baseline.js's tick-grouping can recognize and
+// exclude this exact marker entity from the windowed Welford recompute without re-deriving a
+// parallel copy of the literal that could silently drift from this one.
+export const SESSION_OVERFLOW_ENTITY_KEY = "session.overflow-marker.v1";
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4 (observed-incident collectors plan) Slice 1 addendum — must-fixes 1 & 2 (Fable review,
+// 2026-07-14): a per-tick CENSUS MARKER fact, emitted on EVERY successful sessions envelope,
+// regardless of how many sessions were observed — including exactly zero.
+//
+// MUST-FIX 1: without this marker, a mass session-drop to ZERO is structurally invisible — a
+// zero-session tick emits no session.presence facts at all (see factPointsFromSessionEvidence's
+// `sessions.map(...)` below), so Slice 4's fold has no tick-group to see and can never treat "0"
+// as a real observation (a fold cannot safely infer "0 sessions" from an absent tick-group without
+// fabricating — that would violate degrade-not-fabricate, plan §1). This marker's mere presence
+// turns "zero non-marker session.presence points + a complete marker" into a real, foldable 0.
+//
+// MUST-FIX 2: a partially-degraded census (e.g. tmux ok, screen genuinely errored/"unable") is
+// currently indistinguishable, at the fact-history layer, from a complete census — undercounting
+// silently and able to false-fire a downstream count-drop signature on nothing more than a flaky
+// `screen` binary. `census_state` surfaces this: "partial" whenever ANY multiplexer in this tick's
+// `result.multiplexers` reported status "unable" (a multiplexer reporting "absent" — genuinely not
+// installed — does NOT count as partial: a host with no `screen` at all still has a complete
+// census of what it actually runs).
+//
+// Fixed, non-hashed entity_key (mirrors SESSION_OVERFLOW_ENTITY_KEY's own convention exactly) —
+// this marker carries no session identity, so nothing needs hashing. Exported so
+// session-baseline.js's tick-grouping (Decision 3) can recognize this exact literal, and
+// re-exported from session-baseline.js for convenience (plan Decision 6).
+export const SESSION_CENSUS_MARKER_ENTITY_KEY = "session.census-marker.v1";
 
 // MUST-FIX 6 churn detector. A kill-then-resurrect reuses the same session NAME, so the entity_key
 // (a hash of mux+name) is UNCHANGED across ticks — the only signal that a session was recreated is
@@ -216,12 +245,42 @@ function buildSessionOverflowMarkerFactPoint(result, envelope, ts) {
   };
 }
 
+// Must-fix 2: "partial" iff ANY multiplexer this tick reported status "unable" — "absent"
+// (genuinely not installed) does NOT count as partial. `result.multiplexers` is the real
+// collector's per-mux status array (tools/sessions.js's collectSessionEvidence); a fixture that
+// omits it entirely (e.g. legacy/simplified test evidence) degrades to "complete" rather than
+// throwing — an absent multiplexers array carries no evidence of degradation either way.
+function censusStateFor(result) {
+  const multiplexers = Array.isArray(result?.multiplexers) ? result.multiplexers : [];
+  const anyUnable = multiplexers.some((mux) => mux?.status === "unable");
+  return anyUnable ? "partial" : "complete";
+}
+
+// Must-fix 1/2: emitted unconditionally on every successful sessions envelope — including a
+// genuinely zero-session tick — so the fold (Slice 4) always has a real tick-group to see. Marked
+// confidence:0 like the overflow marker above: it carries no session-presence evidence of its
+// own and must never be mistaken for one downstream.
+function buildSessionCensusMarkerFactPoint(result, envelope, ts) {
+  return {
+    ts,
+    fact_name: "session.presence",
+    entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+    attributes: {
+      census_state: censusStateFor(result),
+    },
+    source_envelope_id: envelope.id,
+    source_tool: envelope.trace?.tool,
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
 /**
  * evidence[] -> fact-store.js-shaped fact points for Slice 1's session-census collector
  * (tools/sessions.js). Mirrors factPointsFromServiceEvidence's overall shape. Pure L0 fact
  * source: this translator never builds an alert candidate and is never wired into daemon.js's
- * extraCandidates — alerting on session-count deviation/churn is explicitly Slice 4's job, not
- * this slice's (plan Slice 1 Definition of Done).
+ * extraCandidates — alerting on session-count deviation/churn is Slice 4's job
+ * (session-baseline.js), which consumes this fact-history rather than emitting candidates here.
  */
 export function factPointsFromSessionEvidence(evidence, { ts } = {}) {
   const envelope = (evidence ?? []).find((e) => e.id === "sessions" && e.status !== "unable");
@@ -229,6 +288,12 @@ export function factPointsFromSessionEvidence(evidence, { ts } = {}) {
   const sessions = envelope.result?.sessions ?? [];
 
   const points = sessions.map((session) => buildSessionFactPoint(session, envelope, ts));
+  // Slice 4 Slice-1-addendum (must-fixes 1/2): the census marker is ALWAYS appended, after every
+  // real session fact, on every successful envelope — including a zero-session tick. It is
+  // excluded from the per-tick entity cap/count (must-fix 5, already enforced by tools/sessions.js
+  // before this translator ever runs), from churn detection, and from Slice 4's session count,
+  // exactly the way SESSION_OVERFLOW_ENTITY_KEY already is excluded.
+  points.push(buildSessionCensusMarkerFactPoint(envelope.result, envelope, ts));
   if (envelope.result?.truncated) {
     points.push(buildSessionOverflowMarkerFactPoint(envelope.result, envelope, ts));
   }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  SESSION_CENSUS_MARKER_ENTITY_KEY,
   factPointsFromNetworkEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
@@ -177,7 +178,7 @@ test("factPointsFromSessionEvidence maps a tmux session into a bucketed, hashed 
   })];
 
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 1);
+  assert.equal(points.length, 2, "expected 1 session fact + 1 census marker fact (Slice 4 addendum)");
   const point = points[0];
   assert.equal(point.fact_name, "session.presence");
   assert.match(point.entity_key, /^session\.tmux\.[0-9a-f]{16}$/);
@@ -207,7 +208,8 @@ test("factPointsFromSessionEvidence: entity_key differs across distinct multiple
     ],
   })];
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
-  assert.equal(new Set(points.map((p) => p.entity_key)).size, 2);
+  const sessionPoints = points.filter((p) => p.entity_key !== SESSION_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(new Set(sessionPoints.map((p) => p.entity_key)).size, 2);
 });
 
 test("factPointsFromSessionEvidence returns [] for a status:unable envelope and for a missing envelope (no fabrication)", () => {
@@ -295,7 +297,7 @@ test("factPointsFromSessionEvidence: a truncated collector result emits an overf
   const evidence = [sessionEnvelope({ sessions: boundedSessions, truncated: true, total_count: 5000 })];
 
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 6, "expected 5 bounded session facts + 1 overflow marker fact");
+  assert.equal(points.length, 7, "expected 5 bounded session facts + 1 census marker fact + 1 overflow marker fact");
 
   const marker = points.find((p) => p.attributes.overflow === "true");
   assert.ok(marker, "expected an overflow marker fact point");
@@ -310,8 +312,59 @@ test("factPointsFromSessionEvidence: a non-truncated collector result never emit
     truncated: false,
   })];
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 1);
+  assert.equal(points.length, 2, "expected 1 session fact + 1 census marker fact, no overflow marker");
   assert.equal(points.some((p) => p.attributes.overflow === "true"), false);
+});
+
+// --- Census marker (Slice 4 Slice-1-addendum, must-fixes 1/2) ----------------------------------
+
+test("factPointsFromSessionEvidence: emits a complete census marker on every successful envelope, excluded from the session count", () => {
+  const evidence = [sessionEnvelope({
+    sessions: [{ multiplexer: "tmux", session_name: "solo", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 }],
+    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+    truncated: false,
+  })];
+  const points = factPointsFromSessionEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY);
+  assert.ok(marker, "expected a census marker fact point");
+  assert.equal(marker.fact_name, "session.presence");
+  assert.equal(marker.attributes.census_state, "complete");
+  assert.equal(marker.confidence, 0);
+  // "absent" (genuinely not installed) must NOT count as partial.
+  const nonMarkerPoints = points.filter((p) => p.entity_key !== SESSION_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(nonMarkerPoints.length, 1, "the marker itself must not be counted as a session");
+});
+
+test("factPointsFromSessionEvidence: a genuinely zero-session tick (EXACT-ZERO, must-fix 1) still emits a complete census marker and no session.presence session facts", () => {
+  const evidence = [sessionEnvelope({
+    sessions: [],
+    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+    truncated: false,
+  })];
+  const points = factPointsFromSessionEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 1, "expected exactly the census marker, no session facts");
+  assert.equal(points[0].entity_key, SESSION_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(points[0].attributes.census_state, "complete");
+});
+
+test("factPointsFromSessionEvidence: census_state is 'partial' when ANY multiplexer reports 'unable' (must-fix 2)", () => {
+  const evidence = [sessionEnvelope({
+    sessions: [{ multiplexer: "tmux", session_name: "solo", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 }],
+    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "unable", error: "permission denied" }],
+    truncated: false,
+  })];
+  const points = factPointsFromSessionEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.census_state, "partial");
+});
+
+test("factPointsFromSessionEvidence: census marker defaults to 'complete' when result.multiplexers is absent (legacy/simplified evidence shape)", () => {
+  const evidence = [sessionEnvelope({
+    sessions: [{ multiplexer: "tmux", session_name: "solo", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 }],
+  })];
+  const points = factPointsFromSessionEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.census_state, "complete");
 });
 
 // --- factPointsFromVpnPeerEvidence (Slice 3, observed-incident collectors plan) ---
