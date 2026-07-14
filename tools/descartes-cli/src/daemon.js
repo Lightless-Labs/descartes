@@ -9,7 +9,12 @@ import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
-import { factPointsFromNetworkEvidence, factPointsFromServiceEvidence, factPointsFromSessionEvidence } from "./fact-translators.js";
+import {
+  factPointsFromNetworkEvidence,
+  factPointsFromServiceEvidence,
+  factPointsFromSessionEvidence,
+  factPointsFromVpnPeerEvidence,
+} from "./fact-translators.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -25,6 +30,7 @@ import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
+import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -60,6 +66,13 @@ export function defaultDaemonProfile() {
         // (no extraCandidates addition below; see docs/plans/2026-07-13-observed-incident-
         // collectors.md Slice 1). Alerting on session-count deviation/churn is Slice 4's job.
         sessions: { enabled: true },
+        // Slice 3 (observed-incident collectors plan): default true, matching its siblings
+        // exactly — same outer learned.json kill switch, same structural-tick deadline/discard
+        // discipline. Pure read-only L0 fact source (SSH/VPN peer census) — this slice ALSO
+        // emits NO alert candidates (no extraCandidates addition below; see docs/plans/
+        // 2026-07-13-observed-incident-collectors.md Slice 3's Alert-emission scope decision,
+        // RESOLVED option 1). Alerting on unattributed/odd-hour peer logins is Slice 4/6's job.
+        "vpn-peer-status": { enabled: true },
       },
     },
     safety: {
@@ -223,6 +236,11 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     // same slow cadence, subject to the same structural-tick deadline/discard discipline below.
     // Read-only tmux/screen census; NO alert candidates emitted by this slice.
     sessions: collectors.sessions ?? collectSessionEvidence,
+    // Slice 3 (observed-incident collectors plan), additive sixth structural sub-collector:
+    // gated identically to its siblings (structuralProfile.collectors["vpn-peer-status"].enabled),
+    // on the same slow cadence, subject to the same structural-tick deadline/discard discipline
+    // below. Read-only SSH/VPN peer census; NO alert candidates emitted by this slice either.
+    "vpn-peer-status": collectors["vpn-peer-status"] ?? collectVpnPeerStatusEvidence,
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
@@ -230,6 +248,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
   if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
   if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions());
+  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"]());
   return evidence;
 }
 
@@ -407,6 +426,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // paired with any extraCandidates addition below — this slice emits NO alert
             // candidates (alerting on session-count deviation/churn is Slice 4's job).
             ...factPointsFromSessionEvidence(structuralEvidence, { ts }),
+            // Slice 3 (observed-incident collectors plan), additive: VPN/SSH peer-status
+            // structural evidence -> fact-points, same discipline as its siblings above — only
+            // reachable on a successful (non-timed-out) structural tick. Pure L0 fact source:
+            // deliberately NOT paired with any extraCandidates addition below — this slice emits
+            // NO alert candidates either (RESOLVED option 1, plan Slice 3's Alert-emission scope
+            // decision). Alerting on unattributed/odd-hour peer logins is Slice 4/6's job.
+            ...factPointsFromVpnPeerEvidence(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;

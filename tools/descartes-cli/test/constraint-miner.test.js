@@ -8,6 +8,7 @@ import { SEED_CONSTRAINTS, loadConstraints, writeConstraints } from "../src/cons
 import { isFixedLengthHexHash, isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
 import {
+  MINED_FAMILIES,
   MINED_ID_PREFIX,
   mergeMinedConstraints,
   mineConstraintCandidates,
@@ -400,4 +401,50 @@ test("descartes learned mine reads facts via readFactPoints and honors --window"
 test("resolveConstraintStorePaths-adjacent: descartes learned mine's writes pass the Pi-owned path guard", async () => {
   const paths = await tempPaths();
   assert.doesNotThrow(() => assertNoPiOwnedPath(paths));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3 (observed-incident collectors plan) MUST-FIX 4(b): miner-inertness. The peer.presence
+// fact_name (tools/vpn-peer-status.js's collector, translated by fact-translators.js's
+// factPointsFromVpnPeerEvidence) is NOT in FAMILY_BY_FACT_NAME's closed mining allowlist — mining
+// a fact-history built ENTIRELY of stable, repeated peer.presence facts must yield ZERO drafts,
+// proving Slice 3's "no alert candidates" claim holds even against the generic fact-history miner,
+// not just against daemon.js's extraCandidates wiring.
+// ---------------------------------------------------------------------------------------------
+
+function stablePeerHistory({ entityKey = "peer.wireguard.deadbeefdeadbeef", count = 10, spanDays = 8 } = {}) {
+  const points = [];
+  for (let index = 0; index < count; index += 1) {
+    const ts = BASE_TS + Math.round((spanDays * DAY_MS * index) / Math.max(1, count - 1));
+    points.push({
+      ts: new Date(ts).toISOString(),
+      fact_name: "peer.presence",
+      entity_key: entityKey,
+      attributes: { source_type: "wireguard", presence_state: "observed_active", login_hour_bucket: "03", handshake_age_bucket: "lt_1h" },
+      source_envelope_id: "vpn-peer-status",
+      source_tool: "collect_vpn_peer_status",
+      sensitivity: "operational",
+    });
+  }
+  return points;
+}
+
+test("MUST-FIX 4(b) miner-inertness: mining a fact-history built entirely of stable peer.presence facts yields ZERO drafts", () => {
+  const factHistory = stablePeerHistory();
+  const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
+  assert.deepEqual(candidates, []);
+});
+
+test("MUST-FIX 4(b): MINED_FAMILIES (the closed set constraint-miner.js can ever mine) contains no peer-related family", () => {
+  for (const family of MINED_FAMILIES) {
+    assert.equal(/peer/i.test(family), false, `unexpected peer-related mined family: ${family}`);
+  }
+  assert.deepEqual([...MINED_FAMILIES].sort(), ["port-binding-identity", "service-presence"]);
+});
+
+test("MUST-FIX 4(b): a MIXED fact-history (stable service.presence + stable peer.presence) mines drafts ONLY for the service family, never for peer facts", () => {
+  const factHistory = [...stableServiceHistory(), ...stablePeerHistory()];
+  const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].family, "service-presence");
 });

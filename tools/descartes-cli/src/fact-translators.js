@@ -9,6 +9,7 @@
 // observation.
 import crypto from "node:crypto";
 import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
+import { computePeerIdentitySignature } from "./peer-signature-store.js";
 
 export function sanitizeEntityKey(value) {
   return sanitizeIdentityString(value);
@@ -111,7 +112,11 @@ export function factPointsFromNetworkEvidence(evidence, { ts } = {}) {
 // identity hash scheme (Slice 3's own peer-identity hashing variant) even if the raw input
 // bytes happened to coincide — mirrors provenance-warnings.js's hashExecutablePath /
 // provenance-store.js's own per-scheme hashing discipline.
-const SESSION_ENTITY_HASH_DOMAIN = "descartes.fact.session.v1";
+// Exported (additive, Slice 3) so test/fact-translators.test.js and
+// test/peer-signature-store.test.js can run a direct session-vs-peer domain-separation
+// differentiation test (must-fix 6) against the ACTUAL shipped session hash scheme, rather than
+// re-deriving a parallel copy that could silently drift from this one.
+export const SESSION_ENTITY_HASH_DOMAIN = "descartes.fact.session.v1";
 
 // A session-identity hash is intentionally NOT emitted for this fixed marker — it carries no
 // session identity at all (see buildSessionOverflowMarkerFactPoint below), so it is a plain,
@@ -129,7 +134,8 @@ const SESSION_OVERFLOW_ENTITY_KEY = "session.overflow-marker.v1";
 // Domain-separated from the identity hash so the two schemes can never collide on shared inputs.
 const SESSION_CREATED_FINGERPRINT_DOMAIN = "descartes.fact.session.created.v1";
 
-function hashSessionIdentity(multiplexer, sessionName) {
+// Exported (additive, Slice 3) for the same reason as SESSION_ENTITY_HASH_DOMAIN above.
+export function hashSessionIdentity(multiplexer, sessionName) {
   return crypto.createHash("sha256").update(`${SESSION_ENTITY_HASH_DOMAIN}:${multiplexer}:${sessionName}`).digest("hex").slice(0, 16);
 }
 
@@ -225,6 +231,144 @@ export function factPointsFromSessionEvidence(evidence, { ts } = {}) {
   const points = sessions.map((session) => buildSessionFactPoint(session, envelope, ts));
   if (envelope.result?.truncated) {
     points.push(buildSessionOverflowMarkerFactPoint(envelope.result, envelope, ts));
+  }
+  return points;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3 (observed-incident collectors plan) — VPN/SSH peer identity translator.
+//
+// entity_key IS the peer-identity hash (hash-at-source, must-fix 3): computed by
+// peer-signature-store.js's computePeerIdentitySignature, a domain-separated ("descartes.peer.v1")
+// scheme distinct from both the process scheme (provenance-store.js's computeIdentitySignature,
+// which carries no domain tag) and the session scheme above (SESSION_ENTITY_HASH_DOMAIN,
+// "descartes.fact.session.v1") — see peer-signature-store.js's own module header for the full
+// identity-vs-attribute split (WireGuard/vpn_service identity = pubkey/UUID only; SSH identity =
+// source_type+user+host).
+//
+// Every persisted attribute below is a CLOSED-ENUM literal — never a raw WG public key, raw
+// IP/hostname/username, raw scutil VPN service name/UUID, or raw timestamp/epoch. This is a hard
+// requirement (must-fix 3/5): fact-store.js's attributes are unsanitized
+// `String(value).slice(0,160)` (fact-store.js:36) — hashing/bucketing at THIS translator is the
+// ONLY control, there is no downstream sanitization gate for fact-history.
+const PEER_FACT_NAME = "peer.presence";
+
+// Marker entity_key for the overflow fact — carries no peer identity at all, so no hash is
+// computed for it (mirrors SESSION_OVERFLOW_ENTITY_KEY's convention exactly).
+const PEER_OVERFLOW_ENTITY_KEY = "peer.overflow-marker.v1";
+
+const CLOSED_PEER_SOURCE_TYPES = new Set(["wireguard", "ssh", "vpn_service"]);
+
+function normalizedPeerSourceType(sourceType) {
+  return CLOSED_PEER_SOURCE_TYPES.has(sourceType) ? sourceType : "unknown";
+}
+
+// sourceType is always one of this collector's own closed-enum literals — safe to embed
+// directly (unhashed) in entity_key, exactly like sessionEntityKey's `mux` component above; only
+// the free-text/secret-shaped identity fields (pubkey/uuid/user/host) are ever hashed.
+function peerEntityKey(peer) {
+  const sourceType = normalizedPeerSourceType(peer.source_type);
+  const hash = computePeerIdentitySignature({
+    sourceType,
+    peerIdentifier: sourceType === "wireguard" ? peer.public_key : sourceType === "vpn_service" ? peer.service_uuid : undefined,
+    remoteUser: sourceType === "ssh" ? peer.remote_user : undefined,
+    remoteHost: sourceType === "ssh" ? peer.remote_host : undefined,
+  });
+  return `peer.${sourceType}.${hash}`;
+}
+
+// Closed-enum local hour-of-day bucket ("00".."23", or "unknown") — the hour at which THIS
+// observation tick occurred, never a raw/precise timestamp. Deliberately NOT derived from
+// parsing an exact login instant out of who/last's locale-dependent date columns (fragile across
+// BSD/GNU implementations and timezones) — the tick's own hour is what "odd-hour" statistical
+// judgment (deferred to Slice 4) will actually consume.
+function bucketLoginHour(ts) {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  return String(date.getHours()).padStart(2, "0");
+}
+
+// Closed-enum handshake-age bucket (must-fix 5, hard requirement) — NEVER a raw epoch or precise
+// seconds value, the same occupancy-signal sensitivity class as a raw creation timestamp
+// (mirrors Slice 1's created_at_fingerprint reasoning, but a bucket suffices here since
+// handshake age is not itself the churn-detection signal must-fix 6 was about). "n/a" for any
+// non-WireGuard peer, keeping every peer fact's attribute-key set uniform.
+function bucketHandshakeAge(epochSeconds, nowEpochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return "unknown";
+  if (epochSeconds === 0) return "never"; // WireGuard's own "never handshaked" signal
+  const ageSeconds = nowEpochSeconds - epochSeconds;
+  if (!Number.isFinite(ageSeconds) || ageSeconds < 0) return "unknown";
+  if (ageSeconds < 300) return "lt_5m";
+  if (ageSeconds < 3600) return "lt_1h";
+  if (ageSeconds < 86400) return "lt_1d";
+  if (ageSeconds < 7 * 86400) return "lt_7d";
+  return "gte_7d";
+}
+
+// Closed-enum bucket for the marker's total-count context — mirrors bucketOverflowTotal exactly
+// (never the raw total_count integer verbatim).
+function bucketPeerOverflowTotal(count) {
+  if (!Number.isFinite(count) || count < 0) return "unknown";
+  if (count <= 200) return "<=200";
+  if (count <= 500) return "201-500";
+  if (count <= 1000) return "501-1000";
+  return "1000+";
+}
+
+function buildPeerFactPoint(peer, envelope, ts) {
+  const sourceType = normalizedPeerSourceType(peer.source_type);
+  const nowEpochSeconds = Math.floor(new Date(ts).getTime() / 1000);
+  return {
+    ts,
+    fact_name: PEER_FACT_NAME,
+    entity_key: peerEntityKey(peer),
+    attributes: {
+      source_type: sourceType,
+      presence_state: peer.presence_state === "observed_historical" ? "observed_historical" : "observed_active",
+      login_hour_bucket: bucketLoginHour(ts),
+      handshake_age_bucket: sourceType === "wireguard" ? bucketHandshakeAge(peer.latest_handshake_epoch_seconds, nowEpochSeconds) : "n/a",
+    },
+    source_envelope_id: envelope.id,
+    source_tool: envelope.trace?.tool,
+    sensitivity: "operational",
+  };
+}
+
+// Emitted only when the collector already reported `truncated:true` (must-fix 3, mirrors
+// buildSessionOverflowMarkerFactPoint's flood-cap convention exactly) — explicit confidence:0 so
+// it can never be mistaken for real peer-presence evidence downstream.
+function buildPeerOverflowMarkerFactPoint(result, envelope, ts) {
+  return {
+    ts,
+    fact_name: PEER_FACT_NAME,
+    entity_key: PEER_OVERFLOW_ENTITY_KEY,
+    attributes: {
+      overflow: "true",
+      total_count_bucket: bucketPeerOverflowTotal(result.total_count),
+    },
+    source_envelope_id: envelope.id,
+    source_tool: envelope.trace?.tool,
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+/**
+ * evidence[] -> fact-store.js-shaped fact points for Slice 3's peer-status collector
+ * (tools/vpn-peer-status.js). Pure L0 fact source, mirroring factPointsFromSessionEvidence's
+ * shape exactly: this translator never builds an alert candidate and is NEVER wired into
+ * daemon.js's extraCandidates. Slice 3's Alert-emission scope decision (RESOLVED option 1, plan
+ * §Slice 3) is that this slice emits ZERO alert candidates in v0 — it only accumulates peer
+ * fact-history; alerting on unattributed/odd-hour peer logins is deferred to Slice 4/6.
+ */
+export function factPointsFromVpnPeerEvidence(evidence, { ts } = {}) {
+  const envelope = (evidence ?? []).find((e) => e.id === "vpn-peer-status" && e.status !== "unable");
+  if (!envelope) return [];
+  const peers = envelope.result?.peers ?? [];
+
+  const points = peers.map((peer) => buildPeerFactPoint(peer, envelope, ts));
+  if (envelope.result?.truncated) {
+    points.push(buildPeerOverflowMarkerFactPoint(envelope.result, envelope, ts));
   }
   return points;
 }

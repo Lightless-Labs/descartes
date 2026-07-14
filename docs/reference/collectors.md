@@ -32,6 +32,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 | `collect_time_sync` | `time-sync` | macOS, Linux | `check_offset?: boolean`, `server?: string` |
 | `collect_certificates` | `certificates` | macOS, Linux | `warning_days?: 1..3650`, `certificate_limit?: 1..500` |
 | `collect_sessions` | `sessions` | macOS, Linux | `session_limit?: 1..500` |
+| `collect_vpn_peer_status` | `vpn-peer-status` | macOS, Linux | `peer_limit?: 1..500` |
 | `inspect_process` | `process-<pid>` | macOS, Linux | `pid: number` |
 | `inspect_parent_tree` | `process-parent-tree-<pid>` | macOS, Linux | `pid: number`, `max_depth?: 1..64` |
 | `inspect_runtime_provenance` | `provenance-<pid\|port\|container>-<value>` | macOS, Linux | exactly one of `pid: number`, `port: 1..65535`, `container: string` |
@@ -235,6 +236,24 @@ Behavior: degrade-not-fabricate — when neither `tmux` nor `screen` is present 
 Fact-history: on the daemon's hourly structural tick (gated behind the `learned.json` kill switch, like every other structural sub-collector), `factPointsFromSessionEvidence` (`fact-translators.js`) translates this census into `session.presence` fact-points. The persisted `entity_key` is a fixed-length (16-char) hex SHA-256 hash of a domain-separated preimage (`descartes.fact.session.v1:<multiplexer>:<session_name>`) — never the raw or charset-substituted session name. Persisted `attributes` are closed-enum/bucketed only: `attached` (`"true"`/`"false"`), `window_count_bucket` (`"0"`/`"1"`/`"2-4"`/`"5-9"`/`"10+"`/`"unknown"`), and `created_at_bucket` (an opaque 10-minute epoch-bucket index, or `"unknown"` for screen sessions, whose `-ls` output does not reliably expose a creation time) — never a raw session name or raw timestamp. A truncated tick additionally emits one `confidence: 0` overflow-marker fact so a session flood is visible as "truncation happened" rather than silently dropped. This collector emits fact-history only — no alert candidates; alerting on session-count deviation/churn is a separate, later slice.
 
 Privacy: the raw, un-hashed session name IS visible in this tool's on-demand `descartes triage` response (matching the existing consent posture of every other `TRIAGE_TOOL_NAMES` collector — triage is operator-invoked and already sees raw process/service data). Only the *persisted* fact-history is hashed/bucketed.
+
+### `collect_vpn_peer_status`
+
+Collects a read-only baseline of VPN/SSH peer identity for the operator's own host, so an unattributed or odd-hour SSH/VPN login becomes detectable. Status only — this collector never inspects traffic content, and never escalates privilege.
+
+Sources:
+
+- SSH login census: fixed `who` (currently logged-in sessions with a remote host — a local console/tty login is not a peer).
+- SSH login history: fixed, BOUNDED `last -n <N>` (default 50) — never an unbounded wtmp read.
+- WireGuard peers: a CLOSED, FIXED-ARGV ALLOWLIST — `wg show interfaces` (enumerate), then per interface `wg show <interface> peers`, `wg show <interface> endpoints`, `wg show <interface> latest-handshakes`. This collector is structurally incapable of constructing any other `wg` argv: it NEVER runs `wg show <interface> dump`, `wg showconf <interface>`, `wg show <interface> private-key`, or `wg show <interface> preshared-keys` (all four leak the interface's private key and/or peers' preshared keys). `wg` commonly requires root even for read-only status on both macOS and Linux; a permission-denied result there is recorded as an `elevation_candidate` documentation marker (the already-shipped S3-priv opt-in path would be the correct place to add elevated WireGuard reads later) — this collector never escalates privilege itself.
+- macOS VPN service state: fixed `scutil --nc list` (darwin only; reported `not_applicable` elsewhere without attempting the command).
+- Established-inbound cross-reference: `ss` (Linux) / `netstat` (macOS) — lowest-confidence, operator-triage context only; never translated into a persisted peer fact.
+
+Behavior: degrade-not-fabricate per source — a genuinely absent binary is `"absent"`; a permission/OS denial is `"missing_permission"`; a source that runs and reports zero peers/logins is a real, distinguishable `"ok"`/empty result, never conflated with unavailability. Per-tick peer entities are bounded at `DEFAULT_PEER_ENTITY_LIMIT` (200); a count above the cap is truncated with an explicit `truncated: true` marker and the real `total_count` preserved.
+
+Fact-history: on the daemon's hourly structural tick (gated behind the `learned.json` kill switch), `factPointsFromVpnPeerEvidence` (`fact-translators.js`) translates this census into `peer.presence` fact-points. The persisted `entity_key` is a fixed-length (16-char) hex SHA-256 hash of a versioned, domain-separated (`descartes.peer.v1`), NUL-joined preimage — computed by the dedicated `peer-signature-store.js` module (its own store/hash scheme, distinct from both the session and process identity schemes, and never written to `signatures.json`). WireGuard/VPN-service identity is the public key/service UUID ONLY (the endpoint/service name is an attribute, since an endpoint roams as a client migrates networks); SSH identity is `(source_type, remote_user, remote_host_as_observed)`, with the documented limitation that a dynamic client IP may keep an SSH peer's baseline provisional forever (consequence-free in v0). Persisted `attributes` are closed-enum/bucketed only: `source_type`, `presence_state` (`"observed_active"`/`"observed_historical"`), `login_hour_bucket` (a closed local hour-of-day bucket, `"00"`–`"23"`, or `"unknown"`), and `handshake_age_bucket` (closed-enum — `"never"`/`"lt_5m"`/`"lt_1h"`/`"lt_1d"`/`"lt_7d"`/`"gte_7d"`/`"unknown"`/`"n/a"` — never a raw epoch or precise seconds). A truncated tick additionally emits one `confidence: 0` overflow-marker fact. **This collector emits fact-history only — zero alert candidates.** It is not wired into `daemon.js`'s `extraCandidates`, and its `peer.presence` fact_name is not in `constraint-miner.js`'s mining allowlist; alerting on unattributed/odd-hour peer logins is a separate, later slice.
+
+Privacy: the raw, un-hashed peer IPs/hostnames/usernames/public keys/VPN service names ARE visible in this tool's on-demand `descartes triage` response (matching the existing consent posture of every other `TRIAGE_TOOL_NAMES` collector). Only the *persisted* fact-history is hashed/bucketed.
 
 ### `sample_dimension`
 

@@ -41,6 +41,20 @@ test("createEvidenceTools includes inspect_runtime_provenance with a single-targ
   assert.equal(typeof provenanceTool.execute, "function");
 });
 
+// Slice 3 (observed-incident collectors plan) registration: closes the same gap as the two tests
+// above for the new collect_vpn_peer_status tool — the set-equality test catches a missing/extra
+// NAME, but not a malformed parameter schema for a specific tool.
+test("createEvidenceTools registers collect_vpn_peer_status with a bounded peer_limit parameter", () => {
+  const paths = resolveDescartesPaths();
+  const tools = createEvidenceTools(paths);
+  const peerTool = tools.find((tool) => tool.name === "collect_vpn_peer_status");
+
+  assert.ok(peerTool, "expected collect_vpn_peer_status to be registered");
+  assert.equal(typeof peerTool.execute, "function");
+  assert.equal(peerTool.parameters.properties.peer_limit.minimum, 1);
+  assert.equal(peerTool.parameters.properties.peer_limit.maximum, 500);
+});
+
 // S3-priv Slice 2 signature-widening regression: closes the gap the tool-name-set-equality check
 // above would not catch -- that resolveProvenance's new second (paths-carrying) argument is
 // actually threaded through the executor's real params -> resolveProvenance call, and that a

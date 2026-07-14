@@ -4,6 +4,7 @@ import {
   factPointsFromNetworkEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
+  factPointsFromVpnPeerEvidence,
   sanitizeEntityKey,
 } from "../src/fact-translators.js";
 
@@ -311,4 +312,195 @@ test("factPointsFromSessionEvidence: a non-truncated collector result never emit
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
   assert.equal(points.length, 1);
   assert.equal(points.some((p) => p.attributes.overflow === "true"), false);
+});
+
+// --- factPointsFromVpnPeerEvidence (Slice 3, observed-incident collectors plan) ---
+
+function peerEnvelope(result, status = "ok") {
+  return envelope("vpn-peer-status", "collect_vpn_peer_status", result, status);
+}
+
+function wgPeer(overrides = {}) {
+  return {
+    source_type: "wireguard",
+    presence_state: "observed_active",
+    interface: "wg0",
+    public_key: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEFG=",
+    endpoint: "203.0.113.10:51820",
+    latest_handshake_epoch_seconds: 1720000000,
+    ...overrides,
+  };
+}
+
+function sshPeer(overrides = {}) {
+  return {
+    source_type: "ssh",
+    presence_state: "observed_active",
+    remote_user: "alice",
+    remote_host: "203.0.113.5",
+    origin: "who",
+    ...overrides,
+  };
+}
+
+function vpnServicePeer(overrides = {}) {
+  return {
+    source_type: "vpn_service",
+    presence_state: "observed_active",
+    service_name: "Corp VPN",
+    service_uuid: "1E4E6C58-F859-4E51-92A6-BF4B14A23689",
+    ...overrides,
+  };
+}
+
+test("factPointsFromVpnPeerEvidence maps a WireGuard peer into a hashed entity_key with closed-enum attributes", () => {
+  const evidence = [peerEnvelope({ peers: [wgPeer()], truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 1);
+  const point = points[0];
+  assert.equal(point.fact_name, "peer.presence");
+  assert.match(point.entity_key, /^peer\.wireguard\.[0-9a-f]{16}$/);
+  assert.equal(point.attributes.source_type, "wireguard");
+  assert.equal(point.attributes.presence_state, "observed_active");
+  assert.match(point.attributes.login_hour_bucket, /^([01][0-9]|2[0-3])$/);
+  assert.equal(point.attributes.handshake_age_bucket, "gte_7d"); // 1720000000 is far in the past relative to TS
+  assert.equal(point.source_envelope_id, "vpn-peer-status");
+  assert.equal(point.source_tool, "collect_vpn_peer_status");
+});
+
+test("factPointsFromVpnPeerEvidence: entity_key is stable across repeated ticks for the same WireGuard pubkey, regardless of a changed endpoint (endpoint is an attribute, not identity)", () => {
+  const first = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer({ endpoint: "203.0.113.10:51820" })] })], { ts: TS });
+  const second = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer({ endpoint: "198.51.100.7:44444" })] })], { ts: TS });
+  assert.equal(first[0].entity_key, second[0].entity_key);
+});
+
+test("factPointsFromVpnPeerEvidence: an SSH peer and a vpn_service peer sharing similar-looking identifiers never collide (source_type domain-separates entity_key)", () => {
+  const evidence = [peerEnvelope({ peers: [sshPeer(), vpnServicePeer(), wgPeer()] })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  assert.equal(new Set(points.map((p) => p.entity_key)).size, 3);
+  assert.deepEqual(points.map((p) => p.attributes.source_type).sort(), ["ssh", "vpn_service", "wireguard"]);
+});
+
+test("factPointsFromVpnPeerEvidence returns [] for a status:unable envelope and for a missing envelope (no fabrication)", () => {
+  const unable = [peerEnvelope({ peers: [] }, "unable")];
+  assert.deepEqual(factPointsFromVpnPeerEvidence(unable, { ts: TS }), []);
+  assert.deepEqual(factPointsFromVpnPeerEvidence([], { ts: TS }), []);
+});
+
+// --- Hash-at-source negative tests (must-fix 3/5) ---
+
+test("factPointsFromVpnPeerEvidence: no raw WG public key survives verbatim into entity_key or attributes", () => {
+  const rawPubkey = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEFG=";
+  const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer({ public_key: rawPubkey })] })], { ts: TS });
+  assert.equal(JSON.stringify(points).includes(rawPubkey), false);
+  assert.match(points[0].entity_key, /^peer\.wireguard\.[0-9a-f]{16}$/);
+});
+
+test("factPointsFromVpnPeerEvidence: no raw IP or hostname survives verbatim (SSH remote_host)", () => {
+  for (const rawHost of ["10.0.0.5", "host-01.internal"]) {
+    const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [sshPeer({ remote_host: rawHost })] })], { ts: TS });
+    assert.equal(JSON.stringify(points).includes(rawHost), false, `raw host leaked for input: ${rawHost}`);
+  }
+});
+
+test("factPointsFromVpnPeerEvidence: no raw username survives verbatim (SSH remote_user)", () => {
+  const rawUser = "thomas";
+  const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [sshPeer({ remote_user: rawUser })] })], { ts: TS });
+  assert.equal(JSON.stringify(points).includes(rawUser), false);
+});
+
+test("factPointsFromVpnPeerEvidence: no raw handshake epoch survives verbatim — only a closed-enum bucket", () => {
+  const rawEpoch = 1720000000;
+  const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer({ latest_handshake_epoch_seconds: rawEpoch })] })], { ts: TS });
+  assert.equal(JSON.stringify(points).includes(String(rawEpoch)), false);
+  assert.match(points[0].attributes.handshake_age_bucket, /^(never|lt_5m|lt_1h|lt_1d|lt_7d|gte_7d|unknown|n\/a)$/);
+});
+
+test("factPointsFromVpnPeerEvidence: no raw scutil VPN service name or UUID survives verbatim", () => {
+  const rawName = "Corp VPN — do not disclose";
+  const rawUuid = "1E4E6C58-F859-4E51-92A6-BF4B14A23689";
+  const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [vpnServicePeer({ service_name: rawName, service_uuid: rawUuid })] })], { ts: TS });
+  const serialized = JSON.stringify(points);
+  assert.equal(serialized.includes(rawName), false);
+  assert.equal(serialized.includes(rawUuid), false);
+});
+
+test("factPointsFromVpnPeerEvidence: no raw ISO timestamp survives verbatim in any ATTRIBUTE (the fact point's own top-level `ts` field is expected and out of scope here, matching every other translator) — only the closed-enum login_hour_bucket", () => {
+  const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer()] })], { ts: TS });
+  assert.equal(JSON.stringify(points[0].attributes).includes(TS), false);
+  assert.match(points[0].attributes.login_hour_bucket, /^([01][0-9]|2[0-3])$/);
+});
+
+// --- Closed-enum handshake-age bucket coverage ---
+
+test("factPointsFromVpnPeerEvidence: handshake_age_bucket covers never/recent/stale, and is 'n/a' for non-WireGuard peers", () => {
+  const nowSeconds = Math.floor(new Date(TS).getTime() / 1000);
+  const cases = [
+    { epoch: 0, expected: "never" },
+    { epoch: nowSeconds - 60, expected: "lt_5m" },
+    { epoch: nowSeconds - 1800, expected: "lt_1h" },
+    { epoch: nowSeconds - 7200, expected: "lt_1d" },
+    { epoch: nowSeconds - 3 * 86400, expected: "lt_7d" },
+    { epoch: nowSeconds - 30 * 86400, expected: "gte_7d" },
+    { epoch: undefined, expected: "unknown" },
+  ];
+  for (const { epoch, expected } of cases) {
+    const points = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer({ latest_handshake_epoch_seconds: epoch })] })], { ts: TS });
+    assert.equal(points[0].attributes.handshake_age_bucket, expected, `epoch=${epoch}`);
+  }
+
+  const sshPoints = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [sshPeer()] })], { ts: TS });
+  assert.equal(sshPoints[0].attributes.handshake_age_bucket, "n/a");
+});
+
+// --- Flood cap + overflow marker (must-fix 3) ---
+
+test("factPointsFromVpnPeerEvidence: a truncated collector result emits an overflow marker fact alongside the bounded peer facts", () => {
+  const boundedPeers = Array.from({ length: 5 }, (_, i) => sshPeer({ remote_user: `user-${i}`, remote_host: `10.0.0.${i}` }));
+  const evidence = [peerEnvelope({ peers: boundedPeers, truncated: true, total_count: 5000 })];
+
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 6, "expected 5 bounded peer facts + 1 overflow marker fact");
+
+  const marker = points.find((p) => p.attributes.overflow === "true");
+  assert.ok(marker, "expected an overflow marker fact point");
+  assert.equal(marker.confidence, 0);
+  assert.equal(marker.attributes.total_count_bucket, "1000+");
+  assert.equal(JSON.stringify(marker).includes("5000"), false);
+});
+
+test("factPointsFromVpnPeerEvidence: a non-truncated collector result never emits an overflow marker", () => {
+  const evidence = [peerEnvelope({ peers: [wgPeer()], truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 1);
+  assert.equal(points.some((p) => p.attributes.overflow === "true"), false);
+});
+
+// --- Schema-level closed-enum/hash test (nice-to-have) ---
+
+test("factPointsFromVpnPeerEvidence: every persisted attribute is either a closed-enum literal or a 16-hex hash — no free-form string reaches a persisted attribute", () => {
+  const CLOSED_ENUM_VALUES = new Set([
+    "wireguard", "ssh", "vpn_service", "unknown",
+    "observed_active", "observed_historical",
+    "never", "lt_5m", "lt_1h", "lt_1d", "lt_7d", "gte_7d", "n/a",
+    "true", "false",
+    "<=200", "201-500", "501-1000", "1000+",
+  ]);
+  const HOUR_BUCKET_RE = /^([01][0-9]|2[0-3])$/;
+  const HEX16_RE = /^[0-9a-f]{16}$/;
+
+  const evidence = [peerEnvelope({
+    peers: [wgPeer(), sshPeer(), vpnServicePeer()],
+    truncated: true,
+    total_count: 999,
+  })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  assert(points.length > 0);
+
+  for (const point of points) {
+    for (const [key, value] of Object.entries(point.attributes)) {
+      const isClosedEnum = CLOSED_ENUM_VALUES.has(value) || HOUR_BUCKET_RE.test(value) || HEX16_RE.test(value);
+      assert(isClosedEnum, `attribute ${key}="${value}" is neither a closed-enum literal nor a 16-hex hash`);
+    }
+  }
 });

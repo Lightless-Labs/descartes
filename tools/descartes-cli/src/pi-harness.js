@@ -21,6 +21,7 @@ import { collectSessionEvidence, DEFAULT_SESSION_ENTITY_LIMIT } from "./tools/se
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectTimeSyncEvidence } from "./tools/time-sync.js";
 import { collectVmEvidence } from "./tools/vms.js";
+import { collectVpnPeerStatusEvidence, DEFAULT_PEER_ENTITY_LIMIT } from "./tools/vpn-peer-status.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
 import { readSamplingArtifactEvidence, sampleDimensionEvidence } from "./tools/sampling.js";
@@ -175,6 +176,14 @@ export function createEvidenceTools(paths) {
       parameters: Type.Object({ session_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
       execute: async (_id, params) => jsonToolResult(await collectSessionEvidence({ sessionLimit: params.session_limit ?? DEFAULT_SESSION_ENTITY_LIMIT })),
+    }),
+    defineTool({
+      name: "collect_vpn_peer_status",
+      label: "Collect VPN/SSH peer status",
+      description: "Collect a read-only baseline of VPN/SSH peer identity: SSH login census (who) and bounded recent history (last -n), WireGuard peers/endpoints/latest-handshakes (status only, never keys), and macOS VPN service state. No traffic content is inspected, no privilege is escalated, and no host actions are taken.",
+      parameters: Type.Object({ peer_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
+      executionMode: "parallel",
+      execute: async (_id, params) => jsonToolResult(await collectVpnPeerStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_PEER_ENTITY_LIMIT })),
     }),
     defineTool({
       name: "inspect_process",

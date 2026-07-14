@@ -32,7 +32,9 @@ import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { readAlertRecords } from "../src/alert-store.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
-import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, writeSignatureStore } from "../src/provenance-store.js";
+import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
+import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
+import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -444,7 +446,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services", "sessions"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services", "sessions", "vpn-peer-status"]);
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
@@ -455,6 +457,10 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   // true, matching its siblings exactly — still gated end-to-end by the outer learned.json kill
   // switch, and this collector itself never emits an alert candidate (pure L0 fact source).
   assert(profile.structural.collectors.sessions.enabled);
+  // Slice 3 (observed-incident collectors plan) sibling-default consistency: vpn-peer-status
+  // defaults true, matching its siblings exactly — same outer learned.json kill switch, and this
+  // collector ALSO never emits an alert candidate (pure L0 fact source, RESOLVED option 1).
+  assert(profile.structural.collectors["vpn-peer-status"].enabled);
 });
 
 test("validateDaemonProfile accepts default and structural-less profiles, rejects malformed ones", () => {
@@ -1556,6 +1562,174 @@ test("Slice 1 day-1 no-storm: the first-ever session observation seeds fact-hist
   const { points } = await readFactPoints(paths);
   assert(points.some((point) => point.fact_name === "session.presence"), "expected fact-history to be seeded on first observation");
   assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("session")), false, "Slice 1 must never emit a session-related alert candidate");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3 (observed-incident collectors plan): VPN/SSH peer-status structural wiring. Pure L0
+// fact source — mirrors Slice 1's own coverage shape exactly (structural evidence -> fact-point,
+// byte-identical-when-disabled, day-1 no-storm), PLUS the two must-fix-4 "no alert candidates"
+// pinned tests (store-separation, miner-inertness-adjacent) the plan requires specifically for
+// this slice.
+// ---------------------------------------------------------------------------------------------
+
+function vpnPeerStatusEnvelopeFixture(overrides = {}) {
+  return envelope("vpn-peer-status", "collect_vpn_peer_status", {
+    platform: "darwin",
+    sources: {
+      ssh_who: { status: "ok" },
+      ssh_last: { status: "ok", requested_n: 50 },
+      wireguard: { status: "ok", elevation_candidate: false, interfaces: [] },
+      vpn_services: { status: "ok" },
+      established_inbound: { status: "ok" },
+    },
+    any_source_available: true,
+    total_count: 1,
+    peers: [{ source_type: "ssh", presence_state: "observed_active", remote_user: "alice", remote_host: "203.0.113.5", origin: "who" }],
+    truncated: false,
+    cap: 200,
+    ...overrides,
+  });
+}
+
+test("Slice 3: the vpn-peer-status sub-collector runs on a structural-due tick alongside its siblings, and its census is translated into a hashed, bucketed fact-point", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+  const structuralCollectors = {
+    services: async () => { structuralCalls.push("services"); return envelope("services", "collect_services", { manager: "systemd", services: [] }); },
+    network: async () => { structuralCalls.push("network"); return envelope("network-basics", "collect_network", { listening_sockets: [] }); },
+    "scheduled-jobs": async () => { structuralCalls.push("scheduled-jobs"); return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }); },
+    "vpn-peer-status": async () => { structuralCalls.push("vpn-peer-status"); return vpnPeerStatusEnvelopeFixture(); },
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, "vpn-peer-status": { enabled: true } },
+  });
+
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "vpn-peer-status"]);
+  assert(result.status.structural_collector_statuses.some((entry) => entry.id === "vpn-peer-status" && entry.status === "ok" && entry.tool === "collect_vpn_peer_status"));
+
+  const { points } = await readFactPoints(paths);
+  const peerPoint = points.find((point) => point.fact_name === "peer.presence");
+  assert.ok(peerPoint, "expected the structural peer census to be translated into a fact-point");
+  assert.match(peerPoint.entity_key, /^peer\.ssh\.[0-9a-f]{16}$/);
+  assert.equal(peerPoint.entity_key.includes("alice"), false, "raw remote_user must never reach persisted fact-history");
+  assert.equal(peerPoint.entity_key.includes("203.0.113.5"), false, "raw remote_host must never reach persisted fact-history");
+  assert.equal(JSON.stringify(points).includes("alice"), false, "raw remote_user must never reach persisted fact-history");
+  assert.equal(JSON.stringify(points).includes("203.0.113.5"), false, "raw remote_host must never reach persisted fact-history");
+  assert.equal(peerPoint.attributes.source_type, "ssh");
+  assert.equal(peerPoint.attributes.presence_state, "observed_active");
+});
+
+test("Slice 3: no peer fact-points are persisted while the learned.json kill switch is off, even with populated peer evidence available (byte-identical fast path)", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    "vpn-peer-status": async () => vpnPeerStatusEnvelopeFixture(),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, "vpn-peer-status": { enabled: true } },
+  });
+
+  const result = await runDaemonIteration(paths, {
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    profile,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 0,
+    evaluateAlerts: false,
+    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
+    // behavior, which is enabled:false when configDir/learned.json is absent.
+  });
+
+  assert.equal(result.structuralFacts, undefined);
+  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("Slice 3 day-1 no-storm: the first-ever peer observation seeds fact-history and emits no alert (this collector has no alert-candidate path at all)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    "vpn-peer-status": async () => vpnPeerStatusEnvelopeFixture(),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, "vpn-peer-status": { enabled: true } },
+  });
+
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+  });
+
+  const { points } = await readFactPoints(paths);
+  assert(points.some((point) => point.fact_name === "peer.presence"), "expected fact-history to be seeded on first observation");
+  assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("peer")), false, "Slice 3 must never emit a peer-related alert candidate");
+});
+
+// MUST-FIX 4 (Fable review 2026-07-13), part (a): store-separation. Peer observations must NEVER
+// write signatures.json (the shipped process-identity store), and computeProvenanceIdentityCandidates
+// (already wired into this same daemon.js's extraCandidates) must emit ZERO candidates after a
+// tick that only ever observed peer facts — proving the "no alert candidates" claim isn't merely
+// a missing extraCandidates edit, but that the peer path genuinely never touches the process store.
+test("Slice 3 MUST-FIX 4(a) store-separation: peer ticks never write signatures.json, and computeProvenanceIdentityCandidates emits ZERO candidates afterward", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    "vpn-peer-status": async () => vpnPeerStatusEnvelopeFixture({
+      peers: [
+        { source_type: "wireguard", presence_state: "observed_active", interface: "wg0", public_key: "keyA", endpoint: "203.0.113.10:51820", latest_handshake_epoch_seconds: 1720000000 },
+        { source_type: "ssh", presence_state: "observed_active", remote_user: "bob", remote_host: "198.51.100.7", origin: "who" },
+      ],
+      total_count: 2,
+    }),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, "vpn-peer-status": { enabled: true } },
+  });
+
+  await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+  });
+
+  // (1) signatures.json (the process-identity store) was never written by the peer path.
+  const processStorePaths = resolveSignatureStorePaths(paths);
+  await assert.rejects(() => fs.access(processStorePaths.signaturesFile), "signatures.json must not exist after a tick that only observed peer facts");
+
+  // (2) peer-signatures.json (this slice's OWN, separate store) was also never written — this
+  // slice does not wire any reconcile call into the daemon loop at all (see peer-signature-
+  // store.js's SCOPE NOTE): there is no code path here that could produce alert-shaped output.
+  const peerStorePaths = resolvePeerSignatureStorePaths(paths);
+  await assert.rejects(() => fs.access(peerStorePaths.peerSignaturesFile), "peer-signatures.json must not be written by this slice's daemon wiring either");
+
+  // (3) computeProvenanceIdentityCandidates (already wired into daemon.js's extraCandidates)
+  // emits zero candidates from peer-only fact-history — the day-1 gate alone guarantees this
+  // (signatures.json was never bootstrapped), independent of anything peer-shaped ever appearing.
+  const identityCandidates = await computeProvenanceIdentityCandidates(paths, { now: Date.parse("2026-05-24T00:00:00.000Z") });
+  assert.deepEqual(identityCandidates, []);
 });
 
 test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a provenance-warning alert coexist across daemon iterations without any one spuriously recovering another (S2 cross-recovery pattern extended to a third source)", async () => {
