@@ -364,6 +364,24 @@ async function computeActiveConstraintCandidates(descartesPaths, options) {
   return evaluateConstraints(activeConstraints, factLookup);
 }
 
+// S13 I/O hardening, residual crash path 5b (defense-in-depth): adjudicateAlertNotifications is
+// now fail-closed at every internal I/O point (config read, budget-seed audit read, per-alert
+// append + in-process latch, the pi-harness.js/notification-delivery.js dynamic imports -- see
+// alert-intelligence.js's own documentation comment above that function), but this call site had
+// NO try/catch up the stack at all: an unhandled rejection here would kill the daemon process
+// (launchd/systemd would then restart it, crash-looping). This catch cannot itself break the
+// total<=max_calls_per_hour budget invariant -- by the time anything could reach it, any admitted
+// LLM call's audit write has already succeeded or already been handled by the mechanisms above.
+async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, options) {
+  try {
+    return await adjudicate(descartesPaths, alerts, options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`descartes: adjudicateAlertNotifications failed unexpectedly (${message}); skipping alert intelligence this tick`);
+    return { status: "error", decisions: [], error: message };
+  }
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
@@ -527,8 +545,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const sessionAlertDelivery = alerts && options.deliverSessionAlerts !== false
     ? await emitSessionAlertSignals(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification })
     : undefined;
+  const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
-    ? await adjudicateAlertNotifications(descartesPaths, alerts, { now: ts })
+    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts })
     : undefined;
   return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, structuralEvidence, structuralFacts, shadowEvaluation };
 }

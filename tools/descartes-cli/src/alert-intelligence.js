@@ -109,6 +109,10 @@ export function normalizeAlertIntelligenceConfig(config = {}) {
   };
 }
 
+function errorLabel(error) {
+  return error?.code ?? (error instanceof Error ? error.message : String(error));
+}
+
 export async function readAlertIntelligenceConfig(descartesPaths) {
   const { configFile } = resolveAlertIntelligencePaths(descartesPaths);
   let contents;
@@ -116,14 +120,24 @@ export async function readAlertIntelligenceConfig(descartesPaths) {
     contents = await fs.readFile(configFile, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") return normalizeAlertIntelligenceConfig();
-    throw error;
+    // S13 I/O hardening: a non-ENOENT read failure (EACCES/EIO/ENOSPC/EROFS/EISDIR) fails CLOSED
+    // rather than throwing out of a daemon tick -- mirrors the corrupt-JSON handling just below.
+    // `unavailable: true` is an additive marker (enabled stays false, so adjudicate short-circuits
+    // to "disabled" -- zero LLM calls); the alerts.js CLI mutation guard also checks it to refuse
+    // clobbering a potentially-intact-but-unreadable config with defaults.
+    console.warn(`descartes: alert-intelligence.json read failed (${errorLabel(error)}); treating alert intelligence as disabled this tick`);
+    return { ...normalizeAlertIntelligenceConfig(), unavailable: true };
   }
   try {
     return normalizeAlertIntelligenceConfig(JSON.parse(contents));
-  } catch {
+  } catch (error) {
     // S13 nice-to-have: fail CLOSED on a corrupt config file rather than throwing out of a daemon
     // tick -- mirrors constraint-store.js's loadLearnedConfig (~L196-204). `corrupt: true` is an
     // additive marker only; callers that only read `.enabled` are unaffected (it's still false).
+    // Warn for parity with the unavailable path above: the daemon ignores the returned status, so
+    // without this a corrupt config would silently disable alert intelligence on every tick with no
+    // operator signal (only surfaced via `descartes alerts intelligence status`).
+    console.warn(`descartes: alert-intelligence.json is corrupt (${errorLabel(error)}); treating alert intelligence as disabled`);
     return { ...normalizeAlertIntelligenceConfig(), corrupt: true };
   }
 }
@@ -216,6 +230,26 @@ async function appendAuditRecord(descartesPaths, record) {
   await ensureParent(auditFile);
   await fs.appendFile(auditFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   return record;
+}
+
+// S13 I/O hardening -- IN-PROCESS (never persisted) latch, keyed by the RESOLVED audit-file path.
+// Persisting this to disk would require the very writes that are failing, so it lives only in
+// process memory; it is keyed by path (not global) so two Descartes installs / two unique-temp-dir
+// tests never cross-pollute each other's degraded state. See adjudicateAlertNotifications' probe
+// -heal logic and the documentation comment above it for the full rationale.
+const auditWriteDegradedPaths = new Set();
+
+// Never throws: swallows any appendFn failure, console.warns, and returns null so a caller can
+// distinguish "recorded" (truthy) from "not recorded" (null) without a second try/catch. Accepts
+// the append function as a parameter (rather than closing over the module-private default) so the
+// DI seam (options.appendAuditRecord) and the real default share this exact same safety wrapper.
+async function safeAppendAuditRecord(appendFn, descartesPaths, record) {
+  try {
+    return await appendFn(descartesPaths, record);
+  } catch (error) {
+    console.warn(`descartes: alert intelligence audit append failed (${errorLabel(error)}); this call will not be recorded in llm-decisions.jsonl`);
+    return null;
+  }
 }
 
 // S13 must-fix 2: budget consumption is classified by the ALERT's severity (a fact that exists
@@ -669,21 +703,55 @@ function hashPromptText(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-// S13 remediation -- DEFERRED residual I/O-crash points (recorded, not fixed, in this pass):
-// `readAlertIntelligenceConfig` (called a few lines below) and `readAuditRecords` (called further
-// below, seeding the budget counters) only guard ENOENT; a non-ENOENT read failure (EACCES/EIO)
-// still throws out of a daemon tick. They must NOT be naively wrapped with an empty/default
-// fallback: the audit read seeds the budget counters, so defaulting to "no history" would
-// UNDER-count prior calls and let this tick OVER-call, breaking the total <= max_calls_per_hour
-// invariant. The correct fix (a separate follow-up slice) is FAIL-CLOSED -- on audit/config read
-// failure, skip adjudication entirely for that tick (zero calls) -- or a write-ahead/transactional
-// audit. Likewise, `appendAuditRecord` failures (the ok-path append inside the per-alert try block
-// below funnels into its own catch; the error-path append inside that catch rethrows out of the
-// per-alert loop) are the same bucket: swallowing them would leave a call that WAS made unrecorded,
-// so the next tick under-counts and over-calls. Crash-looping is not "conservative" either
-// (auto-restart can still over-call once per restart) -- the deferral here is a matter of SCOPE,
-// not a claim that the current unguarded behavior is safe; the fix is the same fail-closed /
-// write-ahead design as above.
+// S13 I/O hardening -- IMPLEMENTED state (replaces the prior DEFERRED-follow-up comment that used
+// to live here; see the tracking todo / plan addendum for the dated record of this pass).
+//
+// - readAlertIntelligenceConfig (above): a non-ENOENT read failure now fails CLOSED
+//   (`unavailable: true`, enabled:false) instead of rethrowing -> `!config.enabled` below returns
+//   "disabled", zero LLM calls.
+// - The budget-seed audit read just below (readAuditRecords, seeding the trailing-hour counters)
+//   is wrapped in its own try/catch: on ANY failure it returns a DISTINCT
+//   `{ status: "audit_unavailable", decisions: [] }`, zero calls. It must NOT fall back to an
+//   empty history -- an empty seed under-counts prior calls and would let THIS tick over-call,
+//   breaking the total <= max_calls_per_hour invariant. readAuditRecords itself still rethrows
+//   non-ENOENT (only this budget-critical call site swallows).
+// - Per-alert appendAuditRecord failures (both the ok-path and error-path append, inside the loop
+//   below) go through safeAppendAuditRecord (defined above appendAuditRecord), which never throws
+//   -- it returns null on failure and console.warns. A null result is never pushed into `records`
+//   (so it can't poison the "ok" vs "rate_limited"/"audit_write_degraded" status calculation at the
+//   bottom). On a null result the loop BREAKS (no further LLM calls this tick) and sets the
+//   in-process, audit-path-keyed `auditWriteDegradedPaths` latch (defined above appendAuditRecord).
+//
+//   THE LATCH IS THE LOAD-BEARING PIECE (Fable review correction of a naive break-only design): a
+//   break alone still lets ~1 unrecorded LLM call happen on EVERY subsequent tick under a sustained
+//   write fault where reads keep succeeding (the canonical case is ENOSPC, also EROFS) -- at a 60s
+//   daemon cadence that is up to 60 over-budget calls per hour, the exact invariant this whole gate
+//   exists to protect. The latch is checked at the TOP of the next invocation (after the
+//   eligibility filter, before any budget-seed audit read or LLM call): if set, it attempts exactly
+//   ONE probe append (`status: "audit_probe"`, deliberately no `alert_severity` so
+//   partitionRecentAuditCounts -- which counts every in-window record regardless of status --
+//   conservatively counts a successful probe as one non-critical call against the trailing-hour
+//   budget, the same "unknown -> non-critical" conservatism historical pre-S13 records already
+//   get). Probe success clears the latch and resumes normal adjudication THIS tick; probe failure
+//   keeps this tick at zero calls. This bounds the residual leak to <=1 call per fail->heal cycle,
+//   plus the pre-existing <=1-per-process-restart residual (a freshly-started process has no
+//   in-memory latch state) -- NOT ~1-per-tick.
+//
+//   The latch is deliberately IN-PROCESS (a module-level Set), never persisted to disk: persisting
+//   it would itself need the very writes that are failing.
+//
+// - The dynamic imports of pi-harness.js/notification-delivery.js (below the budget-seed read) are
+//   also wrapped: a module-load failure (e.g. EIO on an uncached read) fails this tick closed
+//   (`{ status: "dependencies_unavailable" }`, zero calls) instead of escaping adjudicate.
+// - Defense-in-depth: the daemon.js call site additionally wraps the whole
+//   adjudicateAlertNotifications call in try/catch (a call-site catch cannot itself break the
+//   budget invariant -- by the time anything could reach that catch, any admitted call's audit
+//   write has already succeeded or already been handled by the mechanisms above).
+//
+// NAMED FOLLOW-UP (still open, intentionally out of scope here): the zero-leak fix is a
+// write-ahead/transactional audit (record "about to call" before calling, reconcile "outcome"
+// after) so even the FIRST failed write after a fault is never unrecorded. The above bounds the
+// residual to <=1 per heal-cycle/restart -- documented, not silently accepted.
 export async function adjudicateAlertNotifications(descartesPaths, evaluation, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
@@ -703,6 +771,23 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     return { status: "no_eligible_alerts", decisions: [], excluded };
   }
 
+  const { auditFile } = resolveAlertIntelligencePaths(descartesPaths);
+  const doAppendAuditRecord = options.appendAuditRecord ?? appendAuditRecord;
+
+  // S13 I/O hardening -- probe-heal: see the module comment above this function for the full
+  // ENOSPC-leak rationale. If a PRIOR invocation's append failed for this exact audit path, do not
+  // blindly resume calling the LLM -- writes may still be failing. Spend exactly one cheap probe
+  // append to find out, before anything else.
+  if (auditWriteDegradedPaths.has(auditFile)) {
+    const probe = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, { ts: now, status: "audit_probe" });
+    if (probe) {
+      auditWriteDegradedPaths.delete(auditFile);
+    } else {
+      console.warn(`descartes: alert intelligence audit writes are still failing at ${auditFile}; skipping adjudication this tick (zero LLM calls) until a write succeeds again`);
+      return { status: "audit_write_degraded", decisions: [], excluded };
+    }
+  }
+
   // S13 must-fix 2: process CRITICAL due alerts before non-critical ones within a tick (partition
   // before any truncation/dropping).
   const orderedAlerts = [
@@ -710,7 +795,13 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     ...eligibleAlerts.filter((alert) => alert.severity !== "critical"),
   ];
 
-  const audit = await readAuditRecords(descartesPaths);
+  let audit;
+  try {
+    audit = await readAuditRecords(descartesPaths);
+  } catch (error) {
+    console.warn(`descartes: alert intelligence audit read failed (${errorLabel(error)}); skipping adjudication this tick (budget cannot be computed)`);
+    return { status: "audit_unavailable", decisions: [], excluded };
+  }
   const historical = partitionRecentAuditCounts(audit, now);
   // RUNNING per-class counters, seeded from trailing-hour audit history and incremented as calls
   // are admitted within this loop -- this is what lets "so_far" include calls already made earlier
@@ -722,12 +813,24 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   const criticalReservation = config.critical_reservation;
   const nonCriticalBudget = Math.max(0, maxCallsPerHour - criticalReservation);
 
-  const createSession = options.createSession ?? (await import("./pi-harness.js")).createPrivateAlertSession;
-  const deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
+  let createSession;
+  let deliverNotification;
+  try {
+    // S13 I/O hardening (residual crash path 5a): these dynamic imports are unguarded awaits on
+    // the production path (they only run when the DI fakes -- tests -- are absent). An EIO/EACCES
+    // reading an uncached module file must fail this tick closed (zero calls), not escape
+    // adjudicateAlertNotifications and crash the daemon tick.
+    createSession = options.createSession ?? (await import("./pi-harness.js")).createPrivateAlertSession;
+    deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
+  } catch (error) {
+    console.warn(`descartes: alert intelligence session/delivery module load failed (${errorLabel(error)}); skipping adjudication this tick (zero LLM calls)`);
+    return { status: "dependencies_unavailable", decisions: [], excluded };
+  }
 
   const records = [];
   let droppedTotal = 0;
   let droppedCritical = 0;
+  let auditWriteFailed = false;
 
   // S13 must-fix 3, drop site 1 ("fully-exhausted early path"): if the trailing hour (plus nothing
   // yet made this invocation) already meets/exceeds the hard cap, every eligible alert -- critical
@@ -764,6 +867,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
       const startedAt = new Date().toISOString();
       const { namespace } = classifyAlertNamespace(alert.rule_id);
       let promptText;
+      let appended;
       try {
         // S13 must-fix 5: include_history_summary/include_daemon_status are wired here -- omitted
         // entirely (undefined, not just falsy) rather than unconditionally included as pre-S13.
@@ -783,7 +887,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const delivery = decision.notify
           ? await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id })
           : undefined;
-        records.push(await appendAuditRecord(descartesPaths, {
+        appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
           alert_id: alert.id,
           rule_id: alert.rule_id,
@@ -803,9 +907,9 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           prompt_template_version: ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
           decision,
           delivery,
-        }));
+        });
       } catch (error) {
-        records.push(await appendAuditRecord(descartesPaths, {
+        appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
           alert_id: alert.id,
           rule_id: alert.rule_id,
@@ -815,7 +919,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           prompt_hash: promptText ? hashPromptText(promptText) : undefined,
           prompt_template_version: promptText ? ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION : undefined,
           error: error instanceof Error ? error.message : String(error),
-        }));
+        });
       } finally {
         try {
           session?.dispose?.();
@@ -824,6 +928,23 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           // either way, so there's nothing left to do with the error but drop it.
         }
       }
+
+      if (appended) {
+        records.push(appended);
+        continue;
+      }
+
+      // S13 I/O hardening -- THE critical piece: the append for the call just made (whose LLM call
+      // ALREADY happened) failed. Set the in-process latch (keyed by this audit file) and BREAK
+      // rather than continue: a persistent-bound-of-<=1 or break-only design (without the latch)
+      // would let ~1 unrecorded call happen on EVERY subsequent tick under a sustained fault --
+      // breaking bounds THIS tick's leak to the single call already made; the latch (checked at the
+      // top of the NEXT invocation, above) bounds every subsequent tick to zero calls until a probe
+      // append proves writes have healed.
+      auditWriteDegradedPaths.add(auditFile);
+      auditWriteFailed = true;
+      console.warn(`descartes: alert intelligence audit append failed for alert ${alert.id}; halting further LLM calls this tick and latching audit writes as degraded at ${auditFile}`);
+      break;
     }
   }
 
@@ -847,6 +968,12 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     }
   }
 
-  const status = records.length === 0 && droppedTotal > 0 ? "rate_limited" : "ok";
+  // A tick where an append failed must NOT report "ok" (S13 I/O hardening) -- it takes priority
+  // over the pre-existing "rate_limited" classification (records.length===0 can be true either
+  // because everything was dropped for budget reasons, or because the one admitted call's append
+  // failed; those are distinct, actionable states).
+  const status = auditWriteFailed
+    ? "audit_write_degraded"
+    : records.length === 0 && droppedTotal > 0 ? "rate_limited" : "ok";
   return { status, decisions: records, excluded, dropped_total: droppedTotal, dropped_critical: droppedCritical, budget_exhausted: budgetExhausted };
 }

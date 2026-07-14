@@ -150,6 +150,11 @@ function renderAlertIntelligenceStatus(config) {
   if (config.model_pattern) lines.push(`Model override: ${config.model_pattern}`);
   if (config.thinking_level) lines.push(`Thinking override: ${config.thinking_level}`);
   if (config.corrupt) lines.push("WARNING: alert-intelligence.json was corrupt on disk; treated as disabled defaults until rewritten.");
+  // S13 I/O hardening: distinct from `corrupt` -- the file could not be READ at all (EACCES/EIO/
+  // ENOSPC/EROFS), so unlike `corrupt` it may still be intact; enable/disable/enable-namespace/
+  // disable-namespace refuse to write while this is set (see the guard in runAlerts) rather than
+  // silently replacing a possibly-intact config with defaults.
+  if (config.unavailable) lines.push("WARNING: alert-intelligence.json could not be read (filesystem error); treated as disabled defaults until the read succeeds again. Mutating subcommands (enable/disable/enable-namespace/disable-namespace) will refuse to write until then.");
   lines.push("No remediation/action tools are available to alert intelligence sessions.");
   return lines.join("\n");
 }
@@ -219,6 +224,19 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
 
   if (options.subcommand === "intelligence") {
     const existing = await readAlertIntelligenceConfig(descartesPaths);
+    // S13 I/O hardening -- consent-clobber guard: `existing.unavailable` means the on-disk config
+    // could not be READ (EACCES/EIO/ENOSPC/EROFS), not that it doesn't exist and not that it's
+    // garbage. The write below is a tmp-file-write + rename, which needs only DIRECTORY
+    // permissions, not read permission on the old file -- so without this guard a transient read
+    // failure would let enable/disable/enable-namespace/disable-namespace silently REPLACE an
+    // intact-but-unreadable config (destroying enabled_namespaces / the S13 per-namespace consent
+    // state) with defaults + whatever this one flag changed. Refuse instead, loudly. A
+    // `corrupt: true` config is deliberately NOT guarded here -- the file is already garbage, so
+    // overwriting it is recovery, not data loss.
+    const mutatingIntelligenceCommands = ["enable", "disable", "enable-namespace", "disable-namespace"];
+    if (existing.unavailable && mutatingIntelligenceCommands.includes(options.intelligenceCommand)) {
+      throw new Error(`alert-intelligence.json could not be read (filesystem error) -- refusing to write and risk clobbering existing consent state (enabled_namespaces, etc). Resolve the underlying read error (permissions/disk/mount) and retry, or run 'descartes alerts intelligence status' to inspect.\n\n${alertsUsage()}`);
+    }
     let config = existing;
     let namespaceNotice;
     if (options.intelligenceCommand === "enable") {

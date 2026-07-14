@@ -2375,3 +2375,39 @@ test("Slice 4b ts-cohesion (integration): peer.presence fact points share the sa
   assert.equal(distinctTimestamps.size, 1, `expected every session.*/peer.* fact point to share one ts, got ${JSON.stringify([...distinctTimestamps])}`);
   assert.equal([...distinctTimestamps][0], "2026-06-11T00:00:00.000Z");
 });
+
+// ---------------------------------------------------------------------------------------------
+// S13 I/O hardening: the daemon.js call site (runDaemonIteration ~L531) is defense-in-depth --
+// adjudicateAlertNotifications is now fail-closed internally at every I/O point, but this call
+// site previously had NO try/catch up the stack at all, so an unhandled rejection here would kill
+// the daemon process outright.
+// ---------------------------------------------------------------------------------------------
+
+test("S13 I/O hardening: an injected adjudicateAlertNotifications throw does not crash runDaemonIteration -- it resolves with a {status:'error'}-shaped alertIntelligence result", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
+  const collectors = {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0.1, 0.2, 0.3],
+      uptime_seconds: 10,
+      memory: { used_fraction: 0.4, free_bytes: 1234 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+
+  const result = await runDaemonIteration(paths, {
+    collectors,
+    ts,
+    now: ts,
+    adjudicateAlertNotifications: async () => {
+      throw new Error("simulated unexpected adjudicateAlertNotifications failure");
+    },
+  });
+
+  // The call resolved (did not reject/throw) -- proving the daemon tick did not crash.
+  assert.equal(result.status.state, "ok");
+  assert.equal(result.alertIntelligence.status, "error");
+  assert.match(result.alertIntelligence.error, /simulated unexpected adjudicateAlertNotifications failure/);
+});

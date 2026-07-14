@@ -785,6 +785,186 @@ test("emitBudgetExhaustedSignal I/O failure degrades gracefully: adjudicate reso
   assert.equal(audit[0].decision.notify, true);
 });
 
+// ---------------------------------------------------------------------------------------------
+// S13 I/O hardening: fail-closed audit/config I/O (closes the DEFERRED residual from S13's own
+// remediation pass -- see the tracking todo / plan addendum for this pass).
+// ---------------------------------------------------------------------------------------------
+
+test("S13 I/O hardening: a non-ENOENT config read failure (config path is a directory -> EISDIR) fails closed -- unavailable:true, adjudicate returns disabled, ZERO createSession calls", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveAlertIntelligencePaths(paths);
+  // The directory trick (no fs mocking / no chmod): making the config path itself a directory
+  // makes fs.readFile fail with EISDIR -- a real, non-ENOENT filesystem error.
+  await fs.mkdir(configFile, { recursive: true });
+
+  const config = await readAlertIntelligenceConfig(paths);
+  assert.equal(config.enabled, false);
+  assert.equal(config.unavailable, true);
+
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    createSession: async () => { throw new Error("must not create a session when the config is unavailable"); },
+  });
+  assert.equal(result.status, "disabled");
+});
+
+test("S13 I/O hardening: a non-ENOENT budget-seed audit read failure (audit path is a directory -> EISDIR) returns audit_unavailable, ZERO createSession calls, and never throws", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 3 }, { now: "2026-07-14T00:00:00.000Z" });
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(auditFile, { recursive: true });
+
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must not create a session when the audit read fails"); },
+  });
+  assert.equal(result.status, "audit_unavailable");
+  assert.deepEqual(result.decisions, []);
+});
+
+test("S13 I/O hardening: an appendAuditRecord failure does not crash adjudicate, BREAKS after the first failure (does not continue to a second due alert), and surfaces audit_write_degraded (never 'ok')", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
+  const dueAlerts = [
+    alert({ id: "alert_break_1", rule_id: "system.memory.sustained_high", severity: "warning" }),
+    alert({ id: "alert_break_2", rule_id: "disk.space.high_used_fraction", severity: "warning" }),
+  ];
+  let createSessionCalls = 0;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: dueAlerts,
+    notification_due_ids: dueAlerts.map((entry) => entry.id),
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async (...args) => {
+      createSessionCalls += 1;
+      return fakeCreateSession([], { notify: false })(...args);
+    },
+    appendAuditRecord: async () => {
+      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    },
+  });
+  assert.equal(createSessionCalls, 1, "expected the loop to break after the first append failure, never reaching the second due alert");
+  assert.equal(result.status, "audit_write_degraded");
+  assert.deepEqual(result.decisions, []);
+});
+
+test("S13 I/O hardening -- THE LATCH invariant: sustained reads-succeed-writes-fail (ENOSPC-shaped) across MULTIPLE invocations is bounded to <=1 total createSession call, NOT ~1 per tick", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
+  let createSessionCalls = 0;
+  const options = {
+    createSession: async (...args) => {
+      createSessionCalls += 1;
+      return fakeCreateSession([], { notify: false })(...args);
+    },
+    // Reads succeed (the real readAuditRecords sees no file -> []); writes always fail -- the
+    // canonical ENOSPC shape the in-process latch exists for.
+    appendAuditRecord: async () => {
+      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    },
+  };
+  const dueAlertFor = (n) => alert({ id: `alert_latch_${n}`, rule_id: "system.memory.sustained_high", severity: "warning" });
+
+  const first = await adjudicateAlertNotifications(paths, {
+    alerts: [dueAlertFor(1)],
+    notification_due_ids: ["alert_latch_1"],
+  }, { now: "2026-07-14T00:01:00.000Z", ...options });
+  assert.equal(first.status, "audit_write_degraded");
+  assert.equal(createSessionCalls, 1, "the first (failing) tick is allowed its one already-made call");
+
+  for (let tick = 2; tick <= 5; tick += 1) {
+    const result = await adjudicateAlertNotifications(paths, {
+      alerts: [dueAlertFor(tick)],
+      notification_due_ids: [`alert_latch_${tick}`],
+    }, { now: `2026-07-14T00:0${tick}:00.000Z`, ...options });
+    assert.equal(result.status, "audit_write_degraded", `tick ${tick} expected to stay latched`);
+    assert.deepEqual(result.decisions, []);
+  }
+  // Across 5 total invocations (1 initial failure + 4 subsequent latched ticks, each of which
+  // attempts only a cheap probe append, never an LLM call), exactly ONE createSession call was
+  // EVER made -- a break-only design (no latch) would have made one PER tick (5 total).
+  assert.equal(createSessionCalls, 1, "the in-process latch must hold across ticks 2-5 -- total calls must not scale with tick count");
+});
+
+test("S13 I/O hardening -- probe-heal: once appendAuditRecord starts succeeding again, a later invocation's probe clears the latch and resumes adjudicating the SAME tick", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
+  let appendShouldFail = true;
+  const appendedRecords = [];
+  let createSessionCalls = 0;
+  const appendAuditRecordFake = async (descartesPaths, record) => {
+    if (appendShouldFail) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    appendedRecords.push(record);
+    return record;
+  };
+  const createSessionFake = async (...args) => {
+    createSessionCalls += 1;
+    return fakeCreateSession([], { notify: false })(...args);
+  };
+
+  const first = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_heal_1", rule_id: "system.memory.sustained_high", severity: "warning" })],
+    notification_due_ids: ["alert_heal_1"],
+  }, { now: "2026-07-14T00:01:00.000Z", createSession: createSessionFake, appendAuditRecord: appendAuditRecordFake });
+  assert.equal(first.status, "audit_write_degraded");
+  assert.equal(createSessionCalls, 1);
+
+  const second = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_heal_2", rule_id: "system.memory.sustained_high", severity: "warning" })],
+    notification_due_ids: ["alert_heal_2"],
+  }, { now: "2026-07-14T00:02:00.000Z", createSession: createSessionFake, appendAuditRecord: appendAuditRecordFake });
+  assert.equal(second.status, "audit_write_degraded");
+  assert.equal(createSessionCalls, 1, "still latched -- zero further LLM calls while writes remain broken");
+
+  appendShouldFail = false; // writes heal
+
+  const third = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_heal_3", rule_id: "system.memory.sustained_high", severity: "warning" })],
+    notification_due_ids: ["alert_heal_3"],
+  }, { now: "2026-07-14T00:03:00.000Z", createSession: createSessionFake, appendAuditRecord: appendAuditRecordFake });
+  assert.equal(third.status, "ok");
+  assert.equal(createSessionCalls, 2, "the probe succeeded, the latch cleared, and adjudication resumed within this same tick");
+  assert.equal(appendedRecords.some((record) => record.status === "audit_probe"), true, "expected the heal probe's own record to have been appended");
+  assert.equal(appendedRecords.some((record) => record.alert_id === "alert_heal_3" && record.status === "ok"), true, "expected the resumed tick's real decision to also be appended");
+});
+
+test("S13 I/O hardening: the latch is keyed by the resolved audit-file path -- two different temp audit paths do not share latch state (one latched must not zero out the other)", async () => {
+  const pathsA = await tempPaths();
+  const pathsB = await tempPaths();
+  await writeAlertIntelligenceConfig(pathsA, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
+  await writeAlertIntelligenceConfig(pathsB, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
+
+  let createSessionCallsA = 0;
+  const resultA = await adjudicateAlertNotifications(pathsA, {
+    alerts: [alert({ id: "alert_pathA", rule_id: "system.memory.sustained_high", severity: "warning" })],
+    notification_due_ids: ["alert_pathA"],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async (...args) => { createSessionCallsA += 1; return fakeCreateSession([], { notify: false })(...args); },
+    appendAuditRecord: async () => { throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }); },
+  });
+  assert.equal(resultA.status, "audit_write_degraded");
+  assert.equal(createSessionCallsA, 1);
+
+  // pathsB uses the REAL (unmocked) appendAuditRecord and must be entirely unaffected by pathsA's
+  // now-latched degraded state.
+  const prompts = [];
+  const resultB = await adjudicateAlertNotifications(pathsB, {
+    alerts: [alert({ id: "alert_pathB", rule_id: "system.memory.sustained_high", severity: "warning" })],
+    notification_due_ids: ["alert_pathB"],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+  });
+  assert.equal(resultB.status, "ok");
+  assert.equal(prompts.length, 1, "pathsB's own audit file must be writable and unaffected by pathsA's latch");
+});
+
 // --- S13 remediation: alertIntelligencePrompt enforces the single-alert-per-prompt invariant internally --
 
 test("alertIntelligencePrompt throws when given zero alerts", () => {

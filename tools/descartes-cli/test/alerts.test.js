@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { readAlertIntelligenceConfig } from "../src/alert-intelligence.js";
+import { readAlertIntelligenceConfig, resolveAlertIntelligencePaths } from "../src/alert-intelligence.js";
 import { runAlerts, renderAlertList, visibleAlerts } from "../src/alerts.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
 import { readNotificationDeliveryConfig, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
@@ -141,6 +141,63 @@ test("alerts intelligence status renders enabled namespaces, critical reservatio
   const corruptOutputs = [];
   await runAlerts(paths, ["intelligence", "status"], { output: (line) => corruptOutputs.push(line) });
   assert.match(corruptOutputs[0], /WARNING: alert-intelligence\.json was corrupt/);
+});
+
+// S13 I/O hardening: `unavailable` (could not be READ) is distinct from `corrupt` (read fine,
+// parsed as garbage) -- the status renderer surfaces its own, separate warning.
+test("alerts intelligence status renders an 'unavailable' warning, distinct from 'corrupt', when the config path cannot be read (EISDIR)", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveAlertIntelligencePaths(paths);
+  // Directory trick (no fs mocking / no chmod): the config path IS a directory, so fs.readFile
+  // fails with EISDIR -- a real, non-ENOENT filesystem error.
+  await fs.mkdir(configFile, { recursive: true });
+
+  const outputs = [];
+  await runAlerts(paths, ["intelligence", "status"], { output: (line) => outputs.push(line) });
+  assert.match(outputs[0], /WARNING: alert-intelligence\.json could not be read/);
+  assert.doesNotMatch(outputs[0], /WARNING: alert-intelligence\.json was corrupt/);
+});
+
+// S13 I/O hardening -- CLI consent-clobber guard: a config read that returned unavailable:true
+// (the file could not be READ, e.g. EACCES/EIO/ENOSPC/EROFS) must not let a mutation subcommand
+// silently replace a possibly-intact config with defaults via its tmp-write + rename (which only
+// needs directory permissions, not read permission on the old file). A `corrupt:true` config
+// (read fine, parsed as garbage) is NOT guarded -- overwriting it is recovery, not data loss.
+test("S13 I/O hardening: enable-namespace/disable-namespace/enable/disable REFUSE to write (throw) when the config is unavailable, and never clobber it with defaults; a corrupt config still allows overwrite (recovery)", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(configFile, { recursive: true });
+
+  await assert.rejects(
+    () => runAlerts(paths, ["intelligence", "enable-namespace", "provenance"], { output: () => {} }),
+    /alert-intelligence\.json could not be read.*refusing to write/s,
+  );
+  await assert.rejects(
+    () => runAlerts(paths, ["intelligence", "disable-namespace", "metric"], { output: () => {} }),
+    /alert-intelligence\.json could not be read.*refusing to write/s,
+  );
+  await assert.rejects(
+    () => runAlerts(paths, ["intelligence", "enable"], { output: () => {} }),
+    /alert-intelligence\.json could not be read.*refusing to write/s,
+  );
+  await assert.rejects(
+    () => runAlerts(paths, ["intelligence", "disable"], { output: () => {} }),
+    /alert-intelligence\.json could not be read.*refusing to write/s,
+  );
+
+  // The on-disk config was NEVER overwritten: the config path is still a directory (no tmp-write
+  // + rename ever completed), so a fresh read still reports unavailable, never silently-defaulted
+  // enabled_namespaces.
+  const stillUnavailable = await readAlertIntelligenceConfig(paths);
+  assert.equal(stillUnavailable.unavailable, true);
+
+  // A corrupt (not unavailable) config remains overwritable.
+  const corruptPaths = await tempPaths();
+  await fs.mkdir(corruptPaths.configDir, { recursive: true });
+  await fs.writeFile(path.join(corruptPaths.configDir, "alert-intelligence.json"), "{not valid json", "utf8");
+  const enableOutputs = [];
+  await runAlerts(corruptPaths, ["intelligence", "enable-namespace", "provenance", "--json"], { output: (line) => enableOutputs.push(JSON.parse(line)) });
+  assert.deepEqual(enableOutputs[0].alert_intelligence.enabled_namespaces, ["metric", "provenance"]);
 });
 
 test("alerts intelligence enable-namespace validates the namespace, rejects learned, and round-trips via normalize", async () => {
