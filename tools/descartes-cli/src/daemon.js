@@ -16,6 +16,7 @@ import {
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
 import { computeCorrelationCandidates } from "./incident-correlation.js";
+import { computePeerBaselineCandidates } from "./peer-baseline.js";
 import { computeSessionBaselineCandidates } from "./session-baseline.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
@@ -504,6 +505,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // resulting candidate is 100% deterministic (Decision 4) -- it reaches the LLM only
           // through the unmodified S13 gate, via the new default-off "correlation" namespace.
           ...await computeCorrelationCandidates(descartesPaths, options),
+          // Slice 4b (observed-incident collectors plan), additive sixth extraCandidates entry:
+          // peer-count deviation (peer.count_spike), derived purely from Slice 3's already-
+          // persisted peer.presence fact-history — no new execFile/host I/O. Gated identically to
+          // its siblings by computePeerBaselineCandidates' own loadLearnedConfig(...).enabled
+          // short-circuit. peer.count_spike is unknown_namespace (Decision 3), so it can never
+          // reach the LLM adjudication path below regardless of enabled_namespaces.
+          ...await computePeerBaselineCandidates(descartesPaths, options),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
@@ -513,6 +521,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // "straight through deliverNotificationDecision, NEVER through the LLM" precedent) reuses the
   // notification_due_ids/cooldown bookkeeping applyAlertCandidates already computed inside
   // evaluateAndPersistAlerts above — no new cooldown machinery, no session/LLM construction.
+  // Slice 4b Decision 3b (Fable review MUST-FIX 4): emitSessionAlertSignals now also delivers a
+  // due peer.count_spike (also unknown_namespace, per Decision 3) through this identical branch —
+  // the widened allowlist is composed inside alert-intelligence.js itself, not here.
   const sessionAlertDelivery = alerts && options.deliverSessionAlerts !== false
     ? await emitSessionAlertSignals(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification })
     : undefined;

@@ -38,6 +38,7 @@ import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
+import { PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -2237,4 +2238,140 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
 
   const persisted = await readAlertRecords(withHistoryPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === CORRELATION_RULE_ID), false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4b (observed-incident collectors plan): peer-count SPIKE deviation
+// (computePeerBaselineCandidates as the daemon's sixth extraCandidates entry).
+// ---------------------------------------------------------------------------------------------
+
+function completePeerTick(ts, count, entityPrefix = "peer.ssh.e") {
+  const points = [];
+  for (let i = 0; i < count; i += 1) points.push(peerFactPoint(ts, `${entityPrefix}-${i}`, { sourceType: "ssh" }));
+  return points;
+}
+
+test("Slice 4b: byte-identical real alerts when the learned kill switch is off, even with peer fact-history present that would otherwise deviate, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withPeersPaths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
+  ticks.push(...completePeerTick(hour(30), 8));
+  await appendFactPoints(withPeersPaths, ticks, { now: hour(30) });
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the baseline above — computePeerBaselineCandidates must
+  // short-circuit to [] before ever calling readFactPoints.
+  let readFactsCalled = false;
+  const withPeers = await runDaemonIteration(withPeersPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    readFactPoints: async (...args) => {
+      readFactsCalled = true;
+      return readFactPoints(...args);
+    },
+  });
+
+  assert.deepEqual(withPeers.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withPeers.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withPeers.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+
+  const persisted = await readAlertRecords(withPeersPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === PEER_COUNT_SPIKE_RULE_ID), false);
+});
+
+test("Slice 4b wiring: computePeerBaselineCandidates is the daemon's sixth extraCandidates entry — a pre-seeded odd-hour peer-login burst produces a real, sanitized peer.count_spike alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
+  ticks.push(...completePeerTick(hour(30), 8));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(30));
+  const alert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.ok(alert, "expected a real alert for the peer-count burst");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning", "stored severity is capped at warning even for an extreme z (MUST-FIX 1)");
+  assert.equal(alert.diagnostics.observed_count, 8);
+  assert.equal(alert.diagnostics.mean_before, 2);
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+
+  const { state } = await loadPeerBaselineStore(paths);
+  assert.equal(state.confidence_state, "established");
+  assert.equal(state.stats.count, 31);
+});
+
+test("Slice 4b, Decision 3b: a due peer.count_spike is delivered through the deterministic local delivery branch wired into the daemon tick, and never reaches the LLM path", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
+  ticks.push(...completePeerTick(hour(30), 8));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const deliveries = [];
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  assert.ok(result.sessionAlertDelivery, "expected a sessionAlertDelivery result on the daemon iteration");
+  const peerDeliveries = deliveries.filter((entry) => entry.opts.ruleId === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(peerDeliveries.length, 1, "expected exactly one deterministic delivery for the due peer.count_spike candidate");
+  assert.equal(peerDeliveries[0].decision.notify, true);
+  assert.equal(peerDeliveries[0].decision.severity, "warning");
+
+  // Never via the LLM path: peer.* is unknown_namespace, so adjudicateAlertNotifications must
+  // never have constructed a session for it (alert-intelligence.json defaults to disabled anyway,
+  // giving a doubly-enforced guarantee here).
+  assert.equal(result.alertIntelligence.status, "disabled");
+});
+
+test("Slice 4b ts-cohesion (integration): peer.presence fact points share the same ts as session.presence fact points emitted within the same structural-tick iteration", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const structuralCollectors = {
+    ...structuralCollectorFakes(),
+    sessions: async () => envelope("sessions", "collect_sessions", {
+      platform: "darwin",
+      multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+      any_binary_available: true,
+      total_count: 1,
+      sessions: [{ multiplexer: "tmux", session_name: "alpha", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 }],
+      truncated: false,
+      cap: 200,
+    }),
+    "vpn-peer-status": async () => vpnPeerStatusEnvelopeFixture(),
+  };
+  const profile = structuralProfile({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, sessions: { enabled: true }, "vpn-peer-status": { enabled: true } },
+  });
+
+  await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    ts: "2026-06-11T00:00:00.000Z",
+    now: Date.parse("2026-06-11T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+  });
+
+  const { points } = await readFactPoints(paths);
+  const sessionPoints = points.filter((point) => point.fact_name === "session.presence");
+  const peerPoints = points.filter((point) => point.fact_name === "peer.presence");
+  assert.ok(sessionPoints.length > 0 && peerPoints.length > 0);
+  const distinctTimestamps = new Set([...sessionPoints, ...peerPoints].map((point) => point.ts));
+  assert.equal(distinctTimestamps.size, 1, `expected every session.*/peer.* fact point to share one ts, got ${JSON.stringify([...distinctTimestamps])}`);
+  assert.equal([...distinctTimestamps][0], "2026-06-11T00:00:00.000Z");
 });

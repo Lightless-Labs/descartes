@@ -31,6 +31,22 @@ import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
+// Slice 4b (observed-incident collectors plan), Decision 4 / Fable review MUST-FIX 5: the four
+// pure Welford/EWMA/z-score primitives + DEFAULT_BASELINE_FACT_WINDOW_MS were extracted into
+// welford-stats.js so peer-baseline.js can share the exact same, single-sourced math without a
+// session -> peer (or peer -> session) dependency in either direction. This MUST be an
+// import-then-re-export, NOT a bare `export {...} from "./welford-stats.js"` re-export-only
+// clause: a bare re-export-only clause does NOT bind these names in THIS module's own scope, but
+// computeWindowedSessionStats below calls emptyWelfordStats()/foldWelford()/updateEwma()/
+// computeZScore() as bare, locally-resolved identifiers — under a bare re-export none of those
+// names would be bound, and the very first call to computeWindowedSessionStats (the very first
+// daemon tick) would throw a ReferenceError. The import below creates the local bindings this
+// module's own internal calls need; the separate export statement re-exports the same names for
+// session-baseline.test.js's existing name-imports and incident-correlation.js's/
+// incident-correlation.test.js's DEFAULT_BASELINE_FACT_WINDOW_MS import — zero existing import
+// breaks, both true simultaneously.
+import { emptyWelfordStats, foldWelford, updateEwma, computeZScore, DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
+export { emptyWelfordStats, foldWelford, updateEwma, computeZScore, DEFAULT_BASELINE_FACT_WINDOW_MS };
 
 // Re-exported for convenience (plan Decision 6): consumers of this module's tick-grouping should
 // not need to reach into fact-translators.js directly for the marker literal.
@@ -63,11 +79,6 @@ export const DEFAULT_STDDEV_FLOOR = 0.5;
 // monitoring.md:77/138/176) — "provisional" until this many complete tick-groups are inside the
 // window; established.js: no session.count_drop candidate is ever emitted below this count.
 export const DEFAULT_MIN_SAMPLE_COUNT = 30;
-
-// Comfortably covers fact-store.js's own 30-day DEFAULT_FACT_RETENTION_MS ceiling (must-fix 5:
-// the windowed recompute derives its stats from every complete tick-group inside this window —
-// this is what makes the plan's own "bounded by 30-day retention" claim literally true).
-export const DEFAULT_BASELINE_FACT_WINDOW_MS = 31 * 24 * 60 * 60 * 1000;
 
 // A reasonable, undramatic smoothing constant for the persisted (but not v0-trigger-consuming,
 // see Decision 3's "EWMA's role, scoped explicitly") ewma/ewma_variance fields — not part of the
@@ -183,76 +194,6 @@ export async function writeSessionBaselineStore(descartesPaths, state) {
   await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
   await fs.rename(tmpFile, storeFile);
   return normalized;
-}
-
-// ---------------------------------------------------------------------------------------------
-// Pure helpers — Welford/EWMA math (no I/O).
-// ---------------------------------------------------------------------------------------------
-
-export function emptyWelfordStats() {
-  return { count: 0, mean: 0, m2: 0, variance: 0, stddev: 0, min: undefined, max: undefined };
-}
-
-/**
- * Classic Welford single-observation fold: given the PRIOR {count, mean, m2, min, max} (or none —
- * defaults to emptyWelfordStats()), returns the updated stats after folding in observedCount.
- * Sample variance (m2 / (count - 1)), matching the parent roadmap's own baseline-record shape.
- *
- * Must-fix 5 (windowed recompute, hard requirement): this function is a single-observation unit —
- * callers recompute the FULL windowed stats fresh every time by reducing over every complete
- * tick-group's count currently inside the fact-history window (see computeWindowedSessionStats
- * below), starting from emptyWelfordStats() each time. It is never used as a forever-persisted,
- * incrementally-accumulated running total — that would grow unbounded and contradict the plan's
- * own "bounded by 30-day retention" claim.
- */
-export function foldWelford(stats, observedCount) {
-  const prev = stats && typeof stats === "object" ? stats : emptyWelfordStats();
-  const count = (Number.isFinite(prev.count) ? prev.count : 0) + 1;
-  const prevMean = Number.isFinite(prev.mean) ? prev.mean : 0;
-  const prevM2 = Number.isFinite(prev.m2) ? prev.m2 : 0;
-  const delta = observedCount - prevMean;
-  const mean = prevMean + delta / count;
-  const delta2 = observedCount - mean;
-  const m2 = prevM2 + delta * delta2;
-  const variance = count > 1 ? m2 / (count - 1) : 0;
-  const stddev = Math.sqrt(Math.max(variance, 0));
-  const min = prev.min === undefined ? observedCount : Math.min(prev.min, observedCount);
-  const max = prev.max === undefined ? observedCount : Math.max(prev.max, observedCount);
-  return { count, mean, m2, variance, stddev, min, max };
-}
-
-/**
- * Single-observation EWMA-with-variance fold (Finch/West-style incremental update). `stats` is
- * `{ ewma, ewma_variance }` (or undefined/first-observation, in which case ewma seeds to
- * observedCount and ewma_variance to 0). Decision 3: ewma/ewma_variance are computed and
- * persisted for forward compatibility with a future S10 migration but are NOT consumed by v0's
- * trigger formula (Welford-mean/stddev z-score only) — designing a second, EWMA-driven trigger
- * without an incident-motivated justification is explicitly out of v0 scope.
- */
-export function updateEwma(stats, observedCount, alpha) {
-  const prevMean = stats?.ewma;
-  const prevVariance = Number.isFinite(stats?.ewma_variance) ? stats.ewma_variance : 0;
-  if (prevMean === undefined || !Number.isFinite(prevMean)) {
-    return { ewma: observedCount, ewma_variance: 0 };
-  }
-  const diff = observedCount - prevMean;
-  const increment = alpha * diff;
-  const ewma = prevMean + increment;
-  const ewma_variance = (1 - alpha) * (prevVariance + diff * increment);
-  return { ewma, ewma_variance };
-}
-
-/**
- * z = (observedCount - meanBefore) / max(stddevBefore, stddevFloor). Callers are responsible for
- * computing meanBefore/stddevBefore over a window that EXCLUDES the observation being scored
- * (must-fix 5's self-dampening-avoidance ordering requirement) — this function itself is a pure,
- * stateless formula with no opinion on what "before" means.
- */
-export function computeZScore(observedCount, meanBefore, stddevBefore, stddevFloor = DEFAULT_STDDEV_FLOOR) {
-  const effectiveStddev = Math.max(Number.isFinite(stddevBefore) ? stddevBefore : 0, stddevFloor);
-  if (!Number.isFinite(effectiveStddev) || effectiveStddev <= 0) return 0;
-  const mean = Number.isFinite(meanBefore) ? meanBefore : 0;
-  return (Number(observedCount) - mean) / effectiveStddev;
 }
 
 // ---------------------------------------------------------------------------------------------

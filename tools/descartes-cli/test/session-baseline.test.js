@@ -122,42 +122,12 @@ async function seedAndCompute(paths, points, options = {}) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Welford / EWMA / z-score pure-function unit tests (known sequences).
+// Welford / EWMA / z-score pure-function unit tests: MOVED to welford-stats.test.js (Slice 4b,
+// Decision 4 / Fable review MUST-FIX 5 — the four primitives now live in welford-stats.js;
+// session-baseline.js only re-exports them). The name-imports above (foldWelford, updateEwma,
+// computeZScore, emptyWelfordStats) still resolve via that re-export and remain used below by
+// computeWindowedSessionStats-adjacent fixtures/candidate tests in this file.
 // ---------------------------------------------------------------------------------------------
-
-test("foldWelford: classic textbook sequence [2,4,4,4,5,5,7,9] -> mean=5, sample variance=32/7, stddev=sqrt(32/7)", () => {
-  const sequence = [2, 4, 4, 4, 5, 5, 7, 9];
-  const stats = sequence.reduce((acc, value) => foldWelford(acc, value), emptyWelfordStats());
-  assert.equal(stats.count, 8);
-  assert.equal(stats.mean, 5);
-  assert.ok(Math.abs(stats.variance - 32 / 7) < 1e-9, `expected variance ~${32 / 7}, got ${stats.variance}`);
-  assert.ok(Math.abs(stats.stddev - Math.sqrt(32 / 7)) < 1e-9);
-  assert.equal(stats.min, 2);
-  assert.equal(stats.max, 9);
-});
-
-test("foldWelford: a single observation has variance 0 and mean equal to that observation", () => {
-  const stats = foldWelford(emptyWelfordStats(), 42);
-  assert.equal(stats.count, 1);
-  assert.equal(stats.mean, 42);
-  assert.equal(stats.variance, 0);
-  assert.equal(stats.stddev, 0);
-});
-
-test("updateEwma: first observation seeds ewma to that value with zero variance; a known two-step sequence matches hand computation", () => {
-  const seed = updateEwma({ ewma: undefined, ewma_variance: undefined }, 10, 0.5);
-  assert.deepEqual(seed, { ewma: 10, ewma_variance: 0 });
-  const second = updateEwma(seed, 20, 0.5);
-  assert.equal(second.ewma, 15);
-  assert.equal(second.ewma_variance, 25);
-});
-
-test("computeZScore: known values, and the STDDEV_FLOOR guard dampens a trivial fluctuation on a near-zero-variance baseline", () => {
-  assert.equal(computeZScore(1, 10, 2, 0.5), -4.5);
-  assert.equal(computeZScore(0, 5, 0.01, 0.5), -10);
-  // stddev below the floor is clamped to the floor, not used directly.
-  assert.equal(computeZScore(19, 20, 0, DEFAULT_STDDEV_FLOOR), (19 - 20) / DEFAULT_STDDEV_FLOOR);
-});
 
 test("DEVIATION_SIGMA/CRITICAL_SIGMA/STDDEV_FLOOR/MIN_SAMPLE_COUNT defaults are positive finite constants", () => {
   for (const value of [DEFAULT_DEVIATION_SIGMA, DEFAULT_CRITICAL_SIGMA, DEFAULT_STDDEV_FLOOR, DEFAULT_MIN_SAMPLE_COUNT, DEFAULT_BASELINE_FACT_WINDOW_MS]) {

@@ -20,6 +20,7 @@ import {
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -967,6 +968,154 @@ test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS matches the two session rule_ids exa
   for (const ruleId of DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS) {
     assert.equal(classifyAlertNamespace(ruleId).namespace, undefined);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4b (observed-incident collectors plan) — Decision 3 fail-closed namespace regression
+// tests + Decision 3b widened deterministic-delivery tests, for peer.count_spike.
+// ---------------------------------------------------------------------------------------------
+
+test("(a) classifyAlertNamespace('peer.count_spike') returns {namespace: undefined, hardExcluded: false} -- not 'baseline', not any other known namespace", () => {
+  assert.deepEqual(classifyAlertNamespace(PEER_COUNT_SPIKE_RULE_ID), { namespace: undefined, hardExcluded: false });
+});
+
+test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAMESPACES enabled and one due peer.count_spike, is no_eligible_alerts / excluded.unknown_namespace / zero LLM calls", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: [...KNOWN_ALERT_NAMESPACES] }, { now: "2026-07-14T00:00:00.000Z" });
+  const peerAlert = alert({ id: "alert_peer_count_spike", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [peerAlert],
+    notification_due_ids: [peerAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for peer.count_spike — it is unknown_namespace, fail-closed"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.unknown_namespace, 1);
+  assert.equal((await readAlertIntelligenceAudit(paths)).length, 0);
+});
+
+test("(c) invariant: every exported PEER_*_RULE_ID classifies to namespace undefined -- a future peer-family rule_id inherits fail-closed by construction", () => {
+  for (const ruleId of [PEER_COUNT_SPIKE_RULE_ID]) {
+    const { namespace, hardExcluded } = classifyAlertNamespace(ruleId);
+    assert.equal(namespace, undefined, `expected ${ruleId} to classify as unknown_namespace`);
+    assert.equal(hardExcluded, false);
+  }
+});
+
+test("emitSessionAlertSignals delivers a due peer.count_spike through deliverNotificationDecision with a counts/hash-only body, never via a session/LLM", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const peerAlert = alert({
+    id: "alert_peer_count_spike",
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [peerAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [peerAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(deliveries[0].opts.alertId, peerAlert.id);
+  assert.equal(deliveries[0].decision.notify, true);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.match(deliveries[0].decision.body, /^Peer count 8 vs baseline mean 2/);
+  assert.equal(/203\.0\.113|alice|peer\.ssh\./.test(JSON.stringify(deliveries[0].decision)), false, "no raw peer host/IP/pubkey in the delivered body");
+});
+
+test("emitSessionAlertSignals: even a wildly extreme z, a due peer.count_spike still delivers with stored severity 'warning' (never 'critical' in v0, MUST-FIX 1)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const peerAlert = alert({
+    id: "alert_peer_count_spike",
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    severity: "warning", // peer-baseline.js's own candidate builder never stores "critical" in v0
+    diagnostics: { observed_count: 100, mean_before: 2, stddev_before: 0.5, z_score: 196, confidence_state: "established" },
+  });
+  await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [peerAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.equal(deliveries[0].decision.severity, "warning");
+});
+
+test("emitSessionAlertSignals fires for the WIDENED allowlist: a mix of due session.count_drop/session.churn/peer.count_spike alongside a due non-allowlisted metric alert delivers exactly the three allowlisted ones, without cross-contaminating each other's body text", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const dropAlert = alert({ id: "alert_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical", diagnostics: { observed_count: 0, mean_before: 20, stddev_before: 0.5, z_score: -40, confidence_state: "established" } });
+  const churnAlert = alert({ id: "alert_churn", rule_id: SESSION_CHURN_RULE_ID, severity: "warning", diagnostics: { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" } });
+  const peerAlert = alert({ id: "alert_peer", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
+  const metricAlert = alert({ id: "alert_metric", rule_id: "system.memory.sustained_high", severity: "warning" });
+
+  const result = await emitSessionAlertSignals(paths, {
+    alerts: [dropAlert, churnAlert, peerAlert, metricAlert],
+    notification_due_ids: [dropAlert.id, churnAlert.id, peerAlert.id, metricAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  assert.deepEqual(new Set(result.fired), new Set([dropAlert.id, churnAlert.id, peerAlert.id]));
+  assert.equal(deliveries.length, 3, "the non-allowlisted metric alert must never be delivered by this branch");
+  assert.equal(deliveries.some((d) => d.opts.ruleId === "system.memory.sustained_high"), false);
+
+  const byRuleId = Object.fromEntries(deliveries.map((d) => [d.opts.ruleId, d.decision.body]));
+  assert.match(byRuleId[SESSION_COUNT_DROP_RULE_ID], /^Session count 0 vs baseline mean 20/);
+  assert.match(byRuleId[SESSION_CHURN_RULE_ID], /session\.tmux\.aaaaaaaaaaaaaaaa/);
+  assert.match(byRuleId[PEER_COUNT_SPIKE_RULE_ID], /^Peer count 8 vs baseline mean 2/);
+  // No cross-contamination: the peer body never carries session-shaped text and vice versa.
+  assert.equal(/session\.tmux/.test(byRuleId[PEER_COUNT_SPIKE_RULE_ID]), false);
+  assert.equal(/Peer count/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
+});
+
+test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due peer.count_spike-shaped rule_id typo is never delivered by this branch", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const typoAlert = alert({ id: "alert_typo", rule_id: "peer.count_spikes", severity: "warning" }); // deliberately NOT the real rule_id
+  const result = await emitSessionAlertSignals(paths, { alerts: [typoAlert], notification_due_ids: [typoAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, []);
+  assert.equal(deliveries.length, 0);
+});
+
+test("emitSessionAlertSignals respects cooldown for peer.count_spike too: an alert absent from notification_due_ids does not re-deliver", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const peerAlert = alert({ id: "alert_peer_count_spike", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
+
+  const first = await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [peerAlert.id] }, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+  assert.deepEqual(first.fired, [peerAlert.id]);
+
+  const second = await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [] }, { now: "2026-07-14T00:05:00.000Z", deliverNotification });
+  assert.deepEqual(second.fired, []);
+  assert.equal(deliveries.length, 1, "must not re-deliver within the cooldown window");
+});
+
+test("Fable review MUST-FIX 4: the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by delivery is composed of session-baseline.js's own two-id export PLUS PEER_COUNT_SPIKE_RULE_ID (companion to the two shipped allowlist tests at session-baseline.test.js:677-678 and this file's own two-id test above, neither of which is widened)", async () => {
+  // There is no direct export of the module-private ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS
+  // constant (deliberately private to alert-intelligence.js) -- pin its effective composition via
+  // the same public seam every other test in this section already uses: a single
+  // emitSessionAlertSignals call carrying one due alert per candidate id, asserting each is
+  // delivered, PLUS the unchanged two-id session-baseline.js export used to derive the expected
+  // three-id set here (so this test breaks loudly if a future edit widens or shrinks either side).
+  const expectedIds = [...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, PEER_COUNT_SPIKE_RULE_ID];
+  assert.deepEqual(expectedIds, [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID, PEER_COUNT_SPIKE_RULE_ID]);
+
+  const paths = await tempPaths();
+  const deliveries = [];
+  const alerts = expectedIds.map((ruleId, index) => alert({ id: `alert_${index}`, rule_id: ruleId, severity: "warning", diagnostics: { observed_count: 1, mean_before: 1, stddev_before: 0.5, z_score: 1, confidence_state: "established", entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" } }));
+  const result = await emitSessionAlertSignals(paths, { alerts, notification_due_ids: alerts.map((a) => a.id) }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(new Set(result.fired), new Set(alerts.map((a) => a.id)));
+  assert.equal(deliveries.length, expectedIds.length, "every id in the composed three-id constant must actually be delivered by this branch");
 });
 
 // ---------------------------------------------------------------------------------------------

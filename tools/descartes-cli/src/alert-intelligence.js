@@ -2,11 +2,24 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
+import { PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
   SESSION_COUNT_DROP_RULE_ID,
 } from "./session-baseline.js";
+
+// Slice 4b (observed-incident collectors plan), Decision 3b / Fable review MUST-FIX 4: the
+// widened deterministic-delivery allowlist is composed HERE, not in session-baseline.js.
+// Widening session-baseline.js's own exported DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS in place
+// would force a forbidden session-baseline.js -> peer-baseline.js dependency (peer-baseline.js
+// already depends on the shared welford-stats.js; session-baseline.js stays peer-agnostic, full
+// stop). session-baseline.js's own DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS export stays EXACTLY
+// [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID], unchanged, for every other consumer (see
+// the two shipped tests this surface touches: test/session-baseline.test.js:677-678 and
+// test/alert-intelligence.test.js:965-967, both of which remain green as-is). This module-private
+// three-id constant is what the delivery function's allowlist check actually uses.
+const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, PEER_COUNT_SPIKE_RULE_ID];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
 
@@ -274,11 +287,16 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
 // motivating incident — would never actively notify the operator; it would only be visible to an
 // operator who proactively ran `descartes alerts`.
 //
+// Slice 4b (observed-incident collectors plan), Decision 3b / Fable review MUST-FIX 4: this same
+// branch now also delivers a due peer.count_spike (also unknown_namespace — Decision 3) — see
+// ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS above, composed in THIS file (not session-baseline.js).
+//
 // Mirrors emitBudgetExhaustedSignal's own "straight through deliverNotificationDecision, NEVER
 // through the LLM, a session, or enableTools" precedent:
-//   - scoped by an explicit rule_id ALLOWLIST (DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, imported
-//     from session-baseline.js rather than restated here) — never a general unknown-namespace
-//     bypass, so this cannot silently swallow some future, unrelated fail-closed namespace;
+//   - scoped by an explicit rule_id ALLOWLIST (ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, composed
+//     locally above from session-baseline.js's own two-id export plus PEER_COUNT_SPIKE_RULE_ID) —
+//     never a general unknown-namespace bypass, so this cannot silently swallow some future,
+//     unrelated fail-closed namespace;
 //   - the decision handed to deliverNotificationDecision is hand-built and deterministic — never
 //     a session, never an LLM call;
 //   - reuses the notification_due_ids/cooldown state applyAlertCandidates already computed for
@@ -294,8 +312,12 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   const dueIds = new Set(evaluation?.notification_due_ids ?? []);
   if (dueIds.size === 0) return { fired: [] };
 
+  // Slice 4b Decision 3b (Fable review MUST-FIX 4): scoped to the LOCALLY-composed three-id
+  // allowlist (session-baseline.js's own two ids + PEER_COUNT_SPIKE_RULE_ID), never the general
+  // unknown-namespace bypass — a due metric/other alert never reaches this branch just because it
+  // also happens to classify as unknown_namespace.
   const dueSessionAlerts = (evaluation.alerts ?? []).filter(
-    (alert) => dueIds.has(alert.id) && DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
+    (alert) => dueIds.has(alert.id) && ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
   );
   if (dueSessionAlerts.length === 0) return { fired: [] };
 
@@ -334,8 +356,24 @@ function buildSessionAlertNotificationDecision(alert) {
       body: `Session ${diagnostics.entity_key} fingerprint changed (${diagnostics.prior_fingerprint} -> ${diagnostics.current_fingerprint}).`,
     };
   }
-  // Unreachable in normal operation (the caller already filters to DETERMINISTIC_LOCAL_DELIVERY_
-  // RULE_IDS) — fails closed to a generic, still counts/enum-only body rather than throwing.
+  // Slice 4b Decision 3b: the third deterministic-delivery branch. Body shape is identical to
+  // session.count_drop's own — counts/z-score/confidence_state only, peer-flavored wording — never
+  // a raw peer host/IP/pubkey, which never reaches this layer's inputs at all (peer-baseline.js's
+  // diagnostics only ever carry counts/z-scores/confidence_state, no per-peer identity). Stored
+  // severity is always "warning" here (peer-baseline.js's own MUST-FIX 1 cap), but this branch
+  // reads `alert.severity` rather than hardcoding "warning" so a future cap-lift doesn't need a
+  // second edit here.
+  if (alert?.rule_id === PEER_COUNT_SPIKE_RULE_ID) {
+    return {
+      notify: true,
+      severity: alert.severity === "critical" ? "critical" : "warning",
+      title: "Descartes: peer count deviation",
+      body: `Peer count ${diagnostics.observed_count} vs baseline mean ${diagnostics.mean_before} (z=${diagnostics.z_score}, ${diagnostics.confidence_state}).`,
+    };
+  }
+  // Unreachable in normal operation (the caller already filters to
+  // ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS) — fails closed to a generic, still counts/enum-only
+  // body rather than throwing.
   return { notify: true, severity: "warning", title: "Descartes: session alert", body: `rule_id=${alert?.rule_id}` };
 }
 
