@@ -48,6 +48,7 @@ Usage:
   descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
   descartes learned mine [--json] [--window <duration>]
   descartes learned soak [--json]
+  descartes learned calibration [--json] [--since <duration>] [--family <rule_id-prefix>]
   descartes learned review [--json]
   descartes learned approve <constraint-id> --nonce <nonce> [--note <text>] [--json]
   descartes learned reject <constraint-id> --nonce <nonce> [--note <text>] [--json]
@@ -132,6 +133,16 @@ async function main(argv) {
     if (args[0] === "soak") {
       const { runLearnedSoak } = await import("./shadow-store.js");
       await runLearnedSoak(paths, args.slice(1));
+      return;
+    }
+    // "calibration" (Slice S15, the read-only foundation for S14 compile-down): a deterministic,
+    // NO-LLM per-artifact precision/recall PROXY report over existing outcome signals. Lives in
+    // its own module (calibration.js) rather than constraint-miner.js/shadow-store.js -- it reads
+    // across FOUR different existing stores (alerts, LLM-decisions, notification-delivery, shadow
+    // violations), which doesn't naturally belong to any single one of them.
+    if (args[0] === "calibration") {
+      const { runLearnedCalibration } = await import("./calibration.js");
+      await runLearnedCalibration(paths, args.slice(1));
       return;
     }
     // "review"/"approve"/"reject" (Slice S7b, the human authority gate) live in
