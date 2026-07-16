@@ -67,7 +67,7 @@ Full review: `docs/reviews/2026-07-11-codex-gpt5.6-sol-review.md` (Codex gpt-5.6
 - [x] stale `HANDOFF.md` line (identity_hash "absent") + header date — fixed.
 
 **Tracked (real, larger/architectural — deferred):**
-- Approval non-atomicity + concurrency (== spot C, already tracked under S7b; Codex elevated it — cross-file write ordering + no lock; fail-safe, no unauthorized activation).
+- [x] Approval non-atomicity + concurrency (== spot C) — **RESOLVED 2026-07-16** (`9264173`). `descartes learned review` now reconciles orphaned pendings: a new terminal `"reconciled"` status + pure `reconcileOrphanedPendings(constraints, promotions, nowIso)` (never writes constraints, never changes approved/rejected, never touches a still-review-ready pending, idempotent) wired into `runLearnedReview` before minting; a reconciled record is inert (match requires `"pending"`) and its nonce denies with an honest `orphan_reconciled` reason. Adversarially verified OVERALL_SAFE (Sonnet); 41/41 promotion-store + 1042 full suite green. Fail-safe, no unauthorized-activation path.
 - #6 Linux FD-scan not truly bounded (per-pid FD cap) + the daemon deadline abandons but doesn't CANCEL the scan (wall-clock wait cap, not work cap).
 - #7 per-namespace LLM re-consent (`enabled_namespaces`) — belongs to the not-yet-built S13 (LLM-wakeup reuse); gate learned/provenance→adjudicator before S13.
 - multi-owner same-port attribution (SO_REUSEPORT/dual-stack should be ambiguous, not first-PID-wins).
