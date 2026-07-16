@@ -197,22 +197,58 @@ not silently "done".
 
 ---
 
-## Slice D — Linux FD-scan work-bound (Rust, CI-gated) — DESIGN ONLY here
+## Slice D — Linux FD-scan work-bound (Rust, CI-gated)
 
-**Change (design):** In `descartes-root-helper`'s per-pid `/proc/<pid>/fd` scan: (1) add a per-pid
-FD *count* cap (stop enumerating a single pid's fds past N, record `fd_scan_truncated:true` rather
-than scanning unboundedly); (2) make the deadline **CANCEL** the in-flight scan (cooperative
-cancellation checked between fds / directory-read batches), not merely abandon the awaited result
-while the work continues. Emit an explicit `fd_scan_bounded`/`fd_scan_truncated` provenance signal
-so a bounded scan is observable, never silently partial.
+**Addendum 2026-07-16 (code map): the finding's two premises are ALREADY handled in the shipped
+`descartes-root-helper` code.** A read of the crate (`proc_linux.rs`, `procfs.rs`) shows:
+- **Per-pid FD cap already EXISTS.** `MAX_FDS_PER_PROCESS = 4096` (proc_linux.rs:54) is a hard
+  entry-count break inside `procfs::read_dir_entries_at`'s raw `getdents64` loop (procfs.rs:281-283).
+  There is also `MAX_PROCESSES_SCANNED = 65536` (proc_linux.rs:60) on the outer pid loop. The scan is
+  bounded per-pid AND across pids — NOT unbounded.
+- **"Deadline abandons but doesn't CANCEL" is not a real defect here.** There is no wall-clock
+  deadline inside the (fully-synchronous, no-async) Rust crate at all. The only timeout in the call
+  chain is the Node caller's `execFile({ timeout: 3000ms })` (provenance-elevated.js), which **kills**
+  the child process on expiry — a real process-level cancel, not an abandon. The finding appears to
+  have been written against an earlier design draft, not the shipped code.
 
-**Why safe:** tightens a resource bound in the privileged helper; no new capability, no new syscall
-surface; degrades to an explicitly-flagged partial result (honest), never to a fabricated complete
-one. Must pass the existing escalation-lint and the elevated Tart-VM CI smoke.
+**The one genuine residual — silent truncation (LOW, fail-safe).** When the scan hits
+`MAX_FDS_PER_PROCESS` on the *actual* owning process before finding the target socket inode, it
+silently moves to the next pid and `resolve_port` returns `None` — indistinguishable from "genuinely
+no owner". The `Resolved` contract is deliberately all-or-nothing (json.rs) with no
+`fd_scan_truncated`/partial signal. This is fail-safe (a missed owner degrades to the unprivileged
+`partial`/`missing_permission` path — never a fabrication) but not *observable*: an operator can't
+tell "no owner" from "owner had >4096 fds and I gave up". Per the codebase's "no silent caps"
+honesty discipline, an explicit truncation signal would close it.
 
-**Cannot iterate locally** (no Virtualization.framework on this dev machine): implement behind
-`cross-target cargo check --tests` locally, then validate execution under the `:linux: … (elevated
-provenance)` Buildkite step. Sequenced LAST; may split to its own Rust-focused plan if it grows.
+**Proposed residual fix (if pursued):** extract the stop/continue + truncation-tracking decision into
+a small PURE, cross-platform (non-`cfg(linux)`) helper (analogous to `json::truncate_bytes`) so a
+HOST unit test can exercise it without `/proc` (per the code map, ALL current scan code is
+`#[cfg(target_os="linux")]` and its tests are whole-file `#![cfg(target_os="linux")]` — unreachable
+on this macOS host); then thread a `fd_scan_truncated:true` signal from the Linux loop through the
+`Resolved` contract to the provenance envelope. Host-unit-test the pure helper locally; validate the
+Linux wiring + envelope under the `:linux: … (elevated provenance)` Buildkite step (operator-gated —
+this dev machine cannot run VMs).
+
+**Disposition: SHIPPED 2026-07-16** (operator chose "implement the residual now"). The finding's
+two premises were already addressed (bounds present, process-cancel present); the residual
+silent-truncation observability is now closed:
+- Pure, cross-platform, HOST-unit-tested `descartes_root_helper::scan::fd_scan_truncated(entries_seen,
+  cap)` (4 host tests).
+- `proc_linux::find_owning_pid` → `PortResolution { resolved, truncated }`; `resolve_port_detailed`
+  propagates it; `main.rs` emits `EXIT_RESOLUTION_TRUNCATED=3` + a distinct stderr on the
+  no-owner-but-capped case. Success stdout contract untouched. Linux unit tests added (cross-checked
+  for x86_64+aarch64, run under CI).
+- Node: `runMinimalEnvExecFile` tags the (still-`unable`) result `fd_scan_truncated:true` on exit 3;
+  `resolveCrossUidPortResult` surfaces it under `result.privilege` via `withDiagnostics` (side-channel
+  capture mirroring `observedConfig`/`ptrace_scope`), never altering the fail-safe degrade. 3 new
+  host tests incl. a real exit-3 subprocess.
+- Adversarially verified OVERALL_SAFE (Sonnet): never fabricates, success path byte-identical, exit-3
+  mapping specific (timeout→SIGTERM, ENOENT→string; neither collides), no new syscall surface. The
+  dead-code `resolve_port` wrapper it flagged was removed.
+- **CI-gated residual**: the real >4096-fd truncation path (`find_owning_pid` setting `truncated`)
+  runs only under the `:linux: … (elevated provenance)` Buildkite step — host coverage is the pure
+  helper + cross-target `cargo check --tests`. Conservative FP (a table of exactly `cap` real fds is
+  flagged truncated) is documented + acceptable (adds only an "uncertain" annotation, never a pid).
 
 ---
 

@@ -31,6 +31,13 @@ const MINIMAL_ENV = Object.freeze({ PATH: "/usr/bin:/bin" });
 const DEFAULT_PROBE_TIMEOUT_MS = 2000;
 const DEFAULT_INVOKE_TIMEOUT_MS = 3000;
 const DEFAULT_MAX_BUFFER = 64 * 1024;
+
+// descartes-root-helper's EXIT_RESOLUTION_TRUNCATED (main.rs): a `--resolve-port` that found no
+// owner AND gave up at least one candidate's /proc/<pid>/fd scan at the per-process cap (or the pid
+// walk at its cap), so "no owner" is UNCERTAIN, not definitive (Codex-hardening #6). Still a nonzero
+// (failure) exit — the degrade-to-unprivileged flow is unchanged — but distinguishable, so the
+// truncation can be surfaced as an observable provenance signal instead of a silent negative.
+const HELPER_EXIT_FD_SCAN_TRUNCATED = 3;
 // Stricter than execFile's own maxBuffer -- a bounded-length check applied BEFORE JSON.parse is
 // ever attempted, so a technically-below-maxBuffer-but-still-huge response can't reach the parser.
 const MAX_RESPONSE_BYTES = 8 * 1024;
@@ -88,7 +95,7 @@ async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {})
     });
     return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
   } catch (error) {
-    return {
+    const result = {
       status: "unable",
       error: error instanceof Error ? error.message : String(error),
       code: error?.code,
@@ -96,6 +103,13 @@ async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {})
       stderr: error?.stderr ?? "",
       command: { argv, read_only: true },
     };
+    // Codex-hardening #6: on the helper's dedicated truncated-scan exit code, tag the (still-unable)
+    // result additively so callers can surface `fd_scan_truncated` in provenance. The degrade path
+    // is untouched — status stays "unable", so every consumer that keys on status?.=== "ok" still
+    // degrades to the unprivileged shape exactly as before. On a real process exit the child's
+    // numeric exit status arrives as error.code; a signal/ENOENT string code simply won't match.
+    if (error?.code === HELPER_EXIT_FD_SCAN_TRUNCATED) result.fd_scan_truncated = true;
+    return result;
   }
 }
 

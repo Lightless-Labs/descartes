@@ -197,6 +197,72 @@ test("resolveCrossUidPortResult degrades when the helper's self-reported uid dis
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "2" });
 });
 
+// ---------------------------------------------------------------------------------------------
+// Codex-hardening #6: an fd/pid-scan truncation is surfaced as an observable provenance diagnostic
+// (never a silent "no owner"), without changing the fail-safe degrade.
+// ---------------------------------------------------------------------------------------------
+
+test("resolveCrossUidPortResult surfaces fd_scan_truncated in the provenance diagnostic when the helper gave up a scan at the per-process cap (exit 3) — still degrading to the unprivileged partial baseline", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    // The helper found no owner but hit the scan cap -> EXIT_RESOLUTION_TRUNCATED (3). runMinimalEnvExecFile
+    // (tested separately below) tags the unable result with fd_scan_truncated; the mock reproduces that shape.
+    invokeElevatedHelper: async () => ({ status: "unable", code: 3, fd_scan_truncated: true, stdout: "", stderr: "" }),
+    readFile: async () => "0\n",
+  });
+
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  // Fail-safe degrade is UNCHANGED — no pid fabricated, owning uid preserved, partial/0.4/missing_permission.
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.equal(outcome.result.resolved.pid, undefined);
+  assert.equal(outcome.result.resolved.user.uid, 1000);
+  const fields = computeProvenanceEnvelopeFields(outcome.resolvedStatus, outcome.result.source.type);
+  assert.deepEqual(fields, { status: "partial", confidence: 0.4, reviewHint: "missing_permission" });
+  // ...but the truncation is now OBSERVABLE, attached the same way as ptrace_scope, never gating resolution.
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "0", fd_scan_truncated: true });
+});
+
+test("resolveCrossUidPortResult does NOT add fd_scan_truncated for a plain (non-truncated) elevated failure — the diagnostic is specific to the truncated-scan exit", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "unable", code: 1, stdout: "", stderr: "" }), // ordinary resolution failure
+    readFile: async () => "1\n",
+  });
+
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1" });
+  assert.equal("fd_scan_truncated" in outcome.result.privilege, false, "a non-truncated failure must not carry the truncation diagnostic");
+});
+
+test("defaultInvokeElevatedHelper maps the helper's EXIT_RESOLUTION_TRUNCATED (3) to fd_scan_truncated:true, and any other nonzero exit does not (real subprocess)", async () => {
+  const paths = await tempPaths();
+  const mkHelper = async (name, exitCode) => {
+    const helperPath = path.join(paths.stateDir, name);
+    await fs.mkdir(path.dirname(helperPath), { recursive: true });
+    await fs.writeFile(helperPath, `#!/bin/sh\nexit ${exitCode}\n`, { mode: 0o755 });
+    return helperPath;
+  };
+
+  const truncated = await defaultInvokeElevatedHelper(await mkHelper("helper-exit3", 3), ["--resolve-port", "8080"]);
+  assert.equal(truncated.status, "unable");
+  assert.equal(truncated.code, 3);
+  assert.equal(truncated.fd_scan_truncated, true, "exit 3 must be tagged as a truncated scan");
+
+  const plainFailure = await defaultInvokeElevatedHelper(await mkHelper("helper-exit1", 1), ["--resolve-port", "8080"]);
+  assert.equal(plainFailure.status, "unable");
+  assert.equal(plainFailure.code, 1);
+  assert.equal(plainFailure.fd_scan_truncated, undefined, "an ordinary nonzero exit is not a truncated scan");
+});
+
 test("resolveCrossUidPortResult bounds the untrusted helper's executable_path (truncated) before it reaches the envelope/LLM", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });

@@ -28,6 +28,7 @@
 
 mod argv;
 mod json;
+mod scan;
 #[cfg(target_os = "linux")]
 mod proc_linux;
 
@@ -46,6 +47,13 @@ use descartes_root_helper::hardening;
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_RESOLUTION_FAILURE: i32 = 1;
 const EXIT_USAGE_ERROR: i32 = 2;
+// Codex-hardening #6: a `--resolve-port` that found no owner AND gave up at least one candidate's
+// `/proc/<pid>/fd` scan at the per-process cap (or the pid walk at its cap) — so "no owner" is
+// UNCERTAIN, not definitive. A distinct nonzero code (still a failure to any caller that only
+// checks exit==0) lets the Node side surface `fd_scan_truncated` in provenance instead of a silent,
+// indistinguishable-from-genuine negative. Only ever returned on Linux `--resolve-port`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EXIT_RESOLUTION_TRUNCATED: i32 = 3;
 
 fn main() {
     // FIRST statement, unconditionally, before any argv logic: fail-closed by construction (see
@@ -126,17 +134,27 @@ fn run_resolve_pid(_pid: u32) -> i32 {
 
 #[cfg(target_os = "linux")]
 fn run_resolve_port(port: u32) -> i32 {
-    let resolved = proc_linux::resolve_port(port);
+    let resolution = proc_linux::resolve_port_detailed(port);
     // Drop right after the reads that need the (future) capability, before ANY output -- success
     // or failure, per hardening.rs's documented sequence: resolve -> drop -> emit.
     hardening::drop_capabilities();
-    match resolved {
+    match resolution.resolved {
         Some(resolved) => {
+            // The success stdout contract is untouched (truncation on an EARLIER candidate is moot
+            // once an owner is found — the answer is complete).
             println!(
                 "{}",
                 json::emit_response(json::Requested::Port(port), &resolved)
             );
             EXIT_SUCCESS
+        }
+        // Codex-hardening #6: distinguish "gave up at a scan cap (result uncertain)" from a
+        // definitive "no owner". Still nonzero + nothing on stdout, so the strict contract holds.
+        None if resolution.truncated => {
+            eprintln!(
+                "descartes-root-helper: could not resolve port {port} (fd/pid scan hit the per-process cap; result uncertain, not a definitive no-owner)"
+            );
+            EXIT_RESOLUTION_TRUNCATED
         }
         None => {
             eprintln!("descartes-root-helper: could not resolve port {port}");

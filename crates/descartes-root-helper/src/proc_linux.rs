@@ -83,16 +83,35 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Option<Resolved> {
     })
 }
 
-/// Resolves the pid of the process holding a LISTEN-state socket bound to `port`. `None` if no
-/// such listening socket exists, or if the owning process cannot be found or fully resolved.
+/// Outcome of a port owner search. `resolved` is `Some` only on a complete resolution (all-or-
+/// nothing, per the module doc). `truncated` is meaningful ONLY when `resolved` is `None`: the
+/// search gave up short of a full scan (a candidate's `/proc/<pid>/fd` table hit
+/// `MAX_FDS_PER_PROCESS`, or the pid walk hit `MAX_PROCESSES_SCANNED`), so "no owner" is UNCERTAIN
+/// — the real owner may have been beyond a bound. It is NEVER set when an owner was resolved (the
+/// answer is then complete regardless of any earlier candidate having been capped).
+#[derive(Debug, PartialEq, Eq)]
+pub struct PortResolution {
+    pub resolved: Option<Resolved>,
+    pub truncated: bool,
+}
+
+/// Resolves the pid of the process holding a LISTEN-state socket bound to `port`, plus whether the
+/// (unsuccessful) owner search was truncated at a scan bound — see `PortResolution`. `resolved` is
+/// `None` if no such listening socket exists, or if the owning process cannot be found or fully
+/// resolved (Codex-hardening #6: a capped scan is then reported as `truncated`, observable rather
+/// than a silent negative).
 ///
 /// A port with multiple listening owners (SO_REUSEPORT, or a race during handoff) resolves to
 /// whichever owning pid `find_owning_pid` happens to encounter first while walking `/proc` --
 /// this is a recorded, deferred limitation (Layer B plan, Slice 3 section), not solved here.
-pub fn resolve_port(port: u32) -> Option<Resolved> {
+pub fn resolve_port_detailed(port: u32) -> PortResolution {
     let inodes = listening_inodes_for_port(port);
     if inodes.is_empty() {
-        return None;
+        // No listening socket at all: a definitive negative, nothing was scanned.
+        return PortResolution {
+            resolved: None,
+            truncated: false,
+        };
     }
     find_owning_pid(&inodes)
 }
@@ -205,13 +224,23 @@ fn listening_inodes_for_port(port: u32) -> HashSet<String> {
 /// alone does not reach it; `cap_sys_ptrace` covers the readlink of what's found once the
 /// directory can be enumerated -- see the module doc), not an error condition here, and a
 /// since-exited process is precisely the reuse hazard this module defends against, so it fails
-/// closed the same way. First match wins (see `resolve_port`'s doc on the multi-owner limitation).
-fn find_owning_pid(inodes: &HashSet<String>) -> Option<Resolved> {
-    let proc_dir = fs::read_dir("/proc").ok()?;
+/// closed the same way. First match wins (see `resolve_port_detailed`'s doc on the multi-owner limitation).
+fn find_owning_pid(inodes: &HashSet<String>) -> PortResolution {
+    let Ok(proc_dir) = fs::read_dir("/proc") else {
+        return PortResolution {
+            resolved: None,
+            truncated: false,
+        };
+    };
     let mut scanned_processes = 0usize;
+    // Codex-hardening #6: accumulate whether the search gave up short of a full scan. Only reported
+    // on the no-owner path (a match makes any earlier cap-hit moot). A candidate whose fd table was
+    // capped, OR hitting the pid-walk cap, means the eventual "no owner" is UNCERTAIN.
+    let mut truncated = false;
 
     for entry in proc_dir.flatten() {
         if scanned_processes >= MAX_PROCESSES_SCANNED {
+            truncated = true; // did not finish the pid walk -- a None below is uncertain.
             break;
         }
         let name = entry.file_name();
@@ -255,12 +284,24 @@ fn find_owning_pid(inodes: &HashSet<String>) -> Option<Resolved> {
                 .is_some_and(|inode| inodes.contains(inode));
             if matches {
                 // Resolve off the SAME already-open `pid_dir` -- never a fresh lookup by the bare
-                // `pid` number. See the function doc.
-                return resolve_from_pid_dir(pid, pid_dir.as_fd());
+                // `pid` number. See the function doc. Truncation is moot once we have the owner.
+                return PortResolution {
+                    resolved: resolve_from_pid_dir(pid, pid_dir.as_fd()),
+                    truncated: false,
+                };
             }
         }
+
+        // This candidate did not hold the socket; if its fd table was capped, the target could have
+        // been among the fds we never enumerated -- so a final "no owner" is uncertain.
+        if crate::scan::fd_scan_truncated(fd_names.len(), MAX_FDS_PER_PROCESS) {
+            truncated = true;
+        }
     }
-    None
+    PortResolution {
+        resolved: None,
+        truncated,
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +332,9 @@ mod tests {
     fn resolve_port_resolves_back_to_the_test_process_for_a_socket_it_owns() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = listener.local_addr().unwrap().port() as u32;
-        let resolved = resolve_port(port).expect("must resolve the listener's owning pid");
+        let resolved = resolve_port_detailed(port)
+            .resolved
+            .expect("must resolve the listener's owning pid");
         assert_eq!(resolved.pid, std::process::id());
         drop(listener);
     }
@@ -303,7 +346,41 @@ mod tests {
         let probe = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = probe.local_addr().unwrap().port() as u32;
         drop(probe);
-        assert_eq!(resolve_port(port), None);
+        assert_eq!(resolve_port_detailed(port).resolved, None);
+    }
+
+    #[test]
+    fn resolve_port_detailed_reports_a_complete_resolution_as_not_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().unwrap().port() as u32;
+        let resolution = resolve_port_detailed(port);
+        assert_eq!(
+            resolution.resolved.map(|r| r.pid),
+            Some(std::process::id())
+        );
+        assert!(
+            !resolution.truncated,
+            "a successful owner resolution is never flagged truncated"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn resolve_port_detailed_reports_a_definitive_no_owner_as_not_truncated() {
+        // No listener on this port: a DEFINITIVE negative. On a normal test host /proc holds far
+        // fewer than MAX_PROCESSES_SCANNED pids and no candidate has > MAX_FDS_PER_PROCESS fds, so
+        // the search completes in full -- `truncated` must be false, distinguishing this genuine
+        // "no owner" from the capped-scan "uncertain" case (Codex-hardening #6). The >cap truncated
+        // case itself is covered by scan::fd_scan_truncated's host unit tests + the wiring above.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = probe.local_addr().unwrap().port() as u32;
+        drop(probe);
+        let resolution = resolve_port_detailed(port);
+        assert_eq!(resolution.resolved, None);
+        assert!(
+            !resolution.truncated,
+            "a full-scan no-owner result is a definitive negative, not truncated"
+        );
     }
 
     #[test]

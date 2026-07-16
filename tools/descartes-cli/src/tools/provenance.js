@@ -16,7 +16,7 @@ import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
-import { readPtraceScopeDiagnostic, resolveElevated } from "./provenance-elevated.js";
+import { defaultInvokeElevatedHelper, readPtraceScopeDiagnostic, resolveElevated } from "./provenance-elevated.js";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig } from "../provenance-elevated-config.js";
 
 const execFileAsync = promisify(execFile);
@@ -713,6 +713,13 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // all, on any host, Linux CI included (where the sysctl is actually readable).
   let observedConfig;
   const loadConfig = options.loadProvenanceConfig ?? defaultLoadProvenanceConfig;
+  // Codex-hardening #6: capture the elevated invoke's result via the SAME side-channel-wrapper
+  // pattern as observedConfig above (zero extra invocations — just observe the one resolveElevated
+  // already makes) so an fd/pid-scan truncation (helper EXIT_RESOLUTION_TRUNCATED → the invoke
+  // result's additive `fd_scan_truncated` flag) can be surfaced as a pure diagnostic below. Never
+  // gates resolution: resolveElevated still degrades to `undefined` on the same unable status.
+  let observedInvoke;
+  const invoke = options.invokeElevatedHelper ?? defaultInvokeElevatedHelper;
   const upgrade = await resolveElevated(
     { target: { kind: "port", value: port, uid: primary.uid }, paths: options.paths },
     {
@@ -720,6 +727,10 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       loadProvenanceConfig: async (paths) => {
         observedConfig = await loadConfig(paths);
         return observedConfig;
+      },
+      invokeElevatedHelper: async (helperPath, argv, invokeOptions) => {
+        observedInvoke = await invoke(helperPath, argv, invokeOptions);
+        return observedInvoke;
       },
     },
   );
@@ -729,19 +740,27 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // computed only after the real attempt already ran, and it never gates resolution either way.
   const elevationWasConfigured = observedConfig?.elevated?.enabled === true;
   const ptraceScope = elevationWasConfigured ? await readPtraceScopeDiagnostic({ readFile: options.readFile }) : undefined;
-  const withPtraceScopeDiagnostic = (outcome) => {
-    if (ptraceScope === undefined) return outcome; // byte-identical: field simply absent.
-    return { ...outcome, result: { ...outcome.result, privilege: { ...outcome.result.privilege, ptrace_scope: ptraceScope } } };
+  // Codex-hardening #6: the helper gave up an fd/pid scan at a cap, so a "no owner" here is uncertain
+  // rather than a definitive negative. Pure diagnostic, attached the SAME way as ptrace_scope (under
+  // result.privilege), never gating resolution. Only ever true on the degrade path (a successful
+  // upgrade exits 0, so the flag is absent there).
+  const fdScanTruncated = observedInvoke?.fd_scan_truncated === true;
+  const withDiagnostics = (outcome) => {
+    if (ptraceScope === undefined && !fdScanTruncated) return outcome; // byte-identical: no diagnostic fields.
+    const privilege = { ...outcome.result.privilege };
+    if (ptraceScope !== undefined) privilege.ptrace_scope = ptraceScope;
+    if (fdScanTruncated) privilege.fd_scan_truncated = true;
+    return { ...outcome, result: { ...outcome.result, privilege } };
   };
 
-  if (!upgrade) return withPtraceScopeDiagnostic(unprivilegedOutcome);
+  if (!upgrade) return withDiagnostics(unprivilegedOutcome);
 
   // Trust model: the owning uid is a FREE, confident fact the unprivileged path already resolved
   // (primary.uid). The helper is trusted ONLY for the NEW fact it provides (the pid + exe/command),
   // never to re-assert a fact we already hold. If the helper self-reports a uid that DISAGREES with
   // the known-good one, it resolved the wrong socket/process (or is compromised), so its pid is also
   // suspect: degrade to the unprivileged baseline rather than merge an untrusted, contradictory fact.
-  if (upgrade.uid !== undefined && Number(upgrade.uid) !== Number(primary.uid)) return withPtraceScopeDiagnostic(unprivilegedOutcome);
+  if (upgrade.uid !== undefined && Number(upgrade.uid) !== Number(primary.uid)) return withDiagnostics(unprivilegedOutcome);
 
   // Bound the untrusted helper's path/command exactly like the unprivileged path (resolvePidCore
   // truncates executable_path) before either reaches the evidence envelope / triage LLM.
@@ -767,7 +786,7 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       details: { reason: "resolved_via_elevated_helper", mechanism: upgrade.mechanism },
     },
   };
-  return withPtraceScopeDiagnostic(finalizeProvenanceResult({
+  return withDiagnostics(finalizeProvenanceResult({
     targetSelection: { kind: "port", value: port },
     core: upgradedCore,
     sockets,
