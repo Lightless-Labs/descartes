@@ -218,9 +218,9 @@ provenance)` Buildkite step. Sequenced LAST; may split to its own Rust-focused p
 
 ## Sequencing & verification
 
-1. **A** (smallest, clearest correctness win, pure lookup change) → adversarial verify → commit.
-2. **B** (opt-in freshness, default-identical) → adversarial verify → commit.
-3. **C** (census marker, mirrors proven session pattern) → adversarial verify → commit.
+1. **A** — ✅ SHIPPED 2026-07-16 (`accbc49`). same-tick ambiguity → skip + `lookup.ambiguousTargets`. Sonnet-verified OVERALL_SAFE (40k-permutation fuzz).
+2. **B** — ✅ SHIPPED 2026-07-16 (`924d819`). opt-in freshness pinned to the structural interval, wired into active + shadow-soak, one-nowMs-snapshot skew fix folded. Sonnet-verified OVERALL_SAFE.
+3. **C** — census marker. Sonnet review caught two must-fixes (folded before commit): distinct `fact_name:"service.census"` (kills the launchd entity_key collision / confidence-dilution class) + status gate `ok|warning` only (no false "complete" marker on an unsupported-platform `"unknown"` envelope).
 4. **D** (Rust, CI-gated) — implement + verify under CI, or spin to its own plan.
 
 Each slice: TDD (test first) → implement → `node --check` + full `npm test` (0 fail) +

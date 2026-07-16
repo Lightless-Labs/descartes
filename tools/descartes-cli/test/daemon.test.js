@@ -35,7 +35,7 @@ import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenanc
 import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
 import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
-import { SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
+import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY, SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
@@ -785,12 +785,15 @@ test("S6b wiring: structural evidence is translated into fact-points and persist
   });
 
   assert.notEqual(result.structuralFacts, undefined);
-  assert.equal(result.structuralFacts.written_count, 2);
+  // 1 service + 1 network + 1 Slice C service census marker (always appended on a successful
+  // services envelope) = 3.
+  assert.equal(result.structuralFacts.written_count, 3);
 
   const { points } = await readFactPoints(paths);
-  assert.equal(points.length, 2);
+  assert.equal(points.length, 3);
   assert(points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
   assert(points.some((point) => point.fact_name === "network.listening_port.owner" && point.entity_key === "tcp:0.0.0.0:8080"));
+  assert(points.some((point) => point.fact_name === SERVICE_CENSUS_FACT_NAME && point.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY && point.attributes.census_state === "complete"));
 });
 
 test("S6b wiring: no fact-points are persisted while the learned.json kill switch is off, even with populated structural evidence available", async () => {

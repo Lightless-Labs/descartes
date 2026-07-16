@@ -15,6 +15,23 @@ export function sanitizeEntityKey(value) {
   return sanitizeIdentityString(value);
 }
 
+// The service census marker makes "the services collector ran this tick, and here is whether its
+// enumeration was complete" representable — the prerequisite for ever detecting a service that
+// DISAPPEARS (Codex finding #9: today a vanished service simply stops producing facts, which is
+// indistinguishable from "never observed" / "collector didn't run"). It does NOT itself alert on
+// disappearance; it only makes absence observable for a future absence-diff slice.
+//
+// It uses its OWN fact_name ("service.census"), NOT "service.presence": service entity_keys are the
+// sanitized (NOT hashed) service name/label, so a launchd job could be labelled exactly the reserved
+// marker key. A distinct fact_name means the marker can never share a miner group or a
+// buildShadowFactLookup key-attribute with a real service.presence fact even on an entity_key
+// collision (both `SHADOW_KEY_ATTRIBUTE_BY_FACT_NAME` and the miner's `FAMILY_BY_FACT_NAME` lack a
+// "service.census" entry → it is skipped before any grouping/resolution). confidence:0 is kept as
+// belt-and-suspenders. (Sessions can safely reuse "session.presence" for their marker because their
+// real entity_keys are hashes and cannot collide with the literal marker key; services can't.)
+export const SERVICE_CENSUS_FACT_NAME = "service.census";
+export const SERVICE_CENSUS_MARKER_ENTITY_KEY = "service.census-marker.v1";
+
 /**
  * services[] is NOT uniform across managers (grounded against tools/services.js):
  *   - systemd (parseSystemctlListUnits): {name, load, active, sub, description, failed,
@@ -30,7 +47,7 @@ export function factPointsFromServiceEvidence(evidence, { ts } = {}) {
   const services = envelope.result?.services ?? [];
   const manager = envelope.result?.manager;
 
-  return services
+  const points = services
     .map((service) => {
       const identity = manager === "launchd" ? service.label : service.name;
       const running = manager === "launchd" ? service.state === "running" : Boolean(service.running);
@@ -48,6 +65,46 @@ export function factPointsFromServiceEvidence(evidence, { ts } = {}) {
       };
     })
     .filter(Boolean);
+
+  // Slice C (Codex-hardening): the census marker is appended whenever the collector GENUINELY
+  // enumerated — status "ok" or "warning" (units unhealthy but the service list is complete) —
+  // including a zero-service tick, so absence becomes representable. It is NOT emitted on an
+  // "unknown" (unsupported-platform) envelope, which never ran a census: emitting a "complete" marker
+  // there would falsely claim an enumeration and collapse the "collector didn't run" vs "ran, saw
+  // nothing" distinction the marker exists to preserve. (A status:"unable" envelope was already
+  // dropped by the find() filter above.) The marker is inert by construction — its distinct
+  // "service.census" fact_name is unknown to both the lookup and the miner, and confidence:0 backs
+  // that up — so it can never be read as a presence claim or mined.
+  if (envelope.status === "ok" || envelope.status === "warning") {
+    points.push(buildServiceCensusMarkerFactPoint(envelope.result, envelope, ts));
+  }
+  return points;
+}
+
+// "partial" whenever this tick's service enumeration was truncated (tools/services.js capped the list
+// at its own limit), else "complete". A partial census must never be read as an authoritative "these
+// are ALL the services" set by any future absence-diff. Mirrors censusStateFor's role for sessions,
+// adapted to the services result shape (no per-manager `multiplexers` array — `truncated` is its only
+// incompleteness signal).
+function serviceCensusStateFor(result) {
+  return result?.truncated ? "partial" : "complete";
+}
+
+// confidence:0 (exactly like the session census/overflow markers): carries no service-presence
+// evidence of its own and must never be mistaken for one downstream.
+function buildServiceCensusMarkerFactPoint(result, envelope, ts) {
+  return {
+    ts,
+    fact_name: SERVICE_CENSUS_FACT_NAME,
+    entity_key: SERVICE_CENSUS_MARKER_ENTITY_KEY,
+    attributes: {
+      census_state: serviceCensusStateFor(result),
+    },
+    source_envelope_id: envelope.id,
+    source_tool: envelope.trace?.tool,
+    sensitivity: "operational",
+    confidence: 0,
+  };
 }
 
 /**

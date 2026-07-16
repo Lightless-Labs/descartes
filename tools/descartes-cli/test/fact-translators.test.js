@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  SERVICE_CENSUS_FACT_NAME,
+  SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   factPointsFromNetworkEvidence,
   factPointsFromServiceEvidence,
@@ -8,6 +10,9 @@ import {
   factPointsFromVpnPeerEvidence,
   sanitizeEntityKey,
 } from "../src/fact-translators.js";
+import { buildConstraintTarget } from "../src/constraint-store.js";
+import { buildShadowFactLookup } from "../src/shadow-store.js";
+import { mineConstraintCandidates } from "../src/constraint-miner.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -37,8 +42,10 @@ test("factPointsFromServiceEvidence maps systemd's {name, running:boolean} shape
   })];
 
   const points = factPointsFromServiceEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 3);
-  assert.deepEqual(points.map((p) => p.entity_key).sort(), ["cron.service", "nginx.service", "postgres.service"]);
+  // Slice C: 3 real service facts + 1 always-appended census marker.
+  const real = points.filter((p) => p.entity_key !== SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(real.length, 3);
+  assert.deepEqual(real.map((p) => p.entity_key).sort(), ["cron.service", "nginx.service", "postgres.service"]);
   const nginx = points.find((p) => p.entity_key === "nginx.service");
   assert.equal(nginx.fact_name, "service.presence");
   assert.equal(nginx.attributes.running, "true");
@@ -59,7 +66,8 @@ test("factPointsFromServiceEvidence branches on launchd's {label, pid, state} sh
   })];
 
   const points = factPointsFromServiceEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 2);
+  const real = points.filter((p) => p.entity_key !== SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(real.length, 2);
   const running = points.find((p) => p.entity_key === "com.example.running");
   assert.equal(running.attributes.running, "true");
   assert.equal(running.attributes.manager, "launchd");
@@ -82,7 +90,100 @@ test("factPointsFromServiceEvidence drops a service entry with unresolvable iden
     ],
   })];
   const points = factPointsFromServiceEvidence(evidence, { ts: TS });
-  assert.deepEqual(points.map((p) => p.entity_key), ["real.service"]);
+  const real = points.filter((p) => p.entity_key !== SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.deepEqual(real.map((p) => p.entity_key), ["real.service"]);
+});
+
+test("factPointsFromServiceEvidence appends a confidence:0 service census marker on every successful envelope — including a zero-service tick — so absence is representable (Codex #9)", () => {
+  // Non-empty tick: marker present, census_state "complete", inert.
+  const nonEmpty = factPointsFromServiceEvidence(
+    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "nginx.service", running: true }] })],
+    { ts: TS },
+  );
+  const marker = nonEmpty.find((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.ok(marker, "a census marker must be emitted");
+  assert.equal(marker.fact_name, SERVICE_CENSUS_FACT_NAME, "distinct fact_name — never 'service.presence' (collision-safe)");
+  assert.equal(marker.confidence, 0, "confidence:0 is the belt-and-suspenders backup exclusion");
+  assert.equal(marker.attributes.running, undefined, "no running attribute — never a presence claim");
+  assert.equal(marker.attributes.census_state, "complete");
+
+  // Zero-service tick: the marker is STILL emitted (the whole point — 'collector ran, saw nothing').
+  const zero = factPointsFromServiceEvidence(
+    [envelope("services", "collect_services", { manager: "systemd", services: [] })],
+    { ts: TS },
+  );
+  assert.equal(zero.length, 1, "a zero-service tick still emits exactly the census marker");
+  assert.equal(zero[0].entity_key, SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(zero[0].attributes.census_state, "complete");
+
+  // Truncated tick: census_state "partial" (must not be read as an authoritative full set).
+  const truncated = factPointsFromServiceEvidence(
+    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "a.service", running: true }], truncated: true })],
+    { ts: TS },
+  );
+  assert.equal(truncated.find((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY).attributes.census_state, "partial");
+
+  // A "warning" envelope (systemd ran fine but some units failed — census still complete): marker emitted.
+  const warning = factPointsFromServiceEvidence(
+    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "a.service", running: true }] }, "warning")],
+    { ts: TS },
+  );
+  assert.ok(warning.some((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY), "a warning (unhealthy-unit) tick still ran a complete census → marker emitted");
+
+  // status:unable / missing envelope: NO marker (nothing ran to census).
+  assert.deepEqual(factPointsFromServiceEvidence([envelope("services", "collect_services", { manager: "systemd", services: [] }, "unable")], { ts: TS }), []);
+  assert.deepEqual(factPointsFromServiceEvidence([], { ts: TS }), []);
+});
+
+test("factPointsFromServiceEvidence emits NO census marker on an 'unknown' (unsupported-platform) envelope — the collector never ran, so 'collector didn't run' stays distinct from 'ran, saw nothing'", () => {
+  // collectServiceEvidence maps an unsupported platform to status:"unknown" (NOT "unable"), with an
+  // empty services[]. A false "complete" marker here would claim an enumeration that never happened.
+  const unsupported = [envelope("services", "collect_services", { manager: "unsupported", services: [] }, "unknown")];
+  assert.deepEqual(factPointsFromServiceEvidence(unsupported, { ts: TS }), [], "no facts and NO census marker on an unsupported-platform tick");
+});
+
+test("the service census marker cannot dilute a real service's mined confidence even when a launchd label collides with the reserved marker key (distinct fact_name → different miner group)", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const base = Date.parse("2026-07-01T00:00:00.000Z");
+  const history = [];
+  for (let i = 0; i < 4; i += 1) {
+    const ts = new Date(base + i * 3 * DAY_MS).toISOString();
+    // A launchd job labelled EXACTLY the reserved marker key — worst case for collision.
+    history.push(...factPointsFromServiceEvidence(
+      [envelope("services", "collect_services", { manager: "launchd", services: [{ label: SERVICE_CENSUS_MARKER_ENTITY_KEY, state: "running" }] })],
+      { ts },
+    ));
+  }
+  const candidates = mineConstraintCandidates(history, [], { now: base + 12 * DAY_MS });
+  const real = candidates.find((c) => c.family === "service-presence");
+  assert.ok(real, "the colliding real service is still mined");
+  assert.equal(real.confidence, 1, "confidence is NOT diluted — the census marker lives in a different fact_name group, never in the real service's confirming/total counts");
+});
+
+test("the service census marker is inert in buildShadowFactLookup — its confidence:0 excludes it, so its target never resolves to a value", () => {
+  const points = factPointsFromServiceEvidence(
+    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "nginx.service", running: true }] })],
+    { ts: TS },
+  );
+  const lookup = buildShadowFactLookup(points);
+  assert.equal(lookup(buildConstraintTarget("service.presence", "nginx.service")), "true", "the real service still resolves");
+  assert.equal(lookup(buildConstraintTarget(SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY)), undefined, "marker's distinct 'service.census' fact_name is unknown to the lookup's key-attribute map → never resolves (confidence:0 backs it up)");
+});
+
+test("the service census marker is never mined into a constraint, even across enough ticks to clear the miner's sample/span bars (a real service in the same history IS mined — proving the input is genuinely mineable)", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const base = Date.parse("2026-07-01T00:00:00.000Z");
+  const history = [];
+  for (let i = 0; i < 4; i += 1) {
+    const ts = new Date(base + i * 3 * DAY_MS).toISOString(); // 4 ticks spanning 9 days
+    history.push(...factPointsFromServiceEvidence(
+      [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "nginx.service", running: true }] })],
+      { ts },
+    ));
+  }
+  const candidates = mineConstraintCandidates(history, [], { now: base + 12 * DAY_MS });
+  assert.ok(candidates.some((c) => c.family === "service-presence"), "the real nginx.service is mineable — the history genuinely clears the bars");
+  assert.equal(candidates.some((c) => String(c.target).includes("census-marker")), false, "the confidence:0 census marker is never mined, despite appearing in every tick");
 });
 
 // --- factPointsFromNetworkEvidence ---
@@ -147,9 +248,10 @@ test("a hostile path-shaped service name is truncated/redacted before it ever re
     ],
   })];
   const points = factPointsFromServiceEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 1);
-  assert.equal(points[0].entity_key.includes("/"), false);
-  assert.match(points[0].entity_key, /^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+  const real = points.filter((p) => p.entity_key !== SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(real.length, 1);
+  assert.equal(real[0].entity_key.includes("/"), false);
+  assert.match(real[0].entity_key, /^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
 });
 
 test("an over-length process command is bounded before reaching attributes.owner", () => {
