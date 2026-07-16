@@ -6,6 +6,7 @@ import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { appendFactPoints } from "../src/fact-store.js";
 import { buildConstraintTarget, loadConstraints, writeConstraints } from "../src/constraint-store.js";
+import { evaluateConstraints } from "../src/constraint-eval.js";
 import {
   DEFAULT_SHADOW_MAX_BYTES,
   DEFAULT_SHADOW_RETENTION_MS,
@@ -250,6 +251,93 @@ test("buildShadowFactLookup is exported and behaves identically to its existing 
   assert.equal(lookup(buildConstraintTarget("service.presence", "nginx")), "true");
   assert.equal(lookup(buildConstraintTarget("network.listening_port.owner", "tcp:0.0.0.0:5432")), undefined);
   assert.equal(lookup("nonexistent.target"), undefined);
+});
+
+// --- Slice A (Codex-hardening): same-tick multi-owner ambiguity → skip, never silently pick ---
+
+test("buildShadowFactLookup: two same-ts fact points with DIFFERENT values for one entity_key are ambiguous → lookup returns undefined (never silently last-wins) and records the ambiguous target", () => {
+  const port = "tcp:0.0.0.0:8080";
+  // SO_REUSEPORT / same-address multi-owner: two distinct owners in ONE structural tick share that
+  // tick's ts. Pre-Slice-A this collapsed to last-processed-wins with no trace.
+  const points = [
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "nginx", owner_known: "true" } },
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "haproxy", owner_known: "true" } },
+  ];
+  const target = buildConstraintTarget("network.listening_port.owner", port);
+  const lookup = buildShadowFactLookup(points);
+  assert.equal(lookup(target), undefined, "conflicting owners in the same tick must NOT resolve to either — skip");
+  assert.ok(Array.isArray(lookup.ambiguousTargets), "ambiguity is observable via lookup.ambiguousTargets");
+  assert.deepEqual(lookup.ambiguousTargets, [target]);
+});
+
+test("buildShadowFactLookup: two same-ts points with the SAME value are NOT ambiguous (the common real case — identical duplicate observation)", () => {
+  const port = "tcp:0.0.0.0:8080";
+  const points = [
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "nginx", owner_known: "true" } },
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "nginx", owner_known: "true" } },
+  ];
+  const target = buildConstraintTarget("network.listening_port.owner", port);
+  const lookup = buildShadowFactLookup(points);
+  assert.equal(lookup(target), "nginx");
+  assert.deepEqual(lookup.ambiguousTargets, []);
+});
+
+test("buildShadowFactLookup: a strictly-newer single-valued tick CLEARS a prior same-ts ambiguity (newer observation legitimately supersedes; ambiguity is per-latest-ts, not sticky)", () => {
+  const port = "tcp:0.0.0.0:8080";
+  const target = buildConstraintTarget("network.listening_port.owner", port);
+  const mk = (ts, owner) => ({ ts, fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner, owner_known: "true" } });
+  // Ambiguous at 00:00, then a clean single owner at 00:05 → resolved to that owner, order-independent.
+  for (const points of [
+    [mk("2026-07-16T00:00:00.000Z", "nginx"), mk("2026-07-16T00:00:00.000Z", "haproxy"), mk("2026-07-16T00:05:00.000Z", "nginx")],
+    [mk("2026-07-16T00:05:00.000Z", "nginx"), mk("2026-07-16T00:00:00.000Z", "nginx"), mk("2026-07-16T00:00:00.000Z", "haproxy")],
+  ]) {
+    const lookup = buildShadowFactLookup(points);
+    assert.equal(lookup(target), "nginx", "the newest tick's unambiguous owner wins regardless of array order");
+    assert.deepEqual(lookup.ambiguousTargets, []);
+  }
+});
+
+test("buildShadowFactLookup: a DEGRADED point (confidence:0/owner_known:false) never participates in ambiguity — it is excluded first, so one real owner + one degraded is unambiguous", () => {
+  const port = "tcp:0.0.0.0:8080";
+  const target = buildConstraintTarget("network.listening_port.owner", port);
+  const points = [
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "nginx", owner_known: "true" } },
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner_known: "false" }, confidence: 0 },
+  ];
+  const lookup = buildShadowFactLookup(points);
+  assert.equal(lookup(target), "nginx", "degraded exclusion runs BEFORE ambiguity — a degraded point is not a competing value");
+  assert.deepEqual(lookup.ambiguousTargets, []);
+});
+
+test("buildShadowFactLookup: same-ts distinct values across DIFFERENT entity_keys never cross-contaminate (ambiguity is per-target)", () => {
+  const points = [
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } },
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "service.presence", entity_key: "redis", attributes: { running: "false" } },
+  ];
+  const lookup = buildShadowFactLookup(points);
+  assert.equal(lookup(buildConstraintTarget("service.presence", "nginx")), "true");
+  assert.equal(lookup(buildConstraintTarget("service.presence", "redis")), "false");
+  assert.deepEqual(lookup.ambiguousTargets, []);
+});
+
+test("Slice A end-to-end: an active constraint whose target is same-tick-ambiguous is SKIPPED by evaluateConstraints — never fired, never satisfied against a silently-picked owner", () => {
+  const port = "tcp:0.0.0.0:8080";
+  const target = buildConstraintTarget("network.listening_port.owner", port);
+  const points = [
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "nginx", owner_known: "true" } },
+    { ts: "2026-07-16T00:00:00.000Z", fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "evil", owner_known: "true" } },
+  ];
+  const lookup = buildShadowFactLookup(points);
+  const constraint = {
+    id: "constraint.mined.port-binding-identity.test",
+    kind: "constraint",
+    family: "port-binding-identity",
+    target,
+    expected: { comparator: "eq", value: "nginx" },
+    status: "active",
+  };
+  const candidates = evaluateConstraints([constraint], lookup);
+  assert.deepEqual(candidates, [], "ambiguity resolves to skip; a masked 'evil' owner never silently satisfies, and 'nginx' is never fabricated as satisfied either");
 });
 
 // --- No LLM anywhere (grep-able absence, mirrors S6c's/S7's planned regression) ---

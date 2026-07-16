@@ -192,7 +192,12 @@ function isDegradedFactPoint(point) {
  * distinct long entity_keys can collide onto the same target). Degraded observations
  * (owner_known:"false"/confidence:0) are excluded entirely — never used as evidence, mirroring
  * the miner's own degrade-don't-fabricate exclusion. When multiple fact points map to the same
- * target, the most recent (by ts) wins.
+ * target, the most recent (by ts) wins — EXCEPT when the most recent ts itself carries two or more
+ * DIFFERENT values (a within-tick contradiction, since one collector tick shares one ts): that
+ * target is marked ambiguous and the lookup returns undefined for it (Slice A, Codex-hardening),
+ * so evaluateConstraints skips it rather than silently picking whichever was processed last. The
+ * set of suppressed targets is exposed on the returned function as `lookup.ambiguousTargets` for
+ * observability; existing callers that only invoke `lookup(target)` are unaffected.
  *
  * Exported additively (Slice S-live-1): daemon.js's active-constraint evaluation reuses this
  * exact function so ACTIVE and SHADOW evaluation reconstruct constraint targets identically
@@ -211,9 +216,35 @@ export function buildShadowFactLookup(factPoints) {
     const tsMs = new Date(point.ts).getTime();
     if (!Number.isFinite(tsMs)) continue;
     const existing = latestByTarget.get(target);
-    if (!existing || tsMs >= existing.tsMs) latestByTarget.set(target, { tsMs, value });
+    if (!existing || tsMs > existing.tsMs) {
+      // First observation, or a strictly-NEWER tick: it legitimately supersedes anything older,
+      // clearing any prior same-ts ambiguity (ambiguity is per-latest-ts, never sticky).
+      latestByTarget.set(target, { tsMs, value, ambiguous: false });
+    } else if (tsMs === existing.tsMs && value !== existing.value) {
+      // Slice A (Codex-hardening): two DIFFERENT values at the SAME latest ts. Since every fact
+      // from one collector tick shares that tick's ts, this is a within-tick contradiction —
+      // e.g. two owners (SO_REUSEPORT / same-address multi-owner) claiming one port in one tick.
+      // Pre-Slice-A this silently collapsed to last-processed-wins; now the target is marked
+      // ambiguous and the lookup withholds a value (fail to skip, never silently pick one). An
+      // identical duplicate value (value === existing.value, the common real case) is NOT ambiguous.
+      existing.ambiguous = true;
+    }
+    // tsMs < existing.tsMs: an older observation; the newer one already won — ignore.
   }
-  return (target) => latestByTarget.get(target)?.value;
+  // Ambiguity is observable (not silent): every degrade-not-fabricate decision in this codebase
+  // leaves a trail. An ambiguous target resolves to undefined, routing through evaluateConstraints'
+  // audited "no fact, no claim → skip" path — it can only ever WITHHOLD a satisfy/violation on
+  // conflicting evidence, never invent one.
+  const ambiguousTargets = [];
+  for (const [target, entry] of latestByTarget) {
+    if (entry.ambiguous) ambiguousTargets.push(target);
+  }
+  const lookup = (target) => {
+    const entry = latestByTarget.get(target);
+    return entry && !entry.ambiguous ? entry.value : undefined;
+  };
+  lookup.ambiguousTargets = ambiguousTargets;
+  return lookup;
 }
 
 /**
