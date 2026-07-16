@@ -4,12 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { loadConstraints, writeConstraints } from "../src/constraint-store.js";
+import { loadConstraints, resolveConstraintStorePaths, writeConstraints } from "../src/constraint-store.js";
 import {
   DEFAULT_PROMOTION_EXPIRY_MS,
   decideConstraintPromotion,
   loadPromotions,
   mintPendingPromotion,
+  reconcileOrphanedPendings,
   resolvePromotionStorePaths,
   runLearnedApprove,
   runLearnedReject,
@@ -569,4 +570,139 @@ test("a denial never fabricates a wrong-nonce attempt on an already-decided reco
 
   const { constraints } = await loadConstraints(paths);
   assert.equal(constraints.find((c) => c.id === constraint.id).status, "review-ready", "the constraint was not activated");
+});
+
+// --- reconcileOrphanedPendings (Codex "spot C": orphaned pending promotions) ---
+
+test("reconcileOrphanedPendings (pure): only pendings whose constraint is NOT review-ready are closed; live/decided records untouched by identity", () => {
+  const constraints = [
+    reviewReadyConstraint({ id: "constraint.live" }), // review-ready → its pending stays live
+    reviewReadyConstraint({ id: "constraint.active", status: "active" }), // orphan: approve crashed after constraints.json
+    reviewReadyConstraint({ id: "constraint.retired", status: "retired" }), // orphan: reject crashed after constraints.json
+    // constraint.gone is absent entirely → its pending is also an orphan
+  ];
+  const base = (overrides) => ({
+    id: overrides.id,
+    nonce: "n",
+    promotion_ref: overrides.promotion_ref,
+    bounded_summary: "s",
+    evidence_refs: [],
+    expiry: "2026-07-11T00:00:00.000Z",
+    status: overrides.status,
+    audit_transitions: [],
+    ...overrides,
+  });
+  const livePending = base({ id: "promotion.live", promotion_ref: "constraint.live", status: "pending" });
+  const activeOrphan = base({ id: "promotion.active", promotion_ref: "constraint.active", status: "pending" });
+  const retiredOrphan = base({ id: "promotion.retired", promotion_ref: "constraint.retired", status: "pending" });
+  const goneOrphan = base({ id: "promotion.gone", promotion_ref: "constraint.gone", status: "pending" });
+  const alreadyApproved = base({ id: "promotion.appr", promotion_ref: "constraint.active", status: "approved" });
+  const alreadyRejected = base({ id: "promotion.rej", promotion_ref: "constraint.retired", status: "rejected" });
+  const promotions = [livePending, activeOrphan, retiredOrphan, goneOrphan, alreadyApproved, alreadyRejected];
+
+  const { promotions: out, reconciledIds } = reconcileOrphanedPendings(constraints, promotions, "2026-07-10T00:00:00.000Z");
+
+  assert.deepEqual(reconciledIds.sort(), ["promotion.active", "promotion.gone", "promotion.retired"]);
+  const byId = Object.fromEntries(out.map((r) => [r.id, r]));
+  // Live pending, approved, rejected are returned by identity (===) — never touched.
+  assert.equal(byId["promotion.live"], livePending);
+  assert.equal(byId["promotion.appr"], alreadyApproved);
+  assert.equal(byId["promotion.rej"], alreadyRejected);
+  // The three orphans are transitioned to the terminal "reconciled" status with an audit entry.
+  for (const id of ["promotion.active", "promotion.retired", "promotion.gone"]) {
+    assert.equal(byId[id].status, "reconciled");
+    assert.equal(byId[id].decided_at, "2026-07-10T00:00:00.000Z");
+    const last = byId[id].audit_transitions.at(-1);
+    assert.equal(last.action, "reconciled");
+    assert.equal(last.actor, "system");
+    assert.equal(last.reason, "constraint_not_review_ready");
+  }
+});
+
+test("reconcileOrphanedPendings is idempotent — a second pass reconciles nothing and returns records by identity", () => {
+  const constraints = [reviewReadyConstraint({ id: "constraint.active", status: "active" })];
+  const pending = {
+    id: "promotion.p", nonce: "n", promotion_ref: "constraint.active", bounded_summary: "s",
+    evidence_refs: [], expiry: "2026-07-11T00:00:00.000Z", status: "pending", audit_transitions: [],
+  };
+  const first = reconcileOrphanedPendings(constraints, [pending], "2026-07-10T00:00:00.000Z");
+  assert.deepEqual(first.reconciledIds, ["promotion.p"]);
+  const second = reconcileOrphanedPendings(constraints, first.promotions, "2026-07-10T01:00:00.000Z");
+  assert.deepEqual(second.reconciledIds, []);
+  assert.equal(second.promotions[0], first.promotions[0], "unchanged record returned by identity");
+  assert.equal(second.promotions[0].audit_transitions.length, 1, "no duplicate reconciled audit entry");
+});
+
+test("descartes learned review reconciles a pending orphaned by an approve that crashed after writing constraints.json", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  const now = "2026-07-10T00:00:00.000Z";
+  // Mint the pending while review-ready, then simulate the crash window: constraints.json advanced
+  // to active, but promotions.json still holds the stale pending record.
+  const { promotion: minted } = await mintPendingPromotion(paths, constraint, { now });
+  await writeConstraints(paths, [{ ...constraint, status: "active" }]);
+
+  const lines = [];
+  const result = await runLearnedReview(paths, [], { now: Date.parse(now), output: (l) => lines.push(l) });
+
+  assert.deepEqual(result.reconciled, [minted.id]);
+  assert.equal(result.review_ready.length, 0, "the active constraint is not re-listed as review-ready");
+  assert.match(lines.join("\n"), /Reconciled 1 orphaned pending/);
+
+  const { promotions } = await loadPromotions(paths);
+  const record = promotions.find((p) => p.id === minted.id);
+  assert.equal(record.status, "reconciled");
+  assert.equal(record.audit_transitions.at(-1).action, "reconciled");
+});
+
+test("descartes learned review does NOT reconcile a pending whose constraint is still review-ready", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, constraint, { now });
+
+  const result = await runLearnedReview(paths, [], { now: Date.parse(now), output: () => {} });
+  assert.deepEqual(result.reconciled, []);
+
+  const { promotions } = await loadPromotions(paths);
+  const record = promotions.find((p) => p.id === minted.id);
+  assert.equal(record.status, "pending", "a live review-ready pending is left usable");
+});
+
+test("descartes learned review never writes constraints.json while reconciling (byte-identical)", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  const now = "2026-07-10T00:00:00.000Z";
+  await mintPendingPromotion(paths, constraint, { now });
+  await writeConstraints(paths, [{ ...constraint, status: "active" }]);
+
+  const { constraintsFile } = resolveConstraintStorePaths(paths);
+  const before = await fs.readFile(constraintsFile, "utf8");
+
+  await runLearnedReview(paths, [], { now: Date.parse(now), output: () => {} });
+
+  const after = await fs.readFile(constraintsFile, "utf8");
+  assert.equal(after, before, "reconciliation is a promotion-only hygiene pass; constraints.json is untouched");
+});
+
+test("a reconciled promotion record is inert — its nonce can never approve, even if the constraint were review-ready again", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, constraint, { now });
+  await writeConstraints(paths, [{ ...constraint, status: "active" }]);
+  await runLearnedReview(paths, [], { now: Date.parse(now), output: () => {} }); // reconciles minted
+
+  // Pathological: a later mining pass re-lists the constraint as review-ready (fresh cycle). The OLD
+  // reconciled record must still be unusable — matchPendingPromotion only accepts status:"pending".
+  await writeConstraints(paths, [{ ...constraint, status: "review-ready" }]);
+  await assert.rejects(
+    () => decideConstraintPromotion(paths, constraint.id, minted.nonce, "approved", { now }),
+    /promotion denied \(orphan_reconciled\)/,
+    "a reconciled record's nonce is dead — denies closed with an honest orphan_reconciled reason, not a human-decision label",
+  );
 });

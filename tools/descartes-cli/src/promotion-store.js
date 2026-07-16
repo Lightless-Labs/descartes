@@ -31,7 +31,16 @@ export const SCHEMA_VERSION = 1;
 // not an attacker model. 24h recommended window.
 export const DEFAULT_PROMOTION_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
-export const PROMOTION_STATUSES = ["pending", "approved", "rejected"];
+// "reconciled" (Codex-review "spot C" fix): a terminal status for a pending promotion record whose
+// target constraint is no longer review-ready. decideConstraintPromotion writes constraints.json
+// (activate) BEFORE promotions.json (mark approved), so a crash between the two writes leaves an
+// active constraint with a stale status:"pending" record. That record is already dead — it can never
+// approve anything (decideConstraintPromotion denies unless the constraint is review-ready) — so
+// `learned review` reconciles it to this terminal status. This is fail-safe: it NEVER activates or
+// retires a constraint and NEVER un-does an approval; it only closes a promotion record that is
+// already unusable. Not a member of the "usable" set findValidPendingPromotion/matchPendingPromotion
+// filter on (status:"pending"), so a reconciled record is inert by construction.
+export const PROMOTION_STATUSES = ["pending", "approved", "rejected", "reconciled"];
 
 export function resolvePromotionStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "authority");
@@ -229,6 +238,60 @@ export async function mintPendingPromotion(descartesPaths, constraint, options =
 }
 
 /**
+ * Codex-review "spot C" reconciliation. decideConstraintPromotion writes constraints.json
+ * (activate on approve / retire on reject) BEFORE promotions.json (mark the record decided), so
+ * a crash between the two writes leaves a status:"pending" promotion record whose constraint is
+ * no longer review-ready. That record is already inert — decideConstraintPromotion denies at the
+ * "constraint.status !== review-ready" check (step 2) before it ever consults the record — but it
+ * lingers as "pending" forever (well past expiry), polluting the audit surface and any
+ * pending-count telemetry. This pure helper transitions every such orphan to the terminal
+ * "reconciled" status.
+ *
+ * Fail-safe by construction — it can only ever CLOSE an already-dead record:
+ *   - NEVER reads or writes constraints (no activate/retire). Constraints are passed in read-only
+ *     purely to compute the review-ready id set; only promotions are returned.
+ *   - ONLY transitions records currently status:"pending". approved/rejected/reconciled records
+ *     are returned by identity (===), so it never un-does a real human decision and is idempotent
+ *     (a second pass finds nothing left to reconcile).
+ *   - ONLY reconciles a pending whose constraint is NOT currently review-ready (active, retired,
+ *     or absent entirely). A pending whose constraint IS still review-ready is a live, usable
+ *     review and is returned untouched — reconciliation can never invalidate a legitimate nonce.
+ *
+ * Returns { promotions, reconciledIds } — reconciledIds is empty when nothing changed, letting
+ * the caller skip the write entirely (so a steady-state review is a pure read of promotions.json).
+ */
+export function reconcileOrphanedPendings(constraints, promotions, nowIso) {
+  const ts = normalizeIso(nowIso);
+  const reviewReadyIds = new Set(
+    (constraints ?? [])
+      .filter((constraint) => constraint?.status === "review-ready")
+      .map((constraint) => constraint?.id),
+  );
+  const reconciledIds = [];
+  const updated = (promotions ?? []).map((record) => {
+    if (record?.status !== "pending") return record;
+    if (reviewReadyIds.has(record?.promotion_ref)) return record;
+    reconciledIds.push(record.id);
+    return {
+      ...record,
+      status: "reconciled",
+      decided_at: ts,
+      audit_transitions: [
+        ...(record.audit_transitions ?? []),
+        {
+          ts,
+          action: "reconciled",
+          actor: "system",
+          reason: "constraint_not_review_ready",
+          note: "orphaned pending promotion reconciled by descartes learned review",
+        },
+      ],
+    };
+  });
+  return { promotions: updated, reconciledIds };
+}
+
+/**
  * Deny-by-default matcher: returns the single pending, nonce-matched, unexpired promotion
  * record for constraintId, or undefined. Every other case (no record at all, wrong nonce,
  * expired, already decided) returns undefined — callers MUST treat "no match" as a hard deny,
@@ -251,7 +314,15 @@ function denialReason(promotions, constraintId, nonce, nowMs) {
   const forConstraint = (promotions ?? []).filter((record) => record?.promotion_ref === constraintId);
   if (forConstraint.length === 0) return "no_pending_promotion";
   const pending = forConstraint.filter((record) => record.status === "pending");
-  if (pending.length === 0) return "already_decided";
+  if (pending.length === 0) {
+    // Honest attribution: distinguish a system-reconciled orphan (a pending closed by
+    // `learned review` because its constraint left review-ready) from a genuine human
+    // approve/reject. Only when NO real decision exists and a reconciled record does — otherwise a
+    // real decision took precedence and "already_decided" is the accurate reason.
+    const humanDecided = forConstraint.some((record) => record.status === "approved" || record.status === "rejected");
+    if (!humanDecided && forConstraint.some((record) => record.status === "reconciled")) return "orphan_reconciled";
+    return "already_decided";
+  }
   const nonceMatches = pending.filter((record) => record.nonce === nonce);
   if (nonceMatches.length === 0) return "nonce_mismatch";
   const unexpired = nonceMatches.filter((record) => new Date(record.expiry).getTime() > nowMs);
@@ -432,8 +503,24 @@ export async function runLearnedReview(descartesPaths, args, runtime = {}) {
   }
 
   const now = runtime.now ?? Date.now();
+  const nowIso = new Date(now).toISOString();
   const { constraints } = await loadConstraints(descartesPaths);
   const reviewReady = constraints.filter((constraint) => constraint?.status === "review-ready");
+
+  // Codex "spot C": close any pending promotion orphaned by a crash between
+  // decideConstraintPromotion's two writes (constraints.json then promotions.json) BEFORE minting.
+  // Done first so a fresh mint never races a stale record for the same constraint, and so this
+  // reconciliation reads/writes promotions exactly once (mintPendingPromotion re-loads afterwards).
+  // Never touches constraints — a purely promotion-side hygiene pass.
+  const { promotions: loadedPromotions } = await loadPromotions(descartesPaths);
+  const { promotions: reconciledPromotions, reconciledIds } = reconcileOrphanedPendings(
+    constraints,
+    loadedPromotions,
+    nowIso,
+  );
+  if (reconciledIds.length > 0) {
+    await writePromotions(descartesPaths, reconciledPromotions);
+  }
 
   const entries = [];
   for (const constraint of reviewReady) {
@@ -452,13 +539,18 @@ export async function runLearnedReview(descartesPaths, args, runtime = {}) {
   }
 
   if (json) {
-    output(JSON.stringify({ learned_review: { review_ready: entries } }, null, 2));
-  } else if (entries.length === 0) {
-    output("No review-ready constraints.");
+    output(JSON.stringify({ learned_review: { review_ready: entries, reconciled: reconciledIds } }, null, 2));
   } else {
-    output(entries.map(renderReviewEntry).join("\n"));
+    if (reconciledIds.length > 0) {
+      output(`Reconciled ${reconciledIds.length} orphaned pending promotion(s): ${reconciledIds.join(", ")}`);
+    }
+    if (entries.length === 0) {
+      output("No review-ready constraints.");
+    } else {
+      output(entries.map(renderReviewEntry).join("\n"));
+    }
   }
-  return { review_ready: entries };
+  return { review_ready: entries, reconciled: reconciledIds };
 }
 
 function decisionUsage(name) {
