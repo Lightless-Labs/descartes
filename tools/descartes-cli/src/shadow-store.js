@@ -199,11 +199,24 @@ function isDegradedFactPoint(point) {
  * set of suppressed targets is exposed on the returned function as `lookup.ambiguousTargets` for
  * observability; existing callers that only invoke `lookup(target)` are unaffected.
  *
+ * OPT-IN freshness (Slice B): `buildShadowFactLookup(points, { now, freshnessMs })` additionally
+ * resolves a target to undefined when its freshest point predates `now - freshnessMs` (stale = no
+ * live claim). Both fields are required to arm it; omitting either — the default, and every
+ * backtest/replay caller — is byte-identical to the no-argument form (no wall-clock in the lookup).
+ *
  * Exported additively (Slice S-live-1): daemon.js's active-constraint evaluation reuses this
  * exact function so ACTIVE and SHADOW evaluation reconstruct constraint targets identically
  * (same degraded-observation exclusion, same latest-wins tie-break) — never duplicated.
  */
-export function buildShadowFactLookup(factPoints) {
+export function buildShadowFactLookup(factPoints, options = {}) {
+  // Slice B (Codex-hardening) OPT-IN freshness bound. When BOTH `now` and `freshnessMs` are
+  // provided, a target whose latest contributing point is older than `now - freshnessMs` resolves
+  // to undefined (stale = "no live claim" → evaluateConstraints skips it), closing the "vanished
+  // service reads running:true for up to the 30-day retention window" false-satisfy. When either is
+  // omitted — every backtest/replay/calibration caller, and the default — behaviour is BYTE-IDENTICAL
+  // to before (no wall-clock enters the lookup), so historical-window replay is untouched.
+  const nowMs = options.now === undefined ? undefined : (typeof options.now === "number" ? options.now : new Date(options.now).getTime());
+  const staleCutoffMs = Number.isFinite(nowMs) && Number.isFinite(options.freshnessMs) ? nowMs - options.freshnessMs : undefined;
   const latestByTarget = new Map();
   for (const point of factPoints ?? []) {
     if (!point || isDegradedFactPoint(point)) continue;
@@ -241,7 +254,11 @@ export function buildShadowFactLookup(factPoints) {
   }
   const lookup = (target) => {
     const entry = latestByTarget.get(target);
-    return entry && !entry.ambiguous ? entry.value : undefined;
+    if (!entry || entry.ambiguous) return undefined;
+    // Slice B: a target whose freshest observation predates the cutoff is stale — withhold it
+    // (skip), never report a long-dead value as a current claim. Only active when opted in.
+    if (staleCutoffMs !== undefined && entry.tsMs < staleCutoffMs) return undefined;
+    return entry.value;
   };
   lookup.ambiguousTargets = ambiguousTargets;
   return lookup;
@@ -269,8 +286,18 @@ export async function evaluateAndLogShadowConstraints(descartesPaths, options = 
     return { evaluated_count: 0, fired_count: 0, appended_count: 0 };
   }
 
-  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs, now: options.now });
-  const factLookup = buildShadowFactLookup(points);
+  // Slice B (Codex-hardening): the daemon passes `freshnessMs` (3× the structural interval) so the
+  // shadow-SOAK path applies the SAME staleness bound as the live-active path — otherwise a shadow
+  // constraint could accumulate a clean "never fired" soak record purely because its evidence went
+  // stale, then get promoted and only then start skipping. When `freshnessMs` is omitted (direct
+  // unit calls, no daemon), staleness is off and behaviour is unchanged. The read window is bounded
+  // to the same horizon (anything older is stale anyway) instead of scanning full retention.
+  const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const freshnessMs = options.freshnessMs;
+  // Read window and lookup staleness share one resolved nowMs snapshot (never a bare options.now that
+  // would let readFactPoints take its own, later, Date.now() and drop a horizon-edge-fresh fact).
+  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
+  const factLookup = buildShadowFactLookup(points, { now: nowMs, freshnessMs });
   const ts = options.ts ?? (options.now !== undefined ? new Date(options.now).toISOString() : new Date().toISOString());
   const records = evaluateShadowConstraints(shadowConstraints, factLookup, { ts });
 

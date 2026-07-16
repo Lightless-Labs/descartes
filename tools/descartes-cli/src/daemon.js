@@ -41,6 +41,13 @@ export const DEFAULT_DAEMON_INTERVAL_MS = 60 * 1000;
 export const DEFAULT_DAEMON_PROCESS_LIMIT = 5;
 export const DEFAULT_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_STRUCTURAL_TICK_DEADLINE_MS = 45 * 1000;
+// Slice B (Codex-hardening): a structural fact (service.presence / network.listening_port.owner)
+// unobserved for more than this many STRUCTURAL cycles is treated as stale ("no live claim") by the
+// active + shadow-soak constraint eval, instead of reading its last value as current for up to the
+// 30-day fact-retention window. 3× the structural interval (default 3h) tolerates a couple of
+// missed/slow structural ticks before a constraint stops evaluating. Pinned to the STRUCTURAL
+// interval, NEVER the fast tick — those facts only refresh on the structural cadence.
+export const ACTIVE_FRESHNESS_MULTIPLE = 3;
 
 export function defaultDaemonProfile() {
   return {
@@ -358,9 +365,19 @@ async function computeActiveConstraintCandidates(descartesPaths, options) {
   const activeConstraints = constraints.filter((constraint) => constraint?.status === "active");
   if (activeConstraints.length === 0) return [];
 
+  // Slice B (Codex-hardening): `activeFreshnessMs` is threaded in by runDaemonIteration (3× the
+  // STRUCTURAL interval — never the fast tick — since service.presence/network facts only refresh
+  // on the structural cadence). It bounds both the fact read and the lookup's staleness horizon, so
+  // a service/port unobserved for >3 structural cycles stops reading "satisfied" and skips. Absent
+  // (direct unit calls) → staleness off, read window unbounded, behaviour unchanged.
+  const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const freshnessMs = options.activeFreshnessMs;
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs, now: options.now });
-  const factLookup = buildShadowFactLookup(points);
+  // Pass the SAME resolved nowMs snapshot to the read window AND the lookup staleness — never a bare
+  // options.now (undefined in the live loop), which would let readFactPoints take its own, strictly
+  // later, Date.now() and exclude a fact that is fresh per this snapshot at the horizon edge.
+  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
+  const factLookup = buildShadowFactLookup(points, { now: nowMs, freshnessMs });
   return evaluateConstraints(activeConstraints, factLookup);
 }
 
@@ -387,6 +404,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  // Slice B (Codex-hardening): one freshness horizon, derived from the RESOLVED profile's structural
+  // interval (not options.profile, which may be undefined when defaulted), threaded into BOTH the
+  // live-active and shadow-soak constraint evals so they apply the identical staleness bound.
+  const structuralIntervalMs = profile.structural?.interval_ms ?? DEFAULT_STRUCTURAL_INTERVAL_MS;
+  const activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE * structuralIntervalMs;
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
   const write = await appendMetricPoints(descartesPaths, points, {
@@ -473,7 +495,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // alerts.json/notifications (evaluateAndLogShadowConstraints never imports
           // alert-store.js).
           const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
-          shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts });
+          shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
         }
         const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
         await writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts });
@@ -502,7 +524,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
         extraCandidates: [
-          ...await computeActiveConstraintCandidates(descartesPaths, options),
+          ...await computeActiveConstraintCandidates(descartesPaths, { ...options, activeFreshnessMs }),
           ...await computeProvenanceWarningCandidates(descartesPaths, options),
           // Slice S5, additive: identity-baseline deviation candidates (unknown_identity/
           // identity_drift/new_public_bind) land in the same concatenation, same commit

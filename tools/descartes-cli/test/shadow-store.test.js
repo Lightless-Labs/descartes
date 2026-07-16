@@ -340,6 +340,72 @@ test("Slice A end-to-end: an active constraint whose target is same-tick-ambiguo
   assert.deepEqual(candidates, [], "ambiguity resolves to skip; a masked 'evil' owner never silently satisfies, and 'nginx' is never fabricated as satisfied either");
 });
 
+// --- Slice B (Codex-hardening): opt-in freshness bound (stale fact ≠ live claim) ---
+
+test("buildShadowFactLookup: with {now, freshnessMs}, a point WITHIN the window resolves; a point OLDER than now-freshnessMs is stale → undefined (no 30-day stale-true masquerade)", () => {
+  const target = buildConstraintTarget("service.presence", "nginx");
+  const now = Date.parse("2026-07-16T12:00:00.000Z");
+  const freshnessMs = 3 * 60 * 60 * 1000; // 3h
+  const freshPoints = [{ ts: "2026-07-16T11:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }];
+  const stalePoints = [{ ts: "2026-07-16T08:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }]; // 4h old
+  assert.equal(buildShadowFactLookup(freshPoints, { now, freshnessMs })(target), "true", "1h-old fact is fresh within a 3h window");
+  assert.equal(buildShadowFactLookup(stalePoints, { now, freshnessMs })(target), undefined, "4h-old fact is stale — no live claim → skip");
+});
+
+test("buildShadowFactLookup: staleness boundary is inclusive — a point exactly at now-freshnessMs is still fresh; one millisecond older is stale", () => {
+  const target = buildConstraintTarget("service.presence", "nginx");
+  const now = Date.parse("2026-07-16T12:00:00.000Z");
+  const freshnessMs = 3 * 60 * 60 * 1000;
+  const atHorizon = new Date(now - freshnessMs).toISOString();
+  const pastHorizon = new Date(now - freshnessMs - 1).toISOString();
+  const mk = (ts) => [{ ts, fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }];
+  assert.equal(buildShadowFactLookup(mk(atHorizon), { now, freshnessMs })(target), "true", "exactly at the horizon = fresh");
+  assert.equal(buildShadowFactLookup(mk(pastHorizon), { now, freshnessMs })(target), undefined, "1ms past the horizon = stale");
+});
+
+test("buildShadowFactLookup: OMITTING the freshness options is byte-identical to today — an ancient point still resolves latest-wins (backtests/replay unaffected)", () => {
+  const target = buildConstraintTarget("service.presence", "nginx");
+  const ancient = [{ ts: "2000-01-01T00:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }];
+  assert.equal(buildShadowFactLookup(ancient)(target), "true", "no options → no staleness → unchanged");
+  assert.equal(buildShadowFactLookup(ancient, {})(target), "true", "empty options → no staleness");
+  assert.equal(buildShadowFactLookup(ancient, { freshnessMs: 1000 })(target), "true", "freshnessMs without now → no staleness (both required)");
+  assert.equal(buildShadowFactLookup(ancient, { now: Date.parse("2026-07-16T00:00:00.000Z") })(target), "true", "now without freshnessMs → no staleness (both required)");
+});
+
+test("buildShadowFactLookup: ambiguity short-circuits freshness — an ambiguous target is undefined whether its (shared) ts is fresh or stale", () => {
+  const port = "tcp:0.0.0.0:8080";
+  const target = buildConstraintTarget("network.listening_port.owner", port);
+  const mk = (ts) => [
+    { ts, fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "nginx", owner_known: "true" } },
+    { ts, fact_name: "network.listening_port.owner", entity_key: port, attributes: { owner: "haproxy", owner_known: "true" } },
+  ];
+  const now = Date.parse("2026-07-16T12:00:00.000Z");
+  const freshnessMs = 3 * 60 * 60 * 1000;
+  assert.equal(buildShadowFactLookup(mk("2026-07-16T11:00:00.000Z"), { now, freshnessMs })(target), undefined, "ambiguous × fresh → skip");
+  assert.equal(buildShadowFactLookup(mk("2026-07-16T06:00:00.000Z"), { now, freshnessMs })(target), undefined, "ambiguous × stale → skip");
+});
+
+test("Slice B: evaluateAndLogShadowConstraints (the SHADOW-SOAK path) applies the SAME freshness bound — a stale fact is skipped, so staleness can't quietly build a clean soak record that drives promotion; omitting freshnessMs is unchanged (opt-in)", async () => {
+  const paths = await tempPaths();
+  const factTs = "2026-07-10T00:00:00.000Z";
+  await writeConstraints(paths, [shadowConstraint()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } }, // would FIRE (expected "true") if fresh
+  ], { ts: factTs, now: factTs }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
+
+  const staleNow = new Date(Date.parse(factTs) + 4 * 60 * 60 * 1000).toISOString(); // 4h later
+  const freshnessMs = 3 * 60 * 60 * 1000;
+  const wideWindow = 30 * 24 * 60 * 60 * 1000; // read the old fact so the LOOKUP staleness (not the read window) does the skipping
+
+  const bounded = await evaluateAndLogShadowConstraints(paths, { now: staleNow, freshnessMs, factWindowMs: wideWindow });
+  assert.equal(bounded.evaluated_count, 1);
+  assert.equal(bounded.fired_count, 0, "a 4h-stale fact must not fire a shadow constraint");
+  assert.equal(bounded.appended_count, 0, "stale → skipped → no shadow record (neither confirms nor contradicts on dead evidence)");
+
+  const unbounded = await evaluateAndLogShadowConstraints(paths, { now: staleNow, factWindowMs: wideWindow });
+  assert.equal(unbounded.fired_count, 1, "omitting freshnessMs → no staleness → the stale fact still evaluates last-wins (opt-in confirmed)");
+});
+
 // --- No LLM anywhere (grep-able absence, mirrors S6c's/S7's planned regression) ---
 
 test("shadow-store.js never imports the pi-harness/alert-intelligence LLM touchpoints", async () => {

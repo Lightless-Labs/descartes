@@ -1168,6 +1168,50 @@ test("S-live-1: an active constraint whose target has no current fact does not f
   await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
 });
 
+// --- Slice B (Codex-hardening): eval-side freshness bound (stale fact ≠ live claim) ---
+
+test("Slice B: an active constraint whose only fact is older than 3× the structural interval is STALE → skipped, not fired (a vanished service no longer reads as a live violation for up to 30 days)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } }, // would VIOLATE if it were fresh
+  ], { ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
+
+  // now = fact ts + 4h; freshnessMs = 3 × DEFAULT_STRUCTURAL_INTERVAL_MS (1h) = 3h → 4h is stale.
+  // factWindowMs is deliberately WIDE (30d) so the old fact IS read — proving the LOOKUP staleness
+  // bound (not merely the read-window bound) is what suppresses it.
+  const staleNow = new Date(Date.parse(S_LIVE_1_TICK_TS) + 4 * 60 * 60 * 1000).toISOString();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: staleNow,
+    now: staleNow,
+    factWindowMs: 30 * 24 * 60 * 60 * 1000,
+  });
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === "constraint.violation.service-presence"), false, "a 4h-stale fact must not drive a live constraint");
+});
+
+test("Slice B (must-fix guard): freshness is pinned to the STRUCTURAL interval, NOT the fast tick — a 1h-old fact (>>3× the 60s fast tick) is still fresh within the 3h window and fires", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
+
+  // 1h old: if freshness were (wrongly) 3× the 60s fast tick = 180s, this would be stale and skip.
+  // Pinned to 3× the 1h structural interval = 3h, it is fresh → the violation still fires.
+  const freshNow = new Date(Date.parse(S_LIVE_1_TICK_TS) + 60 * 60 * 1000).toISOString();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: freshNow,
+    now: freshNow,
+  });
+  assert.ok(result.alerts.alerts.some((a) => a.rule_id === "constraint.violation.service-presence"), "a 1h-old fact within the 3h structural window still fires");
+});
+
 test("S-live-1: a satisfied active constraint does not fire", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
