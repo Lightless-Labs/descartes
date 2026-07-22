@@ -25,6 +25,28 @@ require_release_env() {
   fi
 }
 
+# Defined here (rather than further down, near its historical use at the
+# GitHub Release publish step) so it is callable by the notifier
+# reuse-vs-build decision, which runs before the build/notarize step.
+github_release_repository() {
+  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+    printf '%s' "$GITHUB_REPOSITORY"
+    return 0
+  fi
+  local url
+  url="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    # Tart guest checkouts are rsynced without .git; fall back to package metadata.
+    url="$(node -p "(JSON.parse(require('fs').readFileSync('$ROOT_DIR/package.json','utf8')).repository||{}).url||''" 2>/dev/null || true)"
+  fi
+  url="${url%.git}"
+  case "$url" in
+    *github.com:*) printf '%s' "${url##*github.com:}" ;;
+    *github.com/*) printf '%s' "${url##*github.com/}" ;;
+    *) return 1 ;;
+  esac
+}
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 Usage:
@@ -515,18 +537,74 @@ else
   print_chain_diagnostics
 fi
 
-DESCARTES_MACOS_NOTIFIER_BUILD_DIR="$BUILD_ROOT" \
-DESCARTES_MACOS_NOTIFIER_VERSION="$PACKAGE_VERSION" \
-"$ROOT_DIR/scripts/build-macos-notifier.sh"
+# Notifier reuse-vs-build decision: skip the rebuild+notarize round-trip when
+# the notifier source is byte-identical to a prior release's (see
+# docs/plans/2026-07-22-notifier-notarization-skip.md). Every uncertainty here
+# resolves to a normal build - this step is best-effort and must never take
+# down the otherwise fail-hard build path, so any unexpected failure of the
+# decision script itself is treated exactly like a "build" verdict.
+NOTIFIER_REUSED=0
+NOTIFIER_SOURCE_DIGEST="$("$ROOT_DIR/scripts/notifier-source-digest.sh")"
+if [[ -n "$TAG" ]]; then
+  NOTIFIER_GH_RELEASE_REPO="$(github_release_repository 2>/dev/null || true)"
+  # Pin reuse to artifacts signed by THIS release's signing team (the 10-char
+  # Team Identifier in the CODESIGN_IDENTITY, e.g. "...(PKPPLFK854)"). This is the
+  # real anti-substitution guard, and it also auto-forces a fresh build+notarize
+  # after a genuine signing-team change (old artifacts fail the team match), per
+  # the plan's identity-rotation runbook. Empty (unexpected identity shape) simply
+  # falls back to "any Developer ID", still gated by bundle id + notarization.
+  NOTIFIER_EXPECTED_TEAM_ID="$(printf '%s' "$CODESIGN_IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\))[[:space:]]*$/\1/p')"
+  if ! NOTIFIER_REUSE_DECISION="$(
+    SOURCE_DIGEST="$NOTIFIER_SOURCE_DIGEST" \
+    GH_RELEASE_REPO="$NOTIFIER_GH_RELEASE_REPO" \
+    GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    CURRENT_TAG="$TAG" \
+    OUT_ZIP="$ZIP_PATH" \
+    EXPECTED_TEAM_ID="$NOTIFIER_EXPECTED_TEAM_ID" \
+    "$ROOT_DIR/scripts/notifier-reuse-decision.sh"
+  )"; then
+    echo "warning: notifier-reuse-decision.sh exited unexpectedly; building fresh" >&2
+    NOTIFIER_REUSE_DECISION="build"
+  fi
+  if [[ "$NOTIFIER_REUSE_DECISION" == reuse\ * && -s "$ZIP_PATH" ]]; then
+    NOTIFIER_REUSED=1
+    echo "Notifier reuse: $NOTIFIER_REUSE_DECISION (source unchanged; skipping rebuild+notarize)"
+    shasum -a 256 "$ZIP_PATH" > "$SHA_PATH"
+  fi
+fi
 
-CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
-APPLE_NOTARY_KEY_PATH="$NOTARY_KEY_PATH" \
-APPLE_NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID" \
-APPLE_NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID" \
-DESCARTES_MACOS_NOTIFIER_ARTIFACT_DIR="$RELEASE_DIR" \
-"$ROOT_DIR/scripts/notarize-macos-notifier.sh" "$APP_DIR"
+if [[ "$NOTIFIER_REUSED" != "1" ]]; then
+  DESCARTES_MACOS_NOTIFIER_BUILD_DIR="$BUILD_ROOT" \
+  DESCARTES_MACOS_NOTIFIER_VERSION="$PACKAGE_VERSION" \
+  "$ROOT_DIR/scripts/build-macos-notifier.sh"
 
-shasum -a 256 "$ZIP_PATH" > "$SHA_PATH"
+  CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
+  APPLE_NOTARY_KEY_PATH="$NOTARY_KEY_PATH" \
+  APPLE_NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID" \
+  APPLE_NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID" \
+  DESCARTES_MACOS_NOTIFIER_ARTIFACT_DIR="$RELEASE_DIR" \
+  "$ROOT_DIR/scripts/notarize-macos-notifier.sh" "$APP_DIR"
+
+  shasum -a 256 "$ZIP_PATH" > "$SHA_PATH"
+fi
+
+# Attest this release's notifier zip (built or reused) so a LATER release can
+# decide whether it, in turn, can reuse it. On reuse this preserves the
+# ORIGINAL source_version (read from the reused zip's own embedded
+# Info.plist), not this release's version - see plan §4 on the version lag.
+# BEST-EFFORT: this runs AFTER a completed build+sign+notarize, so a transient
+# failure here must NOT fail an otherwise-successful, already-notarized release
+# (mirrors the tap-bump's best-effort discipline). Without the attestation this
+# release simply isn't reusable by a future one - which is fail-safe (that
+# future release just builds). Uploads below are gated on the file existing.
+NOTIFIER_REUSE_JSON_PATH="$RELEASE_DIR/notifier-reuse.json"
+if ! SOURCE_DIGEST="$NOTIFIER_SOURCE_DIGEST" \
+  ZIP_PATH="$ZIP_PATH" \
+  OUT_JSON="$NOTIFIER_REUSE_JSON_PATH" \
+  "$ROOT_DIR/scripts/generate-notifier-reuse-json.sh"; then
+  echo "warning: could not write notifier-reuse.json attestation; this release will not be reusable by a later release (its build+notarize is unaffected)" >&2
+  rm -f "$NOTIFIER_REUSE_JSON_PATH"
+fi
 
 # Upload directly only when running under a host-side Buildkite agent. Inside the
 # Tart guest there is no agent access token; there the pipeline rsyncs the release
@@ -534,26 +612,8 @@ shasum -a 256 "$ZIP_PATH" > "$SHA_PATH"
 if command -v buildkite-agent >/dev/null 2>&1 && [[ -n "${BUILDKITE_AGENT_ACCESS_TOKEN:-}" ]]; then
   buildkite-agent artifact upload "$ZIP_PATH"
   buildkite-agent artifact upload "$SHA_PATH"
+  [[ -f "$NOTIFIER_REUSE_JSON_PATH" ]] && buildkite-agent artifact upload "$NOTIFIER_REUSE_JSON_PATH"
 fi
-
-github_release_repository() {
-  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
-    printf '%s' "$GITHUB_REPOSITORY"
-    return 0
-  fi
-  local url
-  url="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null || true)"
-  if [[ -z "$url" ]]; then
-    # Tart guest checkouts are rsynced without .git; fall back to package metadata.
-    url="$(node -p "(JSON.parse(require('fs').readFileSync('$ROOT_DIR/package.json','utf8')).repository||{}).url||''" 2>/dev/null || true)"
-  fi
-  url="${url%.git}"
-  case "$url" in
-    *github.com:*) printf '%s' "${url##*github.com:}" ;;
-    *github.com/*) printf '%s' "${url##*github.com/}" ;;
-    *) return 1 ;;
-  esac
-}
 
 # Publish the stapled zip + checksum to the matching GitHub Release via the REST
 # API (the vanilla guest image has no gh CLI). GITHUB_TOKEN arrives via Doppler
@@ -561,7 +621,11 @@ github_release_repository() {
 if [[ -n "${GITHUB_TOKEN:-}" && -n "$TAG" ]]; then
   if GH_RELEASE_REPO="$(github_release_repository)" && [[ -n "$GH_RELEASE_REPO" ]]; then
     echo "Publishing GitHub Release $TAG assets to $GH_RELEASE_REPO"
-    GH_RELEASE_REPO="$GH_RELEASE_REPO" GH_RELEASE_TAG="$TAG" python3 - "$ZIP_PATH" "$SHA_PATH" <<'PY'
+    # Attestation is appended LAST (so it uploads after the zip+sha), and only when
+    # it was actually written (its generation is best-effort, above).
+    NOTIFIER_RELEASE_ASSETS=("$ZIP_PATH" "$SHA_PATH")
+    [[ -f "$NOTIFIER_REUSE_JSON_PATH" ]] && NOTIFIER_RELEASE_ASSETS+=("$NOTIFIER_REUSE_JSON_PATH")
+    GH_RELEASE_REPO="$GH_RELEASE_REPO" GH_RELEASE_TAG="$TAG" python3 - "${NOTIFIER_RELEASE_ASSETS[@]}" <<'PY'
 import json, os, sys, urllib.error, urllib.parse, urllib.request
 
 token = os.environ["GITHUB_TOKEN"]

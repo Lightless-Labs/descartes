@@ -2,7 +2,8 @@
 
 **Created:** 2026-07-22
 **Reviewed:** 2026-07-22 (adversarial design review, Sonnet — verdict NEEDS REWORK; 4 must-fixes + 8 should-fixes/nits folded below)
-**Status:** REVIEWED — ready to implement
+**Implemented:** 2026-07-22 — 3 standalone testable scripts (`notifier-source-digest.sh`, `notifier-reuse-decision.sh`, `generate-notifier-reuse-json.sh`) + wiring in `release-macos-notifier-buildkite.sh` + 20 host tests (`notifier-reuse.test.js`). Adversarially verified OVERALL_SAFE (Sonnet: no wrong-reuse path, no build-path crash/hang); its MEDIUM finding folded — the attestation WRITE is now best-effort (a failed attestation-gen never fails an otherwise-notarized release; uploads gated on the file existing). Also pinned `EXPECTED_TEAM_ID` from `CODESIGN_IDENTITY` (real anti-substitution + auto-rebuild on a genuine team change). NOT yet exercised on a real release (reuse first triggers on the 2nd post-feature tag; host-tested only until then).
+**Status:** IMPLEMENTED — awaiting first real-release validation (seed tag, then a reuse tag)
 **Motivation:** Every release tag rebuilds → signs → **notarizes** → staples `DescartesNotifier.app`
 unconditionally (`release-macos-notifier-buildkite.sh:518-529`), even for a pure-JS release where the
 notifier binary is byte-equivalent. That burns a multi-minute Apple notarization round-trip + a
