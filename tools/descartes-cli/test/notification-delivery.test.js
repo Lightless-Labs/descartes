@@ -13,6 +13,7 @@ import {
   resolveNotificationDeliveryPaths,
   testNotificationDelivery,
   resolveBundledMacosHelperPath,
+  macosAppBundleFor,
   writeNotificationDeliveryConfig,
 } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -157,6 +158,90 @@ test("native macOS delivery uses configured helper with fixed bounded arguments"
     "--alert-id", "alert_cpu",
     "--rule-id", "system.load.sustained_high",
   ]);
+});
+
+// --- macos-native: launch a .app helper via LaunchServices (`open`), not a direct exec ---
+// (Bug: exec'ing …/DescartesNotifier.app/Contents/MacOS/DescartesNotifier directly makes macOS deny
+//  notification authorization — "Notifications are not allowed for this application". `open` launches
+//  the registered bundle so the permission grant applies. Real-host confirmed 2026-07.)
+
+test("macosAppBundleFor extracts the .app from an inner Mach-O path, and returns undefined for a bare binary", () => {
+  assert.equal(
+    macosAppBundleFor("/opt/x/DescartesNotifier.app/Contents/MacOS/DescartesNotifier"),
+    "/opt/x/DescartesNotifier.app",
+  );
+  assert.equal(macosAppBundleFor("/opt/x/DescartesNotifier"), undefined);
+  assert.equal(macosAppBundleFor(undefined), undefined);
+});
+
+test("native macOS delivery launches a .app helper via `open -g -n <app> --args …`, NOT a direct exec of the inner binary", async () => {
+  const paths = await tempPaths();
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-app-helper-"));
+  const appBundle = path.join(root, "DescartesNotifier.app");
+  const inner = path.join(appBundle, "Contents", "MacOS", "DescartesNotifier");
+  await fs.mkdir(path.dirname(inner), { recursive: true });
+  await fs.writeFile(inner, "#!/bin/sh\n", { mode: 0o755 });
+
+  const calls = [];
+  const record = await deliverNotificationDecision(paths, {
+    notify: true, severity: "info", title: "T", body: "B",
+  }, {
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: inner },
+    alertId: "a1", ruleId: "r1", platform: "darwin",
+    now: "2026-07-16T00:00:00.000Z",
+    runner: async (command, args) => { calls.push([command, ...args]); },
+  });
+
+  assert.equal(record.status, "delivered");
+  assert.equal(calls[0][0], "/usr/bin/open");
+  assert.deepEqual(calls[0].slice(1), [
+    "-g", "-n", appBundle, "--args",
+    "--title", "T", "--body", "B", "--severity", "info", "--alert-id", "a1", "--rule-id", "r1",
+  ]);
+});
+
+test("native macOS delivery treats `open`'s spurious nonzero exit (numeric code) as delivered/best_effort — never a false error", async () => {
+  const paths = await tempPaths();
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-app-helper-besteffort-"));
+  const inner = path.join(root, "DescartesNotifier.app", "Contents", "MacOS", "DescartesNotifier");
+  await fs.mkdir(path.dirname(inner), { recursive: true });
+  await fs.writeFile(inner, "#!/bin/sh\n", { mode: 0o755 });
+
+  const record = await deliverNotificationDecision(paths, { notify: true, title: "T", body: "B" }, {
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: inner },
+    platform: "darwin",
+    now: "2026-07-16T00:01:00.000Z",
+    // `open` delivered but returned exit 1 (the accessory notifier exits before open can observe it).
+    runner: async () => { const e = new Error("Command failed"); e.code = 1; throw e; },
+  });
+  assert.equal(record.status, "delivered");
+  assert.equal(record.delivery_confidence, "best_effort");
+});
+
+test("native macOS delivery still reports an ERROR when `open` itself cannot be spawned (string code) or on a bare-binary direct-exec failure", async () => {
+  const paths = await tempPaths();
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-app-helper-spawnfail-"));
+  const inner = path.join(root, "DescartesNotifier.app", "Contents", "MacOS", "DescartesNotifier");
+  await fs.mkdir(path.dirname(inner), { recursive: true });
+  await fs.writeFile(inner, "#!/bin/sh\n", { mode: 0o755 });
+
+  // .app path but `open` can't be spawned -> a string error.code is a genuine failure, not best-effort.
+  const spawnFail = await deliverNotificationDecision(paths, { notify: true, title: "T", body: "B" }, {
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: inner },
+    platform: "darwin", now: "2026-07-16T00:02:00.000Z",
+    runner: async () => { const e = new Error("spawn open ENOENT"); e.code = "ENOENT"; throw e; },
+  });
+  assert.equal(spawnFail.status, "error");
+
+  // A bare-binary direct-exec failure keeps precise error status (best-effort leniency is open-only).
+  const bare = path.join(root, "bare-notifier");
+  await fs.writeFile(bare, "#!/bin/sh\n", { mode: 0o755 });
+  const bareErr = await deliverNotificationDecision(paths, { notify: true, title: "T", body: "B" }, {
+    config: { enabled: true, channel: "macos-native", macos_native_helper_path: bare },
+    platform: "darwin", now: "2026-07-16T00:03:00.000Z",
+    runner: async () => { const e = new Error("helper failed"); e.code = 1; throw e; },
+  });
+  assert.equal(bareErr.status, "error");
 });
 
 test("native macOS helper resolution reports invalid configured helpers as unavailable", async () => {

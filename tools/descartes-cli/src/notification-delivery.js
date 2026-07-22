@@ -105,6 +105,19 @@ export function resolveBundledMacosHelperPath(options = {}) {
   return bundledMacosHelperCandidates(options).find(isExecutableFile);
 }
 
+// If `helperPath` is the inner Mach-O of a macOS `.app` bundle (`…/<Name>.app/Contents/MacOS/<exe>`),
+// returns the enclosing `.app` path; otherwise undefined. A helper INSIDE a bundle must be launched
+// via LaunchServices (`open`), never exec'd directly: macOS's UNUserNotificationCenter refuses
+// authorization for a process it does not recognize as a launched, registered app — a direct exec of
+// the inner binary fails with "Notifications are not allowed for this application"
+// (UNErrorCodeNotificationsNotAllowed), regardless of code-signing. `open` launches the registered
+// bundle so the permission grant (keyed to the signed bundle id) applies.
+export function macosAppBundleFor(helperPath) {
+  if (typeof helperPath !== "string") return undefined;
+  const match = /^(.*\.app)\/Contents\/MacOS\/[^/]+$/.exec(helperPath);
+  return match ? match[1] : undefined;
+}
+
 function macosNativeHelperResolution(options = {}) {
   const env = options.env ?? process.env;
   const explicitCandidates = [
@@ -167,16 +180,30 @@ function commandForPayload(channel, payload, options = {}) {
     if (!helperResolution.available) {
       return { unavailable: helperResolution.reason };
     }
-    return {
-      command: helperResolution.path,
-      args: [
-        "--title", payload.title,
-        "--body", payload.body,
-        "--severity", payload.severity,
-        "--alert-id", payload.alert_id ?? "",
-        "--rule-id", payload.rule_id ?? "",
-      ],
-    };
+    const notifierArgs = [
+      "--title", payload.title,
+      "--body", payload.body,
+      "--severity", payload.severity,
+      "--alert-id", payload.alert_id ?? "",
+      "--rule-id", payload.rule_id ?? "",
+    ];
+    // A helper resolved inside a `.app` bundle (the packaged/Homebrew default) MUST be launched via
+    // LaunchServices, or macOS denies notification authorization (see macosAppBundleFor). `open`
+    // reliably delivers but returns a nonzero exit even on success — the accessory notifier exits
+    // before `open` can observe it (`-W` fails with a kevent "No such process") — so delivery status
+    // from an `open` launch is best-effort ("launched"), flagged via `best_effort_status` for the
+    // runner below. A bare-binary `--helper` override (not inside a `.app`) keeps the direct-exec
+    // path, whose precise exit-code status is preserved.
+    const appBundle = macosAppBundleFor(helperResolution.path);
+    if (appBundle) {
+      return {
+        // -g: don't steal focus; -n: force a fresh instance so `--args` reaches THIS launch.
+        command: "/usr/bin/open",
+        args: ["-g", "-n", appBundle, "--args", ...notifierArgs],
+        best_effort_status: true,
+      };
+    }
+    return { command: helperResolution.path, args: notifierArgs };
   }
   if (channel === "macos-desktop") {
     if (platform !== "darwin" && !options.allowPlatformMismatch) {
@@ -268,6 +295,22 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
       payload,
     });
   } catch (error) {
+    // `open`-launched delivery (best_effort_status): `open` returns a nonzero exit code even on a
+    // successful LaunchServices launch, so a NUMERIC-exit rejection is NOT a delivery failure — the
+    // notification was launched, we just can't observe the accessory helper's own exit status
+    // (accurate post-time status would need the helper to write a result file, a signed-release
+    // follow-up). Only a spawn failure (`open` itself unrunnable — a string `error.code` like ENOENT)
+    // or a timeout/kill is a real error.
+    if (commandSpec.best_effort_status && typeof error?.code === "number") {
+      return appendDeliveryAudit(descartesPaths, {
+        ts: now,
+        status: "delivered",
+        delivery_confidence: "best_effort",
+        channel: config.channel,
+        command: [commandSpec.command, ...commandSpec.args.slice(0, 3)],
+        payload,
+      });
+    }
     return appendDeliveryAudit(descartesPaths, {
       ts: now,
       status: "error",
