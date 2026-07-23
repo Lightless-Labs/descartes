@@ -157,6 +157,14 @@ test("groupSessionFactsByTick: a markerless (legacy) tick-group has censusState 
   assert.equal(groups[0].censusState, undefined);
 });
 
+test("groupSessionFactsByTick: a garbled/unrecognized census_state marker value degrades to censusState 'unknown', NOT 'complete' (degrade-not-fabricate, never max-trust-by-default — mirrors groupServiceFactsByTick)", () => {
+  const ts = tickTs(0);
+  const points = [sessionPoint(ts, "e-0"), censusMarkerPoint(ts, "truncated-oops")];
+  const groups = groupSessionFactsByTick(points);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].censusState, "unknown");
+});
+
 test("groupSessionFactsByTick: orders tick-groups ascending by ts regardless of input order", () => {
   const points = flatten([completeTick(tickTs(2), 1), completeTick(tickTs(0), 1), completeTick(tickTs(1), 1)]);
   const groups = groupSessionFactsByTick(points);
@@ -324,6 +332,28 @@ test("PARTIAL-CENSUS skip test (must-fix 2): a tick-group carrying a 'partial' m
   assert.equal(state.stats.count, 30, "only the 30 complete tick-groups fold; the partial one is excluded entirely");
   assert.equal(state.skipped_partial_tick_count, 1);
   assert.equal(state.last_folded_ts, tickTs(30), "last_folded_ts advances past the partial tick even though it was skipped");
+});
+
+test("GARBLED-CENSUS skip test (adversarial-review regression, mirrors service-baseline's garbled-marker fix): a tick-group carrying a census marker whose census_state is neither 'complete' nor 'partial' is excluded from the fold exactly like 'partial', last_folded_ts still advances, skipped_partial_tick_count is untouched, and no session.count_drop candidate is derived from it even though the tick itself is a mass-drop (near-zero) tick", async () => {
+  const paths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
+  // A garbled/unrecognized census_state marker value on a tick that is ALSO a mass-drop in raw
+  // entity count -- if this were silently upgraded to "complete" (the pre-fix ternary's behavior),
+  // it would manufacture a false session.count_drop from an empty/garbled census.
+  ticks.push([sessionPoint(tickTs(30), "e-0"), censusMarkerPoint(tickTs(30), "truncated-oops")]);
+
+  const candidates = await seedAndCompute(paths, flatten(ticks));
+  assert.equal(
+    candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length,
+    0,
+    "a garbled census_state marker must never manufacture a fabricated session.count_drop",
+  );
+
+  const { state } = await loadSessionBaselineStore(paths);
+  assert.equal(state.stats.count, 30, "only the 30 complete tick-groups fold; the garbled one is excluded entirely");
+  assert.equal(state.skipped_partial_tick_count, 0, "a garbled census_state is a DISTINCT disposition from 'partial' -- it must not increment the partial counter");
+  assert.equal(state.last_folded_ts, tickTs(30), "last_folded_ts advances past the garbled tick even though it was skipped");
 });
 
 test("OVERFLOW-tick skip, driven end-to-end (must-fix 5): skipped_overflow_tick_count increments and the tick is excluded from the persisted stats", async () => {
@@ -524,6 +554,25 @@ test("session.churn: a partial tick-group's own point is excluded from the pool 
   assert.deepEqual(churn[0], { entity_key: "e1", prior_fingerprint: "fp1", current_fingerprint: "fp2" });
 });
 
+test("session.churn non-fire: a garbled/unrecognized census_state marker on the LATEST tick-group does NOT fire, even though the entity's fingerprint genuinely changed (adversarial-review regression, mirrors service-baseline's garbled-marker fix) -- a garbled census must never be treated as 'the latest complete tick-group' anchor", () => {
+  const points = [
+    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "truncated-oops"),
+  ];
+  assert.deepEqual(detectSessionChurn(points), [], "no other 'complete' tick-group exists in this pool, so the recency-bound anchor can never be satisfied");
+});
+
+test("session.churn: an 'unknown'-disposition tick-group's own point is excluded from the pool even when it is NOT the latest tick (adversarial-review regression) -- a garbled census on an OLDER tick must never supply the prior_fingerprint side of a churn pair", () => {
+  const points = [
+    // tick0's census marker is garbled/unrecognized -> censusState "unknown". Without excluding
+    // it from the pool, its session.presence point would wrongly anchor the "prior_fingerprint"
+    // side of a churn pair against tick1's genuinely complete, latest observation.
+    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "truncated-garbled"),
+    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(points), [], "an 'unknown' tick-group's point must never feed either side of a churn pair, including the older side");
+});
+
 test("session.churn, driven end-to-end through computeSessionBaselineCandidates", async () => {
   const paths = await tempPaths();
   const points = [
@@ -538,6 +587,36 @@ test("session.churn, driven end-to-end through computeSessionBaselineCandidates"
   assert.equal(churnCandidates[0].diagnostics.entity_key, "session.tmux.aaaaaaaaaaaaaaaa");
   assert.equal(churnCandidates[0].diagnostics.prior_fingerprint, "1111111111111111");
   assert.equal(churnCandidates[0].diagnostics.current_fingerprint, "2222222222222222");
+});
+
+test("GARBLED-MARKER end-to-end (adversarial-review regression, mirrors service-baseline's garbled-marker fix): a garbled census_state on the latest tick fires NEITHER session.count_drop NOR session.churn, through computeSessionBaselineCandidates", async () => {
+  const paths = await tempPaths();
+  const points = [
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerPoint(tickTs(0), "complete"),
+    // Latest tick: the same entity's fingerprint changed (would churn) AND the raw entity count
+    // dropped to one lone point (would count_drop), but the census marker itself is garbled.
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(tickTs(1), "truncated-oops"),
+  ];
+  const candidates = await seedAndCompute(paths, points);
+  assert.equal(candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a garbled census must never manufacture a fabricated session.churn");
+  assert.equal(candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 0, "a garbled census must never manufacture a fabricated session.count_drop");
+});
+
+test("GARBLED-MARKER on an OLDER (non-latest) tick, end-to-end (adversarial-review regression): a garbled census_state on an EARLIER tick must not supply the prior_fingerprint side of a fabricated session.churn, through computeSessionBaselineCandidates", async () => {
+  const paths = await tempPaths();
+  const points = [
+    // Older tick: census marker is garbled/unrecognized. Its session.presence point must be
+    // excluded from the churn pool entirely, not merely disqualified as the "latest" anchor.
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerPoint(tickTs(0), "truncated-garbled"),
+    // Latest tick: genuinely complete census, same entity, changed fingerprint.
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(tickTs(1), "complete"),
+  ];
+  const candidates = await seedAndCompute(paths, points);
+  assert.equal(candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a garbled census on an older tick must never manufacture a fabricated session.churn using its point as the prior_fingerprint anchor");
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -209,8 +209,15 @@ export async function writeSessionBaselineStore(descartesPaths, state) {
  *   - `count` excludes both the overflow-marker entity AND the census-marker entity (must-fixes
  *     1/2 — the marker is never counted as a session).
  *   - `hasOverflow` is true iff this tick-group carries the SESSION_OVERFLOW_ENTITY_KEY marker.
- *   - `censusState` is "complete" | "partial" (per the tick's own census marker) | undefined (no
- *     marker at all — a markerless, pre-Slice-4-addendum LEGACY tick-group).
+ *   - `censusState` is "complete" | "partial" (per the tick's own census marker, matched EXACTLY,
+ *     not by elimination) | "unknown" (a census marker DID land for this tick, but its
+ *     `attributes.census_state` is neither the literal string "complete" nor "partial" — e.g. disk
+ *     corruption of facts.jsonl, or a future/garbled marker value; classified as a fail-closed
+ *     third disposition rather than defaulting to "complete", per this module's own
+ *     degrade-not-fabricate contract: an unrecognized census-state value must never be silently
+ *     upgraded into a trusted complete census — mirrors groupServiceFactsByTick's own "unknown"
+ *     disposition exactly) | undefined (no marker at all — a markerless, pre-Slice-4-addendum
+ *     LEGACY tick-group).
  *   - `points` are the real (non-marker) session.presence fact points in this tick-group, in the
  *     order encountered — used by detectSessionChurn below.
  */
@@ -227,7 +234,12 @@ export function groupSessionFactsByTick(points = []) {
       continue;
     }
     if (point.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY) {
-      group.censusState = point.attributes?.census_state === "partial" ? "partial" : "complete";
+      // Strict three-way match on the marker's own value — NEVER an else-defaults-to-"complete"
+      // ternary (mirrors groupServiceFactsByTick's own fail-closed classification, service-baseline.js).
+      // An unrecognized census_state value (corruption, future schema drift, a bug upstream) must
+      // degrade to the fail-closed "unknown" disposition, not the max-trust one.
+      const rawState = point.attributes?.census_state;
+      group.censusState = rawState === "complete" ? "complete" : rawState === "partial" ? "partial" : "unknown";
       continue;
     }
     group.count += 1;
@@ -243,15 +255,21 @@ export function groupSessionFactsByTick(points = []) {
  *     marker and a "complete" census marker simultaneously (the flood cap can trip even when
  *     every multiplexer itself succeeded) — overflow always wins for recompute purposes.
  *   - "partial": excluded, exactly like overflow (must-fix 2).
+ *   - "unknown": a garbled/unrecognized census_state marker value (see groupSessionFactsByTick) —
+ *     excluded, exactly like "partial"/markerless (degrade-not-fabricate: a garbled census must
+ *     never be silently upgraded into a trusted "complete" fold via an else-catch-all).
  *   - "markerless": a legacy, pre-Slice-4-addendum tick-group — skipped entirely (never folded,
  *     never treated as zero, no throw); an honest ~30-sample re-warm-up.
- *   - "complete": foldable — including a genuine zero-session tick (must-fix 1).
+ *   - "complete": foldable — including a genuine zero-session tick (must-fix 1). Matched EXACTLY
+ *     on censusState === "complete", never as an else-catch-all, so an "unknown" tick can never
+ *     slip through as trusted.
  */
 function tickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
+  if (group.censusState === "complete") return "complete";
   if (group.censusState === "partial") return "partial";
   if (group.censusState === undefined) return "markerless";
-  return "complete";
+  return "unknown";
 }
 
 /**
@@ -312,12 +330,16 @@ export function computeWindowedSessionStats(groups, { stddevFloor = DEFAULT_STDD
  * pre-existing history at first run is silent by construction, since neither has its newer point
  * in the freshly-observed latest complete tick-group.
  *
- * Pool construction (must-fix 2): any point belonging to a "partial"-marked tick-group is
- * excluded wholesale from the pool (not merely the marker itself) — an undercounted census must
- * not be allowed to manufacture a false churn signal either. Markerless (legacy) tick-groups'
- * points ARE included in the pool (so a stale/legacy pair can be found and shown NOT to fire via
- * the recency bound alone, per the plan's own upgrade-day-storm reasoning) but a markerless
- * tick-group can never itself be the "latest complete tick-group" anchor.
+ * Pool construction (must-fix 2, extended to the "unknown" disposition): any point belonging to
+ * a "partial"-marked tick-group is excluded wholesale from the pool (not merely the marker
+ * itself) — an undercounted census must not be allowed to manufacture a false churn signal
+ * either. A tick-group whose census marker landed but is garbled/unrecognized ("unknown" — see
+ * groupSessionFactsByTick) is excluded identically: it must never supply either side (older OR
+ * newer) of a fingerprint pair, per this module's degrade-not-fabricate contract — an untrusted
+ * tick can neither anchor nor feed a churn candidate. Markerless (legacy) tick-groups' points ARE
+ * included in the pool (so a stale/legacy pair can be found and shown NOT to fire via the recency
+ * bound alone, per the plan's own upgrade-day-storm reasoning) but a markerless tick-group can
+ * never itself be the "latest complete tick-group" anchor.
  */
 export function detectSessionChurn(points = []) {
   const groups = groupSessionFactsByTick(points);
@@ -327,12 +349,13 @@ export function detectSessionChurn(points = []) {
 
   const byEntity = new Map();
   for (const group of groups) {
-    // Only "partial" groups are excluded here (an undercounted census could drop an entity's
-    // point mid-comparison). "overflow" (flood-capped) groups are DELIBERATELY kept: churn needs
-    // only a same-entity fingerprint pair, not an accurate total headcount, and a flood/mass-
-    // resurrection tick is exactly the incident shape churn exists to catch. This intentionally
-    // differs from the count-drop fold, which excludes both partial AND overflow groups.
-    if (group.censusState === "partial") continue; // must-fix 2
+    // "partial" and "unknown" groups are both excluded here (an undercounted OR garbled census
+    // could drop/misattribute an entity's point mid-comparison). "overflow" (flood-capped) groups
+    // are DELIBERATELY kept: churn needs only a same-entity fingerprint pair, not an accurate
+    // total headcount, and a flood/mass-resurrection tick is exactly the incident shape churn
+    // exists to catch. This intentionally differs from the count-drop fold, which excludes both
+    // partial AND overflow groups.
+    if (group.censusState === "partial" || group.censusState === "unknown") continue; // must-fix 2 + unknown-disposition hardening
     for (const point of group.points) {
       const fingerprint = point.attributes?.created_at_fingerprint;
       const list = byEntity.get(point.entity_key) ?? [];
@@ -458,7 +481,9 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       const disposition = tickGroupDisposition(group);
       if (disposition === "overflow") skippedOverflow += 1;
       else if (disposition === "partial") skippedPartial += 1;
-      // "markerless" (legacy) and "complete": no counter — last_folded_ts still advances.
+      // "unknown" (garbled census_state), "markerless" (legacy), and "complete": no counter —
+      // last_folded_ts still advances. No new counter is introduced for "unknown" (mirrors
+      // service-baseline.js, which also adds no new plumbing for its own "unknown" disposition).
     }
     const nextState = {
       version: 1,
