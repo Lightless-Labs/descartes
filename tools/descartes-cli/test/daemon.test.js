@@ -35,10 +35,10 @@ import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenanc
 import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
 import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
-import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY, SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
+import { PEER_CENSUS_MARKER_ENTITY_KEY, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY, SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
-import { PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
+import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -2382,6 +2382,117 @@ test("Slice 4b, Decision 3b: a due peer.count_spike is delivered through the det
   // never have constructed a session for it (alert-intelligence.json defaults to disabled anyway,
   // giving a doubly-enforced guarantee here).
   assert.equal(result.alertIntelligence.status, "disabled");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4c (observed-incident collectors plan): peer-count DROP deviation (peer.count_drop).
+// No daemon.js code change is required for this direction -- computePeerBaselineCandidates
+// already returns BOTH spike and drop candidates from the SAME sixth extraCandidates entry (see
+// plan §5, "No-change files"). These tests confirm that wiring holds for the drop direction too.
+// Unlike completePeerTick above (legacy, marker-less fixtures -- kept unmodified for the existing
+// spike tests' own backward-compat coverage), peer.count_drop requires the Slice 4c census marker
+// on every tick to ever leave "provisional".
+// ---------------------------------------------------------------------------------------------
+
+function completePeerTickWithMarker(ts, count, signature = "v1:ok-ok-ok-ok-ok", entityPrefix = "peer.ssh.e") {
+  return [
+    ...completePeerTick(ts, count, entityPrefix),
+    {
+      ts,
+      fact_name: "peer.presence",
+      entity_key: PEER_CENSUS_MARKER_ENTITY_KEY,
+      attributes: { availability_signature: signature },
+      source_envelope_id: "vpn-peer-status",
+      source_tool: "collect_vpn_peer_status",
+      sensitivity: "operational",
+      confidence: 0,
+    },
+  ];
+}
+
+test("Slice 4c wiring: computePeerBaselineCandidates' drop direction flows through the daemon's EXISTING sixth extraCandidates entry with NO daemon.js code change -- a pre-seeded mass peer drop produces a real, sanitized peer.count_drop alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
+  ticks.push(...completePeerTickWithMarker(hour(30), 1));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(30));
+  const alert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_DROP_RULE_ID);
+  assert.ok(alert, "expected a real alert for the peer-count drop");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning", "stored severity is capped at warning even for an extreme z (Decision 0)");
+  assert.equal(alert.diagnostics.observed_count, 1);
+  assert.equal(alert.diagnostics.mean_before, 10);
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+
+  const { state } = await loadPeerBaselineStore(paths);
+  assert.equal(state.drop.confidence_state, "established");
+});
+
+test("Slice 4c, delivery: a due peer.count_drop is delivered through the deterministic local delivery branch wired into the daemon tick, and never reaches the LLM path", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
+  ticks.push(...completePeerTickWithMarker(hour(30), 1));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const deliveries = [];
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  assert.ok(result.sessionAlertDelivery, "expected a sessionAlertDelivery result on the daemon iteration");
+  const peerDropDeliveries = deliveries.filter((entry) => entry.opts.ruleId === PEER_COUNT_DROP_RULE_ID);
+  assert.equal(peerDropDeliveries.length, 1, "expected exactly one deterministic delivery for the due peer.count_drop candidate");
+  assert.equal(peerDropDeliveries[0].decision.notify, true);
+  assert.equal(peerDropDeliveries[0].decision.severity, "warning");
+
+  // Never via the LLM path: peer.* is unknown_namespace, so adjudicateAlertNotifications must
+  // never have constructed a session for it (alert-intelligence.json defaults to disabled anyway,
+  // giving a doubly-enforced guarantee here).
+  assert.equal(result.alertIntelligence.status, "disabled");
+});
+
+test("Slice 4c: byte-identical real alerts when the learned kill switch is off, even with marker-bearing peer fact-history present that would otherwise drop-deviate, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withPeersPaths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
+  ticks.push(...completePeerTickWithMarker(hour(30), 1));
+  await appendFactPoints(withPeersPaths, ticks, { now: hour(30) });
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false } -- computePeerBaselineCandidates must short-circuit to [] (both
+  // directions) before ever calling readFactPoints.
+  let readFactsCalled = false;
+  const withPeers = await runDaemonIteration(withPeersPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    readFactPoints: async (...args) => {
+      readFactsCalled = true;
+      return readFactPoints(...args);
+    },
+  });
+
+  assert.deepEqual(withPeers.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withPeers.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withPeers.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+
+  const persisted = await readAlertRecords(withPeersPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === PEER_COUNT_DROP_RULE_ID), false);
 });
 
 test("Slice 4b ts-cohesion (integration): peer.presence fact points share the same ts as session.presence fact points emitted within the same structural-tick iteration", async () => {

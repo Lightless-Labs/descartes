@@ -6,7 +6,7 @@ import test from "node:test";
 import { alertId, applyAlertCandidates, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { appendFactPoints } from "../src/fact-store.js";
-import { PEER_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
+import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "../src/session-baseline.js";
 import {
@@ -65,6 +65,22 @@ function overflowPoint(ts) {
     fact_name: "peer.presence",
     entity_key: PEER_OVERFLOW_ENTITY_KEY,
     attributes: { overflow: "true", total_count_bucket: "1000+" },
+    source_envelope_id: "vpn-peer-status",
+    source_tool: "collect_vpn_peer_status",
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+// Slice 4c's unconditional per-tick marker (fact-translators.js's buildPeerCensusMarkerFactPoint)
+// -- emitted on EVERY successful vpn-peer-status tick, including a genuinely zero-peer one, so
+// peer-baseline.js always has a tick-group to fold. Carries no real peer identity/observation.
+function censusMarkerPoint(ts) {
+  return {
+    ts,
+    fact_name: "peer.presence",
+    entity_key: PEER_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" },
     source_envelope_id: "vpn-peer-status",
     source_tool: "collect_vpn_peer_status",
     sensitivity: "operational",
@@ -342,6 +358,57 @@ test("Slice 6 must-fix 5 overflow-degraded-window no-fire: an otherwise-fully-qu
 
   const candidates = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, []);
+});
+
+test("Slice 4c regression (must-fix 4): marker-only (zero-peer) census ticks spanning 3+ days must NOT fill the stream-wide cold-start gate -- a genuinely first-ever real peer at an odd-hour anchor still fails to correlate, exactly as pre-Slice-4c", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  await seed(paths, {
+    alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
+    factPoints: [
+      // Four census-marker-only tick-groups spanning 3 days -- with the Slice-4c bug, these alone
+      // would satisfy CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS/_DAYS even though NO real peer was
+      // ever observed on any of them.
+      censusMarkerPoint(dayTs(-3, 1)),
+      censusMarkerPoint(dayTs(-2, 1)),
+      censusMarkerPoint(dayTs(-1, 1)),
+      censusMarkerPoint(dayTs(0, 1)),
+      // The peer's genuinely first-ever real observation, coincident with the anchor at an odd
+      // hour -- otherwise fully qualifying (in-window, odd-hour, zero prior ticks).
+      peerPoint(anchorTs, "peer.wireguard.9999999999999999", { hourBucket: "02" }),
+    ],
+    now,
+  });
+
+  const candidates = await computeCorrelationCandidates(paths, { now });
+  assert.deepEqual(
+    candidates,
+    [],
+    "census-marker-only ticks must not count toward the real-peer stream-wide cold-start history",
+  );
+});
+
+test("Slice 4c regression positive control: a real, established (post-cold-start) peer still correlates when census-marker ticks are also present in the read window", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  await seed(paths, {
+    alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
+    factPoints: [
+      ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0), // establishes genuine stream-wide maturity
+      censusMarkerPoint(dayTs(-3, 1)),
+      censusMarkerPoint(dayTs(-2, 1)),
+      censusMarkerPoint(dayTs(-1, 1)),
+      censusMarkerPoint(dayTs(0, 1)), // markers interleaved with real history must not block a real correlation either
+      peerPoint(anchorTs, "peer.wireguard.9999999999999999", { hourBucket: "02" }),
+    ],
+    now,
+  });
+
+  const candidates = await computeCorrelationCandidates(paths, { now });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].diagnostics.peer_entity_key, "peer.wireguard.9999999999999999");
 });
 
 test("Slice 6 ranking/pool-size fixture: two qualifying peers for the same anchor -> exactly one candidate (closest wins), candidate_pool_size reflects the true qualifying count", async () => {

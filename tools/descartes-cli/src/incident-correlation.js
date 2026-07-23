@@ -33,7 +33,7 @@ import { alertId, readAlertRecords } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
+import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_PEER_PRESENCE_WINDOW_MS } from "./peer-signature-store.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
 
@@ -132,6 +132,15 @@ export function findKillSideAnchors(alertRecords = [], { now, lookbackMs = DEFAU
  * once), every peer's prior-tick count in that window is a potential undercount -- no peer may
  * qualify from this window at all. Mirrors session-baseline.js's own overflow fold-skip exactly.
  *
+ * Regression fix (post-Slice-4c): the unconditional PEER_CENSUS_MARKER_ENTITY_KEY point (emitted
+ * on every successful vpn-peer-status tick, including zero-peer ticks, so peer-baseline.js always
+ * has a tick-group to fold) carries no real peer identity/observation either -- exactly like
+ * PEER_OVERFLOW_ENTITY_KEY, it must be excluded from `realPoints` below, or marker-only ticks
+ * would inflate the stream-wide cold-start tick-group/day-span counts (must-fix 4) and let a
+ * peer's genuine first-ever appearance qualify during what should still be a cold-start window.
+ * Unlike the overflow marker, the census marker carries no truncation signal, so it is
+ * deliberately NOT added to `hasOverflowTick` below -- only to the real-peer exclusion.
+ *
  * MUST-FIX 6: odd-hour membership is checked against the CLOSED CORRELATION_ODD_HOURS set, which
  * does not contain "unknown" -- a peer point whose observation-tick hour failed to parse never
  * qualifies, stated here explicitly rather than left as an implicit set-membership consequence.
@@ -149,7 +158,12 @@ export function findQualifyingPeerObservations(peerPoints = [], anchor, options 
   const hasOverflowTick = (peerPoints ?? []).some((point) => point?.entity_key === PEER_OVERFLOW_ENTITY_KEY);
   if (hasOverflowTick) return [];
 
-  const realPoints = (peerPoints ?? []).filter((point) => point?.entity_key !== PEER_OVERFLOW_ENTITY_KEY && point?.fact_name === PEER_FACT_NAME);
+  const realPoints = (peerPoints ?? []).filter(
+    (point) =>
+      point?.entity_key !== PEER_OVERFLOW_ENTITY_KEY &&
+      point?.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY &&
+      point?.fact_name === PEER_FACT_NAME,
+  );
 
   // MUST-FIX 4: stream-wide cold-start gate (see doc comment above) -- computed once over the
   // WHOLE read window, independent of which specific peer/anchor is being evaluated.
@@ -296,7 +310,13 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   const anchors = findKillSideAnchors(alertRecords, { now, lookbackMs });
   if (anchors.length === 0) return [];
 
-  const peerPoints = (factResult?.points ?? []).filter((point) => point?.fact_name === PEER_FACT_NAME);
+  // Regression fix (post-Slice-4c): strip the census marker here too, mirroring the realPoints
+  // exclusion inside findQualifyingPeerObservations -- the overflow marker is deliberately KEPT
+  // in this array (unlike the census marker) because findQualifyingPeerObservations' own
+  // hasOverflowTick check (must-fix 5) needs to see it in the peerPoints it receives.
+  const peerPoints = (factResult?.points ?? []).filter(
+    (point) => point?.fact_name === PEER_FACT_NAME && point?.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY,
+  );
 
   const candidates = [];
   for (const anchor of anchors) {

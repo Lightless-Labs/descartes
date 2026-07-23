@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  PEER_CENSUS_MARKER_ENTITY_KEY,
   SERVICE_CENSUS_FACT_NAME,
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
@@ -511,7 +512,7 @@ function vpnServicePeer(overrides = {}) {
 test("factPointsFromVpnPeerEvidence maps a WireGuard peer into a hashed entity_key with closed-enum attributes", () => {
   const evidence = [peerEnvelope({ peers: [wgPeer()], truncated: false })];
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 1);
+  assert.equal(points.length, 2, "1 real peer fact + 1 census marker");
   const point = points[0];
   assert.equal(point.fact_name, "peer.presence");
   assert.match(point.entity_key, /^peer\.wireguard\.[0-9a-f]{16}$/);
@@ -532,14 +533,100 @@ test("factPointsFromVpnPeerEvidence: entity_key is stable across repeated ticks 
 test("factPointsFromVpnPeerEvidence: an SSH peer and a vpn_service peer sharing similar-looking identifiers never collide (source_type domain-separates entity_key)", () => {
   const evidence = [peerEnvelope({ peers: [sshPeer(), vpnServicePeer(), wgPeer()] })];
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
-  assert.equal(new Set(points.map((p) => p.entity_key)).size, 3);
-  assert.deepEqual(points.map((p) => p.attributes.source_type).sort(), ["ssh", "vpn_service", "wireguard"]);
+  const peerPoints = points.filter((p) => p.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(new Set(peerPoints.map((p) => p.entity_key)).size, 3);
+  assert.deepEqual(peerPoints.map((p) => p.attributes.source_type).sort(), ["ssh", "vpn_service", "wireguard"]);
 });
 
 test("factPointsFromVpnPeerEvidence returns [] for a status:unable envelope and for a missing envelope (no fabrication)", () => {
   const unable = [peerEnvelope({ peers: [] }, "unable")];
   assert.deepEqual(factPointsFromVpnPeerEvidence(unable, { ts: TS }), []);
   assert.deepEqual(factPointsFromVpnPeerEvidence([], { ts: TS }), []);
+});
+
+// --- Peer census marker + availability signature (Slice 4c, observed-incident collectors plan) ---
+
+function allOkSources(overrides = {}) {
+  return {
+    ssh_who: { status: "ok" },
+    ssh_last: { status: "ok" },
+    wireguard: { status: "ok" },
+    vpn_services: { status: "ok" },
+    established_inbound: { status: "ok" },
+    ...overrides,
+  };
+}
+
+test("factPointsFromVpnPeerEvidence: emits a census marker on every successful envelope, with a well-formed availability_signature", () => {
+  const evidence = [peerEnvelope({ peers: [wgPeer()], sources: allOkSources(), truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.ok(marker, "expected a census marker fact point");
+  assert.equal(marker.fact_name, "peer.presence");
+  assert.equal(marker.confidence, 0);
+  assert.match(
+    marker.attributes.availability_signature,
+    /^v1:(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)$/,
+  );
+  assert.equal(marker.attributes.availability_signature, "v1:ok-ok-ok-ok-ok");
+});
+
+test("factPointsFromVpnPeerEvidence: a genuinely zero-peer tick still emits exactly the census marker, no fabricated peer facts", () => {
+  const evidence = [peerEnvelope({ peers: [], sources: allOkSources(), truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 1, "expected exactly the census marker, no peer facts");
+  assert.equal(points[0].entity_key, PEER_CENSUS_MARKER_ENTITY_KEY);
+});
+
+test("factPointsFromVpnPeerEvidence: a degraded source (wireguard missing_permission) yields a signature distinct from the all-ok signature", () => {
+  const degraded = [peerEnvelope({ peers: [], sources: allOkSources({ wireguard: { status: "missing_permission" } }), truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(degraded, { ts: TS });
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.availability_signature, "v1:ok-ok-missing_permission-ok-ok");
+  assert.notEqual(marker.attributes.availability_signature, "v1:ok-ok-ok-ok-ok");
+});
+
+test("factPointsFromVpnPeerEvidence: the who-fails/last-succeeds SSH-only fixture produces its own distinct signature", () => {
+  const sources = allOkSources({
+    ssh_who: { status: "unable" },
+    wireguard: { status: "absent" },
+    vpn_services: { status: "absent" },
+    established_inbound: { status: "absent" },
+  });
+  const points = factPointsFromVpnPeerEvidence(
+    [peerEnvelope({ peers: [sshPeer({ presence_state: "observed_historical", origin: "last" })], sources, truncated: false })],
+    { ts: TS },
+  );
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.availability_signature, "v1:unable-ok-absent-absent-absent");
+});
+
+test("factPointsFromVpnPeerEvidence: an unrecognized/future status literal in any source slot degrades to 'unknown', never throws, never embeds the raw literal", () => {
+  const rawFutureStatus = "quantum_flux_detected";
+  const evidence = [peerEnvelope({ peers: [], sources: allOkSources({ ssh_who: { status: rawFutureStatus } }), truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.availability_signature, "v1:unknown-ok-ok-ok-ok");
+  assert.equal(JSON.stringify(marker).includes(rawFutureStatus), false);
+});
+
+test("factPointsFromVpnPeerEvidence: a malformed/missing result.sources object degrades every slot to 'unknown' rather than throwing", () => {
+  const evidence = [peerEnvelope({ peers: [], truncated: false })]; // no `sources` key at all
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.availability_signature, "v1:unknown-unknown-unknown-unknown-unknown");
+});
+
+test("factPointsFromVpnPeerEvidence: the census marker's availability_signature never leaks a raw source status beyond the 6-value closed set", () => {
+  const CLOSED_SOURCE_STATUS_VALUES = new Set(["ok", "partial", "absent", "missing_permission", "unable", "not_applicable", "unknown"]);
+  const evidence = [peerEnvelope({ peers: [], sources: allOkSources({ established_inbound: { status: "not_applicable" }, wireguard: { status: "partial" } }), truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  const [version, codesPart] = marker.attributes.availability_signature.split(":");
+  assert.equal(version, "v1");
+  const codes = codesPart.split("-");
+  assert.equal(codes.length, 5);
+  for (const code of codes) assert.ok(CLOSED_SOURCE_STATUS_VALUES.has(code), `unrecognized code in signature: ${code}`);
 });
 
 // --- Hash-at-source negative tests (must-fix 3/5) ---
@@ -615,7 +702,7 @@ test("factPointsFromVpnPeerEvidence: a truncated collector result emits an overf
   const evidence = [peerEnvelope({ peers: boundedPeers, truncated: true, total_count: 5000 })];
 
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 6, "expected 5 bounded peer facts + 1 overflow marker fact");
+  assert.equal(points.length, 7, "expected 5 bounded peer facts + 1 census marker + 1 overflow marker fact");
 
   const marker = points.find((p) => p.attributes.overflow === "true");
   assert.ok(marker, "expected an overflow marker fact point");
@@ -627,7 +714,7 @@ test("factPointsFromVpnPeerEvidence: a truncated collector result emits an overf
 test("factPointsFromVpnPeerEvidence: a non-truncated collector result never emits an overflow marker", () => {
   const evidence = [peerEnvelope({ peers: [wgPeer()], truncated: false })];
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
-  assert.equal(points.length, 1);
+  assert.equal(points.length, 2, "1 real peer fact + 1 census marker, no overflow marker");
   assert.equal(points.some((p) => p.attributes.overflow === "true"), false);
 });
 
@@ -649,7 +736,8 @@ test("factPointsFromVpnPeerEvidence: every persisted attribute is either a close
     truncated: true,
     total_count: 999,
   })];
-  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS })
+    .filter((p) => p.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY); // marker's own attribute schema is pinned separately below
   assert(points.length > 0);
 
   for (const point of points) {

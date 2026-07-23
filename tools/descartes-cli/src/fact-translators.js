@@ -382,6 +382,63 @@ const PEER_FACT_NAME = "peer.presence";
 // "peer.overflow-marker.v1" literal.
 export const PEER_OVERFLOW_ENTITY_KEY = "peer.overflow-marker.v1";
 
+// Slice 4c (observed-incident collectors plan) — peer census-marker addendum, mirrors
+// SESSION_CENSUS_MARKER_ENTITY_KEY exactly: emitted unconditionally on every successful
+// vpn-peer-status envelope (including a zero-peer tick), so a true zero is foldable by
+// peer.count_drop. Unlike the session marker, it ALSO carries a closed-enum per-tick
+// source-availability signature (Decision 1 below) so peer-baseline.js's regime-keyed fold can
+// bucket ticks by which peer sources were up this tick.
+export const PEER_CENSUS_MARKER_ENTITY_KEY = "peer.census-marker.v1";
+
+// Decision 1 (plan pinned): a single closed-enum bucketed string, versioned, built from the
+// 5 fixed source keys vpn-peer-status.js's envelope always produces (sources.{ssh_who,ssh_last,
+// wireguard,vpn_services,established_inbound}.status). Grounded against tools/vpn-peer-status.js's
+// real closed status vocabulary (confirmed by direct read): "ok" | "partial" | "absent" |
+// "missing_permission" | "unable" | "not_applicable" (not every source can emit every value --
+// e.g. only wireguard emits "partial", only vpn_services emits "not_applicable" -- but the bucket
+// function below is defensive against ANY future status literal, mapping anything outside this
+// closed set to "unknown" rather than embedding an unrecognized raw string).
+const CLOSED_PEER_SOURCE_STATUS_VALUES = new Set([
+  "ok", "partial", "absent", "missing_permission", "unable", "not_applicable",
+]);
+
+function normalizedSourceStatus(status) {
+  return CLOSED_PEER_SOURCE_STATUS_VALUES.has(status) ? status : "unknown";
+}
+
+// Fixed order, never derived from Object.keys (whose iteration order is an accident of insertion,
+// not a contract) -- a stable, versioned signature format lets peer-baseline.js compare two
+// signatures with simple string equality.
+const PEER_AVAILABILITY_SOURCE_ORDER = ["ssh_who", "ssh_last", "wireguard", "vpn_services", "established_inbound"];
+const PEER_AVAILABILITY_SIGNATURE_VERSION = "v1";
+
+// Degrade-not-fabricate: a missing/malformed `sources` object (e.g. a simplified test fixture)
+// degrades every source to "unknown" rather than throwing -- mirrors censusStateFor's own
+// "absent multiplexers array carries no evidence of degradation either way" posture.
+function buildPeerAvailabilitySignature(sources) {
+  const codes = PEER_AVAILABILITY_SOURCE_ORDER.map((key) => normalizedSourceStatus(sources?.[key]?.status));
+  return `${PEER_AVAILABILITY_SIGNATURE_VERSION}:${codes.join("-")}`;
+}
+
+// Emitted unconditionally on every successful vpn-peer-status envelope, including a genuinely
+// zero-peer tick -- so peer-baseline.js's fold always has a real tick-group to see for the drop
+// direction. confidence:0, non-hashed fixed entity_key literal (mirrors PEER_OVERFLOW_ENTITY_KEY's
+// own convention -- it carries no peer identity, nothing needs hashing).
+function buildPeerCensusMarkerFactPoint(result, envelope, ts) {
+  return {
+    ts,
+    fact_name: PEER_FACT_NAME,
+    entity_key: PEER_CENSUS_MARKER_ENTITY_KEY,
+    attributes: {
+      availability_signature: buildPeerAvailabilitySignature(result?.sources),
+    },
+    source_envelope_id: envelope.id,
+    source_tool: envelope.trace?.tool,
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
 const CLOSED_PEER_SOURCE_TYPES = new Set(["wireguard", "ssh", "vpn_service"]);
 
 function normalizedPeerSourceType(sourceType) {
@@ -492,6 +549,11 @@ export function factPointsFromVpnPeerEvidence(evidence, { ts } = {}) {
   const peers = envelope.result?.peers ?? [];
 
   const points = peers.map((peer) => buildPeerFactPoint(peer, envelope, ts));
+  // Slice 4c (observed-incident collectors plan): the census marker is ALWAYS appended, after
+  // every real peer fact, on every successful envelope — including a zero-peer tick — mirroring
+  // factPointsFromSessionEvidence's own append order (census marker first, overflow marker
+  // second).
+  points.push(buildPeerCensusMarkerFactPoint(envelope.result, envelope, ts));
   if (envelope.result?.truncated) {
     points.push(buildPeerOverflowMarkerFactPoint(envelope.result, envelope, ts));
   }

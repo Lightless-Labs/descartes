@@ -145,10 +145,14 @@ test("attribution: session.*/peer.*/correlation.* -> rule_id, granularity family
     alert({ rule_id: "session.count_drop", diagnostics: {} }),
     alert({ rule_id: "session.churn", diagnostics: {} }),
     alert({ rule_id: "peer.count_spike", diagnostics: {} }),
+    // Slice 4c (observed-incident collectors plan): peer.count_drop joins CLOSED_RULE_IDS
+    // alongside its sibling peer.count_spike -- this is the load-bearing regression for that
+    // addition (without it, this fixture would silently produce only 4 artifacts instead of 5).
+    alert({ rule_id: "peer.count_drop", diagnostics: {} }),
     alert({ rule_id: "correlation.login_kill_proximity", diagnostics: {} }),
   ];
   const report = computeCalibrationReport(alerts, [], [], []);
-  assert.equal(report.artifacts.length, 4);
+  assert.equal(report.artifacts.length, 5);
   for (const row of report.artifacts) {
     assert.equal(row.granularity, "family");
     assert.equal(row.artifact_ref, row.rule_id_family);

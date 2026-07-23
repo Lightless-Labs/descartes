@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
+import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
@@ -22,9 +22,13 @@ import {
 // constant is what the delivery function's allowlist check actually uses. Widened again
 // (service-disappearance-alert plan, 2026-07-23) to add SERVICE_DISAPPEARED_RULE_ID, composed here
 // for the same reason -- avoids a forbidden service-baseline.js -> session-baseline.js coupling.
+// Widened again (Slice 4c, observed-incident collectors plan, 2026-07-23) to add
+// PEER_COUNT_DROP_RULE_ID alongside its sibling PEER_COUNT_SPIKE_RULE_ID -- same rationale,
+// same module (peer-baseline.js already imported above).
 const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
   ...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   PEER_COUNT_SPIKE_RULE_ID,
+  PEER_COUNT_DROP_RULE_ID,
   SERVICE_DISAPPEARED_RULE_ID,
 ];
 
@@ -353,10 +357,11 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   const dueIds = new Set(evaluation?.notification_due_ids ?? []);
   if (dueIds.size === 0) return { fired: [] };
 
-  // Slice 4b Decision 3b (Fable review MUST-FIX 4): scoped to the LOCALLY-composed three-id
-  // allowlist (session-baseline.js's own two ids + PEER_COUNT_SPIKE_RULE_ID), never the general
-  // unknown-namespace bypass — a due metric/other alert never reaches this branch just because it
-  // also happens to classify as unknown_namespace.
+  // Slice 4b Decision 3b (Fable review MUST-FIX 4): scoped to the LOCALLY-composed allowlist
+  // (session-baseline.js's own two ids, plus PEER_COUNT_SPIKE_RULE_ID/PEER_COUNT_DROP_RULE_ID/
+  // SERVICE_DISAPPEARED_RULE_ID -- see ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS above), never the
+  // general unknown-namespace bypass — a due metric/other alert never reaches this branch just
+  // because it also happens to classify as unknown_namespace.
   const dueSessionAlerts = (evaluation.alerts ?? []).filter(
     (alert) => dueIds.has(alert.id) && ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
   );
@@ -409,6 +414,22 @@ function buildSessionAlertNotificationDecision(alert) {
       notify: true,
       severity: alert.severity === "critical" ? "critical" : "warning",
       title: "Descartes: peer count deviation",
+      body: `Peer count ${diagnostics.observed_count} vs baseline mean ${diagnostics.mean_before} (z=${diagnostics.z_score}, ${diagnostics.confidence_state}).`,
+    };
+  }
+  // Slice 4c (observed-incident collectors plan), additive fourth deterministic-delivery branch:
+  // the sign-flipped mirror of peer.count_spike's own branch immediately above. Body shape is
+  // identical -- counts/z-score/confidence_state only, peer-flavored wording -- never a raw peer
+  // host/IP/pubkey, which never reaches this layer's inputs at all (peer-baseline.js's
+  // diagnostics only ever carry counts/z-scores/confidence_state, no per-peer identity). Stored
+  // severity is always "warning" here (peer-baseline.js's own Decision 0 cap), but this branch
+  // reads `alert.severity` rather than hardcoding "warning" for the same "future cap-lift doesn't
+  // need a second edit here" reason as the spike branch above.
+  if (alert?.rule_id === PEER_COUNT_DROP_RULE_ID) {
+    return {
+      notify: true,
+      severity: alert.severity === "critical" ? "critical" : "warning",
+      title: "Descartes: peer count drop",
       body: `Peer count ${diagnostics.observed_count} vs baseline mean ${diagnostics.mean_before} (z=${diagnostics.z_score}, ${diagnostics.confidence_state}).`,
     };
   }

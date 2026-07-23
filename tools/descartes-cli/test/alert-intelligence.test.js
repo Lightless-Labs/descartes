@@ -20,7 +20,7 @@ import {
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
+import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
@@ -1177,7 +1177,9 @@ test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAME
 });
 
 test("(c) invariant: every exported PEER_*_RULE_ID classifies to namespace undefined -- a future peer-family rule_id inherits fail-closed by construction", () => {
-  for (const ruleId of [PEER_COUNT_SPIKE_RULE_ID]) {
+  // Slice 4c (observed-incident collectors plan): widened to include PEER_COUNT_DROP_RULE_ID
+  // alongside its sibling PEER_COUNT_SPIKE_RULE_ID.
+  for (const ruleId of [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID]) {
     const { namespace, hardExcluded } = classifyAlertNamespace(ruleId);
     assert.equal(namespace, undefined, `expected ${ruleId} to classify as unknown_namespace`);
     assert.equal(hardExcluded, false);
@@ -1297,6 +1299,97 @@ test("Fable review MUST-FIX 4: the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE
   });
   assert.deepEqual(new Set(result.fired), new Set(alerts.map((a) => a.id)));
   assert.equal(deliveries.length, expectedIds.length, "every id in the composed three-id constant must actually be delivered by this branch");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4c (observed-incident collectors plan) — Decision 3-equivalent fail-closed namespace
+// regression tests + widened deterministic-delivery tests, for peer.count_drop. Mirrors the
+// peer.count_spike section above exactly, sign-flipped diagnostics.
+// ---------------------------------------------------------------------------------------------
+
+test("(a) classifyAlertNamespace('peer.count_drop') returns {namespace: undefined, hardExcluded: false} -- not 'baseline', not any other known namespace", () => {
+  assert.deepEqual(classifyAlertNamespace(PEER_COUNT_DROP_RULE_ID), { namespace: undefined, hardExcluded: false });
+});
+
+test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAMESPACES enabled and one due peer.count_drop, is no_eligible_alerts / excluded.unknown_namespace / zero LLM calls", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: [...KNOWN_ALERT_NAMESPACES] }, { now: "2026-07-14T00:00:00.000Z" });
+  const peerAlert = alert({ id: "alert_peer_count_drop", rule_id: PEER_COUNT_DROP_RULE_ID, severity: "warning", diagnostics: { observed_count: 1, mean_before: 10, stddev_before: 0.5, z_score: -18, confidence_state: "established" } });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [peerAlert],
+    notification_due_ids: [peerAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for peer.count_drop — it is unknown_namespace, fail-closed"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.unknown_namespace, 1);
+  assert.equal((await readAlertIntelligenceAudit(paths)).length, 0);
+});
+
+test("emitSessionAlertSignals delivers a due peer.count_drop through deliverNotificationDecision with a counts/hash-only body, never via a session/LLM", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const peerAlert = alert({
+    id: "alert_peer_count_drop",
+    rule_id: PEER_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 1, mean_before: 10, stddev_before: 0.5, z_score: -18, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [peerAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [peerAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, PEER_COUNT_DROP_RULE_ID);
+  assert.equal(deliveries[0].opts.alertId, peerAlert.id);
+  assert.equal(deliveries[0].decision.notify, true);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.match(deliveries[0].decision.body, /^Peer count 1 vs baseline mean 10/);
+  assert.equal(/203\.0\.113|alice|peer\.ssh\./.test(JSON.stringify(deliveries[0].decision)), false, "no raw peer host/IP/pubkey in the delivered body");
+});
+
+test("emitSessionAlertSignals: even a wildly extreme z, a due peer.count_drop still delivers with stored severity 'warning' (never 'critical' in v0, Decision 0)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const peerAlert = alert({
+    id: "alert_peer_count_drop",
+    rule_id: PEER_COUNT_DROP_RULE_ID,
+    severity: "warning", // peer-baseline.js's own candidate builder never stores "critical" in v0
+    diagnostics: { observed_count: 0, mean_before: 100, stddev_before: 0.5, z_score: -200, confidence_state: "established" },
+  });
+  await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [peerAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.equal(deliveries[0].decision.severity, "warning");
+});
+
+test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due peer.count_drop-shaped rule_id typo is never delivered by this branch", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const typoAlert = alert({ id: "alert_typo", rule_id: "peer.count_drops", severity: "warning" }); // deliberately NOT the real rule_id
+  const result = await emitSessionAlertSignals(paths, { alerts: [typoAlert], notification_due_ids: [typoAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, []);
+  assert.equal(deliveries.length, 0);
+});
+
+test("emitSessionAlertSignals respects cooldown for peer.count_drop too: an alert absent from notification_due_ids does not re-deliver", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const peerAlert = alert({ id: "alert_peer_count_drop", rule_id: PEER_COUNT_DROP_RULE_ID, severity: "warning", diagnostics: { observed_count: 1, mean_before: 10, stddev_before: 0.5, z_score: -18, confidence_state: "established" } });
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
+
+  const first = await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [peerAlert.id] }, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+  assert.deepEqual(first.fired, [peerAlert.id]);
+
+  const second = await emitSessionAlertSignals(paths, { alerts: [peerAlert], notification_due_ids: [] }, { now: "2026-07-14T00:05:00.000Z", deliverNotification });
+  assert.deepEqual(second.fired, []);
+  assert.equal(deliveries.length, 1, "must not re-deliver within the cooldown window");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1438,9 +1531,9 @@ test("emitSessionAlertSignals fires for the WIDENED allowlist including service.
   assert.equal(/a1b2c3d4e5f6a7b8|previously-established service/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
 });
 
-test("the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by delivery is composed of session-baseline.js's own two-id export PLUS PEER_COUNT_SPIKE_RULE_ID PLUS SERVICE_DISAPPEARED_RULE_ID (companion to the three-id pin test above, further widened)", async () => {
-  const expectedIds = [...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, PEER_COUNT_SPIKE_RULE_ID, SERVICE_DISAPPEARED_RULE_ID];
-  assert.deepEqual(expectedIds, [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, SERVICE_DISAPPEARED_RULE_ID]);
+test("the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by delivery is composed of session-baseline.js's own two-id export PLUS PEER_COUNT_SPIKE_RULE_ID PLUS PEER_COUNT_DROP_RULE_ID PLUS SERVICE_DISAPPEARED_RULE_ID (companion to the three-id pin test above, further widened -- Slice 4c, observed-incident collectors plan)", async () => {
+  const expectedIds = [...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID, SERVICE_DISAPPEARED_RULE_ID];
+  assert.deepEqual(expectedIds, [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID, SERVICE_DISAPPEARED_RULE_ID]);
 
   const paths = await tempPaths();
   const deliveries = [];
@@ -1459,7 +1552,7 @@ test("the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by del
     deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
   });
   assert.deepEqual(new Set(result.fired), new Set(alerts.map((a) => a.id)));
-  assert.equal(deliveries.length, expectedIds.length, "every id in the composed four-id constant must actually be delivered by this branch");
+  assert.equal(deliveries.length, expectedIds.length, "every id in the composed five-id constant must actually be delivered by this branch");
 });
 
 // ---------------------------------------------------------------------------------------------

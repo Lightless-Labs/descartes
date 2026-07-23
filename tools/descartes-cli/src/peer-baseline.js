@@ -24,12 +24,26 @@ import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
+import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, computeZScore, emptyWelfordStats, foldWelford, updateEwma } from "./welford-stats.js";
 
 const PEER_FACT_NAME = "peer.presence";
 
+// Stage 2 adversarial-review fix (2026-07-23): the shape of a WELL-FORMED availability_signature,
+// mirroring fact-translators.js's own buildPeerAvailabilitySignature output exactly -- "v1:" plus
+// exactly 5 hyphen-joined codes drawn from its closed CLOSED_PEER_SOURCE_STATUS_VALUES set (plus
+// "unknown", that same module's own catch-all fallback for anything outside that set). Defined
+// independently here (not imported) -- this module only needs to RECOGNIZE the shape
+// buildPeerAvailabilitySignature produces, not reconstruct it. A string that merely passes
+// `typeof === "string"` but does NOT match this pattern (garbled facts.jsonl content, a bit-flip,
+// a future/incompatible marker producer) is NOT a legitimate regime key -- see
+// groupPeerFactsByTick's own use of this pattern below for why a type-only guard is insufficient.
+const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|missing_permission|unable|not_applicable|unknown)";
+const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v1:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
+
 export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
+// Slice 4c (observed-incident collectors plan) — the sign-flipped mirror of PEER_COUNT_SPIKE_RULE_ID.
+export const PEER_COUNT_DROP_RULE_ID = "peer.count_drop";
 
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
 // chosen to unblock shipping v0, NOT tuned values; peer-count variance dynamics are a fresh,
@@ -69,14 +83,31 @@ async function ensurePeerBaselineDir(descartesPaths) {
   await fs.mkdir(resolvePeerBaselineStorePaths(descartesPaths).dir, { recursive: true, mode: 0o700 });
 }
 
+function freshWelfordStatsShape() {
+  return { count: 0, mean: 0, m2: 0, variance: 0, stddev: 0, ewma: undefined, ewma_variance: undefined, min: undefined, max: undefined };
+}
+
+// Slice 4c: nested sibling state for the drop direction, plus the current regime key and its own
+// skipped-tick counter (§2e).
+function freshPeerDropState() {
+  return {
+    confidence_state: "provisional",
+    stats: freshWelfordStatsShape(),
+    last_observation: undefined,
+  };
+}
+
 function freshPeerBaselineState() {
   return {
     version: 1,
     last_folded_ts: undefined,
     confidence_state: "provisional",
-    stats: { count: 0, mean: 0, m2: 0, variance: 0, stddev: 0, ewma: undefined, ewma_variance: undefined, min: undefined, max: undefined },
+    stats: freshWelfordStatsShape(),
     last_observation: undefined,
     skipped_overflow_tick_count: 0,
+    availability_signature: undefined,
+    drop: freshPeerDropState(),
+    skipped_markerless_tick_count: 0,
   };
 }
 
@@ -90,37 +121,62 @@ function finiteOrUndefined(value) {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function normalizeStatsShape(rawStats) {
+  const stats = rawStats && typeof rawStats === "object" && !Array.isArray(rawStats) ? rawStats : {};
+  return {
+    count: finiteOrDefault(stats.count, 0),
+    mean: finiteOrDefault(stats.mean, 0),
+    m2: finiteOrDefault(stats.m2, 0),
+    variance: finiteOrDefault(stats.variance, 0),
+    stddev: finiteOrDefault(stats.stddev, 0),
+    ewma: finiteOrUndefined(stats.ewma),
+    ewma_variance: finiteOrUndefined(stats.ewma_variance),
+    min: finiteOrUndefined(stats.min),
+    max: finiteOrUndefined(stats.max),
+  };
+}
+
+function normalizeLastObservationShape(rawLastObservation) {
+  if (!rawLastObservation || typeof rawLastObservation !== "object" || Array.isArray(rawLastObservation)) return undefined;
+  return {
+    ts: typeof rawLastObservation.ts === "string" ? rawLastObservation.ts : undefined,
+    count: finiteOrUndefined(rawLastObservation.count),
+    z_score: finiteOrUndefined(rawLastObservation.z_score),
+    mean_before: finiteOrUndefined(rawLastObservation.mean_before),
+    stddev_before: finiteOrUndefined(rawLastObservation.stddev_before),
+    has_overflow: Boolean(rawLastObservation.has_overflow),
+  };
+}
+
+// Slice 4c (§2e): corrupt/missing-tolerant normalization for the nested `drop` sibling state --
+// same discipline as every other field in this function: a missing/malformed `drop` object
+// degrades to a fresh nested state rather than throwing or propagating a malformed shape.
+function normalizePeerDropState(rawDrop) {
+  const drop = rawDrop && typeof rawDrop === "object" && !Array.isArray(rawDrop) ? rawDrop : {};
+  return {
+    confidence_state: drop.confidence_state === "established" ? "established" : "provisional",
+    stats: normalizeStatsShape(drop.stats),
+    last_observation: normalizeLastObservationShape(drop.last_observation),
+  };
+}
+
 export function normalizePeerBaselineState(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const stats = base.stats && typeof base.stats === "object" && !Array.isArray(base.stats) ? base.stats : {};
-  const lastObservation = base.last_observation && typeof base.last_observation === "object" && !Array.isArray(base.last_observation)
-    ? {
-        ts: typeof base.last_observation.ts === "string" ? base.last_observation.ts : undefined,
-        count: finiteOrUndefined(base.last_observation.count),
-        z_score: finiteOrUndefined(base.last_observation.z_score),
-        mean_before: finiteOrUndefined(base.last_observation.mean_before),
-        stddev_before: finiteOrUndefined(base.last_observation.stddev_before),
-        has_overflow: Boolean(base.last_observation.has_overflow),
-      }
-    : undefined;
 
   return {
     version: 1,
     last_folded_ts: typeof base.last_folded_ts === "string" ? base.last_folded_ts : undefined,
     confidence_state: base.confidence_state === "established" ? "established" : "provisional",
-    stats: {
-      count: finiteOrDefault(stats.count, 0),
-      mean: finiteOrDefault(stats.mean, 0),
-      m2: finiteOrDefault(stats.m2, 0),
-      variance: finiteOrDefault(stats.variance, 0),
-      stddev: finiteOrDefault(stats.stddev, 0),
-      ewma: finiteOrUndefined(stats.ewma),
-      ewma_variance: finiteOrUndefined(stats.ewma_variance),
-      min: finiteOrUndefined(stats.min),
-      max: finiteOrUndefined(stats.max),
-    },
-    last_observation: lastObservation,
+    stats: normalizeStatsShape(base.stats),
+    last_observation: normalizeLastObservationShape(base.last_observation),
     skipped_overflow_tick_count: finiteOrDefault(base.skipped_overflow_tick_count, 0),
+    // Slice 4c additions (§2e): the CURRENT regime key (top-level, observability-only) and the
+    // drop-direction nested sibling state. A non-string availability_signature (corrupt/malformed
+    // persisted value) coerces to undefined -- the same markerless/undefined sentinel used
+    // throughout this slice (§2a) -- never a fabricated regime string.
+    availability_signature: typeof base.availability_signature === "string" ? base.availability_signature : undefined,
+    drop: normalizePeerDropState(base.drop),
+    skipped_markerless_tick_count: finiteOrDefault(base.skipped_markerless_tick_count, 0),
   };
 }
 
@@ -180,12 +236,22 @@ export async function writePeerBaselineStore(descartesPaths, state) {
  * string, confirmed against daemon.js's runDaemonIteration: `sessions` and `vpn-peer-status` are
  * registered back-to-back in collectStructuralEvidence's activeCollectors map, so every peer
  * fact emitted in one daemon iteration shares the identical `ts` as every session fact from that
- * same iteration). Returns tick-groups ORDERED ascending by ts, each `{ ts, count, hasOverflow }`:
- *   - `count` is the number of NON-overflow peer.presence points in this tick-group whose
- *     attributes.presence_state is NOT "observed_historical" — i.e. every point that is
+ * same iteration). Returns tick-groups ORDERED ascending by ts, each
+ * `{ ts, count, hasOverflow, availabilitySignature }`:
+ *   - `count` is the number of NON-overflow, non-marker peer.presence points in this tick-group
+ *     whose attributes.presence_state is NOT "observed_historical" — i.e. every point that is
  *     "observed_active" OR carries an unrecognized/missing presence_state (matching
  *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)).
  *   - `hasOverflow` is true iff this tick-group carries the PEER_OVERFLOW_ENTITY_KEY marker.
+ *   - `availabilitySignature` (Slice 4c) is the string carried by this tick-group's
+ *     PEER_CENSUS_MARKER_ENTITY_KEY point's `attributes.availability_signature`, or `undefined`
+ *     when no such marker is present in this tick-group (pre-Slice-4c/legacy fact-history) OR
+ *     when a marker IS present but its `availability_signature` attribute is malformed/missing
+ *     (non-string, OR a string that does not match PEER_AVAILABILITY_SIGNATURE_PATTERN's exact
+ *     "v1:<5 closed-enum codes>" shape — e.g. a garbled/corrupted-but-still-parseable value) —
+ *     all such cases collapse to the identical `undefined` sentinel (Decision 6, §2a; shape
+ *     validation added in the Stage 2 adversarial-review fix, 2026-07-23), never a fabricated
+ *     regime string.
  * A tick-group exists whenever ANY peer.presence point (active OR historical) shares that ts —
  * an all-historical tick-group still produces a `{count: 0, hasOverflow: false}` group, per
  * Decision 1/MUST-FIX 2's documented "real zero, not skipped" semantics.
@@ -195,11 +261,29 @@ export function groupPeerFactsByTick(points = []) {
   for (const point of points ?? []) {
     if (!point || point.fact_name !== PEER_FACT_NAME || typeof point.ts !== "string") continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false });
+      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, availabilitySignature: undefined });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === PEER_OVERFLOW_ENTITY_KEY) {
       group.hasOverflow = true;
+      continue;
+    }
+    if (point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY) {
+      // Sentinel unification (Stage 1 review must-fix, 2026-07-23): a non-string OR a
+      // string-but-not-shaped-like-a-real-signature availability_signature attribute
+      // (malformed/corrupt fact point, e.g. disk corruption of facts.jsonl that leaves the JSON
+      // line still parseable, or a future/incompatible marker producer) coerces to `undefined`,
+      // the exact same value a tick-group that never saw a marker point at all already produces
+      // (the "markerless" disposition, §2b/§2c) — see this module's own header comment and the
+      // plan's §2a rationale for why this is the stricter, fail-toward-silence choice. Stage 2
+      // adversarial-review fix (2026-07-23): a TYPE-ONLY guard is insufficient here -- a garbled
+      // string is still a string, and would otherwise be trusted verbatim as a poolable regime key
+      // (degrade-not-fabricate violation) -- so the value must additionally match
+      // PEER_AVAILABILITY_SIGNATURE_PATTERN, the exact closed-enum shape
+      // buildPeerAvailabilitySignature produces.
+      const rawSignature = point.attributes?.availability_signature;
+      group.availabilitySignature =
+        typeof rawSignature === "string" && PEER_AVAILABILITY_SIGNATURE_PATTERN.test(rawSignature) ? rawSignature : undefined;
       continue;
     }
     if (point.attributes?.presence_state !== "observed_historical") {
@@ -217,6 +301,27 @@ export function groupPeerFactsByTick(points = []) {
  */
 function tickGroupDisposition(group) {
   return group.hasOverflow ? "overflow" : "complete";
+}
+
+// Slice 4c (§2b): deliberately NOT unified with tickGroupDisposition above. Extending that
+// function to a 3-way disposition would permanently exclude every marker-less (pre-Slice-4c)
+// tick-group from peer.count_spike's own fold forever, resetting every live, already-shipped
+// peer.count_spike baseline to "provisional" on upgrade — an unacceptable, unrequested regression
+// to an unrelated-to-this-slice detector. This new function is peer.count_drop-only.
+//
+// peer.count_drop-only disposition (Decision 0.1: mirrors session.count_drop's own STRICTER
+// exclude-from-scoring-AND-folding posture for overflow, transplanted from session-baseline.js's
+// tickGroupDisposition); "markerless" additionally excludes any pre-Slice-4c tick-group, exactly
+// mirroring session.count_drop's own must-fix-1/2 "an honest ~30-sample re-warm-up, never
+// fabricated" pattern -- a marker-less peer.presence tick-group carries the identical "real zero
+// vs. never observed" ambiguity Slice 1's own addendum was built to close for sessions, now
+// closed for peers by THIS marker. Keyed on the marker's presence, not a partial/complete
+// boolean: peers have no binary partial-census concept -- degradation is captured entirely by the
+// signature's own content, which is what the regime key (§2c) exists for.
+function dropTickGroupDisposition(group) {
+  if (group.hasOverflow) return "overflow";
+  if (group.availabilitySignature === undefined) return "markerless";
+  return "complete";
 }
 
 /**
@@ -237,10 +342,25 @@ function tickGroupDisposition(group) {
  * Folding otherwise mirrors computeWindowedSessionStats verbatim: the accumulator recomputes
  * fresh over every complete tick-group inside the window on every call, never an incrementally-
  * accumulated running total.
+ *
+ * Slice 4c regime-keyed fold (Decision 2(c), retroactive fix for peer.count_spike's own accepted
+ * false-positive class named in the Slice 4b plan): `completeGroups` gains a second predicate --
+ * only tick-groups whose availability signature matches the CURRENT (most recent) tick's own
+ * signature are eligible to fold. Chronic degradation now establishes its own baseline WITHIN its
+ * own regime; a recovery flips the regime and triggers an honest re-warm-up (empty completeGroups
+ * for the new signature until minSampleCount is met again) instead of scoring a recovery-driven
+ * jump against a stale, differently-conditioned baseline. Backward compatibility: a fully
+ * marker-less window (every group's availabilitySignature is undefined, including the most
+ * recent) is a true no-op (`undefined === undefined`) -- see this module's own test file for the
+ * one-time, self-healing post-upgrade reset this filter accepts for a live, already-marker-less
+ * baseline (§2c of the plan).
  */
 export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_STDDEV_FLOOR, ewmaAlpha = DEFAULT_PEER_EWMA_ALPHA, minSampleCount = DEFAULT_PEER_MIN_SAMPLE_COUNT } = {}) {
-  const completeGroups = groups.filter((group) => tickGroupDisposition(group) === "complete");
   const mostRecentGroup = groups.length > 0 ? groups[groups.length - 1] : undefined;
+  const currentSignature = mostRecentGroup?.availabilitySignature;
+  const completeGroups = groups.filter(
+    (group) => tickGroupDisposition(group) === "complete" && group.availabilitySignature === currentSignature,
+  );
   const mostRecentIsOverflow = mostRecentGroup ? tickGroupDisposition(mostRecentGroup) === "overflow" : false;
 
   // The most recent COMPLETE tick-group, if the tail of `groups` is itself complete, is also the
@@ -280,6 +400,59 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
     stats = foldWelford(stats, mostRecentGroup.count);
     ewmaState = updateEwma(ewmaState, mostRecentGroup.count, ewmaAlpha);
   }
+
+  const confidence_state = stats.count >= minSampleCount ? "established" : "provisional";
+  return {
+    stats: { ...stats, ewma: ewmaState.ewma, ewma_variance: ewmaState.ewma_variance },
+    confidence_state,
+    last_observation: lastObservation,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4c — peer.count_drop's own windowed fold. NOT a parameterized variant of
+// computeWindowedPeerStats above (their overflow-handling policies diverge: score-but-never-fold
+// for spike vs. exclude-from-both for drop -- Decision 0.1); mirrors session-baseline.js's
+// computeWindowedSessionStats fold+score-at-tail shape verbatim, plus the SAME regime filter as
+// computeWindowedPeerStats above, keyed on dropTickGroupDisposition instead of
+// tickGroupDisposition.
+//
+// Note on when peer.count_drop can first activate: if the current (most recent) tick-group is
+// itself "markerless" (pre-Slice-4c or transitional), `eligibleGroups` is ALWAYS empty (a
+// "markerless" group can never also be "complete"), so confidence_state stays "provisional" and
+// no candidate is ever emitted -- an honest, unavoidable cold-start gate exactly matching
+// session.count_drop's own pre-Slice-1-addendum era. peer.count_drop simply cannot fire until the
+// census marker has been live and accumulating for DEFAULT_PEER_MIN_SAMPLE_COUNT same-signature
+// ticks. This is intended, not a bug to route around.
+// ---------------------------------------------------------------------------------------------
+export function computeWindowedPeerDropStats(groups, { stddevFloor = DEFAULT_PEER_STDDEV_FLOOR, ewmaAlpha = DEFAULT_PEER_EWMA_ALPHA, minSampleCount = DEFAULT_PEER_MIN_SAMPLE_COUNT } = {}) {
+  const mostRecentGroup = groups.length > 0 ? groups[groups.length - 1] : undefined;
+  const currentSignature = mostRecentGroup?.availabilitySignature;
+  const mostRecentIsOverflow = mostRecentGroup ? dropTickGroupDisposition(mostRecentGroup) === "overflow" : false;
+
+  const eligibleGroups = groups.filter(
+    (group) => dropTickGroupDisposition(group) === "complete" && group.availabilitySignature === currentSignature,
+  );
+
+  let stats = emptyWelfordStats();
+  let ewmaState = { ewma: undefined, ewma_variance: undefined };
+  let lastObservation;
+
+  eligibleGroups.forEach((group, index) => {
+    if (index === eligibleGroups.length - 1) {
+      const zScore = computeZScore(group.count, stats.mean, stats.stddev, stddevFloor);
+      lastObservation = {
+        ts: group.ts,
+        count: group.count,
+        z_score: zScore,
+        mean_before: stats.mean,
+        stddev_before: stats.stddev,
+        has_overflow: mostRecentIsOverflow, // purely observational, mirrors session-baseline.js's own nice-to-have (ii)
+      };
+    }
+    stats = foldWelford(stats, group.count);
+    ewmaState = updateEwma(ewmaState, group.count, ewmaAlpha);
+  });
 
   const confidence_state = stats.count >= minSampleCount ? "established" : "provisional";
   return {
@@ -336,6 +509,48 @@ export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_
   };
 }
 
+/**
+ * Slice 4c — fires peer.count_drop when confidence_state === "established" AND
+ * z <= -deviationSigma AND observed_count < mean_before (defense-in-depth, redundant given a
+ * negative z — same posture as buildCountSpikeCandidate's own positive-z guard above and
+ * session-baseline.js's own drop-side guard).
+ *
+ * Decision 0 (plan pinned), mirrors peer.count_spike's own MUST-FIX-1 cap: stored severity is
+ * HARDCODED "warning" -- it never escalates to "critical" in v0, regardless of z magnitude. Peer-
+ * count variance dynamics remain an untuned PROVISIONAL surface for BOTH directions; no new
+ * INERT critical-tier constant is added for the drop direction (Decision 5) -- the existing
+ * DEFAULT_PEER_CRITICAL_SIGMA (already inert for peer.count_spike) is reused as the same
+ * future-facing placeholder here too.
+ */
+export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA } = {}) {
+  if (state?.confidence_state !== "established") return undefined;
+  const obs = state.last_observation;
+  if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
+  if (!(obs.z_score <= -deviationSigma)) return undefined;
+  if (!(obs.count < obs.mean_before)) return undefined; // defense-in-depth guard, redundant given a negative z
+
+  const diagnostics = sanitizeDiagnostics({
+    observed_count: obs.count,
+    mean_before: obs.mean_before,
+    stddev_before: obs.stddev_before,
+    z_score: obs.z_score,
+    confidence_state: state.confidence_state,
+  });
+  return {
+    id: alertId(PEER_COUNT_DROP_RULE_ID, "global"),
+    rule_id: PEER_COUNT_DROP_RULE_ID,
+    fingerprint: "global",
+    // Decision 0 (plan pinned), mirrors peer.count_spike's own MUST-FIX-1 cap: severity is
+    // HARDCODED "warning" -- never escalates to "critical" in v0, regardless of z magnitude.
+    // Peer-count variance dynamics remain an untuned PROVISIONAL surface for BOTH directions.
+    severity: "warning",
+    title: "Peer count drop",
+    summary: "Currently-observed VPN/SSH peer count dropped significantly below its established (regime-matched) baseline.",
+    diagnostics,
+    evidence_refs: ["peer-baseline"],
+  };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Fast-tick side — the daemon.js extraCandidates entry.
 // ---------------------------------------------------------------------------------------------
@@ -374,13 +589,18 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const newGroups = groups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
 
   const windowed = computeWindowedPeerStats(groups, { stddevFloor, ewmaAlpha, minSampleCount });
+  // Slice 4c: the drop-direction windowed fold, computed alongside (not instead of) `windowed`
+  // above -- SHARED tick-grouping (`groups`), independent Welford accumulators/dispositions.
+  const windowedDrop = computeWindowedPeerDropStats(groups, { stddevFloor, ewmaAlpha, minSampleCount });
 
   if (newGroups.length > 0) {
     let skippedOverflow = persistedState.skipped_overflow_tick_count;
+    let skippedMarkerless = persistedState.skipped_markerless_tick_count; // Slice 4c
     let lastFoldedTs = persistedState.last_folded_ts;
     for (const group of newGroups) {
       lastFoldedTs = group.ts;
       if (tickGroupDisposition(group) === "overflow") skippedOverflow += 1;
+      if (dropTickGroupDisposition(group) === "markerless") skippedMarkerless += 1; // Slice 4c, independent counter
     }
     const nextState = {
       version: 1,
@@ -389,18 +609,34 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
       stats: windowed.stats,
       last_observation: windowed.last_observation,
       skipped_overflow_tick_count: skippedOverflow,
+      // Slice 4c additions: the CURRENT regime key (top-level, observability-only) and the
+      // drop-direction nested sibling state.
+      availability_signature: groups.length > 0 ? groups[groups.length - 1].availabilitySignature : undefined,
+      drop: {
+        confidence_state: windowedDrop.confidence_state,
+        stats: windowedDrop.stats,
+        last_observation: windowedDrop.last_observation,
+      },
+      skipped_markerless_tick_count: skippedMarkerless,
     };
     const writeStore = options.writePeerBaselineStore ?? writePeerBaselineStore;
     await writeStore(descartesPaths, nextState);
   }
 
   // Re-emission every tick (load-bearing, mirrors session-baseline.js's own Decision 3): built
-  // fresh from `windowed` on EVERY call — including ticks where nothing new was folded — so
-  // applyAlertCandidates never spuriously "recovers" an active peer.count_spike just because this
-  // source skipped a redundant write.
-  const candidate = buildCountSpikeCandidate(
+  // fresh from `windowed`/`windowedDrop` on EVERY call — including ticks where nothing new was
+  // folded — so applyAlertCandidates never spuriously "recovers" an active peer.count_spike/
+  // peer.count_drop just because this source skipped a redundant write.
+  const candidates = [];
+  const spikeCandidate = buildCountSpikeCandidate(
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
     { deviationSigma },
   );
-  return candidate ? [candidate] : [];
+  if (spikeCandidate) candidates.push(spikeCandidate);
+  const dropCandidate = buildCountDropCandidate(
+    { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
+    { deviationSigma },
+  );
+  if (dropCandidate) candidates.push(dropCandidate);
+  return candidates;
 }
