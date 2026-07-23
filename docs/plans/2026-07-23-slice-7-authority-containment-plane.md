@@ -8,6 +8,9 @@ raw-identifier provenance tension). 6 PASS + 2 MINOR safety findings recorded, n
 required on the MINORs beyond what §(a)'s "Inputs read" note and revoke's precondition text already
 say.
 **Created:** 2026-07-23
+**Review MINORs folded:** 2026-07-23 — prior-art reconciliation with
+`todos/2026-05-19-agent-delegation-identity-authority.md` (§ "Inputs read" below), and an
+illustrative-not-exhaustive caveat on §(a) revoke's credential-class enumeration.
 **Supersedes:** nothing. This is the dedicated, separately-reviewed plan that
 `docs/plans/2026-07-13-observed-incident-collectors.md`'s Slice 7 section (lines 858–871)
 explicitly said would be required before any pickup — "a placeholder for a future,
@@ -23,11 +26,19 @@ requirement.
 convention, `promoteReviewReadyToActive`), `tools/descartes-cli/src/index.js` (`learned` CLI
 dispatch precedent, line 133), `tools/descartes-cli/src/daemon.js` (`learned.json` kill-switch
 gating precedent, lines ~68–80/341/422), `docs/reviews/2026-07-11-codex-gpt5.6-sol-review.md`
-(S3-priv `root_helper` adversarial review, used as the review-bar reference in §(e)). No
-`docs/plans/2026-05-19-agent-delegation-identity-authority.md` file exists in this repo despite
-being referenced in `docs/HANDOFF.md` line 361/391 — treated as **not found / out of scope**;
-if that spike exists elsewhere it should be reconciled with this document in a follow-up, not
-assumed compatible.
+(S3-priv `root_helper` adversarial review, used as the review-bar reference in §(e)). `todos/2026-05-19-agent-delegation-identity-authority.md` (an open, unassigned design-spike TODO,
+not yet an implementation) — corrected 2026-07-23: this file does exist in this repo, contrary to
+this document's earlier "not found / out of scope" framing, and bears directly on §(b)'s hardest
+open question. That TODO scopes inter-**agent** delegation (a Descartes instance delegating work
+to another agent/execution environment: explicit agent identity, scoped capability tokens rather
+than ambient trust, and — most relevantly here — "the user can validate/approve cross-agent
+delegation before mutating or sensitive actions") as a still-open question, not a settled answer.
+It is prior art bearing on, but not a substitute for, this document's multi-party-confirmation
+authority model (§(b)): it establishes that this codebase already recognizes delegated/multi-actor
+authorization as a distinct open problem needing its own identity and capability-token design, which
+is consistent with §(b)'s conclusion that a true second-party mechanism (Option 1) is aspirational
+rather than buildable today. A future implementation should reconcile the two rather than design
+authority primitives twice.
 
 ---
 
@@ -115,6 +126,15 @@ pattern.
   exactly); a **self-lockout guard** that refuses to revoke the credential/session/peer currently
   in use by the approving actor's own connection; a designed-in reversal path (re-adding a peer)
   proven to work *before* the removal path ships.
+- **Enumeration scope note:** the SSH-session and WireGuard-peer cases above are illustrative
+  examples, not the complete revoke surface. Other credential classes — OAuth tokens, API keys,
+  Kerberos tickets, application session cookies — have their own distinct, and possibly higher,
+  privilege surfaces (different revocation mechanisms, different blast radii, different
+  self-lockout shapes) that are not analyzed here and must be enumerated concretely, per credential
+  class, at implementation time (per §(d) item 2's "enumerate against the real deployment rather
+  than building out the full abstract catalog speculatively" discipline). No scope expansion is
+  intended by this note — it flags a gap in this document's enumeration, not a new verb or class to
+  design now.
 
 ### block (firewall/deny a peer)
 
