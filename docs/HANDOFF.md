@@ -1,6 +1,6 @@
 # Descartes Handoff
 
-**Last updated:** 2026-07-12
+**Last updated:** 2026-07-23
 
 ## Current Status
 
@@ -26,6 +26,21 @@ The active initiative is making Descartes *learn* the machine, build its own mon
   - `e580fa5` **S5-follow-1 (done)** — `identity_hash` now = a bounded `sha256(dev:ino:size:mtimeMs).slice(0,16)` content-change fingerprint (one `fs.stat` on the reconcile path), so `identity_drift` catches an in-place binary swap that changes mtime/size/inode. Residual (documented): a same-inode overwrite preserving size AND resetting mtime via `touch -r` still evades a pure stat proxy — a codesign CDHash / full content hash is the future hardening for signed binaries.
 
 Descartes now fires FOUR deterministic alert sources through the one merged pipeline: fixed resource rules, active learned constraints (`a6dde51`), provenance known-bad warnings, and identity deviations — all gated behind the single `learned.json` kill switch (default off), all sanitized, no LLM.
+
+### RESUME HERE (2026-07-23) — Codex findings done · native notifications validated · notarize-skip landed. No task in flight; pick a thread below.
+
+**Live state (all pushed, `main` green, suite 1087):**
+- **All 5 deferred Codex findings dispositioned** (see the 2026-07-16 SESSION UPDATE below): #1 approval atomicity (`9264173`), Slice A multi-owner ambiguity (`accbc49`), Slices B+C service-disappearance representability (`924d819`+`8c3d70d`), #6 FD-scan truncation observability (`3463341`). All fail-safe, adversarially verified.
+- **Native macOS notifications WORK end-to-end on a real host** (see 2026-07-22 SESSION UPDATE): fixed the direct-exec→LaunchServices (`open`) authorization bug (`bf5baab`), released `v0.0.49`, operator validated a delivered banner. Todos `2026-05-30-native-macos-notifications.md` + `2026-07-08-macos-release-validation.md` marked done (residual DEFAULT-channel-promotion checks noted).
+- **Notifier notarization-SKIP landed** (`782e97b`, CI-time optimization): reuse a prior notarized notifier zip when its source is unchanged. **Not yet exercised on a real release** — validate across the next TWO tags (v0.0.49 lacks the attestation → next tag seeds it, the one after can reuse).
+
+**Next-action options (operator to steer — nothing is mid-flight):**
+1. **Service-disappearance ALERT** — the deferred #9 follow-up: a new opt-in baseline slice that diffs expected-vs-seen service set (consuming the Slice C `service.census` marker + Slice B freshness bound). Directly advances the self-learning-monitoring initiative; locally testable.
+2. **`reduceLatestProvenanceWarnings` second `>=` latest-wins copy** — the Slice A follow-up called out in `docs/plans/2026-07-16-codex-findings-hardening.md` (a second copy of the ambiguity bug feeding a real alert-candidate source). Small, self-contained.
+3. **Slice 7 (authority/containment plane)** — DESIGN-ONLY; the approval-gated containment the observed incident motivated. Biggest strategic gap; plan → review first.
+4. Observed-incident follow-ups (4c peer-drop+regime-keyed+census-marker, 0b 7-day-via-aggregates, 1b fast-tick); Slice 16 (`witr` cross-check); accurate (non-best-effort) native delivery status (needs a re-signed notifier).
+
+---
 
 ### RESUME HERE (2026-07-14) — observed-incident collectors milestone: ALL BUILDABLE SLICES COMPLETE (plan `3a15a6a`; Slices 0 `905e8e6`, 1 `4576f4d`, 2 `e61e464`, 3 `91168d1`, 4 `cf0813f`, 4b `47309d4`, 6 `ca6017d` shipped; Slice 5 spike `18176f5` go/no-go DEFER). Both incident signatures (mass session-drop + churn; unattributed odd-hour peer login) are now DETECTED, ALERTED (deterministic non-LLM), and CORRELATED (default-off gated LLM), plus evidence-freeze shipped. Also done this session: S13 LLM-wakeup gate (`bc407e2`), the **S13 audit/config I/O hardening** (`56c9141`), **S15 calibration report** (`e507858`) + **S14 outcome-informed compile-down** (`2ca405a`) — the make-it-live remainder, so **the self-learning loop is now CLOSED end-to-end** (learn → alert → measure outcomes → propose tuning [human-gated, never auto-applied] → self-audit calibration), and S3-priv Slices 1–6. **Cut release `v0.0.48`** (`e92f47f`, tag pushed → Buildkite release job builds/signs/notarizes the notifier; GitHub-release publish depends on the Doppler `GITHUB_TOKEN`). Remaining threads: Slice 7 (authority/containment plane) DESIGN-ONLY; the observed-incident deferred follow-ups (4c peer-drop+regime-keyed+census-marker, 0b 7-day-via-aggregates, 1b fast-tick); Slice 16 (optional bounded `witr` binary cross-check); deferred Codex findings — ALL 4 now SHIPPED this session (see the 2026-07-16 update below), incl. #6 FD-scan truncation observability (`3463341`, Rust+Node, CI-gated real path).
 

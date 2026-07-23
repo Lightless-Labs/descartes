@@ -1,7 +1,7 @@
 ---
 title: macOS Notifier Helper Delivery
 created: 2026-07-08
-status: in_progress
+status: done
 priority: high
 area: notifications
 kind: todo
@@ -29,6 +29,13 @@ The next-tag tap token can be checked ahead of time with
 remaining work is external validation on a real Mac and the next tagged release; see
 `todos/2026-07-08-macos-release-validation.md` for executable steps.
 
+**DONE (2026-07-23).** Homebrew delivery is validated in production: `v0.0.48` and `v0.0.49`
+released with the tap auto-bump, and the operator `brew upgrade`d to `0.0.49` and got a working
+CLI + bundled helper that delivered a real notification (after the LaunchServices `open` fix,
+`bf5baab`). The two open criteria below are resolved (first-tag) / core-validated-with-residuals
+(real-host) — the residuals gate only DEFAULT-channel promotion. See
+`todos/2026-07-08-macos-release-validation.md` + `todos/2026-05-30-native-macos-notifications.md`.
+
 ## Acceptance criteria
 
 - [x] Homebrew formula exists and locally verified install yields a working `descartes`
@@ -43,8 +50,11 @@ remaining work is external validation on a real Mac and the next tagged release;
       fallback/manual bump behavior; it reuses `GITHUB_TOKEN` by default, with optional
       `HOMEBREW_TAP_GITHUB_TOKEN` for a narrower token. `scripts/check-homebrew-tap-token.sh`
       provides a read-only preflight for the token before the next tag.
-- [ ] Real-host validation: first-run Notification Center permission prompt attribution,
+- [~] Real-host validation: first-run Notification Center permission prompt attribution,
       persistence, denied-path behavior, and daemon-context native delivery with the
-      brew-installed helper.
-- [ ] First-tag validation: tap-bump automation runs successfully in CI on the next
-      version tag and `brew upgrade descartes` pulls the new CLI + helper.
+      brew-installed helper. *(2026-07-23: core validated — the brew-installed helper delivered a
+      visible banner on `0.0.49`. Prompt attribution / persistence / denied-path / daemon-context
+      unobserved; gate DEFAULT-channel promotion only.)*
+- [x] First-tag validation: tap-bump automation runs successfully in CI on the next
+      version tag and `brew upgrade descartes` pulls the new CLI + helper. *(2026-07-23: validated
+      across `v0.0.48` and `v0.0.49`.)*

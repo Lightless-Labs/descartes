@@ -1,7 +1,7 @@
 ---
 title: macOS Notifier Release — Real-Host & First-Tag Validation
 created: 2026-07-08
-status: pending
+status: done
 priority: high
 area: notifications
 kind: todo
@@ -49,9 +49,19 @@ or next-tag evidence. If the app repo and tap repo are clean, the latest tag rem
 `v0.0.47`, and no credential-bearing environment or suitable real-host evidence is
 available, do not reclassify this todo as complete; wait for those external inputs.
 
+**DONE (2026-07-23) — the external evidence arrived.** The stop-condition above is lifted:
+subsequent tags `v0.0.48` and `v0.0.49` released end-to-end (build → sign → notarize → staple →
+GitHub Release → **tap auto-bump**), the operator `brew upgrade`d to `0.0.49`, and
+`descartes alerts notifications test --json` **delivered a visible banner** on the real host
+(after the direct-exec→`open` LaunchServices fix, `bf5baab`/`v0.0.49` — see the native-notifications
+todo). Part B (first-tag tap-bump chain) + Token confirmation are validated by two successive
+real releases. Part A's CORE (bundled helper resolves + notification displays) is validated; its
+first-run-PROMPT attribution, daemon-context delivery, and denied-path/fallback sub-checks remain
+UNOBSERVED and now gate only PROMOTING native to the DEFAULT macOS channel (not currently planned).
+
 ## Acceptance criteria
 
-- [ ] **Real-host helper (Part A):** on a Mac with no prior grant, `brew install
+- [~] **Real-host helper (Part A):** *(2026-07-23: CORE validated — brewed CLI resolves the bundled helper (`source: bundled`, path inside the `0.0.49` keg) and the notification DISPLAYS on the real host. UNOBSERVED residuals (gate DEFAULT-channel promotion only): first-run prompt attribution (no prompt seen — already granted), grant-persistence-across-restart, daemon-context delivery, denied-path fail-closed + osascript fallback.)* on a Mac with no prior grant, `brew install
       lightless-labs/tap/descartes`, confirm `descartes` resolves to the brewed 0.0.47+
       CLI rather than an older npm-global shim, then `descartes alerts notifications setup
       --channel native --json` resolves the bundled helper with no flags
@@ -63,13 +73,13 @@ available, do not reclassify this todo as complete; wait for those external inpu
       result (or the review clearly states any narrower harness used); the denied path
       fails closed with an audit record and the osascript fallback still works. Results
       recorded under `docs/reviews/`.
-- [ ] **First-tag chain (Part B):** on the next `vX.Y.Z` tag, the Buildkite release job
+- [x] **First-tag chain (Part B):** *(2026-07-23: validated across `v0.0.48` AND `v0.0.49` — both released build → sign → notarize → staple → GitHub Release → tap auto-bump, and the operator `brew upgrade`d to `0.0.49`, confirming the formula url+sha updated and the new version+helper installed.)* on the next `vX.Y.Z` tag, the Buildkite release job
       runs build → sign → notarize (Accepted) → staple → Buildkite artifacts → GitHub
       Release → **tap formula bump** (a `descartes: update to X.Y.Z` commit in
       `Lightless-Labs/homebrew-tap` with url version + both sha256 updated); and
       `brew upgrade descartes` pulls the new version + helper. This is the first CI run
       of the tap auto-bump.
-- [ ] **Token confirmation:** before tagging, `scripts/check-homebrew-tap-token.sh`
+- [x] **Token confirmation:** *(2026-07-23: proven by the tap bump succeeding on two successive releases reusing `GITHUB_TOKEN` — no separate secret needed.)* before tagging, `scripts/check-homebrew-tap-token.sh`
       reports that the effective token can read `Formula/descartes.rb` and has
       push/write permission on `Lightless-Labs/homebrew-tap`; then the tap bump succeeds
       reusing `GITHUB_TOKEN` (no separate secret). If preflight or CI warns/skips on
