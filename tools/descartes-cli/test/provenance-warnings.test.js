@@ -262,7 +262,64 @@ test("reduceLatestProvenanceWarnings ignores fact points with a different fact_n
   const points = [
     { entity_key: "x", ts: "2026-07-10T00:00:00.000Z", fact_name: "service.presence", attributes: { running: "true" } },
   ];
-  assert.deepEqual(reduceLatestProvenanceWarnings(points), []);
+  const result = reduceLatestProvenanceWarnings(points);
+  assert.deepEqual([...result], []);
+  assert.deepEqual(result.ambiguousEntityKeys, []);
+});
+
+// --- same-tick ambiguity (mirrors shadow-store.js's buildShadowFactLookup Slice A, accbc49) ---
+
+test("reduceLatestProvenanceWarnings: two same-ts points with DIFFERENT attributes for one entity_key are ambiguous → excluded from the result, entity_key listed in ambiguousEntityKeys", () => {
+  const entityKey = "public_bind_no_supervisor.socket.tcp.9000.ipv4_any";
+  const points = [
+    { entity_key: entityKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { rule_id: "public_bind_no_supervisor", active: "true", source_type: "unknown", confidence: "0.8", protocol: "tcp", local_port: "9000", bind_address_family: "ipv4_any" } },
+    { entity_key: entityKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { rule_id: "public_bind_no_supervisor", active: "true", source_type: "unknown", confidence: "0.5", protocol: "tcp", local_port: "9000", bind_address_family: "ipv4_any" } },
+  ];
+  const result = reduceLatestProvenanceWarnings(points);
+  assert.deepEqual([...result], [], "conflicting same-tick observations must NOT resolve to either — withhold, never last-wins");
+  assert.ok(Array.isArray(result.ambiguousEntityKeys), "ambiguity is observable via result.ambiguousEntityKeys");
+  assert.deepEqual(result.ambiguousEntityKeys, [entityKey]);
+});
+
+test("reduceLatestProvenanceWarnings: two same-ts points with byte-identical attributes (canonical key order) are NOT ambiguous — one point kept", () => {
+  const entityKey = "public_bind_no_supervisor.socket.tcp.9000.ipv4_any";
+  const attrs = { rule_id: "public_bind_no_supervisor", active: "true", source_type: "unknown", confidence: "0.8", protocol: "tcp", local_port: "9000", bind_address_family: "ipv4_any" };
+  const points = [
+    { entity_key: entityKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { ...attrs } },
+    { entity_key: entityKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { ...attrs } },
+  ];
+  const result = reduceLatestProvenanceWarnings(points);
+  assert.equal(result.length, 1);
+  assert.deepEqual(result[0].attributes, attrs);
+  assert.deepEqual(result.ambiguousEntityKeys, []);
+});
+
+test("reduceLatestProvenanceWarnings: a strictly-newer single point CLEARS a prior same-ts ambiguity, order-independent (ambiguity is per-latest-ts, not sticky)", () => {
+  const entityKey = "public_bind_no_supervisor.socket.tcp.9000.ipv4_any";
+  const mk = (ts, confidence) => ({ entity_key: entityKey, ts, fact_name: "provenance.warning", attributes: { rule_id: "public_bind_no_supervisor", active: "true", source_type: "unknown", confidence, protocol: "tcp", local_port: "9000", bind_address_family: "ipv4_any" } });
+  for (const points of [
+    [mk("2026-07-16T00:00:00.000Z", "0.8"), mk("2026-07-16T00:00:00.000Z", "0.5"), mk("2026-07-16T01:00:00.000Z", "0.9")],
+    [mk("2026-07-16T01:00:00.000Z", "0.9"), mk("2026-07-16T00:00:00.000Z", "0.8"), mk("2026-07-16T00:00:00.000Z", "0.5")],
+  ]) {
+    const result = reduceLatestProvenanceWarnings(points);
+    assert.equal(result.length, 1, "the newest tick's unambiguous point wins regardless of array order");
+    assert.equal(result[0].attributes.confidence, "0.9");
+    assert.deepEqual(result.ambiguousEntityKeys, []);
+  }
+});
+
+test("reduceLatestProvenanceWarnings: same-ts differing attributes for DIFFERENT entity_keys never cross-contaminate — only the ambiguous one is excluded", () => {
+  const ambiguousKey = "public_bind_no_supervisor.socket.tcp.9000.ipv4_any";
+  const cleanKey = "deleted_exe_running.process.777";
+  const points = [
+    { entity_key: ambiguousKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { rule_id: "public_bind_no_supervisor", active: "true", confidence: "0.8", protocol: "tcp", local_port: "9000", bind_address_family: "ipv4_any" } },
+    { entity_key: ambiguousKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { rule_id: "public_bind_no_supervisor", active: "true", confidence: "0.5", protocol: "tcp", local_port: "9000", bind_address_family: "ipv4_any" } },
+    { entity_key: cleanKey, ts: "2026-07-16T00:00:00.000Z", fact_name: "provenance.warning", attributes: { rule_id: "deleted_exe_running", active: "true", pid: "777" } },
+  ];
+  const result = reduceLatestProvenanceWarnings(points);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].entity_key, cleanKey);
+  assert.deepEqual(result.ambiguousEntityKeys, [ambiguousKey]);
 });
 
 // ---------------------------------------------------------------------------------------------

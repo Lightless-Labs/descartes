@@ -189,12 +189,31 @@ export function provenanceWarningFactPoints(evidence, { ts } = {}) {
 }
 
 /**
- * Reduces a fact-point window down to the latest observation per entity_key (mirrors
- * shadow-store.js's buildShadowFactLookup's own "latest wins" semantics, reimplemented locally
- * rather than reusing that function directly since it hard-codes a fixed
- * fact-name -> attribute map that does not include this module's "provenance.warning" fact
- * name — see blast-radius note in the slice's own instructions: shadow-store.js is read-only
- * for this slice, not edited).
+ * Reduces a fact-point window down to the latest observation per entity_key. Reimplemented
+ * locally rather than reusing shadow-store.js's buildShadowFactLookup directly since that
+ * function hard-codes a fixed fact-name -> attribute map that does not include this module's
+ * "provenance.warning" fact name — see blast-radius note in the slice's own instructions:
+ * shadow-store.js is read-only for this slice, not edited.
+ *
+ * When multiple points for the same entity_key share the latest ts, the most recent (by ts)
+ * wins — EXCEPT when that latest ts itself carries two or more points with DIFFERENT
+ * `attributes` (a within-tick contradiction, since one collector tick shares one ts): that
+ * entity_key is marked ambiguous and withheld from the returned array entirely (mirrors
+ * shadow-store.js's buildShadowFactLookup Slice A fix, commit accbc49), so
+ * buildProvenanceWarningCandidates never sees it and never builds a candidate for it — fail to
+ * skip, never silently pick whichever point was processed last. A strictly-newer point legitimately
+ * supersedes anything older and clears any prior same-ts ambiguity (ambiguity is per-latest-ts,
+ * never sticky). The set of suppressed entity_keys is exposed on the returned array as
+ * `result.ambiguousEntityKeys` for observability (mirrors `lookup.ambiguousTargets`).
+ *
+ * "Different `attributes`" is decided by `JSON.stringify(point.attributes)` (whole-observation
+ * equality — there is no single scalar "value" field here). provenanceWarningFactPoints (above)
+ * builds `attributes` in a fixed key order (`rule_id`, `active`, then optional
+ * `source_type`/`confidence`/`severity`, then rule-specific fields), so this is deterministic
+ * for points produced by that function. Hand-built test fixtures must use that same key order to
+ * avoid a false-negative (identical content, different insertion order) — no key-sorting is
+ * added here, matching Slice A's own "same-ts = same-tick is a PROXY, not a guarantee" caveat
+ * rather than over-engineering the check.
  */
 export function reduceLatestProvenanceWarnings(factPoints = []) {
   const latestByEntity = new Map();
@@ -205,9 +224,27 @@ export function reduceLatestProvenanceWarnings(factPoints = []) {
     const tsMs = new Date(point.ts).getTime();
     if (!Number.isFinite(tsMs)) continue;
     const existing = latestByEntity.get(entityKey);
-    if (!existing || tsMs >= existing.tsMs) latestByEntity.set(entityKey, { tsMs, point });
+    if (!existing || tsMs > existing.tsMs) {
+      // First observation, or a strictly-NEWER tick: legitimately supersedes anything older,
+      // clearing any prior same-ts ambiguity (ambiguity is per-latest-ts, never sticky).
+      latestByEntity.set(entityKey, { tsMs, point, ambiguous: false });
+    } else if (tsMs === existing.tsMs && JSON.stringify(point.attributes) !== JSON.stringify(existing.point.attributes)) {
+      // Same bug class as shadow-store.js's Slice A (commit accbc49): two DIFFERENT observations
+      // at the SAME latest ts is a within-tick contradiction (one collector tick shares one ts).
+      // Pre-fix this silently collapsed to last-processed-wins; now mark ambiguous and withhold —
+      // fail to skip, never silently pick one. Identical duplicates are NOT ambiguous.
+      existing.ambiguous = true;
+    }
+    // tsMs < existing.tsMs: an older observation; the newer one already won — ignore.
   }
-  return [...latestByEntity.values()].map((entry) => entry.point);
+  const ambiguousEntityKeys = [];
+  const result = [];
+  for (const [entityKey, entry] of latestByEntity) {
+    if (entry.ambiguous) { ambiguousEntityKeys.push(entityKey); continue; }
+    result.push(entry.point);
+  }
+  result.ambiguousEntityKeys = ambiguousEntityKeys;
+  return result;
 }
 
 function buildPublicBindCandidate(point) {
