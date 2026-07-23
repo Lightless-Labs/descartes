@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
+import { SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -18,8 +19,14 @@ import {
 // [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID], unchanged, for every other consumer (see
 // the two shipped tests this surface touches: test/session-baseline.test.js:677-678 and
 // test/alert-intelligence.test.js:965-967, both of which remain green as-is). This module-private
-// three-id constant is what the delivery function's allowlist check actually uses.
-const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, PEER_COUNT_SPIKE_RULE_ID];
+// constant is what the delivery function's allowlist check actually uses. Widened again
+// (service-disappearance-alert plan, 2026-07-23) to add SERVICE_DISAPPEARED_RULE_ID, composed here
+// for the same reason -- avoids a forbidden service-baseline.js -> session-baseline.js coupling.
+const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
+  ...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
+  PEER_COUNT_SPIKE_RULE_ID,
+  SERVICE_DISAPPEARED_RULE_ID,
+];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
 
@@ -403,6 +410,25 @@ function buildSessionAlertNotificationDecision(alert) {
       severity: alert.severity === "critical" ? "critical" : "warning",
       title: "Descartes: peer count deviation",
       body: `Peer count ${diagnostics.observed_count} vs baseline mean ${diagnostics.mean_before} (z=${diagnostics.z_score}, ${diagnostics.confidence_state}).`,
+    };
+  }
+  // Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md),
+  // orchestrator resolution 2026-07-23: fail-closed, hash-only body by default. Unlike
+  // session/peer identity (hashed at source in fact-translators.js), service.presence entity_keys
+  // are sanitized but NOT hashed at source -- service-baseline.js hashes entity_key locally
+  // (hashServiceEntityKey) before it ever reaches diagnostics, so this module's own
+  // "counts/hash-only -- never a raw session name" / "a finite number or a short closed-enum/hash
+  // string" invariants (see emitSessionAlertSignals'/this function's own header comments) hold for
+  // this rule_id exactly as they do for every existing one. Cleartext is explicitly DEFERRED
+  // pending a future, separately-approved operator decision (see the plan's "Operator decisions
+  // required before implementation" section) -- shipping it would require updating both of those
+  // invariant doc-comments plus any pinning test, in the SAME commit.
+  if (alert?.rule_id === SERVICE_DISAPPEARED_RULE_ID) {
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: service disappeared",
+      body: `A previously-established service (id ${diagnostics.entity_key_hash}) stopped appearing in the latest complete census (last seen ${diagnostics.last_seen_ts}).`,
     };
   }
   // Unreachable in normal operation (the caller already filters to

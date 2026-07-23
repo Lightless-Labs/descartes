@@ -17,6 +17,7 @@ import {
 } from "./fact-translators.js";
 import { computeCorrelationCandidates } from "./incident-correlation.js";
 import { computePeerBaselineCandidates } from "./peer-baseline.js";
+import { computeServiceBaselineCandidates } from "./service-baseline.js";
 import { computeSessionBaselineCandidates } from "./session-baseline.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
@@ -552,6 +553,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // short-circuit. peer.count_spike is unknown_namespace (Decision 3), so it can never
           // reach the LLM adjudication path below regardless of enabled_namespaces.
           ...await computePeerBaselineCandidates(descartesPaths, options),
+          // Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md),
+          // additive seventh extraCandidates entry: a set-membership diff (service.disappeared)
+          // over Slice C's already-persisted service.presence/service.census fact-history — no new
+          // execFile/host I/O. Gated identically to its siblings by
+          // computeServiceBaselineCandidates' own loadLearnedConfig(...).enabled short-circuit.
+          // Threads the SAME activeFreshnessMs already resolved above (Slice B's freshness
+          // horizon), matching computeActiveConstraintCandidates' own call. service.disappeared is
+          // unknown_namespace (no classifyAlertNamespace branch), so it can never reach the LLM
+          // adjudication path below regardless of enabled_namespaces.
+          ...await computeServiceBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace

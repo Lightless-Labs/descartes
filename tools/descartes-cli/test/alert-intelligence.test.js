@@ -21,6 +21,7 @@ import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
+import { SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -1296,6 +1297,169 @@ test("Fable review MUST-FIX 4: the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE
   });
   assert.deepEqual(new Set(result.fired), new Set(alerts.map((a) => a.id)));
   assert.equal(deliveries.length, expectedIds.length, "every id in the composed three-id constant must actually be delivered by this branch");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md) — Decision
+// 2b-equivalent fail-closed namespace regression tests + widened deterministic-delivery tests, for
+// service.disappeared. Mirrors the peer.count_spike section above exactly.
+// ---------------------------------------------------------------------------------------------
+
+test("(a) classifyAlertNamespace('service.disappeared') returns {namespace: undefined, hardExcluded: false} -- not 'baseline', not any other known namespace", () => {
+  assert.deepEqual(classifyAlertNamespace(SERVICE_DISAPPEARED_RULE_ID), { namespace: undefined, hardExcluded: false });
+});
+
+test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAMESPACES enabled and one due service.disappeared, is no_eligible_alerts / excluded.unknown_namespace / zero LLM calls (airtight even with full consent)", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: [...KNOWN_ALERT_NAMESPACES] }, { now: "2026-07-14T00:00:00.000Z" });
+  const serviceAlert = alert({
+    id: "alert_service_disappeared",
+    rule_id: SERVICE_DISAPPEARED_RULE_ID,
+    severity: "warning",
+    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 },
+  });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [serviceAlert],
+    notification_due_ids: [serviceAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for service.disappeared — it is unknown_namespace, fail-closed"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.unknown_namespace, 1);
+  assert.equal((await readAlertIntelligenceAudit(paths)).length, 0);
+});
+
+test("(c) invariant: SERVICE_DISAPPEARED_RULE_ID classifies to namespace undefined -- a future service-family rule_id inherits fail-closed by construction", () => {
+  for (const ruleId of [SERVICE_DISAPPEARED_RULE_ID]) {
+    const { namespace, hardExcluded } = classifyAlertNamespace(ruleId);
+    assert.equal(namespace, undefined, `expected ${ruleId} to classify as unknown_namespace`);
+    assert.equal(hardExcluded, false);
+  }
+});
+
+test("emitSessionAlertSignals delivers a due service.disappeared through deliverNotificationDecision with a hash-only body, never via a session/LLM -- and never leaks a raw service name even if diagnostics carried one", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const serviceAlert = alert({
+    id: "alert_service_disappeared",
+    rule_id: SERVICE_DISAPPEARED_RULE_ID,
+    severity: "warning",
+    // entity_key deliberately included alongside entity_key_hash here (as if some other code path
+    // mistakenly attached it) to prove buildSessionAlertNotificationDecision's service.disappeared
+    // branch only ever interpolates entity_key_hash/last_seen_ts, never any other diagnostics key.
+    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12, entity_key: "com.example.raw-service-name" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [serviceAlert], notification_due_ids: [serviceAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [serviceAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, SERVICE_DISAPPEARED_RULE_ID);
+  assert.equal(deliveries[0].opts.alertId, serviceAlert.id);
+  assert.equal(deliveries[0].decision.notify, true);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.match(deliveries[0].decision.body, /^A previously-established service \(id a1b2c3d4e5f6a7b8\) stopped appearing in the latest complete census \(last seen 2026-07-14T00:00:00\.000Z\)\.$/);
+  assert.equal(/com\.example\.raw-service-name/.test(JSON.stringify(deliveries[0].decision)), false, "no raw service name in the delivered body, even though diagnostics carried one");
+});
+
+test("emitSessionAlertSignals: even severity stamped 'critical' on the alert record, a due service.disappeared still delivers with severity 'warning' (unconditional hard cap, orchestrator resolution 2026-07-23 #3)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const serviceAlert = alert({
+    id: "alert_service_disappeared",
+    rule_id: SERVICE_DISAPPEARED_RULE_ID,
+    severity: "critical", // service-baseline.js's own candidate builder never stores "critical" -- this simulates a corrupted/tampered record
+    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 },
+  });
+  await emitSessionAlertSignals(paths, { alerts: [serviceAlert], notification_due_ids: [serviceAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.equal(deliveries[0].decision.severity, "warning");
+});
+
+test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due service.disappeared-shaped rule_id typo is never delivered by this branch", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const typoAlert = alert({ id: "alert_typo", rule_id: "service.disappeareds", severity: "warning" }); // deliberately NOT the real rule_id
+  const result = await emitSessionAlertSignals(paths, { alerts: [typoAlert], notification_due_ids: [typoAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, []);
+  assert.equal(deliveries.length, 0);
+});
+
+test("emitSessionAlertSignals respects cooldown for service.disappeared too: an alert absent from notification_due_ids does not re-deliver", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const serviceAlert = alert({ id: "alert_service_disappeared", rule_id: SERVICE_DISAPPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 } });
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
+
+  const first = await emitSessionAlertSignals(paths, { alerts: [serviceAlert], notification_due_ids: [serviceAlert.id] }, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+  assert.deepEqual(first.fired, [serviceAlert.id]);
+
+  const second = await emitSessionAlertSignals(paths, { alerts: [serviceAlert], notification_due_ids: [] }, { now: "2026-07-14T00:05:00.000Z", deliverNotification });
+  assert.deepEqual(second.fired, []);
+  assert.equal(deliveries.length, 1, "must not re-deliver within the cooldown window");
+});
+
+test("emitSessionAlertSignals fires for the WIDENED allowlist including service.disappeared: a mix of due session.count_drop/session.churn/peer.count_spike/service.disappeared alongside a due non-allowlisted metric alert delivers exactly the four allowlisted ones, without cross-contaminating each other's body text", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const dropAlert = alert({ id: "alert_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical", diagnostics: { observed_count: 0, mean_before: 20, stddev_before: 0.5, z_score: -40, confidence_state: "established" } });
+  const churnAlert = alert({ id: "alert_churn", rule_id: SESSION_CHURN_RULE_ID, severity: "warning", diagnostics: { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" } });
+  const peerAlert = alert({ id: "alert_peer", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
+  const serviceAlert = alert({ id: "alert_service", rule_id: SERVICE_DISAPPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 } });
+  const metricAlert = alert({ id: "alert_metric", rule_id: "system.memory.sustained_high", severity: "warning" });
+
+  const result = await emitSessionAlertSignals(paths, {
+    alerts: [dropAlert, churnAlert, peerAlert, serviceAlert, metricAlert],
+    notification_due_ids: [dropAlert.id, churnAlert.id, peerAlert.id, serviceAlert.id, metricAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  assert.deepEqual(new Set(result.fired), new Set([dropAlert.id, churnAlert.id, peerAlert.id, serviceAlert.id]));
+  assert.equal(deliveries.length, 4, "the non-allowlisted metric alert must never be delivered by this branch");
+  assert.equal(deliveries.some((d) => d.opts.ruleId === "system.memory.sustained_high"), false);
+
+  const byRuleId = Object.fromEntries(deliveries.map((d) => [d.opts.ruleId, d.decision.body]));
+  assert.match(byRuleId[SESSION_COUNT_DROP_RULE_ID], /^Session count 0 vs baseline mean 20/);
+  assert.match(byRuleId[SESSION_CHURN_RULE_ID], /session\.tmux\.aaaaaaaaaaaaaaaa/);
+  assert.match(byRuleId[PEER_COUNT_SPIKE_RULE_ID], /^Peer count 8 vs baseline mean 2/);
+  assert.match(byRuleId[SERVICE_DISAPPEARED_RULE_ID], /^A previously-established service \(id a1b2c3d4e5f6a7b8\)/);
+  // No cross-contamination: no body carries another rule_id's shaped text.
+  assert.equal(/session\.tmux/.test(byRuleId[PEER_COUNT_SPIKE_RULE_ID]), false);
+  assert.equal(/Peer count/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
+  assert.equal(/a1b2c3d4e5f6a7b8|previously-established service/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
+});
+
+test("the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by delivery is composed of session-baseline.js's own two-id export PLUS PEER_COUNT_SPIKE_RULE_ID PLUS SERVICE_DISAPPEARED_RULE_ID (companion to the three-id pin test above, further widened)", async () => {
+  const expectedIds = [...DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, PEER_COUNT_SPIKE_RULE_ID, SERVICE_DISAPPEARED_RULE_ID];
+  assert.deepEqual(expectedIds, [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, SERVICE_DISAPPEARED_RULE_ID]);
+
+  const paths = await tempPaths();
+  const deliveries = [];
+  const alerts = expectedIds.map((ruleId, index) => alert({
+    id: `alert_${index}`,
+    rule_id: ruleId,
+    severity: "warning",
+    diagnostics: {
+      observed_count: 1, mean_before: 1, stddev_before: 0.5, z_score: 1, confidence_state: "established",
+      entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222",
+      entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12,
+    },
+  }));
+  const result = await emitSessionAlertSignals(paths, { alerts, notification_due_ids: alerts.map((a) => a.id) }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(new Set(result.fired), new Set(alerts.map((a) => a.id)));
+  assert.equal(deliveries.length, expectedIds.length, "every id in the composed four-id constant must actually be delivered by this branch");
 });
 
 // ---------------------------------------------------------------------------------------------
