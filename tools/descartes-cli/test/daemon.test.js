@@ -39,6 +39,7 @@ import { PEER_CENSUS_MARKER_ENTITY_KEY, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
+import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore } from "../src/service-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -2532,6 +2533,166 @@ test("Slice 4b ts-cohesion (integration): peer.presence fact points share the sa
   const distinctTimestamps = new Set([...sessionPoints, ...peerPoints].map((point) => point.ts));
   assert.equal(distinctTimestamps.size, 1, `expected every session.*/peer.* fact point to share one ts, got ${JSON.stringify([...distinctTimestamps])}`);
   assert.equal([...distinctTimestamps][0], "2026-06-11T00:00:00.000Z");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md): residual
+// daemon-wiring regression test the plan committed to (Wave 1 left it out of that task's file
+// scope). computeServiceBaselineCandidates is the daemon's SEVENTH extraCandidates entry (src/
+// daemon.js), threading the SAME activeFreshnessMs already resolved once per tick for
+// computeActiveConstraintCandidates. Mirrors the Slice 4 session wiring test above and the Slice
+// 4b/4c peer wiring tests above it, adapted for service.disappeared's set-diff shape.
+// ---------------------------------------------------------------------------------------------
+
+function servicePresenceFactPoint(ts, entityKey) {
+  return {
+    ts,
+    fact_name: "service.presence",
+    entity_key: entityKey,
+    attributes: { running: "true", manager: "launchd" },
+    source_envelope_id: "services",
+    source_tool: "collect_services",
+    sensitivity: "operational",
+  };
+}
+
+function serviceCensusMarkerFactPoint(ts, state = "complete") {
+  return {
+    ts,
+    fact_name: SERVICE_CENSUS_FACT_NAME,
+    entity_key: SERVICE_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: state },
+    source_envelope_id: "services",
+    source_tool: "collect_services",
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+function completeServiceTick(ts, entityKeys) {
+  return [...entityKeys.map((key) => servicePresenceFactPoint(ts, key)), serviceCensusMarkerFactPoint(ts, "complete")];
+}
+
+// 30 complete censuses in which "worker.service" is present (establishing it -- the default
+// minEstablishedCount is 3), then a 31st complete census in which it is missing.
+function serviceDisappearanceFixtureFactPoints({ presentEntity = "worker.service" } = {}) {
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeServiceTick(hour(i), [presentEntity]));
+  ticks.push(...completeServiceTick(hour(30), []));
+  return ticks;
+}
+
+test("Service-disappearance wiring: computeServiceBaselineCandidates is the daemon's seventh extraCandidates entry — a pre-seeded service census with a service missing from the latest complete census produces a real, sanitized service.disappeared alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await appendFactPoints(paths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(30));
+  const alert = result.alerts.alerts.find((a) => a.rule_id === SERVICE_DISAPPEARED_RULE_ID);
+  assert.ok(alert, "expected a real alert for the disappeared service");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning");
+  assert.equal(typeof alert.diagnostics, "object");
+  assert.equal(typeof alert.diagnostics.entity_key_hash, "string");
+  assert.equal(JSON.stringify(alert.diagnostics).includes("worker.service"), false, "raw entity_key must never appear in a persisted diagnostics field");
+  assert.notEqual(alert.fingerprint, "worker.service", "fingerprint must be the hash, never the raw entity_key");
+  assert.equal(JSON.stringify(alert).includes("redacted"), false);
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+
+  const { state } = await loadServiceBaselineStore(paths);
+  assert.equal(state.last_folded_ts, hour(30));
+  assert.equal(state.disappearance_event_count, 1);
+  assert.equal(state.skipped_partial_tick_count, 0);
+});
+
+test("Service-disappearance: byte-identical real alerts when the learned kill switch is off, even with service fact-history present that would otherwise produce a disappearance, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withServicesPaths = await tempPaths();
+  await appendFactPoints(withServicesPaths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false }, exactly like the baseline above — computeServiceBaselineCandidates must
+  // short-circuit to [] before ever calling readFactPoints.
+  let readFactsCalled = false;
+  const withServices = await runDaemonIteration(withServicesPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    readFactPoints: async (...args) => {
+      readFactsCalled = true;
+      return readFactPoints(...args);
+    },
+  });
+
+  assert.deepEqual(withServices.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withServices.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withServices.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+
+  const persisted = await readAlertRecords(withServicesPaths);
+  assert.equal(persisted.some((alert) => alert.rule_id === SERVICE_DISAPPEARED_RULE_ID), false);
+});
+
+// Single-source-of-truth wiring proof: computeServiceBaselineCandidates is threaded the SAME
+// activeFreshnessMs computeActiveConstraintCandidates already receives (src/daemon.js ~L565,
+// "Threads the SAME activeFreshnessMs already resolved above"). Rather than reaching into
+// daemon.js's private per-call args (neither function is options-overridable), this pins BOTH
+// sources to fact-history that shares the exact same latest ts (hour(30)) and drives ONE daemon
+// iteration per boundary side, mirroring Slice B's own two freshness tests
+// ("an active constraint whose only fact is older than 3× the structural interval is STALE" /
+// "freshness is pinned to the STRUCTURAL interval, NOT the fast tick") — but now asserting BOTH
+// the constraint-violation alert AND the service.disappeared alert flip identically at the exact
+// same 3h boundary within the SAME iteration. If either source resolved a different
+// activeFreshnessMs value, this pair of assertions would diverge at one of the two boundaries.
+test("Service-disappearance wiring, single-source-of-truth: a service.disappeared transition older than 3× the structural interval is STALE, using the identical activeFreshnessMs boundary computeActiveConstraintCandidates already applies to a violated active constraint in the SAME iteration", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  const ticks = [
+    ...serviceDisappearanceFixtureFactPoints(),
+    { ts: hour(30), fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ];
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  // now = shared latest ts (hour(30)) + 4h; activeFreshnessMs = 3 × DEFAULT_STRUCTURAL_INTERVAL_MS
+  // (1h) = 3h (slice6Profile carries no `structural.interval_ms`, so runDaemonIteration resolves
+  // the SAME default both sources consume) -> 4h is stale for BOTH in this one daemon tick.
+  const staleNow = new Date(Date.parse(hour(30)) + 4 * 60 * 60 * 1000).toISOString();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: staleNow,
+    now: staleNow,
+  });
+
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === "constraint.violation.service-presence"), false, "a 4h-stale constraint fact must not drive a live violation");
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === SERVICE_DISAPPEARED_RULE_ID), false, "a 4h-stale service-census transition must not drive a live disappearance alert, using the SAME freshness boundary");
+});
+
+test("Service-disappearance wiring, single-source-of-truth: a 1h-old service.disappeared transition is still fresh within the shared 3h activeFreshnessMs window and fires, in the SAME iteration a 1h-old violated active constraint also fires", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  const ticks = [
+    ...serviceDisappearanceFixtureFactPoints(),
+    { ts: hour(30), fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ];
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+
+  const freshNow = new Date(Date.parse(hour(30)) + 60 * 60 * 1000).toISOString();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: freshNow,
+    now: freshNow,
+  });
+
+  assert.ok(result.alerts.alerts.some((a) => a.rule_id === "constraint.violation.service-presence"), "expected the 1h-old constraint violation to still fire within the shared freshness window");
+  assert.ok(result.alerts.alerts.some((a) => a.rule_id === SERVICE_DISAPPEARED_RULE_ID), "expected the 1h-old service.disappeared transition to still fire, sharing the SAME activeFreshnessMs as the constraint above");
 });
 
 // ---------------------------------------------------------------------------------------------
