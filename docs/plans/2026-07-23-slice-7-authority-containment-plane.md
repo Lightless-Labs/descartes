@@ -11,6 +11,35 @@ say.
 **Review MINORs folded:** 2026-07-23 — prior-art reconciliation with
 `todos/2026-05-19-agent-delegation-identity-authority.md` (§ "Inputs read" below), and an
 illustrative-not-exhaustive caveat on §(a) revoke's credential-class enumeration.
+**Operator direction folded:** 2026-07-24 — see "## Operator direction (2026-07-24)" below for the
+full operator response, and the updated §(a)/§(b)/§(c)/§(d) cross-references it drove. Summary of
+what changed: §(b)'s authority-model tiering is now operator-confirmed rather than only
+recommended; execution for kill/revoke/block is now explicitly routed through a **separate
+capability-holding helper** (never the daemon/CLI directly) using single-use, time-limited consent,
+leaning on existing OS privilege primitives rather than a new one; block gains an explicit
+read-existing-state-first requirement; quarantine is now concretely defined and flagged as the
+weakest verb, with a recommendation to fold it into {freeze + block} pending an open question back
+to the operator; and a new, heavily governance-gated **federated immune system** direction is
+captured as a future resolution to the fast-response/cooling-off tension, tied to `AGENTS.md`'s L3
+Federated Knowledge Layer and Operational Lifecycle stage 7 ("Learn"). This document remains
+DESIGN-ONLY — no code changed as part of folding this direction in.
+**Slice 7 safety review (operator-direction update):** 2026-07-24 — GO_WITH_CHANGES; all 3
+must-fixes folded (federated immune system fleet-global blast-radius controls — staged/canary
+propagation, a fleet-wide circuit-breaker + signature recall/revocation, Sybil-resistance and
+ratifier-compromise controls, added to the §(e) 7.6 governance checklist and §(d) item 9; the
+federated reflex path's consent-model degradation — reflex execution has no human in the loop to
+mint a per-execution consent nonce, so the helper/capability separation degrades to trusting the
+daemon's own signature-recognition code, now named explicitly with a required-analysis item added
+to the 7.6 checklist; the single-use execution-consent nonce's own crash-consistency and binding —
+write-ahead consume before the mutating call, and cryptographic/logical binding to a specific
+approved §(b) decision plus the freshly re-resolved target+verb, added to §(a) Cross-verb themes).
+Safety findings folded alongside the must-fixes: self-lockout-at-fleet-scale added to the
+federated-section governance checklist ("reversible-first" alone does not bound simultaneous
+multi-host self-lockout); the quarantine-fold privileged-primitive-count overstatement between
+§(a)'s recommendation and §(e) 7.5's own text reconciled. Q2 (honest autonomy-escalation labeling)
+and Q4 (design-only, zero new `execFile`) both re-verified PASS; all three Stage-1 (2026-07-23)
+must-fixes reconfirmed present and correctly reasoned. This document remains DESIGN-ONLY — no code
+changed as part of folding this review in.
 **Supersedes:** nothing. This is the dedicated, separately-reviewed plan that
 `docs/plans/2026-07-13-observed-incident-collectors.md`'s Slice 7 section (lines 858–871)
 explicitly said would be required before any pickup — "a placeholder for a future,
@@ -104,7 +133,11 @@ pattern.
   process, or any process in its own parent-process chain (walk the ancestry of the process issuing
   the kill request up to the session leader/`sshd`/login shell and refuse if the target intersects
   it) — this guard is a hard precondition for `kill`, not an optional hardening, precisely because
-  `kill` combines self-lockout with zero rollback.
+  `kill` combines self-lockout with zero rollback. **Execution routing (operator-directed
+  2026-07-24):** `kill` must never be issued by the daemon/CLI process itself — it is issued only
+  by the separate capability-holding helper described in the Cross-verb themes subsection below,
+  gated on a single-use, time-limited consent nonce distinct from the §(b) approval nonce. See that
+  subsection for the full model and the sudo/polkit-vs-bespoke-mechanism answer.
 
 ### revoke (invalidate a credential/session token)
 
@@ -125,7 +158,10 @@ pattern.
   generic `wg set` accepting arbitrary arguments — mirror the read-side allowlist discipline
   exactly); a **self-lockout guard** that refuses to revoke the credential/session/peer currently
   in use by the approving actor's own connection; a designed-in reversal path (re-adding a peer)
-  proven to work *before* the removal path ships.
+  proven to work *before* the removal path ships. **Execution routing (operator-directed
+  2026-07-24):** same helper-mediated, single-use/time-limited-consent execution model as `kill`
+  (Cross-verb themes subsection below) — `revoke` is explicitly named alongside `kill` as executing
+  only through the separate capability-holding helper, never directly by the daemon/CLI.
 - **Enumeration scope note:** the SSH-session and WireGuard-peer cases above are illustrative
   examples, not the complete revoke surface. Other credential classes — OAuth tokens, API keys,
   Kerberos tickets, application session cookies — have their own distinct, and possibly higher,
@@ -153,9 +189,30 @@ pattern.
   preserves the current management/SSH connection regardless of what is being blocked; dry-run
   diffing against the live ruleset before any real application; a mandatory auto-expiry/auto-revert
   on every block rule (a forgotten permanent block is its own accumulating risk, mirroring why
-  `promotion-store.js` uses a bounded expiry rather than an indefinite pending state).
+  `promotion-store.js` uses a bounded expiry rather than an indefinite pending state). **Existing-state
+  awareness (operator-directed 2026-07-24):** before any block action, Descartes must **read the
+  current firewall state** (`pf`/`nft`/`iptables`, whichever the host runs) — it must **never
+  blind-append** a rule without first observing what is already present. This read pass must
+  **detect conflicts and duplicates** against Descartes' own prior rules and against the operator's
+  existing configuration (e.g. a rule that already blocks the same target, or one that would
+  contradict/shadow it) before deciding to act. On rollback/expiry, Descartes must remove **only the
+  rules it itself added** — never a broader revert, never touching anything already present before
+  Descartes acted, which is the concrete mechanism that makes the isolated-anchor-ownership
+  requirement above actually safe in practice rather than merely aspirational. `block` is also
+  shaped by, though not identical in every detail to, the helper-mediated, single-use-consent
+  execution model described for `kill`/`revoke` in the Cross-verb themes subsection below — the
+  same "helper holds the capability, daemon/CLI does not" and "lean on sudo/polkit rather than a
+  new privilege path" reasoning applies to the anchor-manipulation call itself.
 
 ### quarantine (isolate a container/process)
+
+**Definition (operator-directed 2026-07-24 — the operator asked what this verb even means; this
+is now the answer):** quarantine means **contain without destroying, to preserve forensic state**
+— as opposed to `kill`, which loses evidence the moment the process dies. Concretely this is one
+or both of: **freeze** the process (`SIGSTOP`, a cgroup freezer, or `docker pause`) so it stops
+executing but its memory/state remain inspectable, and/or **network-isolate** it (move it to an
+isolated network namespace, or apply a deny-all rule scoped to its cgroup) so it can no longer
+communicate while its on-disk and in-memory state stay intact for later analysis.
 
 - **Capabilities/privileges:** container-runtime-dependent (Docker/Podman/containerd
   pause/network-disconnect/cgroup-freeze); access to the runtime's control socket
@@ -173,6 +230,31 @@ pattern.
   not an engineering one); if a container-socket route is ever chosen, that credential must be
   held to at least the security bar `root_helper` earned (dedicated, minimally-scoped proxy —
   never the raw socket handed to the general daemon process).
+- **Weakest-defined verb, flagged (operator-directed 2026-07-24):** even with the definition above,
+  `quarantine` remains the least concretely specified verb in this document, because it is the only
+  one whose primitives (freeze, network-isolate) are each already independently expressible as a
+  narrower operation rather than a genuinely new one. **Recommendation:** fold `quarantine` into a
+  **composition of {freeze + block}** — reuse `SIGSTOP`/cgroup-freezer as a "freeze" primitive
+  alongside the `block` verb's network-isolation machinery above, rather than standing up
+  `quarantine` as its own fifth verb with its own execution primitive and its own helper surface.
+  **Reconciliation note (safety-review finding, folded 2026-07-24):** this fold reduces the **verb
+  count** by one; it does not reduce the **privileged-primitive count** — §(e) Slice 7.5 already
+  correctly notes that folding still introduces a new `SIGSTOP`/cgroup-freezer "freeze" primitive,
+  which is itself a new privileged, cross-UID-capable mutating primitive needing its own helper
+  routing and review, exactly as a standalone `quarantine` verb would have needed. Read "avoiding
+  its own execution primitive and its own helper surface" above as applying to the **verb/API
+  surface** (one fewer named verb, one fewer place operators choose from), not as a claim that no
+  new privileged primitive is introduced — the count of privileged primitives (kill/revoke/block/
+  freeze) is unchanged either way, and the security saving from folding is correspondingly smaller
+  than the phrase alone implies. **Unless** the operator actually runs containers on the monitored
+  host that they would want
+  isolated via `docker pause`/`docker network disconnect`, in which case a container-runtime-aware
+  quarantine primitive may be worth keeping distinct rather than decomposed, since the
+  container-socket privilege shape doesn't map cleanly onto plain `SIGSTOP` + netns. **Open question
+  for the operator, not resolved by this document:** does the operator run containers on the
+  monitored host that they would want isolated this way? The answer determines whether `quarantine`
+  is folded away or kept as its own verb; see also §(d) item 2, which already flagged the container
+  applicability question and is now sharpened by this fold-vs-keep framing.
 
 ### Cross-verb themes
 
@@ -183,6 +265,48 @@ pattern.
   separate, independently-scoped, write-capable** privilege surface that does not exist today and
   is explicitly **not** designed by this document (only flagged as needing its own future
   doors-and-corners pass and review, per §(e)).
+- **Execution architecture (operator-directed 2026-07-24; applies to `kill` and `revoke`, and
+  shapes `block`):** any containment verb executes **only** through a **separate,
+  capability-holding helper process**, mirroring the `root_helper` precedent's shape but as a
+  distinct, write-capable grant (not a reuse of the read-only one, per the bullet above). The
+  daemon/CLI itself **does not hold and cannot exercise** the containment capability directly — it
+  can only construct a proposal and hand it to the helper. Each execution additionally requires
+  explicit user consent that is **single-use** (a fresh nonce, consumed exactly once, never
+  replayable) and **time-limited** (a short expiry after which the consent is void and must be
+  re-minted) — this is a distinct, second nonce/expiry pair layered on top of, not a substitute
+  for, the §(b) Option 3 approval-and-cooling-off nonce: the §(b) nonce authorizes the *decision*,
+  this one authorizes the *single act of execution* the helper is about to perform. Are we
+  reinventing sudo/SRP/a bespoke privilege tool? **No, by design intent:** the strong preference is
+  to **lean on existing OS privilege and consent primitives** rather than invent a new
+  privilege-escalation mechanism — concretely, `sudo`/`polkit` policy on Linux, and a privileged
+  `launchd` helper reached over XPC with code-requirement (code-signing identity) checks on macOS,
+  the same shape the platform already offers other privileged helpers. Descartes' own contribution
+  sits **on top of** those primitives, not alongside or instead of them: the **policy** (which
+  verb, which target, under which tier per §(c)), the **single-use consent ledger** (the
+  nonce-per-execution mechanic above, distinct from any OS-level "remember this choice" caching),
+  and the **audit** layer (§(c)'s write-ahead record). Where an existing OS primitive genuinely does
+  not fit — e.g. neither `sudo`/`polkit` nor a signed XPC helper natively expresses "this specific
+  consent nonce may authorize this specific mutating call exactly once and no more" — Descartes must
+  add that single-use consent-ledger mechanic itself, since no OS primitive surveyed here provides
+  it out of the box; this is the one piece of new mechanism this document considers justified, not
+  a broader new privilege model.
+- **Consent-ledger crash-consistency and binding (safety-review must-fix, folded 2026-07-24):** the
+  single-use, time-limited execution-consent nonce introduced above needs the same discipline §(c)
+  already mandates for the `containment.json` audit record, stated explicitly rather than left
+  implicit, because it is a distinct artifact from that audit record and a future implementation
+  must not conflate the two: (1) **write-ahead consume** — the consent nonce must be marked
+  consumed/invalidated **synchronously before** the mutating call is issued, never after it returns,
+  so that a crash between execution and consume cannot leave a still-valid, replayable nonce on
+  daemon restart (this mirrors, but is separate from, §(c)'s write-ahead "execution in progress"
+  record for the audit log — the audit record and the consent ledger must each independently satisfy
+  write-ahead ordering, not share one write as if it covered both); and (2) **binding** — a consent
+  nonce must be cryptographically or logically bound to one specific, already-approved §(b) decision
+  record *and* to the freshly re-resolved target and verb at the moment of execution (per the TOCTOU
+  re-resolution requirement below), so that a valid, unexpended nonce can never be replayed to
+  execute a different verb, a different target, or execute at all without a matching approved
+  decision. Without both properties the model has a theoretical replay-on-crash window and a
+  misbinding window; a future implementation must close both before this execution model is built,
+  not merely design the nonce as an opaque single-use token.
 - **Self-lockout risk** is the dominant failure mode for block/revoke, **and, in its own
   irreversible-plus-self-inflicted form, for `kill` as well** — a self-lockout guard (refuse to
   act on the approving actor's own session/connection/parent-process chain) is a hard-stop
@@ -274,27 +398,39 @@ again when calmer" safeguard and an audit/notification window, not a stand-in fo
 
 ### Recommendation
 
-A **tiered, honestly-labeled** approach, not a single mechanism:
+A **tiered, honestly-labeled** approach, not a single mechanism. **Operator-confirmed 2026-07-24**
+(see "## Operator direction (2026-07-24)" below for the full response) — the tiering itself is no
+longer just this document's recommendation, it is the operator's explicit direction:
 
-1. **Default and only mechanism buildable without new external infrastructure: Option 3** —
-   templated 1:1 on `promotion-store.js`'s nonce/expiry/deny-by-default/`audit_transitions`
-   pattern, with a mandatory minimum delay. Every surface that shows this to the operator (CLI
-   output, audit record, any future notification) must permanently and unambiguously label it
-   "single-party, time-delayed — NOT multi-party confirmation." No language may imply a second
-   party ever reviewed it.
-2. **Option 1 (second human) as the aspirational default for any multi-operator deployment** —
-   config-gateable, but not built until a real second-operator use case and identity model exist;
-   do not build speculatively.
-3. **Option 2 (multi-device push) treated as its own future workstream requiring a dedicated
-   security review** given it is the only option that introduces genuinely new external surface —
-   explicitly not designed further here.
+1. **Near-term, single mechanism actually being built: Option 3** — templated 1:1 on
+   `promotion-store.js`'s nonce/expiry/deny-by-default/`audit_transitions` pattern, with a
+   mandatory minimum delay. Every surface that shows this to the operator (CLI output, audit
+   record, any future notification) must permanently and unambiguously label it "single-party,
+   time-delayed — NOT multi-party confirmation." No language may imply a second party ever
+   reviewed it. The operator has explicitly acknowledged this is weak against fast-moving threats
+   (ransomware and similar) and accepts that weakness for now; see the "Fast-response tension →
+   federated immune system" subsection of the Operator direction section below for the accepted
+   future resolution.
+2. **Option 1 (second human / two-person rule) — not for now.** Confirmed **out of scope near-term**
+   by the operator, not merely deprioritized; possible in a later **enterprise** setting with a
+   real multi-operator identity model. Do not build speculatively.
+3. **Option 2 (multi-device push) — acceptable as a later improvement**, confirmed by the operator
+   to require its own backend for identity and push-notification delivery before it is buildable at
+   all. Still its own future workstream requiring a dedicated security review, and still not
+   designed further here.
 
 **Unresolved tension flagged, not resolved, by this recommendation:** a genuine fast-moving
 incident may need a *faster* response than any cooling-off window allows, which is in direct
 tension with the safety goal of slowing down an unauthorized/mistaken action. Whether — and how —
 to allow an emergency bypass of the delay (and what would authorize skipping it) is left as
 **Open scope decision 5** in §(d); this document deliberately does not pick a delay length or a
-bypass mechanism.
+bypass mechanism. **Operator update 2026-07-24:** the operator has explicitly named this tension
+(Option 3 is too slow for ransomware-class threats) and, rather than proposing a bypass of the
+delay itself, has proposed a structurally different future direction that resolves the tension by
+changing what "confirmation" means for pre-corroborated behaviors rather than shortening this
+delay. See "Fast-response tension → federated immune system" in the Operator direction section
+below. That direction is itself design-only, heavily governance-gated, and does not change the
+Option 3 mechanism described above — it is a distinct future addition, not a replacement.
 
 ---
 
@@ -311,9 +447,9 @@ pre-state, result, post-state, rollback notes when possible.
 |---|---|
 | read-only | Already shipped: session-census, VPN/peer, provenance collectors (Slices 1/3/S3-S5). No change proposed here. |
 | recommend-only | The **only** execution-adjacent tier this document considers safe to build in the near term: surface a proposed verb + target + rationale for a human to read and, if they choose, act on **manually and entirely outside Descartes**. Zero new `execFile`, zero new privilege. |
-| approval-required | Where any real containment *execution*, if ever built, **must** live — the human-gated nonce/expiry/audit pattern from §(b) Option 3 (or 1/2 per the tiering above). No containment verb should skip this tier. |
+| approval-required | Where any real containment *execution*, if ever built, **must** live — the human-gated nonce/expiry/audit pattern from §(b) Option 3 (or 1/2 per the tiering above), with the approved decision then handed to the separate capability-holding helper (§(a) Cross-verb themes, operator-directed 2026-07-24) under its own single-use, time-limited consent nonce for the actual mutating call. No containment verb should skip this tier near-term. |
 | policy-authorized | **Not recommended for any containment verb** in the foreseeable future. `AGENTS.md` scopes this tier to "narrowly scoped, tested, reversible cases" — kill fails "reversible" outright; block/revoke fail "narrowly scoped" given self-lockout blast radius; quarantine's blast radius depends on a credential (`docker.sock`-class) that is itself not narrowly scoped. |
-| autonomous | **Explicitly out of scope.** Same reasoning as policy-authorized, stronger. |
+| autonomous | **Explicitly out of scope for the mechanisms in §(a)-(e) of this document.** Same reasoning as policy-authorized, stronger. **Exception, named not designed:** the federated immune system direction in the Operator direction section below proposes a distinct, heavily governance-gated future path to pre-consented reflex action on ratified/corroborated signatures with human notification rather than confirmation — that is a genuinely new tier-adjacent concept this table's five stock tiers don't cleanly capture, not a quiet reclassification of containment verbs into "autonomous" as `AGENTS.md` defines it today. It remains out of scope for any near-term build. |
 
 **Write-ahead / crash-consistent audit ordering (reviewed 2026-07-23, folded from Stage 1 gate
 must-fix):** the audit *fields* below are not sufficient on their own — the record's **write
@@ -361,7 +497,13 @@ post-state / rollback), mapped concretely rather than left abstract:
   a second, independent failsafe (never rely on the manual rollback alone).
 - **quarantine:** pre-state = running/network state; post-state = paused/isolated state; rollback
   = unpause/reconnect, contingent on the runtime actually preserving state across the pause
-  (verify this per-runtime before relying on it).
+  (verify this per-runtime before relying on it). **Note (operator-directed 2026-07-24):** per
+  §(a)'s quarantine subsection, if the fold-into-`{freeze + block}` recommendation is accepted this
+  row collapses into `kill`-style freeze bookkeeping (pre/post-state = process run-state before and
+  after `SIGSTOP`/cgroup-freeze, rollback = unfreeze) plus `block`'s row above for the network-isolation
+  half, rather than needing its own distinct audit shape — this row is retained here only for the
+  case where the operator's open question above resolves toward keeping quarantine as its own
+  container-runtime-aware verb.
 
 **Store shape (per the source plan's explicit mandate, line 867):** a **new, separate**
 `authority/containment.json`, sibling to but never merged into `authority/promotions.json`
@@ -393,35 +535,70 @@ CLI verb would eventually be added — cited for shape, no case added by this do
 None of the following are answered by this document. Each blocks a real implementation plan, not
 merely its detail:
 
-1. **Execution capability at all, or recommend-only forever?** Does the operator want Descartes to
-   ever *execute* a containment verb, or only ever *surface a recommendation* for a human to act on
-   manually, outside Descartes entirely? This is the single biggest fork in the whole design —
-   recommend-only never needs a privilege surface, a root-helper-equivalent, or an answer to the
-   multi-party question at all, because a human types the real command themselves.
-2. **Which verbs are actually applicable to this operator's real environment?** Is "quarantine"
-   (container isolation) even relevant — does the operator run containers on the monitored host at
-   all? Concretely enumerate against the real deployment rather than building out the full abstract
-   kill/revoke/block/quarantine catalog speculatively.
-3. **Is a second human operator ever available?** This directly decides whether §(b) Option 1 is
-   buildable at all, or whether the design must commit to Option 3 (and its honesty-labeling
-   requirement) as the only realistic mechanism, given the rest of this codebase (e.g.
-   `promotion-store.js`'s own comment) assumes a single-operator deployment.
-4. **Self-lockout tolerance.** For block/revoke, is accidentally cutting off the operator's own
-   remote access an acceptable, recoverable risk (they have physical/console access) or a
-   catastrophic one (fully remote-administered host, no fallback)? This changes the required
-   safety bar for those two verbs specifically.
-5. **Emergency-bypass tension.** Should the time-delay authority model (§(b) Option 3) ever have a
-   fast-path override for a genuinely urgent incident, and if so, what authorizes skipping the
-   delay? (Answering this re-introduces a scaled-down version of the multi-party question.)
+1. **Execution capability at all, or recommend-only forever? — RESOLVED by operator direction
+   2026-07-24.** The operator has directed that real execution is wanted (not recommend-only
+   forever), routed through the separate capability-holding helper with single-use, time-limited
+   consent described in §(a)'s Cross-verb themes and reaffirmed in the Operator direction section
+   below. What remains open is *sequencing* (§(e)'s phased build still starts at 7.1
+   recommend-only before any execution primitive), not *whether* execution is ever wanted.
+2. **Which verbs are actually applicable to this operator's real environment? — Partially resolved.**
+   `kill`, `revoke`, and `block` are confirmed in scope with the execution model above. `quarantine`
+   remains genuinely open: §(a)'s quarantine subsection now recommends folding it into a
+   composition of `{freeze + block}` unless the operator runs containers on the monitored host they
+   would want isolated via a container-runtime-specific route — that container question is the one
+   piece of item 2 still awaiting a direct operator answer.
+3. **Is a second human operator ever available? — RESOLVED by operator direction 2026-07-24.** No,
+   not for now. §(b) Option 1 (second human / two-person rule) is confirmed out of scope near-term,
+   possible only in a later enterprise setting. §(b) Option 3 (time-delay, single-party, explicitly
+   weaker) is confirmed as the near-term mechanism.
+4. **Self-lockout tolerance.** For block/revoke/kill, is accidentally cutting off the operator's own
+   remote access (or, for `kill`, destroying their own controlling session) an acceptable,
+   recoverable risk (they have physical/console access) or a catastrophic one (fully
+   remote-administered host, no fallback)? Still open — the operator direction folded into this
+   document strengthens the *guards* (self-lockout guard, helper-mediated single-use consent) but
+   does not itself state the operator's actual physical/console-access fallback situation.
+5. **Emergency-bypass tension. — Reframed, not resolved, by operator direction 2026-07-24.** Rather
+   than a bypass of the §(b) Option 3 delay itself, the operator has proposed a structurally
+   different future resolution — the federated immune system direction in the Operator direction
+   section below, where pre-corroborated signatures authorize reflex action with notification, not
+   confirmation. That direction is design-only, heavily governance-gated, and not scheduled; whether
+   and when to pursue it is itself a future operator sign-off decision, not answered here.
 6. **Build anything now, or park this document?** Should any part of Slice 7 (even the inert
    recommend-only tier or the authority-store scaffold with no execution primitive, §(e) 7.1/7.2)
    move to an implementation plan in the near term, or does this document simply exist to be filed
-   and revisited once the above are answered?
+   and revisited once the above are answered? Still open — the operator direction folded in here
+   sharpens *what* would be built (the helper-mediated execution model, the quarantine fold
+   recommendation) but does not itself green-light starting §(e) 7.1/7.2 now.
 7. **Confirm this document's own scoping is sufficient.** The dispatch that produced this draft
    supplied section-level scope (the (a)–(e) structure, verb set, store-separation mandate) but did
-   not answer items 1–6 above. Recommend treating this document as a first-pass draft that still
-   requires explicit operator answers to 1–6 before any follow-on implementation plan is opened —
-   not as a completed scoping conversation in itself.
+   not answer items 1–6 above. The 2026-07-24 operator direction resolved items 1 and 3 and
+   substantially sharpened items 2 and 5; items 4 and 6 remain open. Recommend treating this document
+   as a second-pass draft, still requiring explicit operator answers to items 2 (container question
+   only), 4, and 6 before any follow-on implementation plan is opened — not as a completed scoping
+   conversation in itself.
+8. **Quarantine fold-vs-keep — new, operator-directed 2026-07-24.** Does the operator run containers
+   on the monitored host that they would want isolated via a container-runtime-specific route
+   (`docker pause`/network-disconnect)? If no, `quarantine` folds into `{freeze + block}` per §(a)'s
+   recommendation and is not built as its own verb. If yes, it stays a distinct verb with its own
+   container-socket-scoped execution primitive and its own review. This is a sharpened,
+   directly-answerable subset of item 2, called out separately because §(a) now has a concrete
+   recommendation riding on the answer.
+9. **Federated immune system — governance sign-off, new, operator-directed 2026-07-24; checklist
+   expanded by safety review 2026-07-24.** The federated immune system direction (Operator direction
+   section below) is captured as a future design direction only. Before any part of it moves toward
+   even a design-only follow-on plan (let alone implementation), the operator must explicitly sign
+   off on the full governance model that direction enumerates — **now including, per the 2026-07-24
+   safety review's must-fixes**, fleet-level controls in addition to the node-local ones (staged/
+   canary propagation; a fleet-wide circuit-breaker and signature recall/revocation that reaches
+   nodes mid-rollout, not merely a per-node kill-switch; Sybil-resistance and ratifier-compromise
+   controls, since corroboration and ratification are today assumed-honest and unsecured) and an
+   explicit answer to the reflex path's consent-model degradation (what unforgeable authority
+   substitutes for a human-minted, per-execution consent nonce when no human is in the loop, and why
+   a compromised daemon cannot self-authorize by "recognizing" a signature) — alongside the
+   originally-named ratifying authority, corroboration threshold, honest notification-vs-confirmation
+   labeling, and full audit. This document does not itself constitute that sign-off, and the
+   direction's own stated catastrophic-risk framing means this bar should be treated as at least as
+   high as, not lower than, the rest of this document's sign-off requirements.
 
 ---
 
@@ -437,8 +614,11 @@ static reasoning alone, fail-closed/deny-by-default verification, race/TOCTOU an
 mutating path deserves at least that bar, not less.
 
 - **Slice 7.0 — this document + operator resolution of §(d).** No code. Gate for everything below.
-- **Slice 7.1 — recommend-only surface** *(only if §(d) item 1 selects execution-adjacent work at
-  all)*: the daemon/alert pipeline gains a new, purely additive signal that surfaces a proposed
+  Partially cleared 2026-07-24: §(d) items 1 and 3 are resolved by the operator direction folded
+  into this document; items 2 (container question), 4, and 6 remain open per §(d)'s updated text.
+- **Slice 7.1 — recommend-only surface** *(§(d) item 1 now resolved — execution-adjacent work is
+  wanted — but this slice is still the correct, lowest-risk starting point regardless)*: the
+  daemon/alert pipeline gains a new, purely additive signal that surfaces a proposed
   verb + target + rationale (e.g., `session.count_drop` → "consider investigating/killing session
   X") for a human to read and act on manually. **Zero new `execFile`, zero new privilege, zero
   host mutation.** Locally testable end-to-end. Still needs its own doors-and-corners pass and
@@ -452,18 +632,46 @@ mutating path deserves at least that bar, not less.
 - **Slice 7.3 — first real execution primitive, single most-reversible verb first** (likely
   `revoke` of a single VPN peer, or `block` via an isolated firewall anchor — whichever the
   operator's real environment supports per §(d) item 2): a scoped, allowlisted, single-purpose
-  execution primitive, wired **only** behind Slice 7.2's authority gate, with a self-lockout guard,
-  a dry-run mode, an auto-revert/expiry, and full pre/post-state capture per §(c)'s audit shape.
-  This is the first slice that introduces new `execFile`/privilege surface and is therefore the
-  first slice that needs the full S3-priv-or-stricter review bar: trust-boundary analysis, minimal
-  privilege grant (empirically validated, not just reasoned about), fail-closed verification,
-  TOCTOU/race analysis, a dedicated self-lockout test, and a proven rollback test.
+  execution primitive, wired **only** behind Slice 7.2's authority gate, and, per the
+  operator-directed execution architecture in §(a)'s Cross-verb themes, wired through the separate
+  capability-holding helper (never invoked directly by the daemon/CLI) under a single-use,
+  time-limited consent nonce — leaning on `sudo`/`polkit` (Linux) or a privileged `launchd`
+  helper + XPC + code-requirement checks (macOS) rather than a bespoke privilege mechanism — with a
+  self-lockout guard, a dry-run mode, an auto-revert/expiry, and full pre/post-state capture per
+  §(c)'s audit shape. This is the first slice that introduces new `execFile`/privilege surface and
+  is therefore the first slice that needs the full S3-priv-or-stricter review bar: trust-boundary
+  analysis, minimal privilege grant (empirically validated, not just reasoned about), fail-closed
+  verification, TOCTOU/race analysis, a dedicated self-lockout test, and a proven rollback test —
+  now additionally including a dedicated review of the helper boundary itself (does the daemon/CLI
+  genuinely hold zero capability, is the consent nonce genuinely single-use and unforgeable).
 - **Slice 7.4 — `kill`, if ever built at all:** given `kill`'s irreversibility (§(a)), this should
   be the **last** verb attempted, only after 7.3's authority+execution pattern has been live,
-  audited, and uneventful for a meaningful period on a genuinely reversible verb first.
-- **Slice 7.5 — `quarantine`, only if applicable** (§(d) item 2): runtime-specific, its own scoped
-  credential (never a raw `docker.sock`-class handle on the general daemon process, per §(a)), its
-  own dedicated review.
+  audited, and uneventful for a meaningful period on a genuinely reversible verb first. Routed
+  through the same helper + single-use-consent model as 7.3, per §(a).
+- **Slice 7.5 — `quarantine`, only if applicable** (§(d) items 2/8 — the container question):
+  contingent on the operator's answer to whether they run containers on the monitored host. If not,
+  this slice is replaced entirely by composing 7.3's `block` primitive with a new `freeze` primitive
+  (`SIGSTOP`/cgroup-freezer) rather than standing up quarantine as its own verb, per §(a)'s
+  fold-into-`{freeze + block}` recommendation. If yes, this slice proceeds as originally scoped:
+  runtime-specific, its own scoped credential (never a raw `docker.sock`-class handle on the general
+  daemon process, per §(a)), its own dedicated review.
+- **Slice 7.6 — federated immune system, design-only follow-on, not scheduled** *(new,
+  operator-directed 2026-07-24; governance checklist expanded by safety review 2026-07-24; gated on
+  §(d) item 9)*: should the operator ever choose to pursue the federated immune system direction
+  (Operator direction section below) beyond this document's capture of it, the correct next step is a
+  **separate, dedicated, design-only plan** — not an extension of Slices 7.1–7.5's execution work —
+  that works out the full governance model before any code is contemplated: ratifying authority,
+  corroboration threshold, **both node-local and fleet-level blast-radius caps** (staged/canary
+  propagation; a fleet-wide circuit-breaker and signature recall/revocation, not merely a per-node
+  kill-switch; Sybil-resistance and ratifier-compromise controls — node-local caps alone do not
+  bound the fleet-global catastrophic outcome this direction names, per the 2026-07-24 safety
+  review), notification-vs-confirmation labeling, audit/post-hoc review, **and an explicit
+  resolution of the reflex path's consent-model degradation** (what replaces the human-minted,
+  per-execution consent nonce when the reflex path has no human in the loop, and why a compromised
+  daemon cannot self-authorize by "recognizing" a signature). This slice is listed here only to keep
+  it visible in the same phased breakdown as the rest of Slice 7; it is not implied to follow
+  sequentially from 7.5, and per §(d) item 9 it requires its own explicit operator sign-off before
+  even a design-only follow-on plan is opened.
 
 Every slice 7.2 and later is additionally gated behind the **dedicated, default-OFF containment
 kill-switch** from §(c) — never `learned.json`'s existing switch — checked before any I/O, exactly
@@ -480,5 +688,228 @@ own review, and the only mechanism buildable today without new infrastructure (�
 time-delayed single-party approval templated on `promotion-store.js`) must be permanently and
 honestly labeled as weaker than real multi-party confirmation. Every containment verb carries
 irreversibility (`kill`) or self-lockout (`block`/`revoke`) risk that this codebase has not taken
-on anywhere else. Nothing should be built from this document until the operator has answered
-§(d)'s seven open scope decisions.
+on anywhere else.
+
+**Updated 2026-07-24:** the operator has directed this document's §(b) tiering (Option 3 near-term,
+Option 1 not for now/enterprise-later, Option 2 later-with-backend) and confirmed real execution is
+wanted, routed only through a separate capability-holding helper under single-use, time-limited
+consent, leaning on existing OS privilege primitives (`sudo`/`polkit`, macOS `launchd`+XPC) rather
+than a new one. `block` now must read existing firewall state before acting; `quarantine` is now
+defined ("contain without destroying, to preserve forensic state") and recommended folded into
+`{freeze + block}` pending one open question back to the operator (do they run containers they'd
+want isolated?). The operator has also named the resulting tension — this near-term model is
+honestly too slow for fast-moving threats like ransomware — and proposed a future, heavily
+governance-gated **federated immune system** direction as its resolution; that direction is
+captured design-only in the new "Operator direction (2026-07-24)" section below and requires its
+own separate operator sign-off (§(d) item 9) before it becomes anything more than a captured idea.
+Nothing should be built from this document until the operator has answered §(d)'s nine open scope
+decisions (seven original, two added 2026-07-24) — in particular items 2/8 (the container
+question), 4 (self-lockout tolerance), and 6 (build-now-or-park).
+
+**Safety review (2026-07-24), folded:** GO_WITH_CHANGES. The federated immune system direction's
+governance checklist (§(e) Slice 7.6, §(d) item 9) now explicitly requires fleet-level controls —
+staged/canary propagation, a fleet-wide circuit-breaker and signature recall/revocation, and
+Sybil-resistance/ratifier-compromise controls — in addition to the node-local caps already named,
+because node-local caps alone do not bound the fleet-global catastrophic outcome that section itself
+names. The reflex path's consent-model degradation (no human-minted, per-execution consent nonce
+when execution follows local signature recognition) is now named explicitly, with a required
+analysis item added to the 7.6 checklist. §(a) Cross-verb themes now specifies the execution-consent
+nonce's own write-ahead-consume ordering and its binding to a specific approved §(b) decision plus
+the freshly re-resolved target+verb, closing a theoretical replay-on-crash and misbinding window.
+None of this changes what may be built now — it sharpens the bar the not-yet-authorized federated
+direction (§(d) item 9) must clear, and adds detail to the already-mandated §(a)/§(c) execution
+mechanics. This document remains DESIGN-ONLY.
+
+---
+
+## Operator direction (2026-07-24)
+
+This section records the operator's direct response to §(b)'s authority-model options and §(a)'s
+per-verb execution questions, and captures one new future design direction the operator proposed.
+It is folded inline throughout §(a)–(e) above (see the "operator-directed 2026-07-24" /
+"operator-directed" callouts and the header's "Operator direction folded" line); this section is
+the single authoritative statement of that direction, for reference, and does not introduce
+anything not also reflected inline. **This section, like the rest of the document, is DESIGN-ONLY —
+it directs what a future design should look like, it does not itself constitute or authorize any
+code.**
+
+### Authority model (§(b))
+
+- **Option 1 (second human operator / two-person rule): not for now.** Confirmed out of scope for
+  the near term. Possible in a later **enterprise** setting, where a real multi-operator identity
+  model would exist to support it — not something to build speculatively ahead of that need.
+- **Option 2 (multi-device / out-of-band push approval): acceptable as a later improvement.**
+  Confirmed as a legitimate future direction, but explicitly gated on standing up **a backend for
+  identity and push notifications** first — this is new external infrastructure this codebase does
+  not have today, consistent with §(b)'s original caution that Option 2 needs its own dedicated
+  security review before being designed in detail.
+- **Option 3 (time-delay / cooling-off, single-party, explicitly weaker): the near-term mechanism.**
+  Confirmed as the only mechanism actually being pursued right now — nothing more is feasible yet.
+  The operator explicitly acknowledges this is **weak for fast-moving threats** (ransomware and
+  similar classes of incident that outrun a cooling-off window), and accepts that weakness for now,
+  to be addressed later via the federated direction below rather than by weakening Option 3's own
+  honesty-labeling requirement.
+- **The tiered, honestly-labeled approach as a whole: confirmed.** §(b)'s recommendation of treating
+  these as tiers rather than picking one mechanism forever is itself operator-confirmed, not just
+  this document's suggestion.
+
+### Execution architecture (applies to kill + revoke, and shapes block)
+
+Any containment verb executes **only** through a **separate capability-holding helper**, mirroring
+the `root_helper` precedent's shape (S3-priv's read-only, seccomp-hardened grant) but as its own,
+independently-scoped, write-capable grant — never a reuse of the read-only one. The helper **holds**
+the capability; the daemon/CLI **does not and cannot** perform the action on its own. Each execution
+additionally requires explicit user consent that is **single-use** and **time-limited** (a nonce
+plus a short expiry) — distinct from, and layered on top of, the §(b) Option 3 approval nonce: one
+nonce authorizes the *decision* (after the cooling-off window), the other authorizes the single act
+of *execution* the helper is about to perform.
+
+**Are we reinventing sudo / SRP / a dedicated privilege tool?** No, by explicit direction: the
+strong preference is to **lean on existing OS privilege and consent primitives** — `sudo`/`polkit`
+policy on Linux, and a privileged `launchd` helper reached over XPC with code-requirement
+(code-signing identity) checks on macOS — rather than invent a new privilege-escalation mechanism.
+Descartes contributes the **policy** (which verb, which target, which tier), the **single-use
+consent-ledger** (the per-execution nonce mechanic above), and the **audit** layer (§(c)'s
+write-ahead record) **on top of** those OS primitives, not a new privilege path alongside or instead
+of them. The one place an existing primitive genuinely does not fit: neither `sudo`/`polkit` nor a
+signed XPC helper natively expresses "this specific consent nonce authorizes this specific mutating
+call exactly once, never again" — that single-use consent-ledger mechanic is the one piece of new
+mechanism this direction adds, deliberately kept as narrow as possible.
+
+### Per-verb direction
+
+- **kill / revoke:** execute via the helper + single-use, time-limited consent model above. The
+  write-ahead, crash-consistent audit ordering and the self-lockout guard already in §(a)/§(c) of
+  this document stand as-is — this direction adds the execution-routing requirement on top of them,
+  it does not relax either.
+- **block:** Descartes must be **aware of existing firewall rules** — it must **read current state**
+  (`pf`/`nft`/`iptables`, whichever the host runs) before acting, and must **never blind-append** a
+  rule. It must detect conflicts and duplicates against both its own prior rules and the operator's
+  pre-existing configuration. On rollback, it must roll back **only what it added**, never a
+  broader revert.
+- **quarantine:** the operator asked what this verb even means. Definition: **"contain without
+  destroying, to preserve forensic state"** — freeze the process (`SIGSTOP` / cgroup freezer /
+  `docker pause`) and/or network-isolate it (an isolated network namespace, or a deny-all rule
+  scoped to its cgroup), as opposed to `kill`, which loses evidence. This is flagged as the
+  **weakest-defined verb** in the document. Recommendation: fold it into a composition of
+  **`{freeze + block}`** rather than standing it up as a fifth, independent verb with its own
+  execution primitive — **unless** the operator actually runs containers on the monitored host that
+  they would want isolated via a container-runtime-specific route (`docker pause`/network
+  disconnect), in which case a distinct container-aware quarantine primitive may be worth keeping.
+  This is recorded as an **open question for the operator** (also §(d) item 8), not resolved here.
+
+### Fast-response tension → federated immune system (future direction, design-only, heavily governance-gated)
+
+The operator named a real tension directly: Option 3's cooling-off window is honestly too slow for a
+fast-moving threat (ransomware and similar). Rather than weakening Option 3's honesty-labeling or
+adding an ad hoc emergency bypass, the operator proposed a structurally different future resolution:
+
+- **The mechanism:** agents document behaviours and "signatures" and upload them to a **shared
+  federated layer**. A signature that is either **ratified by some authority** or **independently
+  corroborated by other agents** becomes a "rule" that **authorizes running its associated action as
+  soon as the behaviour/signature is recognized locally** — with human **notification** (information
+  after the fact), **not** human confirmation before the fact. This is a real, named escalation of
+  autonomy relative to everything else in this document, and must always be labeled as such, never
+  softened in language.
+- **The trade-off the operator explicitly accepts:** "you lose a few nodes, but the vast majority
+  won't be affected" — a herd-immunity framing, where fast local reflex action on a
+  well-corroborated signature protects the fleet even though a rollout of a bad or malicious
+  signature could still cost some individual nodes before it's caught.
+- **Where this sits in Descartes' existing architecture:** this is the **terminus** of Descartes'
+  already-documented Learn → compile-down → L3 Federated Knowledge arc (`AGENTS.md`'s L3 Federated
+  Knowledge Layer, and Operational Lifecycle stage 7, "Learn — compile confirmed findings back into
+  cheaper rules, signatures, tests, and tools"). That arc today is scoped to making **detection**
+  cheaper (rules/signatures instead of repeated deliberation); this direction extends the same arc
+  one step further, to **authorizing pre-consented reflex actions** on a signature once it's
+  recognized, not merely cheaper detection of it. It is a natural extension of an arc this codebase
+  already committed to, not a disconnected new idea — but it is a materially larger step than
+  anything L3 currently does, and must be treated as such.
+- **Governance is the entire safety burden here**, not a detail to fill in later. Required controls,
+  enumerated (none of these are designed in detail by this document — they are the checklist any
+  future design-only follow-on plan, §(e) Slice 7.6, must work through before this direction is
+  anything more than a captured idea):
+  - **Ratifying authority + corroboration threshold:** who or what authority can ratify a signature
+    outright, and, separately, how many independently-corroborating agents/nodes are required before
+    an unratified signature is trusted enough to become an action-authorizing rule.
+  - **Per-node blast-radius caps (necessary, not sufficient — see "Fleet-level controls" below):**
+    reversible-first actions only (never `kill`-class irreversible actions via this path without a
+    materially higher bar than anything else in this document); scope strictly limited to exactly
+    the recognized signature (no generalization at execution time); rate-limited; and a **per-node
+    kill-switch** that can unilaterally halt this class of action on a single node regardless of
+    federation state. **Safety-review note (2026-07-24):** these caps bound the *node-local* blast
+    radius only. They do **not**, by themselves, bound the *fleet-global* catastrophic outcome this
+    section names below ("infrastructure for a catastrophic automated global outcome") — a poisoned
+    or maliciously-ratified signature that clears the corroboration threshold still propagates to
+    every node that recognizes it, and each node firing its own capped, reversible, rate-limited
+    local action is exactly how the fleet-wide event happens. The line between "you lose a few
+    nodes" and "all nodes at once" is drawn entirely by how broadly a signature matches, not by
+    anything in this per-node checklist — that scope-limiting property is therefore load-bearing and
+    must be treated and reviewed as such, not as an incidental detail.
+  - **Fleet-level controls (required, safety-review must-fix, added 2026-07-24 — without these,
+    per-node caps alone do not bound the catastrophic risk this section itself names):**
+    - **Staged/canary propagation:** a newly ratified-or-corroborated signature authorizes action on
+      only a small, bounded fraction of nodes first, with a mandatory observation window before any
+      propagation beyond that canary set — never an immediate fleet-wide rollout on first
+      recognition.
+    - **Fleet-wide circuit-breaker and signature recall/revocation:** a mechanism that can halt an
+      in-flight rollout of a given signature **across the whole fleet**, not merely on one node — the
+      per-node kill-switch above stops one node from acting again; it does nothing to stop every
+      other node already mid-rollout on the same bad signature. Revocation must reach nodes that
+      have already received the signature but not yet acted, and must be distinguishable from, and
+      take priority over, the signature's own ratification/corroboration state.
+    - **Sybil-resistance and ratifier-compromise controls:** "independently corroborated by other
+      agents" and "ratified by some authority" are, as written, both assumed-honest and unsecured —
+      neither corroborating-node authentication (so an attacker cannot manufacture the appearance of
+      independent corroboration by standing up sock-puppet nodes/agents) nor ratifier
+      key-management, cryptographic signature integrity, and ratification-revocation (so a
+      compromised or coerced ratifying key cannot mint a trusted rule, and a bad ratification can
+      itself be revoked) are designed here. Both must exist before this direction authorizes a
+      single reflex action — the entire mechanism is only as trustworthy as the corroboration/
+      ratification it executes off of.
+  - **Consent-model degradation (safety-review must-fix, named 2026-07-24):** everywhere else in
+    this document, execution requires a fresh, per-execution, human-minted consent nonce (§(a)
+    Cross-verb themes) precisely so that a compromised or prompt-injected daemon cannot self-authorize
+    a mutating action — the daemon proposes, it never holds or exercises the capability itself. The
+    federated reflex path breaks this: it executes on **local signature recognition**, with
+    notification rather than confirmation, meaning there is **no human in the loop to mint an
+    execution-consent nonce at the moment of execution**. This document did not previously state what
+    replaces that guarantee. Naming it plainly, consistent with how this document already names
+    comparable tensions elsewhere (the hash-at-source-vs-raw-identifier tension and the self-lockout
+    risk, both in §(a)): **on the reflex path, the helper/capability separation degrades to trusting
+    the daemon's own signature-recognition code** — exactly the compromised-daemon threat model the
+    helper boundary exists to contain on every other path this document describes. **Required
+    analysis for §(e) Slice 7.6, not answered here:** what unforgeable authority mints or stands in
+    for the execution-consent nonce when no human is present, and what specifically prevents a
+    compromised daemon from "recognizing" a signature it was never legitimately shown, in order to
+    self-authorize action.
+  - **Honest labeling:** every surface must say, unambiguously, that this is **notification, not
+    confirmation** — a real escalation of autonomy beyond everything else in this document, never
+    described as "still requiring approval" or similar softening language.
+  - **Full audit + post-hoc human review:** every reflex action taken this way must be as fully
+    audited (write-ahead, pre/post-state, per §(c)) as any human-approved containment action, plus a
+    mandatory post-hoc human review pass — the absence of pre-action confirmation must be
+    compensated by strengthened, not weakened, after-the-fact review.
+  - **Self-lockout at fleet scale (safety-review finding, folded 2026-07-24):** "reversible-first
+    actions only" is not by itself a sufficient guard against self-lockout on this path. §(a)
+    establishes that block/revoke are reversible *in principle* (re-add the rule/peer) yet a
+    self-lockout on a remotely-administered host can be practically unrecoverable if the host cannot
+    be reached to reverse it — and at fleet scale, a bad block/revoke signature recognized broadly
+    could self-lockout many hosts simultaneously, each individually "reversible" and each
+    individually unreachable. The self-lockout guard that is a hard precondition for kill/block/
+    revoke on the human-approved path (§(a)) must be carried onto this path explicitly, and the
+    fleet-scale case (many simultaneous self-lockouts, not one) must be addressed by name —
+    "reversible-first" alone does not cover it.
+- **The risk, stated plainly, as the operator explicitly flagged it:** a federated, near-instantaneous
+  action-on-recognition network is not only a defensive tool — it is **also the infrastructure for a
+  catastrophic automated global outcome should Descartes become widely deployed**. A bad, poisoned,
+  or maliciously-ratified signature propagating through the same mechanism that lets good signatures
+  authorize fast reflex defense could authorize fast reflex harm at the same speed and the same
+  scale. This is recorded here as an **accepted, eyes-open risk**, not a footnote or a caveat to be
+  minimized — this direction demands the **strongest governance in the entire system**, must never
+  ship without it, and the operator's own framing (herd immunity, "you lose a few nodes") should be
+  read as an acceptance of bounded, individually-scoped local loss, not as license for the
+  catastrophic global failure mode named directly above. Any future design-only follow-on plan for
+  this direction must reproduce this risk statement prominently, not bury it.
+- **Status:** captured here as a design direction only. Not scheduled, not designed in detail, and
+  gated on its own explicit operator sign-off (§(d) item 9) before even a dedicated design-only
+  follow-on plan (§(e) Slice 7.6) is opened.
