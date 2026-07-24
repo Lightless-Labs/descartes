@@ -1431,17 +1431,17 @@ test("(c) invariant: SERVICE_DISAPPEARED_RULE_ID classifies to namespace undefin
   }
 });
 
-test("emitSessionAlertSignals delivers a due service.disappeared through deliverNotificationDecision with a hash-only body, never via a session/LLM -- and never leaks a raw service name even if diagnostics carried one", async () => {
+test("emitSessionAlertSignals delivers a due service.disappeared through deliverNotificationDecision NAMING the sanitized service in cleartext (operator decision, 2026-07-24), never via a session/LLM", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const serviceAlert = alert({
     id: "alert_service_disappeared",
     rule_id: SERVICE_DISAPPEARED_RULE_ID,
     severity: "warning",
-    // entity_key deliberately included alongside entity_key_hash here (as if some other code path
-    // mistakenly attached it) to prove buildSessionAlertNotificationDecision's service.disappeared
-    // branch only ever interpolates entity_key_hash/last_seen_ts, never any other diagnostics key.
-    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12, entity_key: "com.example.raw-service-name" },
+    // service_name is the SANITIZED (charset-bounded) cleartext name service-baseline.js's
+    // buildDisappearedCandidates now emits. entity_key_hash is still carried alongside it (kept for
+    // fingerprint/id parity, see service-baseline.js) but must NOT be what the body interpolates.
+    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12, service_name: "com.example.raw-service-name" },
   });
   const result = await emitSessionAlertSignals(paths, { alerts: [serviceAlert], notification_due_ids: [serviceAlert.id] }, {
     now: "2026-07-14T00:01:00.000Z",
@@ -1453,8 +1453,51 @@ test("emitSessionAlertSignals delivers a due service.disappeared through deliver
   assert.equal(deliveries[0].opts.alertId, serviceAlert.id);
   assert.equal(deliveries[0].decision.notify, true);
   assert.equal(deliveries[0].decision.severity, "warning");
-  assert.match(deliveries[0].decision.body, /^A previously-established service \(id a1b2c3d4e5f6a7b8\) stopped appearing in the latest complete census \(last seen 2026-07-14T00:00:00\.000Z\)\.$/);
-  assert.equal(/com\.example\.raw-service-name/.test(JSON.stringify(deliveries[0].decision)), false, "no raw service name in the delivered body, even though diagnostics carried one");
+  assert.match(deliveries[0].decision.body, /^Service "com\.example\.raw-service-name" stopped appearing in the latest complete census \(last seen 2026-07-14T00:00:00\.000Z\)\.$/);
+  assert.equal(/com\.example\.raw-service-name/.test(JSON.stringify(deliveries[0].decision)), true, "the SANITIZED service name IS shown in the delivered body (2026-07-24 operator decision)");
+  // Sanitized-name discipline: whatever lands in the body must be free of newlines/control chars —
+  // the charset service-baseline.js's sanitizeIdentityString guarantees by construction.
+  // eslint-disable-next-line no-control-regex
+  assert.equal(/[\x00-\x1f\x7f]/.test(deliveries[0].decision.body), false, "delivered body must contain no control characters");
+});
+
+test("emitSessionAlertSignals: session.churn/peer.count_spike/peer.count_drop remain hash-only/counts-only bodies, unaffected by the service.disappeared cleartext-name exception (2026-07-24 scoping regression)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const churnAlert = alert({
+    id: "alert_session_churn_scope",
+    rule_id: SESSION_CHURN_RULE_ID,
+    severity: "warning",
+    diagnostics: { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" },
+  });
+  const peerSpikeAlert = alert({
+    id: "alert_peer_spike_scope",
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 30, mean_before: 4, stddev_before: 0.5, z_score: 40, confidence_state: "established" },
+  });
+  const peerDropAlert = alert({
+    id: "alert_peer_drop_scope",
+    rule_id: PEER_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 0, mean_before: 4, stddev_before: 0.5, z_score: -40, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, {
+    alerts: [churnAlert, peerSpikeAlert, peerDropAlert],
+    notification_due_ids: [churnAlert.id, peerSpikeAlert.id, peerDropAlert.id],
+  }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.equal(result.fired.length, 3);
+  assert.equal(deliveries.length, 3);
+  for (const { decision } of deliveries) {
+    assert.equal(decision.body.includes("stopped appearing"), false, "session/peer bodies must never use the service.disappeared cleartext phrasing");
+  }
+  const spikeDelivery = deliveries.find((d) => d.opts.ruleId === PEER_COUNT_SPIKE_RULE_ID);
+  const dropDelivery = deliveries.find((d) => d.opts.ruleId === PEER_COUNT_DROP_RULE_ID);
+  assert.match(spikeDelivery.decision.body, /^Peer count 30 vs baseline mean 4/);
+  assert.match(dropDelivery.decision.body, /^Peer count 0 vs baseline mean 4/);
 });
 
 test("emitSessionAlertSignals: even severity stamped 'critical' on the alert record, a due service.disappeared still delivers with severity 'warning' (unconditional hard cap, orchestrator resolution 2026-07-23 #3)", async () => {
@@ -1505,7 +1548,7 @@ test("emitSessionAlertSignals fires for the WIDENED allowlist including service.
   const dropAlert = alert({ id: "alert_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical", diagnostics: { observed_count: 0, mean_before: 20, stddev_before: 0.5, z_score: -40, confidence_state: "established" } });
   const churnAlert = alert({ id: "alert_churn", rule_id: SESSION_CHURN_RULE_ID, severity: "warning", diagnostics: { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" } });
   const peerAlert = alert({ id: "alert_peer", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
-  const serviceAlert = alert({ id: "alert_service", rule_id: SERVICE_DISAPPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 } });
+  const serviceAlert = alert({ id: "alert_service", rule_id: SERVICE_DISAPPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12, service_name: "svc-widened-allowlist" } });
   const metricAlert = alert({ id: "alert_metric", rule_id: "system.memory.sustained_high", severity: "warning" });
 
   const result = await emitSessionAlertSignals(paths, {
@@ -1524,11 +1567,11 @@ test("emitSessionAlertSignals fires for the WIDENED allowlist including service.
   assert.match(byRuleId[SESSION_COUNT_DROP_RULE_ID], /^Session count 0 vs baseline mean 20/);
   assert.match(byRuleId[SESSION_CHURN_RULE_ID], /session\.tmux\.aaaaaaaaaaaaaaaa/);
   assert.match(byRuleId[PEER_COUNT_SPIKE_RULE_ID], /^Peer count 8 vs baseline mean 2/);
-  assert.match(byRuleId[SERVICE_DISAPPEARED_RULE_ID], /^A previously-established service \(id a1b2c3d4e5f6a7b8\)/);
+  assert.match(byRuleId[SERVICE_DISAPPEARED_RULE_ID], /^Service "svc-widened-allowlist" stopped appearing/);
   // No cross-contamination: no body carries another rule_id's shaped text.
   assert.equal(/session\.tmux/.test(byRuleId[PEER_COUNT_SPIKE_RULE_ID]), false);
   assert.equal(/Peer count/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
-  assert.equal(/a1b2c3d4e5f6a7b8|previously-established service/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
+  assert.equal(/svc-widened-allowlist|stopped appearing/.test(byRuleId[SESSION_COUNT_DROP_RULE_ID]), false);
 });
 
 test("the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by delivery is composed of session-baseline.js's own two-id export PLUS PEER_COUNT_SPIKE_RULE_ID PLUS PEER_COUNT_DROP_RULE_ID PLUS SERVICE_DISAPPEARED_RULE_ID (companion to the three-id pin test above, further widened -- Slice 4c, observed-incident collectors plan)", async () => {

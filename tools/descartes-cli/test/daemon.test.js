@@ -2594,7 +2594,7 @@ test("Service-disappearance wiring: computeServiceBaselineCandidates is the daem
   assert.equal(alert.severity, "warning");
   assert.equal(typeof alert.diagnostics, "object");
   assert.equal(typeof alert.diagnostics.entity_key_hash, "string");
-  assert.equal(JSON.stringify(alert.diagnostics).includes("worker.service"), false, "raw entity_key must never appear in a persisted diagnostics field");
+  assert.equal(alert.diagnostics.service_name, "worker.service", "service.disappeared names the service (sanitized cleartext) in diagnostics.service_name — operator decision 2026-07-24");
   assert.notEqual(alert.fingerprint, "worker.service", "fingerprint must be the hash, never the raw entity_key");
   assert.equal(JSON.stringify(alert).includes("redacted"), false);
 

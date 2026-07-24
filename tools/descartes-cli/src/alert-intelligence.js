@@ -351,8 +351,12 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
 //     downstream — that stamp reflects only that the candidate was processed, not that any
 //     human-visible delivery happened. This function's own tests assert on an actual call into
 //     (or mock of) deliverNotificationDecision, never merely on the cooldown/last_notified fields;
-//   - the delivered body is counts/hash-only — never a raw session name, matching the sanitized
-//     diagnostics shape session-baseline.js's candidate builders already produce.
+//   - the delivered body is counts/hash-only for session.*/peer.* — never a raw session/peer
+//     identity, matching the sanitized diagnostics shape those candidate builders already produce.
+//     EXCEPTION (operator decision, 2026-07-24, scoped to service.disappeared ONLY): the delivered
+//     body for service.disappeared names the disappeared service in cleartext (sanitized, never
+//     raw/unsanitized) — see buildSessionAlertNotificationDecision's service.disappeared branch
+//     below for the full rationale. session.*/peer.* bodies are unaffected by this exception.
 export async function emitSessionAlertSignals(descartesPaths, evaluation, options = {}) {
   const dueIds = new Set(evaluation?.notification_due_ids ?? []);
   if (dueIds.size === 0) return { fired: [] };
@@ -379,11 +383,15 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   return { fired };
 }
 
-// Counts/hash-only body (must-fix 3): every field interpolated below is a finite number or a
-// short closed-enum/hash string already produced by session-baseline.js's sanitizeDiagnostics-gated
-// candidate builders — never a raw session name, which never reaches this layer's inputs at all
-// (session-baseline.js's diagnostics only ever carry counts/z-scores/confidence_state or hashed
-// entity_key/fingerprints).
+// Counts/hash-only body (must-fix 3) for every branch EXCEPT service.disappeared: every field
+// interpolated below is a finite number or a short closed-enum/hash string already produced by
+// session-baseline.js's/peer-baseline.js's sanitizeDiagnostics-gated candidate builders — never a
+// raw session/peer identity, which never reaches this layer's inputs at all for those rule_ids
+// (their diagnostics only ever carry counts/z-scores/confidence_state or hashed entity_key/
+// fingerprints). service.disappeared is a SCOPED, INTENTIONAL exception (operator decision,
+// 2026-07-24): its body interpolates `diagnostics.service_name`, a sanitized (charset-bounded, NOT
+// hashed) cleartext service name — see that branch below for the full rationale. This exception
+// does not widen to any other rule_id; session/peer identity stays hashed/counts-only.
 function buildSessionAlertNotificationDecision(alert) {
   const diagnostics = alert?.diagnostics ?? {};
   if (alert?.rule_id === SESSION_COUNT_DROP_RULE_ID) {
@@ -433,23 +441,34 @@ function buildSessionAlertNotificationDecision(alert) {
       body: `Peer count ${diagnostics.observed_count} vs baseline mean ${diagnostics.mean_before} (z=${diagnostics.z_score}, ${diagnostics.confidence_state}).`,
     };
   }
-  // Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md),
-  // orchestrator resolution 2026-07-23: fail-closed, hash-only body by default. Unlike
-  // session/peer identity (hashed at source in fact-translators.js), service.presence entity_keys
-  // are sanitized but NOT hashed at source -- service-baseline.js hashes entity_key locally
-  // (hashServiceEntityKey) before it ever reaches diagnostics, so this module's own
-  // "counts/hash-only -- never a raw session name" / "a finite number or a short closed-enum/hash
-  // string" invariants (see emitSessionAlertSignals'/this function's own header comments) hold for
-  // this rule_id exactly as they do for every existing one. Cleartext is explicitly DEFERRED
-  // pending a future, separately-approved operator decision (see the plan's "Operator decisions
-  // required before implementation" section) -- shipping it would require updating both of those
-  // invariant doc-comments plus any pinning test, in the SAME commit.
+  // Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md).
+  // INTENTIONAL, SCOPED EXCEPTION to this file's general hash-only body discipline (operator
+  // decision, 2026-07-24, recorded in the plan's "Operator decisions required before
+  // implementation" section): the body names the disappeared service in cleartext, using the
+  // SANITIZED (charset-bounded, `[A-Za-z0-9._:-]`-only, never raw/unsanitized) `diagnostics.
+  // service_name` that service-baseline.js's buildDisappearedCandidates now produces --
+  // superseding this branch's original hash-only body. Rationale: this is a LOCAL notification to
+  // the machine's own operator, and knowing WHICH service vanished is the entire operational point
+  // of the alert -- unlike session/peer identity below, where the specific session/peer is
+  // irrelevant and hashing loses no signal. This exception is SCOPED to service.disappeared ONLY --
+  // session.churn/session.count_drop/peer.count_spike/peer.count_drop above and below are
+  // UNCHANGED and remain hash-only/counts-only; do not read this as a blanket relaxation of the
+  // module-level invariants (see emitSessionAlertSignals'/this function's own header comments,
+  // updated to describe this exception explicitly).
   if (alert?.rule_id === SERVICE_DISAPPEARED_RULE_ID) {
+    // Defensive fallback: `diagnostics.service_name` is normally the sanitized cleartext name
+    // (see the exception rationale above), but sanitizeIdentityString/sanitizeDiagnostics degrade
+    // it to a redaction-marker object (never a string) when the source entity_key sanitizes to
+    // nothing safe (empty, whitespace-only, or all-punctuation). Interpolating that marker object
+    // directly into the body would stringify to the literal, unhelpful "[object Object]" — so fall
+    // back to the always-present hash identifier instead, matching this module's degrade-not-
+    // fabricate convention rather than surfacing an internal object shape to the operator.
+    const displayServiceName = typeof diagnostics.service_name === "string" ? diagnostics.service_name : `unknown (${diagnostics.entity_key_hash})`;
     return {
       notify: true,
       severity: "warning",
       title: "Descartes: service disappeared",
-      body: `A previously-established service (id ${diagnostics.entity_key_hash}) stopped appearing in the latest complete census (last seen ${diagnostics.last_seen_ts}).`,
+      body: `Service "${displayServiceName}" stopped appearing in the latest complete census (last seen ${diagnostics.last_seen_ts}).`,
     };
   }
   // Unreachable in normal operation (the caller already filters to

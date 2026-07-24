@@ -325,10 +325,11 @@ test("buildDisappearedCandidates: severity is ALWAYS 'warning' -- no code path c
   assert.equal(candidates[0].rule_id, SERVICE_DISAPPEARED_RULE_ID);
 });
 
-test("buildDisappearedCandidates: diagnostics passes through sanitizeDiagnostics (assert shape, not raw passthrough) and hashes entity_key rather than delivering it raw", () => {
+test("buildDisappearedCandidates: diagnostics passes through sanitizeDiagnostics (assert shape) and carries the SANITIZED service name in cleartext (2026-07-24 operator decision) alongside the entity_key_hash", () => {
   const entry = { entity_key: "com.example.raw-service-name", disappeared_at_ts: tickTs(1), last_seen_ts: tickTs(0), complete_census_seen_count: 5 };
   const [candidate] = buildDisappearedCandidates([entry]);
   const expectedShape = sanitizeDiagnostics({
+    service_name: entry.entity_key, // already charset-sanitized at the fixture's own definition
     entity_key_hash: expectedHash(entry.entity_key),
     last_seen_ts: entry.last_seen_ts,
     complete_census_seen_count: entry.complete_census_seen_count,
@@ -336,20 +337,33 @@ test("buildDisappearedCandidates: diagnostics passes through sanitizeDiagnostics
   assert.deepEqual(candidate.diagnostics, expectedShape);
   assert.ok(isFixedLengthHexHash(candidate.diagnostics.entity_key_hash));
   assert.equal(candidate.diagnostics.entity_key_hash, expectedHash(entry.entity_key));
-  assert.equal(JSON.stringify(candidate.diagnostics).includes(entry.entity_key), false, "the raw entity_key must never appear in the delivered diagnostics");
+  // 2026-07-24 operator decision: the sanitized service name IS shown in cleartext in diagnostics
+  // (local notification to the machine's own operator; identity IS the signal for this rule_id).
+  assert.equal(candidate.diagnostics.service_name, entry.entity_key);
+  assert.equal(JSON.stringify(candidate.diagnostics).includes(entry.entity_key), true, "the sanitized service name is intentionally shown in diagnostics for this rule_id");
 });
 
-test("buildDisappearedCandidates: `fingerprint` (and the derived `id`) is HASHED, never the raw entity_key -- alert-store.js persists `fingerprint` verbatim and the generic `descartes alerts list/ack --json` CLI surfaces dump the full record with no compaction, so a raw fingerprint would leak the raw service identity in cleartext (adversarial-review regression)", () => {
+test("buildDisappearedCandidates: diagnostics.service_name is charset-sanitized (no newline/control-char/injection) even if entity_key somehow arrived unsanitized -- defense in depth beyond fact-translators.js's own sanitizeEntityKey", () => {
+  const dirty = "svc\nname\x01with\tcontrol\x1bchars";
+  const entry = { entity_key: dirty, disappeared_at_ts: tickTs(1), last_seen_ts: tickTs(0), complete_census_seen_count: 5 };
+  const [candidate] = buildDisappearedCandidates([entry]);
+  assert.notEqual(candidate.diagnostics.service_name, dirty);
+  assert.equal(/[\x00-\x1f\x7f]/.test(String(candidate.diagnostics.service_name ?? "")), false, "sanitized service_name must contain no control characters");
+  assert.equal(/[\r\n]/.test(String(candidate.diagnostics.service_name ?? "")), false, "sanitized service_name must contain no newlines");
+});
+
+test("buildDisappearedCandidates: `fingerprint` (and the derived `id`) stay HASHED, never the raw/sanitized entity_key, for stable dedup/edge-triggering -- UNCHANGED by the 2026-07-24 cleartext-diagnostics decision, which is scoped to the DISPLAYED diagnostics.service_name field only (adversarial-review regression + 2026-07-24 scoping regression)", () => {
   const entry = { entity_key: "com.example.raw-service-name", disappeared_at_ts: tickTs(1), last_seen_ts: tickTs(0), complete_census_seen_count: 5 };
   const [candidate] = buildDisappearedCandidates([entry]);
   assert.notEqual(candidate.fingerprint, entry.entity_key);
   assert.equal(candidate.fingerprint, expectedHash(entry.entity_key));
   assert.ok(isFixedLengthHexHash(candidate.fingerprint));
   assert.equal(candidate.fingerprint, candidate.diagnostics.entity_key_hash, "fingerprint and diagnostics.entity_key_hash must be derived from the same hash so dedup stays stable");
-  // The raw entity_key must never appear ANYWHERE in the persisted candidate object -- not just
-  // diagnostics -- since the whole record (including `fingerprint`) is what alert-store.js writes
-  // to alerts.json and what the generic --json CLI surfaces serialize verbatim.
-  assert.equal(JSON.stringify(candidate).includes(entry.entity_key), false, "the raw entity_key must never appear anywhere in the persisted candidate, including `fingerprint`/`id`");
+  assert.equal(String(candidate.id).includes(entry.entity_key), false, "`id` (derived from the hashed fingerprint) must never carry the raw/sanitized entity_key");
+  // diagnostics.service_name is the ONE intentional exception (2026-07-24 operator decision) --
+  // the sanitized service name IS expected to appear there. Everywhere else in the persisted
+  // candidate (fingerprint/id in particular) must stay hash-derived.
+  assert.equal(candidate.diagnostics.service_name, entry.entity_key);
 });
 
 test("computeServiceBaselineCandidates: store write is skipped on a tick with zero new tick-groups since last_folded_ts (at-most-one-write convention)", async () => {
@@ -432,7 +446,7 @@ test("re-emission every call: candidate list is rebuilt fresh from the current w
   assert.deepEqual(first, second);
 });
 
-test("computeServiceBaselineCandidates end-to-end: an established service disappearing in a fresh complete census fires exactly one service.disappeared candidate with a hash-only diagnostics body", async () => {
+test("computeServiceBaselineCandidates end-to-end: an established service disappearing in a fresh complete census fires exactly one service.disappeared candidate naming the sanitized service in diagnostics.service_name (2026-07-24), with fingerprint/id still hash-derived", async () => {
   const paths = await tempPaths();
   const ticks = [...establishedTicks(["svc-a", "svc-b"], 5), completeTick(tickTs(5), ["svc-b"])]; // svc-a disappears
   const candidates = await seedAndCompute(paths, flatten(ticks), { freshnessMs: HOUR_MS, establishedMinCensusCount: 3 });
@@ -441,8 +455,13 @@ test("computeServiceBaselineCandidates end-to-end: an established service disapp
   assert.equal(candidate.rule_id, SERVICE_DISAPPEARED_RULE_ID);
   assert.equal(candidate.severity, "warning");
   assert.equal(candidate.diagnostics.entity_key_hash, expectedHash("svc-a"));
-  assert.equal(JSON.stringify(candidate.diagnostics).includes("svc-a"), false);
-  assert.equal(JSON.stringify(candidate).includes("svc-a"), false, "the raw entity_key must not survive anywhere in the full candidate, including fingerprint/id");
+  // 2026-07-24 operator decision: the sanitized service name is intentionally shown in diagnostics.
+  assert.equal(candidate.diagnostics.service_name, "svc-a");
+  assert.equal(JSON.stringify(candidate.diagnostics).includes("svc-a"), true, "the sanitized service name is intentionally shown in diagnostics for service.disappeared");
+  // fingerprint/id must still be hash-derived, never the raw/sanitized entity_key, so dedup stays
+  // stable -- this scoped exception applies to diagnostics.service_name only.
+  assert.notEqual(candidate.fingerprint, "svc-a");
+  assert.equal(String(candidate.id).includes("svc-a"), false);
 });
 
 test("computeServiceBaselineCandidates: readFactPoints window bound is threaded through (regression: fact points outside baselineFactWindowMs are excluded)", async () => {

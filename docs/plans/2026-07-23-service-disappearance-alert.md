@@ -77,6 +77,28 @@ TDD-IMPLEMENT #1:**
    explicitly DEFERRED pending a future, separately-approved operator decision, which would also
    require same-commit updates to the `emitSessionAlertSignals` / `buildSessionAlertNotificationDecision`
    invariant doc-comments plus any pinning tests (unchanged from this plan's own text below).
+
+   **RESOLVED (superseding the above) — OPERATOR DECISION 2026-07-24: CLEARTEXT/SANITIZED NAME
+   APPROVED, scoped to `service.disappeared` only.** The `service.disappeared` notification
+   body/diagnostics now name the disappeared service in cleartext, using the SANITIZED
+   (charset-bounded via `sanitizeIdentityString`/`sanitizeEntityKey`, never raw/unsanitized) service
+   name — `diagnostics.service_name` in `service-baseline.js`'s `buildDisappearedCandidates`, and
+   `alert-intelligence.js`'s `buildSessionAlertNotificationDecision` service.disappeared branch
+   interpolates it into the delivered body. `entity_key_hash` is retained alongside it, and
+   `fingerprint`/`id` (the dedup/edge-trigger keys) stay hash-derived, unaffected by this decision.
+   **Rationale:** this is a LOCAL notification to the machine's own operator, and knowing WHICH
+   service vanished is the entire operational point of the alert — unlike session/peer identity,
+   where the specific session/peer is irrelevant and hashing loses no signal. **Scope:** this
+   REVERSES the fail-safe hash-only default shipped in commit `47e6637` for `service.disappeared`
+   ONLY. `session.churn`/`session.count_drop` and `peer.count_spike`/`peer.count_drop` are
+   UNCHANGED and remain hash-only/counts-only — this is not a blanket relaxation of the module's
+   general hash-only body discipline. Both `emitSessionAlertSignals`'s and
+   `buildSessionAlertNotificationDecision`'s invariant doc-comments in `alert-intelligence.js`, and
+   `service-baseline.js`'s own header/FAIL-CLOSED-DEFAULT comments, were updated in the same change
+   to describe this scoped exception precisely (not as a general relaxation). Tests in
+   `service-baseline.test.js`/`alert-intelligence.test.js` were flipped from "raw entity_key never
+   appears" to "the sanitized service name IS shown, and is charset-sanitized (no control chars)",
+   with new/kept regression coverage asserting session/peer delivery paths remain hash-only.
 2. **set-diff vs literal windowed-Welford:** SET-DIFF (session.churn-shaped edge-triggered
    set-membership diff), NOT a windowed Welford mirror. `welford-stats.js` stays untouched except
    for reusing the generic `DEFAULT_BASELINE_FACT_WINDOW_MS` constant. The review chain converged on
@@ -424,6 +446,16 @@ drift from Slice B's.
   name"; "a finite number or a short closed-enum/hash string") are preserved unmodified, not
   relaxed:
 
+  > **SUPERSEDED 2026-07-24** — this code block and the "If the operator later approves..."
+  > paragraph below it describe the pre-resolution, hash-only-by-default design and the
+  > never-shipped `diagnostics.entity_key` field name. The operator decision was resolved the same
+  > day (see the top-of-file header and "Operator decisions required before implementation" below):
+  > the shipped branch names the service in cleartext via the SANITIZED `diagnostics.service_name`
+  > field (never `diagnostics.entity_key`), with a fallback to `diagnostics.entity_key_hash` when
+  > `service_name` isn't a plain string. See `src/alert-intelligence.js`'s actual
+  > `SERVICE_DISAPPEARED_RULE_ID` branch for the live implementation. Left below for historical
+  > context only — do not use it as a spec.
+
   ```js
   if (alert?.rule_id === SERVICE_DISAPPEARED_RULE_ID) {
     return {
@@ -518,7 +550,10 @@ branches and should merge cleanly as long as they're not developed against a sta
   they do for every existing one, by default. Raw `entity_key` is used ONLY as the internal
   `fingerprint`/dedup key (never delivered), matching how session/peer fingerprints are also
   internal-only. Shipping cleartext instead is a separate, explicitly-operator-approved decision —
-  see "Operator decisions required before implementation."
+  see "Operator decisions required before implementation." **Resolved 2026-07-24:** the operator
+  approved cleartext, scoped to `service.disappeared` only; the shipped diagnostics field is named
+  `service_name` (sanitized cleartext), not `entity_key` — see the SUPERSEDED note in the
+  `alert-intelligence.js` section above.
 
 ## Test plan (TDD — mirror `session-baseline.test.js`/`peer-baseline.test.js`'s own structure)
 

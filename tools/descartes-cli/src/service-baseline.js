@@ -9,10 +9,16 @@
 //   (1) Detection SHAPE = SET-DIFF (session.churn-shaped edge-triggered set-membership diff), NOT
 //       windowed Welford. welford-stats.js stays untouched except for reusing the generic
 //       DEFAULT_BASELINE_FACT_WINDOW_MS read-window bound.
-//   (2) Alert body/diagnostics = HASH-ONLY (entity_key_hash). Raw service name is NEVER delivered
-//       or placed in the notification body/diagnostics. Cleartext is explicitly DEFERRED pending a
-//       future, separately-approved operator decision (see the plan's "Operator decisions
-//       required" section).
+//   (2) Alert body/diagnostics = HASH-ONLY (entity_key_hash) as originally shipped. SUPERSEDED
+//       2026-07-24 by an explicit operator decision: for `service.disappeared` ONLY, the
+//       notification body/diagnostics now carry the SANITIZED (charset-bounded, NOT hashed)
+//       service name in cleartext -- this is a LOCAL notification to the machine's own operator,
+//       and which service vanished is the entire operational point (unlike session/peer identity,
+//       where the specific one is irrelevant and hashing loses nothing). `entity_key_hash` is
+//       retained alongside it for the `fingerprint`/`id` dedup/edge-trigger keys, which stay
+//       hashed. See "Cleartext service name (2026-07-24 operator decision)" below for the full
+//       rationale and scoping. session.churn/session.count_drop/peer.count_spike/peer.count_drop
+//       are UNCHANGED and remain hash-only -- this reversal is scoped to service.disappeared alone.
 //   (3) Severity = UNCONDITIONALLY "warning" (hard cap, peer.count_spike-style; no critical tier).
 //
 // Sibling to session-baseline.js/peer-baseline.js: this module performs NO host execFile/I/O of
@@ -30,7 +36,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
-import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
+import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
@@ -273,27 +279,38 @@ export function detectServiceDisappearances(groups = [], options = {}) {
 // buildCountSpikeCandidate's shape.
 // ---------------------------------------------------------------------------------------------
 
-// FAIL-CLOSED DEFAULT (orchestrator resolution 2, 2026-07-23 / plan Stage-1 review must-fix 1;
-// widened 2026-07-23 by adversarial-review finding to cover `fingerprint` too, not diagnostics
-// alone): entity_key is sanitized-but-NOT-hashed at source (fact-translators.js:sanitizeEntityKey).
-// Per the plan's "Operator decisions required before implementation" section, EVERY persisted
-// field derived from entity_key -- diagnostics AND the candidate's `fingerprint` -- carries a HASH
-// of entity_key, never the raw string, unless/until the operator explicitly approves a cleartext
-// exposure (which would additionally require updating the emitSessionAlertSignals /
-// buildSessionAlertNotificationDecision invariant doc-comments in alert-intelligence.js, plus any
-// pinning tests, in the SAME commit). No shared entity-key-hash helper exists yet
-// (fact-translators.js:hashSessionIdentity/constraint-store.js/alert-store.js each hash their own
-// domain-prefixed string with crypto.createHash("sha256")...slice(0, 16)), so this adds a small
-// local hash helper following the SAME convention: a domain-prefixed sha256, truncated to 16 hex
-// chars.
+// Dedup/edge-trigger keys (`fingerprint`/`id`) stay HASHED (orchestrator resolution 2, 2026-07-23 /
+// plan Stage-1 review must-fix 1; widened 2026-07-23 by adversarial-review finding to cover
+// `fingerprint` too, not diagnostics alone; UNCHANGED by the 2026-07-24 cleartext-name decision
+// below -- that decision is scoped to the DISPLAYED diagnostics/body only, not to dedup keys).
+// entity_key is sanitized-but-NOT-hashed at source (fact-translators.js:sanitizeEntityKey). No
+// shared entity-key-hash helper exists yet (fact-translators.js:hashSessionIdentity/
+// constraint-store.js/alert-store.js each hash their own domain-prefixed string with
+// crypto.createHash("sha256")...slice(0, 16)), so this adds a small local hash helper following the
+// SAME convention: a domain-prefixed sha256, truncated to 16 hex chars.
 function hashServiceEntityKey(entityKey) {
   return createHash("sha256").update(`service.disappeared:${entityKey}`).digest("hex").slice(0, 16);
 }
 
+// Cleartext service name (2026-07-24 operator decision, SUPERSEDES the plan's original fail-closed
+// hash-only default for THIS diagnostics field only): the displayed diagnostics now carry the
+// SANITIZED (charset-bounded via sanitizeIdentityString/sanitizeEntityKey's own
+// `[A-Za-z0-9._:-]`-only output) service name in cleartext, never a raw/unsanitized string --
+// re-sanitized here defensively even though entity_key already arrives sanitized from
+// fact-translators.js, so no newline/control-char/injection can ever reach the notification
+// banner. Rationale (operator, 2026-07-24): this is a LOCAL notification to the machine's own
+// operator, and knowing WHICH service vanished is the entire operational point of this alert --
+// unlike session/peer identity, where the specific session/peer is irrelevant and hashing loses no
+// signal. `entity_key_hash` is retained alongside `service_name` for parity with `fingerprint`/`id`
+// (which stay hashed, see above) and for any tooling that still keys off the hash. This scoping is
+// intentionally narrow: session.churn/session.count_drop/peer.count_spike/peer.count_drop are
+// UNCHANGED elsewhere and remain hash-only -- do not generalize this pattern to those rule_ids.
 export function buildDisappearedCandidates(entries = []) {
   return entries.map((entry) => {
     const entityKeyHash = hashServiceEntityKey(entry.entity_key);
+    const serviceName = sanitizeIdentityString(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
+      service_name: serviceName,
       entity_key_hash: entityKeyHash,
       last_seen_ts: entry.last_seen_ts,
       complete_census_seen_count: entry.complete_census_seen_count,
@@ -301,16 +318,14 @@ export function buildDisappearedCandidates(entries = []) {
     return {
       id: alertId(SERVICE_DISAPPEARED_RULE_ID, entityKeyHash),
       rule_id: SERVICE_DISAPPEARED_RULE_ID,
-      // `fingerprint` is HASHED, never the raw entity_key (adversarial-review finding, 2026-07-23):
-      // alert-store.js's normalizeAlertRecord copies `fingerprint` verbatim onto the persisted
-      // alert record, and the generic `descartes alerts list/watch/ack --json` CLI surfaces dump
-      // the full record with no compaction (unlike the LLM path, which uses compactAlert and
-      // already omits `fingerprint`). session.churn/session.count_drop/peer.count_spike are safe
-      // on that same generic CLI path only because their fingerprint is ALREADY a hash at the
-      // source (hashSessionIdentity/computePeerIdentitySignature) -- service.presence's entity_key
-      // is sanitized-but-NOT-hashed at source, so this module must hash it itself before it is
-      // placed in ANY persisted field, not just diagnostics, to uphold the same "raw service name
-      // is never delivered" invariant end-to-end.
+      // `fingerprint` stays HASHED, never the raw entity_key (adversarial-review finding,
+      // 2026-07-23; unaffected by the 2026-07-24 cleartext-diagnostics decision above): alert-
+      // store.js's normalizeAlertRecord copies `fingerprint` verbatim onto the persisted alert
+      // record, and the generic `descartes alerts list/watch/ack --json` CLI surfaces dump the full
+      // record with no compaction (unlike the LLM path, which uses compactAlert and already omits
+      // `fingerprint`). Keeping `fingerprint`/`id` hash-derived keeps dedup/edge-triggering stable
+      // and unchanged by this reversal -- only the DISPLAYED `service_name` diagnostics field is
+      // cleartext now.
       fingerprint: entityKeyHash,
       // Severity capped at "warning" UNCONDITIONALLY (orchestrator resolution 3, 2026-07-23) —
       // mirrors buildCountSpikeCandidate's hard cap (peer-baseline.js), NOT session.count_drop's
