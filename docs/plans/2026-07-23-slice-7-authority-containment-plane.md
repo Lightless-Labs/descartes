@@ -87,6 +87,17 @@ framing is tightened from "mutates nothing about the host's real state" / "zero 
 "adds only inert, additive bait — no destructive or self-lockout-capable mutation," with its own
 explicit doors-and-corners pass now required, mirroring what Slice 7.2 already mandates for itself.
 This document remains DESIGN-ONLY — no code changed as part of folding this review in.
+**`throttle` verb folded:** 2026-08-11 — reversible graduated "buy-time" containment
+(operator-suggested). A new fifth containment verb, `throttle` (covertly degrade a suspect
+process's or connection's CPU/disk/network resources without it noticing, to buy time for the
+§(b) Option 3 cooling-off window or a future federated response), is added throughout §(a)-(e)
+below. It is the most reversible verb in this document — auto-reverting on a short timer,
+non-destructive, and one-touch operator-revertible — but it is still a **mutating** verb and
+therefore remains fully under §(b)'s fail-closed capability-token floor, exactly like
+`kill`/`block`/`revoke`/`quarantine`; folding it in does **not** create any exception to that
+floor. See §(a)'s new `### throttle` subsection, §(b)'s fail-closed-matrix and
+fast-response-tension updates, §(c)'s policy-authorized-tier note, and §(e)'s slice breakdown for
+the full treatment. This document remains DESIGN-ONLY — no code changed as part of folding this in.
 **Supersedes:** nothing. This is the dedicated, separately-reviewed plan that
 `docs/plans/2026-07-13-observed-incident-collectors.md`'s Slice 7 section (lines 858–871)
 explicitly said would be required before any pickup — "a placeholder for a future,
@@ -313,6 +324,96 @@ communicate while its on-disk and in-memory state stay intact for later analysis
   reasoning and are retained for whichever future deployment genuinely has no container workload and
   wants to reconsider the fold — but the default going forward is **keep**. See §(d) items 2 and 8.
 
+### throttle (covertly slow a suspect process/connection)
+
+**Definition (operator-suggested addition, 2026-08-11):** `throttle` covertly degrades a
+suspicious or unusual process's or connection's resource consumption — CPU, disk/filesystem I/O,
+or network throughput/latency — **without the target noticing**, to buy time. Unlike every other
+verb in this document, `throttle` is not itself an end state: its purpose is to hold a suspect in
+a degraded-but-still-running state *while* the §(b) Option 3 cooling-off window plays out, or,
+later, while a federated corroboration/response decision resolves — see the fast-response-tension
+update in §(b) below. It is the **sibling of `block`**: where `block` DENIES a channel outright,
+`throttle` DEGRADES it, and it inherits `block`'s doors-and-corners obligations for the network
+mechanism specifically (below).
+
+- **Capabilities/privileges (mechanism per resource; covert vs. loud stated honestly):**
+  - **CPU:** Linux cgroup-v2 `cpu.max` (a hard CPU-time cap on the target's cgroup), or
+    reassignment to `SCHED_IDLE`; macOS `taskpolicy -b` to push the target into the
+    background/throttled QoS band. Both are **covert** — the target reads as a busy box getting
+    fewer cycles, not as an externally-frozen process.
+  - **Disk/filesystem:** Linux cgroup `io.max` or `ionice -c3` (idle I/O class); macOS
+    `taskpolicy -b` also throttles I/O as part of the same background QoS band; optionally, an
+    EndpointSecurity client adding bounded latency to `open`/`exec` authorization events for
+    finer-grained FS throttling on macOS — this needs the ES entitlement, itself a
+    **doors-and-corners item** (entitlement provisioning), and the added latency is hard-bounded by
+    the ES authorization deadline, so it cannot stall a target indefinitely. **Covert-ish** —
+    bounded added latency on file operations is a plausible symptom of a busy or slow disk, but a
+    sufficiently instrumented target could in principle notice a suspicious pattern in exactly
+    which operations are slowed.
+  - **Network (highest value, most covert, most reversible):** Linux `tc`/`netem` (added latency,
+    packet loss, and/or a bandwidth cap on a specific flow, classified via an `nft`/`iptables` mark
+    scoped to the target); macOS `dnctl` (dummynet) + `pf`. Reads as a flaky or slow network path —
+    directly slows exfiltration, C2 callbacks, and lateral movement, which is exactly the
+    highest-value use case for buying time. **This is the sibling of `block`** named above, and it
+    **inherits `block`'s existing-state-awareness rule** from that subsection and the Cross-verb
+    themes execution-architecture bullet below: Descartes must read the existing `pf`/`nft`/`tc`
+    state before adding a throttle rule, must never blind-append, and on auto-revert or
+    operator-revert must roll back **only the rules/qdiscs/marks it itself added** — never a
+    broader revert touching state it did not create.
+  - **LOUD — avoid for the covert use case, named for completeness:** `SIGSTOP` (a fully frozen
+    process is an obvious, discontinuous signal to any heartbeat/liveness check the target or its
+    controller runs — this is `quarantine`'s freeze primitive, not `throttle`'s); ptrace-based
+    syscall-delay (detectable via `TracerPid` in `/proc/<pid>/status` or timing-based anti-debug
+    checks). Both are excluded from `throttle`'s own mechanism set precisely because they are loud,
+    even though they are mechanically capable of slowing a target.
+- **What can go wrong:**
+  - **Imperfect covertness against an anti-analysis adversary.** The mechanisms above are covert
+    against a naive or non-adversarial target, but a sufficiently sophisticated one can still
+    notice — e.g. a mismatch between its own observed throughput and what the host's
+    `uptime`/load-average or `/proc/stat` reports, or network-timing characteristics of
+    `netem`/`dnctl` shaping rather than genuine congestion. **Full covertness is deception-grade**
+    (it would require actively forging what the target can observe about its own environment, not
+    merely degrading its resources) and is explicitly **not** what this verb provides — flagged
+    here so it is never oversold as undetectable.
+  - **False-positive collateral is now real, in a way most other verbs' failure modes are not.**
+    Killing or blocking the wrong target is binary (wrong target harmed, right target unaffected);
+    throttling a **legitimately busy, merely misclassified** process or connection degrades real
+    work — a false positive here doesn't fail loudly, it silently makes something slower, which can
+    go unnoticed and unremediated far longer than a failed kill/block would. This needs the same
+    tight, fresh, non-fuzzy target re-resolution every other verb requires (Cross-verb themes)
+    **and** the auto-revert net below as a structural backstop, not merely a monitoring/alerting
+    backstop.
+  - **Self-DoS (new guard, mirroring the existing self-lockout guard):** just as `kill`/`block`/
+    `revoke` must never act on the approving actor's own session/connection/parent-process chain,
+    `throttle` must never degrade the approval/critical path itself or any process/connection below
+    a configured host-safety floor — throttling the daemon's own consent-nonce delivery channel,
+    the approving device's notification transport, or a host-critical service (e.g. the SSH daemon
+    the operator needs to reach the host to review or revert the throttle) would be a
+    **self-inflicted denial of service** that defeats the entire point of buying time. This guard is
+    a hard precondition for `throttle`, structurally identical in spirit to `kill`'s self-lockout
+    guard, even though `throttle`'s irreversibility profile is the opposite of `kill`'s.
+- **Reversibility (the strongest property of this verb, stated plainly):** `throttle` is
+  **reversible, short-timer auto-reverting, and one-touch operator-revertible** — a throttle rule
+  ships with a mandatory bounded expiry (mirroring `block`'s mandatory auto-expiry precondition)
+  after which the cgroup/QoS/`tc`/`dnctl` state is automatically restored, **and** the operator can
+  revert it immediately and manually at any point before that expiry (e.g. on recognizing a false
+  positive). This makes `throttle` the **most reversible verb in this document** — see the
+  Cross-verb themes irreversibility update below.
+- **Preconditions before any implementation:** the same fresh, exact, non-fuzzy target
+  re-resolution at execution time required of every other verb (Cross-verb themes, TOCTOU); a
+  mandatory bounded auto-expiry/auto-revert, proven to actually restore prior state, not merely
+  believed to; an immediate, one-touch manual revert path, proven to work before the throttle path
+  ships; the self-DoS guard above, as a hard precondition, not optional hardening; for the network
+  mechanism specifically, a read-existing-state-first pass identical in spirit to `block`'s, so a
+  throttle rule never blind-appends onto unknown `pf`/`nft`/`tc` state. **Execution routing:** like
+  every other mutating verb, `throttle` must never be issued by the daemon/CLI process itself — it
+  executes only through the separate capability-holding helper described in the Cross-verb themes
+  subsection below, under the same single-use, time-limited execution-consent nonce model.
+  `throttle` introduces no exception to that routing, even though its reversibility profile is the
+  best of any verb here — see §(b)'s fail-closed matrix update below for why it remains under the
+  same authority floor as the other mutating verbs near-term, and §(c)'s policy-authorized tier
+  note for the one place its reversibility may eventually matter.
+
 ### Cross-verb themes
 
 - **Privilege escalation surface:** every verb needs a categorically new, write-capable privilege
@@ -409,6 +510,11 @@ communicate while its on-disk and in-memory state stay intact for later analysis
 - **Irreversibility** varies sharply by verb: kill has none; block/revoke are reversible if
   care is taken (reversal path proven up front); quarantine is reversible via
   pause/unpause **only** if the process's state survives the pause, which is not guaranteed.
+  **`throttle` (added 2026-08-11, operator-suggested) is fully reversible and auto-reverting** —
+  more reversible than block/revoke, which sever a channel outright and depend on a proven-up-front
+  reversal path being exercised; `throttle` degrades rather than severs, ships with a mandatory
+  bounded auto-expiry that restores prior state without any human action, and additionally supports
+  an immediate one-touch manual revert. It is the most reversible verb in this document.
 - **Race conditions (TOCTOU):** approval happens at one point in time; execution happens later.
   Every verb's execution primitive must re-verify target identity immediately before acting, never
   trust the identity captured at proposal/approval time alone.
@@ -645,7 +751,7 @@ host never silently falls back to a weaker mechanism than intended:
 | Unknown / unrecognized action | — | **Deny.** An action with no configured mechanism mapping is never permitted to fall through to a weaker default; it is refused outright. |
 | Mechanism unavailable (e.g. Option 2b not yet configured) | — | **Deny**, not silent downgrade to a weaker configured mechanism (e.g. never silently fall back from Option 2b to Option 3/2a without the operator explicitly configuring that fallback — and, per the row below, no such fallback exists for mutating verbs regardless of configuration). |
 | Recommend-only / deception (mutates nothing) | Local notification (Option 3), or the Option 2a relay once built | Lowest bar is acceptable — no mutation is possible regardless of who reads the notification, so no capability token is required. |
-| **Mutating verb — `kill`, `block`, `revoke`, `quarantine` (network-isolation half)** (**corrected 2026-08-11 sign-off safety review, must-fix**) | **Option 2b only — an off-monitored-machine-minted capability token (§(b) "Capability-token model") is the authority floor for every mutating verb. No weaker fallback exists.** | **No token, no execution.** If no Option 2b-class, token-bearing channel is configured, the action is **DENIED outright** — it is never authorized via Option 3 (local notification) or Option 2a (SSH relay), because neither carries a cryptographic capability token: per "Transport vs. authority" above, Option 3's "transport and authority are effectively the same act" and Option 2a "does not raise the authority bar... no cryptographic proof" mean authority under either is on-machine and forgeable by a compromised daemon. This is deliberately **not** "the strongest available channel" — the previous "Option 2b if configured, else Option 2a, else Option 3" floor is retracted as unsafe. Option 3 and Option 2a may authorize **recommend-only/deception surfaces only**, never a mutating call, regardless of the verb's irreversibility or self-lockout risk. |
+| **Mutating verb — `kill`, `block`, `revoke`, `quarantine` (network-isolation half), `throttle`** (**corrected 2026-08-11 sign-off safety review, must-fix; `throttle` added 2026-08-11, operator-suggested**) | **Option 2b only — an off-monitored-machine-minted capability token (§(b) "Capability-token model") is the authority floor for every mutating verb. No weaker fallback exists.** | **No token, no execution.** If no Option 2b-class, token-bearing channel is configured, the action is **DENIED outright** — it is never authorized via Option 3 (local notification) or Option 2a (SSH relay), because neither carries a cryptographic capability token: per "Transport vs. authority" above, Option 3's "transport and authority are effectively the same act" and Option 2a "does not raise the authority bar... no cryptographic proof" mean authority under either is on-machine and forgeable by a compromised daemon. This is deliberately **not** "the strongest available channel" — the previous "Option 2b if configured, else Option 2a, else Option 3" floor is retracted as unsafe. Option 3 and Option 2a may authorize **recommend-only/deception surfaces only**, never a mutating call, regardless of the verb's irreversibility or self-lockout risk. **`throttle` is included here because it mutates live cgroup/`pf`/`nft`/`tc`/`taskpolicy` state exactly as the other verbs mutate process/session/firewall/container state — its markedly better reversibility profile does NOT carve it an exception now.** Because `throttle` is reversible, non-destructive, and auto-reverting, a **future, separately-designed-and-reviewed** path may eventually grant it a lower authority tier (see §(c)'s policy-authorized tier note) — but until that future path exists and has cleared its own review, `throttle` remains fully under this same Option-2b-only floor, denied outright like every other mutating verb when no token-bearing channel is configured. |
 
 This table is the **default** for non-mutating surfaces, and the operator may add stricter
 requirements on top of it — but any override must be an explicit, auditable configuration act,
@@ -666,6 +772,22 @@ changing what "confirmation" means for pre-corroborated behaviors rather than sh
 delay. See "Fast-response tension → federated immune system" in the Operator direction section
 below. That direction is itself design-only, heavily governance-gated, and does not change the
 Option 3 mechanism described above — it is a distinct future addition, not a replacement.
+
+**`throttle` as the reversible holding action (added 2026-08-11, operator-suggested):** the
+federated-immune-system direction above is a future, heavily governance-gated resolution to this
+tension. `throttle` (§(a)'s new subsection) is a **nearer-term, partial** resolution available
+today, and materially changes the shape of the tension rather than resolving it outright: instead
+of choosing only between "wait out the full cooling-off window" and "bypass the window entirely,"
+Descartes can **covertly throttle the suspect process/connection immediately** — buying time —
+**while** the §(b) Option 3 approval-and-cooling-off decision plays out (or, later, while a
+federated corroboration/response decision resolves), and **silently revert** if the pending
+decision turns out to be a false alarm. This does not eliminate the tension — `throttle` only
+degrades, it does not contain the way kill/block/revoke/quarantine do, so a sufficiently fast or
+already-in-progress attack can still outrun a throttled response — but it makes the single-party,
+time-delay authority model **materially safer** than it would be without it: the operator is not
+helpless for the duration of the cooling-off window, they have a reversible, low-collateral action
+available immediately, while the destructive/higher-certainty verbs remain gated behind the full
+Option 3 delay (or an Option 2b token, per the fail-closed matrix below) exactly as before.
 
 ---
 
@@ -703,7 +825,7 @@ deterministic gate checking one is, by this same principle, not yet a legitimate
 | read-only | Already shipped: session-census, VPN/peer, provenance collectors (Slices 1/3/S3-S5). No change proposed here. |
 | recommend-only | The **only** execution-adjacent tier this document considers safe to build in the near term: surface a proposed verb + target + rationale for a human to read and, if they choose, act on **manually and entirely outside Descartes**. Zero new `execFile`, zero new privilege. |
 | approval-required | Where any real containment *execution*, if ever built, **must** live — the human-gated nonce/expiry/audit pattern from §(b) Option 3 (or 1/2 per the tiering above), with the approved decision then handed to the separate capability-holding helper (§(a) Cross-verb themes, operator-directed 2026-07-24) under its own single-use, time-limited consent nonce for the actual mutating call. No containment verb should skip this tier near-term. |
-| policy-authorized | **Not recommended for any containment verb** in the foreseeable future. `AGENTS.md` scopes this tier to "narrowly scoped, tested, reversible cases" — kill fails "reversible" outright; block/revoke fail "narrowly scoped" given self-lockout blast radius; quarantine's blast radius depends on a credential (`docker.sock`-class) that is itself not narrowly scoped. |
+| policy-authorized | **Not recommended for any containment verb** in the foreseeable future, **with one named exception below.** `AGENTS.md` scopes this tier to "narrowly scoped, tested, reversible cases" — kill fails "reversible" outright; block/revoke fail "narrowly scoped" given self-lockout blast radius; quarantine's blast radius depends on a credential (`docker.sock`-class) that is itself not narrowly scoped. **`throttle` (added 2026-08-11, operator-suggested) is the one containment verb that could eventually qualify** for this tier — and, further out, conceivably the autonomous tier — because it is reversible, non-destructive, auto-reverting, and bounded (a fixed resource-degradation ceiling, a fixed expiry), a materially better fit for "narrowly scoped, tested, reversible" than any other verb here. This is named, not designed: `throttle` remains fully under §(b)'s Option-2b-only fail-closed floor near-term (see §(b)'s fail-closed matrix), and any move to policy-authorized requires its own, **separately-designed-and-reviewed** future path, not something assumed by naming it here. That future path — auto-throttle-on-suspicion, with the human-held capability token reserved for escalation to the destructive verbs (kill/block/revoke/quarantine) rather than for throttling itself — is what would actually resolve the §(b) fast-response tension structurally, rather than merely mitigating it the way the near-term "throttle as a reversible holding action" treatment does. It requires its own doors-and-corners pass, an S3-priv-or-stricter review (§(e)'s review bar), and all of the guardrails named in §(a)'s `throttle` subsection (the self-DoS guard, existing-state-awareness for the network mechanism, false-positive-collateral tightness) before it is anything more than a named future possibility. |
 | autonomous | **Explicitly out of scope for the mechanisms in §(a)-(e) of this document.** Same reasoning as policy-authorized, stronger. **Exception, named not designed:** the federated immune system direction in the Operator direction section below proposes a distinct, heavily governance-gated future path to pre-consented reflex action on ratified/corroborated signatures with human notification rather than confirmation — that is a genuinely new tier-adjacent concept this table's five stock tiers don't cleanly capture, not a quiet reclassification of containment verbs into "autonomous" as `AGENTS.md` defines it today. It remains out of scope for any near-term build. |
 
 **Write-ahead / crash-consistent audit ordering (reviewed 2026-07-23, folded from Stage 1 gate
@@ -969,27 +1091,40 @@ host before it has been exercised against a Vault first.
   matrix, only an Option 2b-class capability-token channel authorizes a mutating call; a host with
   Option 2a (or Option 3) configured but not Option 2b remains **execution-DENIED** — Slice 7.4 is a
   notification-transport improvement, not an authority-tier upgrade.
-- **Slice 7.5 — first real execution primitive, single most-reversible verb first** (likely
-  `revoke` of a single VPN peer, or `block` via an isolated firewall anchor — whichever the
-  operator's real environment supports per §(d) item 2): a scoped, allowlisted, single-purpose
+- **Slice 7.5 — first real execution primitive, single most-reversible verb first** (**strongest
+  candidate, added 2026-08-11, operator-suggested: `throttle`** — of a single suspect process's or
+  connection's CPU/disk/network resources, per §(a)'s new `throttle` subsection — with `revoke` of
+  a single VPN peer or `block` via an isolated firewall anchor as the prior candidates, whichever
+  the operator's real environment supports per §(d) item 2): `throttle` is a **safer** first
+  execution primitive than block/revoke precisely because it is non-destructive and auto-reverting
+  rather than merely "reversible if care is taken" — a misfire degrades rather than severs, and
+  self-corrects on its own bounded expiry even if the manual revert path is never exercised. This
+  slice is otherwise unchanged by that choice: a scoped, allowlisted, single-purpose
   execution primitive, wired **only** behind Slice 7.3's authority gate, and, per the
   operator-directed execution architecture in §(a)'s Cross-verb themes, wired through the separate
   capability-holding helper (never invoked directly by the daemon/CLI) under a single-use,
   time-limited consent nonce that is itself derived from a verified §(b) capability token — leaning
   on `sudo`/`polkit` (Linux) or a privileged `launchd` helper + XPC + code-requirement checks (macOS)
   rather than a bespoke privilege mechanism — with a self-lockout guard (honoring the per-host
-  opt-out from §(a)/§(d) item 4), a dry-run mode, an auto-revert/expiry, and full pre/post-state
-  capture per §(c)'s audit shape. **Hard precondition: exercised in the Vault-Tec sandbox (above)
-  before ever pointed at a real host.** **Hard precondition (corrected 2026-08-11 sign-off safety
+  opt-out from §(a)/§(d) item 4) — **or, if `throttle` is the verb chosen, the self-DoS guard from
+  §(a)'s `throttle` subsection in its place** — a dry-run mode, an auto-revert/expiry, and full
+  pre/post-state capture per §(c)'s audit shape. **Hard precondition: exercised in the Vault-Tec
+  sandbox (above) before ever pointed at a real host** — no exception for `throttle` despite its
+  reversibility. **Hard precondition (corrected 2026-08-11 sign-off safety
   review, must-fix): this primitive must refuse to execute — the deterministic gate (§(c)) denies by
   construction — on any host where only Option 3 and/or Option 2a are configured.** An Option
   2b-class, off-machine-minted capability token (§(b)) is the non-negotiable authority floor per the
   fail-closed matrix; Slice 7.4's Option 2a relay, even once built, does not by itself supply one.
-  This is the first slice that introduces new
+  **This floor applies to `throttle` exactly as to every other mutating verb** (§(b)'s fail-closed
+  matrix) — its superior reversibility does not exempt it from Slice 7.5's authority gate, even
+  though that same reversibility is precisely why it is recommended as the first candidate: it
+  bounds the consequences of a rare authority-gate or targeting failure far more tightly than
+  `revoke`/`block` would. This is the first slice that introduces new
   `execFile`/privilege surface and is therefore the first slice that needs the full
   S3-priv-or-stricter review bar: trust-boundary analysis, minimal privilege grant (empirically
   validated, not just reasoned about, inside the Vault), fail-closed verification, TOCTOU/race
-  analysis, a dedicated self-lockout test, and a proven rollback test — now additionally including a
+  analysis, a dedicated self-lockout test (or self-DoS test, if `throttle`), and a proven rollback
+  test — now additionally including a
   dedicated review of the helper boundary itself (does the daemon/CLI genuinely hold zero capability,
   is the consent nonce genuinely single-use and unforgeable, is the capability token's signing key
   genuinely absent from the monitored machine per §(b)'s key-custody model).
