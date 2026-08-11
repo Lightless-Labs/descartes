@@ -2,9 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyCommandFailure,
+  correlateAppleContainerProcessHints,
+  correlateContainerHostResources,
   correlateContainerHostProcessHints,
   normalizeContainerRequest,
   parseByteQuantity,
+  parseAppleContainerImageListJson,
+  parseAppleContainerListJson,
+  parseAppleContainerStatsJson,
+  parseAppleContainerSystemStatusJson,
+  parseAppleContainerVersionJson,
   parseColimaListJson,
   parseColimaStatusJson,
   parseDockerPsJsonLines,
@@ -21,9 +28,12 @@ test("normalizeContainerRequest clamps limits and preserves booleans", () => {
   assert.deepEqual(normalizeContainerRequest({ containerLimit: 999, hostLimit: 0, includeStopped: false, collectStats: false }), {
     container_limit: 200,
     host_limit: 1,
+    image_limit: 60,
     include_stopped: false,
     collect_stats: false,
   });
+  assert.equal(normalizeContainerRequest({ imageLimit: 999 }).image_limit, 200);
+  assert.equal(normalizeContainerRequest({ image_limit: 0 }).image_limit, 1);
 });
 
 test("parsePercent and parseByteQuantity handle runtime units", () => {
@@ -120,6 +130,130 @@ test("parsePodmanStatsJson parses flexible stats field names", () => {
     block_io: undefined,
     pids: 5,
   });
+});
+
+test("parseAppleContainerListJson normalizes containers and correlates their VM identity", () => {
+  const stdout = JSON.stringify([
+    { id: "ac123", name: "web", image: "nginx:latest", command: "serve --token secret", state: "running", status: "Running", ports: ["8080:80"] },
+    { ID: "ac456", Name: "job", Image: "busybox", Command: ["sleep", "1"], State: "stopped", Status: "Stopped" },
+  ]);
+
+  assert.deepEqual(parseAppleContainerListJson(stdout), [
+    {
+      runtime: "apple_container",
+      id: "ac123",
+      name: "web",
+      image: "nginx:latest",
+      command: "serve --token [REDACTED]",
+      command_redaction: { redacted: true, truncated: false, original_length: 20, max_length: 240 },
+      state: "running",
+      status: "Running",
+      ports: ["8080:80"],
+      source_runtime: "apple_container",
+      confidence: 1,
+      vm_correlation: { runtime: "apple_container", name: "ac123", confidence: 1 },
+    },
+    {
+      runtime: "apple_container",
+      id: "ac456",
+      name: "job",
+      image: "busybox",
+      command: "sleep 1",
+      command_redaction: { redacted: false, truncated: false, original_length: 7, max_length: 240 },
+      state: "stopped",
+      status: "Stopped",
+      ports: undefined,
+      source_runtime: "apple_container",
+      confidence: 1,
+      vm_correlation: { runtime: "apple_container", name: "ac456", confidence: 1 },
+    },
+  ]);
+  assert.equal(parseAppleContainerListJson(stdout, { includeStopped: false }).length, 1);
+});
+
+test("parseAppleContainerImageListJson parses references and bounds image inventory", () => {
+  const stdout = JSON.stringify([
+    { reference: "ghcr.io/example/web:latest", digest: "sha256:abc", size: "12MiB" },
+    { repository: "busybox", tag: "1.36", size_bytes: 2048 },
+  ]);
+
+  assert.deepEqual(parseAppleContainerImageListJson(stdout, { limit: 1 }), [{
+    runtime: "apple_container",
+    repository: "ghcr.io/example/web",
+    tag: "latest",
+    digest: "sha256:abc",
+    size_bytes: 12582912,
+    source_runtime: "apple_container",
+    confidence: 1,
+  }]);
+});
+
+test("parseAppleContainerStatsJson indexes snapshots by id and name", () => {
+  const stats = parseAppleContainerStatsJson(JSON.stringify([
+    { id: "ac123", name: "web", cpuPercent: "3.1%", memoryUsage: "12MiB / 1GiB", networkIO: "3kB / 4kB", pids: 5 },
+  ]));
+
+  assert.deepEqual(stats.get("ac123"), {
+    cpu_percent: 3.1,
+    memory_percent: undefined,
+    memory_usage_bytes: 12582912,
+    memory_limit_bytes: 1073741824,
+    net_io: "3kB / 4kB",
+    block_io: undefined,
+    pids: 5,
+  });
+  assert.deepEqual(stats.get("web"), stats.get("ac123"));
+});
+
+test("parseAppleContainerSystemStatusJson and version parser normalize health probes", () => {
+  assert.deepEqual(parseAppleContainerSystemStatusJson(JSON.stringify({ status: "running", arch: "arm64", cpus: 4 })), {
+    runtime: "apple_container",
+    name: undefined,
+    state: "running",
+    container_runtime: "apple_container",
+    arch: "arm64",
+    cpus: 4,
+    memory_bytes: undefined,
+    disk_bytes: undefined,
+    address: undefined,
+    source_runtime: "apple_container",
+    confidence: 1,
+  });
+  assert.equal(parseAppleContainerSystemStatusJson(""), undefined);
+  assert.equal(parseAppleContainerVersionJson(JSON.stringify({ client: { version: "1.0.0" } })), "1.0.0");
+});
+
+test("correlateAppleContainerProcessHints attaches matched process resources without fabricating unmatched facts", () => {
+  const correlation = correlateAppleContainerProcessHints([
+    { runtime: "apple_container", id: "ac123", name: "web", state: "running", vm_correlation: { runtime: "apple_container", name: "ac123", confidence: 1 } },
+    { runtime: "apple_container", id: "ac456", name: "job", state: "stopped", vm_correlation: { runtime: "apple_container", name: "ac456", confidence: 1 } },
+  ], [
+    { runtime: "apple_container", name: "web", state: "running", owner_hint: "container-runtime-linux ac123", resource_snapshot: { pid: 301, cpu_percent: 4, memory_percent: 2, rss_bytes: 500 } },
+    { runtime: "apple_container", name: "unmatched", state: "running", resource_snapshot: { pid: 302, cpu_percent: 1, memory_percent: 1, rss_bytes: 100 } },
+  ]);
+
+  assert.equal(correlation.correlated_container_process_count, 1);
+  assert.equal(correlation.uncorrelated_container_process_hint_count, 1);
+  assert.deepEqual(correlation.containers[0].resource_snapshot, { pid: 301, cpu_percent: 4, memory_percent: 2, rss_bytes: 500 });
+  assert.equal(correlation.containers[0].process_correlation.source, "apple_container_process_scan");
+  assert.deepEqual(correlation.containers[1].vm_correlation, { runtime: "apple_container", name: "ac456", confidence: 1 });
+});
+
+test("correlateContainerHostResources keeps the empty-host short circuit", async () => {
+  const result = await correlateContainerHostResources([], { collect_stats: true }, { hasAppleContainerCandidates: false });
+
+  assert.deepEqual(result.probes, []);
+  assert.deepEqual(result.processHints, []);
+  assert.deepEqual(result.correlation, { correlated_host_process_count: 0, uncorrelated_host_process_hint_count: 0 });
+});
+
+test("correlateContainerHostResources scans once for Apple Container candidates without hosts", async () => {
+  const result = await correlateContainerHostResources([], { collect_stats: true, host_limit: 1 }, { hasAppleContainerCandidates: true });
+
+  assert.deepEqual(result.hosts, []);
+  assert.equal(result.probes.length, 1);
+  assert.equal(result.probes[0].name, "container_host_process_scan");
+  assert.equal(Array.isArray(result.processHints), true);
 });
 
 test("parseColimaStatusJson and parseColimaListJson normalize container host context", () => {

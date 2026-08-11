@@ -407,6 +407,7 @@ function vmNameFromArgs(args) {
     ?? argValue(args, "--name")
     ?? argValue(args, "--vm-name")
     ?? argValue(args, "--machine")
+    ?? argValue(args, "--container-id")
     ?? vmNameFromPathArg(args);
 }
 
@@ -427,6 +428,7 @@ function processRuntime(command, args) {
   if (haystack.includes("qemu-system")) return "qemu";
   if (haystack.includes("vmware-vmx")) return "vmware";
   if (haystack.includes("utm")) return "utm";
+  if (haystack.includes("container-runtime-linux")) return "apple_container";
   if (haystack.includes("virtualizationservice") || haystack.includes("com.apple.virtualization.virtualmachine") || haystack.includes("/virtualization.framework/")) return "apple_virtualization";
   return undefined;
 }

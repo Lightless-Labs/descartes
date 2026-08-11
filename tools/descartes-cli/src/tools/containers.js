@@ -7,6 +7,7 @@ import { parseVmProcesses } from "./vms.js";
 const execFileAsync = promisify(execFile);
 const DEFAULT_CONTAINER_LIMIT = 80;
 const DEFAULT_HOST_LIMIT = 40;
+const DEFAULT_IMAGE_LIMIT = 60;
 
 function clampNumber(value, fallback, min, max) {
   const number = Number(value);
@@ -18,6 +19,7 @@ export function normalizeContainerRequest(options = {}) {
   return {
     container_limit: clampNumber(options.containerLimit ?? options.container_limit, DEFAULT_CONTAINER_LIMIT, 1, 200),
     host_limit: clampNumber(options.hostLimit ?? options.host_limit, DEFAULT_HOST_LIMIT, 1, 100),
+    image_limit: clampNumber(options.imageLimit ?? options.image_limit, DEFAULT_IMAGE_LIMIT, 1, 200),
     include_stopped: options.includeStopped ?? options.include_stopped ?? true,
     collect_stats: options.collectStats ?? options.collect_stats ?? true,
   };
@@ -78,6 +80,36 @@ function parseJsonMaybeArray(stdout) {
     return parseJsonLines(trimmed);
   }
   return [];
+}
+
+function isObjectRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasAnyField(item, fields) {
+  return fields.some((field) => item[field] !== undefined && item[field] !== null && item[field] !== "");
+}
+
+function parseJsonCollection(stdout, collectionKeys = [], { recordPredicate = isObjectRecord } = {}) {
+  const trimmed = String(stdout ?? "").trim();
+  if (!trimmed) return [];
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) return parsed.filter(recordPredicate);
+    if (parsed && typeof parsed === "object") {
+      for (const key of collectionKeys) {
+        if (Array.isArray(parsed[key])) return parsed[key].filter(recordPredicate);
+      }
+      return recordPredicate(parsed) ? [parsed] : [];
+    }
+  } catch {
+    return parseJsonLines(trimmed).filter(recordPredicate);
+  }
+  return [];
+}
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null);
 }
 
 export function parsePercent(value) {
@@ -234,6 +266,111 @@ export function parsePodmanStatsJson(stdout) {
   return stats;
 }
 
+function parseContainerPorts(value) {
+  if (Array.isArray(value)) return value.slice(0, 12);
+  return boundedString(value, 400);
+}
+
+export function parseAppleContainerListJson(stdout, { limit = DEFAULT_CONTAINER_LIMIT, includeStopped = true } = {}) {
+  return parseJsonCollection(stdout, ["containers", "items", "results", "data"], {
+    recordPredicate: (item) => hasAnyField(item, [
+      "id", "ID", "container_id", "containerId", "ContainerID", "identifier", "Identifier",
+      "name", "Name", "names", "Names", "container_name", "containerName",
+    ]),
+  }).map((item) => {
+    const id = firstDefined(item.id, item.ID, item.container_id, item.containerId, item.ContainerID, item.identifier, item.Identifier);
+    const state = normalizeContainerState(firstDefined(item.state, item.State, item.status, item.Status));
+    if (!includeStopped && state !== "running") return undefined;
+    const command = redactContainerCommand(firstDefined(item.command, item.Command, item.args, item.Args, item.command_line, item.commandLine));
+    const name = firstName(firstDefined(item.name, item.Name, item.names, item.Names, item.container_name, item.containerName));
+    return {
+      runtime: "apple_container",
+      id,
+      name,
+      image: firstDefined(item.image, item.Image, item.image_name, item.imageName, item.reference, item.Reference),
+      ...command,
+      state,
+      status: firstDefined(item.status, item.Status, item.state_description, item.stateDescription),
+      ports: parseContainerPorts(firstDefined(item.ports, item.Ports)),
+      source_runtime: "apple_container",
+      confidence: 1,
+      vm_correlation: vmCorrelation("apple_container", id),
+    };
+  }).filter(Boolean).slice(0, limit);
+}
+
+function splitImageReference(value) {
+  const reference = String(value ?? "");
+  if (!reference) return { repository: undefined, tag: undefined, digest: undefined };
+  const [withoutDigest, referenceDigest] = reference.split("@", 2);
+  const lastSlash = withoutDigest.lastIndexOf("/");
+  const lastColon = withoutDigest.lastIndexOf(":");
+  const hasTag = lastColon > lastSlash;
+  return {
+    repository: hasTag ? withoutDigest.slice(0, lastColon) : withoutDigest,
+    tag: hasTag ? withoutDigest.slice(lastColon + 1) : undefined,
+    digest: referenceDigest,
+  };
+}
+
+export function parseAppleContainerImageListJson(stdout, { limit = DEFAULT_IMAGE_LIMIT } = {}) {
+  return parseJsonCollection(stdout, ["images", "items", "results", "data"], {
+    recordPredicate: (item) => hasAnyField(item, [
+      "repository", "Repository", "repo", "Repo", "reference", "Reference", "image", "Image", "name", "Name",
+      "digest", "Digest", "image_digest", "imageDigest",
+    ]),
+  }).map((item) => {
+    const explicitRepository = firstDefined(item.repository, item.Repository, item.repo, item.Repo);
+    const explicitTag = firstDefined(item.tag, item.Tag);
+    const explicitDigest = firstDefined(item.digest, item.Digest, item.image_digest, item.imageDigest);
+    const reference = firstDefined(item.reference, item.Reference, item.image, item.Image, item.name, item.Name);
+    const parsedReference = splitImageReference(reference);
+    return {
+      runtime: "apple_container",
+      repository: explicitRepository ?? parsedReference.repository,
+      tag: explicitTag ?? parsedReference.tag,
+      digest: explicitDigest ?? parsedReference.digest,
+      size_bytes: parseByteQuantity(firstDefined(item.size_bytes, item.sizeBytes, item.size, item.Size)),
+      source_runtime: "apple_container",
+      confidence: 1,
+    };
+  }).slice(0, limit);
+}
+
+export function parseAppleContainerStatsJson(stdout) {
+  const stats = new Map();
+  for (const item of parseJsonCollection(stdout, ["stats", "containers", "items", "results", "data"], {
+    recordPredicate: (record) => hasAnyField(record, [
+      "id", "ID", "container_id", "containerId", "ContainerID",
+      "name", "Name", "container_name", "containerName",
+    ]),
+  })) {
+    const memoryObject = item.memory && typeof item.memory === "object" ? item.memory : {};
+    const memoryValue = firstDefined(item.memory_usage, item.memoryUsage, item.memory_usage_bytes, item.memoryUsageBytes, memoryObject.usage, memoryObject.usage_bytes, item.MemUsage);
+    const memoryLimitValue = firstDefined(item.memory_limit, item.memoryLimit, item.memory_limit_bytes, item.memoryLimitBytes, memoryObject.limit, memoryObject.limit_bytes);
+    const memory = String(memoryValue ?? "").includes("/")
+      ? parseMemoryUsagePair(memoryValue)
+      : {
+        memory_usage_bytes: parseByteQuantity(memoryValue),
+        memory_limit_bytes: parseByteQuantity(memoryLimitValue),
+      };
+    const snapshot = {
+      cpu_percent: parsePercent(firstDefined(item.cpu_percent, item.cpuPercent, item.cpuPercentage, item.cpu, item.CPU, item.CPUPerc)),
+      memory_percent: parsePercent(firstDefined(item.memory_percent, item.memoryPercent, item.memoryPercentage, item.mem_percent, item.memPercent, item.MemPerc)),
+      ...memory,
+      net_io: firstDefined(item.net_io, item.netIO, item.network_io, item.networkIO, item.NetworkIO, item.NetIO),
+      block_io: firstDefined(item.block_io, item.blockIO, item.BlockIO),
+      pids: firstDefined(item.pids, item.processes, item.processCount, item.PIDs) === undefined ? undefined : Number(firstDefined(item.pids, item.processes, item.processCount, item.PIDs)),
+    };
+    const keys = [
+      item.id, item.ID, item.container_id, item.containerId, item.ContainerID,
+      item.name, item.Name, item.container_name, item.containerName,
+    ].filter(Boolean);
+    for (const key of keys) stats.set(String(key), snapshot);
+  }
+  return stats;
+}
+
 function attachStats(containers, stats) {
   return containers.map((container) => {
     const shortId = container.id ? String(container.id).slice(0, 12) : undefined;
@@ -275,6 +412,21 @@ function parsePodmanVersion(stdout) {
   const objects = parseJsonMaybeArray(stdout);
   const item = objects[0] ?? {};
   return item.Server?.Version ?? item.Client?.Version ?? item.Version ?? item.version;
+}
+
+export function parseAppleContainerVersionJson(stdout) {
+  const objects = parseJsonCollection(stdout, ["versions", "items", "results", "data"]);
+  const item = objects[0] ?? {};
+  return firstDefined(
+    item.server?.version,
+    item.Server?.Version,
+    item.client?.version,
+    item.Client?.Version,
+    item.version,
+    item.Version,
+    item.cli_version,
+    item.cliVersion,
+  );
 }
 
 function parseColimaBytes(value) {
@@ -366,6 +518,32 @@ export function parsePodmanMachineListJson(stdout, { limit = DEFAULT_HOST_LIMIT 
   }).filter((host) => host.name).slice(0, limit);
 }
 
+export function parseAppleContainerSystemStatusJson(stdout) {
+  const item = parseJsonCollection(stdout, ["status", "items", "results", "data"], {
+    recordPredicate: (record) => hasAnyField(record, [
+      "name", "Name", "state", "State", "status", "Status", "health", "Health",
+      "arch", "Arch", "architecture", "Architecture", "cpus", "CPUs", "cpu", "CPU",
+      "memory_bytes", "memoryBytes", "memory", "Memory", "disk_bytes", "diskBytes", "disk", "Disk",
+      "address", "Address", "ip", "IP",
+    ]),
+  })[0];
+  if (!item) return undefined;
+  const name = firstDefined(item.name, item.Name);
+  return {
+    runtime: "apple_container",
+    name,
+    state: normalizeContainerState(firstDefined(item.state, item.State, item.status, item.Status, item.health, item.Health)),
+    container_runtime: "apple_container",
+    arch: firstDefined(item.arch, item.Arch, item.architecture, item.Architecture),
+    cpus: firstDefined(item.cpus, item.CPUs, item.cpu, item.CPU),
+    memory_bytes: parseByteQuantity(firstDefined(item.memory_bytes, item.memoryBytes, item.memory, item.Memory)),
+    disk_bytes: parseByteQuantity(firstDefined(item.disk_bytes, item.diskBytes, item.disk, item.Disk)),
+    address: firstDefined(item.address, item.Address, item.ip, item.IP),
+    source_runtime: "apple_container",
+    confidence: 1,
+  };
+}
+
 function probeMetadata(name, result, parser, count = 0) {
   return {
     name,
@@ -447,8 +625,81 @@ export function correlateContainerHostProcessHints(hosts, processHints) {
   };
 }
 
-async function correlateContainerHostResources(hosts, request) {
-  if (hosts.length === 0) return { hosts, probes: [], correlation: { correlated_host_process_count: 0, uncorrelated_host_process_hint_count: 0 } };
+function appleContainerProcessMatchScore(container, processHint) {
+  if (processHint.runtime !== "apple_container") return 0;
+  if (container.state && processHint.state && container.state !== processHint.state) return 0;
+
+  const identities = [container.id, container.name].map(normalizedIdentity).filter(Boolean);
+  const hintIdentities = [processHint.name, processHint.id].map(normalizedIdentity).filter(Boolean);
+  if (identities.some((identity) => hintIdentities.includes(identity))) return 4;
+
+  const ownerHint = normalizedIdentity(processHint.owner_hint);
+  if (identities.some((identity) => {
+    const escaped = identity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[^a-z0-9_.-])${escaped}($|[^a-z0-9_.-])`, "i").test(ownerHint);
+  })) return 3;
+  return 0;
+}
+
+export function correlateAppleContainerProcessHints(containers, processHints) {
+  const correlatedContainers = containers.map((container) => ({ ...container }));
+  const appleHints = processHints.filter((processHint) => processHint.runtime === "apple_container");
+  const correlatedHintIndexes = new Set();
+  const correlatedContainerIndexes = new Set();
+
+  for (const [hintIndex, processHint] of appleHints.entries()) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    let bestMatchCount = 0;
+    for (const [containerIndex, container] of correlatedContainers.entries()) {
+      if (correlatedContainerIndexes.has(containerIndex)) continue;
+      const score = appleContainerProcessMatchScore(container, processHint);
+      if (score > bestScore) {
+        bestIndex = containerIndex;
+        bestScore = score;
+        bestMatchCount = 1;
+      } else if (score > 0 && score === bestScore) {
+        bestMatchCount += 1;
+      }
+    }
+    if (bestIndex === -1 || bestMatchCount !== 1 || !processHint.resource_snapshot) continue;
+    const target = correlatedContainers[bestIndex];
+    correlatedContainers[bestIndex] = {
+      ...target,
+      resource_snapshot: {
+        ...target.resource_snapshot,
+        ...processHint.resource_snapshot,
+        pid: processHint.resource_snapshot.pid,
+      },
+      process_correlation: {
+        source: "apple_container_process_scan",
+        pid: processHint.resource_snapshot.pid,
+        runtime: processHint.runtime,
+        confidence: Math.min(0.95, 0.5 + bestScore / 10),
+        owner_hint: processHint.owner_hint,
+        owner_hint_redaction: processHint.owner_hint_redaction,
+      },
+    };
+    correlatedHintIndexes.add(hintIndex);
+    correlatedContainerIndexes.add(bestIndex);
+  }
+
+  return {
+    containers: correlatedContainers,
+    correlated_container_process_count: correlatedHintIndexes.size,
+    uncorrelated_container_process_hint_count: appleHints.length - correlatedHintIndexes.size,
+  };
+}
+
+export async function correlateContainerHostResources(hosts, request, { hasAppleContainerCandidates = false } = {}) {
+  if (hosts.length === 0 && !(request.collect_stats && hasAppleContainerCandidates)) {
+    return {
+      hosts,
+      probes: [],
+      correlation: { correlated_host_process_count: 0, uncorrelated_host_process_hint_count: 0 },
+      processHints: [],
+    };
+  }
   const args = psArgsForPlatform();
   const probe = await runFixedCommand("ps", args, { timeout: 3000, maxBuffer: 1024 * 1024 });
   const processHints = probe.status === "ok" ? parseVmProcesses(probe.stdout, { limit: request.host_limit * 4 }) : [];
@@ -457,6 +708,55 @@ async function correlateContainerHostResources(hosts, request) {
     hosts: correlation.hosts,
     probes: [probeMetadata("container_host_process_scan", probe, "ps_vm_processes", processHints.length)],
     correlation,
+    processHints,
+  };
+}
+
+function collectAppleContainerUnavailable() {
+  return {
+    runtime: {
+      runtime: "apple_container",
+      installed: false,
+      available: false,
+      support_status: "not_applicable",
+      source: { argv: ["container"], read_only: true },
+    },
+    containers: [],
+    images: [],
+    probes: [],
+  };
+}
+
+async function collectAppleContainer(request) {
+  if (process.platform !== "darwin") return collectAppleContainerUnavailable();
+
+  const [statusProbe, versionProbe, listProbe, imageListProbe] = await Promise.all([
+    runFixedCommand("container", ["system", "status", "--format", "json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("container", ["system", "version", "--format", "json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("container", ["list", "--all", "--format", "json"], { timeout: 5000, maxBuffer: 1024 * 1024 }),
+    runFixedCommand("container", ["image", "list", "--format", "json"], { timeout: 5000, maxBuffer: 1024 * 1024 }),
+  ]);
+  const status = statusProbe.status === "ok" ? parseAppleContainerSystemStatusJson(statusProbe.stdout) : undefined;
+  const containers = listProbe.status === "ok" ? parseAppleContainerListJson(listProbe.stdout, { limit: request.container_limit, includeStopped: request.include_stopped }) : [];
+  const images = imageListProbe.status === "ok" ? parseAppleContainerImageListJson(imageListProbe.stdout, { limit: request.image_limit }) : [];
+  let statsProbe;
+  let stats = new Map();
+  if (request.collect_stats && containers.some((container) => container.state === "running")) {
+    statsProbe = await runFixedCommand("container", ["stats", "--no-stream", "--format", "json"], { timeout: 6500, maxBuffer: 1024 * 1024 });
+    if (statsProbe.status === "ok") stats = parseAppleContainerStatsJson(statsProbe.stdout);
+  }
+  return {
+    runtime: runtimeFromProbe("apple_container", statusProbe, parseAppleContainerVersionJson(versionProbe.stdout)),
+    system_status: status,
+    containers: attachStats(containers, stats),
+    images,
+    probes: [
+      probeMetadata("apple_container_system_status", statusProbe, "apple_container_system_status_json", status ? 1 : 0),
+      probeMetadata("apple_container_system_version", versionProbe, "apple_container_system_version_json"),
+      probeMetadata("apple_container_list", listProbe, "apple_container_list_json", containers.length),
+      probeMetadata("apple_container_image_list", imageListProbe, "apple_container_image_list_json", images.length),
+      statsProbe ? probeMetadata("apple_container_stats", statsProbe, "apple_container_stats_json", stats.size) : undefined,
+    ].filter(Boolean),
   };
 }
 
@@ -545,11 +845,12 @@ async function collectPodmanMachineHost(request) {
   };
 }
 
-function summarize(runtimes, containers, hosts, correlation = {}) {
+function summarize(runtimes, containers, hosts, images = [], correlation = {}) {
   return {
     runtime_count: runtimes.length,
     available_runtime_count: runtimes.filter((runtime) => runtime.available).length,
     container_count: containers.length,
+    image_count: images.length,
     running_container_count: containers.filter((container) => container.state === "running").length,
     stopped_container_count: containers.filter((container) => container.state === "stopped").length,
     host_count: hosts.length,
@@ -583,11 +884,26 @@ export async function collectContainerEvidence(options = {}) {
       collectColima(request),
       collectLima(request),
       collectPodmanMachineHost(request),
+      process.platform === "darwin" ? collectAppleContainer(request) : collectAppleContainerUnavailable(),
     ]);
     const runtimes = results.map((result) => result.runtime).filter(Boolean);
     const containers = results.flatMap((result) => result.containers ?? []).slice(0, request.container_limit);
+    const rawContainerImages = results.flatMap((result) => result.images ?? []).slice(0, request.image_limit);
     const rawContainerHosts = results.flatMap((result) => result.hosts ?? []).slice(0, request.host_limit);
-    const hostResourceCorrelation = await correlateContainerHostResources(rawContainerHosts, request);
+    const appleContainerContainers = containers.filter((container) => container.runtime === "apple_container");
+    const hostResourceCorrelation = await correlateContainerHostResources(rawContainerHosts, request, {
+      hasAppleContainerCandidates: appleContainerContainers.length > 0,
+    });
+    const appleContainerCorrelation = request.collect_stats && appleContainerContainers.length > 0
+      ? correlateAppleContainerProcessHints(appleContainerContainers, hostResourceCorrelation.processHints)
+      : { containers: appleContainerContainers };
+    let appleContainerCorrelationIndex = 0;
+    const correlatedContainers = containers.map((container) => {
+      if (container.runtime !== "apple_container") return container;
+      const correlated = appleContainerCorrelation.containers[appleContainerCorrelationIndex];
+      appleContainerCorrelationIndex += 1;
+      return correlated ?? container;
+    });
     const container_hosts = hostResourceCorrelation.hosts;
     const probes = [...results.flatMap((result) => result.probes ?? []), ...hostResourceCorrelation.probes];
     const unsupported_or_missing = runtimes.filter((runtime) => !runtime.available).map((runtime) => ({
@@ -600,14 +916,15 @@ export async function collectContainerEvidence(options = {}) {
       platform: process.platform,
       request,
       runtimes,
-      containers,
+      containers: correlatedContainers,
       container_hosts,
+      container_images: rawContainerImages,
       probes,
       unsupported_or_missing,
-      summary: summarize(runtimes, containers, container_hosts, hostResourceCorrelation.correlation),
+      summary: summarize(runtimes, correlatedContainers, container_hosts, rawContainerImages, hostResourceCorrelation.correlation),
       privacy: {
         bounded: true,
-        note: "Container names, images, commands, ports, and host instance metadata are sensitive diagnostic artifacts.",
+        note: "Container names, image repository/tag, images, commands, ports, and host instance metadata are sensitive diagnostic artifacts.",
       },
     };
   }, (result) => evidenceEnvelope({
@@ -618,6 +935,6 @@ export async function collectContainerEvidence(options = {}) {
     confidence: result?.runtimes?.some((runtime) => runtime.available) ? 0.9 : 0.45,
     reviewHint: reviewHint(result),
     tool: "collect_containers",
-    target: `limit=${request.container_limit},hosts=${request.host_limit},stopped=${request.include_stopped},stats=${request.collect_stats}`,
+    target: `limit=${request.container_limit},hosts=${request.host_limit},images=${request.image_limit},stopped=${request.include_stopped},stats=${request.collect_stats}`,
   }));
 }

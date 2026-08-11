@@ -291,6 +291,17 @@ test("parseVmProcesses identifies running QEMU/VMware/UTM/Apple Virtualization p
   assert.equal(vms[8].name, "podman-machine-default");
 });
 
+test("parseVmProcesses identifies Apple Container runtime helpers", () => {
+  const vms = parseVmProcesses(`  PID  PPID  %CPU %MEM   RSS COMM ARGS
+ 1009     1   4.0  2.5 9000 container-runtime-linux container-runtime-linux --container-id ac123
+`);
+
+  assert.equal(vms.length, 1);
+  assert.equal(vms[0].runtime, "apple_container");
+  assert.equal(vms[0].confidence, 0.4);
+  assert.equal(vms[0].owner_hint.includes("ac123"), true);
+});
+
 test("correlateVmProcessHints attaches Apple Virtualization snapshots to matching VZ inventory VMs", () => {
   const correlation = correlateVmProcessHints([
     { runtime: "lima", id: "vz-docker", name: "vz-docker", state: "running", backend: "vz", source_runtime: "lima", confidence: 1 },
