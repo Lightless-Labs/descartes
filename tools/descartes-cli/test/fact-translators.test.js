@@ -2,15 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   PEER_CENSUS_MARKER_ENTITY_KEY,
+  PEER_OVERFLOW_ENTITY_KEY,
   SERVICE_CENSUS_FACT_NAME,
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   factPointsFromNetworkEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
+  factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
   sanitizeEntityKey,
 } from "../src/fact-translators.js";
+import { computePeerIdentitySignature } from "../src/peer-signature-store.js";
 import { buildConstraintTarget } from "../src/constraint-store.js";
 import { buildShadowFactLookup } from "../src/shadow-store.js";
 import { mineConstraintCandidates } from "../src/constraint-miner.js";
@@ -508,6 +511,81 @@ function vpnServicePeer(overrides = {}) {
     ...overrides,
   };
 }
+
+function tailscaleEnvelope(result, status = "ok") {
+  return envelope("tailscale-status", "collect_tailscale_status", result, status);
+}
+
+function tailscalePeer(overrides = {}) {
+  return {
+    source_type: "tailscale",
+    presence_state: "observed_active",
+    node_public_key: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEFG=",
+    is_exit_node_active: false,
+    is_exit_node_option: false,
+    latest_handshake_epoch_seconds: 0,
+    ...overrides,
+  };
+}
+
+test("factPointsFromTailscaleStatusEvidence returns [] for missing and unable envelopes", () => {
+  assert.deepEqual(factPointsFromTailscaleStatusEvidence([], { ts: TS }), []);
+  assert.deepEqual(factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({ peers: [] }, "unable")], { ts: TS }), []);
+});
+
+test("factPointsFromTailscaleStatusEvidence pins the tailscale public-key identity hash", () => {
+  const points = factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({ peers: [tailscalePeer()] })], { ts: TS });
+  assert.equal(points.length, 1, "tailscale deliberately emits no shared census marker");
+  assert.equal(points[0].entity_key, "peer.tailscale.e4a3b48f9d150465");
+  assert.equal(points[0].entity_key, `peer.tailscale.${computePeerIdentitySignature({
+    sourceType: "tailscale",
+    peerIdentifier: tailscalePeer().node_public_key,
+  })}`);
+  assert.equal(points[0].attributes.source_type, "tailscale");
+});
+
+test("tailscale exit_node_role is a closed enum and existing peer sources remain n/a", () => {
+  const tailscalePoints = factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({
+    peers: [
+      tailscalePeer({ is_exit_node_active: true, is_exit_node_option: true }),
+      tailscalePeer({ node_public_key: "plain", is_exit_node_option: true }),
+      tailscalePeer({ node_public_key: "none" }),
+    ],
+  })], { ts: TS });
+  assert.deepEqual(tailscalePoints.map((point) => point.attributes.exit_node_role), ["in_use", "advertised_unused", "none"]);
+
+  const existingPoints = factPointsFromVpnPeerEvidence([peerEnvelope({ peers: [wgPeer(), sshPeer(), vpnServicePeer()] })], { ts: TS });
+  assert.deepEqual(existingPoints.slice(0, 3).map((point) => point.attributes.exit_node_role), ["n/a", "n/a", "n/a"]);
+});
+
+test("tailscale handshake age reuses WireGuard buckets, preserving never versus unknown", () => {
+  const nowSeconds = Math.floor(new Date(TS).getTime() / 1000);
+  const points = factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({ peers: [
+    tailscalePeer({ latest_handshake_epoch_seconds: 0 }),
+    tailscalePeer({ node_public_key: "missing", latest_handshake_epoch_seconds: undefined }),
+    tailscalePeer({ node_public_key: "recent", latest_handshake_epoch_seconds: nowSeconds - 60 }),
+  ] })], { ts: TS });
+  assert.deepEqual(points.map((point) => point.attributes.handshake_age_bucket), ["never", "unknown", "lt_5m"]);
+});
+
+test("tailscale overflow emits the shared overflow marker but never the shared census marker", () => {
+  const points = factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({
+    peers: [tailscalePeer()],
+    truncated: true,
+    total_count: 5000,
+  })], { ts: TS });
+  const overflow = points.find((point) => point.entity_key === PEER_OVERFLOW_ENTITY_KEY);
+  assert.ok(overflow);
+  assert.equal(overflow.attributes.total_count_bucket, "1000+");
+  assert.equal(points.some((point) => point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY), false);
+});
+
+test("tailscale translator never emits a census marker, including a genuine zero-peer tick", () => {
+  for (const result of [{ peers: [] }, { peers: [tailscalePeer()] }, { peers: [], truncated: true, total_count: 999 }]) {
+    const points = factPointsFromTailscaleStatusEvidence([tailscaleEnvelope(result)], { ts: TS });
+    assert.equal(points.some((point) => point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY), false);
+  }
+});
 
 test("factPointsFromVpnPeerEvidence maps a WireGuard peer into a hashed entity_key with closed-enum attributes", () => {
   const evidence = [peerEnvelope({ peers: [wgPeer()], truncated: false })];

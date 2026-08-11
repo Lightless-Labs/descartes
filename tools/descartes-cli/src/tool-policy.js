@@ -12,6 +12,7 @@ export const TRIAGE_TOOL_NAMES = Object.freeze([
   "collect_certificates",
   "collect_sessions",
   "collect_vpn_peer_status",
+  "collect_tailscale_status",
   "inspect_process",
   "inspect_parent_tree",
   "inspect_runtime_provenance",

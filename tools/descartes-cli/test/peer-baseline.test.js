@@ -6,7 +6,7 @@ import test from "node:test";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints } from "../src/fact-store.js";
-import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
+import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY, factPointsFromTailscaleStatusEvidence } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
   DEFAULT_PEER_CRITICAL_SIGMA,
@@ -128,6 +128,26 @@ function overflowTick(ts, activeCount, entityPrefix = "peer.ssh.e") {
   return points;
 }
 
+function tailscalePoints(ts, peers) {
+  return factPointsFromTailscaleStatusEvidence([{
+    id: "tailscale-status",
+    status: "ok",
+    result: { peers },
+    trace: { tool: "collect_tailscale_status" },
+  }], { ts });
+}
+
+function tailscalePeer(index, presenceState = "observed_active") {
+  return {
+    source_type: "tailscale",
+    presence_state: presenceState,
+    node_public_key: `tailscale-key-${index}`,
+    is_exit_node_active: false,
+    is_exit_node_option: false,
+    latest_handshake_epoch_seconds: 0,
+  };
+}
+
 function flatten(groupsOfPoints) {
   return groupsOfPoints.flat();
 }
@@ -202,6 +222,40 @@ test("groupPeerFactsByTick: an unrecognized/missing presence_state defaults to c
 test("groupPeerFactsByTick: orders tick-groups ascending by ts regardless of input order", () => {
   const groups = groupPeerFactsByTick([...activeTick(tickTs(2), 1), ...activeTick(tickTs(0), 1), ...activeTick(tickTs(1), 1)]);
   assert.deepEqual(groups.map((g) => g.ts), [tickTs(0), tickTs(1), tickTs(2)]);
+});
+
+test("groupPeerFactsByTick: VPN and Tailscale peer points sharing one tick sum into one combined count", () => {
+  const ts = tickTs(0);
+  const groups = groupPeerFactsByTick([
+    ...activeTickWithMarker(ts, 2),
+    ...tailscalePoints(ts, [tailscalePeer(1), tailscalePeer(2)]),
+  ]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].count, 4);
+  assert.equal(groups[0].availabilitySignature, DEFAULT_SIGNATURE);
+});
+
+test("Tailscale-only markerless ticks stay provisional for drop detection while spike detection establishes", () => {
+  const points = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    points.push(...tailscalePoints(tickTs(i), [tailscalePeer(`${i}-a`), tailscalePeer(`${i}-b`)]));
+  }
+  // A historical-only point creates a truthful zero-count tick-group without fabricating a
+  // census marker. A completely empty Tailscale Peer map creates no peer.presence tick-group.
+  points.push(...tailscalePoints(tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT), [tailscalePeer("historical", "observed_historical")]));
+
+  const groups = groupPeerFactsByTick(points);
+  assert.equal(groups.length, DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
+  assert.equal(groups.every((group) => group.availabilitySignature === undefined), true);
+  assert.equal(groups.at(-1).count, 0);
+
+  const drop = computeWindowedPeerDropStats(groups, { minSampleCount: DEFAULT_PEER_MIN_SAMPLE_COUNT });
+  assert.equal(drop.confidence_state, "provisional");
+  assert.equal(drop.last_observation, undefined);
+
+  const spike = computeWindowedPeerStats(groups, { minSampleCount: DEFAULT_PEER_MIN_SAMPLE_COUNT });
+  assert.equal(spike.confidence_state, "established");
+  assert.equal(spike.last_observation.count, 0);
 });
 
 // ---------------------------------------------------------------------------------------------

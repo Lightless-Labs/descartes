@@ -439,7 +439,7 @@ function buildPeerCensusMarkerFactPoint(result, envelope, ts) {
   };
 }
 
-const CLOSED_PEER_SOURCE_TYPES = new Set(["wireguard", "ssh", "vpn_service"]);
+const CLOSED_PEER_SOURCE_TYPES = new Set(["wireguard", "ssh", "vpn_service", "tailscale"]);
 
 function normalizedPeerSourceType(sourceType) {
   return CLOSED_PEER_SOURCE_TYPES.has(sourceType) ? sourceType : "unknown";
@@ -452,7 +452,7 @@ function peerEntityKey(peer) {
   const sourceType = normalizedPeerSourceType(peer.source_type);
   const hash = computePeerIdentitySignature({
     sourceType,
-    peerIdentifier: sourceType === "wireguard" ? peer.public_key : sourceType === "vpn_service" ? peer.service_uuid : undefined,
+    peerIdentifier: sourceType === "wireguard" ? peer.public_key : sourceType === "tailscale" ? peer.node_public_key : sourceType === "vpn_service" ? peer.service_uuid : undefined,
     remoteUser: sourceType === "ssh" ? peer.remote_user : undefined,
     remoteHost: sourceType === "ssh" ? peer.remote_host : undefined,
   });
@@ -474,7 +474,7 @@ function bucketLoginHour(ts) {
 // seconds value, the same occupancy-signal sensitivity class as a raw creation timestamp
 // (mirrors Slice 1's created_at_fingerprint reasoning, but a bucket suffices here since
 // handshake age is not itself the churn-detection signal must-fix 6 was about). "n/a" for any
-// non-WireGuard peer, keeping every peer fact's attribute-key set uniform.
+// non-WireGuard/Tailscale peer, keeping every peer fact's attribute-key set uniform.
 function bucketHandshakeAge(epochSeconds, nowEpochSeconds) {
   if (!Number.isFinite(epochSeconds)) return "unknown";
   if (epochSeconds === 0) return "never"; // WireGuard's own "never handshaked" signal
@@ -497,6 +497,13 @@ function bucketPeerOverflowTotal(count) {
   return "1000+";
 }
 
+function bucketExitNodeRole(peer, sourceType) {
+  if (sourceType !== "tailscale") return "n/a";
+  if (peer.is_exit_node_active) return "in_use";
+  if (peer.is_exit_node_option) return "advertised_unused";
+  return "none";
+}
+
 function buildPeerFactPoint(peer, envelope, ts) {
   const sourceType = normalizedPeerSourceType(peer.source_type);
   const nowEpochSeconds = Math.floor(new Date(ts).getTime() / 1000);
@@ -508,7 +515,8 @@ function buildPeerFactPoint(peer, envelope, ts) {
       source_type: sourceType,
       presence_state: peer.presence_state === "observed_historical" ? "observed_historical" : "observed_active",
       login_hour_bucket: bucketLoginHour(ts),
-      handshake_age_bucket: sourceType === "wireguard" ? bucketHandshakeAge(peer.latest_handshake_epoch_seconds, nowEpochSeconds) : "n/a",
+      handshake_age_bucket: sourceType === "wireguard" || sourceType === "tailscale" ? bucketHandshakeAge(peer.latest_handshake_epoch_seconds, nowEpochSeconds) : "n/a",
+      exit_node_role: bucketExitNodeRole(peer, sourceType),
     },
     source_envelope_id: envelope.id,
     source_tool: envelope.trace?.tool,
@@ -554,6 +562,24 @@ export function factPointsFromVpnPeerEvidence(evidence, { ts } = {}) {
   // factPointsFromSessionEvidence's own append order (census marker first, overflow marker
   // second).
   points.push(buildPeerCensusMarkerFactPoint(envelope.result, envelope, ts));
+  if (envelope.result?.truncated) {
+    points.push(buildPeerOverflowMarkerFactPoint(envelope.result, envelope, ts));
+  }
+  return points;
+}
+
+/**
+ * evidence[] -> fact-store.js-shaped fact points for the read-only Tailscale status collector.
+ * Tailscale intentionally does NOT emit PEER_CENSUS_MARKER_ENTITY_KEY: that single-value marker
+ * belongs exclusively to vpn-peer-status, whose five-source availability signature must not be
+ * overwritten by a second collector on the same tick. Tailscale peers still share peer.presence,
+ * and its overflow marker safely composes with the sibling collector's overflow marker.
+ */
+export function factPointsFromTailscaleStatusEvidence(evidence, { ts } = {}) {
+  const envelope = (evidence ?? []).find((e) => e.id === "tailscale-status" && e.status !== "unable");
+  if (!envelope) return [];
+  const peers = envelope.result?.peers ?? [];
+  const points = peers.map((peer) => buildPeerFactPoint(peer, envelope, ts));
   if (envelope.result?.truncated) {
     points.push(buildPeerOverflowMarkerFactPoint(envelope.result, envelope, ts));
   }

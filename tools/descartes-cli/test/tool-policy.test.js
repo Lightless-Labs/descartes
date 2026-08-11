@@ -17,6 +17,7 @@ test("triage investigation active tools are exactly Descartes read-only evidence
     "collect_certificates",
     "collect_sessions",
     "collect_vpn_peer_status",
+    "collect_tailscale_status",
     "inspect_process",
     "inspect_parent_tree",
     "inspect_runtime_provenance",

@@ -255,6 +255,37 @@ Fact-history: on the daemon's hourly structural tick (gated behind the `learned.
 
 Privacy: the raw, un-hashed peer IPs/hostnames/usernames/public keys/VPN service names ARE visible in this tool's on-demand `descartes triage` response (matching the existing consent posture of every other `TRIAGE_TOOL_NAMES` collector). Only the *persisted* fact-history is hashed/bucketed.
 
+### `collect_tailscale_status`
+
+Collects a read-only baseline of Tailscale/tailnet peer identity from the local daemon's
+`tailscale status --json` output. It does not call an admin/control-plane API, inspect traffic,
+escalate privilege, or expose any mutating/authentication command.
+
+Behavior: the command uses one fixed `execFile` argv (`tailscale status --json`). A missing binary
+is `absent`; parsed `NeedsLogin`, `NoState`, or `Stopped` backend state is a truthful
+`logged_out` zero; permission failures are `missing_permission` with an elevation-candidate
+documentation marker; malformed JSON and other failures are `unable`. A Running daemon with no
+peers is a real successful zero. Per-tick peers are bounded at 200 with an explicit truncation
+marker and preserved total count.
+
+Fact-history: on the daemon's hourly structural tick (gated behind the `learned.json` kill
+switch), `factPointsFromTailscaleStatusEvidence` translates peers into the shared
+`peer.presence` stream. The persisted entity key is a fixed-length, versioned,
+domain-separated SHA-256 hash of the node public key; persisted attributes are closed-enum or
+bucketed only: source type, presence state, login hour, handshake age, and exit-node role
+(`in_use`, `advertised_unused`, `none`, or `n/a`). No raw public key, IP, hostname, tailnet, or
+user identity reaches fact-history. This collector emits no new alert rule and no census marker;
+existing deterministic peer-count/correlation paths consume the shared stream, never an LLM path.
+
+Operator dependency: `peer.count_drop` (peer drop-to-zero detection) requires the
+`vpn-peer-status` collector to also be enabled. A Tailscale-only configuration gets
+`peer.count_spike` coverage but not `peer.count_drop` coverage because only the VPN peer
+translator emits the shared census marker used to make drop-direction tick groups complete.
+
+Privacy: raw public keys and other daemon response details may be visible in this operator-invoked
+on-demand triage response, matching the existing consent posture of the other triage collectors;
+only persisted fact-history is hashed/bucketed.
+
 ### `sample_dimension`
 
 Collects bounded temporal samples for one dimension.

@@ -75,6 +75,16 @@ test("computePeerIdentitySignature reproduces the golden vpn_service fixture has
   assert.equal(computePeerIdentitySignature(VPN_SERVICE_GOLDEN_FIXTURE_INPUTS), VPN_SERVICE_GOLDEN_FIXTURE_HASH);
 });
 
+const TAILSCALE_GOLDEN_FIXTURE_INPUTS = {
+  sourceType: "tailscale",
+  peerIdentifier: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEFG=",
+};
+const TAILSCALE_GOLDEN_FIXTURE_HASH = "e4a3b48f9d150465";
+
+test("computePeerIdentitySignature reproduces the golden Tailscale fixture hash exactly (identity = node public key only)", () => {
+  assert.equal(computePeerIdentitySignature(TAILSCALE_GOLDEN_FIXTURE_INPUTS), TAILSCALE_GOLDEN_FIXTURE_HASH);
+});
+
 test("computePeerIdentitySignature is pure and deterministic: identical inputs always produce the identical hash", () => {
   assert.equal(computePeerIdentitySignature(WG_GOLDEN_FIXTURE_INPUTS), computePeerIdentitySignature({ ...WG_GOLDEN_FIXTURE_INPUTS }));
 });

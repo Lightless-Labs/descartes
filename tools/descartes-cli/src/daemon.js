@@ -13,6 +13,7 @@ import {
   factPointsFromNetworkEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
+  factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
 import { computeCorrelationCandidates } from "./incident-correlation.js";
@@ -34,6 +35,7 @@ import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
+import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 
 const execFileAsync = promisify(execFile);
@@ -84,6 +86,9 @@ export function defaultDaemonProfile() {
         // 2026-07-13-observed-incident-collectors.md Slice 3's Alert-emission scope decision,
         // RESOLVED option 1). Alerting on unattributed/odd-hour peer logins is Slice 4/6's job.
         "vpn-peer-status": { enabled: true },
+        // Pure read-only Tailscale/tailnet L0 fact source, default true under the same learned
+        // kill switch and with no extraCandidates addition.
+        "tailscale-status": { enabled: true },
       },
     },
     safety: {
@@ -252,6 +257,8 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     // on the same slow cadence, subject to the same structural-tick deadline/discard discipline
     // below. Read-only SSH/VPN peer census; NO alert candidates emitted by this slice either.
     "vpn-peer-status": collectors["vpn-peer-status"] ?? collectVpnPeerStatusEvidence,
+    // Tailscale/tailnet sibling: pure read-only L0 fact source, no alert candidates.
+    "tailscale-status": collectors["tailscale-status"] ?? collectTailscaleStatusEvidence,
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
@@ -260,6 +267,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
   if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions());
   if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"]());
+  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"]());
   return evidence;
 }
 
@@ -477,6 +485,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // NO alert candidates either (RESOLVED option 1, plan Slice 3's Alert-emission scope
             // decision). Alerting on unattributed/odd-hour peer logins is Slice 4/6's job.
             ...factPointsFromVpnPeerEvidence(structuralEvidence, { ts }),
+            // Tailscale/tailnet is another pure L0 peer.presence source. It deliberately emits no
+            // extraCandidates and no census marker; vpn-peer-status remains the sole shared
+            // availability/regime anchor, avoiding same-tick marker collision.
+            ...factPointsFromTailscaleStatusEvidence(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;

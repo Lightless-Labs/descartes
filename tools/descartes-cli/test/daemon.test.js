@@ -451,7 +451,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services", "sessions", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["network", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
@@ -466,6 +466,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   // defaults true, matching its siblings exactly — same outer learned.json kill switch, and this
   // collector ALSO never emits an alert candidate (pure L0 fact source, RESOLVED option 1).
   assert(profile.structural.collectors["vpn-peer-status"].enabled);
+  assert(profile.structural.collectors["tailscale-status"].enabled);
 });
 
 test("validateDaemonProfile accepts default and structural-less profiles, rejects malformed ones", () => {
@@ -1643,6 +1644,67 @@ function vpnPeerStatusEnvelopeFixture(overrides = {}) {
   });
 }
 
+function tailscaleStatusEnvelopeFixture(overrides = {}) {
+  return envelope("tailscale-status", "collect_tailscale_status", {
+    backend_state: "Running",
+    total_count: 1,
+    peers: [{
+      source_type: "tailscale",
+      presence_state: "observed_active",
+      node_public_key: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEFG=",
+      is_exit_node_active: true,
+      is_exit_node_option: true,
+      latest_handshake_epoch_seconds: 0,
+    }],
+    truncated: false,
+    cap: 200,
+    ...overrides,
+  });
+}
+
+test("collectStructuralEvidence gates tailscale-status independently and preserves sibling ordering", async () => {
+  const calls = [];
+  const evidence = await collectStructuralEvidence({ collectors: {
+    "vpn-peer-status": { enabled: false },
+    "tailscale-status": { enabled: true },
+  } }, {
+    "tailscale-status": async () => { calls.push("tailscale-status"); return tailscaleStatusEnvelopeFixture(); },
+  });
+  assert.deepEqual(calls, ["tailscale-status"]);
+  assert.deepEqual(evidence.map((entry) => entry.id), ["tailscale-status"]);
+});
+
+test("tailscale structural wiring persists hashed peer facts and adds no new alert family", async () => {
+  const paths = await tempPaths();
+  const profile = structuralProfile({
+    collectors: {
+      services: { enabled: false },
+      network: { enabled: false },
+      "scheduled-jobs": { enabled: false },
+      "tailscale-status": { enabled: true },
+    },
+  });
+  const result = await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "tailscale-status": async () => tailscaleStatusEnvelopeFixture() },
+    evaluateAlerts: true, // was false — with alerts disabled the "no new alert family" assertion below was vacuous (sol review)
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  const { points } = await readFactPoints(paths);
+  const peerPoint = points.find((point) => point.fact_name === "peer.presence");
+  assert.ok(peerPoint);
+  assert.match(peerPoint.entity_key, /^peer\.tailscale\.[0-9a-f]{16}$/);
+  assert.equal(peerPoint.attributes.source_type, "tailscale");
+  assert.equal(peerPoint.attributes.exit_node_role, "in_use");
+  assert.equal((result.alerts?.alerts ?? []).some((alert) => ![PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID].includes(alert.rule_id)), false);
+});
+
 test("Slice 3: the vpn-peer-status sub-collector runs on a structural-due tick alongside its siblings, and its census is translated into a hashed, bucketed fact-point", async () => {
   const paths = await tempPaths();
   const structuralCalls = [];
@@ -1782,6 +1844,33 @@ test("Slice 3 MUST-FIX 4(a) store-separation: peer ticks never write signatures.
   // (signatures.json was never bootstrapped), independent of anything peer-shaped ever appearing.
   const identityCandidates = await computeProvenanceIdentityCandidates(paths, { now: Date.parse("2026-05-24T00:00:00.000Z") });
   assert.deepEqual(identityCandidates, []);
+});
+
+test("Tailscale-only peer ticks never write signatures.json or peer-signatures.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const profile = structuralProfile({
+    collectors: {
+      services: { enabled: false },
+      network: { enabled: false },
+      "scheduled-jobs": { enabled: false },
+      "tailscale-status": { enabled: true },
+    },
+  });
+
+  await runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "tailscale-status": async () => tailscaleStatusEnvelopeFixture() },
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+  });
+
+  await assert.rejects(() => fs.access(resolveSignatureStorePaths(paths).signaturesFile));
+  await assert.rejects(() => fs.access(resolvePeerSignatureStorePaths(paths).peerSignaturesFile));
 });
 
 test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a provenance-warning alert coexist across daemon iterations without any one spuriously recovering another (S2 cross-recovery pattern extended to a third source)", async () => {
