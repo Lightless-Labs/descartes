@@ -1,3 +1,18 @@
+---
+title: Collector candidate — Tailscale / tailnet (network-identity + traffic patterns)
+created: 2026-08-11
+status: pending
+priority: medium
+area: collectors
+kind: todo
+owner: unassigned
+related:
+  - docs/research/2026-08-11-agentic-intrusion-defense.md
+  - todos/2026-08-11-agent-intrusion-detection-gaps.md
+  - todos/2026-08-11-apple-container-collector.md
+  - todos/2026-07-09-self-learning-stratified-monitoring.md
+---
+
 # Collector candidate: Tailscale / tailnet (network-identity + traffic patterns)
 
 **Created:** 2026-08-11

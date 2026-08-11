@@ -1,3 +1,16 @@
+---
+title: Collector candidate — apple/container (native Apple-Silicon containers)
+created: 2026-08-11
+status: pending
+priority: low
+area: collectors
+kind: todo
+owner: unassigned
+related:
+  - todos/2026-08-11-tailscale-collector.md
+  - docs/reference/collectors.md
+---
+
 # Collector candidate: `apple/container` (native Apple-Silicon containers)
 
 **Created:** 2026-08-11
