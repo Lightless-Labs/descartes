@@ -96,12 +96,13 @@ test("normalizeFactPoint passes through a bounded numeric confidence marker when
 test("appendFactPoints/readFactPoints round-trip", async () => {
   const paths = await tempPaths();
   const ts = "2026-07-10T00:00:00.000Z";
+  const now = "2026-07-10T00:01:00.000Z"; // pin retention to the fixture, not wall-clock (avoids a 30-day time-bomb)
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" }, ts },
     { fact_name: "service.presence", entity_key: "postgres", attributes: { running: "false" }, ts },
-  ], { ts });
+  ], { ts, now });
 
-  const { points, corrupt_count } = await readFactPoints(paths);
+  const { points, corrupt_count } = await readFactPoints(paths, { now });
   assert.equal(corrupt_count, 0);
   assert.equal(points.length, 2);
   assert.deepEqual(points.map((p) => p.entity_key).sort(), ["nginx", "postgres"]);

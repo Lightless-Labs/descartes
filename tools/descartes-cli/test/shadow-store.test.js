@@ -82,12 +82,13 @@ test("normalizeShadowRecord requires a non-empty constraint_id and a boolean fir
 test("appendShadowRecords/readShadowRecords round-trip, append-only, JSONL shaped", async () => {
   const paths = await tempPaths();
   const ts = "2026-07-10T00:00:00.000Z";
+  const now = "2026-07-10T00:01:00.000Z"; // pin retention to the fixture, not wall-clock (avoids a 30-day time-bomb)
   await appendShadowRecords(paths, [
     { ts, constraint_id: "c1", family: "service-presence", target: "service.presence.nginx", expected: { comparator: "eq", value: "true" }, actual: "true", fired: false },
     { ts, constraint_id: "c2", family: "port-binding-identity", target: "network.listening_port.owner.tcp", expected: { comparator: "eq", value: "postgres" }, actual: "unknown", fired: true },
-  ]);
+  ], { now });
 
-  const { records, corrupt_count } = await readShadowRecords(paths);
+  const { records, corrupt_count } = await readShadowRecords(paths, { now });
   assert.equal(corrupt_count, 0);
   assert.equal(records.length, 2);
   assert.deepEqual(records.map((r) => r.constraint_id).sort(), ["c1", "c2"]);
