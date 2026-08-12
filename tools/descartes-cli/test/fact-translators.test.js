@@ -3,16 +3,21 @@ import test from "node:test";
 import {
   PEER_CENSUS_MARKER_ENTITY_KEY,
   PEER_OVERFLOW_ENTITY_KEY,
+  PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
+  PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY,
+  PROCESS_LINEAGE_EDGE_FACT_NAME,
   SERVICE_CENSUS_FACT_NAME,
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   factPointsFromNetworkEvidence,
   factPointsFromCanaryEvidence,
+  factPointsFromProcessLineageEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
   sanitizeEntityKey,
+  buildLineageEntityKey,
 } from "../src/fact-translators.js";
 import { computePeerIdentitySignature } from "../src/peer-signature-store.js";
 import { buildConstraintTarget } from "../src/constraint-store.js";
@@ -33,6 +38,77 @@ function envelope(id, tool, result, status = "ok") {
 }
 
 const TS = "2026-07-10T00:00:00.000Z";
+
+test("buildLineageEntityKey hashes the edge identity at source and carries no raw comm text (HIGH fix: hash-at-source)", () => {
+  const key = buildLineageEntityKey("parent/name", "child name");
+  // Fixed-length hex hash under the reserved fact_name prefix -- never a sanitized/substituted
+  // copy of the raw comm strings.
+  assert.match(key, /^process\.lineage_edge\.[0-9a-f]{16}$/);
+  assert.equal(key.includes("parent"), false);
+  assert.equal(key.includes("child"), false);
+  assert.equal(key.includes("name"), false);
+  // NUL-joined preimage: two structurally different (parent, child) splits never collide, even
+  // when their naive concatenation would (the old length-prefixed sanitizer scheme's own
+  // motivating case).
+  assert.notEqual(buildLineageEntityKey("a", "bc"), buildLineageEntityKey("ab", "c"));
+  // Degrade-not-fabricate: an unresolvable (empty) parent or child comm returns undefined,
+  // never a hashed placeholder identity.
+  assert.equal(buildLineageEntityKey("", "child"), undefined);
+  assert.equal(buildLineageEntityKey("parent", ""), undefined);
+  assert.equal(buildLineageEntityKey(undefined, "child"), undefined);
+});
+
+test("factPointsFromProcessLineageEvidence emits edge facts and an independent complete census marker", () => {
+  const points = factPointsFromProcessLineageEvidence([
+    envelope("process-lineage-edges", "collect_process_lineage", {
+      edges: [{ parent_comm: "shell", child_comm: "node" }],
+      edge_count: 1,
+      truncated: false,
+    }),
+  ], { ts: TS });
+
+  assert.equal(points.length, 2);
+  assert.equal(points[0].fact_name, PROCESS_LINEAGE_EDGE_FACT_NAME);
+  assert.equal(points[0].entity_key, buildLineageEntityKey("shell", "node"));
+  const marker = points[1];
+  assert.equal(marker.fact_name, PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME);
+  assert.equal(marker.entity_key, PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.census_state, "complete");
+  assert.equal(marker.confidence, 0);
+});
+
+test("factPointsFromProcessLineageEvidence persists no raw comm string in the fact entity_key (HIGH fix: hash-at-source, no raw-identity-at-rest)", () => {
+  const rawParent = "attacker-controlled-parent-binary";
+  const rawChild = "attacker-controlled-child-binary";
+  const points = factPointsFromProcessLineageEvidence([
+    envelope("process-lineage-edges", "collect_process_lineage", {
+      edges: [{ parent_comm: rawParent, child_comm: rawChild }],
+      edge_count: 1,
+      truncated: false,
+    }),
+  ], { ts: TS });
+
+  const edgePoint = points.find((point) => point.fact_name === PROCESS_LINEAGE_EDGE_FACT_NAME);
+  assert.match(edgePoint.entity_key, /^process\.lineage_edge\.[0-9a-f]{16}$/);
+  assert.equal(JSON.stringify(edgePoint).includes(rawParent), false);
+  assert.equal(JSON.stringify(edgePoint).includes(rawChild), false);
+  assert.equal(JSON.stringify(points).includes(rawParent), false);
+  assert.equal(JSON.stringify(points).includes(rawChild), false);
+});
+
+test("factPointsFromProcessLineageEvidence marks truncated ticks partial and omits markers for unknown/unable envelopes", () => {
+  const partial = factPointsFromProcessLineageEvidence([
+    envelope("process-lineage-edges", "collect_process_lineage", { edges: [], edge_count: 0, truncated: true }, "warning"),
+  ], { ts: TS });
+  assert.equal(partial.at(-1).attributes.census_state, "partial");
+
+  assert.deepEqual(factPointsFromProcessLineageEvidence([
+    envelope("process-lineage-edges", "collect_process_lineage", { edges: [] }, "unknown"),
+  ], { ts: TS }), []);
+  assert.deepEqual(factPointsFromProcessLineageEvidence([
+    envelope("process-lineage-edges", "collect_process_lineage", { edges: [] }, "unable"),
+  ], { ts: TS }), []);
+});
 
 // --- factPointsFromServiceEvidence ---
 

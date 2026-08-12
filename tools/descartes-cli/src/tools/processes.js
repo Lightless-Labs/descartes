@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { readlink, readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { buildLineageEntityKey } from "../fact-translators.js";
 
 const execFileAsync = promisify(execFile);
 const PS_COLUMNS = "pid,ppid,pcpu,pmem,rss,comm,args";
@@ -181,6 +182,66 @@ async function getProcessSnapshot() {
       read_only: true,
     },
   };
+}
+
+export const MAX_LINEAGE_EDGES_PER_TICK = 200;
+
+export function buildLineageEdges(processes = []) {
+  const byPid = new Map((processes ?? []).map((process) => [process?.pid, process]));
+  const candidates = [];
+
+  for (const process of processes ?? []) {
+    if (!process) continue;
+    const parent = byPid.get(process.ppid);
+    const parentComm = typeof parent?.command === "string" ? parent.command : undefined;
+    const childComm = typeof process.command === "string" ? process.command : undefined;
+    // Degrade-not-fabricate (HIGH fix, deception/anomaly-detector review): a missing or
+    // unresolvable parent (root process whose ppid isn't in this snapshot, a reaped parent, a
+    // truncated process table, ...) must SKIP this edge entirely. Synthesizing an "unknown ->
+    // child" edge instead would fabricate an entity that reads as a genuinely NOVEL lineage edge
+    // the first time any such process is observed, firing a fabricated
+    // process.lineage.novel_edge anomaly on nothing more than an unresolved parent.
+    if (!parentComm || !childComm) continue;
+    const edgeKey = buildLineageEntityKey(parentComm, childComm);
+    if (!edgeKey) continue;
+    candidates.push({ edgeKey, parent_comm: parentComm, child_comm: childComm });
+  }
+
+  candidates.sort((left, right) =>
+    left.edgeKey.localeCompare(right.edgeKey) ||
+    String(left.parent_comm).localeCompare(String(right.parent_comm)) ||
+    String(left.child_comm).localeCompare(String(right.child_comm))
+  );
+
+  const seen = new Set();
+  const edges = [];
+  for (const candidate of candidates) {
+    if (seen.has(candidate.edgeKey)) continue;
+    seen.add(candidate.edgeKey);
+    edges.push({ parent_comm: candidate.parent_comm, child_comm: candidate.child_comm });
+  }
+
+  const truncated = edges.length > MAX_LINEAGE_EDGES_PER_TICK;
+  return {
+    edges: truncated ? edges.slice(0, MAX_LINEAGE_EDGES_PER_TICK) : edges,
+    truncated,
+  };
+}
+
+export async function collectProcessLineageEvidence() {
+  return timedEnvelope(async () => {
+    const { processes, command } = await getProcessSnapshot();
+    const { edges, truncated } = buildLineageEdges(processes);
+    return { edges, edge_count: edges.length, truncated, command };
+  }, (result) => evidenceEnvelope({
+    id: "process-lineage-edges",
+    status: result.truncated ? "warning" : "ok",
+    source: "process_table",
+    result,
+    reviewHint: result.truncated ? "missing_permission" : "none",
+    tool: "collect_process_lineage",
+    target: `edges=${result.edge_count}`,
+  }));
 }
 
 async function runPs(limit) {

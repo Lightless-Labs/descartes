@@ -43,6 +43,7 @@ import { parseDurationMs } from "./history-store.js";
 import { CORRELATION_RULE_ID } from "./incident-correlation.js";
 import { readNotificationDeliveryAudit } from "./notification-delivery.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
+import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
 import { IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID, UNKNOWN_IDENTITY_RULE_ID } from "./provenance-store.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
 import { readShadowRecords } from "./shadow-store.js";
@@ -73,6 +74,7 @@ const CLOSED_RULE_IDS = new Set([
   SESSION_CHURN_RULE_ID,
   PEER_COUNT_SPIKE_RULE_ID,
   PEER_COUNT_DROP_RULE_ID, // Slice 4c (observed-incident collectors plan)
+  PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
   CORRELATION_RULE_ID,
 ]);
 

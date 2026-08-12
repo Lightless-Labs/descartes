@@ -40,6 +40,7 @@ import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineS
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore } from "../src/service-baseline.js";
+import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, loadProcessLineageBaselineStore, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -451,7 +452,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "network", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
@@ -467,6 +468,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   // collector ALSO never emits an alert candidate (pure L0 fact source, RESOLVED option 1).
   assert(profile.structural.collectors["vpn-peer-status"].enabled);
   assert(profile.structural.collectors["tailscale-status"].enabled);
+  assert(profile.structural.collectors["process-lineage"].enabled);
 });
 
 test("validateDaemonProfile accepts default and structural-less profiles, rejects malformed ones", () => {
@@ -520,6 +522,20 @@ test("collectStructuralEvidence calls only enabled structural collectors in a st
   );
   assert.deepEqual(calls, ["network"]);
   assert.deepEqual(onlyNetwork.map((e) => e.id), ["network-basics"]);
+});
+
+test("collectStructuralEvidence runs the process-lineage collector only when enabled", async () => {
+  const calls = [];
+  const evidence = await collectStructuralEvidence({
+    collectors: { "process-lineage": { enabled: true } },
+  }, {
+    "process-lineage": async () => {
+      calls.push("process-lineage");
+      return envelope("process-lineage-edges", "collect_process_lineage", { edges: [], edge_count: 0, truncated: false });
+    },
+  });
+  assert.deepEqual(calls, ["process-lineage"]);
+  assert.deepEqual(evidence.map((item) => item.id), ["process-lineage-edges"]);
 });
 
 test("collectDaemonEvidence and metricPointsFromEvidence remain untouched by structural additions", async () => {
@@ -2661,6 +2677,73 @@ function serviceCensusMarkerFactPoint(ts, state = "complete") {
 function completeServiceTick(ts, entityKeys) {
   return [...entityKeys.map((key) => servicePresenceFactPoint(ts, key)), serviceCensusMarkerFactPoint(ts, "complete")];
 }
+
+function lineageEdgeFactPoint(ts, entityKey) {
+  return {
+    ts,
+    fact_name: "process.lineage_edge",
+    entity_key: entityKey,
+    attributes: {},
+    source_envelope_id: "process-lineage-edges",
+    source_tool: "collect_process_lineage",
+    sensitivity: "operational",
+  };
+}
+
+function lineageCensusMarkerFactPoint(ts, state = "complete") {
+  return {
+    ts,
+    fact_name: "process.lineage_edge.census",
+    entity_key: "process.lineage_edge.census-marker.v1",
+    attributes: { census_state: state },
+    source_envelope_id: "process-lineage-edges",
+    source_tool: "collect_process_lineage",
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+function completeLineageTick(ts, entityKeys) {
+  return [...entityKeys.map((key) => lineageEdgeFactPoint(ts, key)), lineageCensusMarkerFactPoint(ts)];
+}
+
+function lineageNoveltyFixtureFactPoints() {
+  const establishedEdge = "5:shellnode";
+  const novelEdge = "5:shellpython";
+  const ticks = [];
+  for (let i = 0; i < 6; i += 1) ticks.push(...completeLineageTick(hour(i), [establishedEdge]));
+  ticks.push(...completeLineageTick(hour(6), [establishedEdge, novelEdge]));
+  return ticks;
+}
+
+test("Process-lineage wiring: a novel edge flows through the daemon's alert pipeline as a warning", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Prime the baseline store as already-established: process-lineage-baseline.js's persistent
+  // cold-start lockout (a corrupt/missing/reset store must re-accumulate minHistoryTickCount
+  // genuinely new ticks before trusting the live fact window, never self-heal-and-immediately-
+  // fire) would otherwise gate this single-tick fixture to zero regardless of how much history
+  // it already contains — that lockout has its own dedicated coverage in
+  // process-lineage-baseline.test.js. This wiring test is about the daemon pipeline, not the
+  // lockout. A genuinely-established store must carry a valid last_folded_ts (the process-
+  // lineage-baseline.js exact-schema fix rejects an established store without one), so an
+  // arbitrary before-the-fixture anchor is supplied here.
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await appendFactPoints(paths, lineageNoveltyFixtureFactPoints(), { now: hour(6) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(6));
+  const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID);
+  assert.ok(alert, "expected a real alert for the novel process lineage edge");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning");
+  assert.equal(typeof alert.diagnostics.entity_key_hash, "string");
+  assert.equal(JSON.stringify(alert).includes("shellpython"), false, "edge identity must not be emitted in cleartext");
+
+  const { state } = await loadProcessLineageBaselineStore(paths);
+  assert.equal(state.last_folded_ts, hour(6));
+  assert.equal(state.novel_edge_event_count, 1);
+  assert.equal(state.skipped_partial_tick_count, 0);
+});
 
 // 30 complete censuses in which "worker.service" is present (establishing it -- the default
 // minEstablishedCount is 3), then a 31st complete census in which it is missing.

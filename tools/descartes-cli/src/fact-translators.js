@@ -32,6 +32,50 @@ export function sanitizeEntityKey(value) {
 export const SERVICE_CENSUS_FACT_NAME = "service.census";
 export const SERVICE_CENSUS_MARKER_ENTITY_KEY = "service.census-marker.v1";
 
+export const PROCESS_LINEAGE_EDGE_FACT_NAME = "process.lineage_edge";
+export const PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME = "process.lineage_edge.census";
+export const PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY = "process.lineage_edge.census-marker.v1";
+
+// HASH-AT-SOURCE (HIGH fix, deception/anomaly-detector review): a process `comm` (parent or
+// child) is operator/attacker-influenced free text (an exec'd binary can be named almost
+// anything) -- exactly the same identity-confidentiality class as a tmux/screen session name
+// (SESSION_ENTITY_HASH_DOMAIN above) or a peer identifier (peer-signature-store.js). Sanitizing
+// (charset-substitution + truncation) is NOT a confidentiality control -- it leaves a
+// recognizable, human-readable comm string sitting in fact-history forever, and its lossiness
+// (distinct raw names can sanitize/truncate to the same string) makes entity-key collisions a
+// SANITIZER accident rather than a cryptographic one. The PERSISTED entity_key is therefore a
+// domain-prefixed SHA-256 of the NUL-joined (parent_comm, child_comm) pair, truncated to the same
+// 16 hex chars as every other hash-at-source scheme in this file -- it carries no cleartext comm
+// and two structurally different (parent, child) splits (e.g. ("a","bc") vs ("ab","c")) cannot
+// collide because the NUL separator is never itself a valid comm character. The alert BODY
+// (process-lineage-baseline.js's hashLineageEdgeEntityKey) hashes this value AGAIN under its own
+// rule-scoped domain -- cleartext comm is deferred/never surfaced there either, per the plan.
+const LINEAGE_ENTITY_HASH_DOMAIN = "descartes.fact.process_lineage_edge.v1";
+
+// A literal NUL separator (never a valid `comm` character) so two structurally different
+// (parent, child) splits can never collide when concatenated -- e.g. ("a","bc") and ("ab","c")
+// hash to different preimages ("a\0bc" vs "ab\0c"). Kept as its own named constant (built from
+// the `\u0000` escape, not a raw byte pasted into this source file) purely for readability at
+// the call site below.
+const LINEAGE_IDENTITY_SEPARATOR = "\u0000";
+
+export function hashLineageEdgeIdentity(parentComm, childComm) {
+  return crypto.createHash("sha256")
+    .update(`${LINEAGE_ENTITY_HASH_DOMAIN}:${parentComm}${LINEAGE_IDENTITY_SEPARATOR}${childComm}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+// Degrade-not-fabricate: an unresolvable (non-string/empty) parent or child comm returns
+// `undefined` -- signaling to callers that this edge's identity cannot be established and the
+// record must be dropped, never hashed-and-persisted as a placeholder identity.
+export function buildLineageEntityKey(parentComm, childComm) {
+  const parent = typeof parentComm === "string" ? parentComm.trim() : "";
+  const child = typeof childComm === "string" ? childComm.trim() : "";
+  if (!parent || !child) return undefined;
+  return `process.lineage_edge.${hashLineageEdgeIdentity(parent, child)}`;
+}
+
 // Canary presence uses its own fact_name because operator-chosen ids are cleartext-sanitized and
 // could collide with the reserved census marker entity key. The marker is separate for the same
 // collision-avoidance reason as service.census.
@@ -84,6 +128,40 @@ export function factPointsFromServiceEvidence(evidence, { ts } = {}) {
   // that up — so it can never be read as a presence claim or mined.
   if (envelope.status === "ok" || envelope.status === "warning") {
     points.push(buildServiceCensusMarkerFactPoint(envelope.result, envelope, ts));
+  }
+  return points;
+}
+
+export function factPointsFromProcessLineageEvidence(evidence, { ts } = {}) {
+  const envelope = (evidence ?? []).find((e) => e.id === "process-lineage-edges" && e.status !== "unable");
+  if (!envelope) return [];
+  const edges = envelope.result?.edges ?? [];
+
+  const points = edges.map((edge) => {
+    const entityKey = buildLineageEntityKey(edge.parent_comm, edge.child_comm);
+    if (!entityKey) return undefined;
+    return {
+      ts,
+      fact_name: PROCESS_LINEAGE_EDGE_FACT_NAME,
+      entity_key: entityKey,
+      attributes: {},
+      source_envelope_id: envelope.id,
+      source_tool: envelope.trace?.tool,
+      sensitivity: "operational",
+    };
+  }).filter(Boolean);
+
+  if (envelope.status === "ok" || envelope.status === "warning") {
+    points.push({
+      ts,
+      fact_name: PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
+      entity_key: PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY,
+      attributes: { census_state: envelope.result?.truncated ? "partial" : "complete" },
+      source_envelope_id: envelope.id,
+      source_tool: envelope.trace?.tool,
+      sensitivity: "operational",
+      confidence: 0,
+    });
   }
   return points;
 }

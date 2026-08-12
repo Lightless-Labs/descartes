@@ -12,6 +12,7 @@ import { appendFactPoints, readFactPoints } from "./fact-store.js";
 import {
   factPointsFromNetworkEvidence,
   factPointsFromCanaryEvidence,
+  factPointsFromProcessLineageEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
   factPointsFromTailscaleStatusEvidence,
@@ -20,6 +21,7 @@ import {
 import { computeCorrelationCandidates } from "./incident-correlation.js";
 import { computePeerBaselineCandidates } from "./peer-baseline.js";
 import { computeServiceBaselineCandidates } from "./service-baseline.js";
+import { computeProcessLineageBaselineCandidates } from "./process-lineage-baseline.js";
 import { computeSessionBaselineCandidates } from "./session-baseline.js";
 import { computeCanaryBaselineCandidates } from "./canary-baseline.js";
 import { loadCanaryManifest } from "./canary-manifest.js";
@@ -27,7 +29,7 @@ import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
-import { collectProcessEvidence } from "./tools/processes.js";
+import { collectProcessEvidence, collectProcessLineageEvidence } from "./tools/processes.js";
 import { computeProvenanceIdentityCandidates } from "./tools/provenance-identity.js";
 import {
   collectProvenanceWarningsEvidence,
@@ -97,6 +99,7 @@ export function defaultDaemonProfile() {
         // but remains byte-identical for existing installations because an absent/empty manifest
         // produces no canary facts and the outer learned.json gate still controls this tick.
         canary: { enabled: true },
+        "process-lineage": { enabled: true },
       },
     },
     safety: {
@@ -268,6 +271,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     // Tailscale/tailnet sibling: pure read-only L0 fact source, no alert candidates.
     "tailscale-status": collectors["tailscale-status"] ?? collectTailscaleStatusEvidence,
     canary: collectors.canary ?? (() => collectCanaryEvidence([])),
+    "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
@@ -278,6 +282,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"]());
   if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"]());
   if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary());
+  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"]());
   return evidence;
 }
 
@@ -509,6 +514,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // extraCandidates and no census marker; vpn-peer-status remains the sole shared
             // availability/regime anchor, avoiding same-tick marker collision.
             ...factPointsFromTailscaleStatusEvidence(structuralEvidence, { ts }),
+            ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
@@ -603,6 +609,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // than aborting this whole extraCandidates array -- and therefore the entire daemon
           // tick, every alert family, not just canary.* -- the way an uncaught store error used to.
           ...await computeCanaryBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeProcessLineageBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace

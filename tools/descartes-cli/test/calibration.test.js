@@ -23,6 +23,7 @@ import { resolveNotificationDeliveryPaths } from "../src/notification-delivery.j
 import { resolveDescartesPaths } from "../src/paths.js";
 import { resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
 import { normalizeShadowRecord, resolveShadowStorePaths } from "../src/shadow-store.js";
+import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "../src/process-lineage-baseline.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-calibration-test-"));
@@ -150,9 +151,10 @@ test("attribution: session.*/peer.*/correlation.* -> rule_id, granularity family
     // addition (without it, this fixture would silently produce only 4 artifacts instead of 5).
     alert({ rule_id: "peer.count_drop", diagnostics: {} }),
     alert({ rule_id: "correlation.login_kill_proximity", diagnostics: {} }),
+    alert({ rule_id: PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, diagnostics: {} }),
   ];
   const report = computeCalibrationReport(alerts, [], [], []);
-  assert.equal(report.artifacts.length, 5);
+  assert.equal(report.artifacts.length, 6);
   for (const row of report.artifacts) {
     assert.equal(row.granularity, "family");
     assert.equal(row.artifact_ref, row.rule_id_family);

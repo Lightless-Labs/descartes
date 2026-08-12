@@ -23,6 +23,12 @@ the assumed landing order; (4) a fact-store shared-budget sizing note is added, 
 `MAX_LINEAGE_EDGES_PER_TICK` lowered from a bare provisional 500 to a precedent-justified 200. See
 each fix inline at its resolution point below.
 
+**Addendum:** 2026-08-12 — while closing a BOUNDED corrupt/missing-baseline-store fabrication gap
+in `process-lineage-baseline.js` (self-heal-and-immediately-fire; fixed with a persistent
+cold-start lockout), a CROSS-DETECTOR architectural gap was discovered one layer down, in
+`fact-store.js` itself, shared by every gap-1-shaped detector. Documented, not fixed, below — see
+"Known limitation — cross-detector history-completeness (fact-store corruption/retention)".
+
 ## Grounding read (what this plan mirrors)
 
 - `tools/descartes-cli/src/service-baseline.js` — the exact pattern gap 1 mirrors: stateless
@@ -826,6 +832,75 @@ constraint on HOW this plan gets executed, not a code change.
   doc's §2.0 scope box already marks OUT-OF-SCOPE (cloud IAM, Kubernetes RBAC, cluster velocity,
   outbound/ESTABLISHED-connection visibility). All three stay strictly inside "this host's own
   process table / service+job census / filesystem metadata."
+
+## Known limitation — cross-detector history-completeness (fact-store corruption/retention)
+
+**Status: design-only, NOT fixed here.** Discovered 2026-08-12 while closing a BOUNDED fabrication
+gap in `process-lineage-baseline.js` (a corrupt/missing persisted baseline store used to
+self-heal-and-immediately-fire instead of forcing a persistent cold-start re-accumulation — fixed
+in that file: `cold_start_pending`/`_reason`/`_since_ts` now survive across ticks until
+`minHistoryTickCount` genuinely new complete ticks have re-accumulated). That fix closes the
+baseline-store-level exposure. It does **not** close a related, structurally deeper exposure one
+layer down, in `fact-store.js` itself — and this is a CROSS-DETECTOR class of gap, not specific to
+process-lineage, so it needs its own dedicated design pass rather than a per-detector patch.
+
+**The gap:** `fact-store.js`'s `readJsonLines` (consumed by `readFactPoints`) drops any
+unparseable JSONL line *before* returning, reporting only a `corrupt_count` alongside the
+survivors. Separately, `enforceFactRetention` (called at the end of every `appendFactPoints`)
+rewrites `facts.jsonl` to only the records inside the retention window / byte budget, silently
+dropping everything else — including any corrupt lines it encountered on ITS OWN read of the file
+(`corrupt_dropped_count` is returned to the caller of `enforceFactRetention`, but that caller is
+whatever just appended new points, not the next detector to read the file; the signal does not
+travel forward). The net effect: by the time any detector calls `readFactPoints` for its own tick,
+the file it reads may already have been silently shortened by a PRIOR write's retention pass, with
+no `corrupt_count` at all on the read that matters (`corrupt_count:0`) — the detector has no way to
+tell "genuinely zero corruption ever" apart from "corruption already happened and was already
+compacted away by retention." A `corrupt_count:0` read is therefore not proof of a complete
+history; it only proves the CURRENT read had no unparseable lines, which is a weaker claim than
+every consuming detector's cold-start/established-count logic implicitly relies on.
+
+Separately, `readFactPoints` re-validates each surviving record through `normalizeFactPoint` and
+silently `.filter(Boolean)`-drops any that are parseable JSON but fail the fact-point schema (e.g.
+missing `fact_name`/`entity_key`) — with zero count, zero signal, not even folded into
+`corrupt_count`. This is a second, currently completely invisible, silent-truncation path.
+
+**Why this matters across detectors, not just process-lineage:** every novelty/baseline detector
+that reconstructs its "historical" set by re-reading the live fact-store window on each tick shares
+this exposure, because none of them can distinguish "this window is the complete, un-truncated
+history" from "retention/corruption already quietly shortened it, dropping exactly the older
+tick(s) that would have shown some entity/edge/session as already established." A silently
+shortened history makes a perfectly normal, long-standing fact look novel — the identical
+fabrication shape the BOUNDED fix above closes, but at the fact-store layer instead of the
+baseline-store layer, and not something any single detector's baseline-store fix can close on its
+own. Affected/exposed today: `process-lineage-baseline.js` (novel-edge), `service-baseline.js`
+(disappearance), `session-baseline.js` (churn/count-drop), `peer-baseline.js`
+(count-spike/count-drop), and the deception-canary detector family — every reader of
+`readFactPoints`.
+
+**Why not fixed here:** this is a fact-store-layer contract change (readers need a
+"was-this-history-truncated" signal that survives past a single `readFactPoints` call, and
+retention needs to either preserve or forward its own drop signal to future readers, not just the
+immediate writer) — it needs a dedicated design pass across every consumer, not a bolt-on inside
+one detector. Scope-bounding it out of this pass keeps the process-lineage fix reviewable and
+avoids a half-migrated fact-store contract landing underneath detectors that haven't been updated
+to use it yet.
+
+**Follow-on needed:** a dedicated `fact-store-completeness` design (new todo/plan) that gives
+`readFactPoints` (or a wrapping helper) a way to report "this window may be missing data due to
+past corruption/retention, not just this read's own corrupt_count" — likely a persisted
+high-water-mark of retention/corruption events in `fact-store.js`'s own state, surfaced to every
+caller — so a detector can fail closed (cold-start, same shape as the fix above) instead of
+fabricating novelty from a silently-shortened window. Until that lands, every detector in the list
+above remains exposed to this exact class of fabrication, independent of any per-detector
+baseline-store hardening.
+
+**Related host-local limit (schema-valid store forgery):** even with `process-lineage-baseline.js`'s
+`isValidProcessLineageBaselineStoreShape` now exact-schema (rejecting missing/foreign/out-of-range
+fields into cold-start), a root-capable local attacker who WRITES a crafted, schema-valid baseline
+store on the host can suppress this detector's cold-start (or otherwise seed its state) — this is
+an INHERENT host-local limit (the store is the attacker's own file to write), the same class of
+exposure as the cross-detector fact-store completeness gap above, and is addressed by the
+fleet/dead-man's-switch layer, not by any within-collector fix.
 
 ## Open questions (repeated from above, collected)
 

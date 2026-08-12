@@ -23,6 +23,7 @@ import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
+import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "../src/process-lineage-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -993,6 +994,26 @@ test("alertIntelligencePrompt still returns a string for exactly one valid metri
 test("(a) classifyAlertNamespace returns undefined (not 'baseline' or any other known namespace) for both session.* rule_ids", () => {
   assert.deepEqual(classifyAlertNamespace(SESSION_COUNT_DROP_RULE_ID), { namespace: undefined, hardExcluded: false });
   assert.deepEqual(classifyAlertNamespace(SESSION_CHURN_RULE_ID), { namespace: undefined, hardExcluded: false });
+});
+
+test("process.lineage.novel_edge is fail-closed and delivered deterministically without LLM adjudication", async () => {
+  assert.deepEqual(classifyAlertNamespace(PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID), { namespace: undefined, hardExcluded: false });
+  const paths = await tempPaths();
+  const deliveries = [];
+  const lineageAlert = alert({
+    id: "alert_process_lineage",
+    rule_id: PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+    severity: "warning",
+    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", first_seen_ts: "2026-07-14T00:00:00.000Z" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [lineageAlert], notification_due_ids: [lineageAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (_paths, decision, options) => { deliveries.push({ decision, options }); },
+  });
+  assert.deepEqual(result.fired, [lineageAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].options.ruleId, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID);
+  assert.match(deliveries[0].decision.body, /a1b2c3d4e5f6a7b8/);
 });
 
 test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAMESPACES enabled and one due session.count_drop, is no_eligible_alerts / excluded.unknown_namespace / zero LLM calls", async () => {

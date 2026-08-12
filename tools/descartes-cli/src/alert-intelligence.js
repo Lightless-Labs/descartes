@@ -5,6 +5,7 @@ import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
+import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -39,6 +40,7 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
   // identical deterministic local-delivery treatment or "tampering is suspicious in itself" would
   // silently never notify the operator, defeating the entire point of the fix.
   CANARY_TAMPERED_RULE_ID,
+  PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
@@ -508,6 +510,14 @@ function buildSessionAlertNotificationDecision(alert) {
       severity: "critical",
       title: "Descartes: canary tripped",
       body: `Canary "${displayCanaryId}" (${diagnostics.canary_kind}) tripped: ${diagnostics.trip_reason}.`,
+    };
+  }
+  if (alert?.rule_id === PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID) {
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: unexpected process lineage",
+      body: `Novel process spawn edge ${diagnostics.entity_key_hash} appeared.`,
     };
   }
   // Tamper fix (canary v0 finalization): "tampering is suspicious in itself" -- a manifest that
