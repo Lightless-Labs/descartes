@@ -4,6 +4,7 @@ import path from "node:path";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
+import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -30,6 +31,14 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
   PEER_COUNT_SPIKE_RULE_ID,
   PEER_COUNT_DROP_RULE_ID,
   SERVICE_DISAPPEARED_RULE_ID,
+  CANARY_TRIPPED_RULE_ID,
+  // Tamper fix (canary v0 finalization): canary.tampered is the SAME fail-closed
+  // canary.*-namespace posture as its sibling CANARY_TRIPPED_RULE_ID above (classifyAlertNamespace
+  // is UNTOUCHED by this fix -- "canary.tampered" fails the identical unknown_namespace path
+  // "canary.tripped" always has, so it can never reach LLM adjudication either) and needs the
+  // identical deterministic local-delivery treatment or "tampering is suspicious in itself" would
+  // silently never notify the operator, defeating the entire point of the fix.
+  CANARY_TAMPERED_RULE_ID,
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
@@ -374,13 +383,34 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   const deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
   const now = options.now ?? new Date().toISOString();
 
+  // Reliability fix (canary v0 finalization, FIX-B): this loop was previously a bare, unguarded
+  // `await deliverNotification(...)` -- a PRE-EXISTING general pattern shared by every rule_id in
+  // ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS (session.*/peer.*/service.disappeared), not something
+  // canary-specific. deliverNotificationDecision (notification-delivery.js) CAN throw on a genuine
+  // I/O failure (a non-ENOENT readNotificationDeliveryConfig failure, or an appendDeliveryAudit
+  // write failure -- ENOSPC/EACCES/EROFS/etc, itself uncaught inside that function). Left unguarded,
+  // a single alert's delivery failure propagated straight out of this function and, at daemon.js's
+  // call site (unlike its sibling safeAdjudicateAlertNotifications wrapper), all the way out of
+  // runDaemonIteration -- ABORTING THE ENTIRE TICK (every alert family, not just this one, plus the
+  // structural-checkpoint/status-write work already completed this tick going unreported). A single
+  // alert-family delivery I/O failure must DEGRADE (log + skip that one delivery), never abort the
+  // tick: catch here, per-alert, and continue to the next due alert. `canary.tampered` inherits this
+  // fix by virtue of sharing this exact loop (ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS), not via a
+  // canary-scoped special case -- a real daemon-robustness win for the whole family, not just canary.
   const fired = [];
+  const failed = [];
   for (const alert of dueSessionAlerts) {
     const decision = buildSessionAlertNotificationDecision(alert);
-    await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
-    fired.push(alert.id);
+    try {
+      await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
+      fired.push(alert.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
+      failed.push(alert.id);
+    }
   }
-  return { fired };
+  return { fired, failed };
 }
 
 // Counts/hash-only body (must-fix 3) for every branch EXCEPT service.disappeared: every field
@@ -469,6 +499,58 @@ function buildSessionAlertNotificationDecision(alert) {
       severity: "warning",
       title: "Descartes: service disappeared",
       body: `Service "${displayServiceName}" stopped appearing in the latest complete census (last seen ${diagnostics.last_seen_ts}).`,
+    };
+  }
+  if (alert?.rule_id === CANARY_TRIPPED_RULE_ID) {
+    const displayCanaryId = typeof diagnostics.canary_id === "string" ? diagnostics.canary_id : `unknown (${diagnostics.canary_id_hash})`;
+    return {
+      notify: true,
+      severity: "critical",
+      title: "Descartes: canary tripped",
+      body: `Canary "${displayCanaryId}" (${diagnostics.canary_kind}) tripped: ${diagnostics.trip_reason}.`,
+    };
+  }
+  // Tamper fix (canary v0 finalization): "tampering is suspicious in itself" -- a manifest that
+  // could not be read, a canary that vanished while still listed in the manifest, or a broken
+  // baseline store are each, on their own, evidence worth surfacing even though none of them is a
+  // real atime/mtime/executed OBSERVATION the way canary.tripped's body above is. The per-reason
+  // wording below intentionally names WHICH integrity check failed (matches this module's
+  // service.disappeared precedent of naming the concrete failure, not a generic "something's
+  // wrong") -- canary_vanished's `displayCanaryId` fallback mirrors canary.tripped's own
+  // degrade-not-fabricate object-fallback above for the identical reason (sanitizeIdentityString
+  // can degrade to a redaction-marker object, never a string).
+  if (alert?.rule_id === CANARY_TAMPERED_RULE_ID) {
+    const reason = diagnostics.tamper_reason;
+    if (reason === "canary_vanished") {
+      const displayCanaryId = typeof diagnostics.canary_id === "string" ? diagnostics.canary_id : `unknown (${diagnostics.canary_id_hash})`;
+      return {
+        notify: true,
+        severity: "critical",
+        title: "Descartes: canary tampering suspected",
+        body: `Canary "${displayCanaryId}" (${diagnostics.canary_kind}) vanished while still listed in the manifest (last seen ${diagnostics.last_seen_ts}) — possible tampering.`,
+      };
+    }
+    if (reason === "manifest_unreadable") {
+      return {
+        notify: true,
+        severity: "critical",
+        title: "Descartes: canary tampering suspected",
+        body: "The canary manifest (canaries.json) could not be read or parsed — possible tampering. Established canaries keep alerting off fact history in the meantime.",
+      };
+    }
+    if (reason === "baseline_store_error") {
+      return {
+        notify: true,
+        severity: "critical",
+        title: "Descartes: canary tampering suspected",
+        body: "The canary baseline store could not be read or written — possible tampering. Canary trip detection is unaffected; only bookkeeping counters are degraded.",
+      };
+    }
+    return {
+      notify: true,
+      severity: "critical",
+      title: "Descartes: canary tampering suspected",
+      body: `Canary integrity check failed: ${reason ?? "unknown"}.`,
     };
   }
   // Unreachable in normal operation (the caller already filters to

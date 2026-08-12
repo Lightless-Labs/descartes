@@ -11,6 +11,7 @@ import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
 import {
   factPointsFromNetworkEvidence,
+  factPointsFromCanaryEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
   factPointsFromTailscaleStatusEvidence,
@@ -20,6 +21,8 @@ import { computeCorrelationCandidates } from "./incident-correlation.js";
 import { computePeerBaselineCandidates } from "./peer-baseline.js";
 import { computeServiceBaselineCandidates } from "./service-baseline.js";
 import { computeSessionBaselineCandidates } from "./session-baseline.js";
+import { computeCanaryBaselineCandidates } from "./canary-baseline.js";
+import { loadCanaryManifest } from "./canary-manifest.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -37,6 +40,7 @@ import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
+import { collectCanaryEvidence } from "./tools/canary.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -89,6 +93,10 @@ export function defaultDaemonProfile() {
         // Pure read-only Tailscale/tailnet L0 fact source, default true under the same learned
         // kill switch and with no extraCandidates addition.
         "tailscale-status": { enabled: true },
+        // Canary collection is default-enabled like the other read-only structural collectors,
+        // but remains byte-identical for existing installations because an absent/empty manifest
+        // produces no canary facts and the outer learned.json gate still controls this tick.
+        canary: { enabled: true },
       },
     },
     safety: {
@@ -259,6 +267,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     "vpn-peer-status": collectors["vpn-peer-status"] ?? collectVpnPeerStatusEvidence,
     // Tailscale/tailnet sibling: pure read-only L0 fact source, no alert candidates.
     "tailscale-status": collectors["tailscale-status"] ?? collectTailscaleStatusEvidence,
+    canary: collectors.canary ?? (() => collectCanaryEvidence([])),
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
@@ -268,6 +277,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions());
   if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"]());
   if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"]());
+  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary());
   return evidence;
 }
 
@@ -445,8 +455,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       const structuralDue = nowMs - lastRunMs >= structuralProfile.interval_ms;
       if (structuralDue) {
         const deadlineMs = structuralProfile.deadline_ms ?? DEFAULT_STRUCTURAL_TICK_DEADLINE_MS;
+        let structuralCollectors = options.structuralCollectors;
+        if (structuralProfile.collectors?.canary?.enabled) {
+          const loadManifest = options.loadCanaryManifest ?? loadCanaryManifest;
+          const { canaries } = await loadManifest(descartesPaths);
+          structuralCollectors = {
+            ...structuralCollectors,
+            canary: structuralCollectors?.canary ?? (() => collectCanaryEvidence(canaries)),
+          };
+        }
         const outcome = await withDeadline(
-          collectStructuralEvidence(structuralProfile, options.structuralCollectors),
+          collectStructuralEvidence(structuralProfile, structuralCollectors),
           deadlineMs,
           () => STRUCTURAL_TICK_TIMED_OUT,
         );
@@ -466,6 +485,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // (learnedConfig.enabled)` block above) — never on a timed-out/partial tick, which
           // discards its evidence entirely rather than persisting a partial fact snapshot.
           const factPoints = [
+            ...factPointsFromCanaryEvidence(structuralEvidence, { ts }),
             ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
             ...factPointsFromNetworkEvidence(structuralEvidence, { ts }),
             // Slice S4, additive: structural provenance-warning evidence -> fact-points, same
@@ -575,6 +595,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // unknown_namespace (no classifyAlertNamespace branch), so it can never reach the LLM
           // adjudication path below regardless of enabled_namespaces.
           ...await computeServiceBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          // Slice 7.1: fs-only canary attribute trips over already-persisted canary facts. The
+          // collector itself is the only new host read; this detector is gated by learned.json,
+          // deterministic, critical, and unknown_namespace so it never reaches the LLM path.
+          // Tamper fix (canary v0 finalization): computeCanaryBaselineCandidates now catches and
+          // degrades every canary-baseline-store failure internally (never throws for one) rather
+          // than aborting this whole extraCandidates array -- and therefore the entire daemon
+          // tick, every alert family, not just canary.* -- the way an uncaught store error used to.
+          ...await computeCanaryBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace

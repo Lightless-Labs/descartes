@@ -12,6 +12,14 @@ response ladder — shippable without the Slice-7 authority/containment plane.
 **Status:** DRAFT — not yet implemented.
 **Reviewed:** 2026-08-11 (Fable + gpt-5.6-sol) — Fable GO_WITH_CHANGES (4 must-fixes, all folded
 below as design changes); sol UNAVAILABLE (no review produced, nothing to fold).
+**Addendum:** 2026-08-12 — two must-close findings on the (uncommitted) canary collector fixed:
+FIX-A (identity binding: `canary_id` alone is not enough to gate the baseline/trip comparison — a
+manifest path/sentinel_path edit or a canary_id reused for a different file could fabricate a trip;
+now bound to `canary_id` + `tools/canary.js`'s hashed `identity_fingerprint`) and FIX-B (a
+deterministic alert-delivery I/O failure inside `emitSessionAlertSignals` — a pre-existing general
+pattern shared by every rule_id in that loop, not canary-specific — could abort the entire daemon
+tick; now degrades per-alert instead). See "Known v0 limitations" below for the residual,
+inherent, fleet-addressed gaps recorded alongside this pass.
 
 ---
 
@@ -668,3 +676,49 @@ does not discover it mid-implementation:
 - No operator-facing `descartes canary status`/`list` CLI in v0 (§0) — worth adding once there's a
   real manifest in the wild to inspect; deliberately deferred to avoid building CLI ergonomics ahead
   of the underlying detector proving itself.
+
+---
+
+## Known v0 limitations (inherent host-local tamper — fleet-addressed)
+
+**Addendum:** 2026-08-12 — recorded alongside the identity-binding fix (FIX-A, below) closing the
+canary_id-reuse/path-edit fabrication gap and the delivery-abort fix (FIX-B) hardening
+`emitSessionAlertSignals`'s notification loop.
+
+A single, root-capable, host-local attacker who can already write both the canary files/manifest
+**and** the daemon's own state (`canary-baseline.json`) can always defeat a host-local-only
+detector — this is the same "the manifest is the attacker's own host-local file" class already
+named in §5/§7 above, not a new gap. The residuals below are inherent to a v0 with no host-local
+tamper-evidence primitive and no second, independent (fleet) observer; they are **not chased
+further in this collector** because the correct fix is architectural (a fleet dead-man's-switch +
+tamper-evidence design), not another local mitigation layered on top of a detector the attacker
+already controls:
+
+- **Per-entry manifest corruption.** `canary-manifest.js`'s `normalizeCanaryManifest` treats a
+  single malformed row inside an otherwise-valid `canaries.json` (missing/wrong-typed `id`/`path`,
+  an unrecognized `kind`, an empty/invalid `watch` array) as ordinary data-quality filtering —
+  `schema_valid: true`, `read_ok: true` — and silently drops that one entry rather than raising
+  `canary.tampered`. This is deliberate (§ the module's own `normalizeCanaryManifest` header
+  comment distinguishes top-level shape failures, which DO raise `manifest_unreadable`, from
+  per-entry drops, which don't) but means an attacker who can write `canaries.json` can
+  surgically decommission ONE canary (rather than the whole manifest) with no alert at all — the
+  same class as "the manifest is the attacker's own host-local file," just scoped to a single row
+  instead of the whole document.
+- **Delete a canary file AND its manifest entry together.** Indistinguishable from a legitimate
+  operator decommission by design (`detectCanaryVanished`'s `currentCanaryIds` gate) — see the
+  existing "legit decommission" test and §7's federation note; this is the intended,
+  already-documented fail-safe behavior of the manifest-gate, not an oversight.
+- **Delete `canaries.json` entirely.** Degrades to `ENOENT` → `{ canaries: [], read_ok: true }` (an
+  authoritative empty manifest, not a tamper signal) — already the documented behavior of
+  `loadCanaryManifest`'s ENOENT branch (distinct from a non-ENOENT read failure, which DOES raise
+  `manifest_unreadable`).
+- **Kill the daemon process itself.** No collector, no facts, no alert — outside any host-local
+  detector's reach by construction; the daemon cannot observe its own absence.
+
+**Defense:** all four residuals share the same root cause (a single host-local vantage point with
+no independent corroborating observer and no tamper-evident local state) and the same fix —
+`todos/2026-08-11-tamper-evidence-attestation-design.md`'s fleet/dead-man's-switch +
+tamper-evidence design, which gives a second, harder-to-simultaneously-compromise observer (the
+fleet) and a tamper-evident local attestation chain the attacker cannot silently roll back. Not
+built here; named so the fleet slice inherits these four residuals as its acceptance bar rather
+than rediscovering them.

@@ -17,6 +17,7 @@ import {
   resolveAlertIntelligencePaths,
   writeAlertIntelligenceConfig,
 } from "../src/alert-intelligence.js";
+import { CANARY_TAMPERED_RULE_ID } from "../src/canary-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -1142,6 +1143,38 @@ test("emitSessionAlertSignals: zero due ids -> [] with no deliverNotification ca
   });
   assert.deepEqual(result, { fired: [] });
   assert.equal(deliverCalled, false);
+});
+
+test("emitSessionAlertSignals: a throwing deliverNotification (I/O failure) DEGRADES that single delivery — never aborts the tick — and later due alerts still get delivered", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const tamperedAlert = alert({
+    id: "alert_canary_tampered",
+    rule_id: CANARY_TAMPERED_RULE_ID,
+    severity: "critical",
+    diagnostics: { tamper_reason: "manifest_unreadable" },
+  });
+  const okAlert = alert({
+    id: "alert_session_count_drop",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" },
+  });
+  const deliverNotification = async (descartesPaths, decision, opts) => {
+    if (opts.ruleId === CANARY_TAMPERED_RULE_ID) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    deliveries.push(opts);
+    return { status: "recorded" };
+  };
+  // Must not throw out of emitSessionAlertSignals itself.
+  const result = await emitSessionAlertSignals(
+    paths,
+    { alerts: [tamperedAlert, okAlert], notification_due_ids: [tamperedAlert.id, okAlert.id] },
+    { now: "2026-07-14T00:01:00.000Z", deliverNotification },
+  );
+  assert.deepEqual(result.fired, [okAlert.id], "the failing canary.tampered delivery is skipped, not fired");
+  assert.deepEqual(result.failed, [tamperedAlert.id]);
+  assert.equal(deliveries.length, 1, "the later due alert must still be delivered despite the earlier throw");
+  assert.equal(deliveries[0].ruleId, SESSION_COUNT_DROP_RULE_ID);
 });
 
 test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS matches the two session rule_ids exactly, both classifying to unknown_namespace", () => {

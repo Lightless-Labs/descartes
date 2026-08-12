@@ -32,6 +32,13 @@ export function sanitizeEntityKey(value) {
 export const SERVICE_CENSUS_FACT_NAME = "service.census";
 export const SERVICE_CENSUS_MARKER_ENTITY_KEY = "service.census-marker.v1";
 
+// Canary presence uses its own fact_name because operator-chosen ids are cleartext-sanitized and
+// could collide with the reserved census marker entity key. The marker is separate for the same
+// collision-avoidance reason as service.census.
+export const CANARY_PRESENCE_FACT_NAME = "canary.presence";
+export const CANARY_CENSUS_FACT_NAME = "canary.census";
+export const CANARY_CENSUS_MARKER_ENTITY_KEY = "canary.census-marker.v1";
+
 /**
  * services[] is NOT uniform across managers (grounded against tools/services.js):
  *   - systemd (parseSystemctlListUnits): {name, load, active, sub, description, failed,
@@ -105,6 +112,102 @@ function buildServiceCensusMarkerFactPoint(result, envelope, ts) {
     sensitivity: "operational",
     confidence: 0,
   };
+}
+
+export function factPointsFromCanaryEvidence(evidence, { ts } = {}) {
+  const envelope = (evidence ?? []).find((e) => e.id === "canary" && e.status !== "unable");
+  if (!envelope) return [];
+  const points = (envelope.result?.canaries ?? [])
+    .filter((canary) => canary?.status === "ok")
+    .map((canary) => {
+      const entityKey = sanitizeEntityKey(canary.id);
+      if (typeof entityKey !== "string" || !entityKey) return undefined;
+      const watch = Array.isArray(canary.watch) ? canary.watch : [];
+      // FIX-A (identity binding, canary v0 finalization): pass the collector's identity_fingerprint
+      // straight through as an attribute, unmodified — it is already a hash (tools/canary.js's
+      // canaryIdentityFingerprint), never a raw path, so no further sanitization is needed here.
+      // canary-baseline.js binds its trip comparison to (canary_id + this fingerprint) so a
+      // manifest path/sentinel_path edit, or a canary_id reused for a different underlying file,
+      // cannot fabricate a trip by comparing the OLD file's facts against the NEW file's under the
+      // same entity_key. Omitted (rather than included as an explicit `undefined`) when the
+      // collector didn't supply one (older/simplified evidence shapes) — normalizeAttributes in
+      // fact-store.js already drops undefined values, and canary-baseline.js's own snapshot/
+      // comparison logic degrades a missing fingerprint to "identity not verified, skip" rather
+      // than fabricating a match.
+      const identityFingerprint = typeof canary.identity_fingerprint === "string" && canary.identity_fingerprint
+        ? { identity_fingerprint: canary.identity_fingerprint }
+        : {};
+      return {
+        ts,
+        fact_name: CANARY_PRESENCE_FACT_NAME,
+        entity_key: entityKey,
+        attributes: {
+          atime: canary.atime,
+          mtime: canary.mtime,
+          ino: canary.ino,
+          size: canary.size,
+          executed: canary.executed,
+          kind: canary.kind,
+          watch: watch.join(","),
+          ...identityFingerprint,
+        },
+        source_envelope_id: envelope.id,
+        source_tool: envelope.trace?.tool,
+        sensitivity: "operational",
+      };
+    })
+    .filter(Boolean);
+
+  const totalCount = Number(envelope.result?.summary?.total_count);
+  if ((envelope.status === "ok" || envelope.status === "warning") && totalCount >= 1) {
+    // Degrade-not-fabricate (HIGH fix, canary collector review): a tick with even one
+    // unreadable canary (lstat EACCES etc.) must NOT be labelled "complete" — that canary is
+    // silently absent from `points` above (collectOneCanary never emitted a presence fact for
+    // it), so a "complete" marker here would let detectCanaryTrips's two-COMPLETE-group diff
+    // skip straight over the blackout tick, opening a one-tick evasion window for an attacker
+    // who times their atime/mtime change to land inside it. `envelope.status !== "ok"` is a
+    // second, independent guard (tools/canary.js already flips status to "warning" whenever
+    // unreadable_count>0, but this stays defensive against any future collector/fixture that
+    // decouples the two) — any of the signals below (including the execution-unknown check just
+    // past it) is enough to fall back to "partial", which EXCLUDES this tick from the
+    // clean-comparison set entirely, so the eventual two-COMPLETE-group diff spans the blackout
+    // and detects the attacker's change instead of missing it.
+    const unreadableCount = Number(envelope.result?.summary?.unreadable_count);
+    // P1 fix (canary collector review round 2): a per-canary EXECUTION-check failure (sentinel
+    // access() EACCES/etc, degraded by tools/canary.js to executed:"unknown") is exactly as
+    // much a this-tick read failure as an lstat "unreadable" canary — it must ALSO force this
+    // tick's census to "partial", or a real false->unknown->true execution spanning the
+    // blackout tick is lost: the blackout tick would wrongly stay in the two-COMPLETE-group
+    // comparison set, so detectCanaryTrips's previous/latest pair straddles it and never sees
+    // the false->true transition at all (unknown never trips on its own either — see
+    // canary-baseline.js's `previousSnapshot.executed === "false"` guard). Checked two ways,
+    // same defense-in-depth posture as the unreadable_count check above: the collector's own
+    // summary.execution_unknown_count (added alongside this fix) AND a direct scan of the
+    // per-canary records, so a fixture/future collector that populates one but not the other
+    // still degrades correctly.
+    const executionUnknownCount = Number(envelope.result?.summary?.execution_unknown_count);
+    const anyExecutionUnknown =
+      (Number.isFinite(executionUnknownCount) && executionUnknownCount > 0) ||
+      (Array.isArray(envelope.result?.canaries) && envelope.result.canaries.some((canary) => canary?.executed === "unknown"));
+    const isPartial =
+      Boolean(envelope.result?.truncated) ||
+      (Number.isFinite(unreadableCount) && unreadableCount > 0) ||
+      envelope.status !== "ok" ||
+      anyExecutionUnknown;
+    points.push({
+      ts,
+      fact_name: CANARY_CENSUS_FACT_NAME,
+      entity_key: CANARY_CENSUS_MARKER_ENTITY_KEY,
+      attributes: {
+        census_state: isPartial ? "partial" : "complete",
+      },
+      source_envelope_id: envelope.id,
+      source_tool: envelope.trace?.tool,
+      sensitivity: "operational",
+      confidence: 0,
+    });
+  }
+  return points;
 }
 
 /**

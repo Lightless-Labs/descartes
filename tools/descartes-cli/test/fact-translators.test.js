@@ -7,6 +7,7 @@ import {
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   factPointsFromNetworkEvidence,
+  factPointsFromCanaryEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
   factPointsFromTailscaleStatusEvidence,
@@ -824,4 +825,25 @@ test("factPointsFromVpnPeerEvidence: every persisted attribute is either a close
       assert(isClosedEnum, `attribute ${key}="${value}" is neither a closed-enum literal nor a 16-hex hash`);
     }
   }
+});
+
+test("factPointsFromCanaryEvidence persists executed/watch provenance and a non-empty census marker", () => {
+  const points = factPointsFromCanaryEvidence([envelope("canary", "collect_canary_evidence", {
+    summary: { total_count: 1 },
+    canaries: [{ id: "credential.bak", kind: "credential-file", status: "ok", atime: "a", mtime: "m", ino: "1", size: "2", executed: "true", watch: ["mtime", "executed"] }],
+  })], { ts: TS });
+  assert.equal(points[0].fact_name, "canary.presence");
+  assert.equal(points[0].attributes.executed, "true");
+  assert.equal(points[0].attributes.watch, "mtime,executed");
+  assert.equal(points[1].fact_name, "canary.census");
+  assert.equal(points[1].confidence, 0);
+});
+
+test("factPointsFromCanaryEvidence keeps empty manifests byte-identical at the fact layer", () => {
+  assert.deepEqual(factPointsFromCanaryEvidence([envelope("canary", "collect_canary_evidence", {
+    summary: { total_count: 0 }, canaries: [],
+  })]), []);
+  assert.deepEqual(factPointsFromCanaryEvidence([envelope("canary", "collect_canary_evidence", {
+    summary: { total_count: 1 }, canaries: [{ id: "blocked", status: "unreadable" }],
+  }, "warning")]).map((point) => point.fact_name), ["canary.census"]);
 });
