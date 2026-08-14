@@ -1,7 +1,7 @@
 ---
 title: Deception / canary collector (Slice 7.1 — defend/repel tier below containment)
 created: 2026-08-11
-status: pending
+status: completed  # shipped 2026-08-12 (11f94fb, canary v0)
 priority: high
 area: detection
 kind: todo

@@ -1,7 +1,7 @@
 ---
 title: Collector candidate — Tailscale / tailnet (network-identity + traffic patterns)
 created: 2026-08-11
-status: pending
+status: completed  # shipped 2026-08-12 (320f4c4)
 priority: medium
 area: collectors
 kind: todo

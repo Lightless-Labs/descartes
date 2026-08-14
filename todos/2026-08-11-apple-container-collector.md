@@ -1,7 +1,7 @@
 ---
 title: Collector candidate — apple/container (native Apple-Silicon containers)
 created: 2026-08-11
-status: pending
+status: completed  # shipped 2026-08-12 (3b6534f)
 priority: low
 area: collectors
 kind: todo
