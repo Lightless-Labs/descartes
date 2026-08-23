@@ -1,10 +1,38 @@
 # Descartes Handoff
 
-**Last updated:** 2026-07-23
+**Last updated:** 2026-08-23
 
 ## Current Status
 
-> **LIVE ENTRY POINT → jump to the `RESUME HERE (2026-07-23)` block below** for the current state + next-action options. It is the single authoritative pointer. Everything else in Current Status (the Active-priority block immediately below, the Layer A/B notes, the dated history/session-update blocks, and the later `## Suggested Next Action` / `## Start Here` sections) is initiative context or history — some of it stale; defer to the RESUME HERE block where they disagree.
+> **LIVE ENTRY POINT → the `RESUME HERE (2026-08-23)` block immediately below** is the single authoritative pointer for current state + next action. Everything after it (the Active-priority block, Layer A/B notes, the older `RESUME HERE (2026-07-23)` and dated history/session-update blocks, and the later `## Suggested Next Action` / `## Start Here` sections) is initiative context or history — some stale; defer to the 2026-08-23 block where they disagree.
+
+### RESUME HERE (2026-08-23) — ultracode session: 4 open threads parallelized; fact-store-completeness substrate is the serial ROOT, being built root-first.
+
+**What this session did (ultracode, luna-implements / `gpt-5.6-sol`-reviews split — the operator's validated cost tiering; Opus drafts the plans, cheap tier implements, sol adversarially reviews):** picked up the four remaining open threads and, rather than a flat fan-out, discovered they are entangled through the shared fact-store substrate — so they are being executed as a dependency graph, root-first.
+
+- **Phase 1 — 4 adversarially-reviewed dedicated plans, COMMITTED + PUSHED (`60691f1`).** Opus-drafted (high effort), gated (Opus for the 2 sensitive, Fable for the 2 detector plans), must-fixes folded. 3 of 4 came back NEEDS_REWORK. Plans: `docs/plans/2026-08-21-{fact-store-completeness-hardening,agent-intrusion-detection-gaps,slice-7.2-recommend-only-containment-surface,tamper-evidence-attestation-design}.md`.
+- **Phase 2 — completeness substrate Slices 0+1 COMMITTED + PUSHED (`e657ed6`).** The dependency ROOT: a durable integrity ledger (`tools/descartes-cli/src/fact-store-integrity.js` + `fact-store.js` `readFactPoints` gains an additive `completeness` field) that makes fact-history incompleteness OBSERVABLE and fail-closed, so novelty detectors can no longer fabricate a "first-ever" alert on a silently-shortened/tampered store. `intact` is reachable ONLY by positive proof; content-bound via sha256 committed-prefix digest. **luna implemented; sol reviewed across 4 rounds — 6 HIGH fabrication paths (round 1) → 4 (round 2, incl. a content-tamper hole the plan wrongly deferred → digest override, plan §2a addendum) → 2 (round 3) → OVERALL_SAFE (round 4).** This is the strongest validation yet of the luna/sol split: the main-loop's own read passed the substrate as fail-closed; sol found 12 real fabrication paths across the rounds. Suite 1349 pass / 0 fail / 34 skip at commit.
+- **Slice 2 IN FLIGHT** (trust helper `factHistoryTrustworthy` + `descartes learned status` completeness surfacing — also a serialization point). Then Slices 3–8 (per-detector adoption) parallelize on disjoint detector files.
+
+**The dependency graph (Phase 2 execution order):**
+```
+fact-store completeness  ──►  [substrate Slices 1+2]  ──►  detector-adoption 3–8 (parallel, disjoint detectors)
+   (serial ROOT, 0+1 done)          │
+                                     └─────────────────►  intrusion detectors (persistence + cred-file-access)
+Slice 7.2 containment  ── file-disjoint, SENSITIVE + open decisions  → HOLD for operator green-light
+tamper-evidence        ── design-only, open operator decisions       → not for implementation
+```
+
+**Deferred / documented:** **N4** (concurrent two-daemon-instance fact-store write race) — pre-existing, reachable only via a two-daemon misconfiguration (sol round-4 corrected an earlier "unreachable" claim: nothing enforces single-instance — installed service + a manual `daemon run --foreground` can race), cross-cutting. Documented in the plan §6 + `todos/2026-08-23-fact-store-concurrent-writer-locking.md`.
+
+**Genuine operator decisions surfaced by the plans (weigh when ready — not blocking the root build):**
+1. **Open Decision 5** (completeness plan §1b/§7): does the substrate HARD-BLOCK the intrusion detectors, or may they ship with the completeness gap documented (as `process-lineage` did)? Practically moot since the substrate is landing first.
+2. **Slice 7.2** — green-light to implement the recommend-only containment surface (mutates nothing; sensitive plane; has open withheld-verbs decision)?
+3. **Tamper-evidence** — design doc awaiting operator decisions; shelve until fleet work matures, or review now?
+
+**Next action:** finish Slice 2 (in flight) → land it (luna/sol) → fan out detector-adoption Slices 3–8 → then intrusion detectors → then the held threads per operator steer.
+
+**codex operational notes (this session):** use `codex exec -m gpt-5.6-luna` (impl, `-s workspace-write`) / `-m gpt-5.6-sol` (review, `-s read-only`), `-c 'model_reasoning_effort="high"|"xhigh"'`, and **append `< /dev/null`** — a launch without it hung at codex's "Reading additional input from stdin..." and died in an idle gap. Capture the final message with `-o <file>` (do NOT pipe to `tail`). A codex `workspace-write` run can reset UNTRACKED files in the tree mid-run (an in-progress todo vanished once) — commit/track new docs promptly.
 
 ### Active priority — self-learning stratified monitoring (2026-07-10)
 
