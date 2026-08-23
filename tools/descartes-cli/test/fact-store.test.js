@@ -108,6 +108,13 @@ test("appendFactPoints/readFactPoints round-trip", async () => {
   assert.deepEqual(points.map((p) => p.entity_key).sort(), ["nginx", "postgres"]);
 });
 
+test("appendFactPoints uses injected now as the explicit timestamp default", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: {} }], { now: "2026-07-10T00:00:00.000Z" });
+  const { points } = await readFactPoints(paths, { now: "2026-07-10T00:00:00.000Z" });
+  assert.equal(points[0].ts, "2026-07-10T00:00:00.000Z");
+});
+
 test("readFactPoints returns an empty result on ENOENT", async () => {
   const paths = await tempPaths();
   const { points, corrupt_count } = await readFactPoints(paths);
@@ -115,7 +122,7 @@ test("readFactPoints returns an empty result on ENOENT", async () => {
   assert.equal(corrupt_count, 0);
 });
 
-test("readFactPoints skips corrupt lines (counted) and drops invalid-schema records (not counted as corrupt)", async () => {
+test("readFactPoints skips corrupt lines and counts parseable schema-invalid records separately", async () => {
   const paths = await tempPaths();
   const storePaths = resolveFactStorePaths(paths);
   await fs.mkdir(storePaths.dir, { recursive: true });
@@ -126,8 +133,9 @@ test("readFactPoints skips corrupt lines (counted) and drops invalid-schema reco
     "",
   ].join("\n"));
 
-  const { points, corrupt_count } = await readFactPoints(paths);
+  const { points, corrupt_count, schema_invalid_count } = await readFactPoints(paths);
   assert.equal(corrupt_count, 1);
+  assert.equal(schema_invalid_count, 1);
   assert.equal(points.length, 1);
   assert.equal(points[0].entity_key, "nginx");
 });
