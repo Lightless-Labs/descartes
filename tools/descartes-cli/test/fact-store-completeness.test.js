@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { factHistoryTrustworthy } from "../src/fact-store-completeness.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-fact-completeness-test-"));
@@ -18,6 +19,88 @@ async function tempPaths() {
 }
 
 const NOW = "2026-08-21T00:00:00.000Z";
+
+const LOSS_CHANNELS = [
+  "last_corrupt_ts",
+  "last_schema_invalid_ts",
+  "last_bytecap_evict_ts",
+  "last_continuity_break_ts",
+];
+
+function cleanReadResult(overrides = {}) {
+  const { completeness: completenessOverrides, ...readOverrides } = overrides;
+  return {
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: {
+      status: "intact",
+      ...Object.fromEntries(LOSS_CHANNELS.map((channel) => [channel, null])),
+      ...completenessOverrides,
+    },
+    ...readOverrides,
+  };
+}
+
+test("factHistoryTrustworthy applies the fixed precedence and fails closed across loss channels", () => {
+  const anchorTs = "2026-08-21T00:00:10.000Z";
+  const after = "2026-08-21T00:00:11.000Z";
+  const before = "2026-08-21T00:00:09.000Z";
+  const cases = [
+    ["clean history", cleanReadResult(), {}, { trust: true, reason: "ok" }],
+    ["corrupt facts take precedence", cleanReadResult({ corrupt_count: 1, schema_invalid_count: 2 }), { anchorTs }, { trust: false, reason: "corrupt_facts_this_tick" }],
+    ["schema-invalid facts are second", cleanReadResult({ schema_invalid_count: 1 }), { anchorTs }, { trust: false, reason: "schema_invalid_this_tick" }],
+    ["unknown history is third", cleanReadResult({ completeness: { status: "unknown" } }), { anchorTs }, { trust: false, reason: "history_unknown" }],
+    ...LOSS_CHANNELS.map((channel) => [
+      `${channel} after anchor degrades history`,
+      cleanReadResult({ completeness: { [channel]: after } }),
+      { anchorTs },
+      { trust: false, reason: "history_degraded" },
+    ]),
+    ...LOSS_CHANNELS.map((channel) => [
+      `${channel} at or before anchor is already accounted for`,
+      cleanReadResult({ completeness: { status: "degraded", [channel]: before } }),
+      { anchorTs },
+      { trust: true, reason: "ok" },
+    ]),
+    ...LOSS_CHANNELS.map((channel) => [
+      `${channel} is a lockout without an anchor`,
+      cleanReadResult({ completeness: { [channel]: before } }),
+      { anchorTs: undefined },
+      { trust: false, reason: "history_degraded" },
+    ]),
+    ["stateless reads use their already-scoped intact status", cleanReadResult({ completeness: { last_corrupt_ts: before } }), {}, { trust: true, reason: "ok" }],
+    ["stateless degraded status is not trusted", cleanReadResult({ completeness: { status: "degraded", last_corrupt_ts: before } }), {}, { trust: false, reason: "history_degraded" }],
+  ];
+
+  for (const [name, readResult, opts, expected] of cases) {
+    assert.deepEqual(factHistoryTrustworthy(readResult, opts), expected, name);
+  }
+});
+
+test("factHistoryTrustworthy never trusts a legacy or malformed read shape", () => {
+  const legacy = { corrupt_count: 0, schema_invalid_count: 0 };
+  assert.doesNotThrow(() => factHistoryTrustworthy(legacy));
+  assert.deepEqual(factHistoryTrustworthy(legacy), { trust: false, reason: "history_unknown" });
+  assert.deepEqual(factHistoryTrustworthy(null), { trust: false, reason: "history_unknown" });
+  assert.deepEqual(factHistoryTrustworthy({
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "not-a-status" },
+  }), { trust: false, reason: "history_unknown" });
+});
+
+test("factHistoryTrustworthy permits recovery after a transient loss and blocks sustained loss", () => {
+  const lossTs = "2026-08-21T00:00:01.000Z";
+  const recovered = cleanReadResult({
+    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+  });
+  assert.deepEqual(factHistoryTrustworthy(recovered, { anchorTs: "2026-08-21T00:00:02.000Z" }), { trust: true, reason: "ok" });
+
+  const sustained = cleanReadResult({
+    completeness: { status: "degraded", last_bytecap_evict_ts: "2026-08-21T00:00:03.000Z" },
+  });
+  assert.deepEqual(factHistoryTrustworthy(sustained, { anchorTs: "2026-08-21T00:00:02.000Z" }), { trust: false, reason: "history_degraded" });
+});
 
 test("retention records corrupt-line loss durably and the next read is degraded", async () => {
   const paths = await tempPaths();

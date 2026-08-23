@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
+import { readFactPoints } from "./fact-store.js";
 
 export const SCHEMA_VERSION = 1;
 export const CONSTRAINT_STATUSES = ["draft", "shadow", "review-ready", "active", "retired"];
@@ -242,6 +243,42 @@ function renderLearnedConfigStatus(config, configFile) {
   return lines.join("\n");
 }
 
+function unknownFactStoreCompleteness() {
+  return {
+    status: "unknown",
+    corrupt_dropped_total: 0,
+    schema_invalid_dropped_total: 0,
+    bytecap_evicted_total: 0,
+    age_evicted_total: 0,
+    first_degraded_ts: null,
+    continuity_ok: null,
+  };
+}
+
+function selectFactStoreCompleteness(completeness) {
+  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) {
+    return unknownFactStoreCompleteness();
+  }
+  return {
+    status: ["intact", "degraded", "unknown"].includes(completeness.status) ? completeness.status : "unknown",
+    corrupt_dropped_total: Number.isInteger(completeness.corrupt_dropped_total) ? completeness.corrupt_dropped_total : 0,
+    schema_invalid_dropped_total: Number.isInteger(completeness.schema_invalid_dropped_total) ? completeness.schema_invalid_dropped_total : 0,
+    bytecap_evicted_total: Number.isInteger(completeness.bytecap_evicted_total) ? completeness.bytecap_evicted_total : 0,
+    age_evicted_total: Number.isInteger(completeness.age_evicted_total) ? completeness.age_evicted_total : 0,
+    first_degraded_ts: typeof completeness.first_degraded_ts === "string" ? completeness.first_degraded_ts : null,
+    continuity_ok: [true, false, null].includes(completeness.continuity_ok) ? completeness.continuity_ok : null,
+  };
+}
+
+async function readFactStoreCompleteness(descartesPaths) {
+  try {
+    const readResult = await readFactPoints(descartesPaths);
+    return selectFactStoreCompleteness(readResult?.completeness);
+  } catch {
+    return unknownFactStoreCompleteness();
+  }
+}
+
 /**
  * Shared implementation for the `descartes learned enable|disable|status` subcommands
  * (dispatched from index.js). `enable`/`disable` write configDir/learned.json's `enabled` field
@@ -275,9 +312,21 @@ export async function runLearnedConfigCommand(descartesPaths, subcommand, args, 
     throw new Error(`Unsupported learned command: ${subcommand}\n\n${learnedConfigUsage()}`);
   }
 
-  const result = { ...config, config_path: configFile };
+  const factStoreCompleteness = subcommand === "status"
+    ? await readFactStoreCompleteness(descartesPaths)
+    : undefined;
+  const result = {
+    ...config,
+    config_path: configFile,
+    ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
+  };
   if (json) output(JSON.stringify({ learned_config: result }, null, 2));
-  else output(renderLearnedConfigStatus(config, configFile));
+  else {
+    const statusText = renderLearnedConfigStatus(config, configFile);
+    output(factStoreCompleteness
+      ? `${statusText}\nFact-store completeness: ${factStoreCompleteness.status}`
+      : statusText);
+  }
   return result;
 }
 

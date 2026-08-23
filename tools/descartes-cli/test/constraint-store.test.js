@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
+import { appendFactPoints } from "../src/fact-store.js";
 import { isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import {
   DEFAULT_SOAK_DAYS,
@@ -322,6 +323,52 @@ test("descartes learned enable/disable/status --json print machine-readable payl
   await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => statusLines.push(line) });
   const statusPayload = JSON.parse(statusLines[0]);
   assert.equal(statusPayload.learned_config.enabled, true);
+});
+
+test("descartes learned status --json includes counts-and-timestamps-only fact-store completeness", async () => {
+  const paths = await tempPaths();
+  const now = "2026-07-11T00:00:00.000Z";
+  await appendFactPoints(paths, [{
+    ts: now,
+    fact_name: "service.presence",
+    entity_key: "nginx",
+    attributes: {},
+  }], { now });
+  await appendFactPoints(paths, [], { now });
+
+  const lines = [];
+  await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => lines.push(line) });
+  const payload = JSON.parse(lines[0]);
+  const completeness = payload.learned_config.fact_store_completeness;
+
+  assert.deepEqual(Object.keys(completeness).sort(), [
+    "age_evicted_total",
+    "bytecap_evicted_total",
+    "continuity_ok",
+    "corrupt_dropped_total",
+    "first_degraded_ts",
+    "schema_invalid_dropped_total",
+    "status",
+  ].sort());
+  assert.equal(completeness.status, "intact");
+  assert.equal(completeness.corrupt_dropped_total, 0);
+  assert.equal(completeness.schema_invalid_dropped_total, 0);
+  assert.equal(completeness.bytecap_evicted_total, 0);
+  assert.equal(completeness.age_evicted_total, 0);
+  assert.equal(completeness.first_degraded_ts, null);
+  assert.equal(completeness.continuity_ok, true);
+  for (const identityField of ["entity_key", "fact_name", "attributes", "generation", "source_tool", "sensitivity"]) {
+    assert.equal(JSON.stringify(completeness).includes(identityField), false, `identity field leaked: ${identityField}`);
+  }
+});
+
+test("descartes learned status --json degrades to unknown when fact history was never enabled", async () => {
+  const paths = await tempPaths();
+  const lines = [];
+  await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => lines.push(line) });
+  const completeness = JSON.parse(lines[0]).learned_config.fact_store_completeness;
+  assert.equal(completeness.status, "unknown");
+  assert.equal(completeness.continuity_ok, null);
 });
 
 test("descartes learned status never mutates learned.json (read-only)", async () => {
