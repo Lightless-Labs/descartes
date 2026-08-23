@@ -39,7 +39,7 @@ import { PEER_CENSUS_MARKER_ENTITY_KEY, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
-import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore } from "../src/service-baseline.js";
+import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, loadProcessLineageBaselineStore, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
@@ -2831,7 +2831,15 @@ function serviceDisappearanceFixtureFactPoints({ presentEntity = "worker.service
 test("Service-disappearance wiring: computeServiceBaselineCandidates is the daemon's seventh extraCandidates entry — a pre-seeded service census with a service missing from the latest complete census produces a real, sanitized service.disappeared alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 6) gave service-baseline.js its own persistent
+  // cold-start lockout, mirroring process-lineage-baseline.js's/session-baseline.js's/
+  // peer-baseline.js's — see the "Process-lineage wiring" test above for the identical rationale.
+  // Pre-establish the store (this wiring test is about the daemon pipeline, not the lockout, which
+  // has its own dedicated coverage in service-baseline.test.js) and confirm the shared integrity
+  // ledger to 'intact' before the tick.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   await appendFactPoints(paths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SERVICE_DISAPPEARED_RULE_ID);
@@ -2898,11 +2906,17 @@ test("Service-disappearance wiring, single-source-of-truth: a service.disappeare
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
+  // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout and confirm
+  // the shared integrity ledger to 'intact' (see the "Service-disappearance wiring" test above for
+  // the identical rationale) — this pair of tests is about the shared activeFreshnessMs boundary,
+  // not the lockout.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [
     ...serviceDisappearanceFixtureFactPoints(),
     { ts: hour(30), fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ];
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   // now = shared latest ts (hour(30)) + 4h; activeFreshnessMs = 3 × DEFAULT_STRUCTURAL_INTERVAL_MS
   // (1h) = 3h (slice6Profile carries no `structural.interval_ms`, so runDaemonIteration resolves
@@ -2923,11 +2937,17 @@ test("Service-disappearance wiring, single-source-of-truth: a 1h-old service.dis
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
+  // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout and confirm
+  // the shared integrity ledger to 'intact' (see the "Service-disappearance wiring" test above for
+  // the identical rationale) — this pair of tests is about the shared activeFreshnessMs boundary,
+  // not the lockout.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [
     ...serviceDisappearanceFixtureFactPoints(),
     { ts: hour(30), fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ];
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const freshNow = new Date(Date.parse(hour(30)) + 60 * 60 * 1000).toISOString();
   const result = await runDaemonIteration(paths, {

@@ -13,6 +13,7 @@ import {
   DEFAULT_BASELINE_FACT_WINDOW_MS,
   DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT,
   DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS,
+  DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT,
   SERVICE_DISAPPEARED_RULE_ID,
   buildDisappearedCandidates,
   computeServiceBaselineCandidates,
@@ -89,11 +90,51 @@ function establishedTicks(entityKeys, count = DEFAULT_SERVICE_ESTABLISHED_MIN_CE
   return ticks;
 }
 
+// Fact-store completeness hardening (Slice 6) fixtures, mirroring session-baseline.test.js's/
+// peer-baseline.test.js's own intactReadResult/degradedReadResult exactly -- injected via
+// options.readFactPoints so the dedicated cold-start tests below don't need to fabricate real
+// ledger corruption/eviction.
+function intactReadResult(points) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "intact" },
+  };
+}
+
+function degradedReadResult(points, lossTs = tickTs(2)) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+  };
+}
+
 async function seedAndCompute(paths, points, options = {}) {
   const lastTs = points.reduce((max, p) => Math.max(max, new Date(p.ts).getTime()), 0);
   const now = options.now ?? new Date(lastTs).toISOString();
   await writeLearnedConfig(paths, { enabled: true });
+  // Slice 6 (fact-store completeness hardening) gave service-baseline.js its own persistent
+  // cold-start lockout, mirroring process-lineage-baseline.js's/session-baseline.js's/
+  // peer-baseline.js's: a brand-new store starts cold_start_pending, and a single one-shot
+  // append+compute call (exactly this helper's shape) can never itself satisfy re-establishment
+  // (all of `points`' history necessarily predates the anchor a fresh lockout would set on its own
+  // first read). Every test below this helper predates Slice 6 and is about service-baseline's
+  // OTHER logic (set-diff detection, tick-disposition skips, ...), not the lockout itself -- so,
+  // mirroring session-baseline.test.js's/peer-baseline.test.js's own precedent of pre-seeding
+  // cold_start_pending:false before wiring/candidate-shape tests, this helper pre-establishes the
+  // store (anchored strictly before the fixture's own earliest point) and confirms the shared
+  // integrity ledger to 'intact' (a fresh ledger's first retention pass is deliberately 'unknown' --
+  // bootstrap anti-laundering rule; a second clean pass confirms it) so callers keep exercising
+  // exactly what they always tested. The lockout mechanism itself has its own dedicated coverage
+  // further down in this file.
+  const firstTs = points.reduce((min, p) => Math.min(min, new Date(p.ts).getTime()), Infinity);
+  const establishedAnchor = Number.isFinite(firstTs) ? new Date(firstTs - 1).toISOString() : now;
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: establishedAnchor });
   await appendFactPoints(paths, points, { now });
+  await appendFactPoints(paths, [], { now });
   return computeServiceBaselineCandidates(paths, { now, ...options });
 }
 
@@ -105,26 +146,47 @@ function expectedHash(entityKey) {
 // Store I/O.
 // ---------------------------------------------------------------------------------------------
 
-test("loadServiceBaselineStore: ENOENT yields fresh state with corrupt:false", async () => {
+// Fact-store completeness hardening (Slice 6): freshServiceBaselineState/normalizeServiceBaselineState
+// now also carry the persistent cold-start lockout's three fields, defaulting fail-closed.
+const FRESH_STATE_DEFAULTS = { cold_start_pending: true, cold_start_reason: undefined, cold_start_since_ts: undefined };
+
+test("loadServiceBaselineStore: ENOENT yields fresh state with corrupt:false, missing:true, and a cold-start-pending lockout tagged 'missing_store'", async () => {
   const paths = await tempPaths();
-  const { state, corrupt } = await loadServiceBaselineStore(paths);
+  const { state, corrupt, missing } = await loadServiceBaselineStore(paths);
   assert.equal(corrupt, false);
-  assert.deepEqual(state, { version: 1, last_folded_ts: undefined, skipped_partial_tick_count: 0, disappearance_event_count: 0 });
+  assert.equal(missing, true);
+  assert.deepEqual(state, {
+    version: 1,
+    last_folded_ts: undefined,
+    skipped_partial_tick_count: 0,
+    disappearance_event_count: 0,
+    ...FRESH_STATE_DEFAULTS,
+    cold_start_reason: "missing_store",
+  });
 });
 
-test("loadServiceBaselineStore: corrupt JSON yields fresh state with corrupt:true, never throws", async () => {
+test("loadServiceBaselineStore: corrupt JSON yields fresh state with corrupt:true, missing:false, never throws, and a cold-start-pending lockout tagged 'corrupt_store'", async () => {
   const paths = await tempPaths();
   const { dir, storeFile } = resolveServiceBaselineStorePaths(paths);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   await fs.writeFile(storeFile, "{not valid json", { mode: 0o600 });
-  const { state, corrupt } = await loadServiceBaselineStore(paths);
+  const { state, corrupt, missing } = await loadServiceBaselineStore(paths);
   assert.equal(corrupt, true);
+  assert.equal(missing, false);
   assert.equal(state.disappearance_event_count, 0);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_reason, "corrupt_store");
 });
 
 test("writeServiceBaselineStore: atomic write leaves no tmp file behind and the final file is 0o600", async () => {
   const paths = await tempPaths();
-  await writeServiceBaselineStore(paths, { version: 1, last_folded_ts: tickTs(0), skipped_partial_tick_count: 0, disappearance_event_count: 1 });
+  await writeServiceBaselineStore(paths, {
+    version: 1,
+    last_folded_ts: tickTs(0),
+    skipped_partial_tick_count: 0,
+    disappearance_event_count: 1,
+    cold_start_pending: false,
+  });
   const { dir, storeFile } = resolveServiceBaselineStorePaths(paths);
   const entries = await fs.readdir(dir);
   assert.ok(!entries.some((name) => name.endsWith(".tmp")), "no tmp file should remain after a successful write");
@@ -132,19 +194,56 @@ test("writeServiceBaselineStore: atomic write leaves no tmp file behind and the 
   assert.equal(stat.mode & 0o777, 0o600);
 });
 
+test("writeServiceBaselineStore: a store persisted with cold_start_pending:true and no anchor gets a real cold_start_since_ts synthesized at write time (FAIL-SAFE against the Infinity re-establishment-boundary trap)", async () => {
+  const paths = await tempPaths();
+  const written = await writeServiceBaselineStore(paths, { last_folded_ts: tickTs(0) }); // cold_start_pending defaults true, no since_ts supplied
+  assert.equal(written.cold_start_pending, true);
+  assert.equal(typeof written.cold_start_since_ts, "string");
+  assert.ok(Number.isFinite(new Date(written.cold_start_since_ts).getTime()));
+  const { state } = await loadServiceBaselineStore(paths);
+  assert.equal(state.cold_start_since_ts, written.cold_start_since_ts);
+});
+
 test("normalizeServiceBaselineState: rejects malformed shapes field-by-field, falling back to safe defaults", () => {
-  assert.deepEqual(normalizeServiceBaselineState(undefined), { version: 1, last_folded_ts: undefined, skipped_partial_tick_count: 0, disappearance_event_count: 0 });
-  assert.deepEqual(normalizeServiceBaselineState(null), { version: 1, last_folded_ts: undefined, skipped_partial_tick_count: 0, disappearance_event_count: 0 });
-  assert.deepEqual(normalizeServiceBaselineState([1, 2, 3]), { version: 1, last_folded_ts: undefined, skipped_partial_tick_count: 0, disappearance_event_count: 0 });
+  const freshExpected = {
+    version: 1,
+    last_folded_ts: undefined,
+    skipped_partial_tick_count: 0,
+    disappearance_event_count: 0,
+    ...FRESH_STATE_DEFAULTS,
+  };
+  assert.deepEqual(normalizeServiceBaselineState(undefined), freshExpected);
+  assert.deepEqual(normalizeServiceBaselineState(null), freshExpected);
+  assert.deepEqual(normalizeServiceBaselineState([1, 2, 3]), freshExpected);
   const normalized = normalizeServiceBaselineState({
     version: 99,
     last_folded_ts: 12345, // wrong type -> undefined
     skipped_partial_tick_count: "not a number", // -> 0
     disappearance_event_count: Number.NaN, // -> 0
+    cold_start_pending: "not a boolean", // fail-closed idiom: anything but literal false -> pending
+    cold_start_reason: 42, // wrong type -> undefined
+    cold_start_since_ts: 12345, // wrong type -> undefined
   });
-  assert.deepEqual(normalized, { version: 1, last_folded_ts: undefined, skipped_partial_tick_count: 0, disappearance_event_count: 0 });
+  assert.deepEqual(normalized, freshExpected);
   const valid = normalizeServiceBaselineState({ last_folded_ts: tickTs(3), skipped_partial_tick_count: 2, disappearance_event_count: 5 });
-  assert.deepEqual(valid, { version: 1, last_folded_ts: tickTs(3), skipped_partial_tick_count: 2, disappearance_event_count: 5 });
+  assert.deepEqual(valid, { version: 1, last_folded_ts: tickTs(3), skipped_partial_tick_count: 2, disappearance_event_count: 5, ...FRESH_STATE_DEFAULTS });
+});
+
+test("normalizeServiceBaselineState: cold_start_pending is trusted false ONLY when explicitly and validly recorded as such (fail-closed idiom, mirrors process-lineage/session/peer)", () => {
+  const established = normalizeServiceBaselineState({
+    last_folded_ts: tickTs(3),
+    cold_start_pending: false,
+    cold_start_reason: undefined,
+    cold_start_since_ts: tickTs(0),
+  });
+  assert.equal(established.cold_start_pending, false);
+  assert.equal(established.cold_start_since_ts, tickTs(0));
+
+  // Any non-literal-false value -- missing, non-boolean, or explicit true -- stays pending.
+  assert.equal(normalizeServiceBaselineState({}).cold_start_pending, true);
+  assert.equal(normalizeServiceBaselineState({ cold_start_pending: true }).cold_start_pending, true);
+  assert.equal(normalizeServiceBaselineState({ cold_start_pending: "false" }).cold_start_pending, true);
+  assert.equal(normalizeServiceBaselineState({ cold_start_pending: 0 }).cold_start_pending, true);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -371,7 +470,12 @@ test("computeServiceBaselineCandidates: store write is skipped on a tick with ze
   const ticks = [...establishedTicks(["svc-a"], 3), completeTick(tickTs(3), [])];
   const now = tickTs(3);
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout (this test
+  // is about the write-skip/at-most-one-write convention, not the lockout, which has its own
+  // dedicated coverage further down) and confirm the shared integrity ledger to 'intact'.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, flatten(ticks), { now });
+  await appendFactPoints(paths, [], { now });
 
   let writeCount = 0;
   const countingWrite = async (descartesPaths, state) => {
@@ -395,7 +499,12 @@ test("fold-time-only counter increment (Stage 1 review must-fix 3): disappearanc
   const ticks = [...establishedTicks(["svc-a"], 3), completeTick(tickTs(3), [])]; // svc-a disappears at tick 3
   const now = tickTs(3);
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout (this test
+  // is about the fold-time-only counter convention, not the lockout) and confirm the shared
+  // integrity ledger to 'intact'.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, flatten(ticks), { now });
+  await appendFactPoints(paths, [], { now });
 
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
 
@@ -421,7 +530,12 @@ test("fold-time-only counter increment: skipped_partial_tick_count increments ex
   const ticks = [...establishedTicks(["svc-a"], 3), partialTick(tickTs(3), ["svc-a"])];
   const now = tickTs(3);
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout and confirm
+  // the shared integrity ledger to 'intact' (see the "disappearance_event_count" fold-time test
+  // above for the identical rationale).
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, flatten(ticks), { now });
+  await appendFactPoints(paths, [], { now });
 
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
   for (let i = 0; i < 4; i += 1) {
@@ -436,7 +550,12 @@ test("re-emission every call: candidate list is rebuilt fresh from the current w
   const ticks = [...establishedTicks(["svc-a"], 3), completeTick(tickTs(3), [])];
   const now = tickTs(3);
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout and confirm
+  // the shared integrity ledger to 'intact' (see the fold-time tests above for the identical
+  // rationale) — this test is about re-emission, not the lockout.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, flatten(ticks), { now });
+  await appendFactPoints(paths, [], { now });
 
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
   const first = await computeServiceBaselineCandidates(paths, commonOptions);
@@ -474,8 +593,184 @@ test("computeServiceBaselineCandidates: readFactPoints window bound is threaded 
   assert.deepEqual(points, []);
 });
 
-test("DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT / DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS / DEFAULT_BASELINE_FACT_WINDOW_MS are positive finite constants", () => {
-  for (const value of [DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT, DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS, DEFAULT_BASELINE_FACT_WINDOW_MS]) {
+test("DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT / DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS / DEFAULT_BASELINE_FACT_WINDOW_MS / DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT are positive finite constants", () => {
+  for (const value of [DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT, DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS, DEFAULT_BASELINE_FACT_WINDOW_MS, DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT]) {
     assert(Number.isFinite(value) && value > 0);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store completeness hardening (Slice 6): persistent cold-start lockout.
+// docs/plans/2026-08-21-fact-store-completeness-hardening.md, "Required test in every one of
+// Slices 3-7" + the per-detector migration test. Mirrors session-baseline.test.js's/
+// peer-baseline.test.js's own dedicated cold-start coverage exactly, adapted to service-baseline's
+// set-diff disappearance shape.
+// ---------------------------------------------------------------------------------------------
+
+// 30 complete censuses in which "svc-a" is present (establishing it, default minEstablishedCount is
+// 3), then a 31st complete census in which it is missing -- would fire service.disappeared if the
+// retained history were trusted (mirrors test/daemon.test.js's own serviceDisappearanceFixtureFactPoints).
+function disappearanceFixturePoints() {
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), ["svc-a"]));
+  ticks.push(completeTick(tickTs(30), []));
+  return flatten(ticks);
+}
+
+test("computeServiceBaselineCandidates: degraded truncated history suppresses a fabricated service.disappeared (an established service must not read as vanished just because retention scrubbed the history that would have shown it as present)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const points = disappearanceFixturePoints();
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(30),
+    minHistoryTickCount,
+    freshnessMs: HOUR_MS,
+    readFactPoints: async () => degradedReadResult(points, tickTs(30)),
+  });
+
+  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a service.disappeared claim");
+  const { state } = await loadServiceBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+});
+
+test("computeServiceBaselineCandidates: intact history control still fires a real service.disappeared (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const points = disappearanceFixturePoints();
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(30),
+    freshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  const disappearedCandidates = result.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID);
+  assert.equal(disappearedCandidates.length, 1, "an intact store must not be falsely suppressed");
+});
+
+test("computeServiceBaselineCandidates: one transient fact-history loss recovers after minHistoryTickCount genuinely-new clean ticks (recovery-latch fix, bounded not permanent)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = flatten(establishedTicks(["svc-a"], 3)); // ticks 0,1,2: svc-a established
+  let readResult = degradedReadResult([], tickTs(3));
+  const options = { minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS, readFactPoints: async () => ({ ...readResult, points }) };
+
+  // Loss tick: svc-a would disappear here -- would fire if trusted.
+  points = [...points, ...completeTick(tickTs(3), [])];
+  const lossTick = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(3) });
+  assert.deepEqual(lossTick, []);
+
+  readResult = intactReadResult([]);
+  points = [...points, ...completeTick(tickTs(4), [])]; // 1st re-accum tick (still absent)
+  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(4) }), []);
+
+  points = [...points, ...completeTick(tickTs(5), [])]; // 2nd re-accum tick (still absent)
+  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(5) }), []);
+  assert.equal((await loadServiceBaselineStore(paths)).state.cold_start_pending, false);
+
+  // A genuinely new disappearance after re-establishment must fire normally: svc-a reappears
+  // (tick 6), is present again (tick 7, keeping its already-established sighting count from ticks
+  // 0-2 well above minEstablishedCount), then genuinely vanishes again (tick 8).
+  points = [...points, ...completeTick(tickTs(6), ["svc-a"])];
+  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(6) }), []);
+  points = [...points, ...completeTick(tickTs(7), ["svc-a"])];
+  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(7) }), []);
+  points = [...points, ...completeTick(tickTs(8), [])];
+  const resumed = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(8) });
+  const disappearedCandidates = resumed.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID);
+  assert.equal(disappearedCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+  assert.equal(disappearedCandidates[0].diagnostics.service_name, "svc-a");
+});
+
+test("computeServiceBaselineCandidates: a clean tick cannot self-heal and fire service.disappeared in the same breath fact-history loss is first observed on the prior tick", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // ticks 0-2: svc-a established. tick 3: a normal complete tick (svc-a still present) observed
+  // under a DEGRADED read -- arms the lockout, but carries no disappearance transition of its own
+  // (nothing to suppress there beyond the arming itself).
+  let points = [...flatten(establishedTicks(["svc-a"], 3)), ...completeTick(tickTs(3), ["svc-a"])];
+  let readResult = degradedReadResult(points, tickTs(3));
+  const options = { minHistoryTickCount: 1, establishedMinCensusCount: 3, freshnessMs: HOUR_MS, readFactPoints: async () => ({ ...readResult, points }) };
+
+  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+
+  // Tick 4 is BOTH (a) the first genuinely-new clean tick past the tick-3 anchor -- satisfying
+  // minHistoryTickCount:1 and flipping cold_start_pending false in the persisted store by the end
+  // of this call -- AND (b) a tick where svc-a genuinely disappears (previous=tick3 present,
+  // latest=tick4 absent), i.e. a REAL disappearance candidate that a same-tick self-heal-and-fire
+  // bug (gating on the POST-update cold_start_pending instead of the pre-update
+  // coldStartPendingThisTick) would incorrectly let through.
+  points = [...points, ...completeTick(tickTs(4), [])];
+  readResult = intactReadResult([]);
+  assert.deepEqual(
+    await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    [],
+    "the first clean tick after loss may re-establish state but must not emit novelty in the same tick, even though a real disappearance transition exists on this exact tick",
+  );
+  assert.equal((await loadServiceBaselineStore(paths)).state.cold_start_pending, false);
+});
+
+test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-starts once on first read, then recovers after minHistoryTickCount clean ticks (per-detector P8 analog)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+
+  // Simulate a store written by a pre-Slice-6 daemon: no cold_start_pending/_reason/_since_ts at
+  // all -- written directly to disk, bypassing writeServiceBaselineStore's normalizer entirely.
+  const { dir, storeFile } = resolveServiceBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const legacyState = {
+    version: 1,
+    last_folded_ts: tickTs(-1),
+    skipped_partial_tick_count: 0,
+    disappearance_event_count: 0,
+  };
+  await fs.writeFile(storeFile, JSON.stringify(legacyState, null, 2), { mode: 0o600 });
+
+  const ticks = flatten(establishedTicks(["svc-a"], 5)); // ticks 0-4: svc-a established
+  await appendFactPoints(paths, ticks, { now: tickTs(4) });
+  await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
+
+  // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
+  // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
+  // must not be trusted just because it parses. A bounded, one-time cold-start is required.
+  const firstRead = await computeServiceBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
+  assert.deepEqual(firstRead, []);
+  const afterFirst = (await loadServiceBaselineStore(paths)).state;
+  assert.equal(afterFirst.cold_start_pending, true);
+  assert.equal(
+    typeof afterFirst.cold_start_since_ts,
+    "string",
+    "the migration must synthesize a real anchor, never leave it undefined (the Infinity re-establishment-boundary trap)",
+  );
+  assert.ok(Number.isFinite(new Date(afterFirst.cold_start_since_ts).getTime()));
+
+  // minHistoryTickCount genuinely-new clean ticks after the migration anchor re-establish trust.
+  let hour = 5;
+  for (let i = 0; i < minHistoryTickCount; i += 1) {
+    const ts = tickTs(hour);
+    await appendFactPoints(paths, completeTick(ts, ["svc-a"]), { now: ts });
+    await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
+    hour += 1;
+  }
+  assert.equal(
+    (await loadServiceBaselineStore(paths)).state.cold_start_pending,
+    false,
+    "the migration cold-start must be bounded -- it clears after minHistoryTickCount genuinely-new clean ticks, never latching forever",
+  );
+
+  // And service.disappeared novelty genuinely resumes afterward.
+  const ts = tickTs(hour);
+  await appendFactPoints(paths, completeTick(ts, []), { now: ts }); // svc-a genuinely vanishes
+  const resumed = await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
+  assert.equal(resumed.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1);
 });

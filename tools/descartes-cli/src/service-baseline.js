@@ -38,6 +38,7 @@ import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
@@ -67,6 +68,15 @@ export const DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT = 3;
 // computeActiveConstraintCandidates, so this fallback is never load-bearing in production.
 export const DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
 
+// Fact-store completeness hardening (docs/plans/2026-08-21-fact-store-completeness-hardening.md,
+// Slice 6): the number of genuinely-new, complete (censusState === "complete") tick-groups that
+// must accumulate strictly AFTER a cold-start lockout's cold_start_since_ts anchor before the
+// lockout clears and service.disappeared novelty resumes. Mirrors session-baseline.js's
+// DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT / peer-baseline.js's DEFAULT_PEER_MIN_HISTORY_TICK_COUNT /
+// process-lineage-baseline.js's DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT exactly -- independently
+// defined, not imported, per each detector owning its own re-establishment tuning.
+export const DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT = 6;
+
 // ---------------------------------------------------------------------------------------------
 // Store I/O (atomic tmp+rename 0o600, corrupt-tolerant — mirrors session-baseline.js's/
 // peer-baseline.js's own load*BaselineStore/write*BaselineStore convention exactly).
@@ -87,12 +97,23 @@ function freshServiceBaselineState() {
     last_folded_ts: undefined,
     skipped_partial_tick_count: 0,
     disappearance_event_count: 0,
+    // Persistent cold-start lockout (fact-store completeness hardening, Slice 6 -- ports the
+    // mechanism process-lineage-baseline.js/session-baseline.js/peer-baseline.js already carry, see
+    // the extended comment on computeServiceBaselineCandidates below for the full rationale). A
+    // brand new store starts pending, exactly like a genuine day-1 cold start.
+    cold_start_pending: true,
+    cold_start_reason: undefined,
+    cold_start_since_ts: undefined,
   };
 }
 
 function finiteOrDefault(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function isValidIsoTimestamp(value) {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
 export function normalizeServiceBaselineState(raw) {
@@ -102,6 +123,17 @@ export function normalizeServiceBaselineState(raw) {
     last_folded_ts: typeof base.last_folded_ts === "string" ? base.last_folded_ts : undefined,
     skipped_partial_tick_count: finiteOrDefault(base.skipped_partial_tick_count, 0),
     disappearance_event_count: finiteOrDefault(base.disappearance_event_count, 0),
+    // Fail-closed default (mirrors process-lineage-baseline.js's/session-baseline.js's/
+    // peer-baseline.js's own normalizeXBaselineState exactly): cold_start_pending is trusted
+    // "false" only when the store explicitly and validly recorded it as such. Any other value --
+    // missing (a pre-Slice-6 store predating this field), non-boolean garbage, or an explicit true
+    // -- is treated as still pending. This IS the per-detector P8-style migration: a pre-migration
+    // store cold-starts once on first read. Lenient per-field normalization (not process-lineage's
+    // exact-schema rejection) is deliberately kept here -- see the plan's "Shared schema-extension
+    // spec for Slices 4-7".
+    cold_start_pending: base.cold_start_pending !== false,
+    cold_start_reason: typeof base.cold_start_reason === "string" ? base.cold_start_reason : undefined,
+    cold_start_since_ts: typeof base.cold_start_since_ts === "string" ? base.cold_start_since_ts : undefined,
   };
 }
 
@@ -124,25 +156,42 @@ async function readJsonFile(file) {
  * ENOENT-tolerant (fresh state -> empty counters) and corrupt-tolerant (mirrors
  * session-baseline.js's loadSessionBaselineStore exactly): a corrupt/malformed file yields a fresh
  * baseline rather than throwing out of a daemon tick, with `corrupt:true` surfaced to the caller).
- * Never load-bearing for detection itself (see module header) — only for cross-process
- * observability and the fold-time-only counters.
+ * Cross-process observability and the fold-time-only counters were the only load-bearing use of
+ * this store before Slice 6; since Slice 6 the store also carries the persisted cold-start
+ * lockout, so `missing`/`corrupt` are now distinctly surfaced (mirrors process-lineage-baseline.js's/
+ * session-baseline.js's/peer-baseline.js's own loadXBaselineStore) so computeServiceBaselineCandidates
+ * can tell "no store yet / store I/O loss this tick" (storeLossThisTick) apart from a genuinely-read,
+ * lenient-normalized store -- both cases already default cold_start_pending:true via
+ * freshServiceBaselineState, but storeLossThisTick additionally forces the arming branch to
+ * re-synthesize a real anchor every tick the store stays lost, rather than silently reusing a
+ * stale/undefined one.
  */
 export async function loadServiceBaselineStore(descartesPaths) {
   const { storeFile } = resolveServiceBaselineStorePaths(descartesPaths);
   const { parsed, missing, corrupt } = await readJsonFile(storeFile);
-  if (missing) return { state: freshServiceBaselineState(), corrupt: false };
-  if (corrupt) return { state: freshServiceBaselineState(), corrupt: true };
-  return { state: normalizeServiceBaselineState(parsed), corrupt: false };
+  if (missing) return { state: { ...freshServiceBaselineState(), cold_start_reason: "missing_store" }, corrupt: false, missing: true };
+  if (corrupt) return { state: { ...freshServiceBaselineState(), cold_start_reason: "corrupt_store" }, corrupt: true, missing: false };
+  return { state: normalizeServiceBaselineState(parsed), corrupt: false, missing: false };
 }
 
 export async function writeServiceBaselineStore(descartesPaths, state) {
   await ensureServiceBaselineDir(descartesPaths);
   const { storeFile } = resolveServiceBaselineStorePaths(descartesPaths);
   const normalized = normalizeServiceBaselineState(state);
+  // FAIL-SAFE (mirrors process-lineage-baseline.js's/session-baseline.js's/peer-baseline.js's own
+  // writeXBaselineStore exactly): normalizeServiceBaselineState's own defaulting deliberately leaves
+  // cold_start_since_ts undefined when a caller doesn't supply one -- but a store actually
+  // PERSISTED to disk with cold_start_pending:true and no anchor can never re-establish (the
+  // re-accumulation gate in computeServiceBaselineCandidates has nothing to compare tick timestamps
+  // against). Anything actually written to disk in that shape gets a real anchor synthesized here,
+  // at write time.
+  const normalizedWithAnchor = normalized.cold_start_pending && !normalized.cold_start_since_ts
+    ? { ...normalized, cold_start_since_ts: new Date().toISOString() }
+    : normalized;
   const tmpFile = `${storeFile}.${process.pid}.tmp`;
-  await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
+  await fs.writeFile(tmpFile, JSON.stringify(normalizedWithAnchor, null, 2), { mode: 0o600 });
   await fs.rename(tmpFile, storeFile);
-  return normalized;
+  return normalizedWithAnchor;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -370,37 +419,142 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   if (!learnedConfig.enabled) return []; // default-OFF kill switch, checked before ANY I/O
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS; // reused from welford-stats.js — generic read-window bound, not a Welford use
+  const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT;
+
+  // Fact-store completeness hardening (Slice 6): the FULL read result is captured (not just
+  // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
+  // exactly what process-lineage-baseline.js/session-baseline.js/peer-baseline.js do for their own
+  // candidate computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const { points } = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupServiceFactsByTick(points);
 
   const loadStore = options.loadServiceBaselineStore ?? loadServiceBaselineStore;
-  const { state: persistedState } = await loadStore(descartesPaths);
+  const { state: persistedState, corrupt: corruptBaselineStore, missing: missingBaselineStore } = await loadStore(descartesPaths);
 
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS;
   const minEstablishedCount = options.establishedMinCensusCount ?? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT;
+
+  // BOUNDED fix, ported from process-lineage-baseline.js's/session-baseline.js's/peer-baseline.js's
+  // persistent cold-start lockout (fact-store completeness hardening plan, Slice 6 — service-
+  // baseline.js did not have this mechanism at all before this slice; see
+  // computeSessionBaselineCandidates for the full deception/anomaly-detector-review rationale this
+  // ports verbatim): an unreadable/corrupt fact-history this tick, a lost/corrupt service-baseline
+  // store, or fact-history whose completeness cannot be trusted since this detector's own last
+  // re-established anchor, must never be treated as authoritative "this really is all the
+  // service-census history" — that could make a perfectly normal, still-present service read as
+  // vanished purely because retention scrubbed the tick that would have shown it as established,
+  // fabricating a service.disappeared alert. Corrupt/missing/unrecognizable store state (or
+  // degraded fact-history) enters (or keeps) a PERSISTENT cold_start_pending lockout that survives
+  // across ticks: while pending, this detector emits ZERO service.disappeared novelty — not just
+  // this tick, but every tick — until minHistoryTickCount genuinely NEW complete ticks (ts strictly
+  // after cold_start_since_ts) have been observed. Re-establishment cannot be satisfied
+  // retroactively by fact-history that already existed before/during the loss.
+  const factsCorruptThisTick = Boolean(corruptFactCount);
+  const storeLossThisTick = corruptBaselineStore === true || missingBaselineStore === true;
+  // FAIL-SAFE, additional to the shared 3-term arming formula (process-lineage-baseline.js avoids
+  // this exact gap via its OWN exact-schema store validator, which rejects on disk any
+  // cold_start_pending:true store missing a valid anchor before it is ever normalized — service-
+  // baseline.js deliberately keeps LENIENT per-field normalization instead, per the plan's "Shared
+  // schema-extension spec for Slices 4-7", so that guard does not exist here). Without this term, a
+  // pre-Slice-6 store migrated in place (cold_start_pending defaults to true, cold_start_since_ts
+  // stays undefined) reading against an already-pristine, loss-free fact-history ledger would see
+  // factHistoryTrustworthy return trust:true even with no anchor (anchorTs undefined has nothing to
+  // compare against) — landing in the re-accumulation branch with sinceMs permanently Infinity, an
+  // unrecoverable lockout. This term forces that first post-migration tick to (re-)arm with a REAL
+  // anchor instead, so the migration cold-start is bounded ("cold-starts once"), never a silent
+  // permanent latch — the exact class of bug this whole plan exists to close.
+  const persistedAnchorMissingWhilePending = persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts);
+  const enteringColdStart = factsCorruptThisTick
+    || storeLossThisTick
+    || persistedAnchorMissingWhilePending
+    || !factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts }).trust;
+
+  // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
+  // self-heal and alert in the same breath it (re)establishes trust.
+  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart;
+
+  let nextColdStartPending = persistedState.cold_start_pending;
+  let nextColdStartReason = persistedState.cold_start_reason;
+  let nextColdStartSinceTs = persistedState.cold_start_since_ts;
+
+  if (enteringColdStart) {
+    // (Re-)arm the lockout. Any in-progress re-accumulation is discarded — it cannot be trusted to
+    // have been continuous once corruption/loss is observed again.
+    nextColdStartPending = true;
+    nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
+    nextColdStartSinceTs = nowIso;
+  } else if (persistedState.cold_start_pending) {
+    // Re-accumulating: count complete ticks genuinely observed strictly after the lockout began.
+    // Recomputed fresh from the live window every call (not an incrementing counter) so a missed
+    // or re-ordered tick can never double count, and so re-establishment cannot be satisfied by
+    // ticks that already existed before the reset.
+    //
+    // Counted against `group.censusState === "complete"` — the SAME predicate
+    // detectServiceDisappearances itself already uses as "the" notion of a complete tick.
+    // Service-disappearance subtlety (flagged per the Slice 6 dispatch): peer-baseline.js (Slice 5)
+    // had to choose between TWO disposition functions for its own re-accumulation counter
+    // (tickGroupDisposition, marker-agnostic; dropTickGroupDisposition, marker-gated) because
+    // peer.count_spike has NO census-marker concept at all in v0 — a live, ongoing peer.presence
+    // stream can structurally lack an availability_signature marker forever on some hosts (e.g. the
+    // `wg` command permanently unavailable), so gating re-accumulation on the marker-only
+    // disposition would have permanently latched that host's lockout. service-baseline.js has no
+    // such second disposition to choose from: groupServiceFactsByTick already folds the census
+    // marker's own state directly into each group's `censusState` (complete/partial/unknown/
+    // undefined), and service.disappeared has ALWAYS required a service.census marker to treat a
+    // tick as "complete" since that marker shipped (Slice C, 8c3d70d) — this is not a Slice-6
+    // addition. A markerless service.presence-only tick-group was already unable to establish or
+    // fire service.disappeared before this slice (fact-translators.js only omits the marker on an
+    // "unknown"/unsupported-platform envelope, which also emits no service.presence facts at all —
+    // there is no live, ongoing scenario, analogous to peer's `wg`-failure case, where a supported
+    // host keeps emitting real service.presence facts every tick with the census marker
+    // structurally and permanently absent). Gating re-accumulation on `censusState === "complete"`
+    // therefore cannot regress an existing detection capability the way using the marker-gated
+    // disposition would have for peer.count_drop — it is simply the one and only notion of
+    // "complete tick" this detector has ever had.
+    const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
+    const reestablishedTickCount = groups.filter(
+      (group) => group.censusState === "complete" && new Date(group.ts).getTime() > sinceMs,
+    ).length;
+    if (reestablishedTickCount >= minHistoryTickCount) {
+      nextColdStartPending = false;
+    }
+  }
 
   const disappearances = detectServiceDisappearances(groups, { nowMs, freshnessMs, minEstablishedCount });
 
   const lastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
   const newGroups = groups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
 
-  if (newGroups.length > 0) {
+  if (newGroups.length > 0 || enteringColdStart) {
     const newGroupTsSet = new Set(newGroups.map((group) => group.ts));
     const newPartialCount = newGroups.filter((group) => group.censusState === "partial").length;
     const newDisappearanceCount = disappearances.filter((entry) => newGroupTsSet.has(entry.disappeared_at_ts)).length;
-    const lastFoldedTs = newGroups[newGroups.length - 1].ts;
+    // Stays at the persisted value when newGroups is empty (an enteringColdStart-only call) --
+    // mirrors session-baseline.js's/peer-baseline.js's own loop-accumulated lastFoldedTs, which
+    // likewise only advances across newly-observed groups.
+    const lastFoldedTs = newGroups.length > 0 ? newGroups[newGroups.length - 1].ts : persistedState.last_folded_ts;
 
     const nextState = {
       version: 1,
       last_folded_ts: lastFoldedTs,
       skipped_partial_tick_count: persistedState.skipped_partial_tick_count + newPartialCount,
       disappearance_event_count: persistedState.disappearance_event_count + newDisappearanceCount,
+      cold_start_pending: nextColdStartPending,
+      cold_start_reason: nextColdStartReason,
+      cold_start_since_ts: nextColdStartSinceTs,
     };
     const writeStore = options.writeServiceBaselineStore ?? writeServiceBaselineStore;
     await writeStore(descartesPaths, nextState);
   }
 
+  if (coldStartPendingThisTick) return [];
+
+  // Re-emission every tick (load-bearing, mirrors session/peer's own "re-emission every tick"
+  // behavior): built fresh from `disappearances` on EVERY call — never dependent on whether a store
+  // write happened that tick.
   return buildDisappearedCandidates(disappearances);
 }
