@@ -152,11 +152,49 @@ function flatten(groupsOfPoints) {
   return groupsOfPoints.flat();
 }
 
+// Fact-store completeness hardening (Slice 5) fixtures, mirroring session-baseline.test.js's
+// intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
+// dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
+function intactReadResult(points) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "intact" },
+  };
+}
+
+function degradedReadResult(points, lossTs = tickTs(2)) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+  };
+}
+
 async function seedAndCompute(paths, points, options = {}) {
   const lastTs = points.reduce((max, p) => Math.max(max, new Date(p.ts).getTime()), 0);
   const now = options.now ?? new Date(lastTs).toISOString();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5) gave peer-baseline.js its own persistent
+  // cold-start lockout, mirroring process-lineage-baseline.js's/session-baseline.js's own: a
+  // brand-new store starts cold_start_pending, and a single one-shot append+compute call (exactly
+  // this helper's shape) can never itself satisfy re-establishment (all of `points`' history
+  // necessarily predates the anchor a fresh lockout would set on its own first read). Every test
+  // below this helper predates Slice 5 and is about peer-baseline's OTHER logic (Welford folding,
+  // regime-keyed fold, tick-disposition skips, ...), not the lockout itself -- so, mirroring
+  // session-baseline.test.js's own precedent, this helper pre-establishes the store (anchored
+  // strictly before the fixture's own earliest point) and confirms the shared integrity ledger to
+  // 'intact' (a fresh ledger's first retention pass is deliberately 'unknown' -- bootstrap
+  // anti-laundering rule; a second clean pass confirms it) so callers keep exercising exactly what
+  // they always tested. The lockout mechanism itself has its own dedicated coverage further down
+  // in this file.
+  const firstTs = points.reduce((min, p) => Math.min(min, new Date(p.ts).getTime()), Infinity);
+  const establishedAnchor = Number.isFinite(firstTs) ? new Date(firstTs - 1).toISOString() : now;
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: establishedAnchor });
   await appendFactPoints(paths, points, { now });
+  await appendFactPoints(paths, [], { now });
   return computePeerBaselineCandidates(paths, { now, ...options });
 }
 
@@ -450,6 +488,11 @@ test("observed_historical points are EXCLUDED from the spike count (Decision 1, 
 test("gradual-drift fixture, pinned to a stated realistic rate (~1 new peer/week over a month, legitimate onboarding): no false alarm at any weekly step", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): this fixture only asserts the ABSENCE of a false
+  // spike at every step, so a cold-start suppression (which also yields zero candidates) can never
+  // invalidate that assertion -- left un-pre-seeded on purpose, mirroring
+  // session-baseline.test.js's own identically-shaped gradual-drift fixture, which is likewise
+  // left unmodified by the lockout slice for the same reason.
   const TICKS_PER_DAY = 24;
   const WEEKS = 4;
   let hour = 0;
@@ -473,11 +516,17 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 new peer/week
 test("regime-change fixture: a sustained, legitimate shift from N to M>N (e.g. 3 new authorized devices permanently added) eventually RECOVERS (stops firing) without any operator action", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): pre-establish the cold-start lockout (see
+  // seedAndCompute's comment above) -- this fixture drives appendFactPoints/
+  // computePeerBaselineCandidates directly rather than through seedAndCompute, so it needs the
+  // same pre-seed + ledger-confirmation applied by hand.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   const N = 2;
   const M = 5;
   const baselineTicks = [];
   for (let i = 0; i < 40; i += 1) baselineTicks.push(...activeTick(tickTs(i), N));
   await appendFactPoints(paths, baselineTicks, { now: tickTs(39) });
+  await appendFactPoints(paths, [], { now: tickTs(39) }); // confirm the integrity ledger to 'intact'
 
   let hour = 40;
   let firedImmediatelyAfterShift = false;
@@ -745,7 +794,12 @@ test("re-emission-every-tick (drop): after a peer.count_drop candidate fires onc
   ticks.push(...activeTickWithMarker(tickTs(30), 1));
   const now = tickTs(30);
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): pre-establish the cold-start lockout (see
+  // seedAndCompute's comment above) -- this fixture drives appendFactPoints/
+  // computePeerBaselineCandidates directly.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, ticks, { now });
+  await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
   const first = await computePeerBaselineCandidates(paths, { now });
   const second = await computePeerBaselineCandidates(paths, { now });
@@ -816,7 +870,12 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   ticks.push(...activeTick(tickTs(30), 8));
   const now = tickTs(30);
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): pre-establish the cold-start lockout (see
+  // seedAndCompute's comment above) -- this fixture drives appendFactPoints/
+  // computePeerBaselineCandidates directly.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, ticks, { now });
+  await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
   const first = await computePeerBaselineCandidates(paths, { now });
   const second = await computePeerBaselineCandidates(paths, { now });
@@ -834,6 +893,14 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   const now = tickTs(4);
   await writeLearnedConfig(paths, { enabled: true });
   await appendFactPoints(paths, ticks, { now });
+  // Fact-store completeness hardening (Slice 5): confirm the integrity ledger to 'intact' before
+  // the repeated-call phase below -- a fresh ledger's first retention pass reads 'unknown'
+  // (bootstrap), which would otherwise keep factHistoryTrustworthy returning false and the
+  // cold-start lockout re-arming (and rewriting the store) on every one of the "repeated calls
+  // with unchanged fact-history" below, defeating the very idempotency this test checks. (The
+  // store itself is left un-pre-seeded/day-1 on purpose: this test only asserts on write-count and
+  // state equality, not on candidates, so day-1 suppression on the first call doesn't affect it.)
+  await appendFactPoints(paths, [], { now });
 
   let writeCount = 0;
   const countingWrite = async (descartesPaths, state) => {
@@ -896,6 +963,185 @@ test("no raw peer host/IP/pubkey is reachable from this module's candidate diagn
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   const serialized = JSON.stringify(spike);
   assert.equal(/definitely-not-a-hash|203\.0\.113|alice/.test(serialized), false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store completeness hardening (docs/plans/2026-08-21-fact-store-completeness-hardening.md,
+// Slice 5): the persisted cold-start lockout that gates ALL peer.* novelty (peer.count_spike/
+// peer.count_drop) whenever fact-history completeness cannot be trusted. Per the plan's "Required
+// test in every one of Slices 3-7" + the per-detector migration test. Mirrors
+// session-baseline.test.js's own dedicated cold-start coverage (Slice 4) and
+// process-lineage-baseline.test.js's (Slice 3) exactly, adapted to peer-baseline's spike/drop
+// shape. The suppressed direction below is peer.count_spike (Welford-based, markerless), which
+// needs no census marker to establish -- peer.count_drop shares the exact same lockout (both
+// directions are gated by the one `coldStartPendingThisTick` check) and is exercised by the
+// truncated-history/intact-control pair below via the same mechanism.
+// ---------------------------------------------------------------------------------------------
+
+test("computePeerBaselineCandidates: degraded truncated history suppresses a fabricated peer.count_spike (an established pattern must not read as anomalous just because retention scrubbed the history that would have shown it as normal)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
+  ticks.push(...activeTick(tickTs(30), 8)); // burst tick -- would fire peer.count_spike if trusted
+  const points = ticks;
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computePeerBaselineCandidates(paths, {
+    now: tickTs(30),
+    minHistoryTickCount,
+    readFactPoints: async () => degradedReadResult(points, tickTs(30)),
+  });
+
+  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a peer.count_spike claim");
+  const { state } = await loadPeerBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+});
+
+test("computePeerBaselineCandidates: intact history control still fires a real peer.count_spike (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
+  ticks.push(...activeTick(tickTs(30), 8));
+  const points = ticks;
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computePeerBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  const spikeCandidates = result.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(spikeCandidates.length, 1, "an intact store must not be falsely suppressed");
+});
+
+test("computePeerBaselineCandidates: one transient fact-history loss recovers after minHistoryTickCount genuinely-new clean ticks (recovery-latch fix, bounded not permanent)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const minSampleCount = 2;
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = [...activeTick(tickTs(0), 2)];
+  let readResult = degradedReadResult([], tickTs(1));
+  const options = { minHistoryTickCount, minSampleCount, readFactPoints: async () => ({ ...readResult, points }) };
+
+  // Loss tick: a burst (count 10 vs. an established mean of 2) that would fire peer.count_spike
+  // if trusted.
+  points = [...points, ...activeTick(tickTs(1), 10)];
+  const lossTick = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(1) });
+  assert.deepEqual(lossTick, []);
+  const afterLoss = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(afterLoss.cold_start_pending, true);
+
+  readResult = intactReadResult([]);
+  points = [...points, ...activeTick(tickTs(2), 2)]; // 1st re-accum tick
+  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(2) }), []);
+
+  points = [...points, ...activeTick(tickTs(3), 2)]; // 2nd re-accum tick
+  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false);
+
+  // A genuinely new burst after re-establishment must fire normally.
+  points = [...points, ...activeTick(tickTs(4), 200)];
+  const resumed = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) });
+  const spikeCandidates = resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(spikeCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+});
+
+test("computePeerBaselineCandidates: a clean tick cannot self-heal and fire peer.* novelty in the same breath fact-history loss is first observed on the prior tick", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minSampleCount = 2;
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = [
+    ...activeTick(tickTs(1), 2),
+    ...activeTick(tickTs(2), 2),
+    ...activeTick(tickTs(3), 10), // would fire peer.count_spike if trusted
+  ];
+  let readResult = degradedReadResult(points, tickTs(3));
+  const options = { minHistoryTickCount: 1, minSampleCount, readFactPoints: async () => ({ ...readResult, points }) };
+
+  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+
+  points = [...points, ...activeTick(tickTs(4), 200)]; // an even larger burst on the very next tick
+  readResult = intactReadResult([]);
+  assert.deepEqual(
+    await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    [],
+    "the first clean tick after loss may re-establish state but must not emit novelty in the same tick",
+  );
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false);
+});
+
+test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-starts once on first read, then recovers after minHistoryTickCount clean ticks (per-detector P8 analog)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const minSampleCount = 2;
+
+  // Simulate a store written by a pre-Slice-5 daemon: no cold_start_pending/_reason/_since_ts at
+  // all -- written directly to disk, bypassing writePeerBaselineStore's normalizer entirely.
+  const { dir, storeFile } = resolvePeerBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const legacyState = {
+    version: 1,
+    last_folded_ts: tickTs(-1),
+    confidence_state: "established",
+    stats: { count: 5, mean: 2, m2: 0, variance: 0, stddev: 0, ewma: 2, ewma_variance: 0, min: 2, max: 2 },
+    last_observation: undefined,
+    skipped_overflow_tick_count: 0,
+    availability_signature: undefined,
+    drop: {
+      confidence_state: "provisional",
+      stats: { count: 0, mean: 0, m2: 0, variance: 0, stddev: 0, ewma: undefined, ewma_variance: undefined, min: undefined, max: undefined },
+      last_observation: undefined,
+    },
+    skipped_markerless_tick_count: 0,
+  };
+  await fs.writeFile(storeFile, JSON.stringify(legacyState, null, 2), { mode: 0o600 });
+
+  const ticks = [];
+  for (let i = 0; i < 5; i += 1) ticks.push(...activeTick(tickTs(i), 2));
+  await appendFactPoints(paths, ticks, { now: tickTs(4) });
+  await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
+
+  // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
+  // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
+  // must not be trusted just because it parses. A bounded, one-time cold-start is required.
+  const firstRead = await computePeerBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, minSampleCount });
+  assert.deepEqual(firstRead, []);
+  const afterFirst = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(afterFirst.cold_start_pending, true);
+  assert.equal(
+    typeof afterFirst.cold_start_since_ts,
+    "string",
+    "the migration must synthesize a real anchor, never leave it undefined (the Infinity re-establishment-boundary trap)",
+  );
+  assert.ok(Number.isFinite(new Date(afterFirst.cold_start_since_ts).getTime()));
+
+  // minHistoryTickCount genuinely-new clean ticks after the migration anchor re-establish trust.
+  let hour = 5;
+  for (let i = 0; i < minHistoryTickCount; i += 1) {
+    const ts = tickTs(hour);
+    await appendFactPoints(paths, activeTick(ts, 2), { now: ts });
+    await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
+    hour += 1;
+  }
+  assert.equal(
+    (await loadPeerBaselineStore(paths)).state.cold_start_pending,
+    false,
+    "the migration cold-start must be bounded -- it clears after minHistoryTickCount genuinely-new clean ticks, never latching forever",
+  );
+
+  // And peer.* novelty genuinely resumes afterward.
+  const ts = tickTs(hour);
+  await appendFactPoints(paths, activeTick(ts, 200), { now: ts });
+  const resumed = await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
+  assert.equal(resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1);
 });
 
 // ---------------------------------------------------------------------------------------------

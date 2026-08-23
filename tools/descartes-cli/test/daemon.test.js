@@ -38,7 +38,7 @@ import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY, SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
-import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
+import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore } from "../src/service-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, loadProcessLineageBaselineStore, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
 
@@ -2479,10 +2479,18 @@ test("Slice 4b: byte-identical real alerts when the learned kill switch is off, 
 test("Slice 4b wiring: computePeerBaselineCandidates is the daemon's sixth extraCandidates entry — a pre-seeded odd-hour peer-login burst produces a real, sanitized peer.count_spike alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5) gave peer-baseline.js its own persistent
+  // cold-start lockout, mirroring process-lineage-baseline.js's/session-baseline.js's own — see
+  // the "Process-lineage wiring" test's comment for the identical rationale. Pre-establish the
+  // store (this wiring test is about the daemon pipeline, not the lockout, which has its own
+  // dedicated coverage in peer-baseline.test.js) and confirm the shared integrity ledger to
+  // 'intact' before the tick.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
   ticks.push(...completePeerTick(hour(30), 8));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
@@ -2503,10 +2511,15 @@ test("Slice 4b wiring: computePeerBaselineCandidates is the daemon's sixth extra
 test("Slice 4b, Decision 3b: a due peer.count_spike is delivered through the deterministic local delivery branch wired into the daemon tick, and never reaches the LLM path", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment above for the identical rationale) and confirm the
+  // shared integrity ledger to 'intact' before the tick.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
   ticks.push(...completePeerTick(hour(30), 8));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -2558,10 +2571,15 @@ function completePeerTickWithMarker(ts, count, signature = "v1:ok-ok-ok-ok-ok", 
 test("Slice 4c wiring: computePeerBaselineCandidates' drop direction flows through the daemon's EXISTING sixth extraCandidates entry with NO daemon.js code change -- a pre-seeded mass peer drop produces a real, sanitized peer.count_drop alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment above for the identical rationale) and confirm the
+  // shared integrity ledger to 'intact' before the tick.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
   ticks.push(...completePeerTickWithMarker(hour(30), 1));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_DROP_RULE_ID);
@@ -2581,10 +2599,15 @@ test("Slice 4c wiring: computePeerBaselineCandidates' drop direction flows throu
 test("Slice 4c, delivery: a due peer.count_drop is delivered through the deterministic local delivery branch wired into the daemon tick, and never reaches the LLM path", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 5): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment above for the identical rationale) and confirm the
+  // shared integrity ledger to 'intact' before the tick.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
   ticks.push(...completePeerTickWithMarker(hour(30), 1));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
