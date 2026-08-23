@@ -155,12 +155,12 @@ function flatten(groupsOfPoints) {
 // Fact-store completeness hardening (Slice 5) fixtures, mirroring session-baseline.test.js's
 // intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
 // dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
-function intactReadResult(points) {
+function intactReadResult(points, completeness = { status: "intact" }) {
   return {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
-    completeness: { status: "intact" },
+    completeness,
   };
 }
 
@@ -999,6 +999,82 @@ test("computePeerBaselineCandidates: degraded truncated history suppresses a fab
   assert.equal(state.cold_start_pending, true);
 });
 
+test("computePeerBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writePeerBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+  });
+
+  await computePeerBaselineCandidates(paths, {
+    now: tickTs(0),
+    readFactPoints: async () => intactReadResult([]),
+  });
+
+  const { state } = await loadPeerBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(0));
+});
+
+test("computePeerBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writePeerBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+    last_folded_ts: tickTs(10),
+  });
+
+  let points = flatten([activeTickWithMarker(tickTs(11), 2)]);
+  const options = {
+    minHistoryTickCount: 6,
+    minSampleCount: 2,
+    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+  };
+  await computePeerBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  assert.equal((await loadPeerBaselineStore(paths)).state.last_folded_ts, undefined);
+
+  points = flatten([
+    ...Array.from({ length: 6 }, (_, index) => activeTickWithMarker(tickTs(index + 1), 2)),
+    activeTickWithMarker(tickTs(11), 2),
+  ]);
+  const recoveredTick = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(6) });
+  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  const state = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, false);
+  assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
+
+  points = [...points, ...activeTickWithMarker(tickTs(7), 0)];
+  const resumed = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(7) });
+  assert.equal(resumed.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), true, "peer novelty resumes after rollback recovery has been persisted");
+});
+
+test("computePeerBaselineCandidates: an established future anchor is repaired for count_drop on rollback", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const points = flatten([
+    ...Array.from({ length: 30 }, (_, index) => activeTickWithMarker(tickTs(index), 20)),
+    activeTickWithMarker(tickTs(30), 0),
+  ]);
+  await writePeerBaselineStore(paths, {
+    cold_start_pending: false,
+    cold_start_since_ts: tickTs(100),
+    last_folded_ts: tickTs(29),
+  });
+
+  const candidates = await computePeerBaselineCandidates(paths, {
+    now: tickTs(30),
+    minSampleCount: 2,
+    minHistoryTickCount: 2,
+    readFactPoints: async () => intactReadResult(points),
+  });
+  assert.equal(candidates.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), false);
+  const state = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(30));
+});
+
 test("computePeerBaselineCandidates: intact history control still fires a real peer.count_spike (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
@@ -1049,6 +1125,54 @@ test("computePeerBaselineCandidates: one transient fact-history loss recovers af
   const resumed = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) });
   const spikeCandidates = resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.equal(spikeCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+});
+
+test("computePeerBaselineCandidates: count_drop stays suppressed after BASE recovery from markerless ticks until marker-complete ticks re-accumulate", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const minSampleCount = 2;
+  const options = {
+    minHistoryTickCount,
+    minSampleCount,
+    readFactPoints: async () => ({ ...readResult, points }),
+  };
+
+  let points = [];
+  for (let i = 0; i < 30; i += 1) points.push(...activeTickWithMarker(tickTs(i), 20));
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  let readResult = intactReadResult(points);
+  await computePeerBaselineCandidates(paths, { ...options, now: tickTs(29) });
+
+  // The loss anchors at tick 30. Markerless ticks are BASE-complete, so they clear the shared
+  // lockout for spike recovery, but they are not eligible evidence for count_drop.
+  points.push(...activeTickWithMarker(tickTs(30), 20));
+  readResult = degradedReadResult(points, tickTs(30));
+  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(30) }), []);
+
+  points.push(...activeTick(tickTs(31), 20));
+  readResult = intactReadResult(points);
+  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(31) }), []);
+  points.push(...activeTick(tickTs(32), 20));
+  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(32) }), []);
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false);
+
+  // A marker-complete drop immediately after shared recovery is still suppressed: only one
+  // post-anchor drop-eligible group exists, despite the shared lockout having cleared.
+  points.push(...activeTickWithMarker(tickTs(33), 0));
+  const firstMarkedDrop = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(33) });
+  assert.equal(firstMarkedDrop.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), false);
+
+  // The scored tick itself does not count toward recovery: only one marker-complete group
+  // (tick 33) precedes this scored tick, so count_drop remains suppressed.
+  points.push(...activeTickWithMarker(tickTs(34), 0));
+  const stillRecoveringDrop = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(34) });
+  assert.equal(stillRecoveringDrop.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), false);
+
+  // Once two marker-complete groups genuinely precede the scored tick, the real drop is eligible.
+  points.push(...activeTickWithMarker(tickTs(35), 0));
+  const recoveredDrop = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(35) });
+  assert.equal(recoveredDrop.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), true);
 });
 
 test("computePeerBaselineCandidates: a clean tick cannot self-heal and fire peer.* novelty in the same breath fact-history loss is first observed on the prior tick", async () => {

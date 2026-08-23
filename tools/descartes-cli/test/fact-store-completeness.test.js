@@ -60,7 +60,7 @@ test("factHistoryTrustworthy applies the fixed precedence and fails closed acros
       `${channel} at or before anchor is already accounted for`,
       cleanReadResult({ completeness: { status: "degraded", [channel]: before } }),
       { anchorTs },
-      { trust: true, reason: "ok" },
+      { trust: false, reason: "history_degraded" },
     ]),
     ...LOSS_CHANNELS.map((channel) => [
       `${channel} is a lockout without an anchor`,
@@ -87,12 +87,17 @@ test("factHistoryTrustworthy never trusts a legacy or malformed read shape", () 
     schema_invalid_count: 0,
     completeness: { status: "not-a-status" },
   }), { trust: false, reason: "history_unknown" });
+  assert.deepEqual(factHistoryTrustworthy({
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "degraded" },
+  }, { anchorTs: NOW }), { trust: false, reason: "history_degraded" });
 });
 
 test("factHistoryTrustworthy permits recovery after a transient loss and blocks sustained loss", () => {
   const lossTs = "2026-08-21T00:00:01.000Z";
   const recovered = cleanReadResult({
-    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+    completeness: { status: "intact", last_bytecap_evict_ts: lossTs },
   });
   assert.deepEqual(factHistoryTrustworthy(recovered, { anchorTs: "2026-08-21T00:00:02.000Z" }), { trust: true, reason: "ok" });
 
@@ -100,6 +105,27 @@ test("factHistoryTrustworthy permits recovery after a transient loss and blocks 
     completeness: { status: "degraded", last_bytecap_evict_ts: "2026-08-21T00:00:03.000Z" },
   });
   assert.deepEqual(factHistoryTrustworthy(sustained, { anchorTs: "2026-08-21T00:00:02.000Z" }), { trust: false, reason: "history_degraded" });
+});
+
+test("factHistoryTrustworthy ignores future loss timestamps for the current rollback window but still blocks an in-window loss", () => {
+  const anchorMs = Date.parse(NOW);
+  const futureLoss = new Date(anchorMs + 100_000).toISOString();
+  const currentLoss = new Date(anchorMs + 1_000).toISOString();
+  const opts = { anchorTs: NOW, nowMs: anchorMs + 10_000 };
+
+  assert.deepEqual(
+    factHistoryTrustworthy(cleanReadResult({ completeness: { last_corrupt_ts: futureLoss } }), opts),
+    { trust: true, reason: "ok" },
+  );
+  assert.deepEqual(
+    factHistoryTrustworthy(cleanReadResult({ completeness: { last_corrupt_ts: currentLoss } }), opts),
+    { trust: false, reason: "history_degraded" },
+  );
+  assert.deepEqual(
+    factHistoryTrustworthy(cleanReadResult({ completeness: { last_corrupt_ts: "not-a-timestamp" } }), opts),
+    { trust: false, reason: "history_degraded" },
+    "malformed loss timestamps remain fail-closed",
+  );
 });
 
 test("retention records corrupt-line loss durably and the next read is degraded", async () => {

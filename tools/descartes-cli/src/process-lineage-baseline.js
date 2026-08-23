@@ -86,6 +86,26 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
+const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
+  "last_corrupt_ts",
+  "last_schema_invalid_ts",
+  "last_bytecap_evict_ts",
+  "last_continuity_break_ts",
+];
+
+function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
+  const completeness = readResult?.completeness;
+  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
+  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
+  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
+  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
+    const timestamp = completeness[field];
+    if (timestamp === undefined || timestamp === null) return false;
+    const timestampMs = new Date(timestamp).getTime();
+    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
+  });
+}
+
 // FABRICATION fix (deception/anomaly-detector review -- schema-invalid-store trust pattern):
 // JSON.parse succeeding is NOT sufficient to trust a persisted store. A parseable-but-wrong-shape
 // blob -- a hand-truncated fragment like {"cold_start_pending":false} with no schema_version /
@@ -192,15 +212,12 @@ export async function writeProcessLineageBaselineStore(descartesPaths, state) {
   // with cold_start_pending:true and no anchor can never re-establish (the re-accumulation gate
   // has nothing to compare tick timestamps against -- see computeProcessLineageBaselineCandidates)
   // and, since isValidProcessLineageBaselineStoreShape now requires an anchor whenever pending is
-  // true, would not even round-trip through loadProcessLineageBaselineStore. Anything actually
-  // written to disk in that shape gets a real anchor synthesized here, at write time.
-  const normalizedWithAnchor = normalized.cold_start_pending && !normalized.cold_start_since_ts
-    ? { ...normalized, cold_start_since_ts: new Date().toISOString() }
-    : normalized;
+  // true, would not even round-trip through loadProcessLineageBaselineStore. Compute paths must
+  // set the anchor from their injected clock before persisting pending state.
   const tmpFile = `${storeFile}.${process.pid}.tmp`;
-  await fs.writeFile(tmpFile, JSON.stringify(normalizedWithAnchor, null, 2), { mode: 0o600 });
+  await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
   await fs.rename(tmpFile, storeFile);
-  return normalizedWithAnchor;
+  return normalized;
 }
 
 export function groupProcessLineageFactsByTick(points = []) {
@@ -292,6 +309,10 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
   const nowIso = new Date(nowMs).toISOString();
   const freshnessMs = options.activeFreshnessMs ?? DEFAULT_LINEAGE_FRESHNESS_FALLBACK_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT;
+  const currentGroups = groups.filter((group) => {
+    const groupMs = new Date(group.ts).getTime();
+    return Number.isFinite(groupMs) && groupMs <= nowMs;
+  });
 
   // BOUNDED fix (deception/anomaly-detector review -- corrupt/missing-store
   // self-heal-and-immediately-fire pattern): an unreadable/corrupt fact-history this tick, or a
@@ -322,13 +343,20 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
   // provenance; the zero-claims behavior and the re-accumulation requirement are the same.
   const factsCorruptThisTick = Boolean(corruptFactCount);
   const storeLossThisTick = corruptBaselineStore === true || missingBaselineStore === true;
+  const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
+    || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
+      && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
+  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   const enteringColdStart = factsCorruptThisTick
     || storeLossThisTick
-    || !factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts }).trust;
+    || persistedAnchorMissingOrFuture
+    || completenessLossAfterAnchor
+    || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below -- a tick
   // cannot self-heal and alert in the same breath it (re)establishes trust.
-  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart;
+  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart || !historyTrust.trust;
 
   let nextColdStartPending = persistedState.cold_start_pending;
   let nextColdStartReason = persistedState.cold_start_reason;
@@ -345,31 +373,38 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     // "corrupt_store" (unparsable JSON) instead of both collapsing to one label.
     nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
     nextColdStartSinceTs = nowIso;
-  } else if (persistedState.cold_start_pending) {
+  } else if (persistedState.cold_start_pending && historyTrust.trust) {
     // Re-accumulating: count complete ticks genuinely observed strictly after the lockout began.
     // Recomputed fresh from the live window every call (not an incrementing counter) so a missed
     // or re-ordered tick can never double count, and so re-establishment cannot be satisfied by
     // ticks that already existed before the reset.
     const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
-    const reestablishedTickCount = groups.filter(
-      (group) => group.censusState === "complete" && new Date(group.ts).getTime() > sinceMs,
-    ).length;
+    const reestablishedTickCount = currentGroups.filter((group) => {
+      const groupMs = new Date(group.ts).getTime();
+      return group.censusState === "complete" && groupMs > sinceMs && groupMs <= nowMs;
+    }).length;
     if (reestablishedTickCount >= minHistoryTickCount) {
       nextColdStartPending = false;
     }
   }
 
-  const novel = coldStartPendingThisTick ? [] : detectNovelProcessLineageEdges(groups, { nowMs, freshnessMs, minHistoryTickCount });
+  const novel = coldStartPendingThisTick ? [] : detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
 
-  const lastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
-  const newGroups = groups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
-  if (newGroups.length > 0 || enteringColdStart) {
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
+  const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
+  const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
+  const coldStartStateChanged = nextColdStartPending !== persistedState.cold_start_pending
+    || nextColdStartReason !== persistedState.cold_start_reason
+    || nextColdStartSinceTs !== persistedState.cold_start_since_ts;
+  if (newGroups.length > 0 || coldStartStateChanged || lastFoldedWasFuture) {
     const newGroupTs = new Set(newGroups.map((group) => group.ts));
     const skippedPartial = newGroups.filter((group) => group.censusState === "partial").length;
     const novelEvents = novel.filter((entry) => newGroupTs.has(entry.first_seen_ts)).length;
     const nextState = {
       version: 2,
-      last_folded_ts: newGroups.length > 0 ? newGroups[newGroups.length - 1].ts : persistedState.last_folded_ts,
+      last_folded_ts: newGroups.length > 0 ? newGroups[newGroups.length - 1].ts : effectiveLastFoldedTs,
       skipped_partial_tick_count: persistedState.skipped_partial_tick_count + skippedPartial,
       novel_edge_event_count: persistedState.novel_edge_event_count + novelEvents,
       cold_start_pending: nextColdStartPending,

@@ -288,6 +288,7 @@ export async function readFactPoints(descartesPaths, options = {}) {
     live,
     sinceMs === undefined ? Number.NEGATIVE_INFINITY : sinceMs,
     { corrupt_count, schema_invalid_count: schemaInvalidCount },
+    nowMs,
   );
   return { points, corrupt_count, schema_invalid_count: schemaInvalidCount, completeness };
 }

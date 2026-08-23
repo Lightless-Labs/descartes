@@ -116,12 +116,12 @@ function flatten(groupsOfPoints) {
 // Fact-store completeness hardening (Slice 4) fixtures, mirroring process-lineage-baseline.test.js's
 // intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
 // dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
-function intactReadResult(points) {
+function intactReadResult(points, completeness = { status: "intact" }) {
   return {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
-    completeness: { status: "intact" },
+    completeness,
   };
 }
 
@@ -617,6 +617,34 @@ test("session.churn non-fire: a garbled/unrecognized census_state marker on the 
   assert.deepEqual(detectSessionChurn(points), [], "no other 'complete' tick-group exists in this pool, so the recency-bound anchor can never be satisfied");
 });
 
+test("session.churn ignores a future complete group while still detecting a real current-tick churn", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-2) });
+
+  let points = [
+    sessionPoint(tickTs(-1), "e1", "1111111111111111"), censusMarkerPoint(tickTs(-1), "complete"),
+    sessionPoint(tickTs(1), "e1", "2222222222222222"), censusMarkerPoint(tickTs(1), "complete"),
+  ];
+  const options = {
+    minSampleCount: 2,
+    readFactPoints: async () => intactReadResult(points),
+  };
+
+  const beforeNow = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  assert.equal(beforeNow.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID).length, 0);
+
+  points = [
+    ...points,
+    sessionPoint(tickTs(0), "e1", "2222222222222222"), censusMarkerPoint(tickTs(0), "complete"),
+  ];
+  const atNow = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  const churn = atNow.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID);
+  assert.equal(churn.length, 1, "a real current-tick fingerprint change still fires");
+  assert.equal(churn[0].diagnostics.prior_fingerprint, "1111111111111111");
+  assert.equal(churn[0].diagnostics.current_fingerprint, "2222222222222222");
+});
+
 test("session.churn: an 'unknown'-disposition tick-group's own point is excluded from the pool even when it is NOT the latest tick (adversarial-review regression) -- a garbled census on an OLDER tick must never supply the prior_fingerprint side of a churn pair", () => {
   const points = [
     // tick0's census marker is garbled/unrecognized -> censusState "unknown". Without excluding
@@ -700,6 +728,57 @@ test("computeSessionBaselineCandidates: degraded truncated history suppresses a 
   assert.deepEqual(result, [], "untrustworthy retained history must not authorize a session.count_drop claim");
   const { state } = await loadSessionBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
+});
+
+test("computeSessionBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+  });
+
+  await computeSessionBaselineCandidates(paths, {
+    now: tickTs(0),
+    readFactPoints: async () => intactReadResult([]),
+  });
+
+  const { state } = await loadSessionBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(0));
+});
+
+test("computeSessionBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+    last_folded_ts: tickTs(10),
+  });
+
+  let points = flatten([completeTick(tickTs(11), 2)]);
+  const options = {
+    minHistoryTickCount: 6,
+    minSampleCount: 2,
+    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+  };
+  await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  assert.equal((await loadSessionBaselineStore(paths)).state.last_folded_ts, undefined);
+
+  points = flatten([
+    ...Array.from({ length: 6 }, (_, index) => completeTick(tickTs(index + 1), 2)),
+    completeTick(tickTs(11), 2),
+  ]);
+  const recoveredTick = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(6) });
+  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  const state = (await loadSessionBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, false);
+  assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
+
+  points = [...points, ...completeTick(tickTs(7), 0)];
+  const resumed = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(7) });
+  assert.equal(resumed.some((candidate) => candidate.rule_id === SESSION_COUNT_DROP_RULE_ID), true, "session novelty resumes after rollback recovery has been persisted");
 });
 
 test("computeSessionBaselineCandidates: intact history control still fires a real session.count_drop (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {

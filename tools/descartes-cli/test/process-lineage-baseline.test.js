@@ -81,12 +81,12 @@ function flatten(ticks) {
   return ticks.flat();
 }
 
-function intactReadResult(points) {
+function intactReadResult(points, completeness = { status: "intact" }) {
   return {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
-    completeness: { status: "intact" },
+    completeness,
   };
 }
 
@@ -111,7 +111,12 @@ test("load/write/normalize process-lineage baseline state is corrupt-tolerant an
   });
   const missing = await loadProcessLineageBaselineStore(paths);
   assert.equal(missing.corrupt, false);
-  await writeProcessLineageBaselineStore(paths, { last_folded_ts: tickTs(1), skipped_partial_tick_count: 2, novel_edge_event_count: 3 });
+  await writeProcessLineageBaselineStore(paths, {
+    cold_start_pending: false,
+    last_folded_ts: tickTs(1),
+    skipped_partial_tick_count: 2,
+    novel_edge_event_count: 3,
+  });
   const { dir, storeFile } = resolveProcessLineageBaselineStorePaths(paths);
   assert.equal((await fs.stat(storeFile)).mode & 0o777, 0o600);
   assert.equal((await fs.readdir(dir)).some((name) => name.endsWith(".tmp")), false);
@@ -324,6 +329,57 @@ test("computeProcessLineageBaselineCandidates: degraded truncated history suppre
   assert.deepEqual(result, [], "untrustworthy retained history must not authorize a novel-edge claim");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
+});
+
+test("computeProcessLineageBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+  });
+
+  await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(0),
+    readFactPoints: async () => intactReadResult([]),
+  });
+
+  const { state } = await loadProcessLineageBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(0));
+});
+
+test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+    last_folded_ts: tickTs(10),
+  });
+
+  let points = flatten([completeTick(tickTs(11), [["shell", "python"]])]);
+  const options = {
+    minHistoryTickCount: 6,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+  };
+  await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  assert.equal((await loadProcessLineageBaselineStore(paths)).state.last_folded_ts, undefined);
+
+  points = flatten([
+    ...Array.from({ length: 6 }, (_, index) => completeTick(tickTs(index + 1))),
+    completeTick(tickTs(11), [["shell", "python"]]),
+  ]);
+  const recoveredTick = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(6) });
+  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  const state = (await loadProcessLineageBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, false);
+  assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
+
+  points = [...points, ...completeTick(tickTs(7), [["shell", "python"]])];
+  const resumed = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(7) });
+  assert.equal(resumed.length, 1, "novelty resumes after rollback recovery has been persisted");
 });
 
 test("computeProcessLineageBaselineCandidates: intact history control still detects a novel edge", async () => {

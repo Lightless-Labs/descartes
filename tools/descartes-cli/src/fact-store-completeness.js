@@ -23,15 +23,17 @@ function isValidTimestamp(value) {
  * Missing/null event timestamps mean that channel has no recorded event. A malformed
  * timestamp is treated as a loss so the caller fails closed.
  */
-function hasLossEventAfter(completeness, anchorTs) {
+function hasLossEventAfter(completeness, anchorTs, nowMs) {
   const anchorMs = anchorTs === undefined ? Number.NEGATIVE_INFINITY : Date.parse(anchorTs);
   if (!Number.isFinite(anchorMs) && anchorMs !== Number.NEGATIVE_INFINITY) return true;
+  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Number.POSITIVE_INFINITY;
 
   return LOSS_TIMESTAMP_FIELDS.some((field) => {
     const timestamp = completeness[field];
     if (timestamp === undefined || timestamp === null) return false;
     if (!isValidTimestamp(timestamp)) return true;
-    return Date.parse(timestamp) > anchorMs;
+    const lossMs = Date.parse(timestamp);
+    return lossMs > anchorMs && lossMs <= upperBoundMs;
   });
 }
 
@@ -68,7 +70,8 @@ export function factHistoryTrustworthy(readResult, opts = {}) {
 
     const anchorTs = opts.anchorTs;
     if (anchorTs !== undefined && !isValidTimestamp(anchorTs)) return { trust: false, reason: "history_unknown" };
-    if (hasLossEventAfter(completeness, anchorTs)) {
+    if (completeness.status === "degraded") return { trust: false, reason: "history_degraded" };
+    if (hasLossEventAfter(completeness, anchorTs, opts.nowMs)) {
       return { trust: false, reason: "history_degraded" };
     }
 

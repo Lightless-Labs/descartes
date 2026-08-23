@@ -94,12 +94,12 @@ function establishedTicks(entityKeys, count = DEFAULT_SERVICE_ESTABLISHED_MIN_CE
 // peer-baseline.test.js's own intactReadResult/degradedReadResult exactly -- injected via
 // options.readFactPoints so the dedicated cold-start tests below don't need to fabricate real
 // ledger corruption/eviction.
-function intactReadResult(points) {
+function intactReadResult(points, completeness = { status: "intact" }) {
   return {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
-    completeness: { status: "intact" },
+    completeness,
   };
 }
 
@@ -194,14 +194,13 @@ test("writeServiceBaselineStore: atomic write leaves no tmp file behind and the 
   assert.equal(stat.mode & 0o777, 0o600);
 });
 
-test("writeServiceBaselineStore: a store persisted with cold_start_pending:true and no anchor gets a real cold_start_since_ts synthesized at write time (FAIL-SAFE against the Infinity re-establishment-boundary trap)", async () => {
+test("writeServiceBaselineStore: does not synthesize a wall-clock cold-start anchor", async () => {
   const paths = await tempPaths();
   const written = await writeServiceBaselineStore(paths, { last_folded_ts: tickTs(0) }); // cold_start_pending defaults true, no since_ts supplied
   assert.equal(written.cold_start_pending, true);
-  assert.equal(typeof written.cold_start_since_ts, "string");
-  assert.ok(Number.isFinite(new Date(written.cold_start_since_ts).getTime()));
+  assert.equal(written.cold_start_since_ts, undefined);
   const { state } = await loadServiceBaselineStore(paths);
-  assert.equal(state.cold_start_since_ts, written.cold_start_since_ts);
+  assert.equal(state.cold_start_since_ts, undefined);
 });
 
 test("normalizeServiceBaselineState: rejects malformed shapes field-by-field, falling back to safe defaults", () => {
@@ -634,6 +633,58 @@ test("computeServiceBaselineCandidates: degraded truncated history suppresses a 
   assert.deepEqual(result, [], "untrustworthy retained history must not authorize a service.disappeared claim");
   const { state } = await loadServiceBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
+});
+
+test("computeServiceBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+  });
+
+  await computeServiceBaselineCandidates(paths, {
+    now: tickTs(0),
+    readFactPoints: async () => intactReadResult([]),
+  });
+
+  const { state } = await loadServiceBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(0));
+});
+
+test("computeServiceBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_since_ts: tickTs(10),
+    last_folded_ts: tickTs(10),
+  });
+
+  let points = flatten([completeTick(tickTs(11), ["svc-a"])]);
+  const options = {
+    minHistoryTickCount: 6,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+  };
+  await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  assert.equal((await loadServiceBaselineStore(paths)).state.last_folded_ts, undefined);
+
+  points = flatten([
+    ...Array.from({ length: 6 }, (_, index) => completeTick(tickTs(index + 1), ["svc-a"])),
+    completeTick(tickTs(11), ["svc-a"]),
+  ]);
+  const recoveredTick = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(6) });
+  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  const state = (await loadServiceBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, false);
+  assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
+
+  points = [...points, ...completeTick(tickTs(7), [])];
+  const resumed = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(7) });
+  assert.equal(resumed.some((candidate) => candidate.rule_id === SERVICE_DISAPPEARED_RULE_ID), true, "service novelty resumes after rollback recovery has been persisted");
 });
 
 test("computeServiceBaselineCandidates: intact history control still fires a real service.disappeared (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {

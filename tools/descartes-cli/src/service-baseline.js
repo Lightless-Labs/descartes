@@ -116,6 +116,26 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
+const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
+  "last_corrupt_ts",
+  "last_schema_invalid_ts",
+  "last_bytecap_evict_ts",
+  "last_continuity_break_ts",
+];
+
+function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
+  const completeness = readResult?.completeness;
+  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
+  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
+  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
+  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
+    const timestamp = completeness[field];
+    if (timestamp === undefined || timestamp === null) return false;
+    const timestampMs = new Date(timestamp).getTime();
+    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
+  });
+}
+
 export function normalizeServiceBaselineState(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   return {
@@ -183,15 +203,12 @@ export async function writeServiceBaselineStore(descartesPaths, state) {
   // cold_start_since_ts undefined when a caller doesn't supply one -- but a store actually
   // PERSISTED to disk with cold_start_pending:true and no anchor can never re-establish (the
   // re-accumulation gate in computeServiceBaselineCandidates has nothing to compare tick timestamps
-  // against). Anything actually written to disk in that shape gets a real anchor synthesized here,
-  // at write time.
-  const normalizedWithAnchor = normalized.cold_start_pending && !normalized.cold_start_since_ts
-    ? { ...normalized, cold_start_since_ts: new Date().toISOString() }
-    : normalized;
+  // against). Compute paths must set the anchor from their injected clock before persisting
+  // pending state.
   const tmpFile = `${storeFile}.${process.pid}.tmp`;
-  await fs.writeFile(tmpFile, JSON.stringify(normalizedWithAnchor, null, 2), { mode: 0o600 });
+  await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
   await fs.rename(tmpFile, storeFile);
-  return normalizedWithAnchor;
+  return normalized;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -437,6 +454,10 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   const nowIso = new Date(nowMs).toISOString();
   const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS;
   const minEstablishedCount = options.establishedMinCensusCount ?? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT;
+  const currentGroups = groups.filter((group) => {
+    const groupMs = new Date(group.ts).getTime();
+    return Number.isFinite(groupMs) && groupMs <= nowMs;
+  });
 
   // BOUNDED fix, ported from process-lineage-baseline.js's/session-baseline.js's/peer-baseline.js's
   // persistent cold-start lockout (fact-store completeness hardening plan, Slice 6 — service-
@@ -467,15 +488,20 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   // unrecoverable lockout. This term forces that first post-migration tick to (re-)arm with a REAL
   // anchor instead, so the migration cold-start is bounded ("cold-starts once"), never a silent
   // permanent latch — the exact class of bug this whole plan exists to close.
-  const persistedAnchorMissingWhilePending = persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts);
+  const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
+    || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
+      && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
+  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   const enteringColdStart = factsCorruptThisTick
     || storeLossThisTick
-    || persistedAnchorMissingWhilePending
-    || !factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts }).trust;
+    || persistedAnchorMissingOrFuture
+    || completenessLossAfterAnchor
+    || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
   // self-heal and alert in the same breath it (re)establishes trust.
-  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart;
+  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart || !historyTrust.trust;
 
   let nextColdStartPending = persistedState.cold_start_pending;
   let nextColdStartReason = persistedState.cold_start_reason;
@@ -487,7 +513,7 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
     nextColdStartPending = true;
     nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
     nextColdStartSinceTs = nowIso;
-  } else if (persistedState.cold_start_pending) {
+  } else if (persistedState.cold_start_pending && historyTrust.trust) {
     // Re-accumulating: count complete ticks genuinely observed strictly after the lockout began.
     // Recomputed fresh from the live window every call (not an incrementing counter) so a missed
     // or re-ordered tick can never double count, and so re-establishment cannot be satisfied by
@@ -516,27 +542,34 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
     // disposition would have for peer.count_drop — it is simply the one and only notion of
     // "complete tick" this detector has ever had.
     const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
-    const reestablishedTickCount = groups.filter(
-      (group) => group.censusState === "complete" && new Date(group.ts).getTime() > sinceMs,
-    ).length;
+    const reestablishedTickCount = currentGroups.filter((group) => {
+      const groupMs = new Date(group.ts).getTime();
+      return group.censusState === "complete" && groupMs > sinceMs && groupMs <= nowMs;
+    }).length;
     if (reestablishedTickCount >= minHistoryTickCount) {
       nextColdStartPending = false;
     }
   }
 
-  const disappearances = detectServiceDisappearances(groups, { nowMs, freshnessMs, minEstablishedCount });
+  const disappearances = detectServiceDisappearances(currentGroups, { nowMs, freshnessMs, minEstablishedCount });
 
-  const lastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
-  const newGroups = groups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
+  const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
+  const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
 
-  if (newGroups.length > 0 || enteringColdStart) {
+  const coldStartStateChanged = nextColdStartPending !== persistedState.cold_start_pending
+    || nextColdStartReason !== persistedState.cold_start_reason
+    || nextColdStartSinceTs !== persistedState.cold_start_since_ts;
+  if (newGroups.length > 0 || coldStartStateChanged || lastFoldedWasFuture) {
     const newGroupTsSet = new Set(newGroups.map((group) => group.ts));
     const newPartialCount = newGroups.filter((group) => group.censusState === "partial").length;
     const newDisappearanceCount = disappearances.filter((entry) => newGroupTsSet.has(entry.disappeared_at_ts)).length;
     // Stays at the persisted value when newGroups is empty (an enteringColdStart-only call) --
     // mirrors session-baseline.js's/peer-baseline.js's own loop-accumulated lastFoldedTs, which
     // likewise only advances across newly-observed groups.
-    const lastFoldedTs = newGroups.length > 0 ? newGroups[newGroups.length - 1].ts : persistedState.last_folded_ts;
+    const lastFoldedTs = newGroups.length > 0 ? newGroups[newGroups.length - 1].ts : effectiveLastFoldedTs;
 
     const nextState = {
       version: 1,

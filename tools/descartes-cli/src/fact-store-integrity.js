@@ -332,11 +332,14 @@ export function finalizeFactIntegrityLedger(ledger, passId, { allowRecovery = fa
   return next;
 }
 
-function lossAtOrAfter(timestamp, asOfMs) {
-  return timestamp !== null && Date.parse(timestamp) >= asOfMs;
+function lossAtOrAfter(timestamp, asOfMs, nowMs) {
+  if (timestamp === null) return false;
+  const lossMs = Date.parse(timestamp);
+  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Number.POSITIVE_INFINITY;
+  return lossMs >= asOfMs && lossMs <= upperBoundMs;
 }
 
-export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINITY, currentCounts = {}) {
+export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINITY, currentCounts = {}, nowMs) {
   const base = ledger ?? createFactIntegrityLedger();
   const continuityObservation = observeFactContinuity(ledger, live);
   const thisReadHasLoss = (currentCounts.corrupt_count ?? 0) > 0 || (currentCounts.schema_invalid_count ?? 0) > 0;
@@ -355,10 +358,24 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
       continuity_ok: null,
     };
   }
-  const continuityOk = continuityObservation === "unknown" ? null : ledger?.continuity.continuity_ok ?? null;
+  // A future-dated continuity break (last_continuity_break_ts > nowMs) while the live store
+  // currently observes "ok" is a clock-rollback artifact for THIS read: the live facts match the
+  // ledger, so a stale continuity_ok:false must not latch this read to "unknown" until wall time
+  // reaches the future timestamp. Treat continuity as ok here and fall through to the normal,
+  // nowMs-bounded loss-channel evaluation (which already excludes the future break, so the read
+  // resolves to intact/degraded on real in-window losses only). The durable continuity_ok repair
+  // happens on the next retention pass. Normal/aged breaks (break <= nowMs) are unaffected.
+  const rawContinuityOk = ledger?.continuity.continuity_ok ?? null;
+  const continuityBreakMs = base.last_continuity_break_ts !== null ? Date.parse(base.last_continuity_break_ts) : Number.NaN;
+  const continuityBreakIsFuture = Number.isFinite(nowMs) && Number.isFinite(continuityBreakMs) && continuityBreakMs > nowMs;
+  const continuityOk = continuityObservation === "unknown"
+    ? null
+    : rawContinuityOk === false && continuityObservation === "ok" && continuityBreakIsFuture
+      ? true
+      : rawContinuityOk;
   if (!ledger || continuityObservation === "unknown" || continuityOk !== true) {
     return {
-      status: continuityOk === false && lossAtOrAfter(base.last_continuity_break_ts, asOfMs) ? "degraded" : "unknown",
+      status: continuityOk === false && lossAtOrAfter(base.last_continuity_break_ts, asOfMs, nowMs) ? "degraded" : "unknown",
       last_corrupt_ts: base.last_corrupt_ts,
       last_schema_invalid_ts: base.last_schema_invalid_ts,
       last_bytecap_evict_ts: base.last_bytecap_evict_ts,
@@ -377,7 +394,7 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
     base.last_schema_invalid_ts,
     base.last_bytecap_evict_ts,
     base.last_continuity_break_ts,
-  ].some((timestamp) => lossAtOrAfter(timestamp, asOfMs));
+  ].some((timestamp) => lossAtOrAfter(timestamp, asOfMs, nowMs));
   return {
     status: degraded ? "degraded" : "intact",
     last_corrupt_ts: base.last_corrupt_ts,

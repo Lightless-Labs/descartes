@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
-import { isValidFactIntegrityLedger, readFactIntegrityLedger, resolveFactIntegrityPaths } from "../src/fact-store-integrity.js";
+import { buildCompleteness, isValidFactIntegrityLedger, readFactIntegrityLedger, resolveFactIntegrityPaths } from "../src/fact-store-integrity.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 
 async function tempPaths() {
@@ -78,6 +78,65 @@ test("age eviction alone leaves completeness intact", async () => {
   assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.age_evicted_total, 1);
   assert.equal(read.completeness.first_degraded_ts, null);
+});
+
+test("buildCompleteness does not degrade an intact read for a future ledger loss timestamp", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [], { now: NOW });
+  await enforceFactRetention(paths, { now: NOW });
+  const ledger = await readLedger(paths);
+  const futureLoss = "2026-08-21T00:00:10.000Z";
+  ledger.corrupt_dropped_total = 1;
+  ledger.last_corrupt_ts = futureLoss;
+  const live = {
+    record_count: 0,
+    bytes: 0,
+    raw_bytes: Buffer.alloc(0),
+    exists: true,
+    newest_ts: null,
+  };
+
+  assert.equal(
+    buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW)).status,
+    "intact",
+  );
+  assert.equal(
+    buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(futureLoss)).status,
+    "degraded",
+  );
+});
+
+test("buildCompleteness treats a future continuity break (continuity_ok:false) with an 'ok' observation as a rollback artifact, not a permanent 'unknown'", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [], { now: NOW });
+  await enforceFactRetention(paths, { now: NOW });
+  const ledger = await readLedger(paths);
+  const futureBreak = "2026-08-21T00:00:10.000Z";
+  // Simulate a clock-rollback artifact: the ledger recorded a continuity break at a future
+  // wall-clock time and left continuity_ok:false, but the live store currently observes "ok"
+  // (matches the ledger's last-rewrite fields).
+  ledger.continuity.continuity_ok = false;
+  ledger.last_continuity_break_ts = futureBreak;
+  const live = {
+    record_count: 0,
+    bytes: 0,
+    raw_bytes: Buffer.alloc(0),
+    exists: true,
+    newest_ts: null,
+  };
+
+  // now is BEFORE the future break: the stale continuity_ok:false must NOT latch this read to
+  // "unknown" — the live store is fine right now, so the read is intact.
+  assert.equal(
+    buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW)).status,
+    "intact",
+  );
+  // Control: when the break is at/within the current epoch (not future), continuity_ok:false is a
+  // real break -> degraded (unchanged behavior).
+  assert.equal(
+    buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(futureBreak)).status,
+    "degraded",
+  );
 });
 
 test("two consecutive retention passes do not double-count an unchanged output", async () => {
