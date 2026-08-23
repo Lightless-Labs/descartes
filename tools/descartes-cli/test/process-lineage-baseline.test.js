@@ -33,6 +33,10 @@ async function tempPaths() {
   });
 }
 
+async function settleFactStore(paths, now) {
+  await appendFactPoints(paths, [], { now });
+}
+
 const BASE_TS = Date.parse("2026-01-01T00:00:00.000Z");
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -75,6 +79,24 @@ function partialTick(ts, edges = [["shell", "node"]]) {
 
 function flatten(ticks) {
   return ticks.flat();
+}
+
+function intactReadResult(points) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "intact" },
+  };
+}
+
+function degradedReadResult(points, lossTs = tickTs(2)) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+  };
 }
 
 function expectedHash(entityKey) {
@@ -181,6 +203,7 @@ test("computeProcessLineageBaselineCandidates folds counters once and emits a no
   // so an arbitrary before-the-fixture anchor is supplied here.
   await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, points, { now: tickTs(2) });
+  await settleFactStore(paths, tickTs(2));
   const first = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
   assert.equal(first.length, 1);
   assert.equal(first[0].diagnostics.entity_key_hash, expectedHash(buildLineageEntityKey("shell", "python")));
@@ -214,6 +237,7 @@ test("computeProcessLineageBaselineCandidates fails closed end-to-end when facts
   // novel edge (same shape as the "folds counters once..." end-to-end test above) -- proving the
   // corrupted case below really would have fabricated an alert had it not been gated.
   await appendFactPoints(paths, points, { now: tickTs(2) });
+  await settleFactStore(paths, tickTs(2));
   const clean = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
   assert.equal(clean.length, 1);
 
@@ -260,7 +284,7 @@ test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine 
     now: tickTs(2),
     minHistoryTickCount: 2,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => ({ points, corrupt_count: 1 }),
+    readFactPoints: async () => ({ ...intactReadResult(points), corrupt_count: 1 }),
     loadProcessLineageBaselineStore: async () => ({ state: normalizeProcessLineageBaselineState(), corrupt: false }),
     writeProcessLineageBaselineStore: async () => {},
   });
@@ -272,11 +296,110 @@ test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine 
     now: tickTs(2),
     minHistoryTickCount: 2,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => ({ points: points.filter((point) => point.ts === tickTs(2)), corrupt_count: 0 }),
+    readFactPoints: async () => intactReadResult(points.filter((point) => point.ts === tickTs(2))),
     loadProcessLineageBaselineStore: async () => ({ state: normalizeProcessLineageBaselineState(), corrupt: false }),
     writeProcessLineageBaselineStore: async () => {},
   });
   assert.deepEqual(coldStart, []);
+});
+
+test("computeProcessLineageBaselineCandidates: degraded truncated history suppresses a fabricated established-edge alert", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const truncatedPoints = flatten([
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2)),
+    completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]]),
+  ]);
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(0) });
+
+  const result = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(3),
+    minHistoryTickCount,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => degradedReadResult(truncatedPoints, tickTs(3)),
+  });
+
+  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a novel-edge claim");
+  const state = (await loadProcessLineageBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, true);
+});
+
+test("computeProcessLineageBaselineCandidates: intact history control still detects a novel edge", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const points = flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
+  ]);
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.equal(result.length, 1, "an intact store must not be falsely suppressed");
+  assert.equal(result[0].diagnostics.entity_key_hash, expectedHash(buildLineageEntityKey("shell", "python")));
+});
+
+test("computeProcessLineageBaselineCandidates: one transient fact-history loss recovers after clean ticks", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = flatten([completeTick(tickTs(0)), completeTick(tickTs(1))]);
+  let readResult = degradedReadResult([], tickTs(2));
+  const options = {
+    minHistoryTickCount,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => ({ ...readResult, points }),
+  };
+
+  points = [...points, ...completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]])];
+  const lossTick = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(2) });
+  assert.deepEqual(lossTick, []);
+
+  readResult = intactReadResult([]);
+  points = [...points, ...completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]])];
+  assert.deepEqual(await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+
+  points = [...points, ...completeTick(tickTs(4), [["shell", "node"], ["shell", "python"]])];
+  assert.deepEqual(await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(4) }), []);
+  assert.equal((await loadProcessLineageBaselineStore(paths)).state.cold_start_pending, false);
+
+  points = [...points, ...completeTick(tickTs(5), [["shell", "node"], ["shell", "ruby"]])];
+  const resumed = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(5) });
+  assert.equal(resumed.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+});
+
+test("computeProcessLineageBaselineCandidates: a clean tick cannot self-heal and fire after fact-history loss", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = flatten([completeTick(tickTs(1)), completeTick(tickTs(2)), completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]])]);
+  let readResult = degradedReadResult(points, tickTs(3));
+  const options = {
+    minHistoryTickCount: 1,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => ({ ...readResult, points }),
+  };
+
+  assert.deepEqual(await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  points = [...points, ...completeTick(tickTs(4), [["shell", "node"], ["shell", "python"]])];
+  readResult = intactReadResult([]);
+  assert.deepEqual(
+    await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    [],
+    "the first clean tick after loss may re-establish state but must not emit novelty",
+  );
+  assert.equal((await loadProcessLineageBaselineStore(paths)).state.cold_start_pending, false);
 });
 
 // BOUNDED fix (deception/anomaly-detector review -- corrupt/missing-store self-heal-and-
@@ -347,6 +470,7 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
     completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
   ]);
   await appendFactPoints(paths, points, { now: tickTs(2) });
+  await settleFactStore(paths, tickTs(2));
 
   // Sanity control: this exact fact-history, read against an already-established store, fires
   // immediately (mirrors the "folds counters once" end-to-end test) -- proving the missing-store
@@ -356,6 +480,7 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
   await writeLearnedConfig(controlPaths, { enabled: true });
   await writeProcessLineageBaselineStore(controlPaths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
+  await settleFactStore(controlPaths, tickTs(2));
   const control = await computeProcessLineageBaselineCandidates(controlPaths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
   assert.equal(control.length, 1);
 
@@ -403,6 +528,7 @@ test("computeProcessLineageBaselineCandidates: a parseable-but-schema-invalid ba
   await writeLearnedConfig(controlPaths, { enabled: true });
   await writeProcessLineageBaselineStore(controlPaths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
+  await settleFactStore(controlPaths, tickTs(2));
   const control = await computeProcessLineageBaselineCandidates(controlPaths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
   assert.equal(control.length, 1);
 
@@ -477,6 +603,7 @@ test("computeProcessLineageBaselineCandidates: a fully schema-valid established 
     completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
   ]);
   await appendFactPoints(paths, points, { now: tickTs(2) });
+  await settleFactStore(paths, tickTs(2));
 
   // A hand-constructed but FULLY schema-valid store -- every field correctly typed and present
   // (or validly absent where optional) -- must pass validation and be trusted at face value,
@@ -557,6 +684,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol TERMINAL fix -- an es
   const controlPaths = await tempPaths();
   await writeLearnedConfig(controlPaths, { enabled: true });
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
+  await settleFactStore(controlPaths, tickTs(2));
   const controlStoreWithLastFolded = { ...minimalStoreMissingLastFolded, last_folded_ts: tickTs(-1) };
   assert.equal(isValidProcessLineageBaselineStoreShape(controlStoreWithLastFolded), true);
   const controlLocation = resolveProcessLineageBaselineStorePaths(controlPaths);
@@ -647,6 +775,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- an exact-valid
     completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
   ]);
   await appendFactPoints(paths, points, { now: tickTs(2) });
+  await settleFactStore(paths, tickTs(2));
 
   const exactValidStore = {
     version: 2,

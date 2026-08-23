@@ -2729,7 +2729,19 @@ test("Process-lineage wiring: a novel edge flows through the daemon's alert pipe
   // lineage-baseline.js exact-schema fix rejects an established store without one), so an
   // arbitrary before-the-fixture anchor is supplied here.
   await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  // The fact-store completeness gate (Slice 3) cold-starts process-lineage novelty while the
+  // integrity ledger reads 'unknown'. A fresh ledger's FIRST retention pass is deliberately
+  // 'unknown' (the bootstrap anti-laundering rule — a first/unconfirmed ledger cannot be
+  // trusted); a SECOND independent clean pass confirms it to 'intact'. A genuinely-established
+  // store has had many structural ticks, so its ledger is 'intact' and novelty fires. Mirror
+  // that here: append the fixture ONCE (the bootstrap pass), then trigger one more clean
+  // retention pass with no new facts (appendFactPoints still runs enforceFactRetention) to
+  // confirm the ledger to 'intact'. NB: re-appending the fixture facts instead would leave the
+  // ledger 'unknown' — duplicated facts share the latest fact ts, and excess records that don't
+  // advance newest_ts are treated as unprovable/tampered (an intended continuity guard), not a
+  // benign append.
   await appendFactPoints(paths, lineageNoveltyFixtureFactPoints(), { now: hour(6) });
+  await appendFactPoints(paths, [], { now: hour(6) });
 
   const result = await runIsolatedDaemonTick(paths, hour(6));
   const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID);

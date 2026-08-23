@@ -8,6 +8,7 @@ import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
@@ -281,7 +282,8 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const { points, corrupt_count: corruptFactCount } = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupProcessLineageFactsByTick(points);
 
   const loadStore = options.loadProcessLineageBaselineStore ?? loadProcessLineageBaselineStore;
@@ -320,7 +322,9 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
   // provenance; the zero-claims behavior and the re-accumulation requirement are the same.
   const factsCorruptThisTick = Boolean(corruptFactCount);
   const storeLossThisTick = corruptBaselineStore === true || missingBaselineStore === true;
-  const enteringColdStart = factsCorruptThisTick || storeLossThisTick;
+  const enteringColdStart = factsCorruptThisTick
+    || storeLossThisTick
+    || !factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts }).trust;
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below -- a tick
   // cannot self-heal and alert in the same breath it (re)establishes trust.
