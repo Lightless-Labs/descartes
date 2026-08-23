@@ -30,6 +30,7 @@ import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 // Slice 4b (observed-incident collectors plan), Decision 4 / Fable review MUST-FIX 5: the four
 // pure Welford/EWMA/z-score primitives + DEFAULT_BASELINE_FACT_WINDOW_MS were extracted into
@@ -80,6 +81,15 @@ export const DEFAULT_STDDEV_FLOOR = 0.5;
 // window; established.js: no session.count_drop candidate is ever emitted below this count.
 export const DEFAULT_MIN_SAMPLE_COUNT = 30;
 
+// Fact-store completeness hardening (docs/plans/2026-08-21-fact-store-completeness-hardening.md,
+// Slice 4): the number of genuinely-new, complete tick-groups that must accumulate strictly AFTER
+// a cold-start lockout's cold_start_since_ts anchor before the lockout clears and session.*
+// novelty (count_drop/churn) resumes. Distinct from DEFAULT_MIN_SAMPLE_COUNT above -- that gate is
+// about STATISTICAL significance for the Welford confidence_state; this one is about re-earned
+// TRUST in fact-history completeness after a loss event, and mirrors process-lineage-baseline.js's
+// DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT value exactly.
+export const DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT = 6;
+
 // A reasonable, undramatic smoothing constant for the persisted (but not v0-trigger-consuming,
 // see Decision 3's "EWMA's role, scoped explicitly") ewma/ewma_variance fields — not part of the
 // trigger math, so not flagged PROVISIONAL alongside the three sigma/floor constants above.
@@ -108,6 +118,13 @@ function freshSessionBaselineState() {
     last_observation: undefined,
     skipped_overflow_tick_count: 0,
     skipped_partial_tick_count: 0,
+    // Persistent cold-start lockout (fact-store completeness hardening, Slice 4 -- ports the
+    // mechanism process-lineage-baseline.js already carries, see the extended comment on
+    // computeSessionBaselineCandidates below for the full rationale). A brand new store starts
+    // pending, exactly like a genuine day-1 cold start.
+    cold_start_pending: true,
+    cold_start_reason: undefined,
+    cold_start_since_ts: undefined,
   };
 }
 
@@ -119,6 +136,10 @@ function finiteOrDefault(value, fallback) {
 function finiteOrUndefined(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function isValidIsoTimestamp(value) {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
 export function normalizeSessionBaselineState(raw) {
@@ -153,6 +174,16 @@ export function normalizeSessionBaselineState(raw) {
     last_observation: lastObservation,
     skipped_overflow_tick_count: finiteOrDefault(base.skipped_overflow_tick_count, 0),
     skipped_partial_tick_count: finiteOrDefault(base.skipped_partial_tick_count, 0),
+    // Fail-closed default (mirrors process-lineage-baseline.js's normalizeProcessLineageBaselineState
+    // exactly): cold_start_pending is trusted "false" only when the store explicitly and validly
+    // recorded it as such. Any other value -- missing (a pre-Slice-4 store predating this field),
+    // non-boolean garbage, or an explicit true -- is treated as still pending. This IS the
+    // per-detector P8-style migration: a pre-migration store cold-starts once on first read. Lenient
+    // per-field normalization (not process-lineage's exact-schema rejection) is deliberately kept
+    // here -- see the plan's "Shared schema-extension spec for Slices 4-7".
+    cold_start_pending: base.cold_start_pending !== false,
+    cold_start_reason: typeof base.cold_start_reason === "string" ? base.cold_start_reason : undefined,
+    cold_start_since_ts: typeof base.cold_start_since_ts === "string" ? base.cold_start_since_ts : undefined,
   };
 }
 
@@ -181,19 +212,34 @@ async function readJsonFile(file) {
 export async function loadSessionBaselineStore(descartesPaths) {
   const { storeFile } = resolveSessionBaselineStorePaths(descartesPaths);
   const { parsed, missing, corrupt } = await readJsonFile(storeFile);
-  if (missing) return { state: freshSessionBaselineState(), corrupt: false };
-  if (corrupt) return { state: freshSessionBaselineState(), corrupt: true };
-  return { state: normalizeSessionBaselineState(parsed), corrupt: false };
+  // `missing`/`corrupt` distinctly surfaced (mirrors process-lineage-baseline.js's
+  // loadProcessLineageBaselineStore) so computeSessionBaselineCandidates can tell "no store yet /
+  // store I/O loss this tick" (storeLossThisTick) apart from a genuinely-read, lenient-normalized
+  // store -- both cases already default cold_start_pending:true via freshSessionBaselineState, but
+  // storeLossThisTick additionally forces the arming branch to re-synthesize a real anchor every
+  // tick the store stays lost, rather than silently reusing a stale/undefined one.
+  if (missing) return { state: { ...freshSessionBaselineState(), cold_start_reason: "missing_store" }, corrupt: false, missing: true };
+  if (corrupt) return { state: { ...freshSessionBaselineState(), cold_start_reason: "corrupt_store" }, corrupt: true, missing: false };
+  return { state: normalizeSessionBaselineState(parsed), corrupt: false, missing: false };
 }
 
 export async function writeSessionBaselineStore(descartesPaths, state) {
   await ensureSessionBaselineDir(descartesPaths);
   const { storeFile } = resolveSessionBaselineStorePaths(descartesPaths);
   const normalized = normalizeSessionBaselineState(state);
+  // FAIL-SAFE (mirrors process-lineage-baseline.js's writeProcessLineageBaselineStore exactly):
+  // normalizeSessionBaselineState's own defaulting deliberately leaves cold_start_since_ts
+  // undefined when a caller doesn't supply one -- but a store actually PERSISTED to disk with
+  // cold_start_pending:true and no anchor can never re-establish (the re-accumulation gate in
+  // computeSessionBaselineCandidates has nothing to compare tick timestamps against). Anything
+  // actually written to disk in that shape gets a real anchor synthesized here, at write time.
+  const normalizedWithAnchor = normalized.cold_start_pending && !normalized.cold_start_since_ts
+    ? { ...normalized, cold_start_since_ts: new Date().toISOString() }
+    : normalized;
   const tmpFile = `${storeFile}.${process.pid}.tmp`;
-  await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
+  await fs.writeFile(tmpFile, JSON.stringify(normalizedWithAnchor, null, 2), { mode: 0o600 });
   await fs.rename(tmpFile, storeFile);
-  return normalized;
+  return normalizedWithAnchor;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -459,20 +505,90 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   const criticalSigma = options.criticalSigma ?? DEFAULT_CRITICAL_SIGMA;
   const ewmaAlpha = options.ewmaAlpha ?? DEFAULT_EWMA_ALPHA;
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
+  const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT;
 
+  // Fact-store completeness hardening (Slice 4): the FULL read result is captured (not just
+  // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
+  // exactly what process-lineage-baseline.js does for computeProcessLineageBaselineCandidates.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const { points } = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupSessionFactsByTick(points);
 
   const loadStore = options.loadSessionBaselineStore ?? loadSessionBaselineStore;
-  const { state: persistedState } = await loadStore(descartesPaths);
+  const { state: persistedState, corrupt: corruptBaselineStore, missing: missingBaselineStore } = await loadStore(descartesPaths);
+  const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  // BOUNDED fix, ported from process-lineage-baseline.js's persistent cold-start lockout
+  // (fact-store completeness hardening plan, Slice 4 — session-baseline.js did not have this
+  // mechanism at all before this slice; see computeProcessLineageBaselineCandidates for the full
+  // deception/anomaly-detector-review rationale this ports verbatim): an unreadable/corrupt
+  // fact-history this tick, a lost/corrupt session-baseline store, or fact-history whose
+  // completeness cannot be trusted since this detector's own last re-established anchor, must
+  // never be treated as authoritative "this really is all the session-count/churn history" — that
+  // could make a perfectly normal count/churn pattern read as a deviation purely because retention
+  // scrubbed the ticks that would have shown it as established, fabricating a session.count_drop or
+  // session.churn alert. Corrupt/missing/unrecognizable store state (or degraded fact-history)
+  // enters (or keeps) a PERSISTENT cold_start_pending lockout that survives across ticks: while
+  // pending, this detector emits ZERO session.* novelty (count_drop/churn) — not just this tick,
+  // but every tick — until minHistoryTickCount genuinely NEW complete ticks (ts strictly after
+  // cold_start_since_ts) have been observed. Re-establishment cannot be satisfied retroactively by
+  // fact-history that already existed before/during the loss.
+  const factsCorruptThisTick = Boolean(corruptFactCount);
+  const storeLossThisTick = corruptBaselineStore === true || missingBaselineStore === true;
+  // FAIL-SAFE, additional to the shared 3-term arming formula (process-lineage-baseline.js avoids
+  // this exact gap via its OWN exact-schema store validator, which rejects on disk any
+  // cold_start_pending:true store missing a valid anchor before it is ever normalized — session-
+  // baseline.js deliberately keeps LENIENT per-field normalization instead, per the plan's "Shared
+  // schema-extension spec for Slices 4-7", so that guard does not exist here). Without this term, a
+  // pre-Slice-4 store migrated in place (cold_start_pending defaults to true, cold_start_since_ts
+  // stays undefined) reading against an already-pristine, loss-free fact-history ledger would see
+  // factHistoryTrustworthy return trust:true even with no anchor (anchorTs undefined has nothing to
+  // compare against) — landing in the re-accumulation branch with sinceMs permanently Infinity,
+  // an unrecoverable lockout. This term forces that first post-migration tick to (re-)arm with a
+  // REAL anchor instead, so the migration cold-start is bounded ("cold-starts once"), never a
+  // silent permanent latch — the exact class of bug this whole plan exists to close.
+  const persistedAnchorMissingWhilePending = persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts);
+  const enteringColdStart = factsCorruptThisTick
+    || storeLossThisTick
+    || persistedAnchorMissingWhilePending
+    || !factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts }).trust;
+
+  // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
+  // self-heal and alert in the same breath it (re)establishes trust.
+  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart;
+
+  let nextColdStartPending = persistedState.cold_start_pending;
+  let nextColdStartReason = persistedState.cold_start_reason;
+  let nextColdStartSinceTs = persistedState.cold_start_since_ts;
+
+  if (enteringColdStart) {
+    // (Re-)arm the lockout. Any in-progress re-accumulation is discarded — it cannot be trusted to
+    // have been continuous once corruption/loss is observed again.
+    nextColdStartPending = true;
+    nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
+    nextColdStartSinceTs = nowIso;
+  } else if (persistedState.cold_start_pending) {
+    // Re-accumulating: count complete ticks genuinely observed strictly after the lockout began.
+    // Recomputed fresh from the live window every call (not an incrementing counter) so a missed
+    // or re-ordered tick can never double count, and so re-establishment cannot be satisfied by
+    // ticks that already existed before the reset.
+    const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
+    const reestablishedTickCount = groups.filter(
+      (group) => tickGroupDisposition(group) === "complete" && new Date(group.ts).getTime() > sinceMs,
+    ).length;
+    if (reestablishedTickCount >= minHistoryTickCount) {
+      nextColdStartPending = false;
+    }
+  }
 
   const lastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
   const newGroups = groups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
 
   const windowed = computeWindowedSessionStats(groups, { stddevFloor, ewmaAlpha, minSampleCount });
 
-  if (newGroups.length > 0) {
+  if (newGroups.length > 0 || enteringColdStart) {
     let skippedOverflow = persistedState.skipped_overflow_tick_count;
     let skippedPartial = persistedState.skipped_partial_tick_count;
     let lastFoldedTs = persistedState.last_folded_ts;
@@ -493,10 +609,15 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       last_observation: windowed.last_observation,
       skipped_overflow_tick_count: skippedOverflow,
       skipped_partial_tick_count: skippedPartial,
+      cold_start_pending: nextColdStartPending,
+      cold_start_reason: nextColdStartReason,
+      cold_start_since_ts: nextColdStartSinceTs,
     };
     const writeStore = options.writeSessionBaselineStore ?? writeSessionBaselineStore;
     await writeStore(descartesPaths, nextState);
   }
+
+  if (coldStartPendingThisTick) return [];
 
   const candidates = [];
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call

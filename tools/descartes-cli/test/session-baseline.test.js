@@ -113,11 +113,49 @@ function flatten(groupsOfPoints) {
   return groupsOfPoints.flat();
 }
 
+// Fact-store completeness hardening (Slice 4) fixtures, mirroring process-lineage-baseline.test.js's
+// intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
+// dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
+function intactReadResult(points) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "intact" },
+  };
+}
+
+function degradedReadResult(points, lossTs = tickTs(2)) {
+  return {
+    points,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+  };
+}
+
 async function seedAndCompute(paths, points, options = {}) {
   const lastTs = points.reduce((max, p) => Math.max(max, new Date(p.ts).getTime()), 0);
   const now = options.now ?? new Date(lastTs).toISOString();
   await writeLearnedConfig(paths, { enabled: true });
+  // Slice 4 (fact-store completeness hardening) gave session-baseline.js its own persistent
+  // cold-start lockout, mirroring process-lineage-baseline.js's: a brand-new store starts
+  // cold_start_pending, and a single one-shot append+compute call (exactly this helper's shape)
+  // can never itself satisfy re-establishment (all of `points`' history necessarily predates the
+  // anchor a fresh lockout would set on its own first read). Every test below this helper predates
+  // Slice 4 and is about session-baseline's OTHER logic (Welford folding, churn, tick-disposition
+  // skips, ...), not the lockout itself -- so, mirroring process-lineage-baseline.test.js's own
+  // precedent of pre-seeding cold_start_pending:false before wiring/candidate-shape tests, this
+  // helper pre-establishes the store (anchored strictly before the fixture's own earliest point)
+  // and confirms the shared integrity ledger to 'intact' (a fresh ledger's first retention pass is
+  // deliberately 'unknown' -- bootstrap anti-laundering rule; a second clean pass confirms it) so
+  // callers keep exercising exactly what they always tested. The lockout mechanism itself has its
+  // own dedicated coverage further down in this file.
+  const firstTs = points.reduce((min, p) => Math.min(min, new Date(p.ts).getTime()), Infinity);
+  const establishedAnchor = Number.isFinite(firstTs) ? new Date(firstTs - 1).toISOString() : now;
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: establishedAnchor });
   await appendFactPoints(paths, points, { now });
+  await appendFactPoints(paths, [], { now });
   return computeSessionBaselineCandidates(paths, { now, ...options });
 }
 
@@ -397,11 +435,16 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 session/day o
 test("regime-change fixture: a sustained, legitimate shift from N to M<N eventually RECOVERS (stops firing) without any operator action", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Slice 4: pre-establish the cold-start lockout (see seedAndCompute's comment above) -- this
+  // fixture drives appendFactPoints/computeSessionBaselineCandidates directly rather than through
+  // seedAndCompute, so it needs the same pre-seed + ledger-confirmation applied by hand.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   const N = 20;
   const M = 5;
   const baselineTicks = [];
   for (let i = 0; i < 40; i += 1) baselineTicks.push(...completeTick(tickTs(i), N));
   await appendFactPoints(paths, baselineTicks, { now: tickTs(39) });
+  await appendFactPoints(paths, [], { now: tickTs(39) }); // confirm the integrity ledger to 'intact'
 
   let hour = 40;
   let firedImmediatelyAfterShift = false;
@@ -442,7 +485,11 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   const points = flatten(ticks);
   const now = tickTs(30);
   await writeLearnedConfig(paths, { enabled: true });
+  // Slice 4: pre-establish the cold-start lockout (see seedAndCompute's comment above) -- this
+  // fixture drives appendFactPoints/computeSessionBaselineCandidates directly.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, points, { now });
+  await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
   const first = await computeSessionBaselineCandidates(paths, { now });
   const second = await computeSessionBaselineCandidates(paths, { now }); // no new fact-history written in between
@@ -465,6 +512,14 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   const now = tickTs(4);
   await writeLearnedConfig(paths, { enabled: true });
   await appendFactPoints(paths, flatten(ticks), { now });
+  // Slice 4: confirm the integrity ledger to 'intact' before the repeated-call phase below -- a
+  // fresh ledger's first retention pass reads 'unknown' (bootstrap), which would otherwise keep
+  // factHistoryTrustworthy returning false and the cold-start lockout re-arming (and rewriting the
+  // store) on every one of the "repeated calls with unchanged fact-history" below, defeating the
+  // very idempotency this test checks. (The store itself is left un-pre-seeded/day-1 on purpose:
+  // this test only asserts on write-count and state equality, not on candidates, so day-1
+  // suppression on the first call doesn't affect it.)
+  await appendFactPoints(paths, [], { now });
 
   let writeCount = 0;
   const countingWrite = async (descartesPaths, state) => {
@@ -617,6 +672,167 @@ test("GARBLED-MARKER on an OLDER (non-latest) tick, end-to-end (adversarial-revi
   ];
   const candidates = await seedAndCompute(paths, points);
   assert.equal(candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a garbled census on an older tick must never manufacture a fabricated session.churn using its point as the prior_fingerprint anchor");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store completeness hardening (Slice 4): persistent cold-start lockout.
+// docs/plans/2026-08-21-fact-store-completeness-hardening.md, "Required test in every one of
+// Slices 3-7" + the per-detector migration test. Mirrors process-lineage-baseline.test.js's own
+// dedicated cold-start coverage exactly, adapted to session-baseline's count_drop/churn shape.
+// ---------------------------------------------------------------------------------------------
+
+test("computeSessionBaselineCandidates: degraded truncated history suppresses a fabricated session.count_drop (an established pattern must not read as anomalous just because retention scrubbed the history that would have shown it as normal)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
+  ticks.push(completeTick(tickTs(30), 0)); // mass-drop tick -- would fire session.count_drop if trusted
+  const points = flatten(ticks);
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computeSessionBaselineCandidates(paths, {
+    now: tickTs(30),
+    minHistoryTickCount,
+    readFactPoints: async () => degradedReadResult(points, tickTs(30)),
+  });
+
+  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a session.count_drop claim");
+  const { state } = await loadSessionBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+});
+
+test("computeSessionBaselineCandidates: intact history control still fires a real session.count_drop (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
+  ticks.push(completeTick(tickTs(30), 0));
+  const points = flatten(ticks);
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const result = await computeSessionBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  const dropCandidates = result.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(dropCandidates.length, 1, "an intact store must not be falsely suppressed");
+});
+
+test("computeSessionBaselineCandidates: one transient fact-history loss recovers after minHistoryTickCount genuinely-new clean ticks (recovery-latch fix, bounded not permanent)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = [sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete")];
+  let readResult = degradedReadResult([], tickTs(1));
+  const options = { minHistoryTickCount, readFactPoints: async () => ({ ...readResult, points }) };
+
+  // Loss tick: e1's fingerprint would change here (fp1 -> fp2) -- would churn if trusted.
+  points = [...points, sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete")];
+  const lossTick = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(1) });
+  assert.deepEqual(lossTick, []);
+
+  readResult = intactReadResult([]);
+  points = [...points, sessionPoint(tickTs(2), "e1", "fp2"), censusMarkerPoint(tickTs(2), "complete")]; // 1st re-accum tick
+  assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(2) }), []);
+
+  points = [...points, sessionPoint(tickTs(3), "e1", "fp2"), censusMarkerPoint(tickTs(3), "complete")]; // 2nd re-accum tick
+  assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, false);
+
+  // A genuinely new fingerprint change after re-establishment must fire normally.
+  points = [...points, sessionPoint(tickTs(4), "e1", "fp3"), censusMarkerPoint(tickTs(4), "complete")];
+  const resumed = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) });
+  const churnCandidates = resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID);
+  assert.equal(churnCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+});
+
+test("computeSessionBaselineCandidates: a clean tick cannot self-heal and fire session.* novelty in the same breath fact-history loss is first observed on the prior tick", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  let points = [
+    sessionPoint(tickTs(1), "e1", "fp1"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(2), "e1", "fp1"), censusMarkerPoint(tickTs(2), "complete"),
+    sessionPoint(tickTs(3), "e1", "fp2"), censusMarkerPoint(tickTs(3), "complete"), // would churn if trusted
+  ];
+  let readResult = degradedReadResult(points, tickTs(3));
+  const options = { minHistoryTickCount: 1, readFactPoints: async () => ({ ...readResult, points }) };
+
+  assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+
+  points = [...points, sessionPoint(tickTs(4), "e1", "fp2"), censusMarkerPoint(tickTs(4), "complete")];
+  readResult = intactReadResult([]);
+  assert.deepEqual(
+    await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    [],
+    "the first clean tick after loss may re-establish state but must not emit novelty in the same tick",
+  );
+  assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, false);
+});
+
+test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-starts once on first read, then recovers after minHistoryTickCount clean ticks (per-detector P8 analog)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+
+  // Simulate a store written by a pre-Slice-4 daemon: no cold_start_pending/_reason/_since_ts at
+  // all -- written directly to disk, bypassing writeSessionBaselineStore's normalizer entirely.
+  const { dir, storeFile } = resolveSessionBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const legacyState = {
+    version: 1,
+    last_folded_ts: tickTs(-1),
+    confidence_state: "established",
+    stats: { count: 5, mean: 20, m2: 0, variance: 0, stddev: 0, ewma: 20, ewma_variance: 0, min: 20, max: 20 },
+    last_observation: undefined,
+    skipped_overflow_tick_count: 0,
+    skipped_partial_tick_count: 0,
+  };
+  await fs.writeFile(storeFile, JSON.stringify(legacyState, null, 2), { mode: 0o600 });
+
+  const ticks = [];
+  for (let i = 0; i < 5; i += 1) ticks.push(sessionPoint(tickTs(i), "e1", "fp1"), censusMarkerPoint(tickTs(i), "complete"));
+  await appendFactPoints(paths, ticks, { now: tickTs(4) });
+  await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
+
+  // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
+  // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
+  // must not be trusted just because it parses. A bounded, one-time cold-start is required.
+  const firstRead = await computeSessionBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount });
+  assert.deepEqual(firstRead, []);
+  const afterFirst = (await loadSessionBaselineStore(paths)).state;
+  assert.equal(afterFirst.cold_start_pending, true);
+  assert.equal(
+    typeof afterFirst.cold_start_since_ts,
+    "string",
+    "the migration must synthesize a real anchor, never leave it undefined (the Infinity re-establishment-boundary trap)",
+  );
+  assert.ok(Number.isFinite(new Date(afterFirst.cold_start_since_ts).getTime()));
+
+  // minHistoryTickCount genuinely-new clean ticks after the migration anchor re-establish trust.
+  let hour = 5;
+  for (let i = 0; i < minHistoryTickCount; i += 1) {
+    const ts = tickTs(hour);
+    await appendFactPoints(paths, [sessionPoint(ts, "e1", "fp1"), censusMarkerPoint(ts, "complete")], { now: ts });
+    await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
+    hour += 1;
+  }
+  assert.equal(
+    (await loadSessionBaselineStore(paths)).state.cold_start_pending,
+    false,
+    "the migration cold-start must be bounded -- it clears after minHistoryTickCount genuinely-new clean ticks, never latching forever",
+  );
+
+  // And session.* novelty genuinely resumes afterward.
+  const ts = tickTs(hour);
+  await appendFactPoints(paths, [sessionPoint(ts, "e1", "fp-changed"), censusMarkerPoint(ts, "complete")], { now: ts });
+  const resumed = await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
+  assert.equal(resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 1);
 });
 
 // ---------------------------------------------------------------------------------------------

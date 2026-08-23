@@ -36,7 +36,7 @@ import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePat
 import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY, SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
-import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore } from "../src/session-baseline.js";
+import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore } from "../src/peer-baseline.js";
 import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore } from "../src/service-baseline.js";
@@ -2111,10 +2111,17 @@ test("Slice 4: byte-identical real alerts when the learned kill switch is off, e
 test("Slice 4 wiring: computeSessionBaselineCandidates is the daemon's fourth extraCandidates entry — a pre-seeded mass-drop fact-history produces a real, sanitized session.count_drop alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4) gave session-baseline.js its own persistent
+  // cold-start lockout, mirroring process-lineage-baseline.js's — see the "Process-lineage wiring"
+  // test above for the identical rationale. Pre-establish the store (this wiring test is about the
+  // daemon pipeline, not the lockout, which has its own dedicated coverage in
+  // session-baseline.test.js) and confirm the shared integrity ledger to 'intact' before the tick.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
@@ -2131,6 +2138,10 @@ test("Slice 4 wiring: computeSessionBaselineCandidates is the daemon's fourth ex
 test("Slice 4 wiring: a fingerprint change on the latest tick-group produces a real session.churn alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment above for the identical rationale) and confirm the
+  // shared integrity ledger to 'intact' before the tick.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [
     sessionFactPoint(hour(0), "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
     censusMarkerFactPoint(hour(0), "complete"),
@@ -2138,6 +2149,7 @@ test("Slice 4 wiring: a fingerprint change on the latest tick-group produces a r
     censusMarkerFactPoint(hour(1), "complete"),
   ];
   await appendFactPoints(paths, ticks, { now: hour(1) });
+  await appendFactPoints(paths, [], { now: hour(1) });
 
   const result = await runIsolatedDaemonTick(paths, hour(1));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_CHURN_RULE_ID);
@@ -2191,10 +2203,15 @@ test("Slice 4 ts-cohesion (integration): every session.* fact point emitted with
 test("Slice 4, Decision 2b: a due session.count_drop is delivered through the deterministic local delivery branch wired into the daemon tick, and never reaches the LLM path", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment for the identical rationale) and confirm the shared
+  // integrity ledger to 'intact' before the tick.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -2220,10 +2237,15 @@ test("Slice 4, Decision 2b: a due session.count_drop is delivered through the de
 test("Slice 4, Decision 2b: the deterministic delivery respects cooldown — a second daemon tick within the cooldown window does not re-deliver the same session.count_drop", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment for the identical rationale) and confirm the shared
+  // integrity ledger to 'intact' before the tick.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
@@ -2243,10 +2265,15 @@ test("Slice 4, Decision 2b: the deterministic delivery respects cooldown — a s
 test("Slice 4, Decision 2b: deliverSessionAlerts:false opts the daemon tick out of the deterministic delivery branch entirely (no sessionAlertDelivery, no deliverNotification call for session.*)", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment for the identical rationale) and confirm the shared
+  // integrity ledger to 'intact' before the tick.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -2268,10 +2295,15 @@ test("Slice 4, Decision 2b: deliverSessionAlerts:false opts the daemon tick out 
 test("Slice 4: computeSessionBaselineCandidates candidate shape matches the existing extraCandidates sources (byte-identical structural key set)", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4): pre-establish the cold-start lockout (see the
+  // "Process-lineage wiring" test's comment for the identical rationale) and confirm the shared
+  // integrity ledger to 'intact' before the tick.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
   await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
@@ -2326,7 +2358,14 @@ function correlationFixtureFactPoints() {
 test("Slice 6 wiring: computeCorrelationCandidates is the daemon's fifth extraCandidates entry — once the session.count_drop anchor has been persisted by a prior tick, a following tick joins it against an odd-hour/novel peer login and produces a real, sanitized correlation.login_kill_proximity alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
+  // Fact-store completeness hardening (Slice 4) gave session-baseline.js its own persistent
+  // cold-start lockout. This test's session.count_drop "anchor" is a session-baseline candidate
+  // (the correlation alert itself belongs to incident-correlation.js, Slice 8, out of this
+  // module's scope) — pre-establish the store and confirm the shared integrity ledger to 'intact'
+  // so the anchor fires as this test already expects, same as the SESSION-specific fixtures above.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   await appendFactPoints(paths, correlationFixtureFactPoints(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
 
   // Tick 1: computeSessionBaselineCandidates first derives and PERSISTS the session.count_drop
   // anchor. computeCorrelationCandidates reads alert-HISTORY from disk independently (Decision 1)
