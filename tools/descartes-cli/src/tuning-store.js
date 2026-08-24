@@ -578,6 +578,8 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
   const readIntelligenceConfig = runtime.readAlertIntelligenceConfig ?? readAlertIntelligenceConfig;
   const loadConstraintsFn = runtime.loadConstraints ?? loadConstraints;
   const readFacts = runtime.readFactPoints ?? readFactPoints;
+  // Slice 9 audit — no completeness gate needed: tuning uses available facts for backtesting
+  // and target mapping, and makes no absence or novelty claim from missing history.
 
   const [alerts, auditRecords, deliveryRecords, shadowResult, intelligenceConfig, constraintsResult, factsResult] = await Promise.all([
     safeReadSignal(() => readAlerts(descartesPaths), "alerts.json"),

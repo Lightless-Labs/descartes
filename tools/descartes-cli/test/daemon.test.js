@@ -26,7 +26,7 @@ import {
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
-import { appendFactPoints, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { readAlertRecords } from "../src/alert-store.js";
@@ -893,6 +893,15 @@ function shadowConstraintFixture(overrides = {}) {
   };
 }
 
+// Slice 9 fixture setup: first-touch fact ledgers are intentionally unknown until a clean
+// follow-up retention pass. Commit that follow-up after each fixture append so these wiring
+// tests exercise normal intact shadow evaluation rather than bootstrap suppression.
+async function appendFactPointsAndCommit(paths, points, options = {}) {
+  const result = await appendFactPoints(paths, points, options);
+  await enforceFactRetention(paths, { now: options.now !== undefined ? options.now : options.ts });
+  return result;
+}
+
 test("S7a wiring: with zero shadow constraints, a structural tick produces no shadow-violations.jsonl file (cheap no-op, byte-identical to pre-S7a)", async () => {
   const paths = await tempPaths();
   const result = await runDaemonIteration(paths, {
@@ -926,6 +935,7 @@ test("S7a wiring: with one shadow constraint and a matching fact, exactly one sh
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    appendFactPoints: appendFactPointsAndCommit,
   });
 
   assert.equal(result.shadowEvaluation.evaluated_count, 1);
@@ -996,6 +1006,7 @@ test("S7a wiring: over N simulated structural ticks spanning multiple days, one 
       ts: new Date(simulatedNowMs).toISOString(),
       now: simulatedNowMs,
       loadLearnedConfig: async () => ({ enabled: true }),
+      appendFactPoints: appendFactPointsAndCommit,
     });
     simulatedNowMs += profile.structural.interval_ms;
   }
@@ -1029,6 +1040,7 @@ test("S7a load-bearing safety regression: a shadow constraint that would obvious
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    appendFactPoints: appendFactPointsAndCommit,
   });
 
   // The shadow record itself does fire (proves the fixture is meaningful, not a false negative).

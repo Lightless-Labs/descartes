@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention } from "../src/fact-store.js";
 import { buildConstraintTarget, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import { evaluateConstraints } from "../src/constraint-eval.js";
 import {
@@ -179,6 +179,7 @@ test("evaluateAndLogShadowConstraints appends exactly one record per shadow cons
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } },
   ], { now });
+  await enforceFactRetention(paths, { now });
 
   const result = await evaluateAndLogShadowConstraints(paths, { now });
   assert.equal(result.evaluated_count, 1);
@@ -190,6 +191,57 @@ test("evaluateAndLogShadowConstraints appends exactly one record per shadow cons
   assert.equal(records[0].constraint_id, "constraint.mined.service-presence.deadbeefdeadbeef");
   assert.equal(records[0].fired, true);
   assert.equal(records[0].actual, "false");
+});
+
+test("evaluateAndLogShadowConstraints skips untrustworthy history (degraded, unknown, or corrupt) without advancing a candidate", async () => {
+  const cases = [
+    ["degraded", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded" } }],
+    ["unknown", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "unknown" } }],
+    ["corrupt", { corrupt_count: 1, schema_invalid_count: 0, completeness: { status: "intact" } }],
+  ];
+
+  for (const [label, readResult] of cases) {
+    const paths = await tempPaths();
+    const now = "2026-07-10T00:00:00.000Z";
+    await writeConstraints(paths, [shadowConstraint()]);
+    const result = await evaluateAndLogShadowConstraints(paths, {
+      now,
+      readFactPoints: async () => ({
+        points: [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" }, ts: now }],
+        ...readResult,
+      }),
+    });
+
+    assert.equal(result.evaluated_count, 1, `${label} history still reports the candidate considered`);
+    assert.equal(result.appended_count, 0, `${label} history must not create a soak record`);
+    const { records } = await readShadowRecords(paths, { now });
+    assert.deepEqual(records, [], `${label} history must not advance shadow safety evidence`);
+    const { constraints } = await loadConstraints(paths);
+    assert.equal(constraints[0].status, "shadow", `${label} history must leave promotion state unchanged`);
+  }
+});
+
+test("evaluateAndLogShadowConstraints keeps normal behavior for intact history and ignores a future loss at the injected now", async () => {
+  const paths = await tempPaths();
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const now = new Date(nowMs).toISOString();
+  await writeConstraints(paths, [shadowConstraint()]);
+
+  const result = await evaluateAndLogShadowConstraints(paths, {
+    now,
+    readFactPoints: async () => ({
+      points: [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" }, ts: now }],
+      corrupt_count: 0,
+      schema_invalid_count: 0,
+      completeness: {
+        status: "intact",
+        last_bytecap_evict_ts: new Date(nowMs + 1).toISOString(),
+      },
+    }),
+  });
+
+  assert.equal(result.fired_count, 1, "intact history should evaluate the shadow candidate normally");
+  assert.equal(result.appended_count, 1);
 });
 
 test("evaluateAndLogShadowConstraints excludes degraded facts (owner_known:\"false\"/confidence:0) — never confirming or contradicting", async () => {
@@ -393,6 +445,7 @@ test("Slice B: evaluateAndLogShadowConstraints (the SHADOW-SOAK path) applies th
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } }, // would FIRE (expected "true") if fresh
   ], { ts: factTs, now: factTs }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
+  await enforceFactRetention(paths, { now: factTs });
 
   const staleNow = new Date(Date.parse(factTs) + 4 * 60 * 60 * 1000).toISOString(); // 4h later
   const freshnessMs = 3 * 60 * 60 * 1000;

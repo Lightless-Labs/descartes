@@ -327,6 +327,8 @@ export async function computeProvenanceWarningCandidates(descartesPaths, options
   if (!learnedConfig.enabled) return [];
 
   const readFacts = options.readFactPoints ?? readFactPoints;
+  // Slice 9 audit — no completeness gate needed: this maps latest warning facts; absence
+  // produces no candidate rather than a novelty or absence claim.
   const { points } = await readFacts(descartesPaths, {
     windowMs: options.provenanceFactWindowMs ?? DEFAULT_PROVENANCE_FACT_WINDOW_MS,
     now: options.now,

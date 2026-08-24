@@ -10,6 +10,7 @@ import {
 } from "./constraint-store.js";
 import { evaluateShadowConstraints } from "./constraint-eval.js";
 import { readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 
 // Shadow evaluation is structurally separate from real alerting — not a flag, a different
 // code path (plan §5). Nothing in this module ever imports alert-store.js, never calls
@@ -296,7 +297,13 @@ export async function evaluateAndLogShadowConstraints(descartesPaths, options = 
   const freshnessMs = options.freshnessMs;
   // Read window and lookup staleness share one resolved nowMs snapshot (never a bare options.now that
   // would let readFactPoints take its own, later, Date.now() and drop a horizon-edge-fresh fact).
-  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
+  const readResult = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
+  // Missing historical exercises can make a shadow candidate look falsely safe. Do not
+  // evaluate or append a soak record until this fact-history read is trustworthy.
+  if (!factHistoryTrustworthy(readResult, { nowMs }).trust) {
+    return { evaluated_count: shadowConstraints.length, fired_count: 0, appended_count: 0 };
+  }
+  const { points } = readResult;
   const factLookup = buildShadowFactLookup(points, { now: nowMs, freshnessMs });
   const ts = options.ts ?? (options.now !== undefined ? new Date(options.now).toISOString() : new Date().toISOString());
   const records = evaluateShadowConstraints(shadowConstraints, factLookup, { ts });

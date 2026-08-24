@@ -397,6 +397,8 @@ async function computeActiveConstraintCandidates(descartesPaths, options) {
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
   const freshnessMs = options.activeFreshnessMs;
   const readFacts = options.readFactPoints ?? readFactPoints;
+  // Slice 9 audit — no completeness gate needed: active evaluation uses present facts and
+  // already follows "no fact, no claim"; daemon append/retention wiring only persists facts.
   // Pass the SAME resolved nowMs snapshot to the read window AND the lookup staleness — never a bare
   // options.now (undefined in the live loop), which would let readFactPoints take its own, strictly
   // later, Date.now() and exclude a fact that is fresh per this snapshot at the horizon edge.

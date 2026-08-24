@@ -6,7 +6,7 @@ import test from "node:test";
 import { evaluateConstraints } from "../src/constraint-eval.js";
 import { SEED_CONSTRAINTS, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import { isFixedLengthHexHash, isSafeEnumString } from "../src/diagnostics-sanitizer.js";
-import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention, readFactPoints } from "../src/fact-store.js";
 import {
   MINED_FAMILIES,
   MINED_ID_PREFIX,
@@ -348,6 +348,7 @@ test("descartes learned mine writes drafts to constraints.json, preserves existi
   const paths = await tempPaths();
   await writeConstraints(paths, SEED_CONSTRAINTS);
   await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
 
   const lines = [];
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: (line) => lines.push(line) });
@@ -367,6 +368,7 @@ test("descartes learned mine writes drafts to constraints.json, preserves existi
 test("descartes learned mine --json prints a machine-readable summary", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
 
   const lines = [];
   await runLearned(paths, ["mine", "--json"], { now: BASE_TS + 8 * DAY_MS, output: (line) => lines.push(line) });
@@ -378,9 +380,56 @@ test("descartes learned mine --json prints a machine-readable summary", async ()
   assert.equal(payload.learned_mine.updated_drafts, 0);
 });
 
+test("descartes learned mine mints zero drafts when fact-history is degraded, unknown, or corrupt", async () => {
+  const cases = [
+    ["degraded", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded" } }],
+    ["unknown", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "unknown" } }],
+    ["corrupt", { corrupt_count: 1, schema_invalid_count: 0, completeness: { status: "intact" } }],
+  ];
+
+  for (const [label, readResult] of cases) {
+    const paths = await tempPaths();
+    await writeConstraints(paths, []);
+    const lines = [];
+    await runLearned(paths, ["mine"], {
+      now: BASE_TS + 8 * DAY_MS,
+      readFactPoints: async () => ({ points: stableServiceHistory(), ...readResult }),
+      output: (line) => lines.push(line),
+    });
+
+    const { constraints } = await loadConstraints(paths);
+    assert.deepEqual(constraints, [], `${label} fact-history must suppress all draft mining`);
+    assert.match(lines[0], /Mined 0 candidate/);
+  }
+});
+
+test("descartes learned mine keeps normal behavior for intact history and ignores a future loss at the injected now", async () => {
+  const nowMs = BASE_TS + 8 * DAY_MS;
+  const paths = await tempPaths();
+  await writeConstraints(paths, []);
+  await runLearned(paths, ["mine"], {
+    now: nowMs,
+    readFactPoints: async () => ({
+      points: stableServiceHistory(),
+      corrupt_count: 0,
+      schema_invalid_count: 0,
+      completeness: {
+        status: "intact",
+        last_bytecap_evict_ts: new Date(nowMs + 1).toISOString(),
+      },
+    }),
+    output: () => {},
+  });
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.length, 1, "intact history should still mint the normal draft");
+  assert.equal(constraints[0].status, "draft");
+});
+
 test("descartes learned mine re-run does not duplicate drafts (idempotent CLI round-trip)", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
 
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: () => {} });
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: () => {} });

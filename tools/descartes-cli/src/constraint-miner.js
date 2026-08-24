@@ -10,6 +10,7 @@
 
 import crypto from "node:crypto";
 import { buildConstraintTarget, loadConstraints, SCHEMA_VERSION, writeConstraints } from "./constraint-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { parseDurationMs } from "./history-store.js";
 import { readFactPoints } from "./fact-store.js";
 
@@ -313,8 +314,14 @@ export async function runLearned(descartesPaths, args, runtime = {}) {
     }
   }
 
-  const { points } = await readFactPoints(descartesPaths, { windowMs: options.windowMs, now: runtime.now });
-  const candidates = mineConstraintCandidates(points, [], { now: runtime.now, ...runtime.mineOptions });
+  const readFacts = runtime.readFactPoints ?? readFactPoints;
+  const readResult = await readFacts(descartesPaths, { windowMs: options.windowMs, now: runtime.now });
+  const nowMs = runtime.now !== undefined ? new Date(runtime.now).getTime() : Date.now();
+  // A truncated or otherwise untrustworthy history can hide counterexamples and mint an
+  // over-strong draft. Degrade to zero mining for this pass; drafts remain human-gated.
+  const candidates = factHistoryTrustworthy(readResult, { nowMs }).trust
+    ? mineConstraintCandidates(readResult.points, [], { now: nowMs, ...runtime.mineOptions })
+    : [];
   const { constraints: existing } = await loadConstraints(descartesPaths);
   const merge = mergeMinedConstraints(existing, candidates);
   await writeConstraints(descartesPaths, merge.constraints);
