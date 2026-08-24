@@ -116,7 +116,28 @@ function killSideAlertRecord(ruleId, firstSeenTs, { severity = "critical", finge
 async function seed(paths, { alerts = [], factPoints = [], now, learnedEnabled = true } = {}) {
   if (learnedEnabled) await writeLearnedConfig(paths, { enabled: true });
   if (alerts.length > 0) await writeAlertRecords(paths, alerts);
-  if (factPoints.length > 0) await appendFactPoints(paths, factPoints, { now });
+  if (factPoints.length > 0) {
+    await appendFactPoints(paths, factPoints, { now });
+    // A second clean retention pass confirms the shared completeness ledger as intact. This
+    // keeps positive correlation fixtures representative of established fact history.
+    await appendFactPoints(paths, [], { now });
+  }
+}
+
+function completeFactReadResult(points, { status = "intact", corruptCount = 0, schemaInvalidCount = 0, ...completeness } = {}) {
+  return {
+    points,
+    corrupt_count: corruptCount,
+    schema_invalid_count: schemaInvalidCount,
+    completeness: {
+      status,
+      last_corrupt_ts: null,
+      last_schema_invalid_ts: null,
+      last_bytecap_evict_ts: null,
+      last_continuity_break_ts: null,
+      ...completeness,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -216,6 +237,90 @@ test("Slice 6 positive fixture (motivating incident shape): odd-hour, low-prior-
   for (const value of Object.values(candidate.diagnostics)) {
     assert.notEqual(value && typeof value === "object" && value.redacted, true, "no diagnostics field should be redacted");
   }
+});
+
+test("Slice 8: degraded, unknown, or this-tick-corrupt fact-history suppresses an otherwise qualifying correlation", async () => {
+  const cases = [
+    ["degraded completeness", completeFactReadResult([], { status: "degraded" })],
+    ["unknown completeness", completeFactReadResult([], { status: "unknown" })],
+    ["corrupt facts this tick", completeFactReadResult([], { corruptCount: 1 })],
+  ];
+
+  for (const [label, readResultTemplate] of cases) {
+    const paths = await tempPaths();
+    const anchorTs = dayTs(0, 2);
+    const now = dayTs(0, 3);
+    await seed(paths, {
+      alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
+    });
+    const points = [
+      ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+      peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
+    ];
+
+    const candidates = await computeCorrelationCandidates(paths, {
+      now,
+      readFactPoints: async () => ({ ...readResultTemplate, points }),
+    });
+    assert.deepEqual(candidates, [], `${label} must suppress correlation candidates`);
+  }
+});
+
+test("Slice 8: an intact fact-history control still fires the qualifying correlation", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  await seed(paths, {
+    alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
+  });
+  const points = [
+    ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+    peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
+  ];
+
+  const candidates = await computeCorrelationCandidates(paths, {
+    now,
+    readFactPoints: async () => completeFactReadResult(points),
+  });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].rule_id, CORRELATION_RULE_ID);
+});
+
+test("Slice 8: a future completeness loss timestamp is outside nowMs and does not suppress correlation", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  await seed(paths, {
+    alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
+  });
+  const points = [
+    ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+    peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
+  ];
+
+  const candidates = await computeCorrelationCandidates(paths, {
+    now,
+    readFactPoints: async () => completeFactReadResult(points, {
+      last_corrupt_ts: dayTs(0, 4),
+    }),
+  });
+  assert.equal(candidates.length, 1);
+});
+
+test("Slice 8: intact history does not defeat the existing cold-start gate", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  await seed(paths, {
+    alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
+  });
+  const points = [peerPoint(anchorTs, "peer.wireguard.9999999999999999")];
+
+  const candidates = await computeCorrelationCandidates(paths, {
+    now,
+    readFactPoints: async () => completeFactReadResult(points),
+  });
+  assert.deepEqual(candidates, [], "the existing cold-start gate must still suppress a young peer stream");
 });
 
 test("Slice 6 positive fixture, warning-anchor variant: severity stays capped at warning (proves the cap actually caps rather than coinciding with a warning fixture)", async () => {

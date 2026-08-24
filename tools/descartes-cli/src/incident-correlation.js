@@ -33,6 +33,7 @@ import { alertId, readAlertRecords } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_PEER_PRESENCE_WINDOW_MS } from "./peer-signature-store.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
@@ -291,6 +292,7 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   if (!learnedConfig.enabled) return [];
 
   const now = options.now ?? new Date().toISOString();
+  const nowMs = new Date(now).getTime();
   const lookbackMs = options.lookbackMs ?? DEFAULT_CORRELATION_LOOKBACK_MS;
   const windowMs = options.correlationWindowMs ?? DEFAULT_CORRELATION_WINDOW_MS;
   const oddHours = options.oddHours ?? CORRELATION_ODD_HOURS;
@@ -302,7 +304,7 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   const readAlerts = options.readAlertRecords ?? readAlertRecords;
   const readFacts = options.readFactPoints ?? readFactPoints;
 
-  const [alertRecords, factResult] = await Promise.all([
+  const [alertRecords, readResult] = await Promise.all([
     readAlerts(descartesPaths),
     readFacts(descartesPaths, { now, windowMs: factWindowMs }),
   ]);
@@ -310,11 +312,17 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   const anchors = findKillSideAnchors(alertRecords, { now, lookbackMs });
   if (anchors.length === 0) return [];
 
+  // Slice 8: this detector is intentionally stateless, so trust is recomputed from the full
+  // fact-store read on every call. Omit anchorTs because the correlation joins two observations
+  // from the current read window; the helper's stateless path therefore requires an intact
+  // completeness status while excluding future loss timestamps relative to this injected nowMs.
+  if (!factHistoryTrustworthy(readResult, { nowMs }).trust) return [];
+
   // Regression fix (post-Slice-4c): strip the census marker here too, mirroring the realPoints
   // exclusion inside findQualifyingPeerObservations -- the overflow marker is deliberately KEPT
   // in this array (unlike the census marker) because findQualifyingPeerObservations' own
   // hasOverflowTick check (must-fix 5) needs to see it in the peerPoints it receives.
-  const peerPoints = (factResult?.points ?? []).filter(
+  const peerPoints = (readResult?.points ?? []).filter(
     (point) => point?.fact_name === PEER_FACT_NAME && point?.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY,
   );
 
