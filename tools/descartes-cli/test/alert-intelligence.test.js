@@ -17,7 +17,8 @@ import {
   resolveAlertIntelligencePaths,
   writeAlertIntelligenceConfig,
 } from "../src/alert-intelligence.js";
-import { CANARY_TAMPERED_RULE_ID } from "../src/canary-baseline.js";
+import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-baseline.js";
+import { containmentRecommendationRuleIds } from "../src/containment-recommend.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -360,6 +361,84 @@ test("unrecognized rule_id prefix is excluded from LLM adjudication (fail closed
   });
   assert.equal(result.status, "no_eligible_alerts");
   assert.equal(result.excluded.unknown_namespace, 1);
+});
+
+// --- Slice 7.2.a (recommend-only containment surface plan): containment.* hard-exclude ---------
+
+test("(a) every containment.recommend.<verb> rule_id is hard-excluded, namespace 'containment' -- the STRONGER fencing mechanism, not the weaker unknown_namespace fallback session.*/peer.*/canary.* rely on", () => {
+  for (const ruleId of containmentRecommendationRuleIds()) {
+    assert.deepEqual(classifyAlertNamespace(ruleId), { namespace: "containment", hardExcluded: true });
+  }
+  // The synthetic full-five-verb set too, not just the ones v0's map actually emits -- the
+  // hard-exclude branch matches on the "containment." PREFIX, so it fences every possible verb.
+  for (const verb of ["throttle", "block", "revoke", "quarantine", "kill"]) {
+    assert.deepEqual(classifyAlertNamespace(`containment.recommend.${verb}`), { namespace: "containment", hardExcluded: true });
+  }
+});
+
+test("containment.* is absent from KNOWN_ALERT_NAMESPACES (belt-and-suspenders: not merely hard-excluded, but never a candidate for 'not_consented' -> eligible either)", () => {
+  assert.equal(KNOWN_ALERT_NAMESPACES.includes("containment"), false);
+});
+
+test("containment.recommend.* alerts are hard-excluded from LLM adjudication even when enabled_namespaces is adversarially forged to include 'containment'", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: ["metric", "containment", "learned"] }, { now: "2026-08-21T00:00:00.000Z" });
+  const containmentAlert = alert({ id: "alert_containment", rule_id: "containment.recommend.quarantine", severity: "warning" });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [containmentAlert],
+    notification_due_ids: ["alert_containment"],
+  }, {
+    now: "2026-08-21T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for a containment.recommend.* record — it is structurally incapable of reaching the LLM"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.hard_excluded_learned, 1, "reuses the same exclusion-reason bucket the learned. hard-exclude branch uses (documented misnomer, see the classifyAlertNamespace comment)");
+});
+
+// --- Slice 7.2.c (recommend-only containment surface plan): deterministic local delivery -------
+
+function containmentRecommendationAlert(overrides = {}) {
+  return alert({
+    id: "alert_containment_rec",
+    rule_id: "containment.recommend.quarantine",
+    severity: "warning",
+    diagnostics: { trigger_rule_id: CANARY_TRIPPED_RULE_ID, trigger_alert_id: "alert_canary", verb: "quarantine", target_repr: "abcdef0123456789" },
+    ...overrides,
+  });
+}
+
+test("containment.recommend.* is in the deterministic non-LLM local-delivery allowlist and delivers with the RECOMMEND-ONLY label, never a raw identifier, never through the LLM", async () => {
+  const current = containmentRecommendationAlert();
+  const delivered = [];
+  const result = await emitSessionAlertSignals({}, { notification_due_ids: [current.id], alerts: [current] }, {
+    deliverNotification: async (_paths, decision) => delivered.push(decision),
+  });
+  assert.equal(result.fired.length, 1);
+  assert.equal(delivered[0].notify, true);
+  assert.equal(delivered[0].severity, "warning");
+  assert.match(delivered[0].body, /RECOMMEND-ONLY/);
+  assert.ok(delivered[0].body.startsWith("RECOMMEND-ONLY"), "the label must survive any downstream 240-char truncation, so it must be first");
+  assert.match(delivered[0].body, /quarantine/);
+  assert.equal(delivered[0].body.includes("abcdef0123456789"), true, "the hash-only target repr is fine to include");
+});
+
+test("containment.recommend.* delivery degrades to a label-first fallback body (never silently dropping the label) when the stored diagnostics are corrupt/foreign", async () => {
+  const current = containmentRecommendationAlert({ diagnostics: { trigger_rule_id: "some.foreign.rule_id", verb: "quarantine", target_repr: "global" } });
+  const delivered = [];
+  await emitSessionAlertSignals({}, { notification_due_ids: [current.id], alerts: [current] }, {
+    deliverNotification: async (_paths, decision) => delivered.push(decision),
+  });
+  assert.ok(delivered[0].body.startsWith("RECOMMEND-ONLY"));
+});
+
+test("adding containment.recommend.* to the deterministic-delivery allowlist alone (without the buildSessionAlertNotificationDecision branch) would have dropped the recommendation onto the generic fall-through body — pinning the ACTUAL branch exists by asserting the real title, not just the fall-through's", async () => {
+  const current = containmentRecommendationAlert();
+  const delivered = [];
+  await emitSessionAlertSignals({}, { notification_due_ids: [current.id], alerts: [current] }, {
+    deliverNotification: async (_paths, decision) => delivered.push(decision),
+  });
+  assert.equal(delivered[0].title, "Descartes: containment recommendation");
+  assert.notEqual(delivered[0].title, "Descartes: session alert", "the generic fall-through title would indicate the dedicated branch is missing");
 });
 
 // --- S13 must-fix 2: budget arithmetic invariants ----------------------------------------------

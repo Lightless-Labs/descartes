@@ -46,6 +46,7 @@ Usage:
   descartes alerts ack <alert-id> [--json]
   descartes alerts intelligence status|enable|disable [--json]
   descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
+  descartes containment recommend status|enable|disable [--json]
   descartes learned mine [--json] [--window <duration>]
   descartes learned soak [--json]
   descartes learned calibration [--json] [--since <duration>] [--family <rule_id-prefix>]
@@ -227,6 +228,14 @@ async function main(argv) {
     // top-level command's dedicated-module + run<Thing>(paths, args) dispatch pattern.
     const { runProvenanceStore } = await import("./provenance-store.js");
     await runProvenanceStore(paths, args);
+    return;
+  }
+  if (command === "containment") {
+    // Slice 7.2.b (recommend-only containment surface plan): a dedicated, default-OFF opt-in for
+    // the RECOMMEND-ONLY containment surface, mirroring every other top-level command's dedicated-
+    // module + run<Thing>(paths, args) dispatch pattern above.
+    const { runContainment } = await import("./containment.js");
+    await runContainment(paths, args);
     return;
   }
   if (command === "incident") {

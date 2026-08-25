@@ -13,6 +13,13 @@ import {
   SESSION_CHURN_RULE_ID,
   SESSION_COUNT_DROP_RULE_ID,
 } from "./session-baseline.js";
+// Slice 7.2 (recommend-only containment surface plan, 2026-08-21): a new, explicit
+// alert-intelligence.js -> containment-recommend.js dependency edge (plan §6 File Map note on
+// this exact choice), used only to (a) widen the deterministic local-delivery allowlist below and
+// (b) render a containment.recommend.* record's notification body from its own stored,
+// already-sanitized diagnostics -- Slice 7.2.c's must-fix option (a). containment-recommend.js
+// itself imports nothing from this file, so this is a one-directional edge, not a cycle.
+import { CONTAINMENT_RECOMMEND_LABEL, containmentRecommendationRuleIds, renderStoredRecommendationText } from "./containment-recommend.js";
 
 // Slice 4b (observed-incident collectors plan), Decision 3b / Fable review MUST-FIX 4: the
 // widened deterministic-delivery allowlist is composed HERE, not in session-baseline.js.
@@ -54,6 +61,13 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
   // Credential-file-access signal (Slice D): credential.access is likewise unknown_namespace
   // ("credential." has no reserved prefix) — same deterministic local-delivery treatment.
   CREDENTIAL_ACCESS_RULE_ID,
+  // Slice 7.2.a (recommend-only containment surface plan): containment.recommend.* is
+  // ADDITIONALLY hard-excluded from LLM adjudication below (classifyAlertNamespace) -- this
+  // allowlist entry only routes it to the SAME straight-to-notification branch every other
+  // unknown_namespace/hard-excluded rule_id family above already uses, never the LLM. Derived
+  // from containmentRecommendationRuleIds() (containment-recommend.js), never hand-duplicated,
+  // so this can never register a rule_id the recommendation map doesn't actually emit.
+  ...containmentRecommendationRuleIds(),
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
@@ -611,6 +625,26 @@ function buildSessionAlertNotificationDecision(alert) {
       body: `Canary integrity check failed: ${reason ?? "unknown"}.`,
     };
   }
+  // Slice 7.2.c (recommend-only containment surface plan), must-fix branch: without this, adding
+  // containment.recommend.* to ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS alone would route every
+  // recommendation into the generic fall-through below, dropping the recommended verb, the
+  // target, the rationale, and — critically — the RECOMMEND-ONLY label the whole surface's
+  // honesty depends on. `diagnostics` here is the RECOMMENDATION candidate's own stored
+  // diagnostics (verb/trigger_rule_id/trigger_alert_id/target_repr — computeContainmentRecommend
+  // ationCandidates in containment-recommend.js), not the triggering alert's diagnostics.
+  // renderStoredRecommendationText re-derives the full rationale from the closed RECOMMEND_MAP
+  // keyed on trigger_rule_id; a corrupt/foreign diagnostics shape degrades to the label-first
+  // fallback immediately below rather than throwing or silently dropping the label.
+  if (containmentRecommendationRuleIds().includes(alert?.rule_id)) {
+    const body = renderStoredRecommendationText(diagnostics)
+      ?? `${CONTAINMENT_RECOMMEND_LABEL} Consider reviewing rule_id=${diagnostics.trigger_rule_id ?? "unknown"}.`;
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: containment recommendation",
+      body,
+    };
+  }
   // Unreachable in normal operation (the caller already filters to
   // ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS) — fails closed to a generic, still counts/enum-only
   // body rather than throwing.
@@ -845,6 +879,17 @@ export function classifyAlertNamespace(ruleId) {
   // A self-audit finding must never reach L2 (plan section 110): hard-excluded, never opt-in-able,
   // checked before anything else so no enabled_namespaces misconfiguration can override it.
   if (id.startsWith("learned.")) return { namespace: "learned", hardExcluded: true };
+  // Slice 7.2.a (recommend-only containment surface plan, must-fix): containment.* is hard-
+  // excluded, checked SECOND (immediately after learned.), before every other branch -- the
+  // recommended verb is chosen by deterministic code (containment-recommend.js's RECOMMEND_MAP),
+  // never a model prompt. This is the stronger of the two available fencing mechanisms (vs. the
+  // weaker unknown_namespace fallback session.*/peer.*/canary.* rely on): being checked first and
+  // un-overridable by enabled_namespaces/PROMPT_TEMPLATES registration means a future edit that
+  // adds a real containment. branch further down this chain cannot silently reopen the LLM path
+  // to this surface. "containment" is deliberately NOT added to KNOWN_ALERT_NAMESPACES below
+  // (belt-and-suspenders: even a mis-edited hard-exclude branch would still be blocked from
+  // resolving "not_consented" -> eligible).
+  if (id.startsWith("containment.")) return { namespace: "containment", hardExcluded: true };
   if (id.startsWith("daemon.") || id.startsWith("system.") || id.startsWith("disk.")) return { namespace: "metric", hardExcluded: false };
   if (id.startsWith("constraint.")) return { namespace: "constraint", hardExcluded: false };
   if (id.startsWith("provenance.")) return { namespace: "provenance", hardExcluded: false };

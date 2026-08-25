@@ -47,6 +47,7 @@ import {
 } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
+import { readContainmentRecommendConfig, writeContainmentRecommendConfig } from "../src/containment-recommend.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID, loadServiceAppearanceBaselineStore, loadServiceBaselineStore, writeServiceAppearanceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, loadProcessLineageBaselineStore, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
@@ -3216,4 +3217,184 @@ test("S13 I/O hardening: an injected adjudicateAlertNotifications throw does not
   assert.equal(result.status.state, "ok");
   assert.equal(result.alertIntelligence.status, "error");
   assert.match(result.alertIntelligence.error, /simulated unexpected adjudicateAlertNotifications failure/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Slice 7.2 (recommend-only containment surface plan, docs/plans/
+// 2026-08-21-slice-7.2-recommend-only-containment-surface.md): computeContainmentRecommendationCandidates
+// as the daemon's NINTH extraCandidates entry. Reuses peer.count_spike as the real trigger (it is
+// re-derived fresh from persisted fact-history every tick, so it stays genuinely active across
+// consecutive ticks without any further seeding -- exactly what the opt-in-toggle test below
+// needs to isolate "only the containment opt-in changed" from "the trigger itself cleared").
+// ---------------------------------------------------------------------------------------------
+
+function containmentPeerSpikeTicks() {
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
+  ticks.push(...completePeerTick(hour(30), 8));
+  return ticks;
+}
+
+test("Slice 7.2 wiring: computeContainmentRecommendationCandidates is the daemon's tenth extraCandidates entry — a persisted peer.count_spike trigger, with both gates ON, produces a real containment.recommend.block record delivered with the RECOMMEND-ONLY label and no raw identifier, never reaching the LLM", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeContainmentRecommendConfig(paths, { enabled: true });
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
+
+  // Tick 1: peer.count_spike is derived and PERSISTED this same tick. computeContainmentRecommend
+  // ationCandidates reads alert-HISTORY (mirrors incident-correlation.js's own precedent) — it
+  // never sees this same tick's own in-memory candidate array — so no recommendation exists yet
+  // after this first tick alone (an intentional, documented one-tick lag).
+  const tick1 = await runIsolatedDaemonTick(paths, hour(30));
+  const peerAlert = tick1.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.ok(peerAlert, "expected peer.count_spike to fire on tick 1");
+  assert.equal(tick1.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false, "no recommendation yet -- the trigger was only just persisted by this same tick");
+
+  // Tick 2, a minute later: the now-persisted trigger is visible to computeContainmentRecommendat
+  // ionCandidates' own readAlertRecords call, and the recommendation fires, delivered through the
+  // pre-existing deterministic local-delivery branch (emitSessionAlertSignals).
+  const tick2Ts = new Date(Date.parse(hour(30)) + 60 * 1000).toISOString();
+  const deliveries = [];
+  const tick2 = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: tick2Ts,
+    now: tick2Ts,
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  const recommendation = tick2.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");
+  assert.ok(recommendation, "expected a real containment.recommend.block record");
+  assert.equal(recommendation.status, "active");
+  assert.equal(recommendation.diagnostics.trigger_rule_id, PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(recommendation.diagnostics.verb, "block");
+  assert.equal(recommendation.diagnostics.target_repr, "global");
+  assert.equal(JSON.stringify(recommendation).includes("redacted"), false);
+
+  const recDeliveries = deliveries.filter((entry) => entry.opts.ruleId === "containment.recommend.block");
+  assert.equal(recDeliveries.length, 1, "expected exactly one deterministic delivery for the due recommendation");
+  assert.match(recDeliveries[0].decision.body, /RECOMMEND-ONLY/);
+  assert.ok(recDeliveries[0].decision.body.startsWith("RECOMMEND-ONLY"), "the label must survive any downstream truncation, so it must be first");
+  assert.equal(recDeliveries[0].decision.body.includes("peer.ssh"), false, "no raw peer identity in the delivered body");
+
+  // Never via the LLM: containment.* is hard-excluded regardless of enabled_namespaces, and
+  // alert-intelligence.json defaults to disabled anyway, giving a doubly-enforced guarantee.
+  assert.equal(tick2.alertIntelligence.status, "disabled");
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === recommendation.id && a.status === "active"));
+});
+
+test("Slice 7.2 wiring: the containment opt-in OFF ⇒ zero recommendations, even with a persisted trigger and learned.json ON, and no I/O beyond the two gate reads is attempted", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // containment-recommend.json intentionally never written -> readContainmentRecommendConfig
+  // defaults to { enabled: false } — the same fail-closed default the config module itself pins.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
+
+  await runIsolatedDaemonTick(paths, hour(30));
+  const tick2Ts = new Date(Date.parse(hour(30)) + 60 * 1000).toISOString();
+  const tick2 = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: tick2Ts,
+    now: tick2Ts,
+  });
+
+  assert.equal((await readContainmentRecommendConfig(paths)).enabled, false);
+  assert.equal(tick2.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false);
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.some((a) => a.rule_id === "containment.recommend.block"), false);
+});
+
+test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the containment opt-in ON and a trigger present, and no I/O is attempted for it", async () => {
+  const paths = await tempPaths();
+  await writeContainmentRecommendConfig(paths, { enabled: true });
+  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
+  // { enabled: false } -- computeContainmentRecommendationCandidates must short-circuit to []
+  // before ever calling readAlertRecords, exactly like every sibling extraCandidates source.
+  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+
+  let readAlertsCalled = false;
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    readAlertRecords: async (...args) => { readAlertsCalled = true; return readAlertRecords(...args); },
+  });
+
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false);
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "learned.json OFF also gates the underlying peer-baseline detector itself");
+  assert.equal(readAlertsCalled, false, "readAlertRecords (containment-recommend's own hook, passed through daemon options) must never be called while learned.json is OFF");
+});
+
+test("Slice 7.2 wiring: no trigger present ⇒ zero recommendations (no storm on the first tick), even with both gates ON", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeContainmentRecommendConfig(paths, { enabled: true });
+
+  const result = await runIsolatedDaemonTick(paths, hour(0));
+  assert.equal(result.alerts.alerts.some((a) => String(a.rule_id).startsWith("containment.recommend.")), false);
+});
+
+test("Slice 7.2 wiring, THE LOAD-BEARING FAIL-CLOSED TRANSITION (Definition of Done): toggling the containment opt-in OFF while the underlying trigger is STILL active recovers the previously-active recommendation on the very next tick, and it stays recovered/not-due on every subsequent tick while the opt-in stays OFF and the trigger never clears", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeContainmentRecommendConfig(paths, { enabled: true });
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
+
+  await runIsolatedDaemonTick(paths, hour(30)); // tick 1: persists the peer.count_spike trigger
+  const tick2Ts = new Date(Date.parse(hour(30)) + 60 * 1000).toISOString();
+  const tick2 = await runIsolatedDaemonTick(paths, tick2Ts); // tick 2: recommendation fires, active
+  const active = tick2.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");
+  assert.ok(active, "expected the recommendation to be active on tick 2");
+  assert.equal(active.status, "active");
+  assert.ok(tick2.alerts.notification_due_ids.includes(active.id));
+
+  // Toggle the opt-in OFF while the underlying trigger is STILL present — the peer fact-history is
+  // unchanged, so peer.count_spike keeps re-deriving as active every tick regardless of this
+  // module's own opt-in. This is the ONLY thing that changes between tick 2 and tick 3.
+  await writeContainmentRecommendConfig(paths, { enabled: false });
+
+  const tick3Ts = new Date(Date.parse(tick2Ts) + 60 * 1000).toISOString();
+  const tick3 = await runIsolatedDaemonTick(paths, tick3Ts);
+  const peerStillActive = tick3.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.ok(peerStillActive && peerStillActive.status === "active", "the underlying trigger must genuinely still be active on tick 3 — only the opt-in changed");
+
+  const recovered = tick3.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");
+  assert.ok(recovered, "the previously-active recommendation record must still be PRESENT (recovered), not silently deleted");
+  assert.equal(recovered.status, "recovered");
+  assert.equal(tick3.alerts.notification_due_ids.includes(recovered.id), false);
+
+  // Stays recovered/not-due on a further tick while the opt-in stays OFF and the trigger never
+  // clears -- not merely a one-tick blip.
+  const tick4Ts = new Date(Date.parse(tick3Ts) + 60 * 1000).toISOString();
+  const tick4 = await runIsolatedDaemonTick(paths, tick4Ts);
+  const stillRecovered = tick4.alerts.alerts.find((a) => a.id === recovered.id);
+  assert.ok(stillRecovered);
+  assert.equal(stillRecovered.status, "recovered");
+  assert.equal(tick4.alerts.notification_due_ids.includes(recovered.id), false);
+  assert.ok(tick4.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID)?.status === "active", "the trigger itself is still active on tick 4 -- confirms this is the opt-in's own doing, not the trigger clearing");
+});
+
+test("Slice 7.2 wiring: byte-identical real alerts when BOTH the learned kill switch and the containment opt-in are off, even with peer fact-history present that would otherwise trigger a recommendation, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withHistoryPaths = await tempPaths();
+  await appendFactPoints(withHistoryPaths, containmentPeerSpikeTicks(), { now: hour(30) });
+  // Neither learned.json nor containment-recommend.json is ever written here -> both default OFF,
+  // exactly like the baseline above.
+  const withHistory = await runIsolatedDaemonTick(withHistoryPaths, hour(30));
+
+  assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
+  assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
+  assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
 });

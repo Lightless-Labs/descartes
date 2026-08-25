@@ -28,6 +28,7 @@ import { computeCanaryBaselineCandidates } from "./canary-baseline.js";
 import { loadCanaryManifest } from "./canary-manifest.js";
 import { computeScheduledJobBaselineCandidates } from "./persistence-baseline.js";
 import { computeCredentialAccessCandidates } from "./credential-access-baseline.js";
+import { computeContainmentRecommendationCandidates } from "./containment-recommend.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -640,6 +641,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // mtime/ino change), NOT a novelty/absence claim -> deliberately NOT completeness-gated;
           // fires on the first eligible (post-seed) observation, like the canary tripwire.
           ...await computeCredentialAccessCandidates(descartesPaths, options),
+          // Slice 7.2.c (recommend-only containment surface plan): the daemon's tenth
+          // extraCandidates entry. Reads already-persisted alert-history (readAlertRecords),
+          // never the live pre-hash collector output and never a sibling entry's own in-memory
+          // candidates this same tick -- mirrors computeCorrelationCandidates' own precedent
+          // exactly (see containment-recommend.js's module header). Double-gated (BOTH
+          // learned.json AND its own containment-recommend.json opt-in, P4/P5) via its own
+          // short-circuit-to-[] BEFORE any I/O; mutates nothing, no new execFile/host I/O of any
+          // kind. Delivery reuses the deterministic non-LLM local-delivery branch below
+          // (emitSessionAlertSignals) via the widened allowlist composed in alert-intelligence.js
+          // -- no delivery logic lives here or in containment-recommend.js.
+          ...await computeContainmentRecommendationCandidates(descartesPaths, options),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
