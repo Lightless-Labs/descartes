@@ -44,6 +44,9 @@ import { CORRELATION_RULE_ID } from "./incident-correlation.js";
 import { readNotificationDeliveryAudit } from "./notification-delivery.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
+import { SCHEDULED_JOB_APPEARED_RULE_ID } from "./persistence-baseline.js";
+import { CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
+import { SERVICE_APPEARED_RULE_ID } from "./service-baseline.js";
 import { IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID, UNKNOWN_IDENTITY_RULE_ID } from "./provenance-store.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
 import { readShadowRecords } from "./shadow-store.js";
@@ -76,6 +79,13 @@ const CLOSED_RULE_IDS = new Set([
   PEER_COUNT_DROP_RULE_ID, // Slice 4c (observed-incident collectors plan)
   PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
   CORRELATION_RULE_ID,
+  // Persistence baseline + credential-file-access (docs/plans/2026-08-21-agent-intrusion-
+  // detection-gaps.md, Slices B/C/D). Deliberately included here — unlike SERVICE_DISAPPEARED_
+  // RULE_ID's own conspicuous, pre-existing (out-of-scope) absence from this set, that gap is not
+  // a precedent to copy for these new rule_ids.
+  SCHEDULED_JOB_APPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  CREDENTIAL_ACCESS_RULE_ID,
 ]);
 
 function isCalibratedRuleId(ruleId) {

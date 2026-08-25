@@ -132,6 +132,154 @@ export function factPointsFromServiceEvidence(evidence, { ts } = {}) {
   return points;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-gaps.md) —
+// scheduled-jobs fact-store wiring. FACTS ONLY: this section builds no alert candidate and is
+// never wired into daemon.js's extraCandidates (that is Slice B's job, persistence-baseline.js).
+// Pure L0 fact source, mirroring factPointsFromServiceEvidence's/factPointsFromSessionEvidence's
+// shape: a presence fact per returned job (deduped by composite entity key) plus one census
+// marker per genuinely-enumerated tick (including a genuine zero-job tick).
+// ---------------------------------------------------------------------------------------------
+
+export const SCHEDULED_JOB_PRESENCE_FACT_NAME = "scheduled_job.presence";
+export const SCHEDULED_JOB_CENSUS_FACT_NAME = "scheduled_job.census";
+export const SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY = "scheduled_job.census-marker.v1";
+
+// [REVIEW 2026-08-21, must-fix] Per-entry identity, not job.label ?? job.unit ?? job.path. A
+// parsed cron job (tools/scheduled-jobs.js's parseCronScheduleLine) has NEITHER label NOR unit —
+// only {kind:"cron", source, path, line_number, schedule, user, command}. `path` is shared by
+// EVERY line in the same crontab file (every user-crontab entry shares "crontab -l", every
+// /etc/crontab entry shares "/etc/crontab", every entry in one /etc/cron.d/<file> shares that
+// file's path). Using path alone as the name leg would collapse every entry in one crontab to ONE
+// entity key, making a new malicious line appended to an already-established crontab silently
+// undetectable by Slice B — the plan's own canonical threat. Fixed here: the cron name leg is a
+// domain-separated digest of the entry's STABLE content (path, schedule, user, bounded/redacted
+// command) — never the raw command text embedded verbatim (hash-at-source: the command line is a
+// sensitive diagnostic artifact per tools/scheduled-jobs.js's own module note). `line_number` is
+// deliberately NOT part of the identity: pure reordering (same entries, different line order)
+// must not read as churn. Editing an existing entry's schedule/user/command IS a real identity
+// change and correctly reads as disappear-then-appear (a rewritten cron command is itself a
+// persistence-relevant event — desired, not a false positive).
+const SCHEDULED_JOB_CRON_IDENTITY_HASH_DOMAIN = "descartes.schedjob.cron.v1";
+const SCHEDULED_JOB_IDENTITY_SEPARATOR = " ";
+
+function cronJobIdentityDigest(job) {
+  const preimage = [
+    SCHEDULED_JOB_CRON_IDENTITY_HASH_DOMAIN,
+    String(job?.path ?? ""),
+    String(job?.schedule ?? ""),
+    String(job?.user ?? ""),
+    String(job?.command ?? ""),
+  ].join(SCHEDULED_JOB_IDENTITY_SEPARATOR);
+  return crypto.createHash("sha256").update(preimage).digest("hex").slice(0, 16);
+}
+
+// systemd_timer (unit) / launchd_scheduled_job (label) / periodic_directory_entry (path, already
+// unique per entry — one distinct script file per job) all carry real, structurally-distinct
+// per-entry identity already — kept as their own name leg unchanged, sanitized-not-hashed, the
+// same convention factPointsFromServiceEvidence already uses for service names/labels.
+function scheduledJobIdentityLeg(job) {
+  if (job?.kind === "cron") return cronJobIdentityDigest(job);
+  return sanitizeIdentityString(job?.unit ?? job?.label ?? job?.path) ?? "unknown";
+}
+
+// Length-prefixed composite framing (NOT delimiter-joined — inherits Gap 1/process-lineage's
+// resolved separator-collision fix): `${segment.length}:${segment}` for each of the three legs
+// (kind, source, identity) makes the boundary between segments unambiguous regardless of what
+// characters a segment happens to contain, so two differently-split (kind, source, identity)
+// triples can never collide by concatenation ambiguity — e.g. (source="a", identity="bc") and
+// (source="ab", identity="c") hash/frame to different composite strings. `kind`/`source` are
+// always one of this collector's own closed-enum literals (never raw/attacker-controlled text);
+// a name field that reduces to empty falls back to "unknown" per segment (degrade-not-fabricate,
+// never drop the whole fact silently).
+function lengthPrefixedSegment(value) {
+  const segment = typeof value === "string" && value ? value : "unknown";
+  return `${segment.length}:${segment}`;
+}
+
+export function buildScheduledJobEntityKey(kind, source, identityLeg) {
+  const kindSeg = sanitizeIdentityString(kind, { maxLength: 64 }) ?? "unknown";
+  const sourceSeg = sanitizeIdentityString(source, { maxLength: 64 }) ?? "unknown";
+  const identitySeg = typeof identityLeg === "string" && identityLeg ? identityLeg : "unknown";
+  return `scheduled_job.${lengthPrefixedSegment(kindSeg)}.${lengthPrefixedSegment(sourceSeg)}.${lengthPrefixedSegment(identitySeg)}`;
+}
+
+// [REVIEW 2026-08-21, must-fix] census_state = "complete" iff summary.unavailable_count === 0 AND
+// evidence.truncated !== true; otherwise "partial". The envelope-level `truncated` flag
+// (tools/scheduled-jobs.js: `allJobs.length > jobs.length || probes.some(p => p.truncated)`)
+// subsumes BOTH the total-vs-returned leg AND every probe-level truncation (directory-listing
+// caps, launchd candidate caps, truncated cron-file reads) — using it instead of re-deriving from
+// total_count === returned_count closes the fabrication path where jobs are dropped BEFORE
+// allJobs is ever assembled (a probe can report truncated:true while total_count still equals
+// returned_count, because the drop happened upstream of both counts).
+function scheduledJobCensusStateFor(result) {
+  const summary = result?.summary;
+  let unavailableClean;
+  if (summary === undefined || summary === null) {
+    // Legacy/simplified evidence shape with no summary object at all (mirrors
+    // factPointsFromSessionEvidence's censusStateFor precedent: "an absent multiplexers array
+    // carries no evidence of degradation either way") — degrades to no-degradation rather than
+    // fail-closed, since the REAL collector (tools/scheduled-jobs.js) always populates `summary`
+    // via summarizeScheduledJobs. A PRESENT-but-malformed summary (below) stays fail-closed.
+    unavailableClean = true;
+  } else {
+    const unavailableCount = Number(summary.unavailable_count);
+    unavailableClean = Number.isFinite(unavailableCount) && unavailableCount === 0;
+  }
+  const isPartial = result?.truncated === true || !unavailableClean;
+  return isPartial ? "partial" : "complete";
+}
+
+function buildScheduledJobCensusMarkerFactPoint(result, envelope, ts) {
+  return {
+    ts,
+    fact_name: SCHEDULED_JOB_CENSUS_FACT_NAME,
+    entity_key: SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: scheduledJobCensusStateFor(result) },
+    source_envelope_id: envelope.id,
+    source_tool: envelope.trace?.tool,
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+/**
+ * evidence[] -> fact-store.js-shaped fact points for Slice A's scheduled-jobs collector
+ * (tools/scheduled-jobs.js). Pure L0 fact source: this translator never builds an alert
+ * candidate and is never wired into daemon.js's extraCandidates — alerting on a novel scheduled
+ * job (scheduled_job.appeared) is Slice B's job (persistence-baseline.js), which consumes this
+ * fact-history rather than emitting candidates here.
+ */
+export function factPointsFromScheduledJobsEvidence(evidence, { ts } = {}) {
+  const envelope = (evidence ?? []).find((e) => e.id === "scheduled-jobs" && e.status !== "unable");
+  if (!envelope) return [];
+  const jobs = envelope.result?.jobs ?? [];
+
+  const points = jobs.map((job) => {
+    const entityKey = buildScheduledJobEntityKey(job?.kind, job?.source, scheduledJobIdentityLeg(job));
+    return {
+      ts,
+      fact_name: SCHEDULED_JOB_PRESENCE_FACT_NAME,
+      entity_key: entityKey,
+      attributes: {
+        kind: typeof job?.kind === "string" && job.kind ? job.kind : "unknown",
+        source: typeof job?.source === "string" && job.source ? job.source : "unknown",
+      },
+      source_envelope_id: envelope.id,
+      source_tool: envelope.trace?.tool,
+      sensitivity: "operational",
+    };
+  });
+
+  // Emitted only on a genuine enumeration ("ok"/"warning") — never on "unknown" (unsupported
+  // platform, no real census ran) or "unable" (already excluded by the find() filter above).
+  // Includes a genuine zero-job tick, mirroring factPointsFromServiceEvidence's own precedent.
+  if (envelope.status === "ok" || envelope.status === "warning") {
+    points.push(buildScheduledJobCensusMarkerFactPoint(envelope.result, envelope, ts));
+  }
+  return points;
+}
+
 export function factPointsFromProcessLineageEvidence(evidence, { ts } = {}) {
   const envelope = (evidence ?? []).find((e) => e.id === "process-lineage-edges" && e.status !== "unable");
   if (!envelope) return [];

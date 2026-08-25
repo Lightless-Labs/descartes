@@ -22,8 +22,10 @@ import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
-import { SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
+import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "../src/process-lineage-baseline.js";
+import { SCHEDULED_JOB_APPEARED_RULE_ID } from "../src/persistence-baseline.js";
+import { CREDENTIAL_ACCESS_RULE_ID } from "../src/credential-access-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -1650,6 +1652,127 @@ test("the widened ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS constant used by del
   });
   assert.deepEqual(new Set(result.fired), new Set(alerts.map((a) => a.id)));
   assert.equal(deliveries.length, expectedIds.length, "every id in the composed five-id constant must actually be delivered by this branch");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Persistence baseline + credential-file-access (docs/plans/2026-08-21-agent-intrusion-detection-
+// gaps.md, Slices B/C/D) — P9 fail-closed namespace pins + widened deterministic-delivery tests
+// for SCHEDULED_JOB_APPEARED_RULE_ID / SERVICE_APPEARED_RULE_ID / CREDENTIAL_ACCESS_RULE_ID.
+// Mirrors the SERVICE_DISAPPEARED_RULE_ID/PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID sections above
+// exactly.
+// ---------------------------------------------------------------------------------------------
+
+test("(a) classifyAlertNamespace returns {namespace: undefined, hardExcluded: false} for scheduled_job.appeared, service.appeared, and credential.access -- none matches a reserved prefix", () => {
+  for (const ruleId of [SCHEDULED_JOB_APPEARED_RULE_ID, SERVICE_APPEARED_RULE_ID, CREDENTIAL_ACCESS_RULE_ID]) {
+    assert.deepEqual(classifyAlertNamespace(ruleId), { namespace: undefined, hardExcluded: false }, `expected ${ruleId} to classify as unknown_namespace`);
+  }
+});
+
+test("(b') a full adjudicateAlertNotifications run, with ALL of KNOWN_ALERT_NAMESPACES enabled and one due alert of each new rule_id, is no_eligible_alerts / excluded.unknown_namespace / zero LLM calls (airtight even with full consent)", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, enabled_namespaces: [...KNOWN_ALERT_NAMESPACES] }, { now: "2026-08-24T00:00:00.000Z" });
+  const schedJobAlert = alert({ id: "alert_sched_job_appeared", rule_id: SCHEDULED_JOB_APPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", first_seen_ts: "2026-08-24T00:00:00.000Z" } });
+  const serviceAppearedAlert = alert({ id: "alert_service_appeared", rule_id: SERVICE_APPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "b1b2c3d4e5f6a7b8", first_seen_ts: "2026-08-24T00:00:00.000Z" } });
+  const credentialAlert = alert({ id: "alert_credential_access", rule_id: CREDENTIAL_ACCESS_RULE_ID, severity: "warning", diagnostics: { category: "ssh_private_key", trip_reason: "mtime_changed", path_hash: "c1b2c3d4e5f6a7b8" } });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [schedJobAlert, serviceAppearedAlert, credentialAlert],
+    notification_due_ids: [schedJobAlert.id, serviceAppearedAlert.id, credentialAlert.id],
+  }, {
+    now: "2026-08-24T00:01:00.000Z",
+    createSession: async () => { throw new Error("must never create a session for these rule_ids — all are unknown_namespace, fail-closed"); },
+  });
+  assert.equal(result.status, "no_eligible_alerts");
+  assert.equal(result.excluded.unknown_namespace, 3);
+  assert.equal((await readAlertIntelligenceAudit(paths)).length, 0);
+});
+
+test("emitSessionAlertSignals delivers a due scheduled_job.appeared through deliverNotificationDecision, hash-only body, severity capped at warning, never via a session/LLM", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const schedJobAlert = alert({
+    id: "alert_sched_job_appeared",
+    rule_id: SCHEDULED_JOB_APPEARED_RULE_ID,
+    severity: "critical", // persistence-baseline.js's own candidate builder never stores "critical" -- simulates a tampered record
+    diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", first_seen_ts: "2026-08-24T00:00:00.000Z" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [schedJobAlert], notification_due_ids: [schedJobAlert.id] }, {
+    now: "2026-08-24T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [schedJobAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, SCHEDULED_JOB_APPEARED_RULE_ID);
+  assert.equal(deliveries[0].decision.notify, true);
+  assert.equal(deliveries[0].decision.severity, "warning", "severity is capped at warning regardless of the stored alert record's own severity");
+  assert.match(deliveries[0].decision.body, /a1b2c3d4e5f6a7b8/);
+});
+
+test("emitSessionAlertSignals delivers a due service.appeared through deliverNotificationDecision, hash-only body (deliberately NOT service.disappeared's cleartext-name exception), severity capped at warning", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const serviceAppearedAlert = alert({
+    id: "alert_service_appeared",
+    rule_id: SERVICE_APPEARED_RULE_ID,
+    severity: "warning",
+    diagnostics: { entity_key_hash: "b1b2c3d4e5f6a7b8", first_seen_ts: "2026-08-24T00:00:00.000Z" },
+  });
+  const result = await emitSessionAlertSignals(paths, { alerts: [serviceAppearedAlert], notification_due_ids: [serviceAppearedAlert.id] }, {
+    now: "2026-08-24T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [serviceAppearedAlert.id]);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.match(deliveries[0].decision.body, /b1b2c3d4e5f6a7b8/);
+  assert.equal(deliveries[0].decision.body.includes("stopped appearing"), false, "must not accidentally reuse service.disappeared's phrasing/exception");
+});
+
+test("emitSessionAlertSignals delivers a due credential.access with HONEST-CLAIM wording -- 'changed'/'rewritten'/'replaced', never 'accessed', and never leaks the literal path", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const mtimeAlert = alert({ id: "alert_cred_mtime", rule_id: CREDENTIAL_ACCESS_RULE_ID, severity: "warning", diagnostics: { category: "ssh_private_key", trip_reason: "mtime_changed", path_hash: "c1b2c3d4e5f6a7b8" } });
+  const inoAlert = alert({ id: "alert_cred_ino", rule_id: CREDENTIAL_ACCESS_RULE_ID, severity: "warning", diagnostics: { category: "aws_credentials", trip_reason: "ino_changed", path_hash: "d1b2c3d4e5f6a7b8" } });
+  const result = await emitSessionAlertSignals(paths, {
+    alerts: [mtimeAlert, inoAlert],
+    notification_due_ids: [mtimeAlert.id, inoAlert.id],
+  }, {
+    now: "2026-08-24T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.equal(result.fired.length, 2);
+  const byId = Object.fromEntries(deliveries.map((d) => [d.opts.alertId, d.decision]));
+  assert.equal(byId.alert_cred_mtime.title, "Descartes: credential file changed");
+  assert.match(byId.alert_cred_mtime.body, /rewritten/);
+  assert.equal(byId.alert_cred_mtime.body.includes("accessed"), false);
+  assert.match(byId.alert_cred_ino.body, /replaced/);
+  assert.equal(byId.alert_cred_ino.body.includes("accessed"), false);
+});
+
+test("emitSessionAlertSignals fires for the FURTHER-WIDENED allowlist including scheduled_job.appeared/service.appeared/credential.access alongside a due non-allowlisted metric alert, delivering exactly the three new ones without cross-contaminating bodies", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const schedJobAlert = alert({ id: "alert_a", rule_id: SCHEDULED_JOB_APPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "aaaaaaaaaaaaaaaa", first_seen_ts: "2026-08-24T00:00:00.000Z" } });
+  const serviceAppearedAlert = alert({ id: "alert_b", rule_id: SERVICE_APPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "bbbbbbbbbbbbbbbb", first_seen_ts: "2026-08-24T00:00:00.000Z" } });
+  const credentialAlert = alert({ id: "alert_c", rule_id: CREDENTIAL_ACCESS_RULE_ID, severity: "warning", diagnostics: { category: "netrc", trip_reason: "mtime_changed", path_hash: "cccccccccccccccc" } });
+  const metricAlert = alert({ id: "alert_metric", rule_id: "system.memory.sustained_high", severity: "warning" });
+
+  const result = await emitSessionAlertSignals(paths, {
+    alerts: [schedJobAlert, serviceAppearedAlert, credentialAlert, metricAlert],
+    notification_due_ids: [schedJobAlert.id, serviceAppearedAlert.id, credentialAlert.id, metricAlert.id],
+  }, {
+    now: "2026-08-24T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+
+  assert.deepEqual(new Set(result.fired), new Set([schedJobAlert.id, serviceAppearedAlert.id, credentialAlert.id]));
+  assert.equal(deliveries.length, 3, "the non-allowlisted metric alert must never be delivered by this branch");
+  assert.equal(deliveries.some((d) => d.opts.ruleId === "system.memory.sustained_high"), false);
+
+  const byRuleId = Object.fromEntries(deliveries.map((d) => [d.opts.ruleId, d.decision.body]));
+  assert.match(byRuleId[SCHEDULED_JOB_APPEARED_RULE_ID], /aaaaaaaaaaaaaaaa/);
+  assert.match(byRuleId[SERVICE_APPEARED_RULE_ID], /bbbbbbbbbbbbbbbb/);
+  assert.match(byRuleId[CREDENTIAL_ACCESS_RULE_ID], /cccccccccccccccc/);
+  assert.equal(/aaaaaaaaaaaaaaaa/.test(byRuleId[SERVICE_APPEARED_RULE_ID]), false);
+  assert.equal(/bbbbbbbbbbbbbbbb/.test(byRuleId[CREDENTIAL_ACCESS_RULE_ID]), false);
 });
 
 // ---------------------------------------------------------------------------------------------

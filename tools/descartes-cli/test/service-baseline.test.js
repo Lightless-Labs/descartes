@@ -14,14 +14,23 @@ import {
   DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT,
   DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS,
   DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT,
+  SERVICE_APPEARED_RULE_ID,
   SERVICE_DISAPPEARED_RULE_ID,
+  buildAppearedCandidates,
   buildDisappearedCandidates,
+  computeServiceAppearanceCandidates,
   computeServiceBaselineCandidates,
+  detectServiceAppearances,
   detectServiceDisappearances,
   groupServiceFactsByTick,
+  isValidServiceAppearanceBaselineStoreShape,
+  loadServiceAppearanceBaselineStore,
   loadServiceBaselineStore,
+  normalizeServiceAppearanceBaselineState,
   normalizeServiceBaselineState,
+  resolveServiceAppearanceBaselineStorePaths,
   resolveServiceBaselineStorePaths,
+  writeServiceAppearanceBaselineStore,
   writeServiceBaselineStore,
 } from "../src/service-baseline.js";
 
@@ -824,4 +833,249 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
   await appendFactPoints(paths, completeTick(ts, []), { now: ts }); // svc-a genuinely vanishes
   const resumed = await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
   assert.equal(resumed.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Persistence baseline, Slice C (docs/plans/2026-08-21-agent-intrusion-detection-gaps.md) —
+// service.appeared, the appearance-direction twin of service.disappeared above. Reuses the SAME
+// service.presence/service.census fact-history and groupServiceFactsByTick; own SEPARATE
+// service-appearance-baseline.json store on the hardened exact-schema shape (O3).
+// ---------------------------------------------------------------------------------------------
+
+function expectedAppearedHash(entityKey) {
+  return createHash("sha256").update(`${SERVICE_APPEARED_RULE_ID}:${entityKey}`).digest("hex").slice(0, 16);
+}
+
+test("service-appearance store is a SEPARATE file from service-baseline.json", async () => {
+  const paths = await tempPaths();
+  const disappearance = resolveServiceBaselineStorePaths(paths);
+  const appearance = resolveServiceAppearanceBaselineStorePaths(paths);
+  assert.notEqual(disappearance.storeFile, appearance.storeFile);
+  assert.match(appearance.storeFile, /service-appearance-baseline\.json$/);
+});
+
+test("load/write/normalize service-appearance baseline state is exact-schema and atomic", async () => {
+  const paths = await tempPaths();
+  assert.deepEqual(normalizeServiceAppearanceBaselineState(undefined), {
+    version: 2, last_folded_ts: undefined, skipped_partial_tick_count: 0, appeared_event_count: 0,
+    cold_start_pending: true, cold_start_reason: undefined, cold_start_since_ts: undefined,
+  });
+  const missing = await loadServiceAppearanceBaselineStore(paths);
+  assert.equal(missing.corrupt, false);
+  assert.equal(missing.missing, true);
+  await writeServiceAppearanceBaselineStore(paths, {
+    cold_start_pending: false, last_folded_ts: tickTs(1), skipped_partial_tick_count: 2, appeared_event_count: 3,
+  });
+  const { dir, storeFile } = resolveServiceAppearanceBaselineStorePaths(paths);
+  assert.equal((await fs.stat(storeFile)).mode & 0o777, 0o600);
+  assert.equal((await fs.readdir(dir)).some((name) => name.endsWith(".tmp")), false);
+  assert.equal((await loadServiceAppearanceBaselineStore(paths)).state.appeared_event_count, 3);
+});
+
+test("isValidServiceAppearanceBaselineStoreShape rejects an unknown key, a wrong-typed cold_start_pending, and an established store missing last_folded_ts -- DELIBERATELY stricter than the disappearance sibling's own lenient normalizeServiceBaselineState", () => {
+  assert.equal(isValidServiceAppearanceBaselineStoreShape({
+    version: 2, cold_start_pending: false, last_folded_ts: tickTs(0),
+    skipped_partial_tick_count: 0, appeared_event_count: 0, unexpected_key: "x",
+  }), false);
+  assert.equal(isValidServiceAppearanceBaselineStoreShape({
+    version: 2, cold_start_pending: "false", last_folded_ts: tickTs(0),
+    skipped_partial_tick_count: 0, appeared_event_count: 0,
+  }), false);
+  assert.equal(isValidServiceAppearanceBaselineStoreShape({
+    version: 2, cold_start_pending: false,
+    skipped_partial_tick_count: 0, appeared_event_count: 0,
+  }), false, "an established store missing last_folded_ts must be rejected -- the disappearance sibling's lenient store would have accepted this");
+  assert.equal(isValidServiceAppearanceBaselineStoreShape({
+    version: 2, cold_start_pending: false, last_folded_ts: tickTs(0),
+    skipped_partial_tick_count: 0, appeared_event_count: 0,
+  }), true);
+});
+
+test("loadServiceAppearanceBaselineStore treats a schema-invalid-but-parseable store identically to a missing/corrupt one", async () => {
+  const paths = await tempPaths();
+  const { dir, storeFile } = resolveServiceAppearanceBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false, unexpected: true }), { mode: 0o600 });
+  const { state, corrupt } = await loadServiceAppearanceBaselineStore(paths);
+  assert.equal(corrupt, true);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_reason, "invalid_store_schema");
+});
+
+test("detectServiceAppearances requires prior complete history and fires only for first appearance", () => {
+  const groups = groupServiceFactsByTick(flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    partialTick(tickTs(2), ["svc-b"]),
+    [censusMarkerPoint(tickTs(3), "unknown"), servicePoint(tickTs(3), "svc-b")],
+    [servicePoint(tickTs(4), "svc-b")],
+    completeTick(tickTs(5), ["svc-a", "svc-b"]),
+  ]));
+  const options = { nowMs: Date.parse(tickTs(5)), minHistoryTickCount: 2, freshnessMs: HOUR_MS };
+  assert.deepEqual(detectServiceAppearances(groups, options), [{ entity_key: "svc-b", first_seen_ts: tickTs(5) }]);
+});
+
+test("detectServiceAppearances: a service present in ANY prior complete group never re-fires, even several ticks back", () => {
+  const groups = groupServiceFactsByTick(flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a", "svc-b"]),
+    completeTick(tickTs(3), ["svc-a", "svc-b"]),
+  ]));
+  assert.deepEqual(detectServiceAppearances(groups, { nowMs: Date.parse(tickTs(6)), minHistoryTickCount: 2, freshnessMs: 5 * HOUR_MS }), []);
+});
+
+test("detectServiceAppearances rejects cold-start (too few complete groups) and stale latest complete groups", () => {
+  const groups = groupServiceFactsByTick(flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a", "svc-b"]),
+  ]));
+  assert.deepEqual(detectServiceAppearances(groups, { nowMs: Date.parse(tickTs(1)), minHistoryTickCount: DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT }), []);
+  assert.deepEqual(detectServiceAppearances(groups, { nowMs: Date.parse(tickTs(1)) + 2 * HOUR_MS, minHistoryTickCount: 1, freshnessMs: HOUR_MS }), []);
+});
+
+test("[P8 degrade, both directions] a service appearing only in a partial latest group does not fire; a service whose only prior sightings were partial/unknown is not treated as historical", () => {
+  const latestPartial = groupServiceFactsByTick(flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    partialTick(tickTs(2), ["svc-a", "svc-b"]),
+  ]));
+  assert.deepEqual(detectServiceAppearances(latestPartial, { nowMs: Date.parse(tickTs(2)), minHistoryTickCount: 1, freshnessMs: HOUR_MS }), []);
+
+  const priorPartialOnly = groupServiceFactsByTick(flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    partialTick(tickTs(1), ["svc-b"]),
+    completeTick(tickTs(2), ["svc-a"]),
+    completeTick(tickTs(3), ["svc-a", "svc-b"]),
+  ]));
+  assert.deepEqual(detectServiceAppearances(priorPartialOnly, { nowMs: Date.parse(tickTs(3)), minHistoryTickCount: 2, freshnessMs: HOUR_MS }), [{ entity_key: "svc-b", first_seen_ts: tickTs(3) }]);
+});
+
+test("buildAppearedCandidates hashes identity under service.appeared's OWN domain (never service.disappeared's), sanitizes diagnostics (hash-only, no cleartext-name exception), and caps severity at warning", () => {
+  const candidate = buildAppearedCandidates([{ entity_key: "svc-new", first_seen_ts: tickTs(2) }])[0];
+  assert.equal(candidate.rule_id, SERVICE_APPEARED_RULE_ID);
+  assert.equal(candidate.severity, "warning");
+  assert.equal(candidate.fingerprint, expectedAppearedHash("svc-new"));
+  assert.deepEqual(candidate.diagnostics, { entity_key_hash: expectedAppearedHash("svc-new"), first_seen_ts: tickTs(2) });
+  assert.equal(JSON.stringify(candidate).includes("svc-new"), false);
+  // Domain separation: the appeared-hash must differ from the disappeared-hash for the SAME
+  // entity_key -- a shared fingerprint space would let the two rule_ids' dedup/edge-triggering
+  // silently interfere with each other.
+  assert.notEqual(candidate.fingerprint, createHash("sha256").update(`service.disappeared:svc-new`).digest("hex").slice(0, 16));
+});
+
+test("computeServiceAppearanceCandidates checks learned.json before any fact/store I/O", async () => {
+  const paths = await tempPaths();
+  let readCalls = 0;
+  let loadCalls = 0;
+  const result = await computeServiceAppearanceCandidates(paths, {
+    loadLearnedConfig: async () => ({ enabled: false }),
+    readFactPoints: async () => { readCalls += 1; return { points: [] }; },
+    loadServiceAppearanceBaselineStore: async () => { loadCalls += 1; return { state: normalizeServiceAppearanceBaselineState() }; },
+  });
+  assert.deepEqual(result, []);
+  assert.equal(readCalls, 0);
+  assert.equal(loadCalls, 0);
+});
+
+test("computeServiceAppearanceCandidates folds counters once and emits an appearance end-to-end", async () => {
+  const paths = await tempPaths();
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a", "svc-new"]),
+  ]);
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  await appendFactPoints(paths, points, { now: tickTs(2) });
+  await appendFactPoints(paths, [], { now: tickTs(2) });
+  const first = await computeServiceAppearanceCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS });
+  assert.equal(first.length, 1);
+  assert.equal(first[0].diagnostics.entity_key_hash, expectedAppearedHash("svc-new"));
+  const state = (await loadServiceAppearanceBaselineStore(paths)).state;
+  assert.equal(state.appeared_event_count, 1);
+});
+
+test("co-existence: a service that disappears then reappears exercises BOTH detectors correctly without cross-contaminating each other's fold checkpoints (O3)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // Ticks 0-2: svc-a established. Tick 3: svc-a disappears. Tick 4: svc-a reappears.
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a"]),
+    completeTick(tickTs(3), []),
+    completeTick(tickTs(4), ["svc-a"]),
+  ]);
+  await appendFactPoints(paths, points, { now: tickTs(4) });
+  await appendFactPoints(paths, [], { now: tickTs(4) });
+
+  const opts = { now: tickTs(4), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS };
+  const disappeared = await computeServiceBaselineCandidates(paths, opts);
+  const appeared = await computeServiceAppearanceCandidates(paths, opts);
+
+  // The disappearance fired on tick(3) (svc-a missing from the tick(2)->tick(3) pair) but the
+  // freshness gate on computeServiceBaselineCandidates only ever looks at the SINGLE latest
+  // complete pair (tick(3)->tick(4)) where svc-a is present again -- so no disappearance is live
+  // at tick(4). The appearance detector, using the FULL historical union, correctly does NOT
+  // re-fire for svc-a (it was seen in ticks 0-2, so it is not "never seen before").
+  assert.equal(disappeared.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 0);
+  assert.equal(appeared.filter((c) => c.rule_id === SERVICE_APPEARED_RULE_ID).length, 0);
+
+  // Independent fold checkpoints: both stores must have advanced to the SAME latest tick without
+  // either fold observably skipping a tick because of the other's write.
+  const disappearanceState = (await loadServiceBaselineStore(paths)).state;
+  const appearanceState = (await loadServiceAppearanceBaselineStore(paths)).state;
+  assert.equal(disappearanceState.last_folded_ts, tickTs(4));
+  assert.equal(appearanceState.last_folded_ts, tickTs(4));
+});
+
+test("computeServiceAppearanceCandidates fails closed end-to-end when the persisted appearance-baseline-store file is corrupt, never fabricating the appearance that same history would otherwise fire", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a", "svc-new"]),
+  ]);
+  await appendFactPoints(paths, points, { now: tickTs(2) });
+
+  const { dir, storeFile } = resolveServiceAppearanceBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, "{this is not valid json", { mode: 0o600 });
+
+  const result = await computeServiceAppearanceCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS });
+  assert.deepEqual(result, []);
+});
+
+test("computeServiceAppearanceCandidates: degraded/untrustworthy retained history suppresses a fabricated established-service appearance alert", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const truncatedPoints = flatten([
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a"]),
+    completeTick(tickTs(3), ["svc-a", "svc-new"]),
+  ]);
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(0) });
+
+  const result = await computeServiceAppearanceCandidates(paths, {
+    now: tickTs(3),
+    minHistoryTickCount: 2,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => degradedReadResult(truncatedPoints, tickTs(3)),
+  });
+  assert.deepEqual(result, []);
+  const state = (await loadServiceAppearanceBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, true);
+});
+
+test("[P9] SERVICE_APPEARED_RULE_ID classifies to unknown_namespace -- structurally LLM-ineligible (full deterministic-delivery pin lives in test/alert-intelligence.test.js)", async () => {
+  const { classifyAlertNamespace } = await import("../src/alert-intelligence.js");
+  const classified = classifyAlertNamespace(SERVICE_APPEARED_RULE_ID);
+  assert.equal(classified.namespace, undefined);
+  assert.equal(classified.hardExcluded, false);
 });

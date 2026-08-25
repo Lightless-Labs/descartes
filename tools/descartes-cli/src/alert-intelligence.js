@@ -3,9 +3,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
-import { SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
+import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
+import { SCHEDULED_JOB_APPEARED_RULE_ID } from "./persistence-baseline.js";
+import { CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
 import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -41,6 +43,17 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
   // silently never notify the operator, defeating the entire point of the fix.
   CANARY_TAMPERED_RULE_ID,
   PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+  // Persistence baseline (docs/plans/2026-08-21-agent-intrusion-detection-gaps.md, Slices B/C):
+  // scheduled_job.appeared/service.appeared are the SAME fail-closed unknown_namespace posture as
+  // their sibling *.disappeared/novel_edge rule_ids above — no classifyAlertNamespace branch
+  // recognizes "scheduled_job."/"service." as a prefix, so both are structurally LLM-ineligible
+  // regardless of enabled_namespaces and need the identical deterministic local-delivery
+  // treatment or a new scheduled job/service would silently never notify the operator.
+  SCHEDULED_JOB_APPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  // Credential-file-access signal (Slice D): credential.access is likewise unknown_namespace
+  // ("credential." has no reserved prefix) — same deterministic local-delivery treatment.
+  CREDENTIAL_ACCESS_RULE_ID,
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
@@ -518,6 +531,41 @@ function buildSessionAlertNotificationDecision(alert) {
       severity: "warning",
       title: "Descartes: unexpected process lineage",
       body: `Novel process spawn edge ${diagnostics.entity_key_hash} appeared.`,
+    };
+  }
+  // Persistence baseline, Slice B (docs/plans/2026-08-21-agent-intrusion-detection-gaps.md):
+  // scheduled_job.appeared. Hash-only body (O1 unsigned default) — mirrors
+  // process-lineage's own hash-only branch immediately above, not service.disappeared's scoped
+  // cleartext-name exception.
+  if (alert?.rule_id === SCHEDULED_JOB_APPEARED_RULE_ID) {
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: new scheduled job",
+      body: `A scheduled job not seen in this host's recent history just appeared (${diagnostics.entity_key_hash}).`,
+    };
+  }
+  // Persistence baseline, Slice C: service.appeared, the appearance-direction twin of
+  // service.disappeared above. Hash-only body (O1 unsigned default) — deliberately does NOT
+  // extend service.disappeared's scoped 2026-07-24 cleartext-name exception to this new rule_id.
+  if (alert?.rule_id === SERVICE_APPEARED_RULE_ID) {
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: new service",
+      body: `A service unit not seen in this host's recent history just appeared (${diagnostics.entity_key_hash}).`,
+    };
+  }
+  // Credential-file-access signal, Slice D: credential.access. Honest-claim wording (see
+  // credential-access-baseline.js's own header) — `trip_reason` names "rewritten"/"replaced", NOT
+  // "accessed": mtime/ino evidence proves a change, not a read.
+  if (alert?.rule_id === CREDENTIAL_ACCESS_RULE_ID) {
+    const tripWord = diagnostics.trip_reason === "ino_changed" ? "replaced" : diagnostics.trip_reason === "mtime_changed" ? "rewritten" : String(diagnostics.trip_reason ?? "changed");
+    return {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: credential file changed",
+      body: `A tracked credential file (${diagnostics.category}) was ${tripWord} (path_hash=${diagnostics.path_hash}).`,
     };
   }
   // Tamper fix (canary v0 finalization): "tampering is suspicious in itself" -- a manifest that

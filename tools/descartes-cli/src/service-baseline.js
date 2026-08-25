@@ -591,3 +591,310 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   // write happened that tick.
   return buildDisappearedCandidates(disappearances);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Persistence baseline, Slice C (docs/plans/2026-08-21-agent-intrusion-detection-gaps.md) —
+// service.appeared, the appearance-direction twin of service.disappeared above. Reuses the SAME
+// service.presence/service.census fact-history and groupServiceFactsByTick unchanged — no new
+// collector, no new fact translator.
+//
+// GATE DECISION (per-signal, stated explicitly — see the task's CRITICAL SECURITY-SEMANTICS
+// LESSON): service.appeared is an ABSENCE/NOVELTY claim ("this service unit was never seen before
+// in this host's fact-history"), the exact same shape as scheduled_job.appeared
+// (persistence-baseline.js) and canary-baseline.js's own canary_vanished — an incomplete/
+// truncated fact-history CAN fabricate it (a long-standing service reads as "new" purely because
+// retention/corruption dropped the earlier tick that would have shown it as established). It is
+// therefore COMPLETENESS-GATED via its OWN persistent cold-start lockout, adopting the hardened
+// exact-schema store shape (mirrors process-lineage-baseline.js's/persistence-baseline.js's
+// PROCESS_LINEAGE_BASELINE_STORE_KEYS-style validation) — NOT the older lenient
+// normalizeServiceBaselineState the sibling DISAPPEARANCE path above still uses (that path
+// predates the fact-store-completeness hardening; retrofitting it is a separate, out-of-scope
+// follow-up per the plan's O5). Behavior on incomplete history: emit NOTHING, never fabricate.
+// ---------------------------------------------------------------------------------------------
+
+export const SERVICE_APPEARED_RULE_ID = "service.appeared";
+
+export function resolveServiceAppearanceBaselineStorePaths(descartesPaths) {
+  const dir = path.join(descartesPaths.stateDir, "learned");
+  // [O3] A SEPARATE store from service-baseline.json (not shared with the disappearance path):
+  // keeps the two directions' last_folded_ts checkpoints independent — a shared checkpoint would
+  // risk one fold advancing past the other's unprocessed tick.
+  return { dir, storeFile: path.join(dir, "service-appearance-baseline.json") };
+}
+
+async function ensureServiceAppearanceBaselineDir(descartesPaths) {
+  await fs.mkdir(resolveServiceAppearanceBaselineStorePaths(descartesPaths).dir, { recursive: true, mode: 0o700 });
+}
+
+function freshServiceAppearanceBaselineState() {
+  return {
+    version: 2,
+    last_folded_ts: undefined,
+    skipped_partial_tick_count: 0,
+    appeared_event_count: 0,
+    cold_start_pending: true,
+    cold_start_reason: undefined,
+    cold_start_since_ts: undefined,
+  };
+}
+
+export function normalizeServiceAppearanceBaselineState(raw) {
+  const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  return {
+    version: 2,
+    last_folded_ts: typeof base.last_folded_ts === "string" ? base.last_folded_ts : undefined,
+    skipped_partial_tick_count: finiteOrDefault(base.skipped_partial_tick_count, 0),
+    appeared_event_count: finiteOrDefault(base.appeared_event_count, 0),
+    cold_start_pending: base.cold_start_pending !== false,
+    cold_start_reason: typeof base.cold_start_reason === "string" ? base.cold_start_reason : undefined,
+    cold_start_since_ts: typeof base.cold_start_since_ts === "string" ? base.cold_start_since_ts : undefined,
+  };
+}
+
+// [REVIEW 2026-08-21, must-fix] Exact-schema validation (mirrors
+// process-lineage-baseline.js's isValidProcessLineageBaselineStoreShape byte-for-byte — see that
+// module's own extended comment for the full fabrication-class rationale): a closed key set, a
+// cold_start_pending:true store MUST carry a valid cold_start_since_ts anchor, and an established
+// (cold_start_pending:false) store MUST carry the complete established-state schema (a valid
+// last_folded_ts). This is DELIBERATELY stricter than the sibling disappearance path's own
+// normalizeServiceBaselineState (lenient per-field defaulting) — see the module-section header
+// above for why the two paths carry different store-trust postures.
+const SERVICE_APPEARANCE_BASELINE_STORE_KEYS = new Set([
+  "version",
+  "last_folded_ts",
+  "skipped_partial_tick_count",
+  "appeared_event_count",
+  "cold_start_pending",
+  "cold_start_reason",
+  "cold_start_since_ts",
+]);
+
+function isNonNegativeFiniteInteger(value) {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0;
+}
+
+export function isValidServiceAppearanceBaselineStoreShape(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  for (const key of Object.keys(raw)) {
+    if (!SERVICE_APPEARANCE_BASELINE_STORE_KEYS.has(key)) return false;
+  }
+  if (raw.version !== 2) return false;
+  if (typeof raw.cold_start_pending !== "boolean") return false;
+  if (!isNonNegativeFiniteInteger(raw.skipped_partial_tick_count)) return false;
+  if (!isNonNegativeFiniteInteger(raw.appeared_event_count)) return false;
+  if (raw.cold_start_reason !== undefined && typeof raw.cold_start_reason !== "string") return false;
+  if (raw.cold_start_pending) {
+    if (!isValidIsoTimestamp(raw.cold_start_since_ts)) return false;
+    if (raw.last_folded_ts !== undefined && !isValidIsoTimestamp(raw.last_folded_ts)) return false;
+  } else {
+    if (!isValidIsoTimestamp(raw.last_folded_ts)) return false;
+    if (raw.cold_start_since_ts !== undefined && !isValidIsoTimestamp(raw.cold_start_since_ts)) return false;
+  }
+  return true;
+}
+
+export async function loadServiceAppearanceBaselineStore(descartesPaths) {
+  const { storeFile } = resolveServiceAppearanceBaselineStorePaths(descartesPaths);
+  const { parsed, missing, corrupt } = await readJsonFile(storeFile);
+  if (missing) {
+    return { state: { ...freshServiceAppearanceBaselineState(), cold_start_reason: "missing_store" }, corrupt: false, missing: true };
+  }
+  if (corrupt) {
+    return { state: { ...freshServiceAppearanceBaselineState(), cold_start_reason: "corrupt_store" }, corrupt: true, missing: false };
+  }
+  if (!isValidServiceAppearanceBaselineStoreShape(parsed)) {
+    return { state: { ...freshServiceAppearanceBaselineState(), cold_start_reason: "invalid_store_schema" }, corrupt: true, missing: false };
+  }
+  return { state: normalizeServiceAppearanceBaselineState(parsed), corrupt: false, missing: false };
+}
+
+export async function writeServiceAppearanceBaselineStore(descartesPaths, state) {
+  await ensureServiceAppearanceBaselineDir(descartesPaths);
+  const { storeFile } = resolveServiceAppearanceBaselineStorePaths(descartesPaths);
+  const normalized = normalizeServiceAppearanceBaselineState(state);
+  const tmpFile = `${storeFile}.${process.pid}.tmp`;
+  await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), { mode: 0o600 });
+  await fs.rename(tmpFile, storeFile);
+  return normalized;
+}
+
+/**
+ * The appearance-direction twin of detectServiceDisappearances, over the SAME groups (reuses
+ * groupServiceFactsByTick unchanged). Shape mirrors process-lineage-baseline.js's/
+ * persistence-baseline.js's own novelty detection (historical union across every complete group
+ * EXCEPT latest; fire for latest-group keys absent from that union) — the only self-consistent
+ * "detect NEW" semantics: a per-entity established-sightings gate (detectServiceDisappearances'
+ * own minEstablishedCount) cannot sensibly invert for the appearance direction (an entity cannot
+ * be required to have PRIOR established sightings to be flagged as newly appeared). The
+ * `minHistoryTickCount` default REUSES DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT (per the
+ * plan's own instruction) as this detector's window-size/cold-start-style gate — a value distinct
+ * from, and not to be confused with, the SEPARATE persistent-lockout re-accumulation gate
+ * (DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT) computeServiceAppearanceCandidates applies below.
+ */
+export function detectServiceAppearances(groups = [], options = {}) {
+  const {
+    nowMs = Date.now(),
+    freshnessMs = DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS,
+    minHistoryTickCount = DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT,
+  } = options;
+  const completeGroups = groups.filter((group) => group.censusState === "complete");
+  if (completeGroups.length < minHistoryTickCount + 1) return [];
+
+  const latest = completeGroups[completeGroups.length - 1];
+  const latestMs = new Date(latest.ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return [];
+
+  const historical = new Set();
+  for (const group of completeGroups.slice(0, -1)) {
+    for (const entityKey of group.entityKeys) historical.add(entityKey);
+  }
+
+  const appearances = [];
+  for (const entityKey of latest.entityKeys) {
+    if (historical.has(entityKey)) continue;
+    appearances.push({ entity_key: entityKey, first_seen_ts: latest.ts });
+  }
+  return appearances;
+}
+
+// Own domain-separated hash — deliberately NOT hashServiceEntityKey (which is
+// "service.disappeared"-domain-prefixed): a distinct rule-scoped domain keeps
+// service.appeared's fingerprints from ever coinciding with service.disappeared's for the same
+// entity_key, mirroring hashLineageEdgeEntityKey's/hashScheduledJobEntityKey's own per-rule_id
+// domain-separation convention.
+function hashServiceAppearedEntityKey(entityKey) {
+  return createHash("sha256").update(`${SERVICE_APPEARED_RULE_ID}:${entityKey}`).digest("hex").slice(0, 16);
+}
+
+// [O1] Hash-only diagnostics by default (unsigned) — mirrors buildDisappearedCandidates' hashed
+// fingerprint/id discipline but deliberately does NOT extend service.disappeared's scoped
+// 2026-07-24 cleartext-service-name exception to this new rule_id (that exception is explicitly
+// narrow, "do not generalize"). A future operator sign-off can add a sanitized `service_name`
+// diagnostics field the same way service.disappeared did, without a redesign.
+export function buildAppearedCandidates(entries = []) {
+  return entries.map((entry) => {
+    const entityKeyHash = hashServiceAppearedEntityKey(entry.entity_key);
+    const diagnostics = sanitizeDiagnostics({
+      entity_key_hash: entityKeyHash,
+      first_seen_ts: entry.first_seen_ts,
+    });
+    return {
+      id: alertId(SERVICE_APPEARED_RULE_ID, entityKeyHash),
+      rule_id: SERVICE_APPEARED_RULE_ID,
+      fingerprint: entityKeyHash,
+      // Severity capped at "warning" UNCONDITIONALLY, mirroring buildDisappearedCandidates' own
+      // hard cap — no critical tier in v1.
+      severity: "warning",
+      title: "New service appeared",
+      summary: "A service unit not seen in this host's recent history just appeared in the latest complete service census.",
+      diagnostics,
+      evidence_refs: ["service-baseline"],
+    };
+  });
+}
+
+/**
+ * Same signature/short-circuit shape as computeServiceBaselineCandidates: gated by the same
+ * loadLearnedConfig(...).enabled short-circuit-to-[] BEFORE any I/O. Threads its OWN persistent
+ * cold-start lockout (separate store, see resolveServiceAppearanceBaselineStorePaths/O3) so an
+ * appearance fold and a disappearance fold can never mutually skip a tick.
+ */
+export async function computeServiceAppearanceCandidates(descartesPaths, options = {}) {
+  const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
+  const learnedConfig = await loadConfig(descartesPaths);
+  if (!learnedConfig.enabled) return [];
+
+  const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
+  // Persistent-lockout re-accumulation gate (distinct from detectServiceAppearances' own
+  // window-size gate below) — reuses DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT, the SAME value/
+  // semantics the sibling disappearance path already applies to its own lockout over this
+  // identical fact stream (see the module-section header above for the full rationale).
+  const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT;
+  // detectServiceAppearances' own window-size gate — reuses DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT
+  // per the plan's explicit instruction ("Reuse DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT").
+  const establishedMinCensusCount = options.establishedMinCensusCount ?? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT;
+
+  const readFacts = options.readFactPoints ?? readFactPoints;
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const { points, corrupt_count: corruptFactCount } = readResult;
+  const groups = groupServiceFactsByTick(points);
+
+  const loadStore = options.loadServiceAppearanceBaselineStore ?? loadServiceAppearanceBaselineStore;
+  const { state: persistedState, corrupt: corruptBaselineStore, missing: missingBaselineStore } = await loadStore(descartesPaths);
+
+  const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS;
+  const currentGroups = groups.filter((group) => {
+    const groupMs = new Date(group.ts).getTime();
+    return Number.isFinite(groupMs) && groupMs <= nowMs;
+  });
+
+  const factsCorruptThisTick = Boolean(corruptFactCount);
+  const storeLossThisTick = corruptBaselineStore === true || missingBaselineStore === true;
+  const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
+    || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
+      && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
+  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
+  const enteringColdStart = factsCorruptThisTick
+    || storeLossThisTick
+    || persistedAnchorMissingOrFuture
+    || completenessLossAfterAnchor
+    || (!persistedState.cold_start_pending && !historyTrust.trust);
+
+  const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart || !historyTrust.trust;
+
+  let nextColdStartPending = persistedState.cold_start_pending;
+  let nextColdStartReason = persistedState.cold_start_reason;
+  let nextColdStartSinceTs = persistedState.cold_start_since_ts;
+
+  if (enteringColdStart) {
+    nextColdStartPending = true;
+    nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
+    nextColdStartSinceTs = nowIso;
+  } else if (persistedState.cold_start_pending && historyTrust.trust) {
+    const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
+    const reestablishedTickCount = currentGroups.filter((group) => {
+      const groupMs = new Date(group.ts).getTime();
+      return group.censusState === "complete" && groupMs > sinceMs && groupMs <= nowMs;
+    }).length;
+    if (reestablishedTickCount >= minHistoryTickCount) {
+      nextColdStartPending = false;
+    }
+  }
+
+  const appearances = coldStartPendingThisTick
+    ? []
+    : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount });
+
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
+  const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
+  const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
+  const coldStartStateChanged = nextColdStartPending !== persistedState.cold_start_pending
+    || nextColdStartReason !== persistedState.cold_start_reason
+    || nextColdStartSinceTs !== persistedState.cold_start_since_ts;
+  if (newGroups.length > 0 || coldStartStateChanged || lastFoldedWasFuture) {
+    const newGroupTsSet = new Set(newGroups.map((group) => group.ts));
+    const newPartialCount = newGroups.filter((group) => group.censusState === "partial").length;
+    const newAppearedCount = appearances.filter((entry) => newGroupTsSet.has(entry.first_seen_ts)).length;
+    const lastFoldedTs = newGroups.length > 0 ? newGroups[newGroups.length - 1].ts : effectiveLastFoldedTs;
+    const nextState = {
+      version: 2,
+      last_folded_ts: lastFoldedTs,
+      skipped_partial_tick_count: persistedState.skipped_partial_tick_count + newPartialCount,
+      appeared_event_count: persistedState.appeared_event_count + newAppearedCount,
+      cold_start_pending: nextColdStartPending,
+      cold_start_reason: nextColdStartReason,
+      cold_start_since_ts: nextColdStartSinceTs,
+    };
+    const writeStore = options.writeServiceAppearanceBaselineStore ?? writeServiceAppearanceBaselineStore;
+    await writeStore(descartesPaths, nextState);
+  }
+
+  if (coldStartPendingThisTick) return [];
+
+  return buildAppearedCandidates(appearances);
+}

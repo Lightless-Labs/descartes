@@ -35,12 +35,23 @@ import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenanc
 import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
 import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
-import { PEER_CENSUS_MARKER_ENTITY_KEY, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY, SESSION_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
+import {
+  PEER_CENSUS_MARKER_ENTITY_KEY,
+  SCHEDULED_JOB_CENSUS_FACT_NAME,
+  SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY,
+  SCHEDULED_JOB_PRESENCE_FACT_NAME,
+  SERVICE_CENSUS_FACT_NAME,
+  SERVICE_CENSUS_MARKER_ENTITY_KEY,
+  SESSION_CENSUS_MARKER_ENTITY_KEY,
+  buildScheduledJobEntityKey,
+} from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
-import { SERVICE_DISAPPEARED_RULE_ID, loadServiceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
+import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID, loadServiceAppearanceBaselineStore, loadServiceBaselineStore, writeServiceAppearanceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, loadProcessLineageBaselineStore, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
+import { SCHEDULED_JOB_APPEARED_RULE_ID, loadPersistenceBaselineStore, writePersistenceBaselineStore } from "../src/persistence-baseline.js";
+import { CREDENTIAL_ACCESS_RULE_ID, writeCredentialAccessBaselineStore } from "../src/credential-access-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -804,14 +815,16 @@ test("S6b wiring: structural evidence is translated into fact-points and persist
 
   assert.notEqual(result.structuralFacts, undefined);
   // 1 service + 1 network + 1 Slice C service census marker (always appended on a successful
-  // services envelope) = 3.
-  assert.equal(result.structuralFacts.written_count, 3);
+  // services envelope) + 1 Persistence-baseline Slice A scheduled_job census marker (always
+  // appended on a successful, even zero-job, scheduled-jobs envelope) = 4.
+  assert.equal(result.structuralFacts.written_count, 4);
 
   const { points } = await readFactPoints(paths);
-  assert.equal(points.length, 3);
+  assert.equal(points.length, 4);
   assert(points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
   assert(points.some((point) => point.fact_name === "network.listening_port.owner" && point.entity_key === "tcp:0.0.0.0:8080"));
   assert(points.some((point) => point.fact_name === SERVICE_CENSUS_FACT_NAME && point.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY && point.attributes.census_state === "complete"));
+  assert(points.some((point) => point.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME && point.entity_key === SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY && point.attributes.census_state === "complete"));
 });
 
 test("S6b wiring: no fact-points are persisted while the learned.json kill switch is off, even with populated structural evidence available", async () => {
@@ -2831,6 +2844,96 @@ test("Process-lineage wiring: a novel edge flows through the daemon's alert pipe
   assert.equal(state.skipped_partial_tick_count, 0);
 });
 
+// ---------------------------------------------------------------------------------------------
+// Persistence baseline, Slice B (docs/plans/2026-08-21-agent-intrusion-detection-gaps.md):
+// scheduled_job.appeared. Mirrors the "Process-lineage wiring" test immediately above exactly —
+// same absence/novelty gate discipline (DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT is 6, same
+// as process-lineage's own default).
+// ---------------------------------------------------------------------------------------------
+
+function scheduledJobPresenceFactPoint(ts, entityKey) {
+  return {
+    ts,
+    fact_name: SCHEDULED_JOB_PRESENCE_FACT_NAME,
+    entity_key: entityKey,
+    attributes: { kind: "systemd_timer", source: "systemd_timers" },
+    source_envelope_id: "scheduled-jobs",
+    source_tool: "collect_scheduled_jobs",
+    sensitivity: "operational",
+  };
+}
+
+function scheduledJobCensusMarkerFactPoint(ts, state = "complete") {
+  return {
+    ts,
+    fact_name: SCHEDULED_JOB_CENSUS_FACT_NAME,
+    entity_key: SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: state },
+    source_envelope_id: "scheduled-jobs",
+    source_tool: "collect_scheduled_jobs",
+    sensitivity: "operational",
+    confidence: 0,
+  };
+}
+
+function completeScheduledJobTick(ts, entityKeys) {
+  return [...entityKeys.map((key) => scheduledJobPresenceFactPoint(ts, key)), scheduledJobCensusMarkerFactPoint(ts, "complete")];
+}
+
+function scheduledJobNoveltyFixtureFactPoints() {
+  const establishedKey = buildScheduledJobEntityKey("systemd_timer", "systemd_timers", "backup.timer");
+  const novelKey = buildScheduledJobEntityKey("systemd_timer", "systemd_timers", "exfil.timer");
+  const ticks = [];
+  for (let i = 0; i < 6; i += 1) ticks.push(...completeScheduledJobTick(hour(i), [establishedKey]));
+  ticks.push(...completeScheduledJobTick(hour(6), [establishedKey, novelKey]));
+  return { ticks, establishedKey, novelKey };
+}
+
+test("Scheduled-job persistence wiring: computeScheduledJobBaselineCandidates reaches the daemon's extraCandidates array — a novel scheduled job flows through the alert pipeline as a warning, gated by its own completeness lockout (absence/novelty claim)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Prime the baseline store as already-established (same rationale as the process-lineage wiring
+  // test above): this wiring test is about the daemon pipeline, not the lockout itself, which has
+  // its own dedicated coverage in persistence-baseline.test.js.
+  await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  const { ticks, novelKey } = scheduledJobNoveltyFixtureFactPoints();
+  await appendFactPoints(paths, ticks, { now: hour(6) });
+  await appendFactPoints(paths, [], { now: hour(6) }); // confirm the shared integrity ledger to 'intact'
+
+  const result = await runIsolatedDaemonTick(paths, hour(6));
+  const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === SCHEDULED_JOB_APPEARED_RULE_ID);
+  assert.ok(alert, "expected a real alert for the novel scheduled job");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning");
+  assert.equal(typeof alert.diagnostics.entity_key_hash, "string");
+  assert.equal(JSON.stringify(alert).includes(novelKey), false, "job identity must not be emitted in cleartext (O1 hash-only default)");
+
+  const { state } = await loadPersistenceBaselineStore(paths);
+  assert.equal(state.last_folded_ts, hour(6));
+  assert.equal(state.appeared_event_count, 1);
+});
+
+test("Scheduled-job persistence: byte-identical real alerts when the learned kill switch is off, even with scheduled-job fact-history present that would otherwise appear-fire, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withJobsPaths = await tempPaths();
+  const { ticks } = scheduledJobNoveltyFixtureFactPoints();
+  await appendFactPoints(withJobsPaths, ticks, { now: hour(6) });
+  let readFactsCalled = false;
+  const withJobs = await runDaemonIteration(withJobsPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(6),
+    now: hour(6),
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+  });
+
+  assert.deepEqual(withJobs.alerts.alerts, baseline.alerts.alerts);
+  assert.equal(withJobs.alerts.alerts.some((a) => a.rule_id === SCHEDULED_JOB_APPEARED_RULE_ID), false);
+  assert.equal(readFactsCalled, false, "computeScheduledJobBaselineCandidates must short-circuit before ever calling readFactPoints while the kill switch is off");
+});
+
 // 30 complete censuses in which "worker.service" is present (establishing it -- the default
 // minEstablishedCount is 3), then a 31st complete census in which it is missing.
 function serviceDisappearanceFixtureFactPoints({ presentEntity = "worker.service" } = {}) {
@@ -2971,6 +3074,112 @@ test("Service-disappearance wiring, single-source-of-truth: a 1h-old service.dis
 
   assert.ok(result.alerts.alerts.some((a) => a.rule_id === "constraint.violation.service-presence"), "expected the 1h-old constraint violation to still fire within the shared freshness window");
   assert.ok(result.alerts.alerts.some((a) => a.rule_id === SERVICE_DISAPPEARED_RULE_ID), "expected the 1h-old service.disappeared transition to still fire, sharing the SAME activeFreshnessMs as the constraint above");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Persistence baseline, Slice C: service.appeared — the appearance-direction twin of
+// service.disappeared, wired as its own extraCandidates entry with its own SEPARATE store (O3).
+// ---------------------------------------------------------------------------------------------
+
+test("Service-appearance wiring: computeServiceAppearanceCandidates reaches the daemon's extraCandidates array — a new service unit in the latest complete census produces a real, sanitized service.appeared alert record in alerts.json", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Prime BOTH stores as already-established: computeServiceAppearanceCandidates has its OWN
+  // persistent cold-start lockout, separate from the disappearance path's store (O3) — this
+  // wiring test is about the daemon pipeline, not the lockout itself.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  const ticks = [];
+  for (let i = 0; i < 3; i += 1) ticks.push(...completeServiceTick(hour(i), ["worker.service"]));
+  ticks.push(...completeServiceTick(hour(3), ["worker.service", "new-backdoor.service"]));
+  await appendFactPoints(paths, ticks, { now: hour(3) });
+  await appendFactPoints(paths, [], { now: hour(3) });
+
+  const result = await runIsolatedDaemonTick(paths, hour(3));
+  const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === SERVICE_APPEARED_RULE_ID);
+  assert.ok(alert, "expected a real alert for the newly-appeared service");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning");
+  assert.equal(typeof alert.diagnostics.entity_key_hash, "string");
+  assert.equal(alert.diagnostics.service_name, undefined, "service.appeared is hash-only by default (O1) -- deliberately NOT service.disappeared's cleartext-name exception");
+  assert.equal(JSON.stringify(alert).includes("new-backdoor.service"), false);
+
+  const { state } = await loadServiceAppearanceBaselineStore(paths);
+  assert.equal(state.last_folded_ts, hour(3));
+  assert.equal(state.appeared_event_count, 1);
+});
+
+test("Service-appearance: byte-identical real alerts when the learned kill switch is off, even with service fact-history present that would otherwise appear-fire, and no I/O is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withServicesPaths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < 3; i += 1) ticks.push(...completeServiceTick(hour(i), ["worker.service"]));
+  ticks.push(...completeServiceTick(hour(3), ["worker.service", "new-backdoor.service"]));
+  await appendFactPoints(withServicesPaths, ticks, { now: hour(3) });
+  const withServices = await runIsolatedDaemonTick(withServicesPaths, hour(3));
+
+  assert.deepEqual(withServices.alerts.alerts, baseline.alerts.alerts);
+  assert.equal(withServices.alerts.alerts.some((a) => a.rule_id === SERVICE_APPEARED_RULE_ID), false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Credential-file-access signal, Slice D: credential.access — a per-path lstat mtime/ino diff,
+// NOT gated by any fact-store completeness lockout (positive direct evidence, P7 own store).
+// ---------------------------------------------------------------------------------------------
+
+test("Credential-file-access wiring: computeCredentialAccessCandidates reaches the daemon's extraCandidates array — a real mtime change against a pre-seeded per-path baseline produces a real, sanitized credential.access alert record in alerts.json, firing on the FIRST eligible observation (not completeness-gated)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeCredentialAccessBaselineStore(paths, { entries: { "0123456789abcdef": { atime: 1000, mtime: 2000, ino: 42 } } });
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(0),
+    now: hour(0),
+    collectCredentialAccessEvidence: async () => ({
+      result: {
+        entries: [{ category: "ssh_private_key", path_hash: "0123456789abcdef", watch: ["mtime", "ino"], status: "ok", atime: 1000, mtime: 9999, ino: 42 }],
+      },
+    }),
+  });
+
+  const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === CREDENTIAL_ACCESS_RULE_ID);
+  assert.ok(alert, "expected a real alert for the credential-file mtime change");
+  assert.equal(alert.status, "active");
+  assert.equal(alert.severity, "warning");
+  assert.equal(alert.diagnostics.trip_reason, "mtime_changed");
+  assert.equal(alert.diagnostics.category, "ssh_private_key");
+  assert.equal(alert.diagnostics.path_hash, "0123456789abcdef");
+  assert.equal(JSON.stringify(alert).includes("/"), false, "no literal filesystem path ever reaches the alert record");
+
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+});
+
+test("Credential-file-access: byte-identical real alerts when the learned kill switch is off, even with a real mtime change present that would otherwise trip, and no lstat is attempted for it", async () => {
+  const baselinePaths = await tempPaths();
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const withChangePaths = await tempPaths();
+  await writeCredentialAccessBaselineStore(withChangePaths, { entries: { "0123456789abcdef": { atime: 1000, mtime: 2000, ino: 42 } } });
+  let collectCalled = false;
+  const withChange = await runDaemonIteration(withChangePaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(0),
+    now: hour(0),
+    collectCredentialAccessEvidence: async () => {
+      collectCalled = true;
+      return { result: { entries: [{ category: "ssh_private_key", path_hash: "0123456789abcdef", watch: ["mtime", "ino"], status: "ok", atime: 1000, mtime: 9999, ino: 42 }] } };
+    },
+  });
+
+  assert.deepEqual(withChange.alerts.alerts, baseline.alerts.alerts);
+  assert.equal(withChange.alerts.alerts.some((a) => a.rule_id === CREDENTIAL_ACCESS_RULE_ID), false);
+  assert.equal(collectCalled, false, "computeCredentialAccessCandidates must short-circuit before ever collecting lstat evidence while the kill switch is off");
 });
 
 // ---------------------------------------------------------------------------------------------

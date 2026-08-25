@@ -17,6 +17,7 @@ import {
   sanitizeEntityKey,
 } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
+import { computeStatDiffTripReason } from "./stat-diff.js";
 
 export { CANARY_CENSUS_MARKER_ENTITY_KEY, DEFAULT_BASELINE_FACT_WINDOW_MS };
 
@@ -224,13 +225,6 @@ function watchList(value) {
   return [];
 }
 
-function atimeValue(value) {
-  const numeric = Number(value);
-  if (Number.isFinite(numeric)) return numeric;
-  const parsed = new Date(value).getTime();
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
 // FIX-A (identity binding, canary v0 finalization). detectCanaryTrips' entity_key (canary_id) is
 // a SANITIZED form of the manifest's operator-chosen `id` string alone -- it says nothing about
 // WHICH underlying file that id currently points at. Left unbound, an operator (or an attacker
@@ -310,37 +304,13 @@ export function detectCanaryTrips(groups = [], options = {}) {
     const sightingKey = canarySightingKey(canaryId, latestSnapshot);
     if ((sightingCounts.get(sightingKey) ?? 0) < minEstablishedCount) continue;
     const watches = watchList(latestSnapshot.watch);
-    let tripReason;
-    for (const watch of watches) {
-      if (watch === "atime") {
-        const latestAtime = atimeValue(latestSnapshot.atime);
-        const previousAtime = atimeValue(previousSnapshot.atime);
-        if (latestAtime !== undefined && previousAtime !== undefined && latestAtime > previousAtime) {
-          tripReason = "atime_advanced";
-          break;
-        }
-      } else if (
-        watch === "mtime" &&
-        latestSnapshot.mtime !== undefined &&
-        previousSnapshot.mtime !== undefined &&
-        latestSnapshot.mtime !== previousSnapshot.mtime
-      ) {
-        // Fail-closed (HIGH fix, canary collector review): a MISSING mtime on either side
-        // (undefined !== "some-value" is trivially true in JS) must SKIP the comparison, not
-        // trip — a hole in the fact record is not evidence of a real attribute change.
-        tripReason = "mtime_changed";
-        break;
-      } else if (watch === "executed" && latestSnapshot.executed === "true" && previousSnapshot.executed === "false") {
-        // Fail-closed (HIGH fix, canary collector review): trip ONLY on an explicit,
-        // previously-observed "false" flipping to "true". Requiring previousSnapshot.executed
-        // === "false" (rather than the looser `!== "true"`) means an UNDEFINED/missing
-        // previous value and canary.js's new degrade-not-fabricate "unknown" value (see
-        // tools/canary.js's access()-failure fix) can never themselves manufacture a trip —
-        // only a genuine, previously-confirmed false->true transition does.
-        tripReason = "executed";
-        break;
-      }
-    }
+    // Extracted (Slice D, credential-access plan): the per-watch trip-reason diff itself now
+    // lives in stat-diff.js's computeStatDiffTripReason, shared with credential-access-
+    // baseline.js. Behavior is byte-identical to the inline loop this replaces (same three
+    // reasons, same fail-closed missing-value discipline, same first-match-wins order) — see
+    // canary-baseline.test.js's regression coverage. `ino` is additive/new and is never in a
+    // canary manifest's `watch` list, so it never fires here.
+    const tripReason = computeStatDiffTripReason(previousSnapshot, latestSnapshot, watches);
     if (tripReason) {
       trips.push({
         canary_id: canaryId,

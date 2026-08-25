@@ -13,6 +13,7 @@ import {
   factPointsFromNetworkEvidence,
   factPointsFromCanaryEvidence,
   factPointsFromProcessLineageEvidence,
+  factPointsFromScheduledJobsEvidence,
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
   factPointsFromTailscaleStatusEvidence,
@@ -20,11 +21,13 @@ import {
 } from "./fact-translators.js";
 import { computeCorrelationCandidates } from "./incident-correlation.js";
 import { computePeerBaselineCandidates } from "./peer-baseline.js";
-import { computeServiceBaselineCandidates } from "./service-baseline.js";
+import { computeServiceAppearanceCandidates, computeServiceBaselineCandidates } from "./service-baseline.js";
 import { computeProcessLineageBaselineCandidates } from "./process-lineage-baseline.js";
 import { computeSessionBaselineCandidates } from "./session-baseline.js";
 import { computeCanaryBaselineCandidates } from "./canary-baseline.js";
 import { loadCanaryManifest } from "./canary-manifest.js";
+import { computeScheduledJobBaselineCandidates } from "./persistence-baseline.js";
+import { computeCredentialAccessCandidates } from "./credential-access-baseline.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
@@ -517,6 +520,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // availability/regime anchor, avoiding same-tick marker collision.
             ...factPointsFromTailscaleStatusEvidence(structuralEvidence, { ts }),
             ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
+            // Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-
+            // gaps.md): scheduled-jobs structural evidence -> fact-points, same discipline as its
+            // siblings above — only reachable on a successful (non-timed-out) structural tick.
+            // Pure L0 fact source: deliberately NOT paired with any extraCandidates addition here
+            // — alerting on a novel scheduled job (scheduled_job.appeared) is Slice B's job.
+            ...factPointsFromScheduledJobsEvidence(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
@@ -612,6 +621,25 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // tick, every alert family, not just canary.* -- the way an uncaught store error used to.
           ...await computeCanaryBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
           ...await computeProcessLineageBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          // Persistence baseline, Slice B (docs/plans/2026-08-21-agent-intrusion-detection-
+          // gaps.md): scheduled_job.appeared — a set-membership novelty diff over Slice A's
+          // already-persisted scheduled_job.presence/scheduled_job.census fact-history. Absence/
+          // novelty claim -> completeness-gated (own persistent cold-start lockout, mirroring
+          // process-lineage-baseline.js). unknown_namespace (no classifyAlertNamespace branch), so
+          // it can never reach the LLM adjudication path below regardless of enabled_namespaces.
+          ...await computeScheduledJobBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          // Persistence baseline, Slice C: service.appeared — the appearance-direction twin of
+          // service.disappeared, over the SAME already-persisted service.presence/service.census
+          // fact-history. Also an absence/novelty claim -> completeness-gated (own separate
+          // appearance-baseline store + persistent cold-start lockout, so an appearance fold can
+          // never mutually skip a tick with the disappearance fold above).
+          ...await computeServiceAppearanceCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          // Credential-file-access signal, Slice D: credential.access — a per-path lstat
+          // mtime/ino diff over a FIXED set of real credential paths (own dedicated store, no
+          // fact-store I/O at all — P7). POSITIVE DIRECT EVIDENCE (a concrete two-snapshot
+          // mtime/ino change), NOT a novelty/absence claim -> deliberately NOT completeness-gated;
+          // fires on the first eligible (post-seed) observation, like the canary tripwire.
+          ...await computeCredentialAccessCandidates(descartesPaths, options),
         ],
       });
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
