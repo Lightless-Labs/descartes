@@ -52,7 +52,7 @@ import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStor
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID, loadServiceAppearanceBaselineStore, loadServiceBaselineStore, writeServiceAppearanceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, loadProcessLineageBaselineStore, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
 import { SCHEDULED_JOB_APPEARED_RULE_ID, loadPersistenceBaselineStore, writePersistenceBaselineStore } from "../src/persistence-baseline.js";
-import { CREDENTIAL_ACCESS_RULE_ID, writeCredentialAccessBaselineStore } from "../src/credential-access-baseline.js";
+import { CREDENTIAL_ACCESS_RULE_ID, loadCredentialAccessBaselineStore, writeCredentialAccessBaselineStore } from "../src/credential-access-baseline.js";
 
 function envelope(id, tool, result, status = "ok") {
   return {
@@ -3129,6 +3129,77 @@ test("Service-appearance: byte-identical real alerts when the learned kill switc
 // Credential-file-access signal, Slice D: credential.access — a per-path lstat mtime/ino diff,
 // NOT gated by any fact-store completeness lockout (positive direct evidence, P7 own store).
 // ---------------------------------------------------------------------------------------------
+
+test("evaluateAlerts:false skips detector I/O and leaves the credential baseline unchanged, while the default evaluates it", async () => {
+  const initialEntries = { "0123456789abcdef": { atime: 1000, mtime: 2000, ino: 42 } };
+  const changedEvidence = {
+    status: "ok",
+    result: {
+      entries: [{
+        category: "ssh_private_key",
+        path_hash: "0123456789abcdef",
+        watch: ["mtime", "ino"],
+        status: "ok",
+        atime: 1000,
+        mtime: 9999,
+        ino: 42,
+        size: 7,
+      }],
+    },
+  };
+
+  async function seededPaths() {
+    const paths = await tempPaths();
+    await writeLearnedConfig(paths, { enabled: true });
+    await writeCredentialAccessBaselineStore(paths, { entries: initialEntries });
+    return paths;
+  }
+
+  const disabledPaths = await seededPaths();
+  let detectorIoCalls = 0;
+  let disabledCollectCalled = false;
+  const disabled = await runDaemonIteration(disabledPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(0),
+    now: hour(0),
+    evaluateAlerts: false,
+    collectCredentialAccessEvidence: async () => {
+      disabledCollectCalled = true;
+      return changedEvidence;
+    },
+    loadCredentialAccessBaselineStore: async (...args) => {
+      detectorIoCalls += 1;
+      return loadCredentialAccessBaselineStore(...args);
+    },
+    writeCredentialAccessBaselineStore: async (...args) => {
+      detectorIoCalls += 1;
+      return writeCredentialAccessBaselineStore(...args);
+    },
+  });
+
+  assert.equal(disabled.alerts, undefined);
+  assert.equal(disabledCollectCalled, false);
+  assert.equal(detectorIoCalls, 0);
+  assert.deepEqual((await loadCredentialAccessBaselineStore(disabledPaths)).entries, initialEntries);
+
+  const enabledPaths = await seededPaths();
+  let enabledCollectCalled = false;
+  const enabled = await runDaemonIteration(enabledPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(0),
+    now: hour(0),
+    collectCredentialAccessEvidence: async () => {
+      enabledCollectCalled = true;
+      return changedEvidence;
+    },
+  });
+
+  assert.equal(enabledCollectCalled, true);
+  assert.notDeepEqual((await loadCredentialAccessBaselineStore(enabledPaths)).entries, initialEntries);
+  assert.equal(enabled.alerts.alerts.find((candidate) => candidate.rule_id === CREDENTIAL_ACCESS_RULE_ID)?.status, "active");
+});
 
 test("Credential-file-access wiring: computeCredentialAccessCandidates reaches the daemon's extraCandidates array — a real mtime change against a pre-seeded per-path baseline produces a real, sanitized credential.access alert record in alerts.json, firing on the FIRST eligible observation (not completeness-gated)", async () => {
   const paths = await tempPaths();

@@ -125,6 +125,47 @@ function cronJob({ path = "/etc/cron.d/a", schedule = "* * * * *", user = "root"
   return { kind: "cron", source: "cron_d", path, line_number: lineNumber, schedule, user, command };
 }
 
+test("user_crontab cron jobs without a user persist by hashed identity while system cron jobs without a user are dropped", () => {
+  const userJob = {
+    kind: "cron",
+    source: "user_crontab",
+    path: "crontab -l",
+    schedule: "* * * * *",
+    user: undefined,
+    command: "echo hi",
+  };
+  const userPoints = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({
+      jobs: [userJob],
+      summary: { unavailable_count: 0 },
+      truncated: false,
+    }),
+  ], { ts: TS });
+
+  const userPresence = userPoints.filter((point) => point.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME);
+  assert.equal(userPresence.length, 1);
+  assert.match(userPresence[0].entity_key, /^scheduled_job\.4:cron\.12:user_crontab\.16:[0-9a-f]{16}$/);
+  assert.equal(userPresence[0].entity_key, factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({ jobs: [{ ...userJob }], summary: { unavailable_count: 0 }, truncated: false }),
+  ], { ts: TS }).find((point) => point.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).entity_key);
+  assert.equal(userPoints.find((point) => point.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "complete");
+  assert.equal(JSON.stringify(userPoints).includes(userJob.path), false);
+  assert.equal(JSON.stringify(userPoints).includes(userJob.command), false);
+  assert.equal(JSON.stringify(userPoints).includes("user:undefined"), false);
+
+  for (const source of ["system_crontab", "cron_d"]) {
+    const systemPoints = factPointsFromScheduledJobsEvidence([
+      scheduledJobsEnvelope({
+        jobs: [{ ...userJob, source }],
+        summary: { unavailable_count: 0 },
+        truncated: false,
+      }),
+    ], { ts: TS });
+    assert.equal(systemPoints.filter((point) => point.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).length, 0);
+    assert.equal(systemPoints.find((point) => point.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "partial");
+  }
+});
+
 test("factPointsFromScheduledJobsEvidence returns [] for a missing envelope and for status:'unable'", () => {
   assert.deepEqual(factPointsFromScheduledJobsEvidence([], { ts: TS }), []);
   assert.deepEqual(factPointsFromScheduledJobsEvidence([

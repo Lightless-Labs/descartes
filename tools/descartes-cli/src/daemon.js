@@ -564,7 +564,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
   });
-  const mainExtraCandidates = [
+  // Regression fix (sol re-review of the 7.2 re-phasing): computing the detector candidates
+  // MUTATES detector stores (baseline folds, credential/lineage advances), so it must NOT run
+  // when evaluateAlerts is false — otherwise the next enabled tick treats the changed state as
+  // baseline and misses the signal, violating the option's prior no-detector-I/O contract.
+  // Declared at this scope (not inside the branch) because the containment phase below re-merges
+  // mainExtraCandidates; that block only runs when mainAlerts is truthy, i.e. when the branch ran.
+  let mainExtraCandidates;
+  let mainAlerts;
+  if (options.evaluateAlerts !== false) {
+    mainExtraCandidates = [
           ...await computeActiveConstraintCandidates(descartesPaths, { ...options, activeFreshnessMs }),
           ...await computeProvenanceWarningCandidates(descartesPaths, options),
           ...await computeProvenanceIdentityCandidates(descartesPaths, options),
@@ -578,9 +587,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           ...await computeServiceAppearanceCandidates(descartesPaths, { ...options, activeFreshnessMs }),
           ...await computeCredentialAccessCandidates(descartesPaths, options),
         ];
-  const mainAlerts = options.evaluateAlerts === false
-    ? undefined
-    : await evaluateAndPersistAlerts(descartesPaths, {
+    mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,
         daemonStatus: status,
         windowMs: options.alertWindowMs,
@@ -590,6 +597,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // section 4 / S-live-1 grounding).
         extraCandidates: mainExtraCandidates,
       });
+  }
   let alerts = mainAlerts;
   if (mainAlerts) {
     // Containment is a second phase: it consumes only the main evaluation's current active alerts

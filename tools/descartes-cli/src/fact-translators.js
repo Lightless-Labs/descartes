@@ -227,7 +227,16 @@ function scheduledJobIdentityLeg(job) {
   const { kind, source } = job ?? {};
   if (!isValidScheduledJobKindSource(kind, source)) return undefined;
   if (kind === "cron") {
-    if (![job.path, job.schedule, job.user, job.command].every((value) => typeof value === "string" && value.length > 0)) {
+    // path/schedule/command are always required; `user` exists only for system-level cron
+    // (system_crontab / cron_d carry a user column). A real `crontab -l` (user_crontab) and the
+    // parser's generic `cron` source legitimately have NO user column, so requiring it there
+    // dropped real per-user cron jobs -> invisible persistence + a spuriously-partial census
+    // (sol re-review regression). The empty user leg is still hashed by cronJobIdentityDigest
+    // (String(job.user ?? "")), so identity stays confined to the SHA-256 preimage.
+    if (![job.path, job.schedule, job.command].every((value) => typeof value === "string" && value.length > 0)) {
+      return undefined;
+    }
+    if ((job.source === "system_crontab" || job.source === "cron_d") && !(typeof job.user === "string" && job.user.length > 0)) {
       return undefined;
     }
     return cronJobIdentityDigest(job);
