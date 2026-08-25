@@ -23,8 +23,9 @@
 // rule_id -> verb map (RECOMMEND_MAP below) -- never a model prompt, never free text (§(c) of the
 // parent design: "the recommended verb is chosen by deterministic code, never a model prompt").
 import fs from "node:fs/promises";
+import crypto from "node:crypto";
 import path from "node:path";
-import { alertId, readAlertRecords } from "./alert-store.js";
+import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -57,15 +58,17 @@ export const CONTAINMENT_RECOMMEND_LABEL = "RECOMMEND-ONLY — Descartes will NO
 // (plan §7 Open Decision 2's reconciliation note).
 export const KNOWN_CONTAINMENT_VERBS = Object.freeze(["throttle", "block", "revoke", "quarantine", "kill"]);
 
-// Matches diagnostics-sanitizer.js's own SAFE_STRING_PATTERN (mirrored, not imported -- this is a
-// deliberately independent, narrower re-validation of an already-sanitized field, the same
-// "defense in depth, not the single source of truth" posture alert-intelligence.js's compactAlert
-// takes re-running sanitizeDiagnostics). A target_repr must be a hash/closed-enum-shaped string;
-// anything else degrades to undefined (no recommendation), never a raw identifier.
-const SAFE_TARGET_REPR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// The intrusion detectors emit 16-character, lowercase SHA-256 prefixes. Keep this validator
+// exact: a broad identifier regex would accept hostnames, IPs, usernames, and paths as if they
+// were hashes.
+const TARGET_HASH_PATTERN = /^[0-9a-f]{16}$/;
 
-function isSafeTargetRepr(value) {
-  return typeof value === "string" && SAFE_TARGET_REPR_PATTERN.test(value);
+function isTargetHash(value) {
+  return typeof value === "string" && TARGET_HASH_PATTERN.test(value);
+}
+
+function hashReference(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 16);
 }
 
 // No entity-level identity exists for a peer-count spike (peer-baseline.js's
@@ -85,16 +88,20 @@ function extractTargetRepr(alert) {
   const ruleId = alert?.rule_id;
   const diagnostics = alert?.diagnostics && typeof alert.diagnostics === "object" && !Array.isArray(alert.diagnostics) ? alert.diagnostics : {};
   if (ruleId === PEER_COUNT_SPIKE_RULE_ID) return GLOBAL_TARGET_REPR;
-  if (ruleId === CANARY_TRIPPED_RULE_ID || ruleId === CANARY_TAMPERED_RULE_ID) {
-    // canary_id_hash is present on every canary.tripped record and on canary.tampered's
-    // canary_vanished reason; canary.tampered's two singleton reasons (manifest_unreadable /
-    // baseline_store_error, canary-baseline.js's buildCanaryTamperedCandidates) name no specific
-    // canary at all -- degrade to the global/system-wide target rather than fabricating a
-    // per-canary identity that was never actually observed for this record.
-    return isSafeTargetRepr(diagnostics.canary_id_hash) ? diagnostics.canary_id_hash : GLOBAL_TARGET_REPR;
+  if (ruleId === CANARY_TRIPPED_RULE_ID) {
+    return isTargetHash(diagnostics.canary_id_hash) ? diagnostics.canary_id_hash : undefined;
+  }
+  if (ruleId === CANARY_TAMPERED_RULE_ID) {
+    if (diagnostics.tamper_reason === "canary_vanished") {
+      return isTargetHash(diagnostics.canary_id_hash) ? diagnostics.canary_id_hash : undefined;
+    }
+    if (diagnostics.tamper_reason === "manifest_unreadable" || diagnostics.tamper_reason === "baseline_store_error") {
+      return GLOBAL_TARGET_REPR;
+    }
+    return undefined;
   }
   if (ruleId === PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID) {
-    return isSafeTargetRepr(diagnostics.entity_key_hash) ? diagnostics.entity_key_hash : undefined;
+    return isTargetHash(diagnostics.entity_key_hash) ? diagnostics.entity_key_hash : undefined;
   }
   return undefined;
 }
@@ -155,6 +162,7 @@ export function mapAlertToRecommendation(alertRecord) {
   if (!KNOWN_CONTAINMENT_VERBS.includes(entry.verb)) return undefined; // defensive; unreachable given RECOMMEND_MAP is hand-authored against the closed enum above
   const targetRepr = extractTargetRepr(alertRecord);
   if (targetRepr === undefined) return undefined; // garbled/unsafe diagnostics -- degrade, never fabricate a target
+  const tamperReason = ruleId === CANARY_TAMPERED_RULE_ID ? alertRecord.diagnostics?.tamper_reason : undefined;
   return {
     verb: entry.verb,
     rule_id: `containment.recommend.${entry.verb}`,
@@ -162,6 +170,7 @@ export function mapAlertToRecommendation(alertRecord) {
     rationale: entry.rationale,
     target_repr: targetRepr,
     label: CONTAINMENT_RECOMMEND_LABEL,
+    ...(tamperReason ? { tamper_reason: tamperReason } : {}),
   };
 }
 
@@ -173,7 +182,8 @@ export function mapAlertToRecommendation(alertRecord) {
 export function renderRecommendationText(rec) {
   if (!rec || typeof rec !== "object") return undefined;
   if (!KNOWN_CONTAINMENT_VERBS.includes(rec.verb)) return undefined;
-  const target = isSafeTargetRepr(rec.target_repr) ? rec.target_repr : GLOBAL_TARGET_REPR;
+  if (!isTargetHash(rec.target_repr) && rec.target_repr !== GLOBAL_TARGET_REPR) return undefined;
+  const target = rec.target_repr;
   const rationale = typeof rec.rationale === "string" && rec.rationale ? rec.rationale : "No further detail available.";
   return `${CONTAINMENT_RECOMMEND_LABEL} Consider: ${rec.verb} ${target}. ${rationale}`;
 }
@@ -195,7 +205,16 @@ export function renderStoredRecommendationText(diagnostics) {
   const triggerRuleId = diagnostics?.trigger_rule_id;
   const entry = typeof triggerRuleId === "string" ? RECOMMEND_MAP.get(triggerRuleId) : undefined;
   if (!entry || entry.verb !== diagnostics?.verb) return undefined;
-  return renderRecommendationText({ verb: entry.verb, rationale: entry.rationale, target_repr: diagnostics?.target_repr });
+  const target = diagnostics?.target_repr;
+  const targetValid = triggerRuleId === PEER_COUNT_SPIKE_RULE_ID
+    ? target === GLOBAL_TARGET_REPR
+    : triggerRuleId === CANARY_TAMPERED_RULE_ID
+      ? (diagnostics?.tamper_reason === "manifest_unreadable" || diagnostics?.tamper_reason === "baseline_store_error"
+        ? target === GLOBAL_TARGET_REPR
+        : diagnostics?.tamper_reason === "canary_vanished" && isTargetHash(target))
+      : isTargetHash(target);
+  if (!targetValid) return undefined;
+  return renderRecommendationText({ verb: entry.verb, rationale: entry.rationale, target_repr: target });
 }
 
 /**
@@ -287,19 +306,12 @@ export async function writeContainmentRecommendConfig(descartesPaths, config, op
 }
 
 // ---------------------------------------------------------------------------------------------
-// Slice 7.2.c -- daemon-tick candidate compute. Reads already-persisted alert history only
-// (readAlertRecords) -- NEVER the live pre-hash collector output, and never a sibling detector's
-// same-tick in-memory candidate array. Mirrors incident-correlation.js's own precedent exactly
-// ("Anchors are read from alert-HISTORY (readAlertRecords, ANY status), never from the current
-// tick's in-memory candidate array"): the triggering alert's status as of the end of the
-// PREVIOUS tick is what this tick's recommendation candidate is derived from, since
-// evaluateAndPersistAlerts (which would produce a fresher view) has not run yet when daemon.js's
-// extraCandidates array is assembled. This is a one-tick lag on a trigger's very first
-// activation, self-consistent on every tick thereafter -- an accepted, precedented
-// characteristic of this daemon's extraCandidates model, not a bug.
+// Slice 7.2.c -- daemon-tick candidate compute. The daemon supplies the result of the main alert
+// evaluation, so this phase never reads stale alert history and never acts on a previous-tick
+// record. Only alerts that are active AND notification-due in that current evaluation qualify.
 // ---------------------------------------------------------------------------------------------
 
-const RECOMMENDATION_TRIGGER_STATUSES = new Set(["active", "acknowledged"]);
+const RECOMMENDATION_TRIGGER_STATUS = "active";
 
 /**
  * Computes containment recommendation candidates for the current daemon tick, matching every
@@ -311,9 +323,9 @@ const RECOMMENDATION_TRIGGER_STATUSES = new Set(["active", "acknowledged"]);
  * tick (the load-bearing fail-closed transition; see the plan's Slice 7.2.c "Deterministic
  * behavior" note).
  *
- * `options.alerts` is a DI seam for tests (and, if a future refactor wires the same-tick
- * evaluation through, a real caller) -- production wiring reads readAlertRecords(descartesPaths)
- * directly, per the module header's precedent note above.
+ * `options.evaluation` is the current result from evaluateAndPersistAlerts. The `alerts` and
+ * `notification_due_ids` options remain a small pure DI seam for unit tests; neither path reads
+ * persisted alert history here.
  */
 export async function computeContainmentRecommendationCandidates(descartesPaths, options = {}) {
   const loadLearned = options.loadLearnedConfig ?? loadLearnedConfig;
@@ -324,37 +336,40 @@ export async function computeContainmentRecommendationCandidates(descartesPaths,
   const containmentConfig = await readContainmentConfig(descartesPaths);
   if (!containmentConfig.enabled) return [];
 
-  const readAlerts = options.readAlertRecords ?? readAlertRecords;
-  const alerts = options.alerts ?? (await readAlerts(descartesPaths));
+  const evaluation = options.evaluation ?? {
+    alerts: options.alerts,
+    notification_due_ids: options.notification_due_ids,
+  };
+  const dueIds = new Set(evaluation?.notification_due_ids ?? []);
+  const alerts = evaluation?.alerts ?? [];
 
   const candidates = [];
   for (const alert of alerts ?? []) {
-    if (!RECOMMENDATION_TRIGGER_STATUSES.has(alert?.status)) continue;
+    if (alert?.status !== RECOMMENDATION_TRIGGER_STATUS || !dueIds.has(alert?.id)) continue;
     const recommendation = mapAlertToRecommendation(alert);
     if (!recommendation) continue;
 
-    // Every field below is already a closed-enum/short-identifier/hash string by construction
-    // (recommendation.verb is a KNOWN_CONTAINMENT_VERBS member; trigger_rule_id/trigger_alert_id
-    // are rule_id/alertId()-shaped; target_repr passed extractTargetRepr's own safe-charset gate
-    // above) -- sanitizeDiagnostics is still run, defense-in-depth, matching every sibling
-    // candidate builder's discipline (never store an un-gated diagnostics object).
+    // All persisted identity-bearing fields are derived from fixed rule IDs and validated hashes;
+    // the triggering alert's arbitrary id/fingerprint never crosses this boundary verbatim.
+    const triggerRef = hashReference(alert.id ?? `${recommendation.trigger_rule_id}:${recommendation.target_repr}`);
+    const fingerprint = hashReference(`${recommendation.trigger_rule_id}:${recommendation.target_repr}`);
     const diagnostics = sanitizeDiagnostics({
       trigger_rule_id: recommendation.trigger_rule_id,
-      trigger_alert_id: alert.id,
+      trigger_alert_ref: triggerRef,
       verb: recommendation.verb,
       target_repr: recommendation.target_repr,
+      ...(recommendation.tamper_reason ? { tamper_reason: recommendation.tamper_reason } : {}),
     });
 
-    const fingerprint = alert.fingerprint ?? alert.id ?? "global";
     candidates.push({
       id: alertId(recommendation.rule_id, fingerprint),
       rule_id: recommendation.rule_id,
       fingerprint,
       severity: "warning",
       title: `Descartes containment recommendation: ${recommendation.verb}`,
-      summary: `RECOMMEND-ONLY: consider ${recommendation.verb} in response to ${recommendation.trigger_rule_id}. Descartes will not act on this.`,
+      summary: `RECOMMEND-ONLY: consider ${recommendation.verb}. Descartes will not act on this.`,
       diagnostics,
-      evidence_refs: ["containment-recommend", alert.id],
+      evidence_refs: ["containment-recommend", `trigger-ref:${triggerRef}`],
     });
   }
   return candidates;

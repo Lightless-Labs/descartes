@@ -564,7 +564,21 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
   });
-  const alerts = options.evaluateAlerts === false
+  const mainExtraCandidates = [
+          ...await computeActiveConstraintCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeProvenanceWarningCandidates(descartesPaths, options),
+          ...await computeProvenanceIdentityCandidates(descartesPaths, options),
+          ...await computeSessionBaselineCandidates(descartesPaths, options),
+          ...await computeCorrelationCandidates(descartesPaths, options),
+          ...await computePeerBaselineCandidates(descartesPaths, options),
+          ...await computeServiceBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeCanaryBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeProcessLineageBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeScheduledJobBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeServiceAppearanceCandidates(descartesPaths, { ...options, activeFreshnessMs }),
+          ...await computeCredentialAccessCandidates(descartesPaths, options),
+        ];
+  const mainAlerts = options.evaluateAlerts === false
     ? undefined
     : await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,
@@ -574,86 +588,34 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // evaluateAndPersistAlerts/applyAlertCandidates call, in the same commit as the
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
-        extraCandidates: [
-          ...await computeActiveConstraintCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeProvenanceWarningCandidates(descartesPaths, options),
-          // Slice S5, additive: identity-baseline deviation candidates (unknown_identity/
-          // identity_drift/new_public_bind) land in the same concatenation, same commit
-          // discipline as S4's own addition above (plan section 5 / S-live-1 grounding).
-          ...await computeProvenanceIdentityCandidates(descartesPaths, options),
-          // Slice 4 (observed-incident collectors plan), additive fourth extraCandidates entry:
-          // session-count deviation (session.count_drop) + churn (session.churn) candidates,
-          // derived purely from Slice 1's already-persisted session.presence fact-history — no
-          // new execFile/host I/O. Gated identically to its siblings by
-          // computeSessionBaselineCandidates' own loadLearnedConfig(...).enabled short-circuit.
-          ...await computeSessionBaselineCandidates(descartesPaths, options),
-          // Slice 6 (observed-incident collectors plan), additive fifth extraCandidates entry:
-          // the deterministic cross-stream login/kill-proximity join (correlation.
-          // login_kill_proximity), derived purely from Slice 3's/Slice 4's already-persisted
-          // peer.presence fact-history and session.count_drop/session.churn alert-history — no
-          // new execFile/host I/O. Gated identically to its siblings by
-          // computeCorrelationCandidates' own loadLearnedConfig(...).enabled short-circuit. The
-          // resulting candidate is 100% deterministic (Decision 4) -- it reaches the LLM only
-          // through the unmodified S13 gate, via the new default-off "correlation" namespace.
-          ...await computeCorrelationCandidates(descartesPaths, options),
-          // Slice 4b (observed-incident collectors plan), additive sixth extraCandidates entry:
-          // peer-count deviation (peer.count_spike), derived purely from Slice 3's already-
-          // persisted peer.presence fact-history — no new execFile/host I/O. Gated identically to
-          // its siblings by computePeerBaselineCandidates' own loadLearnedConfig(...).enabled
-          // short-circuit. peer.count_spike is unknown_namespace (Decision 3), so it can never
-          // reach the LLM adjudication path below regardless of enabled_namespaces.
-          ...await computePeerBaselineCandidates(descartesPaths, options),
-          // Service-disappearance ALERT (docs/plans/2026-07-23-service-disappearance-alert.md),
-          // additive seventh extraCandidates entry: a set-membership diff (service.disappeared)
-          // over Slice C's already-persisted service.presence/service.census fact-history — no new
-          // execFile/host I/O. Gated identically to its siblings by
-          // computeServiceBaselineCandidates' own loadLearnedConfig(...).enabled short-circuit.
-          // Threads the SAME activeFreshnessMs already resolved above (Slice B's freshness
-          // horizon), matching computeActiveConstraintCandidates' own call. service.disappeared is
-          // unknown_namespace (no classifyAlertNamespace branch), so it can never reach the LLM
-          // adjudication path below regardless of enabled_namespaces.
-          ...await computeServiceBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          // Slice 7.1: fs-only canary attribute trips over already-persisted canary facts. The
-          // collector itself is the only new host read; this detector is gated by learned.json,
-          // deterministic, critical, and unknown_namespace so it never reaches the LLM path.
-          // Tamper fix (canary v0 finalization): computeCanaryBaselineCandidates now catches and
-          // degrades every canary-baseline-store failure internally (never throws for one) rather
-          // than aborting this whole extraCandidates array -- and therefore the entire daemon
-          // tick, every alert family, not just canary.* -- the way an uncaught store error used to.
-          ...await computeCanaryBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeProcessLineageBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          // Persistence baseline, Slice B (docs/plans/2026-08-21-agent-intrusion-detection-
-          // gaps.md): scheduled_job.appeared — a set-membership novelty diff over Slice A's
-          // already-persisted scheduled_job.presence/scheduled_job.census fact-history. Absence/
-          // novelty claim -> completeness-gated (own persistent cold-start lockout, mirroring
-          // process-lineage-baseline.js). unknown_namespace (no classifyAlertNamespace branch), so
-          // it can never reach the LLM adjudication path below regardless of enabled_namespaces.
-          ...await computeScheduledJobBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          // Persistence baseline, Slice C: service.appeared — the appearance-direction twin of
-          // service.disappeared, over the SAME already-persisted service.presence/service.census
-          // fact-history. Also an absence/novelty claim -> completeness-gated (own separate
-          // appearance-baseline store + persistent cold-start lockout, so an appearance fold can
-          // never mutually skip a tick with the disappearance fold above).
-          ...await computeServiceAppearanceCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          // Credential-file-access signal, Slice D: credential.access — a per-path lstat
-          // mtime/ino diff over a FIXED set of real credential paths (own dedicated store, no
-          // fact-store I/O at all — P7). POSITIVE DIRECT EVIDENCE (a concrete two-snapshot
-          // mtime/ino change), NOT a novelty/absence claim -> deliberately NOT completeness-gated;
-          // fires on the first eligible (post-seed) observation, like the canary tripwire.
-          ...await computeCredentialAccessCandidates(descartesPaths, options),
-          // Slice 7.2.c (recommend-only containment surface plan): the daemon's tenth
-          // extraCandidates entry. Reads already-persisted alert-history (readAlertRecords),
-          // never the live pre-hash collector output and never a sibling entry's own in-memory
-          // candidates this same tick -- mirrors computeCorrelationCandidates' own precedent
-          // exactly (see containment-recommend.js's module header). Double-gated (BOTH
-          // learned.json AND its own containment-recommend.json opt-in, P4/P5) via its own
-          // short-circuit-to-[] BEFORE any I/O; mutates nothing, no new execFile/host I/O of any
-          // kind. Delivery reuses the deterministic non-LLM local-delivery branch below
-          // (emitSessionAlertSignals) via the widened allowlist composed in alert-intelligence.js
-          // -- no delivery logic lives here or in containment-recommend.js.
-          ...await computeContainmentRecommendationCandidates(descartesPaths, options),
-        ],
+        extraCandidates: mainExtraCandidates,
       });
+  let alerts = mainAlerts;
+  if (mainAlerts) {
+    // Containment is a second phase: it consumes only the main evaluation's current active alerts
+    // and notification-due IDs. Re-merge the first phase's candidates so shared recovery semantics
+    // do not recover sibling alert families during the containment persistence pass.
+    const containmentCandidates = await computeContainmentRecommendationCandidates(descartesPaths, {
+      ...options,
+      evaluation: mainAlerts,
+    });
+    const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
+      now: ts,
+      daemonStatus: status,
+      historySummary: mainAlerts.history_summary,
+      windowMs: options.alertWindowMs,
+      extraCandidates: [...mainAlerts.candidates, ...mainExtraCandidates, ...containmentCandidates],
+    });
+    alerts = {
+      ...containmentAlerts,
+      // The second persistence pass must not hide ordinary alerts that were due in the first
+      // phase; containment adds to the same delivery set rather than replacing it.
+      notification_due_ids: [...new Set([
+        ...(mainAlerts.notification_due_ids ?? []),
+        ...(containmentAlerts.notification_due_ids ?? []),
+      ])],
+    };
+  }
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
   // (Decision 2) and therefore structurally can NEVER reach adjudicateAlertNotifications' LLM path
   // below — left unmitigated, this milestone's first alerting slice would never actively notify the

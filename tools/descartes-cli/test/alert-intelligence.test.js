@@ -422,13 +422,15 @@ test("containment.recommend.* is in the deterministic non-LLM local-delivery all
   assert.equal(delivered[0].body.includes("abcdef0123456789"), true, "the hash-only target repr is fine to include");
 });
 
-test("containment.recommend.* delivery degrades to a label-first fallback body (never silently dropping the label) when the stored diagnostics are corrupt/foreign", async () => {
-  const current = containmentRecommendationAlert({ diagnostics: { trigger_rule_id: "some.foreign.rule_id", verb: "quarantine", target_repr: "global" } });
+test("containment.recommend.* delivery degrades to a constant label-only body when the stored diagnostics are corrupt/foreign", async () => {
+  const current = containmentRecommendationAlert({ diagnostics: { trigger_rule_id: "/Users/alice/.ssh/id_ed25519", verb: "quarantine", target_repr: "prod-db.example.com" } });
   const delivered = [];
   await emitSessionAlertSignals({}, { notification_due_ids: [current.id], alerts: [current] }, {
     deliverNotification: async (_paths, decision) => delivered.push(decision),
   });
-  assert.ok(delivered[0].body.startsWith("RECOMMEND-ONLY"));
+  assert.equal(delivered[0].body, "RECOMMEND-ONLY — Descartes will NOT act on this; act manually if you choose.");
+  assert.equal(delivered[0].body.includes("/Users/alice/.ssh/id_ed25519"), false);
+  assert.equal(delivered[0].body.includes("prod-db.example.com"), false);
 });
 
 test("adding containment.recommend.* to the deterministic-delivery allowlist alone (without the buildSessionAlertNotificationDecision branch) would have dropped the recommendation onto the generic fall-through body — pinning the ACTUAL branch exists by asserting the real title, not just the fall-through's", async () => {

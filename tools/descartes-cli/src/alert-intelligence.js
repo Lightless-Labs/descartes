@@ -630,14 +630,14 @@ function buildSessionAlertNotificationDecision(alert) {
   // recommendation into the generic fall-through below, dropping the recommended verb, the
   // target, the rationale, and — critically — the RECOMMEND-ONLY label the whole surface's
   // honesty depends on. `diagnostics` here is the RECOMMENDATION candidate's own stored
-  // diagnostics (verb/trigger_rule_id/trigger_alert_id/target_repr — computeContainmentRecommend
+  // diagnostics (verb/trigger_rule_id/trigger_alert_ref/target_repr — computeContainmentRecommend
   // ationCandidates in containment-recommend.js), not the triggering alert's diagnostics.
   // renderStoredRecommendationText re-derives the full rationale from the closed RECOMMEND_MAP
-  // keyed on trigger_rule_id; a corrupt/foreign diagnostics shape degrades to the label-first
-  // fallback immediately below rather than throwing or silently dropping the label.
+  // keyed on trigger_rule_id; a corrupt/foreign diagnostics shape degrades to a constant label-only
+  // fallback rather than interpolating any diagnostic value into a notification.
   if (containmentRecommendationRuleIds().includes(alert?.rule_id)) {
     const body = renderStoredRecommendationText(diagnostics)
-      ?? `${CONTAINMENT_RECOMMEND_LABEL} Consider reviewing rule_id=${diagnostics.trigger_rule_id ?? "unknown"}.`;
+      ?? CONTAINMENT_RECOMMEND_LABEL;
     return {
       notify: true,
       severity: "warning",

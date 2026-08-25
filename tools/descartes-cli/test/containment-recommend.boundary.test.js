@@ -197,7 +197,7 @@ test("standing boundary invariant: mapAlertToRecommendation never returns a reco
     "session.churn": { entity_key: "session.tmux.aaaaaaaaaaaaaaaa" },
     "peer.count_spike": { observed_count: 8, mean_before: 2 },
     "canary.tripped": { canary_id_hash: "abcdef0123456789" },
-    "canary.tampered": { canary_id_hash: "abcdef0123456789" },
+    "canary.tampered": { tamper_reason: "canary_vanished", canary_id_hash: "abcdef0123456789" },
     "process.lineage.novel_edge": { entity_key_hash: "abcdef0123456789" },
   };
   let sawAtLeastOneRecommendation = false;

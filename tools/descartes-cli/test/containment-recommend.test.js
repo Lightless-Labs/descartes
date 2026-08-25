@@ -63,6 +63,11 @@ test("mapAlertToRecommendation: garbled/absent trigger degrades to undefined, ne
   // unrecognized rule_id.
   assert.equal(mapAlertToRecommendation({ rule_id: PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, diagnostics: {} }), undefined);
   assert.equal(mapAlertToRecommendation({ rule_id: PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, diagnostics: { entity_key_hash: "not a safe repr!" } }), undefined);
+  assert.equal(mapAlertToRecommendation({ rule_id: CANARY_TRIPPED_RULE_ID, diagnostics: {} }), undefined);
+  assert.equal(mapAlertToRecommendation({ rule_id: CANARY_TRIPPED_RULE_ID, diagnostics: { canary_id_hash: "prod-db.example.com" } }), undefined);
+  assert.equal(mapAlertToRecommendation({ rule_id: CANARY_TAMPERED_RULE_ID, diagnostics: {} }), undefined);
+  assert.equal(mapAlertToRecommendation({ rule_id: CANARY_TAMPERED_RULE_ID, diagnostics: { tamper_reason: "unexpected" } }), undefined);
+  assert.equal(mapAlertToRecommendation({ rule_id: CANARY_TAMPERED_RULE_ID, diagnostics: { tamper_reason: "canary_vanished" } }), undefined);
 });
 
 // Deliberate, documented gate/no-gate decisions (see the module header in containment-recommend.js
@@ -129,15 +134,14 @@ test("renderRecommendationText: always contains the RECOMMEND-ONLY label, label-
   assert.ok(text.startsWith(CONTAINMENT_RECOMMEND_LABEL), "the label must be first so a 240-char body clamp downstream truncates the rationale tail, never the label");
 });
 
-test("renderRecommendationText: an unsafe/garbled target_repr degrades to the global marker, never passes a raw value through", () => {
+test("renderRecommendationText: an unsafe/garbled target_repr produces no text, never a fabricated global target", () => {
   const text = renderRecommendationText({ verb: "block", target_repr: "raw peer host name with spaces", rationale: "x" });
-  assert.ok(text.includes("global"));
-  assert.equal(text.includes("raw peer host name with spaces"), false);
+  assert.equal(text, undefined);
 });
 
 test("renderStoredRecommendationText: re-derives the exact rationale for the matching trigger_rule_id, and never cross-contaminates two triggers sharing a verb", () => {
   const trippedText = renderStoredRecommendationText({ verb: "quarantine", trigger_rule_id: CANARY_TRIPPED_RULE_ID, target_repr: "abcdef0123456789" });
-  const tamperedText = renderStoredRecommendationText({ verb: "quarantine", trigger_rule_id: CANARY_TAMPERED_RULE_ID, target_repr: "global" });
+  const tamperedText = renderStoredRecommendationText({ verb: "quarantine", trigger_rule_id: CANARY_TAMPERED_RULE_ID, tamper_reason: "manifest_unreadable", target_repr: "global" });
   assert.ok(trippedText.includes(CONTAINMENT_RECOMMEND_LABEL));
   assert.ok(tamperedText.includes(CONTAINMENT_RECOMMEND_LABEL));
   assert.notEqual(trippedText, tamperedText);
@@ -243,15 +247,20 @@ function activeCanaryTrippedAlert(fingerprint = "abcdef0123456789") {
 
 test("computeContainmentRecommendationCandidates: both gates ON + an active trigger ⇒ exactly one recommendation candidate", async () => {
   const paths = await tempPaths();
+  const trigger = { ...activeCanaryTrippedAlert(), id: "/Users/alice/.ssh/id_ed25519", fingerprint: "alice.example.com" };
   const candidates = await computeContainmentRecommendationCandidates(paths, {
     loadLearnedConfig: async () => ({ enabled: true }),
     readContainmentRecommendConfig: async () => ({ enabled: true }),
-    alerts: [activeCanaryTrippedAlert()],
+    alerts: [trigger],
+    notification_due_ids: [trigger.id],
   });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].rule_id, "containment.recommend.quarantine");
   assert.equal(candidates[0].diagnostics.trigger_rule_id, CANARY_TRIPPED_RULE_ID);
   assert.equal(candidates[0].diagnostics.target_repr, "abcdef0123456789");
+  assert.match(candidates[0].fingerprint, /^[0-9a-f]{16}$/);
+  assert.equal(JSON.stringify(candidates).includes("/Users/alice/.ssh/id_ed25519"), false);
+  assert.equal(JSON.stringify(candidates).includes("alice.example.com"), false);
   assert.equal(JSON.stringify(candidates).includes("redacted"), false);
 });
 
@@ -289,18 +298,21 @@ test("computeContainmentRecommendationCandidates: no trigger present ⇒ zero (n
   assert.deepEqual(candidates, []);
 });
 
-test("computeContainmentRecommendationCandidates: a recovered/acknowledged-away trigger produces no candidate; only an active/acknowledged trigger does", async () => {
+test("computeContainmentRecommendationCandidates: only a current active trigger whose notification is due qualifies; acknowledged and recovered triggers do not", async () => {
   const paths = await tempPaths();
   const recovered = { ...activeCanaryTrippedAlert(), status: "recovered" };
   const suppressed = { ...activeCanaryTrippedAlert("1111111111111111"), status: "suppressed" };
   const acknowledged = { ...activeCanaryTrippedAlert("2222222222222222"), status: "acknowledged" };
+  const active = activeCanaryTrippedAlert("3333333333333333");
   const candidates = await computeContainmentRecommendationCandidates(paths, {
     loadLearnedConfig: async () => ({ enabled: true }),
     readContainmentRecommendConfig: async () => ({ enabled: true }),
-    alerts: [recovered, suppressed, acknowledged],
+    alerts: [recovered, suppressed, acknowledged, active],
+    notification_due_ids: [acknowledged.id, active.id],
   });
   assert.equal(candidates.length, 1);
-  assert.equal(candidates[0].fingerprint, "2222222222222222");
+  assert.notEqual(candidates[0].fingerprint, active.fingerprint, "recommendation fingerprint is derived, never copied from the trigger");
+  assert.equal(candidates[0].diagnostics.trigger_alert_ref.length, 16);
 });
 
 test("computeContainmentRecommendationCandidates: two distinct triggers sharing the same verb (canary.tripped + canary.tampered both -> quarantine) produce two distinct candidate records, never a collision", async () => {
@@ -322,6 +334,7 @@ test("computeContainmentRecommendationCandidates: two distinct triggers sharing 
     loadLearnedConfig: async () => ({ enabled: true }),
     readContainmentRecommendConfig: async () => ({ enabled: true }),
     alerts: [tripped, tampered],
+    notification_due_ids: [tripped.id, tampered.id],
   });
   assert.equal(candidates.length, 2);
   assert.equal(candidates.every((c) => c.rule_id === "containment.recommend.quarantine"), true);
