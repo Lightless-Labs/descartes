@@ -56,6 +56,8 @@ export const CREDENTIAL_CATEGORY_VALUES = new Set([
   "netrc",
 ]);
 
+export const CREDENTIAL_WATCH_V1 = Object.freeze(["mtime", "ino"]);
+
 /**
  * `path_hash` = sha256(literalPath).slice(0,16) — the literal path can embed a username/home
  * detail; hash it for dedup/identity, carry only the closed-enum `category` for the operator, the
@@ -67,6 +69,12 @@ export function credentialPathHash(literalPath) {
 
 async function collectOneCredentialPath(entry, lstat) {
   const pathHash = credentialPathHash(entry.path);
+  const hasSafeCategory = CREDENTIAL_CATEGORY_VALUES.has(entry.category);
+  const hasSafeWatch = Array.isArray(entry.watch)
+    && entry.watch.length === CREDENTIAL_WATCH_V1.length
+    && entry.watch.every((watch, index) => watch === CREDENTIAL_WATCH_V1[index]);
+  if (!hasSafeCategory || !hasSafeWatch) return { path_hash: pathHash, status: "unreadable" };
+
   let stat;
   try {
     stat = await lstat(entry.path);
@@ -78,6 +86,14 @@ async function collectOneCredentialPath(entry, lstat) {
     // never "untouched".
     return { category: entry.category, path_hash: pathHash, watch: entry.watch, status: "unreadable" };
   }
+  const atime = stat.atime instanceof Date ? stat.atime.getTime() : Number(stat.atime);
+  const mtime = stat.mtime instanceof Date ? stat.mtime.getTime() : Number(stat.mtime);
+  const ino = Number(stat.ino);
+  const size = Number(stat.size);
+  if (![atime, mtime, ino, size].every(Number.isFinite)) {
+    return { category: entry.category, path_hash: pathHash, watch: entry.watch, status: "unreadable" };
+  }
+
   // Credential-access-baseline.js's dedicated per-path store schema wants finite NUMBERS (epoch
   // ms for atime/mtime, the raw inode number) — unlike canary's fact-store-backed persistence
   // (which coerces every attribute to a string regardless), this collector's own store has no
@@ -89,9 +105,10 @@ async function collectOneCredentialPath(entry, lstat) {
     path_hash: pathHash,
     watch: entry.watch,
     status: "ok",
-    atime: stat.atime instanceof Date ? stat.atime.getTime() : Number(stat.atime),
-    mtime: stat.mtime instanceof Date ? stat.mtime.getTime() : Number(stat.mtime),
-    ino: Number(stat.ino),
+    atime,
+    mtime,
+    ino,
+    size,
   };
 }
 

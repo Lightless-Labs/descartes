@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { writeLearnedConfig } from "../src/constraint-store.js";
+import { computeStatDiffTripReason } from "../src/stat-diff.js";
 import { resolveDefaultCredentialPaths } from "../src/tools/credential-access.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
@@ -37,7 +38,7 @@ const PATH_HASH_A = "0123456789abcdef";
 const PATH_HASH_B = "fedcba9876543210";
 
 function okEntry({ pathHash = PATH_HASH_A, category = "ssh_private_key", watch = ["mtime", "ino"], atime = 1000, mtime = 2000, ino = 42 } = {}) {
-  return { category, path_hash: pathHash, watch, status: "ok", atime, mtime, ino };
+  return { category, path_hash: pathHash, watch, status: "ok", atime, mtime, ino, size: 7 };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -144,8 +145,7 @@ test("[O7] atime is disabled for every v1 entry: an atime advance alone (mtime/i
   const v1Shaped = detectCredentialAccess(previous, [okEntry({ atime: 9999, mtime: 2000, ino: 42, watch: ["mtime", "ino"] })]);
   assert.deepEqual(v1Shaped.findings, [], "a v1-shaped watch list (mtime/ino only) never trips on atime alone");
 
-  const injectedAtimeWatch = detectCredentialAccess(previous, [okEntry({ atime: 9999, mtime: 2000, ino: 42, watch: ["atime"] })]);
-  assert.deepEqual(injectedAtimeWatch.findings, [{ category: "ssh_private_key", path_hash: PATH_HASH_A, trip_reason: "atime_advanced" }], "the atime branch is implemented (for a future opt-in) and reachable only via an injected fixture, never a real v1 entry");
+  assert.equal(computeStatDiffTripReason({ atime: 1000 }, { atime: 9999 }, ["atime"]), "atime_advanced", "the shared atime branch remains available for canary/future opt-in callers");
 });
 
 test("status:'absent'/'unreadable' entries are skipped entirely -- no comparison, no baseline update (the last-known-good baseline is left untouched)", () => {
@@ -157,6 +157,32 @@ test("status:'absent'/'unreadable' entries are skipped entirely -- no comparison
   assert.deepEqual(findings, []);
   assert.deepEqual(nextEntries[PATH_HASH_A], { atime: 1000, mtime: 2000, ino: 42 }, "untouched, not reset");
   assert.equal(nextEntries[PATH_HASH_B], undefined, "never seeded from an unreadable observation");
+});
+
+test("invalid current entries are skipped without firing or corrupting the retained baseline, while valid entries in a warning snapshot still fire", () => {
+  const previous = {
+    [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 },
+    [PATH_HASH_B]: { atime: 1000, mtime: 3000, ino: 43 },
+  };
+  const result = detectCredentialAccess(previous, [
+    { ...okEntry({ pathHash: PATH_HASH_A, mtime: Number.NaN }), category: "prod-db.example.com" },
+    okEntry({ pathHash: PATH_HASH_B, mtime: 4000, ino: 43 }),
+  ]);
+  assert.deepEqual(result.findings, [{ category: "ssh_private_key", path_hash: PATH_HASH_B, trip_reason: "mtime_changed" }]);
+  assert.deepEqual(result.nextEntries[PATH_HASH_A], previous[PATH_HASH_A]);
+  assert.deepEqual(result.nextEntries[PATH_HASH_B], { atime: 1000, mtime: 4000, ino: 43 });
+});
+
+test("garbled current path hash/category/watch/stat entries neither fire nor enter the baseline store", () => {
+  const previous = { [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 } };
+  const result = detectCredentialAccess(previous, [
+    { ...okEntry({ pathHash: "not-a-hash", mtime: 9000 }) },
+    { ...okEntry({ pathHash: PATH_HASH_A, mtime: 9000 }), category: "ssh.private_key" },
+    { ...okEntry({ pathHash: PATH_HASH_B, mtime: 9000 }), watch: ["mtime"] },
+    { ...okEntry({ pathHash: PATH_HASH_B, mtime: 9000 }), size: Number.NaN },
+  ]);
+  assert.deepEqual(result.findings, []);
+  assert.deepEqual(result.nextEntries, previous);
 });
 
 test("buildCredentialAccessCandidates: severity is ALWAYS 'warning', fingerprint/id are hashed, diagnostics carry only category/trip_reason/path_hash -- never a literal path", () => {
@@ -193,7 +219,7 @@ test("computeCredentialAccessCandidates: cold-start (no prior store) seeds silen
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const result = await computeCredentialAccessCandidates(paths, {
-    collectCredentialAccessEvidence: async () => ({ result: { entries: [okEntry()] } }),
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry()] } }),
   });
   assert.deepEqual(result, []);
   const loaded = await loadCredentialAccessBaselineStore(paths);
@@ -206,7 +232,7 @@ test("computeCredentialAccessCandidates: a real mtime change on the SECOND obser
   await writeCredentialAccessBaselineStore(paths, { entries: { [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 } } });
 
   const result = await computeCredentialAccessCandidates(paths, {
-    collectCredentialAccessEvidence: async () => ({ result: { entries: [okEntry({ mtime: 5000 })] } }),
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 5000 })] } }),
   });
   assert.equal(result.length, 1);
   assert.equal(result[0].rule_id, CREDENTIAL_ACCESS_RULE_ID);
@@ -214,7 +240,7 @@ test("computeCredentialAccessCandidates: a real mtime change on the SECOND obser
 
   // The store advanced unconditionally -- a second identical tick does not re-fire.
   const second = await computeCredentialAccessCandidates(paths, {
-    collectCredentialAccessEvidence: async () => ({ result: { entries: [okEntry({ mtime: 5000 })] } }),
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 5000 })] } }),
   });
   assert.deepEqual(second, []);
 });
@@ -228,7 +254,7 @@ test("computeCredentialAccessCandidates: NOT completeness-gated -- fires immedia
 
   // Tick 1: corrupt store forces a whole-store re-seed -- silent, no trip (nothing to diff yet).
   const first = await computeCredentialAccessCandidates(paths, {
-    collectCredentialAccessEvidence: async () => ({ result: { entries: [okEntry({ mtime: 2000 })] } }),
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 2000 })] } }),
   });
   assert.deepEqual(first, []);
 
@@ -236,7 +262,7 @@ test("computeCredentialAccessCandidates: NOT completeness-gated -- fires immedia
   // re-accumulation window required, because this is positive two-snapshot evidence, not an
   // absence/novelty claim over fact-history.
   const second = await computeCredentialAccessCandidates(paths, {
-    collectCredentialAccessEvidence: async () => ({ result: { entries: [okEntry({ mtime: 9000 })] } }),
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
   });
   assert.equal(second.length, 1);
   assert.equal(second[0].diagnostics.trip_reason, "mtime_changed");

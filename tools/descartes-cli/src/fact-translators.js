@@ -174,13 +174,72 @@ function cronJobIdentityDigest(job) {
   return crypto.createHash("sha256").update(preimage).digest("hex").slice(0, 16);
 }
 
-// systemd_timer (unit) / launchd_scheduled_job (label) / periodic_directory_entry (path, already
-// unique per entry — one distinct script file per job) all carry real, structurally-distinct
-// per-entry identity already — kept as their own name leg unchanged, sanitized-not-hashed, the
-// same convention factPointsFromServiceEvidence already uses for service names/labels.
+export const SCHEDULED_JOB_KIND_VALUES = new Set([
+  "cron",
+  "systemd_timer",
+  "launchd_scheduled_job",
+  "periodic_directory_entry",
+]);
+
+export const SCHEDULED_JOB_SOURCE_VALUES = new Set([
+  "cron",
+  "user_crontab",
+  "system_crontab",
+  "cron_d",
+  "periodic_directory",
+  "systemd_timers",
+  "systemd_user_timers",
+  "launchd_plist",
+]);
+
+const SCHEDULED_JOB_KIND_SOURCE_PAIRS = new Set([
+  "cron\u0000cron",
+  "cron\u0000user_crontab",
+  "cron\u0000system_crontab",
+  "cron\u0000cron_d",
+  "systemd_timer\u0000systemd_timers",
+  "systemd_timer\u0000systemd_user_timers",
+  "launchd_scheduled_job\u0000launchd_plist",
+  "periodic_directory_entry\u0000periodic_directory",
+]);
+
+const SCHEDULED_JOB_IDENTITY_HASH_DOMAIN = "descartes.schedjob.identity.v1";
+
+function isValidScheduledJobKindSource(kind, source) {
+  return typeof kind === "string" && typeof source === "string"
+    && SCHEDULED_JOB_KIND_VALUES.has(kind)
+    && SCHEDULED_JOB_SOURCE_VALUES.has(source)
+    && SCHEDULED_JOB_KIND_SOURCE_PAIRS.has(`${kind}\u0000${source}`);
+}
+
+function hashScheduledJobIdentityLeg(kind, source, identity) {
+  return crypto.createHash("sha256")
+    .update(`${SCHEDULED_JOB_IDENTITY_HASH_DOMAIN}\u0000${kind}\u0000${source}\u0000${identity}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+// systemd_timer (unit) / launchd_scheduled_job (label) / periodic_directory_entry (path) all
+// carry real, structurally-distinct per-entry identity. They are still operator/attacker-
+// controlled identifiers, so hash them at source just like cron identity. Only the closed kind
+// and source enums remain visible in the persisted fact.
 function scheduledJobIdentityLeg(job) {
-  if (job?.kind === "cron") return cronJobIdentityDigest(job);
-  return sanitizeIdentityString(job?.unit ?? job?.label ?? job?.path) ?? "unknown";
+  const { kind, source } = job ?? {};
+  if (!isValidScheduledJobKindSource(kind, source)) return undefined;
+  if (kind === "cron") {
+    if (![job.path, job.schedule, job.user, job.command].every((value) => typeof value === "string" && value.length > 0)) {
+      return undefined;
+    }
+    return cronJobIdentityDigest(job);
+  }
+
+  const identity = kind === "systemd_timer"
+    ? job.unit
+    : kind === "launchd_scheduled_job"
+      ? job.label
+      : job.path;
+  if (typeof identity !== "string" || identity.length === 0) return undefined;
+  return hashScheduledJobIdentityLeg(kind, source, identity);
 }
 
 // Length-prefixed composite framing (NOT delimiter-joined — inherits Gap 1/process-lineage's
@@ -214,19 +273,13 @@ export function buildScheduledJobEntityKey(kind, source, identityLeg) {
 // returned_count, because the drop happened upstream of both counts).
 function scheduledJobCensusStateFor(result) {
   const summary = result?.summary;
-  let unavailableClean;
-  if (summary === undefined || summary === null) {
-    // Legacy/simplified evidence shape with no summary object at all (mirrors
-    // factPointsFromSessionEvidence's censusStateFor precedent: "an absent multiplexers array
-    // carries no evidence of degradation either way") — degrades to no-degradation rather than
-    // fail-closed, since the REAL collector (tools/scheduled-jobs.js) always populates `summary`
-    // via summarizeScheduledJobs. A PRESENT-but-malformed summary (below) stays fail-closed.
-    unavailableClean = true;
-  } else {
-    const unavailableCount = Number(summary.unavailable_count);
-    unavailableClean = Number.isFinite(unavailableCount) && unavailableCount === 0;
-  }
-  const isPartial = result?.truncated === true || !unavailableClean;
+  const unavailableClean = summary !== null
+    && typeof summary === "object"
+    && !Array.isArray(summary)
+    && typeof summary.unavailable_count === "number"
+    && Number.isFinite(summary.unavailable_count)
+    && summary.unavailable_count === 0;
+  const isPartial = !Array.isArray(result?.jobs) || result?.truncated === true || !unavailableClean;
   return isPartial ? "partial" : "complete";
 }
 
@@ -253,29 +306,37 @@ function buildScheduledJobCensusMarkerFactPoint(result, envelope, ts) {
 export function factPointsFromScheduledJobsEvidence(evidence, { ts } = {}) {
   const envelope = (evidence ?? []).find((e) => e.id === "scheduled-jobs" && e.status !== "unable");
   if (!envelope) return [];
-  const jobs = envelope.result?.jobs ?? [];
+  const jobs = Array.isArray(envelope.result?.jobs) ? envelope.result.jobs : [];
+  let invalidJob = !Array.isArray(envelope.result?.jobs);
 
   const points = jobs.map((job) => {
-    const entityKey = buildScheduledJobEntityKey(job?.kind, job?.source, scheduledJobIdentityLeg(job));
+    const identityLeg = scheduledJobIdentityLeg(job);
+    if (!identityLeg) {
+      invalidJob = true;
+      return undefined;
+    }
+    const entityKey = buildScheduledJobEntityKey(job.kind, job.source, identityLeg);
     return {
       ts,
       fact_name: SCHEDULED_JOB_PRESENCE_FACT_NAME,
       entity_key: entityKey,
       attributes: {
-        kind: typeof job?.kind === "string" && job.kind ? job.kind : "unknown",
-        source: typeof job?.source === "string" && job.source ? job.source : "unknown",
+        kind: job.kind,
+        source: job.source,
       },
       source_envelope_id: envelope.id,
       source_tool: envelope.trace?.tool,
       sensitivity: "operational",
     };
-  });
+  }).filter(Boolean);
 
   // Emitted only on a genuine enumeration ("ok"/"warning") — never on "unknown" (unsupported
   // platform, no real census ran) or "unable" (already excluded by the find() filter above).
   // Includes a genuine zero-job tick, mirroring factPointsFromServiceEvidence's own precedent.
   if (envelope.status === "ok" || envelope.status === "warning") {
-    points.push(buildScheduledJobCensusMarkerFactPoint(envelope.result, envelope, ts));
+    const marker = buildScheduledJobCensusMarkerFactPoint(envelope.result, envelope, ts);
+    if (invalidJob) marker.attributes.census_state = "partial";
+    points.push(marker);
   }
   return points;
 }

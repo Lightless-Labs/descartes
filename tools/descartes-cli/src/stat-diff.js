@@ -27,10 +27,20 @@ export function statSnapshotAttributes(stat) {
 }
 
 function atimeValue(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string" || value.length === 0) return undefined;
   const numeric = Number(value);
   if (Number.isFinite(numeric)) return numeric;
   const parsed = new Date(value).getTime();
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isFiniteStatValue(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "string" || value.length === 0) return false;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return true;
+  return Number.isFinite(new Date(value).getTime());
 }
 
 /**
@@ -53,8 +63,8 @@ export function computeStatDiffTripReason(previousSnapshot, latestSnapshot, watc
       }
     } else if (
       watch === "mtime" &&
-      latestSnapshot?.mtime !== undefined &&
-      previousSnapshot?.mtime !== undefined &&
+      isFiniteStatValue(latestSnapshot?.mtime) &&
+      isFiniteStatValue(previousSnapshot?.mtime) &&
       latestSnapshot.mtime !== previousSnapshot.mtime
     ) {
       return "mtime_changed";
@@ -66,8 +76,8 @@ export function computeStatDiffTripReason(previousSnapshot, latestSnapshot, watc
       // rename), distinct from mtime_changed's in-place rewrite. Same fail-closed missing-value
       // discipline as the three reasons above.
       watch === "ino" &&
-      latestSnapshot?.ino !== undefined &&
-      previousSnapshot?.ino !== undefined &&
+      isFiniteStatValue(latestSnapshot?.ino) &&
+      isFiniteStatValue(previousSnapshot?.ino) &&
       latestSnapshot.ino !== previousSnapshot.ino
     ) {
       return "ino_changed";

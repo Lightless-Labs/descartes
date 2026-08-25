@@ -70,7 +70,18 @@ test("a present, readable path returns numeric atime/mtime/ino plus the closed-e
   assert.equal(typeof entry.mtime, "number");
   assert.equal(typeof entry.ino, "number");
   assert.equal(entry.ino, 12345);
+  assert.equal(entry.size, 400);
   assert.deepEqual(entry.watch, ["mtime", "ino"]);
+});
+
+test("a non-finite lstat stat degrades to unreadable and never emits NaN evidence", async () => {
+  const evidence = await collectCredentialAccessEvidence({
+    paths: [{ category: "ssh_private_key", path: "/home/op/.ssh/id_ed25519", watch: ["mtime", "ino"] }],
+    lstat: async () => ({ atime: new Date(1), mtime: Number.NaN, ino: 3, size: 4 }),
+  });
+  assert.equal(evidence.status, "warning");
+  assert.equal(evidence.result.entries[0].status, "unreadable");
+  assert.equal("mtime" in evidence.result.entries[0], false);
 });
 
 test("path never leaks: no literal path/username substring survives into any evidence field, only category + path_hash", async () => {

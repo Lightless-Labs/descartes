@@ -420,7 +420,7 @@ function structuralCollectorFakes(calls = []) {
     },
     "scheduled-jobs": async () => {
       calls.push("scheduled-jobs");
-      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] });
+      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [], summary: { unavailable_count: 0 }, truncated: false });
     },
   };
 }
@@ -442,7 +442,7 @@ function structuralCollectorFakesWithFacts(calls = []) {
     },
     "scheduled-jobs": async () => {
       calls.push("scheduled-jobs");
-      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] });
+      return envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [], summary: { unavailable_count: 0 }, truncated: false });
     },
   };
 }
@@ -3141,8 +3141,9 @@ test("Credential-file-access wiring: computeCredentialAccessCandidates reaches t
     ts: hour(0),
     now: hour(0),
     collectCredentialAccessEvidence: async () => ({
+      status: "ok",
       result: {
-        entries: [{ category: "ssh_private_key", path_hash: "0123456789abcdef", watch: ["mtime", "ino"], status: "ok", atime: 1000, mtime: 9999, ino: 42 }],
+        entries: [{ category: "ssh_private_key", path_hash: "0123456789abcdef", watch: ["mtime", "ino"], status: "ok", atime: 1000, mtime: 9999, ino: 42, size: 7 }],
       },
     }),
   });
@@ -3174,7 +3175,7 @@ test("Credential-file-access: byte-identical real alerts when the learned kill s
     now: hour(0),
     collectCredentialAccessEvidence: async () => {
       collectCalled = true;
-      return { result: { entries: [{ category: "ssh_private_key", path_hash: "0123456789abcdef", watch: ["mtime", "ino"], status: "ok", atime: 1000, mtime: 9999, ino: 42 }] } };
+      return { status: "ok", result: { entries: [{ category: "ssh_private_key", path_hash: "0123456789abcdef", watch: ["mtime", "ino"], status: "ok", atime: 1000, mtime: 9999, ino: 42, size: 7 }] } };
     },
   });
 

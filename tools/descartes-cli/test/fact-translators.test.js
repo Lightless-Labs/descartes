@@ -191,11 +191,27 @@ test("[REVIEW must-fix, P2 probe-truncation trap] census_state is 'partial' when
   assert.equal(points.find((p) => p.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "partial");
 });
 
-test("census marker defaults to 'complete' when result.summary is absent (legacy/simplified evidence shape), matching the real collector's own zero-unavailable/non-truncated tick", () => {
+test("census marker is partial when result.summary is absent, never fail-open to a complete empty census", () => {
   const points = factPointsFromScheduledJobsEvidence([
     scheduledJobsEnvelope({ jobs: [] }),
   ], { ts: TS });
-  assert.equal(points[0].attributes.census_state, "complete");
+  assert.equal(points[0].attributes.census_state, "partial");
+});
+
+test("a malformed scheduled-job entry downgrades the census and never persists an unknown presence", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({
+      jobs: [
+        { kind: "periodic_directory_entry", source: "periodic_directory", path: "/etc/cron.daily/prod-db-alice" },
+        { kind: "not-a-real-kind", source: "periodic_directory", path: "/etc/cron.daily/other" },
+      ],
+      summary: { unavailable_count: 0 },
+      truncated: false,
+    }, "warning"),
+  ], { ts: TS });
+  const presence = points.filter((point) => point.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME);
+  assert.equal(presence.length, 1);
+  assert.equal(points.find((point) => point.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "partial");
 });
 
 test("factPointsFromScheduledJobsEvidence emits NO census marker on an 'unknown' (unsupported-platform) envelope", () => {
@@ -260,6 +276,33 @@ test("hash-at-source: a cron command shaped like an IP/hostname/username does no
   assert.equal(JSON.stringify(points).includes("corp-laptop"), false);
   const presence = points.find((p) => p.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME);
   assert.match(presence.entity_key, /^scheduled_job\./);
+});
+
+test("hash-at-source: non-cron scheduled-job identity never persists a periodic path or username", () => {
+  const rawPath = "/etc/cron.daily/prod-db-alice";
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({
+      jobs: [{ kind: "periodic_directory_entry", source: "periodic_directory", path: rawPath }],
+      summary: { unavailable_count: 0 },
+      truncated: false,
+    }),
+  ], { ts: TS });
+  const presence = points.find((point) => point.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME);
+  assert.equal(JSON.stringify(points).includes(rawPath), false);
+  assert.equal(JSON.stringify(points).includes("prod-db-alice"), false);
+  assert.match(presence.entity_key, /^scheduled_job\.\d+:periodic_directory_entry\.\d+:periodic_directory\.\d+:[0-9a-f]{16}$/);
+});
+
+test("unknown scheduled-job kind/source values downgrade the census and never persist as open enums", () => {
+  const points = factPointsFromScheduledJobsEvidence([
+    scheduledJobsEnvelope({
+      jobs: [{ kind: "cron", source: "scheduler.attacker", path: "/etc/cron.d/a", schedule: "* * * * *", user: "root", command: "echo hi" }],
+      summary: { unavailable_count: 0 },
+      truncated: false,
+    }, "warning"),
+  ], { ts: TS });
+  assert.equal(points.filter((point) => point.fact_name === SCHEDULED_JOB_PRESENCE_FACT_NAME).length, 0);
+  assert.equal(points.find((point) => point.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME).attributes.census_state, "partial");
 });
 
 // --- factPointsFromServiceEvidence ---

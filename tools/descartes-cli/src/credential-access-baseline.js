@@ -23,7 +23,7 @@ import { alertId } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { computeStatDiffTripReason } from "./stat-diff.js";
-import { collectCredentialAccessEvidence } from "./tools/credential-access.js";
+import { CREDENTIAL_CATEGORY_VALUES, CREDENTIAL_WATCH_V1, collectCredentialAccessEvidence } from "./tools/credential-access.js";
 
 export const CREDENTIAL_ACCESS_RULE_ID = "credential.access";
 
@@ -52,9 +52,38 @@ async function readJsonFile(file) {
 }
 
 const PATH_HASH_PATTERN = /^[0-9a-f]{16}$/;
+const CREDENTIAL_ENVELOPE_STATUSES = new Set(["ok", "warning"]);
+const CREDENTIAL_ENTRY_STATUSES = new Set(["ok", "absent", "unreadable"]);
 
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isExactCredentialWatch(value) {
+  return Array.isArray(value)
+    && value.length === CREDENTIAL_WATCH_V1.length
+    && value.every((watch, index) => watch === CREDENTIAL_WATCH_V1[index]);
+}
+
+function isValidCredentialSnapshotEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  if (!CREDENTIAL_ENTRY_STATUSES.has(entry.status)) return false;
+  if (!PATH_HASH_PATTERN.test(entry.path_hash ?? "")) return false;
+  if (!CREDENTIAL_CATEGORY_VALUES.has(entry.category)) return false;
+  if (!isExactCredentialWatch(entry.watch)) return false;
+  if (entry.status !== "ok") return true;
+  return [entry.atime, entry.mtime, entry.ino, entry.size].every(isFiniteNumber);
+}
+
+function isValidCredentialSnapshotEnvelope(envelope) {
+  return Boolean(envelope)
+    && typeof envelope === "object"
+    && !Array.isArray(envelope)
+    && CREDENTIAL_ENVELOPE_STATUSES.has(envelope.status)
+    && envelope.result
+    && typeof envelope.result === "object"
+    && !Array.isArray(envelope.result)
+    && Array.isArray(envelope.result.entries);
 }
 
 function isValidCredentialEntryValue(value) {
@@ -136,9 +165,9 @@ export function detectCredentialAccess(previousEntries = {}, latestSnapshot = []
   const nextEntries = { ...safePrevious };
   const findings = [];
   for (const entry of latestSnapshot ?? []) {
-    if (!entry || entry.status !== "ok") continue;
+    if (!isValidCredentialSnapshotEntry(entry)) continue;
+    if (entry.status !== "ok") continue;
     const pathHash = entry.path_hash;
-    if (typeof pathHash !== "string" || !pathHash) continue;
     const latest = { atime: entry.atime, mtime: entry.mtime, ino: entry.ino };
     const previous = safePrevious[pathHash];
     if (previous) {
@@ -202,7 +231,7 @@ export async function computeCredentialAccessCandidates(descartesPaths, options 
 
   const collectEvidence = options.collectCredentialAccessEvidence ?? collectCredentialAccessEvidence;
   const envelope = await collectEvidence(options.collectorOptions ?? {});
-  const latestSnapshot = Array.isArray(envelope?.result?.entries) ? envelope.result.entries : [];
+  const latestSnapshot = isValidCredentialSnapshotEnvelope(envelope) ? envelope.result.entries : [];
 
   const loadStore = options.loadCredentialAccessBaselineStore ?? loadCredentialAccessBaselineStore;
   const { entries: previousEntries } = await loadStore(descartesPaths);
