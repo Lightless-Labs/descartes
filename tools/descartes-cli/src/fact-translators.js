@@ -521,7 +521,17 @@ export function factPointsFromCanaryEvidence(evidence, { ts } = {}) {
 export function factPointsFromNetworkEvidence(evidence, { ts } = {}) {
   const envelope = evidence.find((e) => e.id === "network-basics" && e.status !== "unable");
   if (!envelope) return [];
-  const sockets = envelope.result?.listening_sockets ?? [];
+  // tools/network.js collectNetworkEvidence() sets result.listening_sockets to the
+  // collectListeningSockets() OBJECT { status, sockets:[...], truncated, ... } — the socket
+  // array is nested at .sockets. Reading it as an array directly crashed the daemon tick on
+  // real macOS (sockets.map is not a function). Accept the real object shape OR a bare array
+  // (legacy/fixture); degrade to [] on anything else (never fabricate).
+  const rawListeningSockets = envelope.result?.listening_sockets;
+  const sockets = Array.isArray(rawListeningSockets?.sockets)
+    ? rawListeningSockets.sockets
+    : Array.isArray(rawListeningSockets)
+      ? rawListeningSockets
+      : [];
 
   return sockets
     .map((socket) => {

@@ -520,6 +520,28 @@ test("factPointsFromNetworkEvidence: macOS-style resolvable owner produces owner
   assert.equal("confidence" in points[0], false);
 });
 
+test("factPointsFromNetworkEvidence: reads the REAL collectNetworkEvidence shape — listening_sockets is the {status, sockets:[...], truncated} OBJECT, not a bare array (regression: crashed the real-macOS daemon tick with 'sockets.map is not a function')", () => {
+  // tools/network.js's collectNetworkEvidence() sets result.listening_sockets to the
+  // collectListeningSockets() OBJECT; the socket array is nested at .sockets. The bare-array
+  // fixture the other tests here use is a shape the real collector NEVER produces — this pins the
+  // real contract so the fabrication-free tick can't regress on a real host.
+  const evidence = [envelope("network-basics", "collect_network", {
+    listening_sockets: {
+      status: "ok",
+      sockets: [
+        { protocol: "tcp", state: "LISTEN", command: "postgres", pid: 456, local_address: "127.0.0.1", local_port: 5432 },
+      ],
+      truncated: false,
+    },
+  })];
+  const points = factPointsFromNetworkEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 1);
+  assert.equal(points[0].fact_name, "network.listening_port.owner");
+  assert.equal(points[0].entity_key, "tcp:127.0.0.1:5432");
+  assert.equal(points[0].attributes.owner, "postgres");
+  assert.equal(points[0].attributes.owner_known, "true");
+});
+
 test("factPointsFromNetworkEvidence: Linux-style unresolvable owner degrades to owner_known:false/confidence:0, never fabricates an owner", () => {
   const evidence = [envelope("network-basics", "collect_network", {
     listening_sockets: [
