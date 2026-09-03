@@ -2,7 +2,11 @@
 
 **Created:** 2026-09-03
 **Status:** In progress — **spike** (time-boxed decision aid; "skip it / pivot" is a valid outcome).
-**Progress:** 2026-09-03 — **§8 steps 1–2 landed** (`80031d4`): `src/model-ir.js` — the thin v2 IR + pure DAG interpreter (feature ops `fact`/`latest`/`window`/`zscore`, model op `threshold`), missing-input→silence, dual-read routing, and the **two byte-identical regression locks** (`threshold` reuses `evaluateExpected`; `zscore`/`window` reuse the welford primitives — identical *by construction*). Pure/offline, additive (no existing file touched), 24 new tests, suite 1621/1587-pass/0-fail. Two IR-shape questions surfaced for §6 (below). Next: §8 step 3 (the one CUSUM kernel + windowed feature, pure).
+**Progress:** 2026-09-03 — **§8 steps 1–2 landed** (`80031d4`): `src/model-ir.js` — the thin v2 IR + pure DAG interpreter (feature ops `fact`/`latest`/`window`/`zscore`, model op `threshold`), missing-input→silence, dual-read routing, and the **two byte-identical regression locks** (`threshold` reuses `evaluateExpected`; `zscore`/`window` reuse the welford primitives — identical *by construction*). Pure/offline, additive (no existing file touched), 24 new tests, suite 1621/1587-pass/0-fail. Two IR-shape questions surfaced for §6 (below). **§8 step 3 (CUSUM kernel) landed** (`f1d8d28`): a new `cusum` feature op (two-sided tabular; `target: number|"mean"`, reusing `foldWelford`), golden-locked against an independent reference + injected-changepoint-fires/stable-quiet + full silence coverage; additive, suite 1633/1599-pass.
+
+**Decision for step 4 (from step 3, flag #1):** author bounded-statistic detectors (CUSUM etc.) as `threshold {comparator:"lt"|"lte", value:h}` invariants — *"the statistic should stay below h"* — so a crossing is a **violation → `fired:true`**, consistent with v1's alarm=violation semantics (`evaluateModelNode` sets `fired:!satisfied`; a naive `gte h` framing would invert `fired`). The step-3 kernel itself is correct and neutral here — it only asserts `satisfied`, never `fired`, so nothing is baked in wrong.
+
+Minor step-3 flags routed to the §6 go/no-go: `k` accepts negatives (hyperparameter admissibility is the authoring seam's job); `Number([])→0` loose-coercion silently accepts `target:[]` (the file's pre-existing convention); `rate` transform deliberately not built (only needed if the chosen metric is a monotone counter, not a level). **Next: §8 step 4** (the seeded-oracle promote/demote ladder — the **first VM-dependent step**, gated on the tart CI infra).
 **Origin:** Slice 1 of `docs/plans/2026-09-03-proactive-behavioral-modeling.md` (reworked spike-first by the 2026-09-03 five-lens gate). Governed by `docs/design/autonomy-doctrine.md`.
 **Owner:** unassigned
 **Todo:** tracked under [`todos/2026-07-09-self-learning-stratified-monitoring.md`](../../todos/2026-07-09-self-learning-stratified-monitoring.md).
@@ -85,7 +89,7 @@ The spike is not "done" until it writes these down (they are what the horizontal
 1. Thin v2 IR + DAG interpreter + the two byte-identical regression locks (pure, offline).
 2. Missing-input → silence semantics + dual-read v1/v2 (pure).
 3. The one CUSUM kernel + windowed feature (pure, backtested against recorded history).
-4. Minimal `shadow → notify-only` ladder + seeded oracle + auto-demote loop (VM).
+4. Minimal `shadow → notify-only` ladder + seeded oracle + auto-demote loop (VM). *(Author the demo CUSUM model as a `lt/lte h` invariant so `fired` = a changepoint crossing — see the Progress note's step-4 decision; the ladder keys on `fired`.)*
 5. The authoring seam (one LLM-proposed DAG; ref/arity admissibility; sanitized prompt; closed diagnostics) (VM).
 6. The three red-team fixtures (VM).
 7. Write the §6 go/no-go.
