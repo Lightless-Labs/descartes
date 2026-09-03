@@ -445,6 +445,8 @@ Descartes uses the XDG Base Directory conventions. It must not use a Pi-owned pa
   each plan.
 - `docs/reference/` — collector and command reference docs (`collectors.md`,
   `incident-freeze.md`).
+- `docs/design/` — durable design doctrine. These are living design principles, not
+  point-in-time plans (for example, the autonomy doctrine).
 - `docs/research/`, `docs/reviews/`, `docs/solutions/`, `docs/use-cases/` — research notes,
   real-host validation reports, durable learnings, and example scenarios.
 - `docs/ROADMAP.md` — the longer-term capability roadmap and non-negotiables.
