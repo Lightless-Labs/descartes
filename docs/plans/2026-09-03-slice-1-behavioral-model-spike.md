@@ -1,7 +1,8 @@
 # Slice 1 — Behavioral-Model Spike (thin vertical slice → written go/no-go)
 
 **Created:** 2026-09-03
-**Status:** Proposed — **spike** (time-boxed decision aid; "skip it / pivot" is a valid outcome).
+**Status:** In progress — **spike** (time-boxed decision aid; "skip it / pivot" is a valid outcome).
+**Progress:** 2026-09-03 — **§8 steps 1–2 landed** (`80031d4`): `src/model-ir.js` — the thin v2 IR + pure DAG interpreter (feature ops `fact`/`latest`/`window`/`zscore`, model op `threshold`), missing-input→silence, dual-read routing, and the **two byte-identical regression locks** (`threshold` reuses `evaluateExpected`; `zscore`/`window` reuse the welford primitives — identical *by construction*). Pure/offline, additive (no existing file touched), 24 new tests, suite 1621/1587-pass/0-fail. Two IR-shape questions surfaced for §6 (below). Next: §8 step 3 (the one CUSUM kernel + windowed feature, pure).
 **Origin:** Slice 1 of `docs/plans/2026-09-03-proactive-behavioral-modeling.md` (reworked spike-first by the 2026-09-03 five-lens gate). Governed by `docs/design/autonomy-doctrine.md`.
 **Owner:** unassigned
 **Todo:** tracked under [`todos/2026-07-09-self-learning-stratified-monitoring.md`](../../todos/2026-07-09-self-learning-stratified-monitoring.md).
@@ -65,7 +66,7 @@ TDD throughout; offline/pure tests before any daemon wiring.
 
 The spike is not "done" until it writes these down (they are what the horizontal build-out needs):
 
-1. **IR shape** — did the thin windowed/series contract generalize cleanly, or did it fight the flat evaluator? What does v2 actually need to be?
+1. **IR shape** — did the thin windowed/series contract generalize cleanly, or did it fight the flat evaluator? What does v2 actually need to be? *Surfaced by step 1:* (a) does `zscore` score the latest point **inclusive** of the window (step-1 default; byte-identical to a direct welford fold) or **exclusive** (peer-baseline's self-dampening convention)? (b) on a non-finite point, silence the **whole window** (step-1 default; conservative never-fabricate) or **drop just that point**?
 2. **Kernel vocabulary** — which families are actually pulled by real authored models (vs the aspirational "dozen")?
 3. **Node-vs-Rust boundary** — measured recompute×model cost and memory floor: does the durable core need to move to Rust before build-out, or not yet?
 4. **Stateless-recompute vs incremental-state** — the measured cost vs the state-poisoning surface each opens.
