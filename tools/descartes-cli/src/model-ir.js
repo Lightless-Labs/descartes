@@ -29,16 +29,16 @@
 //
 // -- Missing-input -> silence (plan §2.1 / §5, hard requirement) --------------------------------
 // Every FeatureNode below returns `{ supported: false }` -- never a fabricated value -- when its
-// input is missing, empty, too short, or (for window/zscore, the genuinely new windowed-series
-// surface) contains a non-finite value anywhere inside the selected window. That last rule is
+// input is missing, empty, too short, or (for window/zscore/cusum, the series ops) contains a
+// non-finite value anywhere inside the selected window. That last rule is
 // deliberately conservative: ONE degraded point silences the whole window rather than being
 // quietly dropped, because folding partial/degraded data into a stat is itself a form of
 // fabrication. This is a stricter contract than v1's evaluateExpected (which downgrades a
 // non-finite *scalar* fact to `satisfied:false`, not silence) -- but "latest" + "threshold"
 // (Lock A) never applies this stricter rule; it passes the resolved scalar straight to
 // evaluateExpected unchanged, which is what keeps Lock A byte-identical to v1 over ANY input,
-// finite or not. The stricter degrade-to-silence rule applies only to window/zscore, the new
-// series surface the plan calls out explicitly (§2.1: "a windowed feature with too few / degraded
+// finite or not. The stricter degrade-to-silence rule applies only to window/zscore/cusum, the
+// series ops the plan calls out explicitly (§2.1: "a windowed feature with too few / degraded
 // points emits nothing, never a fabricated value").
 
 import { evaluateExpected } from "./constraint-eval.js";
@@ -51,6 +51,11 @@ export const MODEL_SCHEMA_VERSION = 2;
 // 0 by construction -- not "wrong", but not meaningfully a z-score either). Overridable per-node
 // via `node.minSamples`; kept as a named default rather than a magic number.
 export const DEFAULT_MIN_ZSCORE_SAMPLES = 2;
+
+// cusum's minimum sample count before it will emit a value at all (mirrors DEFAULT_MIN_ZSCORE_
+// SAMPLES's reasoning -- a single point cannot show a changepoint). Overridable per-node via
+// `node.minSamples`.
+export const DEFAULT_MIN_CUSUM_SAMPLES = 2;
 
 /**
  * Validates a v2 model-record ENVELOPE (kind, schema_version, id, family, feature/model node
@@ -188,6 +193,58 @@ export function evaluateFeatureNode(node, factSeriesInput, opts = {}) {
       const value = computeZScore(Number(latest.value), stats.mean, stats.stddev, stddevFloor);
 
       return { supported: true, kind: "scalar", value };
+    }
+
+    case "cusum": {
+      // Slice-1 spike step 3 (plan §8 item 3): two-sided tabular CUSUM over a series, typically
+      // `window(...)`'s already ts-filtered/sorted output -- but sorted defensively here too,
+      // matching window/zscore's own defensive re-sort. `target` is the reference level (a finite
+      // number, or the literal string "mean" -- the series' own Welford mean, reusing the SAME
+      // shared primitive zscore uses, not a re-derived copy). `k` is the CUSUM allowance/slack.
+      // Emits the scalar `value = max over the whole series of max(S_hi, S_lo)` (the peak
+      // accumulation) -- a `threshold` model node then fires when this crosses the decision
+      // interval h. Missing-input -> silence, same discipline as window/zscore: a non-series `of`,
+      // an empty/sub-minSamples series, any non-finite point, a non-finite `k`, a `target` that is
+      // neither a finite number nor "mean", or a "mean" that isn't finite (e.g. computed over
+      // non-finite input, though hasNonFiniteValue already excludes that case) all silence the
+      // whole node -- never a fabricated statistic.
+      const of = evaluateFeatureNode(node.of, factSeriesInput, opts);
+      if (!of.supported || of.kind !== "series") return { supported: false }; // cannot cusum a scalar
+
+      const k = Number(node.k);
+      if (!Number.isFinite(k)) return { supported: false };
+
+      const minSamples = Number.isFinite(Number(node.minSamples)) ? Number(node.minSamples) : DEFAULT_MIN_CUSUM_SAMPLES;
+
+      const sorted = sortedValidPoints(of.points);
+      if (sorted.length < minSamples) return { supported: false }; // sub-threshold sample count
+      if (hasNonFiniteValue(sorted)) return { supported: false }; // degraded input -> silence, never fabricate
+
+      let target;
+      if (node.target === "mean") {
+        const stats = sorted.reduce((acc, p) => foldWelford(acc, Number(p.value)), emptyWelfordStats());
+        if (!Number.isFinite(stats.mean)) return { supported: false };
+        target = stats.mean;
+      } else {
+        target = Number(node.target);
+        if (!Number.isFinite(target)) return { supported: false };
+      }
+
+      // Classic two-sided tabular CUSUM: S_hi/S_lo start at 0 and are clipped at 0 every step, so
+      // both are always >= 0 by construction -- maxStat starting at 0 and tracking the running
+      // max of both statistics IS "the max over the whole series of max(S_hi, S_lo)".
+      let sHi = 0;
+      let sLo = 0;
+      let maxStat = 0;
+      for (const p of sorted) {
+        const x = Number(p.value);
+        sHi = Math.max(0, sHi + (x - target - k));
+        sLo = Math.max(0, sLo + (target - k - x));
+        if (sHi > maxStat) maxStat = sHi;
+        if (sLo > maxStat) maxStat = sLo;
+      }
+
+      return { supported: true, kind: "scalar", value: maxStat };
     }
 
     default:
