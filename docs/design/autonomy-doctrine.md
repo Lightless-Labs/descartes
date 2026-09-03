@@ -58,6 +58,14 @@ be tested against them in one sentence.
   to act comes from *multiple independent signals agreeing* (the immune system's two-signal
   rule), every action is *notified* and *reversible*, and everything is *audited*. The human
   can always see, veto, and roll back.
+- **The single-host caveat (the load-bearing one):** on one machine, every "independent"
+  signal — and the completeness proof itself — shares a single failure mode (host compromise)
+  and is forgeable at the daemon's own privilege. One host agreeing with itself is **not**
+  corroboration. So corroboration that grounds *authority* (anything above raising an alert)
+  must be **cross-host / off-host** — a federated or hardware root of trust — exactly as
+  antivirus/EDR concede the on-host war against root and move the authority to a signed,
+  off-host backend. On-host, the ceiling is additive alerting; everything above it waits on
+  attestation.
 
 ## The unifying principle
 
@@ -99,13 +107,26 @@ shift) *and* the underlying history is proven complete (the fact-store completen
 substrate). "Adapt to the new normal" is the primary attack surface, and it is governed as
 strictly as acting on the host.
 
+**Adaptation is authoring.** When the agent adapts a model to a benign change, it does *not*
+mutate an active model in place — it proposes a *new model version* that enters the shadow
+tier and must re-earn promotion on evidence. But "re-earn from shadow" measures fit to recent
+history, and recent history is what a slow poisoner controls; so authoring-as-adaptation must
+additionally be bounded by a per-lineage cumulative-drift budget anchored to an *attested*
+baseline, or a chain of individually-plausible successors walks the baseline onto the
+attacker. Adaptation is authoring, and authoring above additive alerting is attestation-gated.
+
 ## Invariants this doctrine preserves
 
 - **Never fabricate** a security or health signal; degrade to silence under uncertainty.
 - **Completeness-gated** — never reason, and never *adapt*, over history not proven complete.
 - **Declarative-only in the hot path** — the agent authors model *specifications*, never
   executable code, in the evaluation loop. A future sandboxed, fuel-bounded expression hatch
-  is the only exception, and it is itself statically bounded.
+  is the only exception, and it is **runtime-bounded (fuel + memory), not statically
+  analyzable** — do not conflate the two.
+- **Attestation-gated authority** — on-host, the ceiling is additive alerting; recommend,
+  sticky adaptation, and acting hard-depend on an off-host / hardware root of trust.
+  Ground truth for promotion is *fed* (operator labels, seeded fixtures, signed feeds),
+  never minted on the endpoint.
 - **Recommend-only until earned** — the capability to act is a ceiling that lifts by
   evidence, never a toggle.
 - **Fully audited and reversible** — every promotion, adaptation, and action leaves a trail
