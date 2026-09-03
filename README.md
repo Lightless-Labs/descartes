@@ -21,11 +21,47 @@ signatures, and deliberative agent layers for escalation — all sitting on top 
 structured evidence rather than model guesswork. See `AGENTS.md` for the full project
 identity, architecture, and conventions this repo follows.
 
+## Index
+
+- [Capabilities at a glance](#capabilities-at-a-glance)
+- [Status](#status)
+- [Quick start](#quick-start)
+- [Architecture](#architecture)
+- [Operational lifecycle](#operational-lifecycle)
+- [What `triage` does today](#what-triage-does-today)
+- [Local history daemon and deterministic alerts](#local-history-daemon-and-deterministic-alerts)
+- [Self-learning and defensive detection](#self-learning-and-defensive-detection-opt-in-default-off) — [detectors](#defensive-detectors) · [current limits](#current-limits)
+- [Login and model selection](#login-and-model-selection)
+- [JSON output](#json-output)
+- [Safety and privacy invariants](#safety-and-privacy-invariants)
+- [Supported platforms](#supported-platforms)
+- [Descartes-owned paths](#descartes-owned-paths)
+- [Repository layout](#repository-layout)
+- [Building and testing](#building-and-testing)
+- [Further reading](#further-reading)
+
+## Capabilities at a glance
+
+| Capability | What it does | Status |
+|---|---|---|
+| **Triage** | Model-led, evidence-cited diagnosis of a host question, grounded only in read-only collector envelopes (`actions_taken: []`). | Live |
+| **Local history + deterministic alerts** | Bounded local metric history and no-LLM alerts on memory / load / disk pressure and daemon staleness. | Live |
+| **Self-learning monitoring** | Mines candidate constraints and provenance/identity baselines from the host's own history; promotion to live monitoring is human-gated. | Opt-in (default off) |
+| **Defensive detection** | Completeness-gated novelty detectors, deception canaries, and agent-intrusion signals — see [detectors](#defensive-detectors). | Opt-in (default off) |
+| **Containment recommendations** | Surfaces "consider containing X" recommendations via local notification — suggests only, mutates nothing. | Opt-in (default off) |
+| **Evidence freeze** | Operator-invoked, read-only forensic evidence bundle (`descartes incident freeze`). | Live |
+| **Remediation / host actions** | No general mutating action tool exists yet; the only mutating surfaces are Descartes' own daemon lifecycle and alert-state files. | Not yet |
+
+Everything under "defensive detection" and "self-learning" is **off by default** and is
+designed to **degrade to silence, never to a false alarm** — see [current limits](#current-limits).
+
 ## Status
 
 This is v0: a read-only triage CLI, a local-first deterministic alerting daemon, and an
 opt-in (default-off) self-learning subsystem that mines constraints and provenance
-baselines from a machine's own history. The durable core is expected to move toward Rust
+baselines from a machine's own history and runs a layer of completeness-gated defensive
+detectors — novelty baselines, deception canaries, and agent-intrusion signals — that
+degrade to silence rather than fabricate an alert. The durable core is expected to move toward Rust
 over time; the current external slice is a Node.js CLI so it can ship quickly with the
 embedded agent harness and subscription login flow. See `docs/ROADMAP.md` for the broader
 capability roadmap and `docs/HANDOFF.md` for exactly what is implemented right now.
@@ -194,27 +230,91 @@ descartes alerts intelligence enable --max-per-hour 3
 descartes alerts notifications setup --channel desktop
 ```
 
-## Self-learning subsystem (opt-in, default off)
+## Self-learning and defensive detection (opt-in, default off)
 
 Behind a single `learned.json` kill switch (default disabled), Descartes can observe its
 own accumulated fact history, mine candidate constraints and provenance/identity
-baselines, shadow-soak them against real traffic, and only promote a candidate to live
+baselines, run a layer of defensive detectors, and only promote a mined candidate to live
 monitoring after an explicit, single-use, audited human approval:
 
 ```bash
-descartes learned mine       # deterministic candidate mining from accumulated facts
-descartes learned soak       # shadow-soak evaluation, never alerts on its own
-descartes learned review     # list promotions awaiting human approval
+descartes learned enable                # turn the subsystem on (default off)
+descartes learned mine                  # deterministic candidate mining from accumulated facts
+descartes learned soak                  # shadow-soak evaluation, never alerts on its own
+descartes learned review                # list promotions awaiting human approval
 descartes learned approve <constraint-id> --nonce <nonce>
-descartes learned status
-descartes provenance snapshot          # process/identity baseline snapshot
+descartes learned status                # subsystem state, including fact-store completeness
+descartes provenance snapshot           # process/identity baseline snapshot
 descartes provenance baseline show
+descartes containment recommend status  # recommend-only containment surface (separate default-off opt-in)
 ```
 
-Learned artifacts move through one lifecycle — `draft → shadow → review-ready → active →
+Mined artifacts move through one lifecycle — `draft → shadow → review-ready → active →
 retired` — and, once active, feed the same deterministic alert pipeline as the fixed
-rules; no promotion happens without a human decision. Design and current build status live
-in `docs/plans/2026-07-09-self-learning-stratified-monitoring.md` and `docs/HANDOFF.md`.
+rules; no promotion happens without a human decision.
+
+### Defensive detectors
+
+These run inside the daemon tick (deterministic, no LLM unless noted), read only the
+host's own collected facts, and hash identity-bearing values at the source. Every
+**novelty** detector is **completeness-gated**: when the fact history it reads is degraded,
+incomplete, or tampered, it emits **nothing** (cold-start) rather than a false "first-ever"
+alert. **Positive-evidence** detectors (credential access, canary trips) fire on a direct
+observation and are deliberately *not* gated, so a real event is never discarded.
+
+| Detector | Detects | Basis |
+|---|---|---|
+| Session baseline | Mass session drop / churn (`session.count_drop`, `session.churn`). | tmux/screen session census |
+| Peer baseline | VPN/tailnet peer-login bursts and drops (`peer.count_spike`, `peer.count_drop`). | WireGuard / Tailscale / VPN peer census |
+| Service baseline | A known service disappearing, or a new one appearing (`service.disappeared`, `service.appeared`). | launchd / systemd census |
+| Scheduled-job baseline | A new cron / scheduled job — a common persistence foothold (`scheduled_job.appeared`). | cron / systemd-timer / launchd census |
+| Process lineage | A never-before-seen exec-chain edge — anomalous child-spawn (`process.lineage_edge`). | process parent/child census |
+| Credential access | A watched credential file being read or rewritten (`credential.access`) — *positive evidence*, not gated. | two-snapshot `lstat` (mtime/inode), `lstat`-only, never reads contents |
+| Deception canaries | A honey-token file touched, or the canary manifest/store tampered (`canary.tripped`, `canary.tampered`). | filesystem tripwire |
+| Incident correlation | A mass session-drop correlated with an odd-hour, unattributed peer login. | cross-stream join (optional, separately-gated LLM adjudication) |
+| Provenance / identity | A process or listening socket whose provenance or identity signature drifts from its established baseline. | process ancestry + hashed identity signatures |
+
+The **fact-store completeness** substrate underneath these is what makes the "never
+fabricate" guarantee hold: a durable, tamper-aware integrity ledger records whether the
+fact history a detector reads is actually complete, so a detector can tell "I have never
+seen this" apart from "I can no longer trust my history" — and stays silent in the latter
+case. `intact` is reachable only by positive proof, and `descartes learned status` surfaces
+the current completeness state.
+
+The **recommend-only containment surface** turns an active high-signal trigger into a
+*recommendation* ("consider throttling / blocking / quarantining X"), delivered through the
+same local-notification path and always labeled `RECOMMEND-ONLY`. It is structurally
+incapable of acting — no execution primitive, no capability token, no host mutation — and
+its opt-in refuses to enable unless `descartes learned enable` is already on.
+
+### Current limits
+
+Honest boundaries of the defensive layer as it ships today:
+
+- **Off by default.** None of this protects the host until you `descartes learned enable`
+  it and let the daemon run — and, for delivery, opt into notifications.
+- **Cold-start and establishment.** A detector stays silent until it has enough clean
+  history to establish a baseline; a fresh install (or a detector recovering from a real
+  fact-history loss) deliberately reports nothing rather than risk a false alarm. Recovery
+  after a real loss is bounded by the fact-retention window — conservative by design.
+- **Host-edge scope.** Descartes watches the local host. Cloud- or cluster-plane intrusions
+  that live above the host are out of scope by construction.
+- **Polling, not real-time.** Detection runs on the daemon's structural cadence; a fast
+  action entirely between two ticks can be missed. A real-time event-source path has been
+  evaluated and deferred.
+- **On-host tamper is bounded, not defeated.** The completeness ledger raises the bar
+  against accidental and non-root, out-of-band loss or tampering, but an adversary with root
+  who rewrites both the facts and the ledger coherently defeats the on-host cross-check.
+  Off-host attestation and a fleet dead-man's-switch are future (design-only) work, and a
+  canary detects tampering but cannot defend itself against local root.
+- **Recommend-only.** Containment proposes; it never acts. There is no general
+  remediation/action tool yet.
+- **Single-instance assumption.** Running two daemon instances against the same state
+  directory can race the fact store (a documented, deferred hardening item).
+
+Design and current build status live in
+`docs/plans/2026-07-09-self-learning-stratified-monitoring.md`,
+`docs/plans/2026-08-21-fact-store-completeness-hardening.md`, and `docs/HANDOFF.md`.
 
 ## Login and model selection
 
@@ -334,3 +434,15 @@ reproducible tests, and a clean crate graph.
   to live state and the next action.
 - `docs/plans/` — per-slice implementation plans.
 - `docs/ROADMAP.md` — the broader capability roadmap.
+
+### Lineage (fiction)
+
+Two novels sit behind the project's sensibility:
+
+- *The Second Angel*, Philip Kerr — the source of the name. Descartes is the computer
+  running the literal Blood Bank on the Moon: a machine entrusted with keeping critical
+  infrastructure alive. That is the whole posture, made humble — observe first, act only
+  when allowed.
+- *Absolution Gap*, Alastair Reynolds — for the layered approach. Survival there is a matter
+  of stratified, defense-in-depth reflexes and escalation rather than one all-seeing
+  intelligence, which is exactly how Descartes' L0–L3 layering is meant to work.
