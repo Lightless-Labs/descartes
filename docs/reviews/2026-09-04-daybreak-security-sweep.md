@@ -6,6 +6,23 @@
 
 > Fix-specs are ready-to-implement. Drive fixes area-by-area with a daybreak re-gate on each; land under review.
 
+---
+
+## RESOLUTION (2026-09-04 — all areas hardened + committed locally; 8 commits, unpushed pending keychain unlock)
+
+| Area | Outcome | Commit | daybreak re-gate |
+|---|---|---|---|
+| daemon isolation (orchestrator seam) | per-detector isolation — one throwing detector no longer blinds the tick | `4d350f7` | n/a (structural) |
+| fact-store | all plain-JSON never-fabricate findings CLOSED (3 rounds); **#3 clock-rollback DEFERRED → operator** | `5faf51f` | ✅ re-gated (3 rounds) |
+| positive-evidence — credential | BLOCKER #1 store-I/O + HIGH #3 lstat-bound CLOSED | `74cc39c` | ✅ (part of positive-evidence rounds) |
+| positive-evidence — canary | collision + oversized + `schema_invalid` trip-suppression CLOSED (rounds 2–4); **clean-delete DEFERRED → operator** | `7452de7` | ✅ re-gated (3 rounds) |
+| action-and-llm-surface | #3 fail-closed budget + #6 observable delivery-failure + #7 tick-survival CLOSED; #1/#2 deferred (write-ahead/lock) | `121071e` | ⚠️ committed on Opus review + TDD (not separately re-gated) |
+| learned-promotion-tuning | F5/F6/F4/F8/F2 defense-in-depth CLOSED; **F1/F3/F7 DEFERRED → trusted-state** | `884f69f` | ⚠️ committed on Opus review + TDD (not separately re-gated) |
+| statistical-novelty | F5 (3 rounds + K=1) / F4 / F1 / F7 fabrication CLOSED; F3/F6 closed-for-fabrication (observability deferred); F2/F8 deferred | `ab2cca9` | ✅ re-gated (F5 caught twice + final) |
+
+**The four "deferred" security items are ONE threat-model boundary, not four decisions.** fact-store #3 (clock-rollback → intact), canary clean-delete (manifest removal suppresses a real trip), and learned-promotion-tuning F1/F3/F7 (file-authored `active`, non-atomic authority writes, unbounded store parse) ALL share the single precondition **"an attacker who can write Descartes's trusted same-user state files."** Descartes explicitly declares that outside its threat model (promotion-store.js:30-31; SEED_CONSTRAINTS are hand-authored `active` records). The answer to all four is the same one slice: **state-file attestation / off-host signing** (per MEMORY "off-host attestation" future work). fact-store #3 and canary clean-delete ALSO reverse deliberate, test-pinned behavior, so they additionally need an operator design sign-off before any code change (not autonomous). Treat these as a single "trusted-same-user-state" package for the owner decision.
+
+**Deferred OBSERVABILITY residuals (statistical, NOT fabrication):** F3 silent census-contradiction suppression + F6 silent unsupported-signature (`v2:`) mute — the fail-closed suppression is correct; they should emit a positive integrity signal. F6 also carries a **forward-compat footgun**: a future Descartes `availability_signature` `v2:` schema bump will SILENTLY dark `peer.count_spike` until the pattern is updated. See each area's "Deferred / architectural" section below.
 
 ---
 
