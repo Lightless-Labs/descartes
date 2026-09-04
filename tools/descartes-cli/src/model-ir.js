@@ -35,11 +35,17 @@
 // quietly dropped, because folding partial/degraded data into a stat is itself a form of
 // fabrication. This is a stricter contract than v1's evaluateExpected (which downgrades a
 // non-finite *scalar* fact to `satisfied:false`, not silence) -- but "latest" + "threshold"
-// (Lock A) never applies this stricter rule; it passes the resolved scalar straight to
-// evaluateExpected unchanged, which is what keeps Lock A byte-identical to v1 over ANY input,
-// finite or not. The stricter degrade-to-silence rule applies only to window/zscore/cusum, the
-// series ops the plan calls out explicitly (§2.1: "a windowed feature with too few / degraded
-// points emits nothing, never a fabricated value").
+// (Lock A) never applies this stricter rule WHEN THE FACT ITSELF IS A BARE SCALAR (not a series):
+// it passes that resolved scalar straight to evaluateExpected unchanged, which is what keeps Lock
+// A byte-identical to v1 over ANY bare-scalar input, finite or not. This passthrough is narrower
+// than it may look, though: when the fact is a SERIES and "latest" extracts a single point's value
+// out of it, a stricter admissibility gate DOES apply (fix-spec R8-latest, round 2) -- only a
+// finite number or a non-empty string may pass, because an arbitrary/adversarial series point
+// (unlike an author-supplied bare scalar) has no such guarantee and would otherwise smuggle a
+// fabricated verdict past threshold the same way an unguarded window/zscore point would. The
+// stricter degrade-to-silence rule otherwise applies to window/zscore/cusum, the series ops the
+// plan calls out explicitly (§2.1: "a windowed feature with too few / degraded points emits
+// nothing, never a fabricated value").
 
 import { evaluateExpected } from "./constraint-eval.js";
 import { computeZScore, emptyWelfordStats, foldWelford } from "./welford-stats.js";
@@ -68,8 +74,14 @@ export function validateModel(record) {
     throw new Error("Model record must be an object");
   }
 
-  const id = String(record.id ?? "").trim();
-  if (!id) throw new Error("Model record requires a non-empty id");
+  // R9 (round-2 fix-spec): id must be a literal string, not merely coercible to a non-empty one --
+  // a numeric id (e.g. 7) used to pass this gate via String(7)="7", which let promotion/demotion
+  // disagree on identity (one side comparing the number, the other a coerced string) and let a
+  // numeric id promote at all. `String(record.id ?? "").trim()` is deliberately NOT used here
+  // anymore for the type check (only for consistency of the trim/non-empty check below).
+  if (typeof record.id !== "string" || record.id.trim().length === 0) {
+    throw new Error("Model record requires a non-empty id");
+  }
 
   if (record.kind !== MODEL_KIND) {
     throw new Error(`Model record kind must be "model", got: ${JSON.stringify(record.kind)}`);
@@ -102,19 +114,127 @@ function toEpochMs(ts) {
   return NaN;
 }
 
+// M-rows (fix-spec R10-cheap, minimal survivable count cap -- NOT the full runtime budget
+// analyzer, which is explicitly deferred): a factSeriesInput series is caller/fact-store supplied
+// and could be adversarially (or just accidentally) huge. Checked BEFORE the filter/sort below, so
+// an oversized series never pays the cost of sorting itself -- it degrades to an empty array,
+// which every existing `sorted.length === 0` -> silence check downstream (latest/window/zscore/
+// cusum) already handles correctly, so no separate cap is needed at each call site.
+export const MAX_SERIES_POINTS = 10000;
+
+// C2 (round-3 fix-spec): snapshots an array-like `points` argument into a REAL plain array from a
+// SINGLE `.length` read, captured into the local `len` and never re-read afterward. The array
+// itself is then filled by INDEXED gets (`points[i]` for `i` in `[0, len)`) rather than any method
+// that re-invokes `.length` internally (`Array.from`, a spread, `.filter`/`.slice`/`.map` called
+// directly on the original array-like all read `.length` at least once on their own, separately
+// from any check a caller already made). A Proxy-backed `points` argument whose `length` getter
+// answers DIFFERENTLY across separate reads -- e.g. a value at/under MAX_SERIES_POINTS on a first
+// check, then a larger REAL value once something else re-reads it -- would otherwise bypass the cap
+// below entirely: the cap check would see the small answer while a later, separate length-consuming
+// read processed the large one. Capturing `.length` exactly once and indexing up to that ONE value
+// closes that regardless of how many more times the getter might have answered differently.
+function toPlainPointsArray(points) {
+  if (!Array.isArray(points)) return null;
+  const len = points.length; // the ONE read -- reused for both the cap check and every index below
+  if (!Number.isInteger(len) || len < 0 || len > MAX_SERIES_POINTS) return null;
+  const arr = new Array(len);
+  for (let i = 0; i < len; i++) arr[i] = points[i];
+  return arr;
+}
+
+// R7-dupts (round 3, type-aware -- see compareTiedPointValues below): equal-ts points must sort
+// identically regardless of the INPUT array's order. `typeof` is ranked first, in a FIXED order
+// independent of which type happens to appear first in the input array, so two points whose values
+// are of DIFFERENT types can never collide onto the same comparison key -- see
+// compareTiedPointValues's own doc comment for why this matters (`Number(false) === Number(0)`).
+// Only within the SAME type does the comparison fall through to a same-type ordering, then finally
+// to a String() fallback for anything still tied. Only a genuine full tie (same ts AND the same
+// String(value), where the choice cannot change the outcome) falls through to the stable fallback.
+const POINT_VALUE_TYPE_ORDER = ["number", "string", "boolean", "object", "undefined", "function", "symbol", "bigint"];
+
+function pointValueTypeRank(value) {
+  const idx = POINT_VALUE_TYPE_ORDER.indexOf(typeof value);
+  return idx === -1 ? POINT_VALUE_TYPE_ORDER.length : idx;
+}
+
+// C3 (round-3 fix-spec, HIGH): the old tie-break compared `Number(a.value) - Number(b.value)` and
+// RETURNED as soon as both sides were finite -- but `Number(false) === Number(0) === 0`, so a
+// boolean `false` point and a numeric `0` point at the same ts compared as a genuine tie (both -> 0)
+// and fell through to Array.prototype.sort's STABLE fallback, which preserves the pre-sort (i.e.
+// caller-supplied) array order -- exactly the order-dependence R7-dupts exists to remove, just for
+// a pair the old coercion-based check couldn't tell apart. Ranking by `typeof` FIRST (above) means
+// two values of different types are NEVER compared via a lossy `Number()` coercion in the first
+// place: they're ordered by type, deterministically, before value ever enters into it.
+function compareTiedPointValues(a, b) {
+  const ta = pointValueTypeRank(a);
+  const tb = pointValueTypeRank(b);
+  if (ta !== tb) return ta - tb;
+  if (typeof a === "number" && typeof b === "number") {
+    const aFinite = Number.isFinite(a);
+    const bFinite = Number.isFinite(b);
+    if (aFinite && bFinite) return a - b;
+    if (aFinite !== bFinite) return aFinite ? -1 : 1;
+    // both non-finite (NaN/Infinity/-Infinity) -- fall through to the String() fallback below
+  } else if (typeof a === "string" && typeof b === "string") {
+    if (a !== b) return a < b ? -1 : 1;
+    return 0;
+  }
+  const sa = String(a);
+  const sb = String(b);
+  if (sa !== sb) return sa < sb ? -1 : 1;
+  return 0; // genuine full tie -- stable fallback (Array.sort is stable, ES2019+)
+}
+
 // Drops any point without a parseable ts (a corrupt/missing timestamp excludes just that point --
 // see the header comment) and returns the rest sorted ascending by ts. Used wherever "latest" or
 // "the window" needs a well-defined order.
 function sortedValidPoints(points) {
-  return points
+  const arr = toPlainPointsArray(points); // C2: single-length-read snapshot into a real array
+  if (!arr) return [];
+  return arr
     .filter((p) => p && typeof p === "object" && Number.isFinite(toEpochMs(p.ts)))
-    .slice()
-    .sort((a, b) => toEpochMs(a.ts) - toEpochMs(b.ts));
+    .sort((a, b) => {
+      const tsDiff = toEpochMs(a.ts) - toEpochMs(b.ts);
+      if (tsDiff !== 0) return tsDiff;
+      return compareTiedPointValues(a.value, b.value); // C3: type-aware tie-break
+    });
+}
+
+// A point's value is admissible ONLY if it is an actual finite number -- not "coercible to one".
+// `Number(null) === 0`, `Number([]) === 0`, `Number("") === 0`, `Number(false) === 0` are all
+// finite under the old `Number(p.value)` coercion, which silently smuggled null/[]/""/false into
+// the stat as a fabricated `0` instead of degrading to silence (fix-spec M3). typeof-gating first
+// closes that hole while leaving genuinely-numeric points (including NaN/Infinity, still caught by
+// Number.isFinite) untouched.
+function isValidNumericValue(value) {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function hasNonFiniteValue(points) {
-  return points.some((p) => !Number.isFinite(Number(p.value)));
+  return points.some((p) => !isValidNumericValue(p.value));
 }
+
+// R8-latest (fix-spec, round 2): a value extracted from a SERIES point (as opposed to a bare
+// scalar fact -- see the "latest" case below) is admissible only if it is a finite number or a
+// non-empty string; anything else (null, [], "", false, Infinity, NaN, an object) silences rather
+// than reaching threshold's evaluateExpected, which would otherwise fabricate a satisfied/violated
+// verdict out of a degraded reading. Deliberately NOT applied to the scalar-passthrough branch --
+// see this file's header comment ("Lock A ... passes the resolved scalar straight to
+// evaluateExpected unchanged, which is what keeps Lock A byte-identical to v1 over ANY input,
+// finite or not").
+function isLatestAdmissibleValue(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") return value.length > 0;
+  return false;
+}
+
+// M7 (fix-spec, #10 "minimal survivable depth cap"): evaluateFeatureNode recurses once per node
+// on the way down its `of` chain with no depth limit -- an adversarial/malformed node graph (or
+// just a very deep legitimate one) can exhaust the call stack (RangeError), which is a crash, not
+// a silence -- and a crash is strictly worse than "no claim". This is the MINIMAL survivable cap
+// only: a fixed ceiling that turns a stack overflow into an ordinary `{ supported: false }`. It is
+// not the full runtime budget analyzer (node/row/fuel/timeout) the fix-spec explicitly defers.
+const MAX_FEATURE_NODE_DEPTH = 64;
 
 /**
  * Evaluates one FeatureNode against `factSeriesInput` (see the header comment for its shape).
@@ -127,28 +247,50 @@ function hasNonFiniteValue(points) {
  * which is what keeps this interpreter deterministic/testable without a wall-clock dependency.
  */
 export function evaluateFeatureNode(node, factSeriesInput, opts = {}) {
+  return evaluateFeatureNodeAtDepth(node, factSeriesInput, opts, 0);
+}
+
+// The actual recursive interpreter, threading a depth counter (M7) that never leaks into the
+// public signature above -- every recursive call in this function MUST go through this depth-
+// carrying helper (never the public `evaluateFeatureNode` wrapper), or the depth counter resets
+// to 0 at that call site and the cap stops protecting that branch of the graph.
+function evaluateFeatureNodeAtDepth(node, factSeriesInput, opts, depth) {
+  if (depth > MAX_FEATURE_NODE_DEPTH) return { supported: false }; // M7: survivable depth cap
   if (!node || typeof node !== "object") return { supported: false };
 
   switch (node.op) {
     case "fact": {
-      const raw = factSeriesInput ? factSeriesInput[node.name] : undefined;
+      // M1 (fix-spec, #5a prototype pollution): resolve OWN properties only. A plain `[key]`
+      // lookup also resolves INHERITED properties (`name:"toString"` over `{}` would otherwise
+      // resolve `Object.prototype.toString`, a function, as if it were a real fact value) --
+      // Object.hasOwn gates that out while a genuine own-property scalar/series still resolves
+      // exactly as before (Lock A intact).
+      if (!factSeriesInput || typeof factSeriesInput !== "object" || !Object.hasOwn(factSeriesInput, node.name)) {
+        return { supported: false }; // no fact, no claim
+      }
+      const raw = factSeriesInput[node.name];
       if (raw === undefined) return { supported: false }; // no fact, no claim
       if (Array.isArray(raw)) return { supported: true, kind: "series", points: raw };
       return { supported: true, kind: "scalar", value: raw };
     }
 
     case "latest": {
-      const of = evaluateFeatureNode(node.of, factSeriesInput, opts);
+      const of = evaluateFeatureNodeAtDepth(node.of, factSeriesInput, opts, depth + 1);
       if (!of.supported) return { supported: false };
       if (of.kind === "scalar") return of; // already latest-wins; passthrough, matches v1 exactly
       const sorted = sortedValidPoints(of.points);
       if (sorted.length === 0) return { supported: false };
       const last = sorted[sorted.length - 1];
+      // M2 (fix-spec, #5b latest missing value) + R8-latest (fix-spec, round 2): a point that
+      // lacks a `value` key, or whose value is not a finite number/non-empty string, silences
+      // rather than fabricating a verdict out of a degraded series point -- see
+      // isLatestAdmissibleValue's doc comment for why this gate is scoped to the series path only.
+      if (!isLatestAdmissibleValue(last.value)) return { supported: false };
       return { supported: true, kind: "scalar", value: last.value };
     }
 
     case "window": {
-      const of = evaluateFeatureNode(node.of, factSeriesInput, opts);
+      const of = evaluateFeatureNodeAtDepth(node.of, factSeriesInput, opts, depth + 1);
       if (!of.supported || of.kind !== "series") return { supported: false }; // cannot window a scalar
 
       const ms = Number(node.ms);
@@ -169,16 +311,25 @@ export function evaluateFeatureNode(node, factSeriesInput, opts = {}) {
     }
 
     case "zscore": {
-      const of = evaluateFeatureNode(node.of, factSeriesInput, opts);
+      const of = evaluateFeatureNodeAtDepth(node.of, factSeriesInput, opts, depth + 1);
       if (!of.supported || of.kind !== "series") return { supported: false };
 
       const stddevFloor = Number(node.stddevFloor);
       if (!Number.isFinite(stddevFloor) || stddevFloor < 0) return { supported: false };
 
-      const minSamples = Number.isFinite(Number(node.minSamples)) ? Number(node.minSamples) : DEFAULT_MIN_ZSCORE_SAMPLES;
+      // M4 (fix-spec, #6 minSamples + empty guard): minSamples must coerce to an INTEGER >= 2, or
+      // the node silences -- 0/negative/fractional values used to be accepted (finite was the only
+      // check), which let `sorted.length < minSamples` pass even for an EMPTY sorted array (e.g.
+      // minSamples=0), falling through to `sorted[sorted.length - 1]` === `sorted[-1]` ===
+      // undefined and crashing on `.value`. The explicit `sorted.length === 0` check below is
+      // redundant once minSamples>=2 is enforced (0 < 2 already fails the length check) but is
+      // kept as a defensive, unconditional guard BEFORE any array deref -- no path here may throw.
+      const minSamplesRaw = node.minSamples === undefined ? DEFAULT_MIN_ZSCORE_SAMPLES : Number(node.minSamples);
+      if (!Number.isInteger(minSamplesRaw) || minSamplesRaw < 2) return { supported: false };
+      const minSamples = minSamplesRaw;
 
       const sorted = sortedValidPoints(of.points);
-      if (sorted.length < minSamples) return { supported: false }; // sub-threshold window length
+      if (sorted.length === 0 || sorted.length < minSamples) return { supported: false }; // sub-threshold window length
       if (hasNonFiniteValue(sorted)) return { supported: false }; // degraded input -> silence, never fabricate
 
       // Fold EVERY selected point (including the latest one) through the shared Welford
@@ -189,8 +340,25 @@ export function evaluateFeatureNode(node, factSeriesInput, opts = {}) {
       // real windowed detectors want inclusive or exclusive scoring is exactly the kind of
       // question the spike's go/no-go (plan §6, "IR shape") exists to answer -- not decided here.
       const stats = sorted.reduce((acc, p) => foldWelford(acc, Number(p.value)), emptyWelfordStats());
+      // R8-welford (fix-spec, round 2): reject on a non-finite WELFORD STATE component BEFORE
+      // calling computeZScore. Every input point already passed the finite-point gate above, but
+      // the running fold itself can still overflow to +/-Infinity/NaN on extreme-magnitude inputs
+      // (e.g. Number.MAX_VALUE paired with -Number.MAX_VALUE) -- and computeZScore silently
+      // replaces a non-finite mean with 0 (`Number.isFinite(meanBefore) ? meanBefore : 0`), which
+      // launders an overflowed state into a plausible-looking FINITE z-score that the M6 result
+      // check below would never catch. Checking the state itself, not just the final result,
+      // closes that laundering path.
+      if (![stats.mean, stats.stddev, stats.variance, stats.m2].every(Number.isFinite)) {
+        return { supported: false };
+      }
       const latest = sorted[sorted.length - 1];
       const value = computeZScore(Number(latest.value), stats.mean, stats.stddev, stddevFloor);
+      // M6 (fix-spec, #8 overflow): the computed statistic can itself be non-finite (arithmetic
+      // overflow to +/-Infinity on extreme-magnitude inputs) even though every INPUT point passed
+      // the finite-point gate above -- silence rather than emit an overflowed statistic. Kept as a
+      // backstop even with the state check above (R8-welford guards the STATE, this guards the
+      // RESULT -- belt and suspenders).
+      if (!Number.isFinite(value)) return { supported: false };
 
       return { supported: true, kind: "scalar", value };
     }
@@ -200,24 +368,28 @@ export function evaluateFeatureNode(node, factSeriesInput, opts = {}) {
       // `window(...)`'s already ts-filtered/sorted output -- but sorted defensively here too,
       // matching window/zscore's own defensive re-sort. `target` is the reference level (a finite
       // number, or the literal string "mean" -- the series' own Welford mean, reusing the SAME
-      // shared primitive zscore uses, not a re-derived copy). `k` is the CUSUM allowance/slack.
-      // Emits the scalar `value = max over the whole series of max(S_hi, S_lo)` (the peak
-      // accumulation) -- a `threshold` model node then fires when this crosses the decision
-      // interval h. Missing-input -> silence, same discipline as window/zscore: a non-series `of`,
-      // an empty/sub-minSamples series, any non-finite point, a non-finite `k`, a `target` that is
-      // neither a finite number nor "mean", or a "mean" that isn't finite (e.g. computed over
-      // non-finite input, though hasNonFiniteValue already excludes that case) all silence the
-      // whole node -- never a fabricated statistic.
-      const of = evaluateFeatureNode(node.of, factSeriesInput, opts);
+      // shared primitive zscore uses, not a re-derived copy). `k` is the CUSUM allowance/slack
+      // (fix-spec M5: `k` must be a non-negative finite number -- a negative `k` amplifies every
+      // step instead of damping it, fabricating a changepoint out of ordinary noise). Emits the
+      // scalar `value = max over the whole series of max(S_hi, S_lo)` (the peak accumulation) -- a
+      // `threshold` model node then fires when this crosses the decision interval h. Missing-input
+      // -> silence, same discipline as window/zscore: a non-series `of`, an empty/sub-minSamples
+      // series (fix-spec M4, same integer->=2 + pre-deref empty guard as zscore), any non-finite
+      // point (fix-spec M3), a non-finite or negative `k` (fix-spec M5), a `target` that is
+      // neither a finite number nor "mean", a "mean" that isn't finite, or an overflowed resulting
+      // statistic (fix-spec M6) all silence the whole node -- never a fabricated statistic.
+      const of = evaluateFeatureNodeAtDepth(node.of, factSeriesInput, opts, depth + 1);
       if (!of.supported || of.kind !== "series") return { supported: false }; // cannot cusum a scalar
 
       const k = Number(node.k);
-      if (!Number.isFinite(k)) return { supported: false };
+      if (!Number.isFinite(k) || k < 0) return { supported: false };
 
-      const minSamples = Number.isFinite(Number(node.minSamples)) ? Number(node.minSamples) : DEFAULT_MIN_CUSUM_SAMPLES;
+      const minSamplesRaw = node.minSamples === undefined ? DEFAULT_MIN_CUSUM_SAMPLES : Number(node.minSamples);
+      if (!Number.isInteger(minSamplesRaw) || minSamplesRaw < 2) return { supported: false };
+      const minSamples = minSamplesRaw;
 
       const sorted = sortedValidPoints(of.points);
-      if (sorted.length < minSamples) return { supported: false }; // sub-threshold sample count
+      if (sorted.length === 0 || sorted.length < minSamples) return { supported: false }; // sub-threshold sample count
       if (hasNonFiniteValue(sorted)) return { supported: false }; // degraded input -> silence, never fabricate
 
       let target;
@@ -243,6 +415,8 @@ export function evaluateFeatureNode(node, factSeriesInput, opts = {}) {
         if (sHi > maxStat) maxStat = sHi;
         if (sLo > maxStat) maxStat = sLo;
       }
+      // M6 (fix-spec, #8 overflow): see the matching guard in "zscore" above.
+      if (!Number.isFinite(maxStat)) return { supported: false };
 
       return { supported: true, kind: "scalar", value: maxStat };
     }

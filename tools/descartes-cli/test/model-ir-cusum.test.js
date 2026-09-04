@@ -239,3 +239,54 @@ test("cusum missing-input: a non-finite k silences the node", () => {
     assert.deepEqual(verdict, { supported: false }, `expected silence for k=${JSON.stringify(badK)}`);
   }
 });
+
+// --- Security hardening (adversarial-review fix-spec M3/M4/M5/M6, cusum-specific) --------------
+
+test("M3: cusum rejects a coercible-but-non-numeric point value (null/[]/\"\"/false) instead of coercing it to 0", () => {
+  for (const badValue of [null, [], "", false]) {
+    const series = seriesFrom(Date.parse("2026-09-03T00:00:00.000Z"), 60_000, [5, 8]);
+    series[1] = { ...series[1], value: badValue };
+    const model = validModelRecord({
+      feature: { op: "cusum", of: { op: "fact", name: "metric.coerce" }, target: 0, k: 1 },
+    });
+    const verdict = evaluateModel(model, { "metric.coerce": series });
+    assert.deepEqual(verdict, { supported: false }, `expected silence for value=${JSON.stringify(badValue)}`);
+  }
+});
+
+test("M4: cusum minSamples must be an integer >= 2 -- a fractional/zero/negative/NaN minSamples silences rather than being accepted", () => {
+  const series = seriesFrom(Date.parse("2026-09-03T00:00:00.000Z"), 60_000, [5, 8]);
+  for (const badMinSamples of [0, -1, 1.5, NaN]) {
+    const model = validModelRecord({
+      feature: { op: "cusum", of: { op: "fact", name: "metric.x" }, target: 6, k: 1, minSamples: badMinSamples },
+    });
+    const verdict = evaluateModel(model, { "metric.x": series });
+    assert.deepEqual(verdict, { supported: false }, `expected silence for minSamples=${JSON.stringify(badMinSamples)}`);
+  }
+});
+
+test("M4: cusum never fabricates a statistic from zero real samples, even when minSamples is invalid", () => {
+  const model = validModelRecord({
+    feature: { op: "cusum", of: { op: "fact", name: "metric.emptyseries" }, target: "mean", k: 1, minSamples: 0 },
+  });
+  const verdict = evaluateModel(model, { "metric.emptyseries": [] });
+  assert.deepEqual(verdict, { supported: false }, "zero samples must silence, never fabricate value:0");
+});
+
+test("M5: cusum rejects a negative k instead of fabricating a changepoint from it", () => {
+  const series = seriesFrom(Date.parse("2026-09-03T00:00:00.000Z"), 60_000, [10, 10, 10, 10, 10]); // perfectly flat, no real drift
+  const model = validModelRecord({
+    feature: { op: "cusum", of: { op: "fact", name: "metric.flat" }, target: 10, k: -100 },
+  });
+  const verdict = evaluateModel(model, { "metric.flat": series });
+  assert.deepEqual(verdict, { supported: false });
+});
+
+test("M6: cusum silences instead of returning a non-finite (overflow) statistic", () => {
+  const series = seriesFrom(Date.parse("2026-09-03T00:00:00.000Z"), 60_000, [Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE]);
+  const model = validModelRecord({
+    feature: { op: "cusum", of: { op: "fact", name: "metric.overflow" }, target: -Number.MAX_VALUE, k: Number.MAX_VALUE },
+  });
+  const verdict = evaluateModel(model, { "metric.overflow": series });
+  assert.deepEqual(verdict, { supported: false });
+});
