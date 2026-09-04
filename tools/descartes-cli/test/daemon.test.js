@@ -3947,3 +3947,66 @@ test("F4-B2: a non-fatal retention_error from the structural fact-persist writer
   // persist step's retention_error, not from any collector.
   assert(result.status.structural_collector_statuses.every((entry) => entry.status === "ok"));
 });
+
+// ---------------------------------------------------------------------------------------------
+// daybreak-blue re-gate BLOCKER: metricPersistError/structuralFactPersistError captured
+// `error.message` directly -- an EMPTY-message Error (e.g. `new Error()`, which some fs/EISDIR-
+// style failures surface as) coalesced storageWriteError back to `undefined` via combineErrors'
+// `filter(Boolean)`, which drops falsy entries including "". That silently resurrected the exact
+// F4-B1 fabrication (state:"ok", daemon.status.not_ok never firing) the message-bearing tests
+// above already close, but only for the empty-message edge. The fix coalesces an empty message to
+// a non-empty fallback string at the point of capture, so combineErrors' filter(Boolean) can never
+// drop it. Pre-fix, this test's `assert.equal(result.status.state, "error")` would have read "ok".
+// ---------------------------------------------------------------------------------------------
+
+test("F4-B1 empty-message edge: a throwing appendMetricPoints with NO message still surfaces state:\"error\", a non-empty storage_write_error, and daemon.status.not_ok firing", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: S_LIVE_1_TICK_TS,
+      now: S_LIVE_1_TICK_TS,
+      appendMetricPoints: async () => {
+        throw new Error();
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // THE THESIS: an empty-message throw must not be silently dropped back to a healthy-looking
+  // status. state must genuinely reflect the persist failure, exactly as it does for a
+  // message-bearing throw.
+  assert.equal(result.status.state, "error");
+  assert.ok(
+    typeof result.status.storage_write_error === "string" && result.status.storage_write_error.length > 0,
+    `expected a non-empty storage_write_error, got: ${JSON.stringify(result.status.storage_write_error)}`,
+  );
+
+  assert.deepEqual(result.write, { written_count: 0, retention: undefined });
+
+  // A completely unrelated real alert still fires this tick -- evaluateAndPersistAlerts still ran.
+  const constraintAlert = result.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(constraintAlert, "expected the active-constraint alert to still fire even though metric-persist threw with an empty message");
+
+  // The watchdog rule that a hardcoded/dropped-to-undefined state made permanently unable to fire.
+  const notOk = result.alerts.alerts.find((alert) => alert.rule_id === "daemon.status.not_ok");
+  assert.ok(notOk, "expected daemon.status.not_ok to fire from the genuine empty-message persist failure");
+  assert.equal(notOk.status, "active");
+
+  assert.ok(
+    warnings.some((w) => w.includes("metric-persist")),
+    `expected a warning naming the failing metric-persist step even with an empty error message, got: ${JSON.stringify(warnings)}`,
+  );
+});

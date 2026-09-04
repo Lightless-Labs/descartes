@@ -510,7 +510,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       now: options.now ?? ts,
     });
   } catch (error) {
-    metricPersistError = error instanceof Error ? error.message : String(error);
+    metricPersistError = (error instanceof Error ? error.message : String(error)) || "unknown metric-persist error";
     console.warn(`[daemon] metric-persist failed this tick (${metricPersistError}); degrading to written_count: 0, not fabricating a write`);
     write = { written_count: 0, retention: undefined };
   }
@@ -609,7 +609,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             try {
               structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts });
             } catch (error) {
-              structuralFactPersistError = error instanceof Error ? error.message : String(error);
+              structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
               console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
               structuralFacts = { written_count: 0, retention: undefined };
             }

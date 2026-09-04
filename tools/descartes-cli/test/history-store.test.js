@@ -223,3 +223,48 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
   const read = await readMetricPoints(paths);
   assert.equal(read.points.length, 2);
 });
+
+// ---------------------------------------------------------------------------------------------
+// daybreak-blue re-gate BLOCKER: the F4-B2 catch above captured `error.message` directly -- an
+// EMPTY-message Error (e.g. `new Error()`) coalesced to `retentionError = ""`, which is FALSY, so
+// the `...(retentionError ? { retention_error: retentionError } : {})` spread silently omitted
+// the key entirely -- the exact "retention error discarded, never surfaced anywhere" fabrication
+// F4-B2 closes, but only for the empty-message edge. The fix coalesces an empty message to
+// "unknown retention error" at the point of capture, so the spread condition is always truthy on
+// a genuine retention failure. There is no DI seam for enforceHistoryRetention itself, so this
+// mocks `fs.writeFile` directly (the same singleton `node:fs/promises` module object src imports)
+// to fail with an EMPTY-message Error only for enforceHistoryRetention's own tmp+rename write --
+// appendMetricPoints' earlier fs.appendFile call is a different method, untouched.
+// ---------------------------------------------------------------------------------------------
+
+test("F4-B2 empty-message edge: a retention failure with NO message still surfaces a non-empty retention_error -- appendMetricPoints reports the real written_count and the records genuinely reached disk", async (t) => {
+  const paths = await tempPaths();
+  const storePaths = resolveHistoryStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+
+  const retentionTmpFile = `${storePaths.metricsFile}.${process.pid}.tmp`;
+  const originalWriteFile = fs.writeFile.bind(fs);
+  t.mock.method(fs, "writeFile", async (file, data, opts) => {
+    if (String(file) === retentionTmpFile) throw new Error();
+    return originalWriteFile(file, data, opts);
+  });
+
+  const points = [
+    { ts: "2026-05-24T00:00:00.000Z", metric_name: "system.load.1m", value: 1, unit: "load_average" },
+    { ts: "2026-05-24T00:00:01.000Z", metric_name: "system.load.1m", value: 2, unit: "load_average" },
+  ];
+
+  const result = await appendMetricPoints(paths, points, { now: "2026-05-24T00:00:02.000Z" });
+
+  assert.equal(result.written_count, 2, "the append genuinely succeeded before retention ran -- the real count must be reported, never a fabricated 0");
+  assert.equal(result.retention, undefined, "no genuine retention outcome exists on this failure -- must not synthesize one");
+  assert.ok(
+    typeof result.retention_error === "string" && result.retention_error.length > 0,
+    `expected a non-empty retention_error even from an empty-message throw, got: ${JSON.stringify(result.retention_error)}`,
+  );
+
+  // The records really are on disk -- readMetricPoints reads metricsFile directly, unaffected by
+  // (and not blocked by) the still-failing retention tmp path.
+  const read = await readMetricPoints(paths);
+  assert.equal(read.points.length, 2);
+});

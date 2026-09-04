@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 import {
   ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
@@ -226,6 +227,34 @@ function fakeBusyWaitSession(busyMs, decision) {
       while (Date.now() - start < busyMs) {
         // Deliberately synchronous -- starves the event loop (and the deadline timer with it) for
         // the duration, unlike a setTimeout-based delay.
+      }
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+    },
+    abort() {
+      state.abortCalls += 1;
+      // Even a well-behaved abort() cannot preempt a synchronous busy-wait already in progress.
+    },
+    dispose() {},
+  };
+  return { session, state };
+}
+
+// daybreak-blue re-gate BLOCKER 3: mirrors fakeBusyWaitSession above, but spins on
+// performance.now() (a monotonic clock, node:perf_hooks) instead of Date.now(). fakeBusyWaitSession
+// itself spins on `Date.now() - start`, so reusing it under a test that freezes/steps back
+// Date.now() would spin forever (the delta never grows) instead of busy-waiting for a real,
+// bounded span -- this fake exists so the test below can manipulate Date.now() while the busy-wait
+// itself still genuinely consumes `busyMs` of real wall-clock time.
+function fakeMonotonicBusyWaitSession(busyMs, decision) {
+  const state = { abortCalls: 0 };
+  const session = {
+    messages: [],
+    async prompt(promptText) {
+      session.lastPrompt = promptText;
+      const start = performance.now();
+      while (performance.now() - start < busyMs) {
+        // Deliberately synchronous -- starves the event loop (and the deadline timer with it) for
+        // the duration, immune to any Date.now() manipulation by the caller.
       }
       this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
     },
@@ -2572,4 +2601,64 @@ test("F5-B HIGH residual: a session.prompt() that never settles with a TRUE no-o
   assert.match(audit[0].error, /model_deadline_exceeded/);
   assert.equal(result.decisions[0].status, "error");
   assert.equal(result.status, "ok");
+});
+
+// daybreak-blue re-gate BLOCKER 3: the deadline belt's elapsed check used to read `Date.now() -
+// promptStartedMs` -- wall-clock, not monotonic. Date.now() can be frozen (NTP step, a VM pause)
+// or even stepped BACKWARD, which would make the elapsed check read <= deadlineMs forever
+// regardless of how long prompt() actually starved the event loop, letting a starved-then-late
+// response win the race and get trusted. The fix (this file's diff) switched both the deadline-
+// belt start capture and its elapsed check to performance.now(), a monotonic clock immune to any
+// Date.now() manipulation. This test freezes Date.now() and then steps it BACKWARD on every read
+// (worse than merely frozen) for the whole adjudicateAlertNotifications call, while
+// fakeMonotonicBusyWaitSession genuinely busy-waits well past the deadline using performance.now()
+// -- pre-fix, with Date.now() frozen/reversed, `Date.now() - promptStartedMs` would read <= 0 <=
+// deadlineMs and the late response would be trusted as status:"ok" and delivered.
+test("F5-B2 daybreak-blue re-gate BLOCKER 3: the deadline belt is monotonic -- freezing and stepping Date.now() backward during a starved-then-late response must not fool it into trusting the late decision", async () => {
+  const paths = await tempPaths();
+  const { session } = fakeMonotonicBusyWaitSession(40, {
+    notify: true,
+    severity: "critical",
+    title: "A decision produced after the deadline while Date.now() was frozen/reversed",
+    body: "Must never be delivered or recorded as ok.",
+    reason: "Date.now() manipulation must not fool the deadline belt",
+    evidence_refs: [],
+  });
+  let deliverCalls = 0;
+
+  const originalDateNow = Date.now;
+  const frozenMs = originalDateNow();
+  let reads = 0;
+  // Frozen on the first read, then strictly DECREASING on every subsequent read -- exercises both
+  // edges named by the fix's own comment (frozen AND stepped back), and is strictly worse than
+  // simply freezing: a pre-fix elapsed check computed from this clock never even reaches 0, let
+  // alone deadlineMs.
+  Date.now = () => {
+    reads += 1;
+    return frozenMs - (reads - 1);
+  };
+
+  let result;
+  try {
+    result = await adjudicateAlertNotifications(paths, {
+      alerts: [alert()],
+      notification_due_ids: ["alert_memory"],
+    }, {
+      now: "2026-09-04T00:00:00.000Z",
+      config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 10 }),
+      createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+      deliverNotification: async () => { deliverCalls += 1; return { delivered: true }; },
+    });
+  } finally {
+    Date.now = originalDateNow;
+  }
+
+  assert.equal(deliverCalls, 0, "a decision produced by a starved-then-late response must never be delivered, even with Date.now() frozen/reversed");
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.notEqual(audit[0].status, "ok");
+  assert.equal(audit[0].decision, undefined);
+  assert.match(audit[0].error, /model_deadline_exceeded/);
+  assert.equal(result.decisions[0].status, "error");
 });

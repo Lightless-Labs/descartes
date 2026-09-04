@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
@@ -1320,7 +1321,12 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         // check as a belt-and-braces close for the starved-then-resolves race (catches it even if
         // the timer callback hasn't run the instant this line executes).
         let timedOut = false;
-        const promptStartedMs = Date.now();
+        // MONOTONIC clock for the deadline belt (daybreak-blue F5 re-gate 2, BLOCKER 3): Date.now()
+        // is wall-clock and can be frozen or stepped BACK (NTP, a VM pause, or the very clock-rollback
+        // scenario Descartes' own fact-store guards against), which would let a starve-then-resolve
+        // prompt() win the microtask race with elapsed reading <= deadline. performance.now() is
+        // monotonic and immune to wall-clock manipulation.
+        const promptStartedMs = performance.now();
         let deadlineTimer;
         const deadlinePromise = new Promise((resolve) => {
           deadlineTimer = setTimeout(() => {
@@ -1358,7 +1364,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         // (elapsed >= deadlineMs) closes the F5-B race even when `timedOut` itself hasn't been set
         // yet -- a starved-then-resolved prompt() can win Promise.race before the timer callback
         // runs, but real elapsed time already tells the truth.
-        if (timedOut || Date.now() - promptStartedMs >= deadlineMs) throw new Error("model_deadline_exceeded");
+        if (timedOut || performance.now() - promptStartedMs >= deadlineMs) throw new Error("model_deadline_exceeded");
 
         const rawText = lastAssistantText(session.messages);
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));

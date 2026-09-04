@@ -145,7 +145,7 @@ export async function appendMetricPoints(descartesPaths, points, options = {}) {
   try {
     retention = await enforceHistoryRetention(descartesPaths, options);
   } catch (error) {
-    retentionError = error instanceof Error ? error.message : String(error);
+    retentionError = (error instanceof Error ? error.message : String(error)) || "unknown retention error";
   }
   return { written_count: normalized.length, retention, ...(retentionError ? { retention_error: retentionError } : {}) };
 }

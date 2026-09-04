@@ -379,3 +379,50 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
   const { points } = await readFactPoints(paths, { now: ts });
   assert.equal(points.length, 2);
 });
+
+// ---------------------------------------------------------------------------------------------
+// daybreak-blue re-gate BLOCKER, mirrors history-store.test.js: the F4-B2 catch above captured
+// `error.message` directly -- an EMPTY-message Error (e.g. `new Error()`) coalesced to
+// `retentionError = ""`, which is FALSY, so `...(retentionError ? { retention_error:
+// retentionError } : {})` silently omitted the key entirely -- the exact "retention error
+// discarded, never surfaced anywhere" fabrication F4-B2 closes, but only for the empty-message
+// edge. The fix coalesces an empty message to "unknown retention error" at the point of capture.
+// There is no DI seam for enforceFactRetention itself, so this mocks `fs.writeFile` directly (the
+// same singleton `node:fs/promises` module object src imports) to fail with an EMPTY-message
+// Error only for enforceFactRetention's own `${factsFile}.${process.pid}.tmp` write -- every other
+// writeFile call (the integrity ledger, appendFactPoints' own fs.appendFile is a different method
+// entirely) passes through to the real implementation untouched.
+// ---------------------------------------------------------------------------------------------
+
+test("F4-B2 empty-message edge: a retention failure with NO message still surfaces a non-empty retention_error -- appendFactPoints reports the real written_count and the records genuinely reached disk", async (t) => {
+  const paths = await tempPaths();
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+
+  const retentionTmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
+  const originalWriteFile = fs.writeFile.bind(fs);
+  t.mock.method(fs, "writeFile", async (file, data, opts) => {
+    if (String(file) === retentionTmpFile) throw new Error();
+    return originalWriteFile(file, data, opts);
+  });
+
+  const ts = "2026-07-10T00:00:00.000Z";
+  const factPoints = [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+    { fact_name: "service.presence", entity_key: "postgres.service", attributes: { running: "true" } },
+  ];
+
+  const result = await appendFactPoints(paths, factPoints, { ts, now: ts });
+
+  assert.equal(result.written_count, 2, "the append genuinely succeeded before retention ran -- the real count must be reported, never a fabricated 0");
+  assert.equal(result.retention, undefined, "no genuine retention outcome exists on this failure -- must not synthesize one");
+  assert.ok(
+    typeof result.retention_error === "string" && result.retention_error.length > 0,
+    `expected a non-empty retention_error even from an empty-message throw, got: ${JSON.stringify(result.retention_error)}`,
+  );
+
+  // The records really are on disk -- readFactPoints reads facts.jsonl directly, unaffected by
+  // (and not blocked by) the still-failing retention tmp path.
+  const { points } = await readFactPoints(paths, { now: ts });
+  assert.equal(points.length, 2);
+});
