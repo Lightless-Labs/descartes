@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { readAlertIntelligenceConfig, resolveAlertIntelligencePaths } from "../src/alert-intelligence.js";
-import { runAlerts, renderAlertList, visibleAlerts } from "../src/alerts.js";
+import { runAlerts, renderAlertList, visibleAlerts, readAlertRecords } from "../src/alerts.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
 import { readNotificationDeliveryConfig, writeNotificationDeliveryConfig } from "../src/notification-delivery.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -77,6 +77,50 @@ test("alerts list evaluates local history and prints active alerts", async () =>
   assert.equal(outputs.length, 1);
   assert.match(outputs[0], /Alerts/);
   assert.match(outputs[0], /disk/i);
+});
+
+test("alerts list is read-only: never recovers an active alert from a detector family it did not evaluate", async () => {
+  const paths = await tempPaths();
+  const [seeded] = await writeAlertRecords(paths, [{
+    rule_id: "canary.tripped",
+    fingerprint: "global",
+    status: "active",
+    severity: "critical",
+    title: "Canary tripped",
+    summary: "Canary tripped",
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T00:00:00.000Z",
+    last_notified: "2026-05-28T00:00:00.000Z",
+    cooldown_until: "2026-05-28T00:15:00.000Z",
+  }]);
+
+  const outputs = [];
+  await runAlerts(paths, ["list", "--json", "--all"], { output: (line) => outputs.push(line) });
+
+  const afterList = await readAlertRecords(paths);
+  const afterAlert = afterList.find((alert) => alert.id === seeded.id);
+  assert.ok(afterAlert, "the seeded detector-family alert must still exist");
+  assert.equal(afterAlert.status, "active", "list must never recover a rule_id it did not itself evaluate");
+  assert.equal(afterAlert.last_notified, seeded.last_notified, "list must never touch last_notified");
+  assert.equal(afterAlert.cooldown_until, seeded.cooldown_until, "list must never touch cooldown_until");
+});
+
+test("alerts list never consumes a fixed-rule alert's cooldown even when notification is due", async () => {
+  const paths = await tempPaths();
+  const now = new Date().toISOString();
+  await appendMetricPoints(paths, [
+    { ts: now, metric_name: "system.memory.used_fraction", value: 0.95, unit: "fraction" },
+    { ts: now, metric_name: "system.memory.used_fraction", value: 0.96, unit: "fraction" },
+  ], { now });
+  await writeDaemonStatus(paths, { ts: now, state: "ok", profile: { interval_ms: 60_000 } });
+
+  const before = await readAlertRecords(paths);
+  assert.deepEqual(before, [], "nothing persisted yet before any list call");
+
+  await runAlerts(paths, ["list", "--json"], { output: () => {} });
+
+  const after = await readAlertRecords(paths);
+  assert.deepEqual(after, [], "a read-only list call must never write alert records to disk, even for a due fixed-rule candidate");
 });
 
 test("alerts ack marks an alert acknowledged", async () => {

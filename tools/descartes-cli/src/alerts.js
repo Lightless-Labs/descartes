@@ -4,7 +4,7 @@ import {
   readAlertIntelligenceConfig,
   writeAlertIntelligenceConfig,
 } from "./alert-intelligence.js";
-import { acknowledgeAlert, evaluateAndPersistAlerts, readAlertRecords } from "./alert-store.js";
+import { acknowledgeAlert, evaluateAlerts, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
@@ -302,7 +302,13 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
   }
 
   const printList = async () => {
-    const result = await evaluateAndPersistAlerts(descartesPaths);
+    // Read-only view: list/watch must never mutate persisted alert state (no false recovery of
+    // canary/credential/session/... detector alerts, no phantom cooldown consumption with no
+    // notification ever delivered). Uses evaluateAlerts (never writes) scoped to
+    // FIXED_ALERT_RULE_IDS so this call can only assert recovery for the built-in threshold rules
+    // it actually evaluates -- persisted mutation (recovery + cooldown/last_notified) remains
+    // exclusively the daemon's job via evaluateAndPersistAlerts with the full extraCandidates set.
+    const result = await evaluateAlerts(descartesPaths, { coveredRuleIds: FIXED_ALERT_RULE_IDS });
     if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, options), notification_due_ids: result.notification_due_ids }, null, 2));
     else output(renderAlertList(result.alerts, options));
   };

@@ -7,7 +7,9 @@ import {
   acknowledgeAlert,
   applyAlertCandidates,
   evaluateAlertRules,
+  evaluateAlerts,
   evaluateAndPersistAlerts,
+  FIXED_ALERT_RULE_IDS,
   readAlertRecords,
   resolveAlertStorePaths,
   writeAlertRecords,
@@ -265,4 +267,77 @@ test("a fixed-rule alert and an extraCandidates alert do not spuriously recover 
   const extraSymmetric = symmetricSecond.alerts.find((alert) => alert.rule_id === "constraint.violation.test-family");
   assert.equal(extraSymmetric.status, "active");
   assert.equal(fixedSymmetric.status, "recovered");
+});
+
+test("applyAlertCandidates scoped by coveredRuleIds only recovers rule_ids it has full visibility into", () => {
+  const existing = [
+    {
+      id: "alert_disk",
+      rule_id: "disk.space.high_used_fraction",
+      fingerprint: "global",
+      status: "active",
+      severity: "warning",
+      title: "High disk pressure",
+      summary: "Disk high",
+      evidence_refs: ["history-summary"],
+      first_seen: "2026-05-28T00:00:00.000Z",
+      last_seen: "2026-05-28T00:00:00.000Z",
+      last_notified: null,
+      cooldown_until: null,
+      acknowledged_at: null,
+      diagnostics: {},
+    },
+    {
+      id: "alert_canary",
+      rule_id: "canary.tripped",
+      fingerprint: "global",
+      status: "active",
+      severity: "critical",
+      title: "Canary tripped",
+      summary: "Canary tripped",
+      evidence_refs: ["canary-baseline"],
+      first_seen: "2026-05-28T00:00:00.000Z",
+      last_seen: "2026-05-28T00:00:00.000Z",
+      last_notified: null,
+      cooldown_until: null,
+      acknowledged_at: null,
+      diagnostics: {},
+    },
+  ];
+
+  // No candidates supplied this round (as if only the fixed rules were re-evaluated and both
+  // fixed-rule and detector-only alerts came up empty this call), but scoped to FIXED_ALERT_RULE_IDS.
+  const result = applyAlertCandidates(existing, [], {
+    now: "2026-05-28T00:05:00.000Z",
+    coveredRuleIds: FIXED_ALERT_RULE_IDS,
+  });
+
+  const diskAfter = result.alerts.find((alert) => alert.id === "alert_disk");
+  const canaryAfter = result.alerts.find((alert) => alert.id === "alert_canary");
+  assert.equal(diskAfter.status, "recovered", "fixed-rule alert absent from covered candidates must recover");
+  assert.equal(canaryAfter.status, "active", "non-covered rule_id must never be touched by a scoped recovery pass");
+});
+
+test("evaluateAlerts never writes; evaluateAndPersistAlerts does", async () => {
+  const paths = await tempPaths();
+  await appendMetricPoints(paths, [
+    { ts: "2026-05-28T00:00:00.000Z", metric_name: "system.memory.used_fraction", value: 0.92, unit: "fraction" },
+    { ts: "2026-05-28T00:01:00.000Z", metric_name: "system.memory.used_fraction", value: 0.91, unit: "fraction" },
+  ], { now: "2026-05-28T00:01:00.000Z" });
+  await writeDaemonStatus(paths, { ts: "2026-05-28T00:01:00.000Z", state: "ok", profile: { interval_ms: 60_000 } });
+
+  const before = await readAlertRecords(paths);
+  assert.deepEqual(before, []);
+
+  const evaluated = await evaluateAlerts(paths, { now: "2026-05-28T00:02:00.000Z", windowMs: 15 * 60 * 1000 });
+  assert(evaluated.alerts.some((alert) => alert.rule_id === "system.memory.sustained_high"));
+
+  const afterReadOnly = await readAlertRecords(paths);
+  assert.deepEqual(afterReadOnly, [], "evaluateAlerts must never persist to disk");
+
+  const persisted = await evaluateAndPersistAlerts(paths, { now: "2026-05-28T00:02:00.000Z", windowMs: 15 * 60 * 1000 });
+  assert(persisted.alerts.some((alert) => alert.rule_id === "system.memory.sustained_high"));
+
+  const afterWrite = await readAlertRecords(paths);
+  assert(afterWrite.some((alert) => alert.rule_id === "system.memory.sustained_high"), "evaluateAndPersistAlerts must persist to disk");
 });

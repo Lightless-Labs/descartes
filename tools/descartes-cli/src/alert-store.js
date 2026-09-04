@@ -54,6 +54,24 @@ function pushCandidate(candidates, candidate) {
   });
 }
 
+// The complete, static set of rule_ids evaluateAlertRules() can ever produce. Used to scope
+// applyAlertCandidates' recovery eligibility (see coveredRuleIds below) for callers — like the
+// CLI's read-only alerts list/watch view — that only ever compute THIS subset of candidates and
+// must never be treated as authoritative over a detector family (canary.*, credential.access,
+// session.*, peer.*, service.*, provenance.*, correlation.*, scheduled_job.*, service_appearance.*,
+// containment.*, learned.*) they did not themselves evaluate this call. Keep in sync with the
+// rule_id literals pushed inside evaluateAlertRules below.
+export const FIXED_ALERT_RULE_IDS = new Set([
+  "daemon.status.missing",
+  "daemon.status.not_ok",
+  "daemon.samples.missing",
+  "daemon.samples.stale",
+  "daemon.status.stale",
+  "system.memory.sustained_high",
+  "system.load.sustained_high",
+  "disk.space.high_used_fraction",
+]);
+
 export function evaluateAlertRules(historySummary, daemonStatus, options = {}) {
   const now = new Date(options.now ?? historySummary?.until ?? Date.now());
   const nowMs = now.getTime();
@@ -224,6 +242,12 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   const byId = new Map(existingAlerts.map((alert) => [alert.id, normalizeAlertRecord(alert)]));
   const activeCandidateIds = new Set(candidates.map((candidate) => candidate.id));
   const notificationDueIds = [];
+  // undefined (the default, used by every existing daemon.js call site — unchanged) means
+  // "unrestricted", i.e. today's exact behavior: any persisted id absent from `candidates` this
+  // call is eligible for recovery. A caller that only evaluates a PARTIAL candidate universe (the
+  // CLI's read-only view, restricted to FIXED_ALERT_RULE_IDS) must pass an explicit Set so it can
+  // only recover rule_ids it actually has full visibility into this call.
+  const coveredRuleIds = options.coveredRuleIds;
 
   for (const candidate of candidates) {
     const current = byId.get(candidate.id);
@@ -253,7 +277,8 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   }
 
   for (const [id, alert] of byId) {
-    if (!activeCandidateIds.has(id) && ["active", "acknowledged"].includes(alert.status)) {
+    const isCovered = !coveredRuleIds || coveredRuleIds.has(alert.rule_id);
+    if (isCovered && !activeCandidateIds.has(id) && ["active", "acknowledged"].includes(alert.status)) {
       byId.set(id, normalizeAlertRecord({
         ...alert,
         status: "recovered",
@@ -268,7 +293,13 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   };
 }
 
-export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
+// Non-persisting evaluation: computes candidates and merges them against the existing persisted
+// alerts in memory, but never writes to disk. Used by evaluateAndPersistAlerts below (the daemon's
+// authoritative write path) and directly by read-only callers (the CLI's alerts list/watch view)
+// that must never mutate persisted state — see options.coveredRuleIds, threaded through to
+// applyAlertCandidates to scope recovery eligibility for a caller that only evaluates a partial
+// candidate universe (e.g. FIXED_ALERT_RULE_IDS).
+export async function evaluateAlerts(descartesPaths, options = {}) {
   const now = options.now ?? new Date().toISOString();
   const [historySummary, daemonStatus, existing] = await Promise.all([
     options.historySummary ? Promise.resolve(options.historySummary) : buildHistorySummary(descartesPaths, { now, windowMs: options.windowMs ?? DEFAULT_ALERT_WINDOW_MS, limit: options.limit }),
@@ -287,9 +318,14 @@ export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
   const mergedCandidates = [...candidates, ...extraCandidates].map((candidate) =>
     candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
   );
-  const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs });
-  const alerts = await writeAlertRecords(descartesPaths, applied.alerts);
-  return { alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
+  const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredRuleIds: options.coveredRuleIds });
+  return { alerts: applied.alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
+}
+
+export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
+  const evaluated = await evaluateAlerts(descartesPaths, options);
+  const alerts = await writeAlertRecords(descartesPaths, evaluated.alerts);
+  return { ...evaluated, alerts };
 }
 
 export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
