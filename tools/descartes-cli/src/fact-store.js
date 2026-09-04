@@ -18,6 +18,21 @@ import {
 export const DEFAULT_FACT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const DEFAULT_FACT_MAX_BYTES = 5 * 1024 * 1024; // 5MB
 
+// daybreak-blue security sweep (2026-09-04), fact-store HIGH #5 (cheap-caps portion): bound
+// attribute-key count/length and fact_name/entity_key/source_* lengths so a doctored fact
+// point can't be fully built (and later stored/read back as normal) before any cap applies.
+// Over-cap input is REJECTED (throws), never silently truncated -- see normalizeAttributes
+// and normalizeFactPoint below.
+export const MAX_FACT_ATTRIBUTE_COUNT = 64;
+export const MAX_FACT_ATTRIBUTE_KEY_LENGTH = 160;
+export const MAX_FACT_NAME_LENGTH = 256;
+export const MAX_FACT_ENTITY_KEY_LENGTH = 256;
+export const MAX_FACT_SOURCE_LENGTH = 256;
+// daybreak-blue re-gate (2026-09-04), fact-store MEDIUM: sensitivity is a short categorical
+// label ("operational", "path", "process_identity", ...) throughout the codebase, never a
+// free-form value -- cap it like the other fields so it can't be built unbounded either.
+export const MAX_FACT_SENSITIVITY_LENGTH = 64;
+
 export function resolveFactStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "learned", "facts");
   return { dir, factsFile: path.join(dir, "facts.jsonl") };
@@ -27,9 +42,16 @@ async function ensureFactDir(descartesPaths) {
   await fs.mkdir(resolveFactStorePaths(descartesPaths).dir, { recursive: true, mode: 0o700 });
 }
 
+// daybreak-blue security sweep, fact-store HIGH #4: the raw supplied ts value must never be
+// echoed into an error message (hash-at-source discipline: error/log surfaces never reflect
+// raw, potentially sensitive field values). Report shape (type + string length), not content.
+function describeInvalidTimestamp(value) {
+  return typeof value === "string" ? `string(length=${value.length})` : typeof value;
+}
+
 function normalizeTimestamp(ts = new Date().toISOString()) {
   const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) throw new Error(`Invalid fact timestamp: ${ts}`);
+  if (Number.isNaN(date.getTime())) throw new Error(`Invalid fact timestamp: ${describeInvalidTimestamp(ts)}`);
   return date.toISOString();
 }
 
@@ -37,11 +59,29 @@ function normalizeTimestamp(ts = new Date().toISOString()) {
 // per value, drop undefined/null, collapse non-object/array to {}. Deliberately no
 // Number.isFinite gate anywhere in this module — that gate is exactly what makes
 // history-store.js unsuitable for categorical facts.
+//
+// Divergence from history-store.js's normalizeDimensions (daybreak-blue security sweep,
+// 2026-09-04, HIGH #5): normalizeDimensions has no cap on key COUNT or key LENGTH, so an
+// attacker-controlled attributes object with hundreds of thousands of keys is fully built
+// before any bound applies. Here, over-cap input is REJECTED (thrown -> observable batch
+// abort / schema_invalid on read), not silently truncated -- see MAX_FACT_ATTRIBUTE_COUNT /
+// MAX_FACT_ATTRIBUTE_KEY_LENGTH above. history-store.js's identical gap is left as-is
+// (out of scope for this fix).
 function normalizeAttributes(attributes = {}) {
   if (!attributes || typeof attributes !== "object" || Array.isArray(attributes)) return {};
+  const rawKeyCount = Object.keys(attributes).length;
+  if (rawKeyCount > MAX_FACT_ATTRIBUTE_COUNT) {
+    throw new Error(`Fact point attributes exceed max key count (${rawKeyCount} > ${MAX_FACT_ATTRIBUTE_COUNT})`);
+  }
   const entries = Object.entries(attributes)
     .filter(([, value]) => value !== undefined && value !== null)
-    .map(([key, value]) => [String(key), String(value).slice(0, 160)]);
+    .map(([key, value]) => {
+      const stringKey = String(key);
+      if (stringKey.length > MAX_FACT_ATTRIBUTE_KEY_LENGTH) {
+        throw new Error(`Fact point attribute key exceeds max length (${stringKey.length} > ${MAX_FACT_ATTRIBUTE_KEY_LENGTH})`);
+      }
+      return [stringKey, String(value).slice(0, 160)];
+    });
   return Object.fromEntries(entries);
 }
 
@@ -56,19 +96,46 @@ function normalizeAttributes(attributes = {}) {
  */
 export function normalizeFactPoint(point, defaults = {}) {
   if (!point || typeof point !== "object") throw new Error("Fact point must be an object");
-  const factName = String(point.fact_name ?? "").trim();
+  // daybreak-blue re-gate (2026-09-04), fact-store HIGH #3: fact_name/entity_key were trimmed
+  // BEFORE their length check, so a whitespace-padded over-cap raw value (e.g. 258 chars of
+  // whitespace + "x") normalized down to a tiny trimmed string and sailed through the cap. Check
+  // the RAW string length first -- over-cap raw input is rejected outright, never silently
+  // shrunk by trimming.
+  const rawFactName = String(point.fact_name ?? "");
+  if (rawFactName.length > MAX_FACT_NAME_LENGTH) {
+    throw new Error(`Fact point fact_name exceeds max length (${rawFactName.length} > ${MAX_FACT_NAME_LENGTH})`);
+  }
+  const factName = rawFactName.trim();
   if (!factName) throw new Error("Fact point requires fact_name");
-  const entityKey = String(point.entity_key ?? "").trim();
+  const rawEntityKey = String(point.entity_key ?? "");
+  if (rawEntityKey.length > MAX_FACT_ENTITY_KEY_LENGTH) {
+    throw new Error(`Fact point entity_key exceeds max length (${rawEntityKey.length} > ${MAX_FACT_ENTITY_KEY_LENGTH})`);
+  }
+  const entityKey = rawEntityKey.trim();
   if (!entityKey) throw new Error("Fact point requires entity_key");
+  const sourceEnvelopeId = point.source_envelope_id ? String(point.source_envelope_id) : defaults.source_envelope_id;
+  if (sourceEnvelopeId && sourceEnvelopeId.length > MAX_FACT_SOURCE_LENGTH) {
+    throw new Error(`Fact point source_envelope_id exceeds max length (${sourceEnvelopeId.length} > ${MAX_FACT_SOURCE_LENGTH})`);
+  }
+  const sourceTool = point.source_tool ? String(point.source_tool) : defaults.source_tool;
+  if (sourceTool && sourceTool.length > MAX_FACT_SOURCE_LENGTH) {
+    throw new Error(`Fact point source_tool exceeds max length (${sourceTool.length} > ${MAX_FACT_SOURCE_LENGTH})`);
+  }
+  // daybreak-blue re-gate (2026-09-04), fact-store MEDIUM: sensitivity was an uncapped string --
+  // a multi-megabyte value was accepted unchanged. Mirror the other field caps.
+  const sensitivity = point.sensitivity ? String(point.sensitivity) : "operational";
+  if (sensitivity.length > MAX_FACT_SENSITIVITY_LENGTH) {
+    throw new Error(`Fact point sensitivity exceeds max length (${sensitivity.length} > ${MAX_FACT_SENSITIVITY_LENGTH})`);
+  }
 
   const normalized = {
     ts: normalizeTimestamp(point.ts ?? defaults.ts),
     fact_name: factName,
     entity_key: entityKey,
     attributes: normalizeAttributes(point.attributes),
-    source_envelope_id: point.source_envelope_id ? String(point.source_envelope_id) : defaults.source_envelope_id,
-    source_tool: point.source_tool ? String(point.source_tool) : defaults.source_tool,
-    sensitivity: point.sensitivity ? String(point.sensitivity) : "operational",
+    source_envelope_id: sourceEnvelopeId,
+    source_tool: sourceTool,
+    sensitivity,
   };
 
   const confidence = Number(point.confidence);
@@ -138,7 +205,24 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   const storePaths = resolveFactStorePaths(descartesPaths);
   const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
+  // daybreak-blue security sweep, fact-store BLOCKER #1: a non-finite retentionMs (e.g.
+  // "garbage" -> NaN cutoff) makes every valid record satisfy neither `tsMs < cutoff`
+  // (age-evicted) nor `tsMs >= cutoff` (kept candidate) -- it is silently dropped and the
+  // rewrite commits as an empty, status:intact store. Validate all three inputs up front
+  // instead of letting a bad value flow into arithmetic that can silently erase history.
+  // Zero is a legitimate, fully-accounted degenerate case (evict-everything /
+  // keep-nothing — see evidence-freeze.test.js's deliberate 0-retention/0-byte isolation
+  // sweep), so only non-finite/negative values are rejected, not zero.
+  if (!Number.isFinite(retentionMs) || retentionMs < 0) {
+    throw new Error("enforceFactRetention requires a finite, non-negative retentionMs");
+  }
+  if (!Number.isFinite(maxBytes) || maxBytes < 0) {
+    throw new Error("enforceFactRetention requires a finite, non-negative maxBytes");
+  }
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("enforceFactRetention requires options.now to parse as a valid date");
+  }
   const cutoffMs = nowMs - retentionMs;
   const nowIso = new Date(nowMs).toISOString();
   const {
@@ -183,6 +267,13 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   const keptLines = keptReversed.reverse();
   const keptRecords = keptLines.map((line) => JSON.parse(line));
   const bytecapEvicted = candidates.length - keptRecords.length;
+  // daybreak-blue security sweep, fact-store BLOCKER #1, fix layer 2: every valid record must
+  // be either kept or counted as an observable eviction (age/bytecap) -- no valid record may
+  // silently vanish from the accounting. This is a defense-in-depth backstop against this bug
+  // and any future silent-drop class, regardless of which input caused it.
+  if (keptRecords.length + ageEvicted.length + bytecapEvicted !== validRecords.length) {
+    throw new Error("enforceFactRetention accounting mismatch: kept + evicted counts do not sum to the valid record count");
+  }
   const counts = {
     corrupt_count: corruptBefore,
     schema_invalid_count: schemaInvalid.length,
@@ -258,6 +349,17 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
 export async function readFactPoints(descartesPaths, options = {}) {
   const storePaths = resolveFactStorePaths(descartesPaths);
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  if (options.now !== undefined && !Number.isFinite(nowMs)) {
+    throw new Error("readFactPoints requires options.now to parse as a valid date");
+  }
+  // daybreak-blue security sweep, fact-store BLOCKER #2: a malformed/negative windowMs made
+  // sinceMs NaN, which drops every point from BOTH the point filter AND buildCompleteness's
+  // asOfMs boundary -- reproduced against a PROVEN-intact store, windowMs:"garbage"/-1000
+  // returned points:[] status:intact over a real store. Validate up front so sinceMs can
+  // never be NaN.
+  if (options.windowMs !== undefined && (!Number.isFinite(options.windowMs) || options.windowMs < 0)) {
+    throw new Error("readFactPoints requires a finite, non-negative windowMs");
+  }
   const sinceMs = options.windowMs !== undefined ? nowMs - options.windowMs : undefined;
   const { records, corrupt_count, bytes, raw_bytes: rawBytes, exists } = await readJsonLines(storePaths.factsFile);
   let schemaInvalidCount = 0;

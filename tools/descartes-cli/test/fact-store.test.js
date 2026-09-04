@@ -10,6 +10,12 @@ import {
   DEFAULT_FACT_MAX_BYTES,
   DEFAULT_FACT_RETENTION_MS,
   enforceFactRetention,
+  MAX_FACT_ATTRIBUTE_COUNT,
+  MAX_FACT_ATTRIBUTE_KEY_LENGTH,
+  MAX_FACT_ENTITY_KEY_LENGTH,
+  MAX_FACT_NAME_LENGTH,
+  MAX_FACT_SENSITIVITY_LENGTH,
+  MAX_FACT_SOURCE_LENGTH,
   normalizeFactPoint,
   readFactPoints,
   resolveFactStorePaths,
@@ -184,4 +190,152 @@ test("enforceFactRetention rewrites the file atomically (tmp file appears then i
 
   const dirEntries = await fs.readdir(storePaths.dir);
   assert(!dirEntries.some((entry) => entry.endsWith(".tmp")), "no leftover tmp file after a successful retention rewrite");
+});
+
+// daybreak-blue security sweep (2026-09-04), fact-store BLOCKER #1: a malformed retentionMs
+// (e.g. "garbage" -> NaN cutoff) made every valid record satisfy neither the age-evicted nor
+// the kept/candidate branch, so it was silently dropped -- the rewrite committed as an empty,
+// status:intact store. Reject non-finite/negative retentionMs/maxBytes up front instead of
+// letting them flow into arithmetic that can silently erase history. Zero is a legitimate,
+// fully-accounted degenerate case (evict-everything/keep-nothing -- see
+// evidence-freeze.test.js's deliberate 0-retention/0-byte isolation sweep against this same
+// function), so it stays valid; only non-finite/negative values are rejected.
+test("enforceFactRetention throws on a non-finite/negative retentionMs or maxBytes instead of silently erasing history", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-07-10T00:00:00.000Z";
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts },
+  ], { ts, now: ts });
+
+  await assert.rejects(() => enforceFactRetention(paths, { now: ts, retentionMs: "garbage" }), /retentionMs/);
+  await assert.rejects(() => enforceFactRetention(paths, { now: ts, retentionMs: NaN }), /retentionMs/);
+  await assert.rejects(() => enforceFactRetention(paths, { now: ts, retentionMs: -1 }), /retentionMs/);
+  await assert.rejects(() => enforceFactRetention(paths, { now: ts, maxBytes: NaN }), /maxBytes/);
+  await assert.rejects(() => enforceFactRetention(paths, { now: ts, maxBytes: -1 }), /maxBytes/);
+
+  // None of the rejected calls may have touched the store -- no silent erasure.
+  const { points } = await readFactPoints(paths, { now: ts });
+  assert.equal(points.length, 1);
+
+  // Zero remains valid (a deliberate evict-everything/keep-nothing sweep), fully accounted.
+  const retention = await enforceFactRetention(paths, { now: ts, retentionMs: 0, maxBytes: 0 });
+  assert.equal(retention.kept_count, 0);
+});
+
+// daybreak-blue security sweep, fact-store HIGH #4: normalizeTimestamp's error reflected the
+// raw supplied ts value verbatim -- the only reflecting throw in the file. Errors/logs must
+// never echo raw (potentially sensitive) field values.
+test("normalizeFactPoint's invalid-timestamp error does not reflect the raw supplied value", () => {
+  const sensitive = "/Users/alice/.ssh/id_ed25519";
+  assert.throws(
+    () => normalizeFactPoint({ fact_name: "service.presence", entity_key: "nginx", ts: sensitive }),
+    (error) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message.includes(sensitive), false, "error message must not include the raw invalid timestamp value");
+      return true;
+    },
+  );
+});
+
+// daybreak-blue security sweep, fact-store HIGH #5 (cheap-caps portion): attribute-key count,
+// key length, and fact_name/entity_key/source_* lengths were unbounded -- a fact point with
+// hundreds of thousands of keys was fully built before any cap applied. Over-cap input must be
+// REJECTED (observable batch abort / schema_invalid), never silently truncated.
+test("normalizeFactPoint rejects an attributes object with too many keys instead of silently building it", () => {
+  const attributes = Object.fromEntries(Array.from({ length: MAX_FACT_ATTRIBUTE_COUNT + 1 }, (_, i) => [`key${i}`, "v"]));
+  assert.throws(
+    () => normalizeFactPoint({ fact_name: "service.presence", entity_key: "nginx", attributes }),
+    /attribute/i,
+  );
+});
+
+test("normalizeFactPoint rejects an over-long attribute key instead of silently accepting it", () => {
+  assert.throws(
+    () => normalizeFactPoint({
+      fact_name: "service.presence",
+      entity_key: "nginx",
+      attributes: { [`k${"x".repeat(MAX_FACT_ATTRIBUTE_KEY_LENGTH)}`]: "v" },
+    }),
+    /attribute key/i,
+  );
+});
+
+test("normalizeFactPoint rejects over-long fact_name/entity_key/source_envelope_id/source_tool instead of silently accepting them", () => {
+  assert.throws(() => normalizeFactPoint({ fact_name: "x".repeat(MAX_FACT_NAME_LENGTH + 1), entity_key: "nginx" }), /fact_name/);
+  assert.throws(() => normalizeFactPoint({ fact_name: "service.presence", entity_key: "x".repeat(MAX_FACT_ENTITY_KEY_LENGTH + 1) }), /entity_key/);
+  assert.throws(
+    () => normalizeFactPoint({ fact_name: "service.presence", entity_key: "nginx", source_envelope_id: "x".repeat(MAX_FACT_SOURCE_LENGTH + 1) }),
+    /source_envelope_id/,
+  );
+  assert.throws(
+    () => normalizeFactPoint({ fact_name: "service.presence", entity_key: "nginx", source_tool: "x".repeat(MAX_FACT_SOURCE_LENGTH + 1) }),
+    /source_tool/,
+  );
+});
+
+// daybreak-blue re-gate (2026-09-04), fact-store HIGH #3: fact_name/entity_key were trimmed
+// BEFORE their length check, so a whitespace-padded raw value well over the cap (e.g. 258
+// chars: 257 spaces + "x") normalized down to "x" and sailed through -- the cap only ever
+// looked at the post-trim string. Assert the RAW length is what gets checked.
+test("normalizeFactPoint rejects a whitespace-padded fact_name/entity_key whose RAW length is over cap even though it trims down under it", () => {
+  const paddedName = `${" ".repeat(MAX_FACT_NAME_LENGTH + 1)}x`;
+  assert.equal(paddedName.length, MAX_FACT_NAME_LENGTH + 2);
+  assert.equal(paddedName.trim().length, 1); // trims down to "x" -- must not be what's checked
+  assert.throws(
+    () => normalizeFactPoint({ fact_name: paddedName, entity_key: "nginx" }),
+    /fact_name/,
+  );
+
+  const paddedEntityKey = `${" ".repeat(MAX_FACT_ENTITY_KEY_LENGTH + 1)}x`;
+  assert.equal(paddedEntityKey.trim().length, 1);
+  assert.throws(
+    () => normalizeFactPoint({ fact_name: "service.presence", entity_key: paddedEntityKey }),
+    /entity_key/,
+  );
+});
+
+// daybreak-blue re-gate (2026-09-04), fact-store MEDIUM: sensitivity was an uncapped string --
+// a multi-megabyte value was accepted unchanged into every stored fact point.
+test("normalizeFactPoint rejects an over-cap sensitivity value instead of silently accepting it", () => {
+  assert.throws(
+    () => normalizeFactPoint({
+      fact_name: "service.presence",
+      entity_key: "nginx",
+      sensitivity: "x".repeat(MAX_FACT_SENSITIVITY_LENGTH + 1),
+    }),
+    /sensitivity/,
+  );
+  assert.doesNotThrow(() => normalizeFactPoint({
+    fact_name: "service.presence",
+    entity_key: "nginx",
+    sensitivity: "x".repeat(MAX_FACT_SENSITIVITY_LENGTH),
+  }));
+});
+
+test("appendFactPoints propagates an over-cap point as a whole-batch abort (mirrors the documented atomic-reject convention)", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-07-10T00:00:00.000Z";
+  await assert.rejects(() => appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts },
+    { fact_name: "x".repeat(MAX_FACT_NAME_LENGTH + 1), entity_key: "postgres", attributes: {}, ts },
+  ], { ts, now: ts }));
+
+  const { points } = await readFactPoints(paths, { now: ts });
+  assert.equal(points.length, 0); // neither point in the batch was written
+});
+
+test("readFactPoints counts a disk record with over-cap attributes as schema_invalid rather than throwing or silently accepting it", async () => {
+  const paths = await tempPaths();
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  const oversizedAttributes = Object.fromEntries(Array.from({ length: MAX_FACT_ATTRIBUTE_COUNT + 1 }, (_, i) => [`key${i}`, "v"]));
+  await fs.writeFile(storePaths.factsFile, [
+    JSON.stringify({ ts: "2026-07-10T00:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: {} }),
+    JSON.stringify({ ts: "2026-07-10T00:00:01.000Z", fact_name: "service.presence", entity_key: "oversized", attributes: oversizedAttributes }),
+  ].join("\n"));
+
+  const { points, schema_invalid_count } = await readFactPoints(paths);
+  assert.equal(schema_invalid_count, 1);
+  assert.equal(points.length, 1);
+  assert.equal(points[0].entity_key, "nginx");
 });

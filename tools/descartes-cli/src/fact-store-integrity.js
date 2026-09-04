@@ -95,19 +95,26 @@ function hasExactKeys(value, keys) {
   return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
 }
 
+// daybreak-blue security sweep (2026-09-04), fact-store HIGH #3: Number.isInteger(2^53) is
+// true (2^53 IS an integer, just not one JS floats can distinguish from 2^53+1) -- a
+// hand-crafted/tampered ledger with pass_id at or above 2^53 passed validation, then the next
+// retention pass computed passId = max(2^53, 0) + 1 === 2^53 (float rounds back to the same
+// value), making pending_pass.pass_id <= last_committed_pass_id and crash-looping every
+// subsequent write. Number.isSafeInteger rejects these up front so a poisoned ledger fails
+// closed (invalid -> bootstraps to unknown) instead of crash-looping.
 function isValidPendingPass(value) {
   if (value === null) return true;
   return Boolean(
     value && typeof value === "object" &&
     !Array.isArray(value) &&
     hasExactKeys(value, PENDING_PASS_KEYS) &&
-    Number.isInteger(value.pass_id) && value.pass_id > 0 &&
-    Number.isInteger(value.corrupt_count) && value.corrupt_count >= 0 &&
-    Number.isInteger(value.schema_invalid_count) && value.schema_invalid_count >= 0 &&
-    Number.isInteger(value.bytecap_evicted_count) && value.bytecap_evicted_count >= 0 &&
-    Number.isInteger(value.age_evicted_count) && value.age_evicted_count >= 0 &&
-    Number.isInteger(value.output_record_count) && value.output_record_count >= 0 &&
-    Number.isInteger(value.output_bytes) && value.output_bytes >= 0 &&
+    Number.isSafeInteger(value.pass_id) && value.pass_id > 0 &&
+    Number.isSafeInteger(value.corrupt_count) && value.corrupt_count >= 0 &&
+    Number.isSafeInteger(value.schema_invalid_count) && value.schema_invalid_count >= 0 &&
+    Number.isSafeInteger(value.bytecap_evicted_count) && value.bytecap_evicted_count >= 0 &&
+    Number.isSafeInteger(value.age_evicted_count) && value.age_evicted_count >= 0 &&
+    Number.isSafeInteger(value.output_record_count) && value.output_record_count >= 0 &&
+    Number.isSafeInteger(value.output_bytes) && value.output_bytes >= 0 &&
     isNullableTimestamp(value.output_newest_ts) &&
     isDigest(value.output_digest) &&
     hasCoherentOutput({
@@ -129,13 +136,13 @@ export function isValidFactIntegrityLedger(value) {
   ];
   if (!hasExactKeys(value, LEDGER_KEYS)) return false;
   if (value.schema_version !== FACT_INTEGRITY_SCHEMA_VERSION || typeof value.generation !== "string" || !value.generation) return false;
-  if (totals.some((key) => !Number.isInteger(value[key]) || value[key] < 0)) return false;
+  if (totals.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)) return false;
   if (["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "first_degraded_ts"].some((key) => !isNullableTimestamp(value[key]))) return false;
 
   const continuity = value.continuity;
   if (!continuity || typeof continuity !== "object" || Array.isArray(continuity)) return false;
   if (!hasExactKeys(continuity, CONTINUITY_KEYS) || !Object.prototype.hasOwnProperty.call(continuity, "pending_pass")) return false;
-  if (!["record_count_hwm", "last_rewrite_record_count", "last_rewrite_bytes", "last_committed_pass_id"].every((key) => Number.isInteger(continuity[key]) && continuity[key] >= 0)) return false;
+  if (!["record_count_hwm", "last_rewrite_record_count", "last_rewrite_bytes", "last_committed_pass_id"].every((key) => Number.isSafeInteger(continuity[key]) && continuity[key] >= 0)) return false;
   if (!isNullableTimestamp(continuity.oldest_ts) || !isNullableTimestamp(continuity.last_rewrite_newest_ts) || !isDigest(continuity.output_digest)) return false;
   if (!hasCoherentOutput({
     recordCount: continuity.last_rewrite_record_count,
@@ -253,10 +260,48 @@ export function observeFactContinuity(ledger, live) {
 }
 
 export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live, outputRecords, outputBytes, outputDigest, counts }) {
-  const next = ledger ?? createFactIntegrityLedger();
-  const bootstrap = ledger === null;
+  // daybreak-blue re-gate (2026-09-04) HIGH (residual): a ledger whose last_committed_pass_id
+  // (or a still-pending pass_id) sits exactly at Number.MAX_SAFE_INTEGER is itself perfectly
+  // VALID -- isValidFactIntegrityLedger's Number.isSafeInteger check accepts it -- but the next
+  // passId computed below (+1) would exceed MAX_SAFE_INTEGER. Throwing there (as this used to)
+  // rejects every subsequent retention write forever: the throw happens before the facts
+  // rewrite is renamed into place, so the on-disk ledger never advances past the poisoned
+  // value and the same throw recurs on every future pass -- a permanent fail-STUCK crash loop
+  // (appendFactPoints/enforceFactRetention can never write again), not the fail-closed behavior
+  // the rest of this module aims for. Route pass_id exhaustion through the exact same
+  // fail-closed path an invalid/unreadable ledger already takes below: bootstrap a fresh
+  // ledger and stamp a continuity-break marker, so completeness reads degraded/unknown (never
+  // intact) instead of bricking retention.
+  const priorPassId = ledger
+    ? Math.max(ledger.continuity.last_committed_pass_id, ledger.continuity.pending_pass?.pass_id ?? 0)
+    : 0;
+  const passIdExhausted = ledger !== null && priorPassId >= Number.MAX_SAFE_INTEGER;
+  const bootstrap = ledger === null || passIdExhausted;
+  const next = bootstrap ? createFactIntegrityLedger() : ledger;
+  // daybreak-blue re-gate (2026-09-04) BLOCKER: bootstrapping straight over an INVALID
+  // (tampered/corrupt), UNREADABLE, or pass_id-EXHAUSTED ledger must not let this pass's own
+  // fresh observation silently bless a possibly-shortened store as trustworthy. With no valid
+  // prior ledger to compare against, the freshly-bootstrapped ledger's "last rewrite" fields
+  // are just an echo of whatever the live store looks like right now -- so the very next clean
+  // pass finds itself self-consistent against that echo and flips continuity_ok:true with NO
+  // recorded loss, even though the store may have been truncated moments before (Descartes
+  // re-signing its own shortened state). A genuinely-missing ledger (first-ever run,
+  // ledgerReason "missing") has nothing to distrust and must still be able to reach intact.
+  // "invalid", "unreadable", and pass_id exhaustion all get a now-stamped continuity-break
+  // marker instead, so buildCompleteness degrades (not intact) until that marker ages out of
+  // the retention window -- the same bounded-recovery design already used for a real
+  // continuity break (see lossAtOrAfter).
+  const invalidLedgerBootstrap = bootstrap && (ledgerReason === "invalid" || ledgerReason === "unreadable" || passIdExhausted);
   const priorPending = next.continuity.pending_pass;
   const passId = Math.max(next.continuity.last_committed_pass_id, priorPending?.pass_id ?? 0) + 1;
+  // daybreak-blue security sweep, fact-store HIGH #3, defense-in-depth: pass_id must stay in
+  // the exactly-representable integer range for strict monotonicity to hold. isValidPendingPass
+  // rejects >= 2^53 on load, and passIdExhausted above reroutes a ledger already AT
+  // MAX_SAFE_INTEGER to a fresh bootstrap (passId resets to 1), so this should be unreachable
+  // from this function -- fenced anyway in case a ledger reaches here by another path.
+  if (passId > Number.MAX_SAFE_INTEGER) {
+    throw new Error("fact-store integrity ledger pass_id would exceed Number.MAX_SAFE_INTEGER");
+  }
   const continuityObservation = bootstrap ? "unknown" : observeFactContinuity(next, live);
   const outputNewestTs = newestTimestamp(outputRecords);
   const outputOldestTs = oldestTimestamp(outputRecords);
@@ -282,15 +327,41 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
   const bytecapDelta = addCount("bytecap_evicted_count", counts.bytecap_evicted_count);
   const ageDelta = addCount("age_evicted_count", counts.age_evicted_count);
 
-  next.corrupt_dropped_total += corruptDelta;
-  next.schema_invalid_dropped_total += schemaInvalidDelta;
-  next.bytecap_evicted_total += bytecapDelta;
-  next.age_evicted_total += ageDelta;
+  // daybreak-blue re-gate HIGH #2: a total already at Number.MAX_SAFE_INTEGER is itself a
+  // valid, safe integer, but `total + delta` (delta > 0) overflows into an UNSAFE integer --
+  // isValidFactIntegrityLedger then rejects it and writeFactIntegrityLedger throws "Invalid
+  // fact-store integrity ledger" on this pass. Because the throw happens before the facts
+  // rewrite is renamed into place, the on-disk store (and its offending delta source, e.g. a
+  // persistently-corrupt line) is untouched, so the very same overflow recurs on every future
+  // pass: a permanent crash loop that bricks appendFactPoints/enforceFactRetention for good.
+  // Saturate instead of incrementing past MAX_SAFE_INTEGER -- the counter stops being exact at
+  // that point (an already-astronomical count), but stays a safe integer and the pass
+  // completes; last_corrupt_ts/last_schema_invalid_ts/etc. below still record the ongoing loss
+  // independently of the exact total, so this never masks a real, current degradation.
+  // daybreak-blue re-gate HIGH #2: a total already at Number.MAX_SAFE_INTEGER is itself a
+  // valid, safe integer, but `total + delta` (delta > 0) overflows into an UNSAFE integer --
+  // isValidFactIntegrityLedger then rejects it and writeFactIntegrityLedger throws "Invalid
+  // fact-store integrity ledger" on this pass. Because the throw happens before the facts
+  // rewrite is renamed into place, the on-disk store (and its offending delta source, e.g. a
+  // persistently-corrupt line) is untouched, so the very same overflow recurs on every future
+  // pass: a permanent crash loop that bricks appendFactPoints/enforceFactRetention for good.
+  // Saturate instead of incrementing past MAX_SAFE_INTEGER -- the counter stops being exact at
+  // that point (an already-astronomical count), but stays a safe integer and the pass
+  // completes; last_corrupt_ts/last_schema_invalid_ts/etc. below still record the ongoing loss
+  // independently of the exact total, so this never masks a real, current degradation.
+  const addSaturating = (total, delta) => {
+    const sum = total + delta;
+    return Number.isSafeInteger(sum) ? sum : Number.MAX_SAFE_INTEGER;
+  };
+  next.corrupt_dropped_total = addSaturating(next.corrupt_dropped_total, corruptDelta);
+  next.schema_invalid_dropped_total = addSaturating(next.schema_invalid_dropped_total, schemaInvalidDelta);
+  next.bytecap_evicted_total = addSaturating(next.bytecap_evicted_total, bytecapDelta);
+  next.age_evicted_total = addSaturating(next.age_evicted_total, ageDelta);
   if (corruptDelta > 0) next.last_corrupt_ts = nowIso;
   if (schemaInvalidDelta > 0) next.last_schema_invalid_ts = nowIso;
   if (bytecapDelta > 0) next.last_bytecap_evict_ts = nowIso;
-  if (effectiveContinuityBreak) next.last_continuity_break_ts = nowIso;
-  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + effectiveContinuityBreak) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
+  if (effectiveContinuityBreak || invalidLedgerBootstrap) next.last_continuity_break_ts = nowIso;
+  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + effectiveContinuityBreak + invalidLedgerBootstrap) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
 
   next.continuity = {
     record_count_hwm: Math.max(next.continuity.record_count_hwm, live.record_count, outputRecords.length),
