@@ -55,34 +55,44 @@ test("lstat permission errors degrade the envelope to warning", async () => {
   assert.equal(evidence.result.canaries[0].status, "unreadable");
 });
 
-test("execution sentinel uses access existence checks only", async () => {
+// Round-2 fix (positive-evidence re-gate, finding 4): "executed" is now determined by lstat-ing
+// the SENTINEL path itself, never access()/stat() -- lstat never follows a final symlink
+// component, so this cannot be fooled by a dangling sentinel symlink whose TARGET an attacker
+// later creates (see the dedicated dangling-symlink test below). This test pinned the old,
+// buggy access(F_OK) behavior; updated to the lstat-only semantics.
+test("execution sentinel uses lstat existence checks only, never access()", async () => {
   const calls = [];
+  const stubStat = { atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 };
   const evidence = await collectCanaryEvidence(
     [{ id: "sentinel", kind: "scheduled-job", path: "/fixture", watch: ["executed"], sentinel_path: "/sentinel" }],
     {
-      lstat: async () => ({ atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 }),
-      access: async (...args) => { calls.push(args); },
+      lstat: async (targetPath) => { calls.push(targetPath); return stubStat; },
     },
   );
   assert.equal(evidence.result.canaries[0].executed, "true");
-  assert.deepEqual(calls, [["/sentinel", 0]]);
+  assert.deepEqual(calls, ["/fixture", "/sentinel"]);
 
   const absentSentinel = await collectCanaryEvidence(
     [{ id: "sentinel", kind: "scheduled-job", path: "/fixture", watch: ["executed"], sentinel_path: "/sentinel" }],
     {
-      lstat: async () => ({ atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 }),
-      access: async () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; },
+      lstat: async (targetPath) => {
+        if (targetPath === "/sentinel") { const error = new Error("missing"); error.code = "ENOENT"; throw error; }
+        return stubStat;
+      },
     },
   );
   assert.equal(absentSentinel.result.canaries[0].executed, "false");
 });
 
-test("a non-ENOENT access() failure (e.g. EACCES) degrades executed to unknown, never a fabricated false", async () => {
+test("a non-ENOENT lstat() failure on the sentinel (e.g. EACCES) degrades executed to unknown, never a fabricated false", async () => {
+  const stubStat = { atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 };
   const evidence = await collectCanaryEvidence(
     [{ id: "sentinel", kind: "scheduled-job", path: "/fixture", watch: ["executed"], sentinel_path: "/sentinel" }],
     {
-      lstat: async () => ({ atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 }),
-      access: async () => { const error = new Error("denied"); error.code = "EACCES"; throw error; },
+      lstat: async (targetPath) => {
+        if (targetPath === "/sentinel") { const error = new Error("denied"); error.code = "EACCES"; throw error; }
+        return stubStat;
+      },
     },
   );
   assert.equal(evidence.result.canaries[0].executed, "unknown");
@@ -92,23 +102,66 @@ test("a non-ENOENT access() failure (e.g. EACCES) degrades executed to unknown, 
   const evidenceNoCode = await collectCanaryEvidence(
     [{ id: "sentinel", kind: "scheduled-job", path: "/fixture", watch: ["executed"], sentinel_path: "/sentinel" }],
     {
-      lstat: async () => ({ atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 }),
-      access: async () => { throw new Error("unspecified failure"); },
+      lstat: async (targetPath) => {
+        if (targetPath === "/sentinel") throw new Error("unspecified failure");
+        return stubStat;
+      },
     },
   );
   assert.equal(evidenceNoCode.result.canaries[0].executed, "unknown");
 });
 
+// Round-2 fix (finding 4) dedicated regression: a dangling sentinel SYMLINK must report
+// executed:"true" the moment it exists (its own lstat identity, unaffected by whether the target
+// exists) and must NOT flip on account of the target appearing/disappearing later -- lstat never
+// resolves the final symlink component, unlike the old access(F_OK), which followed it and would
+// fabricate a false->true "executed" transition purely from the target being created.
+test("[round-2 fix] a dangling sentinel symlink reports executed:'true' from lstat alone, unaffected by whether its target exists", async () => {
+  const dir = await fixtureDir();
+  try {
+    const file = path.join(dir, "credential.bak");
+    const sentinel = path.join(dir, "credential.bak.executed");
+    const target = path.join(dir, "never-created-target");
+    await fs.writeFile(file, "fixture");
+    await fs.symlink(target, sentinel); // dangling: target does not exist
+    const watch = ["mtime", "executed"];
+
+    const before = await collectCanaryEvidence([{ id: "aws-backup", kind: "credential-file", path: file, watch, sentinel_path: sentinel }]);
+    const beforeEntry = before.result.canaries[0];
+    assert.equal(beforeEntry.executed, "true");
+    const beforeSentinelLstat = await fs.lstat(sentinel);
+
+    // The attacker (or anything else) creates ONLY the target -- the sentinel symlink itself is
+    // untouched.
+    await fs.writeFile(target, "now exists");
+
+    const after = await collectCanaryEvidence([{ id: "aws-backup", kind: "credential-file", path: file, watch, sentinel_path: sentinel }]);
+    const afterEntry = after.result.canaries[0];
+    assert.equal(afterEntry.executed, "true");
+    const afterSentinelLstat = await fs.lstat(sentinel);
+    // The sentinel's OWN identity (ino/mtime) is unchanged -- no real event occurred at the
+    // sentinel itself, only at its (irrelevant, per lstat-only semantics) target.
+    assert.equal(afterSentinelLstat.ino, beforeSentinelLstat.ino);
+    assert.equal(afterSentinelLstat.mtimeMs, beforeSentinelLstat.mtimeMs);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("P1 fix: a sentinel EACCES degrades the whole envelope to warning even though lstat succeeded", async () => {
+  const stubStat = { atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 };
   const evidence = await collectCanaryEvidence(
     [{ id: "sentinel", kind: "scheduled-job", path: "/fixture", watch: ["executed"], sentinel_path: "/sentinel" }],
     {
-      lstat: async () => ({ atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 }),
-      access: async () => { const error = new Error("denied"); error.code = "EACCES"; throw error; },
+      lstat: async (targetPath) => {
+        if (targetPath === "/sentinel") { const error = new Error("denied"); error.code = "EACCES"; throw error; }
+        return stubStat;
+      },
     },
   );
-  // lstat succeeded (no unreadable canary), yet a real execution-check failure occurred — the
-  // envelope must still degrade to "warning", not silently report "ok" and lose the blackout.
+  // lstat succeeded for the canary's own path (no unreadable canary), yet a real execution-check
+  // failure occurred on the sentinel — the envelope must still degrade to "warning", not silently
+  // report "ok" and lose the blackout.
   assert.equal(evidence.result.canaries[0].status, "ok");
   assert.equal(evidence.result.canaries[0].executed, "unknown");
   assert.equal(evidence.result.summary.unreadable_count, 0);
@@ -121,8 +174,10 @@ test("an executed-watch with no sentinel_path configured is a config error -> un
   const evidence = await collectCanaryEvidence(
     [{ id: "misconfigured", kind: "scheduled-job", path: "/fixture", watch: ["executed"] }],
     {
-      lstat: async () => ({ atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 }),
-      access: async () => { throw new Error("should never be called: no sentinel_path configured"); },
+      lstat: async (targetPath) => {
+        if (targetPath !== "/fixture") throw new Error("should never lstat anything but the canary's own path: no sentinel_path configured");
+        return { atime: new Date(1), mtime: new Date(2), ino: 3, size: 4 };
+      },
     },
   );
   const entry = evidence.result.canaries[0];

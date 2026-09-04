@@ -1,10 +1,9 @@
 // Filesystem-only canary collector. This module is deliberately read-only: it uses lstat for
-// metadata and access(F_OK) for optional execution sentinels, never reads file contents, starts a
-// listener, or shells out. Canary paths are supplied by the manifest loader so this collector is
-// easy to exercise against fixture files.
+// metadata, INCLUDING for optional execution sentinels (never access(), never a stat that follows
+// symlinks), never reads file contents, starts a listener, or shells out. Canary paths are
+// supplied by the manifest loader so this collector is easy to exercise against fixture files.
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 export const MAX_CANARIES = 200;
@@ -35,7 +34,7 @@ function statAttribute(value) {
   return value instanceof Date ? value.toISOString() : String(value);
 }
 
-async function collectOneCanary(canary, lstat, access) {
+async function collectOneCanary(canary, lstat) {
   let stat;
   try {
     stat = await lstat(canary.path);
@@ -72,15 +71,23 @@ async function collectOneCanary(canary, lstat, access) {
     } else {
       result.executed = "false";
       try {
-        await access(canary.sentinel_path, fsConstants.F_OK);
+        // Round-2 fix (positive-evidence re-gate, finding 4): lstat the SENTINEL itself, never
+        // access()/stat() it. access(F_OK) follows symlinks -- if sentinel_path is (or becomes) a
+        // dangling symlink, access() resolves and stats its TARGET, so an attacker who merely
+        // creates the target (never touching the sentinel path itself) flips "executed" to
+        // "true" even though the sentinel's own lstat identity (ino/mtime) never changed. lstat
+        // never follows the final symlink component, so "executed" here reflects only whether the
+        // sentinel path itself exists (ENOENT vs. present) -- exactly like every other watch in
+        // this collector, which is lstat-only by the same module-header invariant.
+        await lstat(canary.sentinel_path);
         result.executed = "true";
       } catch (error) {
         // Degrade-not-fabricate (HIGH fix, canary collector review): only an ENOENT — the
         // sentinel genuinely does not exist — is real evidence of "not executed", so only
-        // ENOENT is allowed to leave `executed` at its "false" default. Any OTHER access()
+        // ENOENT is allowed to leave `executed` at its "false" default. Any OTHER lstat()
         // failure (EACCES, or any error without a recognized code) means we simply don't know
         // whether the sentinel exists: asserting "false" here would plant a fabricated
-        // false-baseline that a LATER successful access (e.g. a permission fix, or an
+        // false-baseline that a LATER successful lstat (e.g. a permission fix, or an
         // attacker manipulating perms) could flip to "true", manufacturing a false->true
         // "executed" trip canary-baseline.js never actually observed. Fail closed to
         // "unknown" instead — canary-baseline.js's trip comparison only fires on an explicit
@@ -95,14 +102,13 @@ async function collectOneCanary(canary, lstat, access) {
 
 export async function collectCanaryEvidence(canaries = [], options = {}) {
   const lstat = options.lstat ?? fs.lstat;
-  const access = options.access ?? fs.access;
   const boundedCanaries = Array.isArray(canaries) ? canaries.slice(0, MAX_CANARIES) : [];
   const truncated = Array.isArray(canaries) && canaries.length > MAX_CANARIES;
 
   return timedEnvelope(async () => {
     const results = [];
     for (const canary of boundedCanaries) {
-      results.push(await collectOneCanary(canary, lstat, access));
+      results.push(await collectOneCanary(canary, lstat));
     }
     const summary = {
       total_count: results.length,

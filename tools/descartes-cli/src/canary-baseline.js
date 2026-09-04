@@ -671,7 +671,50 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
     const identityFingerprint = canaryIdentityFingerprint(entry.path, entry.sentinel_path);
     if (canaryId && identityFingerprint) currentCanaryIdentityFingerprints.set(canaryId, identityFingerprint);
   }
-  const trips = manifestReadOk ? rawTrips.filter((entry) => currentCanaryIds.has(entry.canary_id)) : rawTrips;
+  const invalidManifestEntries = Array.isArray(manifestResult?.invalid_entries) ? manifestResult.invalid_entries : [];
+
+  // Round-3 fix (positive-evidence suppression, daybreak-blue re-gate): canary.tripped is POSITIVE
+  // two-snapshot evidence computed ENTIRELY off persisted fact-history (detectCanaryTrips never
+  // reads the manifest, and rawTrips above already required minEstablishedCount sightings under a
+  // stable identity before a trip is even produced) -- once observed, it must never be
+  // suppressible by an attacker's manifest manipulation. The gate just above (currentCanaryIds)
+  // exists to catch a LEGITIMATE decommission: the operator deletes the entry outright, so no
+  // manifest entry -- valid OR isolated -- resolves to that entity_key anywhere any more. Round 2's
+  // isolation fix (canary-manifest.js) means an entity_key collision or a manifest-order cap-flood
+  // does NOT decommission the colliding/flooded-out id -- it isolates it, and the manifest still
+  // "knows about" it via `invalid_entries`. That distinction -- present-but-isolated vs.
+  // genuinely-absent -- is exactly what tells an attacker-forced isolation apart from a real
+  // decommission, so a rawTrip whose canary_id resolves to one of these isolated entries is let
+  // through even though currentCanaryIds excludes it. This can only ever UN-suppress a trip that
+  // was already genuinely computed from real fact-history two-snapshot diffs; it can never
+  // fabricate one -- an attacker who manipulates only the manifest (never touching the canary
+  // itself) still produces zero rawTrips to un-suppress. "empty_entity_key" is deliberately left
+  // out of the reason allowlist: it sanitizes to nothing (falsy) and so can never equal a real
+  // canary_id in the first place.
+  //
+  // canary_vanished (below) is deliberately NOT given the same treatment: unlike canary.tripped,
+  // it is an ABSENCE claim, fabricable from incomplete/manipulated state, so isolation there
+  // correctly stays conservative (no vanished claim) rather than being made immune the same way --
+  // see detectCanaryVanished's own currentCanaryIds gate and the "manifest_oversized... NOT a
+  // fabricated canary_vanished" test above, both intentionally unchanged by this fix.
+  //
+  // Round-4 fix (positive-evidence isolation completeness, daybreak-blue finding 3):
+  // "schema_invalid" joins the allowlist for the exact same reason entity_key_collision/
+  // manifest_oversized are here -- canary-manifest.js's loader now isolates (rather than silently
+  // drops) a per-entry validation failure whose id is still usable (e.g. an established canary's
+  // `path` accidentally dropped by a config edit), and that id is just as PRESENT-but-malformed in
+  // the manifest as a collision/cap-flood victim. "empty_entity_key" stays deliberately excluded
+  // (unchanged): it sanitizes to nothing and so can never equal a real canary_id in the first
+  // place, exactly as noted above.
+  const isolatedEntityKeys = new Set(
+    invalidManifestEntries
+      .filter((entry) => entry.reason === "entity_key_collision" || entry.reason === "manifest_oversized" || entry.reason === "schema_invalid")
+      .map((entry) => sanitizeEntityKey(entry.id))
+      .filter(Boolean),
+  );
+  const trips = manifestReadOk
+    ? rawTrips.filter((entry) => currentCanaryIds.has(entry.canary_id) || isolatedEntityKeys.has(entry.canary_id))
+    : rawTrips;
   const outputTrips = trips;
 
   // MANIFEST TAMPER (tamper fix, canary v0 finalization): read_ok:false is a genuine read/parse/
@@ -686,6 +729,30 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   const tamperEntries = [];
   if (manifestResult?.read_ok === false) {
     tamperEntries.push({ reason: "manifest_unreadable" });
+  }
+  // Round-2 fix (findings 2/3/5): canary-manifest.js's loadCanaryManifest now ISOLATES an
+  // entity_key collision, an id that sanitizes to no safe entity_key, or an entry beyond the
+  // MAX_CANARIES cap -- rather than failing the WHOLE manifest closed the way round 1 did -- so
+  // every OTHER canary keeps collecting/gating normally. An isolated entry never reaches
+  // `canaries` above (currentCanaryIds excludes it, so it can never be gated as "still monitored")
+  // and would otherwise vanish with no operator-visible signal at all; surfaced here as its own
+  // canary.tampered instead. Ungated by coldStartPendingThisTick, same as manifest_unreadable
+  // above: this is a direct manifest-shape signal, not a fact-history novelty/absence claim.
+  // (invalidManifestEntries itself is computed earlier, above the trips filter -- round-3 fix --
+  // and reused here unchanged.)
+  //
+  // Round-4 fix: this loop was already reason-agnostic, so "schema_invalid" entries (a per-entry
+  // validation failure with a still-usable id -- see canary-manifest.js/isolatedEntityKeys above)
+  // fall into it unchanged and get their own canary.tampered exactly like entity_key_collision/
+  // manifest_oversized/empty_entity_key already do -- no new branch needed here. This is a
+  // deliberate policy choice, not an oversight: a present-but-malformed manifest entry (bad path/
+  // kind/watch on an otherwise-identifiable id) is itself worth flagging to the operator, same as
+  // any other isolated entry -- "surfacing a malformed present-entry as an anomaly is desirable;
+  // the silent-drop was the bug" (round-4 dispatch). No existing test's tamper count regresses:
+  // no pre-round-4 test constructs an `invalid_entries` fixture with reason "schema_invalid", so
+  // this can only add tamper entries for scenarios the round-4 tests below newly cover.
+  for (const entry of invalidManifestEntries) {
+    tamperEntries.push({ reason: entry.reason, canary_id: entry.id, kind: entry.kind });
   }
   // CANARY VANISHED (tamper fix, canary v0 finalization): only meaningful when the manifest itself
   // was read successfully -- with an unreadable manifest, currentCanaryIds is empty and every

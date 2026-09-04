@@ -14,6 +14,7 @@ import {
   resolveCanaryBaselineStorePaths,
   writeCanaryBaselineStore,
 } from "../src/canary-baseline.js";
+import { MAX_CANARIES } from "../src/tools/canary.js";
 
 const ts = (day) => `2026-08-${String(day).padStart(2, "0")}T00:00:00.000Z`;
 
@@ -496,6 +497,349 @@ test("canary vanished: a canary still listed in the manifest that disappears fro
   assert.equal(candidates[0].diagnostics.tamper_reason, "canary_vanished");
   assert.equal(candidates[0].diagnostics.canary_id, "credential");
   assert.equal(candidates[0].diagnostics.last_seen_ts, ts(2));
+});
+
+// Round-2 fix (positive-evidence re-gate, finding 3): canary-manifest.js's loadCanaryManifest now
+// caps `canaries` at MAX_CANARIES itself and isolates anything beyond the cap via
+// `invalid_entries` (reason: "manifest_oversized") rather than letting the collector silently
+// truncate every tick (which used to force the census permanently "partial" and kill ALL
+// canary.tripped/canary_vanished detection, forever, for every canary -- not just the oversized
+// ones). This is the loader-side effect of that fix: a canary that slides past the cap (e.g. an
+// operator inserts an entry above it in canaries.json) must be read as "no longer monitored", NOT
+// fabricated as canary_vanished -- currentCanaryIds/currentCanaryIdentityFingerprints are built
+// from the (capped) `canaries` list, which excludes it, so detectCanaryVanished's identity/
+// membership gates fail closed. It still must not vanish SILENTLY, so a dedicated
+// canary.tampered(manifest_oversized) fires instead.
+test("[round-2 fix] a canary isolated past the MAX_CANARIES cap raises canary.tampered(manifest_oversized), NOT a fabricated canary_vanished", async () => {
+  const points = [
+    presence(1, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
+    presence(2, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
+    // Day 3: "credential" slid past the cap -- the collector was never even asked to look for it,
+    // so (exactly like a genuine ENOENT) no presence fact is emitted, but that alone does not
+    // force the census to "partial".
+    census(3),
+  ];
+  const candidates = await computeCanaryBaselineCandidates({}, {
+    now: ts(3),
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    // The loader isolated "credential" past the cap: it is NOT in `canaries` (so the manifest gate
+    // can never treat it as still-monitored) but IS surfaced via invalid_entries.
+    loadCanaryManifest: async () => ({
+      canaries: [],
+      invalid_entries: [{ id: "credential", kind: "credential-file", reason: "manifest_oversized" }],
+      read_ok: true,
+    }),
+  });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].rule_id, "canary.tampered");
+  assert.equal(candidates[0].severity, "critical");
+  assert.equal(candidates[0].diagnostics.tamper_reason, "manifest_oversized");
+  assert.equal(candidates[0].diagnostics.canary_id, "credential");
+});
+
+// Round-2 fix (findings 2/5) parity: entity_key_collision and empty_entity_key entries isolated by
+// the loader must ALSO raise their own canary.tampered, and must NOT suppress an unrelated,
+// non-isolated canary's genuine canary.tripped in the same tick.
+test("[round-2 fix] entity_key_collision/empty_entity_key entries raise their own canary.tampered without suppressing an unrelated canary's genuine trip", async () => {
+  const points = [
+    presence(1, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
+    presence(2, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
+    // manifestCanary()'s watch is ["atime"] (see its own definition above) -- the transition must
+    // be on atime for detectCanaryTrips to fire.
+    presence(3, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY, atime: "200" }), census(3),
+  ];
+  const candidates = await computeCanaryBaselineCandidates({}, {
+    now: ts(3),
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    loadCanaryManifest: async () => ({
+      canaries: [manifestCanary()],
+      invalid_entries: [
+        { id: "prod/key", kind: "credential-file", reason: "entity_key_collision" },
+        { id: "prod_key", kind: "credential-file", reason: "entity_key_collision" },
+        { id: "////", kind: "credential-file", reason: "empty_entity_key" },
+      ],
+      read_ok: true,
+    }),
+  });
+  const trip = candidates.find((entry) => entry.rule_id === "canary.tripped");
+  assert.ok(trip, "the unrelated, non-isolated canary's genuine trip must still fire");
+  const tampered = candidates.filter((entry) => entry.rule_id === "canary.tampered");
+  assert.equal(tampered.length, 3);
+  assert.deepEqual(tampered.map((entry) => entry.diagnostics.tamper_reason).sort(), [
+    "empty_entity_key", "entity_key_collision", "entity_key_collision",
+  ]);
+});
+
+// Round-3 fix (positive-evidence suppression, daybreak-blue re-gate): canary.tripped is POSITIVE
+// two-snapshot evidence computed purely off fact-history (detectCanaryTrips never reads the
+// manifest at all). Round 2 isolated (rather than dropped-with-the-whole-manifest) an entry that
+// collides with another id's sanitized entity_key or that an attacker pushed past MAX_CANARIES,
+// but the isolated id ALSO fell out of currentCanaryIds -- the same set the manifest-gate uses to
+// tell a legitimate decommission apart from "still monitored". Since the two are keyed off the
+// exact same set, an ESTABLISHED canary that an attacker isolates this way had its own
+// already-observed, genuine trip silently discarded by the gate, indistinguishable from having
+// been cleanly deleted from canaries.json. This regresses exactly that: the attacker never
+// touches "prod_key" itself (no execution, no filesystem access to the canary) -- only the
+// manifest -- yet the genuine two-snapshot atime transition on "prod_key" must still surface as
+// canary.tripped, not be swallowed by the tamper alert alone.
+test("[round-3 fix] an established canary's genuine trip survives a colliding attacker manifest entry (entity_key collision no longer suppresses canary.tripped)", async () => {
+  const points = [
+    presence(1, "prod_key"), census(1),
+    presence(2, "prod_key"), census(2),
+    // Genuine two-snapshot atime transition on day 3 -- real positive evidence, independent of the
+    // manifest entirely.
+    presence(3, "prod_key", { atime: "200" }), census(3),
+  ];
+  const candidates = await computeCanaryBaselineCandidates({}, {
+    now: ts(3),
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    // The attacker adds "prod/key" -- sanitizeEntityKey maps "/" to "_", colliding with the
+    // established "prod_key" -- so canary-manifest.js's loader isolates BOTH entries: neither
+    // reaches `canaries`, both are surfaced via invalid_entries instead.
+    loadCanaryManifest: async () => ({
+      canaries: [],
+      invalid_entries: [
+        { id: "prod_key", kind: "credential-file", reason: "entity_key_collision" },
+        { id: "prod/key", kind: "credential-file", reason: "entity_key_collision" },
+      ],
+      read_ok: true,
+    }),
+  });
+  const trip = candidates.find((entry) => entry.rule_id === "canary.tripped");
+  assert.ok(trip, "the established canary's genuine, already-observed trip must still fire despite the colliding attacker entry");
+  assert.equal(trip.diagnostics.canary_id, "prod_key");
+  assert.equal(trip.diagnostics.trip_reason, "atime_advanced");
+  const tampered = candidates.filter((entry) => entry.rule_id === "canary.tampered");
+  assert.equal(tampered.length, 2, "both isolated entries still each raise their own canary.tampered");
+  assert.deepEqual(tampered.map((entry) => entry.diagnostics.tamper_reason), ["entity_key_collision", "entity_key_collision"]);
+});
+
+// Round-3 fix parity: the same suppression, but via manifest-order cap flooding (finding 2 of the
+// re-gate) instead of a colliding id -- an attacker prepends enough junk entries ahead of the
+// established canary in manifest order to push it past MAX_CANARIES, isolating it as
+// "manifest_oversized" the same way the cap already does for a legitimately-removed canary.
+test("[round-3 fix] an established canary's genuine trip survives being flooded past the manifest cap (manifest_oversized no longer suppresses canary.tripped)", async () => {
+  const points = [
+    presence(1, "prod_key"), census(1),
+    presence(2, "prod_key"), census(2),
+    presence(3, "prod_key", { atime: "200" }), census(3),
+  ];
+  const candidates = await computeCanaryBaselineCandidates({}, {
+    now: ts(3),
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    // The loader isolated "prod_key" past the cap (an attacker prepended 200 entries ahead of it in
+    // manifest order): NOT in `canaries`, surfaced only via invalid_entries.
+    loadCanaryManifest: async () => ({
+      canaries: [],
+      invalid_entries: [{ id: "prod_key", kind: "credential-file", reason: "manifest_oversized" }],
+      read_ok: true,
+    }),
+  });
+  const trip = candidates.find((entry) => entry.rule_id === "canary.tripped");
+  assert.ok(trip, "the established canary's genuine, already-observed trip must still fire despite being flooded past the cap");
+  assert.equal(trip.diagnostics.canary_id, "prod_key");
+  assert.equal(trip.diagnostics.trip_reason, "atime_advanced");
+  const tampered = candidates.filter((entry) => entry.rule_id === "canary.tampered");
+  assert.equal(tampered.length, 1);
+  assert.equal(tampered[0].diagnostics.tamper_reason, "manifest_oversized");
+});
+
+// Round-3 fix, end-to-end with the real loadCanaryManifest (mirrors the P1 end-to-end precedent
+// above at "P1 fix, end-to-end..."): the two mocked round-3 tests above prove the baseline-side
+// filter behaves correctly GIVEN an `invalid_entries` shape, but not that the actual plain-JSON
+// attack canary-manifest.js's loader isolates is closed through the real load path. This writes a
+// genuine canaries.json to disk and lets the real loadCanaryManifest parse/isolate it.
+test("[round-3 fix] end-to-end with the real loadCanaryManifest: a colliding attacker entry in canaries.json does not silence the established canary's genuine trip", async () => {
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-baseline-"));
+  const configRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-manifest-"));
+  const paths = { stateDir: stateRoot, configDir: configRoot };
+  const points = [
+    presence(1, "prod_key"), census(1),
+    presence(2, "prod_key"), census(2),
+    presence(3, "prod_key", { atime: "200" }), census(3),
+  ];
+  try {
+    // "prod_key" is the established canary's real manifest entry; "prod/key" is the attacker's --
+    // sanitizeEntityKey maps "/" to "_", so both resolve to the same entity_key and the real
+    // loader isolates BOTH via entity_key_collision.
+    await fs.writeFile(path.join(configRoot, "canaries.json"), JSON.stringify({
+      schema_version: 1,
+      canaries: [
+        { id: "prod_key", kind: "credential-file", path: "/fixture/prod-key", watch: ["atime"] },
+        { id: "prod/key", kind: "credential-file", path: "/fixture/prod-key-attacker", watch: ["atime"] },
+      ],
+    }));
+    const candidates = await computeCanaryBaselineCandidates(paths, {
+      now: ts(3),
+      establishedMinCensusCount: 2,
+      loadLearnedConfig: async () => ({ enabled: true }),
+      readFactPoints: async () => intactReadResult(points),
+      loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+      writeCanaryBaselineStore: async (_paths, next) => next,
+    });
+    const trip = candidates.find((candidate) => candidate.rule_id === "canary.tripped");
+    assert.ok(trip, "the established canary's genuine trip must still fire through the real loader");
+    assert.equal(trip.diagnostics.canary_id, "prod_key");
+    assert.equal(trip.diagnostics.trip_reason, "atime_advanced");
+    const tampered = candidates.filter((candidate) => candidate.rule_id === "canary.tampered");
+    assert.equal(tampered.length, 2);
+    assert.ok(tampered.every((candidate) => candidate.diagnostics.tamper_reason === "entity_key_collision"));
+  } finally {
+    await fs.rm(stateRoot, { recursive: true, force: true });
+    await fs.rm(configRoot, { recursive: true, force: true });
+  }
+});
+
+test("[round-3 fix] end-to-end with the real loadCanaryManifest: manifest-order cap flooding does not silence the established canary's genuine trip", async () => {
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-baseline-"));
+  const configRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-manifest-"));
+  const paths = { stateDir: stateRoot, configDir: configRoot };
+  const points = [
+    presence(1, "prod_key"), census(1),
+    presence(2, "prod_key"), census(2),
+    presence(3, "prod_key", { atime: "200" }), census(3),
+  ];
+  try {
+    // An attacker prepends MAX_CANARIES junk entries ahead of the established "prod_key" entry in
+    // manifest order, pushing it past the loader's own cap -- isolated as manifest_oversized.
+    const junk = Array.from({ length: MAX_CANARIES }, (_, index) => (
+      { id: `junk-${index}`, kind: "credential-file", path: `/fixture/junk-${index}`, watch: ["atime"] }
+    ));
+    await fs.writeFile(path.join(configRoot, "canaries.json"), JSON.stringify({
+      schema_version: 1,
+      canaries: [...junk, { id: "prod_key", kind: "credential-file", path: "/fixture/prod-key", watch: ["atime"] }],
+    }));
+    const candidates = await computeCanaryBaselineCandidates(paths, {
+      now: ts(3),
+      establishedMinCensusCount: 2,
+      loadLearnedConfig: async () => ({ enabled: true }),
+      readFactPoints: async () => intactReadResult(points),
+      loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+      writeCanaryBaselineStore: async (_paths, next) => next,
+    });
+    const trip = candidates.find((candidate) => candidate.rule_id === "canary.tripped");
+    assert.ok(trip, "the established canary's genuine trip must still fire through the real loader despite cap flooding");
+    assert.equal(trip.diagnostics.canary_id, "prod_key");
+    assert.equal(trip.diagnostics.trip_reason, "atime_advanced");
+    const tampered = candidates.filter((candidate) => candidate.rule_id === "canary.tampered");
+    assert.equal(tampered.length, 1);
+    assert.equal(tampered[0].diagnostics.tamper_reason, "manifest_oversized");
+  } finally {
+    await fs.rm(stateRoot, { recursive: true, force: true });
+    await fs.rm(configRoot, { recursive: true, force: true });
+  }
+});
+
+// Round-4 fix (positive-evidence isolation completeness, daybreak-blue finding 3): rounds 2/3 above
+// isolate an entity_key collision or a manifest-order cap flood so a genuine, already-computed
+// rawTrip for that id survives the currentCanaryIds gate. But canary-manifest.js's loadCanaryManifest
+// used to return `undefined` from its per-entry validation map for EVERY OTHER kind of per-entry
+// failure too -- including one whose declared id is still perfectly usable, e.g. a `path` an
+// operator's config edit accidentally dropped -- and silently drop it with no `invalid_entries`
+// record at all. That id then falls out of BOTH currentCanaryIds AND isolatedEntityKeys, so a
+// genuine two-snapshot rawTrip for an established canary with that id is filtered out exactly as if
+// the operator had cleanly deleted it from canaries.json. Fixed by isolating such entries too
+// (reason: "schema_invalid") -- see canary-manifest.js's `dropOrIsolate`/`schemaInvalidEntries` and
+// this file's own `isolatedEntityKeys` allowlist above.
+//
+// SAFETY INVARIANT under test: this can only ever UN-suppress a rawTrip that detectCanaryTrips
+// ALREADY computed from two real, complete snapshots + freshness + minEstablishedCount established
+// sightings + a real watched-field diff (rawTrips is computed entirely off persisted fact-history,
+// before any manifest processing runs at all -- see computeCanaryBaselineCandidates above).
+// Enlarging isolatedEntityKeys only widens which already-genuine rawTrips survive the
+// currentCanaryIds gate; it can never insert a trip that wasn't already there. The negative-control
+// test below (no usable declared id) proves the fix cannot go further than that.
+test("[round-4 fix] end-to-end with the real loadCanaryManifest: an established canary's genuine trip survives a present-but-invalid manifest entry (missing path -- schema_invalid), which is isolated rather than silently dropped", async () => {
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-baseline-"));
+  const configRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-manifest-"));
+  const paths = { stateDir: stateRoot, configDir: configRoot };
+  const points = [
+    presence(1, "prod_key"), census(1),
+    presence(2, "prod_key"), census(2),
+    presence(3, "prod_key", { atime: "200" }), census(3),
+  ];
+  try {
+    // "prod_key" is the established canary's own manifest entry, but a config edit has since
+    // dropped its `path` -- the id is still declared/usable, so this must isolate (schema_invalid),
+    // not silently drop.
+    await fs.writeFile(path.join(configRoot, "canaries.json"), JSON.stringify({
+      schema_version: 1,
+      canaries: [{ id: "prod_key", kind: "credential-file", watch: ["atime"] }],
+    }));
+    const candidates = await computeCanaryBaselineCandidates(paths, {
+      now: ts(3),
+      establishedMinCensusCount: 2,
+      loadLearnedConfig: async () => ({ enabled: true }),
+      readFactPoints: async () => intactReadResult(points),
+      loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+      writeCanaryBaselineStore: async (_paths, next) => next,
+    });
+    const trip = candidates.find((candidate) => candidate.rule_id === "canary.tripped");
+    assert.ok(trip, "the established canary's genuine trip must still fire through the real loader despite the present-but-invalid entry");
+    assert.equal(trip.diagnostics.canary_id, "prod_key");
+    assert.equal(trip.diagnostics.trip_reason, "atime_advanced");
+    const tampered = candidates.filter((candidate) => candidate.rule_id === "canary.tampered");
+    assert.equal(tampered.length, 1);
+    assert.equal(tampered[0].diagnostics.tamper_reason, "schema_invalid");
+    assert.equal(tampered[0].diagnostics.canary_id, "prod_key");
+  } finally {
+    await fs.rm(stateRoot, { recursive: true, force: true });
+    await fs.rm(configRoot, { recursive: true, force: true });
+  }
+});
+
+// Round-4 fix, negative control (cannot fabricate): an entry with NO usable declared id at all --
+// here, both unusable ("////" sanitizes to nothing safe) AND missing `path` -- can never resolve to
+// a real canary_id, so canary-manifest.js's loader keeps this a genuine SILENT drop (no
+// invalid_entries record, not even schema_invalid -- see canary-manifest.test.js's own coverage of
+// this same boundary at the loader level). Trip-shaped facts recorded directly under that garbage
+// entity_key (bypassing the production invariant that factPointsFromCanaryEvidence can never emit a
+// presence fact with no sanitizable entity_key, purely to stress-test the seam) must still produce
+// NO candidate at all -- neither a fabricated canary.tripped nor a spurious canary.tampered -- and
+// must not crash.
+test("[round-4 fix] negative control: an entry with no usable declared id stays a silent drop -- trip-shaped facts under that garbage key produce NO candidate (not fabricated), no crash", async () => {
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-baseline-"));
+  const configRoot = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-manifest-"));
+  const paths = { stateDir: stateRoot, configDir: configRoot };
+  const points = [
+    presence(1, "////"), census(1),
+    presence(2, "////"), census(2),
+    presence(3, "////", { atime: "200" }), census(3),
+  ];
+  try {
+    await fs.writeFile(path.join(configRoot, "canaries.json"), JSON.stringify({
+      schema_version: 1,
+      canaries: [{ id: "////", kind: "credential-file", watch: ["atime"] }], // no `path`
+    }));
+    const candidates = await computeCanaryBaselineCandidates(paths, {
+      now: ts(3),
+      establishedMinCensusCount: 2,
+      loadLearnedConfig: async () => ({ enabled: true }),
+      readFactPoints: async () => intactReadResult(points),
+      loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+      writeCanaryBaselineStore: async (_paths, next) => next,
+    });
+    assert.deepEqual(candidates, [], "a garbage-id entry with no usable declared id must produce zero candidates -- no fabricated trip, no tamper alert");
+  } finally {
+    await fs.rm(stateRoot, { recursive: true, force: true });
+    await fs.rm(configRoot, { recursive: true, force: true });
+  }
 });
 
 test("legit decommission: a canary removed from the manifest AND gone produces NO tamper alert (indistinguishable from decommission -- inherent host-local limit)", async () => {
