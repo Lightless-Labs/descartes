@@ -5,6 +5,50 @@ import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 const execFileAsync = promisify(execFile);
 const DEFAULT_SERVICE_LIMIT = 80;
 
+// F3 fix (2026-09-04): the 80-item PRESENTATION limit above must never gate what the
+// service-census/baseline machinery sees -- a >80-service host would otherwise have its
+// service-appearance/disappearance baseline permanently stuck at censusState:"partial"
+// (service-baseline.js's completeGroups filter never populates -> establishment gate never
+// fires; see docs findings for F3). This is a SEPARATE, much larger AUTHORITATIVE sanity
+// ceiling: it bounds the full census array returned alongside the presentation-bounded
+// `services` field, and only a genuinely pathological over-enumeration (well beyond any
+// plausible real host inventory) should ever hit it and flip `truncated:true`. This function
+// itself always populates `services_census` (collector-level, platform-agnostic); it is
+// pi-harness.js's on-demand collect_services tool that explicitly strips it back out of its
+// tool result before the model ever sees it (v1: presentation limit only there) -- this
+// remains purely a structural-tick/daemon-path field otherwise.
+//
+// Sizing: chosen conservatively against fact-store.js's shared DEFAULT_FACT_MAX_BYTES (5MB,
+// cross-family) -- up to 1000 service.presence facts/tick at ~150-250 bytes/record is a
+// real (~150-250KB/tick) but bounded slice of that shared budget, versus 2000 which would
+// roughly double the pressure on sibling fact families' retention window for comparatively
+// little extra real-world headroom (real hosts, even large ones, very rarely exceed a few
+// hundred loaded service units). 1000 is still >12x the old 80 cap.
+export const DEFAULT_SERVICE_CENSUS_CEILING = 1000;
+// Hard upper clamp so the authoritative array can never become literally unbounded even if a
+// future caller raises censusCeiling far beyond the sane default (fail-closed backstop for a
+// pathological host, per the fix-spec's "must not become literally unbounded" requirement).
+const MAX_SERVICE_CENSUS_CEILING = 5000;
+
+function boundedCensusCeiling(value, presentationLimit) {
+  const numeric = Number(value);
+  const base = Number.isFinite(numeric) && numeric > 0 ? numeric : DEFAULT_SERVICE_CENSUS_CEILING;
+  return Math.min(Math.max(base, presentationLimit), MAX_SERVICE_CENSUS_CEILING);
+}
+
+// Lighter {identity, running/state} projections for the authoritative census array, so a
+// large real inventory doesn't balloon evidence-envelope size with per-unit `description`/
+// `load`/`active`/`sub`/`pid`/`last_exit_status` fields that factPointsFromServiceEvidence
+// never reads. Field names match what services[] already carries per-manager so downstream
+// consumers (fact-translators.js) branch identically on manager without a shape change.
+function projectSystemdIdentity(service) {
+  return { name: service.name, running: service.running };
+}
+
+function projectLaunchdIdentity(service) {
+  return { label: service.label, state: service.state };
+}
+
 function truncate(value, max = 2048) {
   if (typeof value !== "string") return value;
   return value.length > max ? `${value.slice(0, max)}…` : value;
@@ -120,8 +164,8 @@ export function summarizeLaunchdServices(services, { limit = DEFAULT_SERVICE_LIM
   };
 }
 
-async function collectSystemdServices(limit) {
-  const command = await runFixedCommand("systemctl", [
+export async function collectSystemdServices(limit, censusCeiling, runCommand) {
+  const command = await runCommand("systemctl", [
     "list-units",
     "--type=service",
     "--all",
@@ -135,6 +179,7 @@ async function collectSystemdServices(limit) {
       status: "unable",
       summary: summarizeSystemdServices([], { limit }),
       services: [],
+      services_census: [],
       truncated: false,
       command: command.command,
       error: command.error,
@@ -144,20 +189,30 @@ async function collectSystemdServices(limit) {
 
   const services = parseSystemctlListUnits(command.stdout);
   const summary = summarizeSystemdServices(services, { limit });
+  const truncated = services.length > censusCeiling;
+  if (truncated) {
+    // Never a silent cap: a host genuinely exceeding the authoritative sanity ceiling is a
+    // pathological-enumeration signal worth an operator's attention immediately, not only
+    // discoverable later via census_state:"partial" in fact history.
+    console.warn(
+      `descartes: services collector (systemd) truncated at the authoritative census sanity ceiling (${censusCeiling}); host reports ${services.length} service units -- investigate before trusting the service baseline`,
+    );
+  }
   return {
     platform: process.platform,
     manager: "systemd",
     status: "ok",
     summary,
     services: services.slice(0, limit),
-    truncated: services.length > limit,
+    services_census: services.slice(0, censusCeiling).map(projectSystemdIdentity),
+    truncated,
     command: command.command,
     stderr: command.stderr,
   };
 }
 
-async function collectLaunchdServices(limit) {
-  const command = await runFixedCommand("launchctl", ["list"]);
+export async function collectLaunchdServices(limit, censusCeiling, runCommand) {
+  const command = await runCommand("launchctl", ["list"]);
   if (command.status !== "ok") {
     return {
       platform: process.platform,
@@ -165,6 +220,7 @@ async function collectLaunchdServices(limit) {
       status: "unable",
       summary: summarizeLaunchdServices([], { limit }),
       services: [],
+      services_census: [],
       truncated: false,
       command: command.command,
       error: command.error,
@@ -174,13 +230,20 @@ async function collectLaunchdServices(limit) {
 
   const services = parseLaunchctlList(command.stdout);
   const summary = summarizeLaunchdServices(services, { limit });
+  const truncated = services.length > censusCeiling;
+  if (truncated) {
+    console.warn(
+      `descartes: services collector (launchd) truncated at the authoritative census sanity ceiling (${censusCeiling}); host reports ${services.length} jobs -- investigate before trusting the service baseline`,
+    );
+  }
   return {
     platform: process.platform,
     manager: "launchd",
     status: "ok",
     summary,
     services: services.slice(0, limit),
-    truncated: services.length > limit,
+    services_census: services.slice(0, censusCeiling).map(projectLaunchdIdentity),
+    truncated,
     command: command.command,
     stderr: command.stderr,
   };
@@ -202,17 +265,26 @@ function reviewHint(result) {
   return "none";
 }
 
-export async function collectServiceEvidence({ serviceLimit = DEFAULT_SERVICE_LIMIT } = {}) {
+export async function collectServiceEvidence({
+  serviceLimit = DEFAULT_SERVICE_LIMIT,
+  censusCeiling = DEFAULT_SERVICE_CENSUS_CEILING,
+  // Test-only dependency injection point (mirrors tools/tailscale-status.js's
+  // runFixedExecFile pattern) -- production callers (daemon.js, pi-harness.js) never pass
+  // this, so they always get the real execFile-backed runFixedCommand.
+  runFixedCommand: injectedRunFixedCommand = runFixedCommand,
+} = {}) {
   const limit = boundedLimit(serviceLimit);
+  const ceiling = boundedCensusCeiling(censusCeiling, limit);
   return timedEnvelope(async () => {
-    if (process.platform === "linux") return collectSystemdServices(limit);
-    if (process.platform === "darwin") return collectLaunchdServices(limit);
+    if (process.platform === "linux") return collectSystemdServices(limit, ceiling, injectedRunFixedCommand);
+    if (process.platform === "darwin") return collectLaunchdServices(limit, ceiling, injectedRunFixedCommand);
     return {
       platform: process.platform,
       manager: "unsupported",
       status: "unsupported",
       summary: {},
       services: [],
+      services_census: [],
       truncated: false,
       error: `unsupported platform: ${process.platform}`,
     };

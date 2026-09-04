@@ -95,7 +95,18 @@ export const CANARY_CENSUS_MARKER_ENTITY_KEY = "canary.census-marker.v1";
 export function factPointsFromServiceEvidence(evidence, { ts } = {}) {
   const envelope = evidence.find((e) => e.id === "services" && e.status !== "unable");
   if (!envelope) return [];
-  const services = envelope.result?.services ?? [];
+  // F3 fix (2026-09-04): PREFER the AUTHORITATIVE `services_census` field (bounded by
+  // tools/services.js's much larger census sanity ceiling), not the presentation-bounded
+  // `services` field (capped at 80 for human/LLM display) -- otherwise every host with >80
+  // services would only ever get service.presence facts for the first 80 units the OS
+  // happened to list, and service-baseline.js's censusState==="complete" gate (fed by
+  // serviceCensusStateFor below) would never see a genuinely-complete tick to establish on.
+  // Fall back to `services` when `services_census` is absent: a legacy persisted envelope or a
+  // pre-F3 test fixture only carries `services`, and orphaning it (=> zero service facts) would
+  // silently drop this family and break shadow/appearance wiring. The current collector always
+  // emits `services_census`, so this fallback only ever fires for legacy/degraded input, where the
+  // presentation-bounded list is the best (and pre-F3 identical) evidence available.
+  const services = envelope.result?.services_census ?? envelope.result?.services ?? [];
   const manager = envelope.result?.manager;
 
   const points = services

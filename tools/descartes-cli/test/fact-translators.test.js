@@ -351,7 +351,7 @@ test("unknown scheduled-job kind/source values downgrade the census and never pe
 test("factPointsFromServiceEvidence maps systemd's {name, running:boolean} shape correctly", () => {
   const evidence = [envelope("services", "collect_services", {
     manager: "systemd",
-    services: [
+    services_census: [
       { name: "nginx.service", running: true },
       { name: "postgres.service", running: true },
       { name: "cron.service", running: false },
@@ -373,10 +373,35 @@ test("factPointsFromServiceEvidence maps systemd's {name, running:boolean} shape
   assert.equal(cron.attributes.running, "false");
 });
 
+test("factPointsFromServiceEvidence F3 fix: reads the AUTHORITATIVE services_census field (not the 80-item presentation-bounded `services` field) — a >80-service host gets a service.presence fact for every genuinely-observed unit, and a complete census marker", () => {
+  const servicesCensus = Array.from({ length: 150 }, (_, i) => ({
+    name: `svc${String(i).padStart(6, "0")}.service`,
+    running: i % 2 === 0,
+  }));
+  // The presentation-bounded `services` field, if present at all, must be IGNORED by this
+  // translator — it is capped at 80 and would silently drop the 70 units beyond index 80.
+  const presentationOnly = servicesCensus.slice(0, 80);
+  const evidence = [envelope("services", "collect_services", {
+    manager: "systemd",
+    services: presentationOnly,
+    services_census: servicesCensus,
+    truncated: false,
+  })];
+
+  const points = factPointsFromServiceEvidence(evidence, { ts: TS });
+  const real = points.filter((p) => p.entity_key !== SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(real.length, 150, "must emit one service.presence fact per genuinely-observed unit, not just the first 80 (structurally impossible pre-fix)");
+  assert.ok(real.some((p) => p.entity_key === "svc000149.service"), "a service beyond index 80 must be represented");
+
+  const marker = points.find((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY);
+  assert.ok(marker, "a census marker must still be emitted");
+  assert.equal(marker.attributes.census_state, "complete", "truncated:false on a >80-service host must read census_state:'complete' — a normal-sized host must never be stuck at 'partial'");
+});
+
 test("factPointsFromServiceEvidence branches on launchd's {label, pid, state} shape — no name/running keys at all", () => {
   const evidence = [envelope("services", "collect_services", {
     manager: "launchd",
-    services: [
+    services_census: [
       { label: "com.example.running", pid: 123, last_exit_status: 0, state: "running", nonzero_exit: false },
       { label: "com.example.stopped", pid: null, last_exit_status: 0, state: "not_running", nonzero_exit: false },
     ],
@@ -393,7 +418,7 @@ test("factPointsFromServiceEvidence branches on launchd's {label, pid, state} sh
 });
 
 test("factPointsFromServiceEvidence returns [] for a status:unable envelope (no fabrication) and for missing envelope", () => {
-  const unable = [envelope("services", "collect_services", { manager: "systemd", services: [] }, "unable")];
+  const unable = [envelope("services", "collect_services", { manager: "systemd", services_census: [] }, "unable")];
   assert.deepEqual(factPointsFromServiceEvidence(unable, { ts: TS }), []);
   assert.deepEqual(factPointsFromServiceEvidence([], { ts: TS }), []);
 });
@@ -401,7 +426,7 @@ test("factPointsFromServiceEvidence returns [] for a status:unable envelope (no 
 test("factPointsFromServiceEvidence drops a service entry with unresolvable identity rather than emitting an empty entity_key", () => {
   const evidence = [envelope("services", "collect_services", {
     manager: "systemd",
-    services: [
+    services_census: [
       { name: "", running: true },
       { name: "real.service", running: true },
     ],
@@ -414,7 +439,7 @@ test("factPointsFromServiceEvidence drops a service entry with unresolvable iden
 test("factPointsFromServiceEvidence appends a confidence:0 service census marker on every successful envelope — including a zero-service tick — so absence is representable (Codex #9)", () => {
   // Non-empty tick: marker present, census_state "complete", inert.
   const nonEmpty = factPointsFromServiceEvidence(
-    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "nginx.service", running: true }] })],
+    [envelope("services", "collect_services", { manager: "systemd", services_census: [{ name: "nginx.service", running: true }] })],
     { ts: TS },
   );
   const marker = nonEmpty.find((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY);
@@ -426,7 +451,7 @@ test("factPointsFromServiceEvidence appends a confidence:0 service census marker
 
   // Zero-service tick: the marker is STILL emitted (the whole point — 'collector ran, saw nothing').
   const zero = factPointsFromServiceEvidence(
-    [envelope("services", "collect_services", { manager: "systemd", services: [] })],
+    [envelope("services", "collect_services", { manager: "systemd", services_census: [] })],
     { ts: TS },
   );
   assert.equal(zero.length, 1, "a zero-service tick still emits exactly the census marker");
@@ -435,27 +460,27 @@ test("factPointsFromServiceEvidence appends a confidence:0 service census marker
 
   // Truncated tick: census_state "partial" (must not be read as an authoritative full set).
   const truncated = factPointsFromServiceEvidence(
-    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "a.service", running: true }], truncated: true })],
+    [envelope("services", "collect_services", { manager: "systemd", services_census: [{ name: "a.service", running: true }], truncated: true })],
     { ts: TS },
   );
   assert.equal(truncated.find((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY).attributes.census_state, "partial");
 
   // A "warning" envelope (systemd ran fine but some units failed — census still complete): marker emitted.
   const warning = factPointsFromServiceEvidence(
-    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "a.service", running: true }] }, "warning")],
+    [envelope("services", "collect_services", { manager: "systemd", services_census: [{ name: "a.service", running: true }] }, "warning")],
     { ts: TS },
   );
   assert.ok(warning.some((p) => p.entity_key === SERVICE_CENSUS_MARKER_ENTITY_KEY), "a warning (unhealthy-unit) tick still ran a complete census → marker emitted");
 
   // status:unable / missing envelope: NO marker (nothing ran to census).
-  assert.deepEqual(factPointsFromServiceEvidence([envelope("services", "collect_services", { manager: "systemd", services: [] }, "unable")], { ts: TS }), []);
+  assert.deepEqual(factPointsFromServiceEvidence([envelope("services", "collect_services", { manager: "systemd", services_census: [] }, "unable")], { ts: TS }), []);
   assert.deepEqual(factPointsFromServiceEvidence([], { ts: TS }), []);
 });
 
 test("factPointsFromServiceEvidence emits NO census marker on an 'unknown' (unsupported-platform) envelope — the collector never ran, so 'collector didn't run' stays distinct from 'ran, saw nothing'", () => {
   // collectServiceEvidence maps an unsupported platform to status:"unknown" (NOT "unable"), with an
   // empty services[]. A false "complete" marker here would claim an enumeration that never happened.
-  const unsupported = [envelope("services", "collect_services", { manager: "unsupported", services: [] }, "unknown")];
+  const unsupported = [envelope("services", "collect_services", { manager: "unsupported", services_census: [] }, "unknown")];
   assert.deepEqual(factPointsFromServiceEvidence(unsupported, { ts: TS }), [], "no facts and NO census marker on an unsupported-platform tick");
 });
 
@@ -467,7 +492,7 @@ test("the service census marker cannot dilute a real service's mined confidence 
     const ts = new Date(base + i * 3 * DAY_MS).toISOString();
     // A launchd job labelled EXACTLY the reserved marker key — worst case for collision.
     history.push(...factPointsFromServiceEvidence(
-      [envelope("services", "collect_services", { manager: "launchd", services: [{ label: SERVICE_CENSUS_MARKER_ENTITY_KEY, state: "running" }] })],
+      [envelope("services", "collect_services", { manager: "launchd", services_census: [{ label: SERVICE_CENSUS_MARKER_ENTITY_KEY, state: "running" }] })],
       { ts },
     ));
   }
@@ -479,7 +504,7 @@ test("the service census marker cannot dilute a real service's mined confidence 
 
 test("the service census marker is inert in buildShadowFactLookup — its confidence:0 excludes it, so its target never resolves to a value", () => {
   const points = factPointsFromServiceEvidence(
-    [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "nginx.service", running: true }] })],
+    [envelope("services", "collect_services", { manager: "systemd", services_census: [{ name: "nginx.service", running: true }] })],
     { ts: TS },
   );
   const lookup = buildShadowFactLookup(points);
@@ -494,7 +519,7 @@ test("the service census marker is never mined into a constraint, even across en
   for (let i = 0; i < 4; i += 1) {
     const ts = new Date(base + i * 3 * DAY_MS).toISOString(); // 4 ticks spanning 9 days
     history.push(...factPointsFromServiceEvidence(
-      [envelope("services", "collect_services", { manager: "systemd", services: [{ name: "nginx.service", running: true }] })],
+      [envelope("services", "collect_services", { manager: "systemd", services_census: [{ name: "nginx.service", running: true }] })],
       { ts },
     ));
   }
@@ -582,7 +607,7 @@ test("sanitizeEntityKey is exported and delegates to the shared diagnostics-sani
 test("a hostile path-shaped service name is truncated/redacted before it ever reaches entity_key, end-to-end from raw collector shape to stored fact point", () => {
   const evidence = [envelope("services", "collect_services", {
     manager: "systemd",
-    services: [
+    services_census: [
       { name: "/usr/local/bin/../../etc/passwd", running: true },
     ],
   })];

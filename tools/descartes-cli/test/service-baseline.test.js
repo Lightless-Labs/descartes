@@ -7,7 +7,7 @@ import test from "node:test";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { isFixedLengthHexHash, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
-import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
+import { factPointsFromServiceEvidence, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
   DEFAULT_BASELINE_FACT_WINDOW_MS,
@@ -89,6 +89,34 @@ function partialTick(ts, entityKeys) {
 
 function flatten(groupsOfPoints) {
   return groupsOfPoints.flat();
+}
+
+// F3 integration fixture (must-fix 2): a "collect_services"-shaped envelope carrying a
+// >80-entry services_census, mirroring what tools/services.js's real collector emits on a
+// large host. Used with factPointsFromServiceEvidence below to build REAL fact points for a
+// tick (not the completeTick/servicePoint fixtures above, which fabricate service.presence
+// points directly and would pass unchanged even against the pre-F3 translator that only ever
+// read the 80-item presentation-bounded `services` field). `omit` drops named entities from
+// this tick's census, so a later tick that includes them again is a genuine appearance.
+function censusEnvelope(count, { omit = [], ts } = {}) {
+  const omitSet = new Set(omit);
+  const present = Array.from({ length: count }, (_, i) => `svc${String(i).padStart(6, "0")}.service`)
+    .filter((name) => !omitSet.has(name));
+  return {
+    id: "services",
+    status: "ok",
+    layer: "L0",
+    source: "test",
+    result: {
+      manager: "systemd",
+      services: present.slice(0, 80), // presentation-bounded, mirrors the real collector's split
+      services_census: present.map((name) => ({ name, running: true })),
+      truncated: false,
+    },
+    confidence: 1,
+    review_hint: "none",
+    trace: { tool: "collect_services", target: null, latency_ms: 0, ts },
+  };
 }
 
 // Builds N leading "established" complete tick-groups all carrying the same entityKeys (>=
@@ -1028,6 +1056,46 @@ test("[P8 degrade, both directions] a service appearing only in a partial latest
     completeTick(tickTs(3), ["svc-a", "svc-b"]),
   ]));
   assert.deepEqual(detectServiceAppearances(priorPartialOnly, { nowMs: Date.parse(tickTs(3)), minHistoryTickCount: 2, freshnessMs: HOUR_MS }), [{ entity_key: "svc-b", first_seen_ts: tickTs(3) }]);
+});
+
+// F3 fix integration regression (must-fix 2): the appearance/disappearance detectors must see a
+// service beyond the OLD 80-item presentation cutoff, when the facts feeding them are built from
+// a REAL >80-entry services_census envelope via factPointsFromServiceEvidence (not the
+// completeTick/servicePoint fixtures above, which fabricate service.presence points directly and
+// would pass unchanged even pre-F3). Pre-F3, factPointsFromServiceEvidence read the
+// presentation-bounded `services` field (capped at 80), so a 100-service host's index-99 entity
+// would NEVER have produced a service.presence fact at all -- appearance/disappearance for it was
+// structurally impossible to detect, regardless of what the detectors themselves did with it.
+// RED against that pre-F3 behavior (conceptually: swap services_census for the old plain
+// `services` field-of-record and this entity vanishes from every tick's fact set, so
+// detectServiceAppearances/detectServiceDisappearances would see zero evidence of it ever). GREEN
+// now that factPointsFromServiceEvidence prefers services_census.
+test("F3 integration: service.appeared fires for a >80-index service, using facts built from a real >80-entry services_census envelope (truncated:false) -- structurally impossible before the F3 fix", () => {
+  const LATE_ENTITY = "svc000099.service"; // index 99: well beyond the old 80-item presentation cap
+  const tick0 = factPointsFromServiceEvidence([censusEnvelope(100, { omit: [LATE_ENTITY], ts: tickTs(0) })], { ts: tickTs(0) });
+  const tick1 = factPointsFromServiceEvidence([censusEnvelope(100, { omit: [LATE_ENTITY], ts: tickTs(1) })], { ts: tickTs(1) });
+  const tick2 = factPointsFromServiceEvidence([censusEnvelope(100, { ts: tickTs(2) })], { ts: tickTs(2) }); // LATE_ENTITY now present
+
+  const groups = groupServiceFactsByTick(flatten([tick0, tick1, tick2]));
+  const appeared = detectServiceAppearances(groups, { nowMs: Date.parse(tickTs(2)), minHistoryTickCount: 2, freshnessMs: HOUR_MS });
+
+  assert.deepEqual(appeared, [{ entity_key: LATE_ENTITY, first_seen_ts: tickTs(2) }]);
+});
+
+test("F3 integration: service.disappeared fires for a >80-index service, using facts built from a real >80-entry services_census envelope (truncated:false) -- structurally impossible before the F3 fix", () => {
+  const LATE_ENTITY = "svc000099.service"; // index 99: well beyond the old 80-item presentation cap
+  const tick0 = factPointsFromServiceEvidence([censusEnvelope(100, { ts: tickTs(0) })], { ts: tickTs(0) });
+  const tick1 = factPointsFromServiceEvidence([censusEnvelope(100, { ts: tickTs(1) })], { ts: tickTs(1) });
+  const tick2 = factPointsFromServiceEvidence([censusEnvelope(100, { omit: [LATE_ENTITY], ts: tickTs(2) })], { ts: tickTs(2) }); // LATE_ENTITY now gone
+
+  const groups = groupServiceFactsByTick(flatten([tick0, tick1, tick2]));
+  const disappeared = detectServiceDisappearances(groups, { nowMs: Date.parse(tickTs(2)), minEstablishedCount: 2, freshnessMs: HOUR_MS });
+
+  assert.equal(disappeared.length, 1);
+  assert.equal(disappeared[0].entity_key, LATE_ENTITY);
+  assert.equal(disappeared[0].disappeared_at_ts, tickTs(2));
+  assert.equal(disappeared[0].last_seen_ts, tickTs(1));
+  assert.equal(disappeared[0].complete_census_seen_count, 2);
 });
 
 test("buildAppearedCandidates hashes identity under service.appeared's OWN domain (never service.disappeared's), sanitizes diagnostics (hash-only, no cleartext-name exception), and caps severity at warning", () => {
