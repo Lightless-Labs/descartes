@@ -208,6 +208,58 @@ function fakeResolvesAfterDeadlineSession(resolveDelayMs, decision, { abortThrow
   return { session, state };
 }
 
+// F5-B fix (daybreak-blue CONFIRMED BLOCKER): a session whose prompt() BUSY-WAITS -- a
+// synchronous, non-yielding spin, unlike fakeResolvesAfterDeadlineSession's setTimeout-based delay
+// -- for `busyMs`, starving the event loop (and therefore the deadline timer's own callback) for
+// that entire span, THEN resolves with syntactically-valid decision JSON. This reproduces
+// daybreak-blue's exact repro (deadlineMs=5, elapsed~66ms -> delivered): under the pre-fix code, a
+// bare `setTimeout` only flips `timedOut` from ITS OWN callback, which cannot run until the busy
+// spin releases the event loop -- by then the continuation after `await session.prompt()` may
+// already be running with `timedOut` still false, fabricating a status:"ok" delivered decision.
+function fakeBusyWaitSession(busyMs, decision) {
+  const state = { abortCalls: 0 };
+  const session = {
+    messages: [],
+    async prompt(promptText) {
+      session.lastPrompt = promptText;
+      const start = Date.now();
+      while (Date.now() - start < busyMs) {
+        // Deliberately synchronous -- starves the event loop (and the deadline timer with it) for
+        // the duration, unlike a setTimeout-based delay.
+      }
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+    },
+    abort() {
+      state.abortCalls += 1;
+      // Even a well-behaved abort() cannot preempt a synchronous busy-wait already in progress.
+    },
+    dispose() {},
+  };
+  return { session, state };
+}
+
+// F5-B fix, HIGH residual: a session whose prompt() never settles AND whose abort() is a TRUE
+// no-op -- unlike fakeHangingSession's abort() (which rejects the pending prompt(), a well-behaved
+// cancellable-request assumption), this abort() does nothing at all to the pending prompt(). Under
+// the pre-fix code (a bare `await session.prompt()` bounded only by a side timer that merely calls
+// abort()), this awaited promise never settles, so the call hangs forever.
+function fakeNeverSettlesNoopAbortSession() {
+  const state = { abortCalls: 0 };
+  const session = {
+    messages: [],
+    async prompt(promptText) {
+      session.lastPrompt = promptText;
+      return new Promise(() => {}); // never settles, no matter what abort() does
+    },
+    abort() {
+      state.abortCalls += 1;
+      // True no-op: does not reject/resolve the pending prompt() at all.
+    },
+    dispose() {},
+  };
+  return { session, state };
+}
+
 test("alert intelligence config is disabled by default and persists explicit opt-in", async () => {
   const paths = await tempPaths();
   assert.equal((await readAlertIntelligenceConfig(paths)).enabled, false);
@@ -2459,4 +2511,65 @@ test("F5: the call site reads model_deadline_ms directly off a raw (never normal
   assert(elapsedMs < 2000, `expected the raw config's model_deadline_ms to bound the call, took ${elapsedMs}ms`);
   assert.equal(state.abortCalls, 1);
   assert.equal(result.decisions[0].status, "error");
+});
+
+// --- F5-B fix: race prompt() against a deadline PROMISE (not only a side timer) so a starved
+// event loop that resolves late is still caught, and so a never-settling prompt() with a no-op
+// abort() still bounds the call. See docs/reviews (daybreak-blue re-gate). ------------------------
+
+test("F5-B fabrication trap: a session.prompt() that busy-waits past the deadline (starving the event loop, not merely delaying) then resolves with valid decision JSON must still be recorded as a timeout, never status:\"ok\", and must never deliver", async () => {
+  const paths = await tempPaths();
+  const { session } = fakeBusyWaitSession(40, {
+    notify: true,
+    severity: "critical",
+    title: "A decision produced after the deadline via a starved event loop",
+    body: "Must never be delivered or recorded as ok.",
+    reason: "event-loop starvation must not let a late response win the race",
+    evidence_refs: [],
+  });
+  let deliverCalls = 0;
+
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 10 }),
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+    deliverNotification: async () => { deliverCalls += 1; return { delivered: true }; },
+  });
+
+  assert.equal(deliverCalls, 0, "a decision produced by a starved-then-late response must never be delivered");
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.notEqual(audit[0].status, "ok");
+  assert.equal(audit[0].decision, undefined);
+  assert.match(audit[0].error, /model_deadline_exceeded/);
+  assert.equal(result.decisions[0].status, "error");
+});
+
+test("F5-B HIGH residual: a session.prompt() that never settles with a TRUE no-op abort() does not hang the tick -- bounded by the deadline and recorded as a deterministic timeout", { timeout: 2000 }, async () => {
+  const paths = await tempPaths();
+  const { session, state } = fakeNeverSettlesNoopAbortSession();
+  const start = Date.now();
+
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 25 }),
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+  });
+  const elapsedMs = Date.now() - start;
+
+  assert(elapsedMs < 1500, `expected the adjudication to be bounded by its deadline even with a no-op abort(), took ${elapsedMs}ms`);
+  assert.equal(state.abortCalls, 1, "abort() must still be attempted even though it is a no-op");
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.match(audit[0].error, /model_deadline_exceeded/);
+  assert.equal(result.decisions[0].status, "error");
+  assert.equal(result.status, "ok");
 });

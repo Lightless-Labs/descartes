@@ -1305,21 +1305,46 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         // an abandoned continuation racing a LATER tick's own calls would risk duplicate/
         // out-of-order operator notifications and a genuine race on the append-only audit trail
         // S13 must-fix 2's budget accounting depends on being accurate and serial.
+        //
+        // F5-B re-gate (daybreak-blue CONFIRMED BLOCKER): the original fix bounded the AWAIT with
+        // only a side timer flipping `timedOut` -- but `await session.prompt(promptText)` still
+        // awaits prompt()'s OWN eventual settlement. If the event loop is starved (by prompt()
+        // itself, e.g. a long synchronous stretch inside the provider client) past deadlineMs and
+        // THEN resolves, the deadline timer's callback may not have run yet -- so the continuation
+        // right after this await can observe `timedOut` still false and fall through to a
+        // fabricated status:"ok" delivery (daybreak-blue repro: deadlineMs=5, elapsed~66ms ->
+        // delivered). It also meant an abort() that is a no-op for the underlying request (fixspec
+        // item 7) left this await never settling at all -- HIGH residual, an indefinite hang.
+        // Fixed by racing prompt() against a deadline PROMISE (so the awaited expression itself
+        // settles at the deadline even if prompt() never does) AND adding a wall-clock elapsed
+        // check as a belt-and-braces close for the starved-then-resolves race (catches it even if
+        // the timer callback hasn't run the instant this line executes).
         let timedOut = false;
-        const deadlineTimer = setTimeout(() => {
-          timedOut = true;
-          // Must never throw synchronously or leave a rejected promise unhandled -- a
-          // timer-callback exception is an uncaught exception that kills the daemon process,
-          // exactly the class of crash S13 5b / 4d350f7 exist to prevent. Mirrors the
-          // session?.dispose?.() guard idiom in the outer finally below.
-          try {
-            session?.abort?.()?.catch?.(() => {});
-          } catch {
-            // Swallow -- see comment above.
-          }
-        }, deadlineMs);
+        const promptStartedMs = Date.now();
+        let deadlineTimer;
+        const deadlinePromise = new Promise((resolve) => {
+          deadlineTimer = setTimeout(() => {
+            timedOut = true;
+            // Must never throw synchronously or leave a rejected promise unhandled -- a
+            // timer-callback exception is an uncaught exception that kills the daemon process,
+            // exactly the class of crash S13 5b / 4d350f7 exist to prevent. Mirrors the
+            // session?.dispose?.() guard idiom in the outer finally below.
+            try {
+              session?.abort?.()?.catch?.(() => {});
+            } catch {
+              // Swallow -- see comment above.
+            }
+            resolve();
+          }, deadlineMs);
+        });
         try {
-          await session.prompt(promptText);
+          const promptPromise = session.prompt(promptText);
+          // If the deadline wins the race below, `promptPromise` is left to settle on its own
+          // (mirrors the createSessionPromise race-and-abandon above) -- attach a no-op catch so
+          // an eventual real rejection from the LOSING side never becomes an unhandled promise
+          // rejection later.
+          promptPromise.catch(() => {});
+          await Promise.race([promptPromise, deadlinePromise]);
         } finally {
           clearTimeout(deadlineTimer);
         }
@@ -1329,8 +1354,11 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         // normalizeAlertNotificationDecision's lenient defaults turning a truncated/partial
         // response into a spuriously "ok" audit record carrying a decision the model never
         // actually finished rendering -- a fabricated adjudication outcome (NEVER-FABRICATE).
-        // Treat ANY timeout identically, regardless of how prompt() settled.
-        if (timedOut) throw new Error("model_deadline_exceeded");
+        // Treat ANY timeout identically, regardless of how prompt() settled. The wall-clock check
+        // (elapsed >= deadlineMs) closes the F5-B race even when `timedOut` itself hasn't been set
+        // yet -- a starved-then-resolved prompt() can win Promise.race before the timer callback
+        // runs, but real elapsed time already tells the truth.
+        if (timedOut || Date.now() - promptStartedMs >= deadlineMs) throw new Error("model_deadline_exceeded");
 
         const rawText = lastAssistantText(session.messages);
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
