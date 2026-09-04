@@ -1,0 +1,445 @@
+# daybreak-blue Security Sweep — 5 sensitive Descartes areas
+
+**Date:** 2026-09-04  
+**Method:** ultracode workflow — `gpt-daybreak-blue-latest` (frontier defensive-cyber, via codex, read-only) audited each area; Opus verified/reproduced + triaged each finding.  
+**Verdict:** all 5 areas `has-fixable`. Findings below are Opus-verified and classified by reachability (plain-JSON/disk vs requires-live-object vs deferred-architectural vs false-positive).
+
+> Fix-specs are ready-to-implement. Drive fixes area-by-area with a daybreak re-gate on each; land under review.
+
+
+---
+
+## fact-store — `has-fixable`
+
+All 6 daybreak findings verified against the code and reproduced where load-bearing (repros for #1, #2, #3, #5, #6 are conclusive; #4 confirmed by inspection). None is a false positive and none requires a hostile in-process live object — all are reachable via ordinary disk/config/env input. Three (#1 retentionMs=NaN silently erases + commits intact, #2 NaN/negative read window yields empty-but-intact over a proven store, #3 clock-rollback flips a genuinely-emptied store to intact) directly violate the cardinal "intact only by positive proof" invariant and are fixable in-file; #5/#6 are cheap correctness/leak fixes; #4 splits into cheap input caps (fixable) plus a whole-file streaming read (deferred). Note: #3's fix reverses deliberate, test-pinned behavior, so it needs design-owner sign-off, not a silent patch.
+
+### Confirmed-fixable
+
+- **[BLOCKER] Malformed retentionMs (NaN cutoff) silently erases all history and commits it as intact**  
+  - _Files:_ tools/descartes-cli/src/fact-store.js (enforceFactRetention, ~137-192)  
+  - _Invariant:_ Every valid record is either kept or counted as an observable eviction (age/bytecap); no valid record silently vanishes, so status:intact only ever covers a fully-accounted rewrite.  
+  - _Fix:_ Reproduced: retentionMs:"garbage" -> cutoffMs=NaN -> a valid record satisfies NEITHER `tsMs < cutoff` (ageEvicted) NOR `tsMs >= cutoff` (candidates); it is dropped with all counts zero, output digest null, and the next read returns points:[] status:intact continuity_ok:true. FIX (two layers): (1) at the top of enforceFactRetention, validate `retentionMs` (and `maxBytes`) are finite and > 0, throw a non-reflecting Error on violation. `options.now` already fails loud (new Date(NaN).toISOString() throws RangeError at line 143) and a NaN maxBytes fails in the safe direction (keeps everything), so retentionMs is the only silent path — but validate all three. (2) Add the real guard: after classification assert `keptRecords.length + ageEvicted.length + bytecapEvicted === validRecords.length`, throw on mismatch. This catches this and any future silent-drop class regardless of which param is bad.
+
+- **[BLOCKER] Malformed/negative read window returns an empty history as intact**  
+  - _Files:_ tools/descartes-cli/src/fact-store.js (readFactPoints, ~258-292)  
+  - _Invariant:_ A windowed read must never report status:intact while silently dropping in-store points because of a NaN/negative boundary; the completeness asOfMs boundary must be a real number.  
+  - _Fix:_ Reproduced against a PROVEN-intact store (>=2 retention passes so continuity_ok:true): windowMs:"garbage" and windowMs:-1000 both return points:[] status:intact continuity_ok:true over a 1-record store. sinceMs=NaN (or future) drops every point in the window filter AND makes the loss-window check vacuous, so completeness stays intact. FIX: in readFactPoints validate `options.now` (when defined) and `options.windowMs` (when defined) are finite and windowMs >= 0; throw on violation. Guarantees sinceMs is never NaN feeding both the point filter and the buildCompleteness asOfMs. Reachability note for implementer: parseDurationMs (history-store.js) throws on bad CLI strings and cannot emit negatives, so direct attacker-CLI reach is limited; the realistic trigger is a programmatic caller passing a bad number or undefined arithmetic — this is a cheap boundary guard on a shared primitive consumed by constraint-miner/session-baseline/peer-baseline/provenance-warnings.
+
+- **[BLOCKER] Clock rollback flips a genuinely-emptied store from degraded to intact**  
+  - _Files:_ tools/descartes-cli/src/fact-store-integrity.js (lossAtOrAfter 335-340; buildCompleteness 361-397; prepareFactIntegrityLedger loss-timestamp assignments 289-292)  
+  - _Invariant:_ continuity_ok:false or any recorded loss must never yield status:intact; recovery is bounded by the retention window (loss ages out over the window), never by a future wall-clock date.  
+  - _Fix:_ Reproduced: commit a fact @2026, append a corrupt line, run retention with now=2100 (age-evicts the real record + records corruption + a continuity break, all stamped 2100, facts.jsonl now empty, status:degraded continuity_ok:false), then read with now=2026 -> status:INTACT continuity_ok:false points:[]. The empty store that really lost its only record reads complete. WARNING — this reverses DELIBERATE, TEST-PINNED behavior: fact-store-integrity.test.js:83 and :109 (and fact-store-completeness.test.js:110) explicitly assert intact for future-dated losses/breaks, and the 361-375 comment defends it as a clock artifact. The flaw: 'live matches the ledger' only proves the store matches the ALREADY-truncated committed digest, not that no loss occurred. FIX (design-owner sign-off required, two parts): (a) Read path — in lossAtOrAfter drop the `lossMs <= upperBoundMs` upper-bound exclusion so a future-dated loss (real loss, untrustworthy timestamp) counts; this makes line 378 resolve to degraded and the 371-375 override land on degraded at 392-397, so the override can then be simplified/removed with its comment. (b) Retention path — in prepareFactIntegrityLedger clamp any loss timestamp assigned > nowIso down to nowIso (the 'durable repair' the 366 comment promises but never implements) so the loss ages out over the normal window instead of persisting until 2100. Then flip the three named test expectations to degraded/unknown.
+
+- **[HIGH] Unsafe JSON integer (pass_id = 2^53) creates a persistent retention write crash loop**  
+  - _Files:_ tools/descartes-cli/src/fact-store-integrity.js (isValidPendingPass 104-110; isValidFactIntegrityLedger 132,138; prepareFactIntegrityLedger passId 259)  
+  - _Invariant:_ Ledger integers stay in the exactly-representable range so pass_id strict monotonicity holds; a poisoned ledger fails closed to unknown rather than permanently crashing the retention write path.  
+  - _Fix:_ Reproduced: a hand-crafted valid ledger with continuity.last_committed_pass_id = 9007199254740992 (2^53) passes isValidFactIntegrityLedger (Number.isInteger(2^53)===true). prepareFactIntegrityLedger then computes passId = max(2^53,0)+1 === 2^53 (float rounds back), the resulting pending_pass.pass_id <= last_committed_pass_id makes the ledger invalid, and writeFactIntegrityLedger throws 'Invalid fact-store integrity ledger' every pass. FIX: use Number.isSafeInteger (not Number.isInteger) for pass_id and the *_total/*_count integer checks (104-110, 132, 138); add a fence in prepareFactIntegrityLedger to throw if passId > Number.MAX_SAFE_INTEGER (259). Post-fix a 2^53 ledger becomes invalid -> readFactIntegrityLedger returns reason:'invalid' -> ledger:null -> completeness bootstraps to unknown (fail-closed), identical to every existing invalid-ledger path (not a regression). Reachability note: pass_id reaching 2^53 by ordinary +1 increments is infeasible; realistic reach is integrity.json tamper, which overlaps the deferred off-host-attestation threat — the fix is cheap defense-in-depth that converts a fail-STUCK crash loop into fail-closed.
+
+- **[HIGH] normalizeTimestamp error reflects the raw supplied value verbatim**  
+  - _Files:_ tools/descartes-cli/src/fact-store.js (normalizeTimestamp 30-34)  
+  - _Invariant:_ Error/log surfaces never echo raw (potentially sensitive) field values — hash-at-source discipline.  
+  - _Fix:_ Reproduced: appendFactPoints with a point whose ts is '/Users/alice/.ssh/id_ed25519' throws 'Invalid fact timestamp: /Users/alice/.ssh/id_ed25519' — the only reflecting throw in the file (every other throw is non-reflecting). FIX: make normalizeTimestamp's error non-reflecting (report type+length or a truncated sha256 of the value, not the value). DO NOT change the batch-abort behavior: the whole-batch atomic reject on one bad point is DELIBERATE and documented (line 239-240, mirrors appendMetricPoints 'throw propagates, no per-point catch') and is fail-closed (verified: the good point in the batch was NOT written, nothing fabricated). Adding per-point isolation would contradict the documented convention; only the message reflection is the defect. Caveat: daybreak's second-order 'leaks into logs' claim depends on the out-of-scope CLI error handler actually printing the message to stderr — the in-file root cause is confirmed, the stderr leak is plausible-but-unverified here.
+
+- **[HIGH] Unbounded attribute/key/string inputs are allocated and processed before any cap (cheap-caps portion)**  
+  - _Files:_ tools/descartes-cli/src/fact-store.js (normalizeAttributes 40-46; normalizeFactPoint 57-80)  
+  - _Invariant:_ Input shape is bounded and over-cap input is REJECTED observably (batch abort / schema_invalid), never silently truncated — a silent shape change would let a doctored fact pass as normal.  
+  - _Fix:_ normalizeAttributes caps only per-VALUE length (slice 0,160); there is no cap on attribute-key COUNT or key length, and normalizeFactPoint does not cap fact_name/entity_key/source_* lengths, so a fact with hundreds of thousands of keys is fully built. FIX: add bounded caps on attribute-key count, key length, and fact_name/entity_key/source lengths, and REJECT over-cap input (throw -> observable batch abort, or fail isStoredFactPoint -> counted as schema_invalid on read) rather than silently truncate. Mirror-note: history-store.js normalizeDimensions (27-31) has the identical gap (no count cap) — apply the same cap there or record the divergence, since fact-store deliberately mirrors it. (The whole-file-read / multi-GB-single-line half of this finding is deferred — see deferred[].)
+
+### Out-of-contract (requires hostile live object)
+
+- None. All 6 findings were re-checked for a live-object precondition and none needs one: retentionMs/maxBytes/windowMs/now arrive as plain values from config/CLI/clock, corrupt lines and unsafe integers arrive as JSON off disk (facts.jsonl / integrity.json), and the reflected ts is an ordinary string. Every finding is reachable with JSON-deserialized / disk / env input, so none belongs in the out-of-contract bucket.
+
+### Deferred / architectural
+
+- Finding 4 (streaming-read half): readJsonLines (fact-store.js 97-125) reads the entire file into memory and duplicates it as a UTF-8 string before any cap, so a single multi-GB valid JSON line OOMs before the 5MB retention output cap can act. Fixing needs a streaming / per-line-byte-capped reader, a cross-store change since it mirrors the documented history-store convention (#2/#3). Owner: a dedicated store-hardening slice applied consistently across history/fact/shadow stores.
+- Finding 5 (exploitation route): the only realistic way to plant last_committed_pass_id=2^53 is tampering integrity.json, which overlaps the already-documented off-host-attestation deferral (a daemon-UID attacker can rewrite both files and recompute the unkeyed SHA-256 ledger). The in-file isSafeInteger hardening is queued under confirmed_fixable; the tamper threat itself is owned by the attestation work.
+- Sibling divergence (out of this area's two files, flag to orchestrator): shadow-store.js:98-101 and :158 copy the exact retentionMs/windowMs NaN-cutoff / NaN-window arithmetic from fact-store; the same input-validation guards from findings #1 and #2 should be applied there.
+- Known-deferred N4: two-daemon concurrent-writer lost-update race, tracked in todos/2026-08-23-fact-store-concurrent-writer-locking.md — matches the brief's stated known-deferred item; unchanged.
+
+### False positives (daybreak refuted)
+
+- None of the 6 findings is a false positive; all verified. Two scoping caveats for the implementer (not refutations): (a) Finding 2's status:intact is only reachable on a PROVEN-intact store (>=2 retention passes so continuity_ok:true); a fresh single-append store sits at status:unknown and is NOT vulnerable, so the fix must be tested against the proven-store precondition daybreak implicitly used. (b) Finding 6's 'reflects into logs' is a two-part claim: the in-file message reflection is confirmed, but the actual stderr leak depends on the out-of-scope CLI error handler and was not verified here.
+
+### Fix-spec
+
+# Fact-store security fixes — implementer spec
+
+Cardinal invariant for this area: **`status:"intact"` is reachable ONLY by positive proof (sha256 committed-prefix digest); any corruption / retention / byte-cap / schema drop must be observable and fail-closed.** Every fix below defends that. Preserve the documented byte-identical JSONL output format and the atomic tmp+rename write discipline — none of these fixes change on-disk output shape.
+
+## 1. BLOCKER — retentionMs=NaN silently erases store, commits intact (`fact-store.js`)
+**Repro:** one committed record + intact ledger, `enforceFactRetention(paths,{now,retentionMs:"garbage"})` then a clean pass → `readFactPoints` returns `points:[] status:"intact" continuity_ok:true`, all drop counts 0, facts.jsonl empty.
+**Root cause:** `cutoffMs = nowMs - retentionMs` = NaN; a valid record satisfies neither `tsMs < cutoffMs` (ageEvicted) nor `tsMs >= cutoffMs` (candidates) → dropped, uncounted.
+**Fix (in `enforceFactRetention`, ~137-192):**
+1. Validate at entry: `retentionMs` and `maxBytes` finite and `> 0` → throw non-reflecting Error otherwise. (`options.now` already throws RangeError at line 143; a NaN `maxBytes` fails safe by keeping everything — so `retentionMs` is the sole silent path, but validate all three.)
+2. **The real guard** — after classification, assert `keptRecords.length + ageEvicted.length + bytecapEvicted === validRecords.length`; throw on mismatch. Catches this and any future silent-drop class.
+
+## 2. BLOCKER — NaN/negative read window → empty-but-intact (`fact-store.js`)
+**Repro:** proven-intact 1-record store, `readFactPoints(paths,{now,windowMs:"garbage"})` (or `-1000`) → `points:[] status:"intact" continuity_ok:true`.
+**Root cause:** `sinceMs = nowMs - windowMs` = NaN/future → drops every point AND makes the `buildCompleteness` `asOfMs` loss-window vacuous.
+**Fix (in `readFactPoints`, ~258-292):** validate `options.now` (when defined) finite and `options.windowMs` (when defined) finite `>= 0`; throw on violation, so `sinceMs` is never NaN.
+**Reachability:** `parseDurationMs` throws on bad CLI strings and can't emit negatives; realistic trigger is a programmatic caller. Cheap boundary guard on a shared primitive.
+
+## 3. BLOCKER — clock rollback flips a really-emptied store to intact (`fact-store-integrity.js`) — DESIGN-OWNER SIGN-OFF REQUIRED
+**Repro:** commit fact @2026 → append corrupt line → `enforceFactRetention({now:"2100-01-01"})` (age-evicts the record, records corruption + continuity break, all stamped 2100, facts.jsonl now empty, read@2100 = `degraded/continuity_ok:false`) → read@2026 → **`status:"intact"` continuity_ok:false points:[]**.
+**This reverses deliberate, tested behavior:** `fact-store-integrity.test.js:83` and `:109`, and `fact-store-completeness.test.js:110`, explicitly assert `intact` for future-dated losses/breaks; the 361-375 comment defends it. The flaw: "live matches the ledger" only proves the store matches the *already-truncated* committed digest, not that no loss occurred.
+**Fix (two parts):**
+- **Read path** — `lossAtOrAfter` (335-340): remove the `lossMs <= upperBoundMs` clause. A future-dated loss is a real loss with an untrustworthy timestamp → count it. Line 378 then resolves to `degraded`; the 371-375 clock-rollback override lands on `degraded` at 392-397, so that override + its comment can be simplified/deleted.
+- **Retention path** — `prepareFactIntegrityLedger` (loss-ts assignments 289-292): clamp any loss timestamp assigned `> nowIso` down to `nowIso` (the "durable repair" the 366 comment promises but never implements), so the loss ages out over the normal window — bounded recovery — instead of persisting until 2100.
+- Flip the three named test expectations from `intact` to `degraded`/`unknown`. Get design-owner acknowledgement that future-dated losses now degrade reads until clamped/aged (the fail-closed direction the cardinal invariant demands).
+
+## 5. HIGH — unsafe integer pass_id crash loop (`fact-store-integrity.js`)
+**Repro:** valid ledger with `last_committed_pass_id = 9007199254740992` (2^53) passes validation; `passId = max(2^53,0)+1 === 2^53` (float rounds back) → pending `pass_id <= last_committed_pass_id` → ledger invalid → `writeFactIntegrityLedger` throws `Invalid fact-store integrity ledger` every retention pass (permanent write-path crash loop).
+**Fix:** replace `Number.isInteger` with `Number.isSafeInteger` for `pass_id` and the `*_total`/`*_count` checks (104-110, 132, 138); add a fence in `prepareFactIntegrityLedger` (259): throw if `passId > Number.MAX_SAFE_INTEGER`. Post-fix a 2^53 ledger is simply `reason:"invalid"` → `null` → completeness bootstraps to `unknown` (fail-closed) — identical to every existing invalid-ledger path, not a regression.
+**Reachability:** natural +1 increment can't reach 2^53; realistic reach is integrity.json tamper (overlaps deferred attestation). Cheap fix that converts fail-STUCK into fail-closed.
+
+## 6. HIGH — normalizeTimestamp error reflects raw value (`fact-store.js`)
+**Repro:** point with `ts:"/Users/alice/.ssh/id_ed25519"` → `Invalid fact timestamp: /Users/alice/.ssh/id_ed25519` (only reflecting throw in the file).
+**Fix:** make `normalizeTimestamp` (30-34) non-reflecting — report type+length or a truncated sha256, not the value.
+**Do NOT** add per-point isolation: the whole-batch atomic reject is documented (239-240, mirrors appendMetricPoints) and fail-closed (verified: the good point was not written). Only the message reflection is the defect.
+
+## 4. HIGH (cheap-caps portion) — unbounded inputs (`fact-store.js`)
+`normalizeAttributes` (40-46) caps only per-value length; no cap on attribute-key **count** or key length, and `normalizeFactPoint` doesn't cap `fact_name`/`entity_key`/`source_*` lengths.
+**Fix:** add bounded caps on attribute-key count, key length, and the string-field lengths, and **REJECT** over-cap input (throw → observable batch abort, or fail `isStoredFactPoint` → counted as `schema_invalid` on read) — never silently truncate. `history-store.js normalizeDimensions` (27-31) has the same gap; mirror the cap there or record the divergence.
+(The whole-file-read / multi-GB-single-line half is deferred to a store-hardening slice — see deferred list.)
+
+## Out of scope for these two files (flag to orchestrator)
+- Apply the finding-#1/#2 validation guards to `shadow-store.js:98-101` and `:158` (identical copied arithmetic).
+
+
+---
+
+## positive-evidence-detectors — `has-fixable`
+
+Verified all six daybreak findings against the code with runnable repros. BLOCKER 2 (credential-access store I/O throws escape computeCredentialAccessCandidates, discarding an already-computed positive mtime_changed finding and aborting the whole daemon tick since daemon.js:576-589 has no per-detector isolation) is confirmed exactly as stated. BLOCKER 1 is partially confirmed: its primary repro (2-snapshot / established-count gating) is a FALSE-POSITIVE — the cold-start completeness lockout is correctly NOT applied to canary.tripped and established canaries fire on their tick — but a secondary mechanism it gestures at is real and worse: a persistently-partial census (one valid executed-watch canary with no sentinel_path, or any canary with a persistent non-ENOENT lstat failure) drives completeGroups to empty and silently, collaterally kills ALL canary.tripped detection forever. HIGH 5 (no lstat deadline) and HIGH 3b (lossy sanitized entity_key collisions silently drop a canary) are confirmed-fixable; HIGH 4 and MEDIUM 6 are out-of-contract (only reachable via injected fact-history / an adversarial store file — the documented root-rewrite limitation); HIGH 3a (canary_id cleartext) is a false-positive (deliberate operator decoy-label, hashed path carried separately).
+
+### Confirmed-fixable
+
+- **[BLOCKER] Credential-access store I/O failure discards a computed positive finding and aborts the entire daemon tick**  
+  - _Files:_ tools/descartes-cli/src/credential-access-baseline.js (:237 load, :242 write, :227-247 compute body); reachability confirmed at daemon.js:576-589  
+  - _Invariant:_ A positive two-snapshot signal must never be discarded, and a single detector's store I/O failure must degrade only that detector — never abort the shared daemon tick (blinding every alert family). This is the exact failure canary-baseline.js:712-722 already documents catching; its sibling does not.  
+  - _Fix:_ Mirror canary-baseline.js's discipline. (1) Wrap loadCredentialAccessBaselineStore in try/catch; on a non-ENOENT throw, SKIP the write and return [] this tick — do NOT fall back to an empty baseline and then write, which would clobber the real last-known-good baseline and lose the very change being tracked (canary-baseline.js:718-722 documents this clobber hazard). (2) Compute findings, then wrap writeCredentialAccessBaselineStore in try/catch; on a write throw (ENOSPC/EROFS/EACCES) STILL return buildCredentialAccessCandidates(findings) — the stable alertId dedup absorbs the re-fire — so the positive alert is emitted even though the baseline could not advance. (3) Ensure no throw escapes computeCredentialAccessCandidates under any ordinary disk condition. Repro: node repro fed a real mtime 1->2 finding + a throwing write; the finding was discarded and the call rejected.
+
+- **[BLOCKER] A persistently-partial canary census permanently and collaterally suppresses ALL canary.tripped detection**  
+  - _Files:_ tools/descartes-cli/src/canary-baseline.js:273-274 (completeGroups<2 => []); trigger sources: tools/canary.js:62-71 (executed:"unknown" when watch includes "executed" and no sentinel_path) + canary-manifest.js:41-43 (accepts that entry) + fact-translators.js:459-482 (marks census partial on unreadable_count>0 OR execution_unknown_count>0)  
+  - _Invariant:_ canary.tripped is a POSITIVE two-snapshot direct-evidence signal that must NOT be completeness-gated into silence. The census-wide complete/partial gate is fine for a single transient blackout tick (the change resurfaces at the next complete census), but under a PERSISTENT partial-making condition no complete census ever occurs and every canary's positive detection dies — the cardinal sin the area must not commit.  
+  - _Fix:_ Immediate in-scope patch (a): in canary-manifest.js reject or drop any entry whose `watch` includes "executed" but has no `sentinel_path` (currently sentinel_path is only rejected when defined-but-empty), closing the ordinary-config trigger that makes every census partial forever. Larger patch (b) — see deferred: replace the census-wide `censusState==="complete"` gate in detectCanaryTrips/detectCanaryVanished with PER-CANARY completeness (compare each canary across its own last two fully-observed sightings: presence fact present AND executed!=="unknown"), so one canary's blackout or a host-state lstat failure (parent-dir EACCES/EIO/ENOTDIR on an unrelated canary) can no longer suppress every other canary. If (b) is deferred, state explicitly that (a) alone leaves the host-state (persistent non-ENOENT lstat failure) sources open. Repro: detectCanaryTrips over three all-"partial" groups with a real 100->200 mtime change returns [].
+
+- **[HIGH] Credential-access lstat pass has no deadline; one hung mount stalls (and can progressively exhaust the libuv pool across) every future daemon tick**  
+  - _Files:_ tools/descartes-cli/src/tools/credential-access.js:123-127 (sequential awaited lstats, no timeout); tools/descartes-cli/src/credential-access-baseline.js:232-233 (detector awaits the collector directly, outside the daemon's withDeadline that already guards the structural path, daemon.js:301-307,468-487)  
+  - _Invariant:_ A single detector's filesystem I/O must not be able to stall the whole daemon tick indefinitely.  
+  - _Fix:_ Wrap the credential-access collection in an outer per-tick deadline (Promise.race with a timer, reusing daemon.js's withDeadline discipline) that abandons the remaining path loop on the first timeout, returns [] and does NOT write the store that tick. A bare per-path race is insufficient: all 8 paths live under $HOME, so a hung $HOME mount can leak up to 8 libuv threadpool threads (default pool size 4) in a single tick, blocking all fs ops process-wide including fact-store reads. Pair the deadline with an in-memory circuit breaker that skips credential collection for K ticks after a timeout. Label this a mitigation; full out-of-process/threadpool-isolated collection is deferred-architectural.
+
+- **[LOW-MEDIUM] Lossy sanitized canary entity_key collisions silently drop a canary's per-tick evidence**  
+  - _Files:_ tools/descartes-cli/src/canary-baseline.js:216 (group.canaries.set keyed by sanitized entity_key); fact-translators.js:419 (sanitizeEntityKey, lossy) + canary-manifest.js:39-46 (no dedup of ids)  
+  - _Invariant:_ Never silently discard a positive canary's per-tick evidence. Because entity_key is sanitized (charset-substituted + truncated), not hashed, two distinct manifest ids can collapse to one key.  
+  - _Fix:_ Detect colliding sanitizeEntityKey values across manifest entries and mark the manifest read_ok:false on collision (rather than silently letting the last-written presence fact overwrite the first in groupCanaryFactsByTick's per-tick map). read_ok:false fails the decommission gate OPEN and raises canary.tampered(manifest_unreadable), so the operator is told loudly instead of one decoy going dark — and it leaves the detect* functions untouched. Reachability requires an unusual/adversarial manifest (two ids that sanitize-collide), but it is plain JSON off disk. Repro: two presence facts with ids 'prod/key' and 'prod_key' (both sanitize to 'prod_key') collapse to one map entry (mtime=999 overwrites mtime=100).
+
+### Out-of-contract (requires hostile live object)
+
+- HIGH 4 (equivalent stat encodings fabricate mtime_changed, stat-diff.js:64,68): confirmed that computeStatDiffTripReason('1000','1e3',['mtime']) returns mtime_changed, BUT the real collector never emits divergent encodings — statAttribute produces canonical Date.toISOString()/String() (verified: same unchanged Date twice -> undefined) and credential-access compares finite numbers. Divergent strings can only enter via injected fact-history, i.e. state-dir write, which is the documented root-rewrite attestation limitation. Direction is fabrication (a false alert), the less-dangerous failure for a positive detector. Optional cheap hardening: numeric-aware comparison for the timestamp branches.
+- MEDIUM 6 (unbounded credential baseline cardinality, credential-access-baseline.js:41,115,139-142): organically the store is bounded to the ~8 fixed v1 path_hashes forever — detectCredentialAccess only ever writes nextEntries for the fixed collector path list. Unbounded growth/DoS requires an external writer bloating the 0600 store file in the state dir (state-dir write = the same root-rewrite territory). Optional cheap defense-in-depth: cap accepted entry count in isValidCredentialAccessBaselineStoreShape to a small multiple of the known path count.
+
+### Deferred / architectural
+
+- BLOCKER 1 fix layer (b): redesign detectCanaryTrips/detectCanaryVanished to per-canary completeness (each canary compared across its own last two fully-observed sightings) instead of the census-wide complete/partial gate. This ends ALL collateral suppression (including host-state lstat-failure sources that manifest-fix (a) cannot reach) but changes the documented 'two-COMPLETE-group' semantics and the byte-identical regression coverage canary-baseline.test.js pins — a scoped slice of its own.
+- HIGH 5 residual: out-of-process / threadpool-isolated collector I/O (bounded-concurrency worker) to fully eliminate libuv-pool exhaustion from a hung mount; the in-file deadline+circuit-breaker above is only a mitigation.
+- BLOCKER 2 residual: daemon.js:576-589 builds mainExtraCandidates as one array literal with no per-detector try/catch, so ANY detector that throws aborts the whole tick. The in-file fix hardens credential-access specifically; a general per-detector isolation wrapper at the daemon seam would defend every family.
+- Establishment-window edge (a change occurring at a canary's 2nd sighting, before minEstablishedCount=3 accrues, then stable): not caught. This is the intended false-positive control (a canary is not trusted until stably established) and is a tuning consideration, not a bug.
+
+### False positives (daybreak refuted)
+
+- BLOCKER 1 as stated (canary trips 'incorrectly gated beyond two snapshots ... genuine events permanently lost', citing the 2-snapshot repro): the cold-start/completeness lockout is correctly NOT applied to canary.tripped (canary-baseline.js:637 computes rawTrips unconditionally; :765-768 emits them regardless of coldStartPendingThisTick — daybreak itself conceded this in 'defenses that held'). The gate the 2-snapshot repro hits is the pre-existing minEstablishedCount(=3, not 2)+two-complete-group FALSE-POSITIVE control, not the completeness lockout. Empirically an ESTABLISHED canary fires on the exact tick of change (repro B: 3 complete snaps, change on the last -> mtime_changed fires), and persistent-attribute changes survive a single partial tick (recovered vs the next complete census, since mtime/ino persist on disk). 'Permanently lost' is overstated for the mechanism cited. (The genuinely-real permanent-loss path — persistent partial censuses — is a DIFFERENT mechanism, captured as a confirmed-fixable blocker above.)
+- HIGH 3a (canary_id cleartext-sanitized 'exposing username and path structure'): the sanitized value is the operator's OWN chosen canary_id LABEL for their OWN decoy artifact, deliberately carried sanitized AND alongside its hash (canary_id_hash) so the operator can tell WHICH decoy tripped — a hash-only alert would be operationally useless. The raw FILE PATH is separately hashed (identity_fingerprint in tools/canary.js, path never leaves the collector) and never reaches diagnostics. The repro's 'leak' requires the operator to name their canary id after a sensitive path — self-inflicted labeling, not a raw-path leak the sanitizer failed to prevent. Contrast credential-access, whose paths ARE real secrets and ARE hashed (path_hash).
+
+### Fix-spec
+
+## Fix spec — positive-evidence-detectors
+
+Two blockers, two high/low fixes. Preserve the documented invariant that `canary.tripped` and `credential.access` are POSITIVE two-snapshot signals emitted even while any completeness/cold-start lockout is pending (never regress that).
+
+### 1. BLOCKER — credential-access store I/O must not abort the tick or drop findings
+File: `tools/descartes-cli/src/credential-access-baseline.js` (`computeCredentialAccessCandidates`, ~:227-247)
+
+Mirror `canary-baseline.js:517-525, 712-722, 751-755`.
+
+- Wrap `loadCredentialAccessBaselineStore`. On a **non-ENOENT throw** (readJsonFile re-throws EACCES/EISDIR at :42): **skip the write and `return []` this tick.** Do NOT substitute an empty baseline then write — that clobbers the real last-known-good baseline and loses the change (canary-baseline.js:718-722 documents this exact hazard).
+- Compute `findings` first, then wrap `writeCredentialAccessBaselineStore`. On a **write throw** (ENOSPC/EROFS/EACCES): set a local `storeWriteFailed` flag but **still `return buildCredentialAccessCandidates(findings)`** — stable `alertId` dedup absorbs the re-fire. The positive alert must survive a failed baseline advance.
+- No throw may escape `computeCredentialAccessCandidates` under ordinary disk conditions.
+
+Invariant: positive signal never discarded; store I/O failure degrades this detector only, never the shared tick (daemon.js:576-589 has no per-detector catch).
+
+### 2. BLOCKER — persistent-partial census must not suppress all canary trips
+Files: `canary-manifest.js:41-43` (immediate), `canary-baseline.js:273-274` + `detectCanaryTrips`/`detectCanaryVanished` (larger, may defer)
+
+Root cause: a valid manifest entry with `watch:["executed"]` and no `sentinel_path` makes `collectOneCanary` emit `executed:"unknown"` every tick (canary.js:62-71) → `execution_unknown_count>0` → census `partial` every tick (fact-translators.js:459-482) → `completeGroups.length < 2` → `detectCanaryTrips` returns `[]` for ALL canaries, forever. Same from any canary with a persistent non-ENOENT lstat failure (`unreadable_count>0`).
+
+- **(a) do now:** in `normalizeCanaryManifest`, reject/drop an entry whose `watch` includes `"executed"` when `sentinel_path` is absent (today it is only rejected when defined-but-empty). Closes the ordinary-config trigger.
+- **(b) deferred:** switch the complete/partial census-wide gate to PER-CANARY completeness — compare each canary across its own last two fully-observed sightings (presence fact present AND `executed !== "unknown"`). Ends collateral suppression from an unrelated canary's blackout or host-state lstat failure. Changes the byte-identical two-COMPLETE-group regression tests, so it is its own slice. **If (b) is deferred, document that (a) leaves host-state (EACCES/EIO/ENOTDIR) sources open.**
+
+Invariant: a positive two-snapshot signal must not be completeness-gated into permanent silence.
+
+### 3. HIGH — bound the credential lstat pass
+Files: `tools/descartes-cli/src/tools/credential-access.js:123-127`, `credential-access-baseline.js:232-233`
+
+Wrap the collection in an outer per-tick deadline (reuse daemon.js `withDeadline`, :301-307) that abandons the remaining loop on first timeout, returns `[]`, and skips the store write that tick. A bare per-path `Promise.race` is not enough: 8 paths under `$HOME` can leak up to 8 libuv threads (pool default 4) in one tick, blocking all process fs. Add an in-memory circuit breaker (skip credential collection for K ticks after a timeout). Mitigation only; out-of-process isolation deferred.
+
+### 4. LOW-MEDIUM — surface canary entity_key collisions loudly
+Files: `canary-manifest.js:39-46`, `canary-baseline.js:216`
+
+Detect colliding `sanitizeEntityKey` values across manifest entries and set `read_ok:false` on collision. That fails the decommission gate OPEN and raises `canary.tampered(manifest_unreadable)` — operator told loudly — instead of one decoy's snapshot being silently overwritten in `groupCanaryFactsByTick`'s per-tick map. Leaves the detect* functions untouched.
+
+### Do NOT change
+- HIGH 4 string-vs-numeric compare and MEDIUM 6 cardinality: not reachable via ordinary collector output / organic store growth (require injected fact-history or an adversarial store file — the documented root-rewrite limitation). Optional cheap hardening noted; not required this pass.
+- The unconditional emission of `canary.tripped` / `credential.access` while cold-start lockouts are pending (canary-baseline.js:765-768; credential-access-baseline.js:244-246) — this is the invariant, keep it.
+
+
+---
+
+## statistical-novelty-detectors — `has-fixable`
+
+All 8 daybreak findings reproduce mechanically against the real code (repro at scratchpad/repro.mjs), but the severity ranking shifts on verification: the two clean fabrication-from-a-shortened-window bugs are F5 (single-tick session churn) and F4 (future/clock-rolled-back last_folded_ts silently resets the watermark and fires novelty), plus F3 (contradictory in-tick census markers resolved by attacker-controlled record order). F1 (lenient stores trust a bare cold_start_pending:false) reproduces but is fragment-robustness parity, not a security boundary — the plan explicitly scoped exact-schema hardening of these three stores as out-of-plan future work, the independent completeness gates still fire, and a deliberate state-dir writer can forge a fully-valid established store regardless — so it drops from BLOCKER to low-medium. F2 (marker-only ticks clearing cold-start) and F8 (documented cleartext service name) are deferred design/policy calls, not defects to patch now.
+
+### Confirmed-fixable
+
+- **[high] F5 — A single tick fabricates session.churn (no distinct-timestamp requirement)**  
+  - _Files:_ tools/descartes-cli/src/session-baseline.js (detectSessionChurn, ~L407-443)  
+  - _Invariant:_ Never fabricate a kill-then-resurrect (churn) alert from within one tick / a shortened window: a fingerprint change must be observed BETWEEN two distinct observation ticks, never between two rows of the same tick.  
+  - _Fix:_ detectSessionChurn takes the last two records for an entity by ts but never requires older.ts !== newer.ts. Verified: one complete tick with two session.presence rows for the same entity_key (fingerprints aaaa… then bbbb…) emits a churn entry. Fix: after sorting an entity's observations by ts, fail closed if the latest complete tick carries more than one record for that entity with differing fingerprints (ambiguous same-tick evidence → no claim); otherwise compare the newest record only against the most recent STRICTLY-EARLIER tick's record (older.ts < newer.ts). The K=1 recency bound (newer.ts === latestCompleteTs) stays. Preserve stateless/byte-identical-repeated-call behavior.
+
+- **[high] F4 — Future / clock-rolled-back last_folded_ts silently resets the watermark and fires novelty (all 5 modules)**  
+  - _Files:_ process-lineage-baseline.js (~L393-401), session-baseline.js (~L613-624), peer-baseline.js (~L744-758), persistence-baseline.js (~L340-348), service-baseline.js (~L556-565)  
+  - _Invariant:_ A future/clock-rolled-back watermark must not poison the baseline or fabricate novelty: when the persisted last_folded_ts is in the future, pre-rollback (future-dated) history is excluded by the groupMs<=nowMs filter, leaving a SHORTENED window — the detector must cold-start, not fire.  
+  - _Fix:_ Verified: an established store with last_folded_ts=2099 passes validation (exact-schema and lenient both accept it), lastFoldedWasFuture only forces a store WRITE and never re-arms cold-start, so novel_edge fires against a window that excludes the future-dated history proving the edge is old. Fix: in every compute function, hoist the lastFoldedWasFuture computation above enteringColdStart and add it as an arming term (enteringColdStart = … || lastFoldedWasFuture), mirroring the existing persistedAnchorMissingOrFuture (> nowMs) treatment of a future cold_start_since_ts. Cost is one bounded minHistoryTickCount re-warm on a backward NTP step; the store write on that tick already happens via coldStartStateChanged. Keep strict > nowMs (no tolerance) for consistency with persistedAnchorMissingOrFuture.
+
+- **[medium] F3 — Contradictory in-tick census markers resolved by attacker-controlled record order (last-marker-wins)**  
+  - _Files:_ session-baseline.js (~L299-306), service-baseline.js (~L254-263), persistence-baseline.js (~L202-204), process-lineage-baseline.js (~L232-234); peer signature grouping peer-baseline.js (~L339-355)  
+  - _Invariant:_ Contradictory/ambiguous census evidence for one tick must fail closed (untrusted), never resolve by facts.jsonl record order — otherwise a partial-then-complete pair fabricates a disappearance/novelty and a complete-then-partial pair suppresses a real one.  
+  - _Fix:_ Verified: groupServiceFactsByTick([partial,complete])→'complete', reversed→'partial' (order decides). Every grouper overwrites group.censusState on each marker. Fix: when a tick already has a census marker and a SECOND marker with a DIFFERENT census_state arrives, downgrade that tick to the fail-closed 'unknown' disposition (which existing '=== "complete"' filters already exclude from establishment and comparison). Fail closed ONLY on contradiction — identical duplicate markers must NOT downgrade (a benign double-write must not cause a 1-tick suppression). For peer, the analogous case is two census markers with different availability_signature in one tick → treat as present-but-invalid (see F6 sentinel). Distinct from the documented/deferred two-daemon writer race — this is single-read handling of contradictory evidence.
+
+- **[low-medium] F1 — Lenient stores trust a bare cold_start_pending:false without establishment provenance (session / peer / service-disappearance)**  
+  - _Files:_ session-baseline.js (loadSessionBaselineStore/normalizeSessionBaselineState ~L165-244), peer-baseline.js (~L205-272), service-baseline.js disappearance path (~L139-195)  
+  - _Invariant:_ A store that clears the persistent cold-start lockout (cold_start_pending:false) must carry the complete established-state provenance (a valid last_folded_ts watermark), not merely a parseable boolean — 'not establishment-confirmed → zero novelty'.  
+  - _Fix:_ Verified: a forged {cold_start_pending:false} store fires session.count_drop/critical while the fresh-store control emits nothing; process-lineage's exact-schema validator rejects the identical blob. This is fragment/old-format-store robustness parity with the 3 already-hardened stores (process-lineage, persistence, service-appearance), NOT a security boundary — a deliberate state-dir writer can forge a fully-valid established store either way, and the independent completeness gates (historyTrust, completenessLossAfterAnchor) still fire on any recorded loss. The plan (docs/plans/2026-08-21-fact-store-completeness-hardening.md L224-278) explicitly names this as 'legitimate future hardening — out of this plan's scope.' Minimal migration-safe fix: in each of the three loaders, after JSON.parse, if cold_start_pending === false AND last_folded_ts is not a valid ISO timestamp, return invalid_store_schema (routing to storeLossThisTick + real anchor re-arm, exactly as the exact-schema siblings do). Do NOT copy process-lineage's closed key set — session/peer carry richer schemas (stats, last_observation, drop, availability_signature, skipped_*); a pre-migration store lacking cold_start_pending already defaults to pending and must stay untouched (missing-field-degrades-not-crashes rule). A full closed-key-set validator would require enumerating each module's complete key set.
+
+- **[low-medium] F6 — Present-but-invalid peer availability_signature is conflated with legacy markerless (fail-open in the spike direction)**  
+  - _Files:_ peer-baseline.js (groupPeerFactsByTick ~L339-355; computeWindowedPeerStats spike fold ~L426-431)  
+  - _Invariant:_ A garbled/future/incompatible census marker is evidence of corruption and must fail closed on its own, not silently join (and be scored against) the trusted legacy markerless regime.  
+  - _Fix:_ Verified: 30 markerless count-1 ticks + a count-10 tick carrying availability_signature 'v2:future-garbage' → peer.count_spike z=18; the same tick with a VALID new signature suppresses (regime flip → provisional). So an invalid marker behaves like no-marker (pools) instead of like a new regime (suppresses). NOTE daybreak's 'fabricates a spike' framing is narrower than stated — a genuine markerless-baseline count jump 1→10 is the detector working as designed; the real defect is the invalid-vs-absent conflation, so this is defense-in-depth, not a fresh fabrication class. Fix: add a THIRD sentinel in groupPeerFactsByTick distinguishing 'marker present but signature invalid' from 'no marker at all' (do NOT change the existing undefined/markerless semantics — the Tailscale-only/legacy pooling is load-bearing and documented). Exclude present-but-invalid-marker ticks from the spike fold AND score (fail closed), the same posture drop already takes for markerless.
+
+- **[low] F7 — session.churn republishes an unvalidated raw entity_key into fingerprint + diagnostics (defense-in-depth; needs a nonconforming fact source)**  
+  - _Files:_ session-baseline.js (buildChurnCandidates ~L477-495; detectSessionChurn pool ~L422-427)  
+  - _Invariant:_ Identity-bearing values must be hashed/bucketed; session.churn should not pass an entity_key that does not match the translator's hashed session.<mux>.<16hex> shape into a displayed/persisted field.  
+  - _Fix:_ Verified: entity_key 'alice.internal' flows verbatim into candidate.fingerprint and diagnostics.entity_key. Requires an out-of-contract fact producer — the real translator (fact-translators.js:642) always emits session.<tmux|screen>.<16hex> (hashed at source), so the normal path is safe. Sibling detectors (process-lineage/service-appeared/scheduled_job) hash the entity_key at emit; session.churn does not. Fix by SHAPE VALIDATION, not re-hashing: require entity_key to match /^session\.(tmux|screen)\.[0-9a-f]{16}$/ and drop nonconforming entries from churn. Do NOT re-hash — fingerprint: entry.entity_key feeds alertId(SESSION_CHURN_RULE_ID, entity_key); changing it to a hash changes every existing session.churn alert id and breaks dedup on upgrade (a documented behavioral invariant).
+
+### Deferred / architectural
+
+- F2 — Marker-only ticks satisfy cold-start re-accumulation and then feed novelty (all 5 modules). Verified: 6 census-marker-only 'complete' ticks (empty evidence bodies) clear the persistent lockout, and a novel edge in the 7th tick fires process.lineage.novel_edge against an evidence-empty history (the same-tick variant returns [] only because the gate reads pre-update state). This reproduces the operator's literally-stated invariant ('a per-tick census marker must NOT itself defeat the cold-start gate'), BUT the obvious fix (require re-accumulation/history ticks to carry actual evidence) regresses legitimate zero-entity hosts — a minimal host can have long runs of genuinely empty-but-complete service/scheduled_job/session/peer censuses, then a real new entity that SHOULD fire. Additionally, the practical false-history path (marker-only 'complete' censuses whose evidence lines were deleted) is largely caught by the continuity content-digest (plan Addendum 2026-08-21), which flags prefix tampering as degraded. Owner decision needed on what 'itself' means in the invariant. A lineage-only guard ('latest AND historical each carry ≥1 edge', safe because process lineage always has edges) is regression-safe there but NOT for service/scheduled_job/session/peer. Track as a design slice, not a blind patch.
+- F8 — service.disappeared republishes a sanitized-but-unhashed cleartext service name (service-baseline.js ~L361-405). Factually accurate (daybreak correct) but this is a DOCUMENTED, deliberately-scoped 2026-07-24 operator decision (local operator notification where 'which service vanished' is the entire operational point; fingerprint/id stay hashed; comment says 'do not generalize'). It conflicts with the brief's absolute hash-at-source wording, not with a code contract. No code change without an operator policy reversal — owner = operator policy, not this area.
+
+### Fix-spec
+
+# Fix spec — statistical-novelty-detectors (verified triage)
+
+Repro harness: `scratchpad/repro.mjs` drives the real exported functions with injected facts/stores; every claim below was reproduced. Apply TDD: add the failing case first, then fix.
+
+Preserve these documented behavioral invariants throughout (they are load-bearing and tested by the ~1321-test suite — run it after each change):
+- byte-identical repeated calls / at-most-one-write-per-unchanged-batch,
+- re-emission-every-tick (candidates rebuilt fresh from the windowed recompute, independent of whether a store write happened),
+- peer spike SCORE-BUT-NEVER-FOLD, session/peer/service cold-start no-self-heal-and-fire (gate reads pre-update `persistedState`),
+- session.churn `fingerprint: entity_key` = the alert dedup key (must not change for conforming keys),
+- the Tailscale-only/legacy markerless (`availabilitySignature === undefined`) pooling in peer spike.
+
+## Priority 1 — clean fabrication-from-shortened-window
+
+### F5 — single-tick session.churn — `session-baseline.js` `detectSessionChurn`
+Require the two compared observations to come from DISTINCT ticks. After sorting an entity's observations by ts: if the latest complete tick carries >1 record for that entity with differing fingerprints → fail closed (ambiguous, no claim). Otherwise compare the newest record only against the most recent STRICTLY-EARLIER tick (`older.ts < newer.ts`). Keep the K=1 recency bound.
+Test: one complete tick, one entity, two rows fp aaaa…/bbbb… → **no** churn; genuine cross-tick fingerprint change → still fires.
+
+### F4 — future / clock-rolled-back `last_folded_ts` — all 5 compute functions
+In each `computeX…Candidates`, hoist the `lastFoldedWasFuture` computation ABOVE `enteringColdStart` and add it as an arming term (`… || lastFoldedWasFuture`), mirroring the existing `persistedAnchorMissingOrFuture` (strict `> nowMs`) handling of a future `cold_start_since_ts`. The store write on that tick already fires via `coldStartStateChanged`. Cost: one bounded `minHistoryTickCount` re-warm on a backward NTP step.
+Test: established store, `last_folded_ts` in the future, live post-rollback window → cold-start (no novelty), not fire.
+
+## Priority 2 — ambiguity / establishment integrity
+
+### F3 — contradictory in-tick census markers — all 5 groupers
+When a tick already recorded a census marker and a second marker with a DIFFERENT `census_state` (peer: a different `availability_signature`) arrives in the same tick, downgrade that tick to the fail-closed `unknown` disposition. Fail closed ONLY on contradiction; identical duplicate markers must not downgrade (no benign-double-write suppression).
+Test: `[partial,complete]` and `[complete,partial]` for one ts both → `unknown`; `[complete,complete]` → `complete`.
+
+### F1 — lenient stores trust bare `cold_start_pending:false` — `session-baseline.js`, `peer-baseline.js`, `service-baseline.js` (disappearance loader)
+Severity LOW-MEDIUM (fragment-robustness parity, not a security boundary; plan-documented as out-of-scope future hardening). Minimal migration-safe fix: in each loader, after parse, if `cold_start_pending === false` AND `last_folded_ts` is not a valid ISO timestamp → return `invalid_store_schema` (→ `storeLossThisTick` → real anchor re-arm), exactly as the exact-schema siblings do. Do NOT import process-lineage's closed key set (session/peer schemas are richer); a pre-migration store lacking `cold_start_pending` already defaults to pending — leave it untouched.
+Test: forged `{cold_start_pending:false}` (no watermark) → cold-start, no count_drop; a fully-valid established store still fires.
+
+## Priority 3 — defense-in-depth
+
+### F6 — present-but-invalid peer signature — `peer-baseline.js`
+Add a third sentinel distinguishing "marker present but signature invalid" from "no marker" in `groupPeerFactsByTick` (do not touch `undefined`/markerless semantics). Exclude present-but-invalid-marker ticks from the spike fold AND score (fail closed).
+Test: markerless baseline + count-10 tick with `v2:future-garbage` → **no** spike; markerless baseline + count-10 truly-markerless tick → spike (unchanged).
+
+### F7 — raw entity_key in session.churn output — `session-baseline.js` `buildChurnCandidates`/`detectSessionChurn`
+Shape-validate, don't re-hash. Drop churn entries whose entity_key does not match `/^session\.(tmux|screen)\.[0-9a-f]{16}$/`. Re-hashing would change `alertId(SESSION_CHURN_RULE_ID, entity_key)` and break dedup on upgrade.
+Test: entity_key `alice.internal` → dropped; `session.tmux.<16hex>` → emitted with entity_key preserved as fingerprint.
+
+## Deferred (do NOT patch blind)
+- **F2** marker-only re-accumulation: owner decision on the invariant's meaning; evidence-bearing-history guard regresses legitimate zero-entity hosts; continuity digest already mitigates the prefix-tampering path. A lineage-only "latest+historical each carry ≥1 edge" guard is regression-safe there only.
+- **F8** cleartext service name: accepted, documented operator decision; no change without policy reversal.
+
+Run the full suite (~1321 tests) after each fix and confirm no regression in the preserved-invariant tests listed above.
+
+
+---
+
+## action-and-llm-surface — `has-fixable`
+
+Verified all 9 daybreak findings against the three area files plus the upstream producers (alert-store.js), sanitizer, delivery module, and daemon call sites. The recommend-only execution isolation and the closed-namespace/hard-exclude/opt-in gates all hold as daybreak agreed. Three findings are real and fixable in-area (#3 corrupt/invalid-ts audit records under-count the budget = fail-open, verified by repro; #6 soft delivery failures are recorded as fired/ok; #7 two daemon call sites are unwrapped so an import EIO aborts the whole tick). Two BLOCKERs (#1 cross-process TOCTOU, #2 append-fail over-call on restart) are real but are exactly the write-ahead/transactional-audit follow-up the code already documents as deferred at alert-intelligence.js:1002, and #1's normal two-daemon case is blocked by the OS service-manager single-instance guard. The remaining confidentiality findings (#4 prompt, #5 notification) are not reachable via any current producer's ordinary output — confidentiality is enforced hash-at-source upstream with the sanitizer as a documented shape-only backstop — and #9 misapplies the invariant to local 0600 logs.
+
+### Confirmed-fixable
+
+- **[HIGH] #3 Corrupt/invalid-timestamp audit records fail OPEN and under-count the LLM budget**  
+  - _Files:_ tools/descartes-cli/src/alert-intelligence.js (readAuditRecords :262-270, isWithinTrailingHour :314-318, partitionRecentAuditCounts :324-332, the budget-seed read at :1051)  
+  - _Invariant:_ Total LLM calls in the trailing hour + this invocation must ALWAYS be <= max_calls_per_hour; audit I/O must fail CLOSED (never under-count, which over-calls). This is the invariant the module's own :957-1005 comment claims to uphold.  
+  - _Fix:_ Verified by repro: a parseable record with a non-finite ts (isWithinTrailingHour returns false) and a truncated/unparseable JSONL line (dropped at :266) both count as ZERO, so a genuine prior call is not counted and an extra call is admitted. Reachable via ordinary disk corruption (crash or ENOSPC truncating the final append of the never-rotated file at :1156). DO NOT change the exported readAlertIntelligenceAudit / shared readAuditRecords behavior — calibration.js:465 and tuning-store.js:575 depend on the current corrupt-line tolerance. Scope the fix to the budget-seed path only: (a) have the budget seed at :1051 read raw and, for each unparseable line, count it toward the trailing-hour budget iff the nearest parseable record AFTER it (or EOF) is in-window — this fails closed yet ages out with the append-ordered monotonic-ts file, so one old truncated line cannot forever disable adjudication; (b) in the counting path, a parsed record with a non-finite ts counts as one in-window (non-critical) call rather than being skipped. Optional one-liner while in isWithinTrailingHour: a future-ts record (nowMs - tsMs < 0, clock stepped back) is also skipped and under-counts — clamp or count it. Do not fold this into the shared reader; add a strict counting variant or return {records, corruptLineCount} from a budget-local read.
+
+- **[MEDIUM] #6 Soft notification-delivery failures are recorded as fired/successful**  
+  - _Files:_ tools/descartes-cli/src/alert-intelligence.js (emitSessionAlertSignals :431-441; LLM path context :1138-1161)  
+  - _Invariant:_ A delivery that did not actually reach the operator must not be reported as fired/ok — the operator-visibility half of the alerting contract for deterministic critical signals (canary.tripped, mass session.count_drop).  
+  - _Fix:_ Verified: deliverNotificationDecision (notification-delivery.js :269-321) RESOLVES with {status:'error'|'unavailable'|'disabled'|'cli_only'|'skipped'} without throwing; emitSessionAlertSignals only catches THROWS (:436) and pushes every non-throwing resolve into `fired` (:435). In-area fix: inspect the returned delivery record's status and route 'error'/'unavailable' into the existing `failed` array, NOT `fired`. Treat 'delivered'/'recorded'/'skipped'/'disabled'/'cli_only'/undefined as NOT failures ('disabled'/'cli_only' are intentional config states, not delivery failures). Safe against existing tests — their fakes return undefined or {status:'recorded'}, neither of which is error/unavailable. IMPORTANT scoping: the LLM-path top-level status:'ok' at :1150 is the ADJUDICATION status and already preserves the real delivery.status in the `delivery` field (:1160) — that sub-claim of daybreak's is accurate-but-not-a-defect; do not change it. Genuine RETRY of a failed delivery is out of area: applyAlertCandidates (alert-store.js) stamps last_notified/cooldown_until before delivery is confirmed (:388-391), so retry needs the cooldown seam upstream — this in-area fix only makes the failure observable, it does not resurrect the suppressed alert.
+
+- **[MEDIUM] #7 Unwrapped emitSessionAlertSignals / computeContainmentRecommendationCandidates can abort the whole daemon tick**  
+  - _Files:_ tools/descartes-cli/src/alert-intelligence.js (emitSessionAlertSignals :399,:407,:412), tools/descartes-cli/src/containment-recommend.js (computeContainmentRecommendationCandidates :343,:347); call sites daemon.js :606 and :638 are NOT wrapped, unlike adjudicate which is wrapped by safeAdjudicateAlertNotifications :642  
+  - _Invariant:_ Tick-survival: a single alert-family / dependency failure must DEGRADE (log + skip), never abort the whole daemon iteration (dropping the structural-checkpoint/status-write already done this tick).  
+  - _Fix:_ Two sub-issues. (1) The dynamic `await import('./notification-delivery.js')` at :412 sits BEFORE the per-alert try/loop, so a cold-cache EIO rejects the entire function and, because daemon.js :638 is unwrapped, aborts runDaemonIteration — this is the real disk-reachable trigger. Wrap the import in try/catch and degrade to {fired:[],failed:[...]} on module-load failure, mirroring adjudicate's :1069-1079 dependencies_unavailable pattern. (2) Add Array.isArray guards before `new Set(evaluation?.notification_due_ids)` (:399, containment :343) and before `(evaluation.alerts ?? []).filter` (:407, :347) so a non-array shape yields [] instead of throwing 'object is not iterable' (repro-confirmed). NOTE: the shape-throw itself is only reachable via an in-process producer bug — evaluation is the live result of evaluateAndPersistAlerts, not disk-deserialized — so the guards are defense-in-depth; the import-EIO path is the ordinary-reachable half. Belt-and-suspenders alternative/addition: wrap the daemon.js :606 and :638 call sites like safeAdjudicateAlertNotifications.
+
+### Out-of-contract (requires hostile live object)
+
+- #7 shape-throw half (clarification): the 'object is not iterable' / '.filter is not a function' throw requires a NON-ARRAY notification_due_ids/alerts, but in production `evaluation` is the in-process return of evaluateAndPersistAlerts (daemon.js :608), not a disk-deserialized object — array-ness is guaranteed by in-process code, so the shape-throw itself needs an in-process producer bug, reachable only through the DI test seams. The Array.isArray guards are therefore defense-in-depth; the ordinary-reachable half of #7 (module-load EIO on the pre-loop dynamic import aborting an unwrapped tick) is what makes #7 confirmed-fixable.
+
+### Deferred / architectural
+
+- #1 (daybreak BLOCKER) Cross-invocation TOCTOU race on the hourly budget: REAL — each invocation reads+counts the audit, admits, calls the model, and only then appends, with no cross-process lock or write-ahead reservation, so two concurrent invocations both see count 0 and both call (repro-confirmed by daybreak). This is exactly the transactional/write-ahead audit + cross-process lock named as the open follow-up at alert-intelligence.js:1002-1005; it is not cleanly fixable inside these files without introducing a new cross-process lock primitive. Reachability note for the follow-up: the OS service-manager single-instance guard (daemon.js :861/:884/:1000 already_running) prevents the normal two-daemon case, and no CLI subcommand invokes adjudication directly (daemon.js is the sole real caller — the calibration.js/incident-correlation.js references are comments only), so this is live only if an operator manually launches a second `daemon run --foreground` against the same stateDir. Owner: the :1002 write-ahead-audit follow-up, which must include a cross-process lock, not just write-ahead.
+- #2 (daybreak BLOCKER) Post-call append failure -> unlimited over-calls across restarts: REAL and already documented as deferred in-code at alert-intelligence.js:1002-1005. The model call (:1130-1135) precedes the durable append (:1141); an append failure sets only the in-memory auditWriteDegradedPaths latch (:289), which a process restart loses, so a fresh process reads an empty/short audit and calls again. Bounded to <=1 unrecorded call per fail->heal cycle and <=1 per restart (documented), requires a sustained write fault (ENOSPC/EROFS) plus a restart. Same owner as #1: the write-ahead/transactional audit follow-up. daybreak's BLOCKER ranking is defensible against the literal 'ALWAYS <= max' wording, but this is the named, dated, deferred item, not a new gap.
+- #4 (daybreak HIGH) Raw identity into the LLM prompt via verbatim title/summary: compactAlert (:678-690) copies id/title/summary verbatim and only sanitizes diagnostics. VERIFIED not reachable via any current producer's ordinary output — the only default-LLM-eligible namespace is metric, and every metric producer (alert-store.js :95-156: daemon.samples.*, daemon.status.stale, system.memory/load, disk.space) interpolates ONLY numbers/durations/percentages into title/summary, never a path/user/IP (the disk mount identity goes to diagnostics.dimensions_seen as a count, not the summary). Learned namespaces require opt-in and their translators hash at source. The code itself documents (:661-668) that confidentiality is a hash-at-source UPSTREAM control and sanitizeDiagnostics is only a shape backstop that intentionally permits IP/hostname-shaped strings. A leak requires a producer regression or forged alerts.json (normalizeAlertRecord :174-175 String()-coerces title/summary with no charset gate). A defense-in-depth title/summary sanitizer is cross-cutting and cannot charset-clamp legitimate prose; if pursued, the fix-owner is the producer/schema layer, not this area.
+- #5 (daybreak HIGH) Deterministic notification renders identity-bearing diagnostics verbatim (session.churn entity_key/prior/current_fingerprint at :469, etc.): the body MUST render these values, and session-baseline.js hashes entity_key/fingerprints at source, so a raw value appears only via forged/corrupt JSON or a producer regression — daybreak's own caveat. Same upstream hash-at-source ownership as #4; not reachable via ordinary producer output. (The service.disappeared cleartext sub-branch :517-531 is a documented, intentional operator decision of 2026-07-24, not a defect — see the false-positive note.)
+- #8 (daybreak MEDIUM) Duplicate/order-controlled alerts consume the budget ahead of a real alert: alert-store dedupes by id, so duplicate due IDs in one batch require forged/corrupt alerts.json (daybreak's own caveat) — not reachable via compliant producers, so not ordinary-input CONFIRMED-FIXABLE. Optional cheap defense-in-depth if desired: dedupe orderedAlerts by alert.id at :1044 (a one-line Map). Stable priority WITHIN a severity class is a design choice, not a bug — critical is already processed before non-critical (:1044-1047).
+
+### False positives (daybreak refuted)
+
+- #9 (daybreak MEDIUM) Absolute paths + error text in logs/audit: daybreak's FACT is true (the audit-file absolute path is console.warn'd at :1037/:1197 and session/delivery error text is persisted into the audit `error` field at :438/:1172), but it MISAPPLIES the invariant. The stated confidentiality invariant's protected surfaces are the LLM PROMPT and the NOTIFICATION; local logs and the 0600 llm-decisions.jsonl audit (written by ensureParent mode 0700 / appendFile mode 0600) are neither — the path is the machine's own state directory printed in the machine's own local logs, exfiltrated nowhere. Misapplied invariant, not a leak of a protected surface.
+- #5 service.disappeared cleartext sub-branch (:517-531): NOT a defect. The cleartext service name is a documented, intentional, scoped operator decision (2026-07-24, recorded in the plan and in the :503-516 / :445-453 header comments), uses the charset-bounded sanitized name (never raw), and is deliberately NOT extended to session/peer/service.appeared branches. daybreak flags it as 'documented but still conflicts' — but a documented, deliberately-scoped operator exception is a preserved invariant of this code, not a bug to fix.
+- #6 LLM-path status:'ok' sub-claim: daybreak lists :1150 (LLM path records status:'ok') as part of the defect, but that top-level status is the ADJUDICATION-call status and the real delivery outcome is preserved in the audit record's `delivery` field (:1160). Accurate-but-not-a-defect; the genuine #6 defect is confined to the deterministic emitSessionAlertSignals `fired` path.
+
+### Fix-spec
+
+## Fix spec — action-and-llm-surface (3 in-area items)
+
+All three are in `tools/descartes-cli/src/`. TDD: add the failing test first, then the fix. None touches the recommend-only isolation or the namespace/opt-in gates (all verified intact).
+
+### Fix 1 — #3 Corrupt/invalid-ts audit records must fail CLOSED (budget under-count)
+**Invariant:** total LLM calls (trailing hour + this invocation) ALWAYS `<= max_calls_per_hour`; audit read must never under-count.
+
+**Do NOT** change the exported `readAlertIntelligenceAudit` / shared `readAuditRecords` (`:262`) — `calibration.js:465` and `tuning-store.js:575` rely on its current "ignore corrupt lines" tolerance, and a `test/alert-intelligence.test.js` suite pins config/audit tolerance. Scope everything to the budget seed at `:1051`.
+
+1. Add a budget-local strict read (or return `{ records, corruptLineCount }` from a new variant) used only at `:1051`.
+2. **Unparseable line policy (must age out, must fail closed):** count an unparseable line toward the trailing-hour budget **iff the nearest parseable record after it (or EOF) is in-window.** The file is append-ordered with monotonic `ts` (`:1141` writes `ts: now`), so this bounds a corrupt line's time by its neighbours — fails closed for a fresh truncation, ages out an old one. Never "skip the tick on any corrupt line" and never "count every corrupt line forever": the file is never rotated (`:1156`), so both permanently wedge adjudication into `audit_unavailable`.
+3. **Parsed record, non-finite `ts`:** in `partitionRecentAuditCounts` (`:324`), count it as one in-window non-critical call instead of skipping (today `isWithinTrailingHour` `:317` returns false → dropped).
+4. **Optional one-liner:** in `isWithinTrailingHour`, a future-ts record (`nowMs - tsMs < 0`, clock stepped back) is also skipped → under-count; clamp or count it. Do not expand scope beyond this.
+
+**Test:** seed the audit with `{"ts":"invalid","status":"ok","alert_severity":"critical"}` (or a truncated final line) + one due eligible alert, `max_calls_per_hour=1`; assert the second call is NOT admitted (`status: "rate_limited"`/dropped), not `ok`.
+
+### Fix 2 — #6 Failed deterministic delivery must not be reported as `fired`
+**Invariant:** a delivery that did not reach the operator is not reported as fired.
+
+In `emitSessionAlertSignals` (`:431-441`): `deliverNotificationDecision` resolves (never throws) with `{status:"error"|"unavailable"|"disabled"|"cli_only"|"skipped"|"delivered"}`. Capture the resolved record and route `status === "error" || status === "unavailable"` into the existing `failed` array; everything else (incl. `undefined`, `"recorded"`, `"delivered"`, `"skipped"`, `"disabled"`, `"cli_only"`) stays `fired`. `disabled`/`cli_only` are intentional config states — not failures.
+
+**Leave the LLM path (`:1150` `status:"ok"`) alone** — that's adjudication status and `delivery.status` is already preserved at `:1160`.
+
+**Scope note (write into the PR):** this makes the failure *observable*; it does NOT retry. `applyAlertCandidates` (alert-store.js) stamps `last_notified`/`cooldown_until` before delivery is confirmed (`:388-391`), so real retry-on-failure is a separate, cross-file change (out of this area).
+
+**Test:** fake `deliverNotification` returning `{status:"error"}`; assert the alert id lands in `failed`, not `fired`. Existing fakes return `undefined`/`{status:"recorded"}` → unaffected.
+
+### Fix 3 — #7 Degrade one alert-family failure, never abort the tick
+**Invariant:** tick-survival — a dependency/shape failure in one alert family degrades, it does not abort `runDaemonIteration`.
+
+1. **Real disk-reachable half:** wrap the pre-loop `await import("./notification-delivery.js")` at `emitSessionAlertSignals :412` in try/catch; on module-load failure return `{fired:[], failed:[...dueSessionAlerts.map(a=>a.id)]}` and `console.warn`, mirroring the `dependencies_unavailable` pattern at `:1069-1079`. (Daemon call site `daemon.js:638` is unwrapped, unlike adjudicate's `safeAdjudicateAlertNotifications` `:642`, so today this import EIO aborts the whole tick.)
+2. **Defense-in-depth:** guard `Array.isArray(...)` before `new Set(evaluation?.notification_due_ids ?? [])` (`alert-intelligence.js:399`, `containment-recommend.js:343`) and before `(evaluation.alerts ?? []).filter(...)` (`:407`, `:347`) — a non-array yields `[]` instead of throwing (repro-confirmed `object is not iterable`). This half needs an in-process producer bug to trigger (`evaluation` is in-process, not disk), so it is hardening.
+3. **Optional belt-and-suspenders:** wrap the `daemon.js:606` (`computeContainmentRecommendationCandidates`) and `:638` (`emitSessionAlertSignals`) call sites like `safeAdjudicateAlertNotifications`.
+
+**Test:** call `emitSessionAlertSignals` with a fake import failure (or an object-typed `notification_due_ids`); assert it resolves (does not reject) and the tick continues.
+
+
+---
+
+## learned-promotion-tuning — `has-fixable`
+
+Three of daybreak's four "BLOCKER"s (F1 declare-active, F3 non-atomic writes, F7 unbounded parse) share one precondition: an attacker who can write Descartes's trusted same-user state files. The code explicitly declares that out of scope (promotion-store.js:30-31 "friction against mistakes/stale reviews, not an attacker model") and SEED_CONSTRAINTS (constraint-store.js:463-546) are hand-authored status:"active" records — direct proof that file-authored activation is intended, not a nonce-path bypass; the nonce gate holds against its designed threat, and state-file integrity is a deferred attestation slice. Four findings are genuine, cheaply fixable in-file gaps that harden documented invariants (F5 audit-misattribution — the strongest, already fixed in the sibling tuning file; F6 malformed-proposedExpected reaching review-ready; F4 miner not re-sanitizing three fields; F8 spread-based min/max crash), so daybreak's blanket "FAIL" verdict does not transfer — the confirmed items are defense-in-depth, and the one clear correctness bug (F5) is audit-integrity, not an activation bypass.
+
+### Confirmed-fixable
+
+- **[medium] F5: Promotion denial misattributed to an expired pending record instead of the live review**  
+  - _Files:_ promotion-store.js:342-349 (logDenial)  
+  - _Invariant:_ A denial is attributed to the promotion record actually under attack (the live, unexpired pending), so an attack on a reissued review is visible in that review's audit trail — not silently appended to a stale expired record.  
+  - _Fix:_ logDenial's fallback currently picks candidates.find(record.status==="pending") — the FIRST pending in array order. When a constraint has an expired-but-still-status:pending record 'old' followed by a freshly reissued valid pending 'new' (a natural state: mintPendingPromotion only mints when no valid pending exists, leaving the expired one behind), a garbage-nonce denial attaches to 'old', not 'new'. The sibling file tuning-authority.js:287-295 already fixes exactly this (prefers an unexpired pending via isUnexpiredPending before falling back to any pending). Mirror it: target = candidates.find(nonce match) ?? candidates.find(unexpired pending) ?? candidates.find(any pending). Verified reachable with ordinary state (normal expiry + review reissuance), no tampering.
+
+- **[low] F6: Malformed (non-finite) proposedExpected reaches review-ready and is persisted, violating the 'never persisted' invariant**  
+  - _Files:_ tuning-store.js:277-284 (proposeRetune), :86-125 (validateTuningCandidate), :494-515 (promoteTuningDraftsToReviewReady)  
+  - _Invariant:_ A malformed proposedExpected is REJECTED and never persisted/never reaches review-ready (persisting one that later fails at apply time wastes a human review and erodes the defense-in-depth layer stated by the orchestrator).  
+  - _Fix:_ Verified: proposeRetune('lte',[1.7976931348623157e308]) returns Infinity (only the empty-array case is guarded); buildTuningCandidate stores {value:Infinity}; JSON.stringify persists it as null; validateTuningCandidate never inspects proposed; promoteTuningDraftsToReviewReady gates only on backtest.sample_ticks, so the candidate reaches review-ready. The live monitor is NOT corrupted — applyApprovedRetune (constraint-store.js:656, isValidNumericExpected) rejects Infinity/null at approve time (repro-confirmed) — so severity is low and the trigger is contrived (a ~1.7e308 fact value). Belt-and-braces to honor the literal invariant: (a) proposeRetune returns undefined when the computed value is not Number.isFinite (so mineTuningCandidates emits nothing); (b) validateTuningCandidate, when kind==="retune", asserts proposed.expected is {comparator:'gte'|'lte', Number.isFinite(value)} — catches in-memory Infinity at write and round-tripped null at load (dropping any already-persisted malformed candidate). Export isValidNumericExpected from constraint-store.js (additive) or duplicate the predicate. Note: the backtest already flags this to a reviewer — {lte,Infinity} makes evaluateExpected return supported:false so would_fire_count_proposed===sample_ticks.
+
+- **[low] F4: Miner emits expected.value, fixtures, and provenance.source_collectors raw — re-sanitizing only target**  
+  - _Files:_ constraint-miner.js:132 (source_collectors), :140 (expected.value), :149-151 (fixtures)  
+  - _Invariant:_ The miner's own documented defense-in-depth contract (constraint-miner.js:114-120: 're-apply the sanitizer, never trust facts.jsonl stayed clean — hand-edited file, future translator regression') must cover every identity-bearing field it emits, not just target.  
+  - _Fix:_ CORRECTION to daybreak's repro first, so nobody chases phantom leaks: in normal operation source_envelope_id is envelope.id — a FIXED collector label like 'network-basics' (fact-translators.js:551), NOT 'host=prod-db-01 ip=10.0.0.8'; and attributes.owner is already sanitizeEntityKey(command)=sanitizeIdentityString(command) (fact-translators.js:541). So there is no normal-operation host/IP leak. The real, narrower gap: buildConstraintTarget re-sanitizes target (constraint-store.js:33-49), but buildMinedConstraint passes observedValue into expected.value and both fixtures, and source_envelope_id into source_collectors, WITHOUT re-sanitizing — so a hand-edited or translator-regressed facts.jsonl (exactly the threat the doc comment names) flows raw into constraints.json and out through 'learned review --json'. Fix: run sanitizeIdentityString on observedValue before using it in expected.value/fixtures (drop the group if it returns undefined, mirroring the target path) and on each source_envelope_id before pushing into source_collectors. Eval stays correct: the live translator already emits sanitized values and sanitizeIdentityString is idempotent on safe strings. IMPORTANT: leave the distinctValues contradiction check (constraint-miner.js:201) on RAW values — sanitizing there could collapse two distinct raw commands into a false 'stable', and raw is the conservative direction.
+
+- **[low] F8: Spread-based Math.min/max crashes the on-demand miner/retuner on large fact histories**  
+  - _Files:_ constraint-miner.js:130-131 and :197, tuning-store.js:281-282  
+  - _Invariant:_ The pure mining/retuning functions must not crash on large-but-valid histories (availability of the on-demand learning pipeline), preserving their documented 'same inputs -> byte-identical outputs' contract.  
+  - _Fix:_ Repro-confirmed: Math.min(...arrayOf200000) throws RangeError: Maximum call stack size exceeded (500k too). This crashes 'learned mine' / 'learned tuning mine' (not the live daemon tick — it reads active constraints, not raw fact spreads), hence low. Replace Math.min(...arr)/Math.max(...arr) at all three sites with a reduce-based min/max (or a simple loop). Reduce yields identical numeric results, so the byte-identical-output contract holds.
+
+- **[low] F2: One nonce mutates every record sharing a constraint id (map-over-all-matches)**  
+  - _Files:_ constraint-store.js:565-582 (promoteReviewReadyToActive), :604-624 (retireActiveConstraint), :656-682 (applyApprovedRetune)  
+  - _Invariant:_ One human approval mutates exactly one constraint record ('one approval = one record').  
+  - _Fix:_ Repro-confirmed: promoteReviewReadyToActive over two review-ready records both with id 'dup' returns promoted_statuses ['active','active'] from a single call (all three mutators use .map and flip/mutate every match; the authority layer only ever constraints.find()s the first). HONEST SCOPING: duplicate ids are only introducible by directly authoring/tampering constraints.json (the miner's mergeMinedConstraints dedupes by id Map; writeConstraints doesn't dedupe but nothing legitimate produces dups), and an attacker who can do that can already write a single active record directly (F1) — so the amplification grants an attacker nothing beyond F1. The value is robustness against ACCIDENTAL duplicates (a future merge/concurrency regression) silently mutating two live monitors on one approval, and preserving the stated one-approval-one-record invariant. Fix: promoteReviewReadyToActive counts matches; if >1, return {constraints: input unchanged, activated:false} (NOT a throw — that routes through decideConstraintPromotion's existing transition_failed branch which logDenial-audits before throwing; a raw throw would skip the audit). For retireActiveConstraint/applyApprovedRetune, throw on multi-match (consistent with their existing throw-on-precondition-failure contract). Do NOT introduce a new status:"active" string literal — promotion-store.test.js's 'only one activation path' source-grep will fail otherwise.
+
+### Deferred / architectural
+
+- F1 (daybreak BLOCKER) — constraints.json can declare a status:"active" rule without the nonce path. TRUE as written but reachable ONLY by writing Descartes's trusted same-user state file directly. This is outside the declared threat model (promotion-store.js:30-31: single-user local CLI, 'friction against mistakes/stale reviews, not an attacker model') and directly contradicted as a 'bypass' by SEED_CONSTRAINTS (constraint-store.js:468-546), which ARE hand-authored status:"active" records — file-authored activation is a supported path. No in-file fix is real: a promotion_history cross-check is forgeable in the same JSON file, giving zero integrity. Binding constraints.json to the nonce ledger needs a signature/MAC keyed to a secret the writer cannot read — i.e. off-host attestation / state-file signing. OWNER: the future attestation/signing slice (per MEMORY 'off-host attestation' future work). The bogus-comparator variant (repro-confirmed: evaluateExpected returns supported:false for {comparator:'bogus',value:90}, so evaluateConstraints emits no alert) silently disables a live monitor — but again only via direct file tampering, same boundary.
+- F3 (daybreak BLOCKER) — non-atomic authority writes: concurrent approve+reject TOCTOU and the crash window between writeConstraints and writeTuningCandidates/writeTuningDecisions. Real, but concurrency/crash-atomicity is a cross-cutting seam, not an in-file patch: decideConstraintPromotion (promotion-store.js:460-461) and decideTuningApproval (tuning-authority.js:463-467) both write two/three files sequentially with no lock/CAS. Proper fix is a lockfile/transaction seam across ALL authority writes. NOTE on the tuning crash window specifically: (a) its replay is largely benign — applyApprovedRetune re-applies the same fixed proposed value (idempotent) and retireActiveConstraint throws (fails closed) once the constraint is already retired; (b) the current constraints-FIRST write order is the safe one and must NOT be reordered; (c) a copy-paste of promotion-store's reconcileOrphanedPendings does NOT port cleanly — it detects orphans by 'constraint left review-ready', but after a tuning crash the CANDIDATE is still review-ready, so detection would need a heuristic (compare constraint.expected to candidate.proposed.expected, or constraint.status==="retired"). OWNER: an authority-store locking/transaction slice. A smaller in-file follow-up (tuning crash-window reconciliation parity) is possible but low-value given the benign replay.
+- F7 (daybreak BLOCKER) — unbounded readJsonFile/loadConstraints (constraint-store.js:116-155) awaited on daemon ticks; a multi-GB or millions-of-records constraints.json stalls/OOMs the tick. Real resource-exhaustion gap, but reachable only via trusted-state tampering or unbounded legitimate growth, and the proper fix (byte cap + record cap, mirroring the fact-store's existing bytecap eviction model — fact-store-completeness surfaces bytecap_evicted_total) is a bounded-store design change touching the daemon read path (daemon.js, out of this area's files). A cheap in-file mitigation (a byte cap in readJsonFile before JSON.parse) is possible and worth considering, but the durable fix is a bounded-store/DoS-resistance slice. OWNER: bounded learned-store slice.
+
+### Fix-spec
+
+## Fix spec — learned-promotion-tuning (confirmed-fixable, defense-in-depth)
+
+All five items are localized to the area files, uphold an invariant the code already documents, and preserve the pure functions' documented "byte-identical outputs" contract. **After each fix, run the existing regression suites** referenced by the doc comments — `test/constraint-miner.test.js`, `test/constraint-store.test.js`, `test/promotion-store.test.js`, `test/tuning-store.test.js`, `test/tuning-authority.test.js` — they assert the invariants (e.g. promotion-store's "only one activation path" source-grep, the no-LLM source regexes, byte-identical eval).
+
+### F5 (medium) — promotion denial audit-misattribution
+File: `promotion-store.js` `logDenial` (~:342-349).
+- Current fallback `candidates.find(r => r.status === "pending")` picks the first pending in array order. Replace with unexpired-pending-first, mirroring the already-shipped `tuning-authority.js` `logTuningDenial` (:287-295):
+  - `target = candidates.find(nonce match) ?? candidates.find(isUnexpiredPending) ?? candidates.find(any pending)` where `isUnexpiredPending(r)` = `r.status==="pending" && Number.isFinite(new Date(r.expiry).getTime()) && new Date(r.expiry).getTime() > nowMs`.
+  - `logDenial` has `options.now`; derive `nowMs` from it (as `logTuningDenial` does).
+- Invariant: a denial lands on the review actually under attack, not a coexisting stale-expired record.
+
+### F6 (low) — malformed proposedExpected never persisted / never review-ready
+File: `tuning-store.js`.
+1. `proposeRetune` (:277): after computing the `gte`/`lte` value, `return undefined` unless `Number.isFinite(result)`. Keeps the empty-array guard; adds overflow (Infinity) guard so `mineTuningCandidates` emits no candidate.
+2. `validateTuningCandidate` (:86): when `record.kind === "retune"`, require `record.proposed?.expected` to be `{comparator: "gte"|"lte", value: <Number.isFinite>}`. This rejects in-memory `Infinity` at write (`writeTuningCandidates` validates) AND round-tripped `null` at load (`loadTuningCandidates` drops it). Export `isValidNumericExpected` from `constraint-store.js` (additive) and reuse it, or duplicate the 4-line predicate.
+- Note: `applyApprovedRetune` already rejects at apply time (live constraint was never at risk); this closes the "reaches review-ready / is persisted" layer the orchestrator's invariant names literally.
+
+### F4 (low) — miner re-sanitizes only `target`
+File: `constraint-miner.js` `buildMinedConstraint` (:111-159).
+- Correction (state in the change note): `source_envelope_id` is a fixed collector label (`fact-translators.js:551`) and `attributes.owner` is already `sanitizeEntityKey(command)` (`:541`) — no normal-operation host/IP/path leak. The gap is defense-in-depth against a hand-edited/regressed `facts.jsonl`, exactly the threat the file's own doc comment (:114-120) names.
+- `import { sanitizeIdentityString } from "./diagnostics-sanitizer.js"`.
+- Sanitize `observedValue` before it enters `expected.value` and both `fixtures`; if `sanitizeIdentityString(String(observedValue))` returns `undefined`, `return undefined` for the group (mirror the existing `target`/attribute-missing drops).
+- Sanitize each `source_envelope_id` before pushing into `source_collectors` (drop the ones that don't survive), matching `promotion-store.js buildEvidenceRefs`.
+- **Do NOT** sanitize inside the `distinctValues` contradiction check (:201) — raw comparison is the conservative direction (sanitizing could merge two distinct commands into a false "stable").
+
+### F8 (low) — spread-based min/max crash
+Files: `constraint-miner.js:130-131` and `:197`; `tuning-store.js:281-282`.
+- Replace `Math.min(...arr)` / `Math.max(...arr)` with a reduce/loop-based min & max. Identical numeric results → byte-identical-output contract preserved. Confirmed: `Math.min(...arrayOf200000)` throws `RangeError`.
+
+### F2 (low) — one nonce mutates every id-match
+File: `constraint-store.js`.
+- `promoteReviewReadyToActive` (:565): count records matching `id === constraintId && status === "review-ready"`. If count `> 1`, return `{ constraints: <input unchanged>, activated: false }` — **do not throw**; the `activated:false` return routes through `decideConstraintPromotion`'s existing `transition_failed` branch (:420-424) which `logDenial`-audits before throwing. A raw throw skips that audit.
+- `retireActiveConstraint` (:604) and `applyApprovedRetune` (:656): on `> 1` matches, `throw` (consistent with their existing throw-on-precondition contract; `dispatchApprovedTuning` catches and fail-closes).
+- **Do not** add any new `status: "active"` string literal — the "only one activation path" source-grep test guards this.
+- Scope note in the commit: duplicate ids require direct constraints.json authoring (same trust boundary as the deferred F1) and grant an attacker nothing beyond F1; this is robustness against accidental duplicates and preserves the one-approval-one-record invariant.
+
