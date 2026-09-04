@@ -248,6 +248,22 @@ async function readJsonFile(file) {
   }
 }
 
+// Security-sweep F1 fix (2026-09-04 daybreak review): a bare `{cold_start_pending:false}` fragment
+// -- no `last_folded_ts` watermark, no real folded-tick provenance behind it -- must not be trusted
+// as a genuinely-established store just because normalizePeerBaselineState's lenient per-field
+// defaulting can produce *something* from it (mirrors session-baseline.js's own F1 fix exactly; the
+// same gap exists here because peer-baseline.js deliberately kept lenient per-field normalization
+// instead of process-lineage-baseline.js's exact-schema validation -- see normalizePeerBaselineState's
+// own comment for why). Pre-migration stores (missing cold_start_pending entirely) are UNAFFECTED:
+// `raw.cold_start_pending === false` is a strict comparison, so a store that never wrote the field
+// at all (undefined) still falls through to normal lenient normalization, which already defaults it
+// to pending.
+function lacksEstablishmentProvenance(raw) {
+  return Boolean(raw) && typeof raw === "object" && !Array.isArray(raw)
+    && raw.cold_start_pending === false
+    && !isValidIsoTimestamp(raw.last_folded_ts);
+}
+
 /**
  * ENOENT-tolerant (fresh state -> empty/provisional baseline) and corrupt-tolerant (mirrors
  * session-baseline.js's loadSessionBaselineStore exactly): a corrupt/malformed file yields a
@@ -268,6 +284,9 @@ export async function loadPeerBaselineStore(descartesPaths) {
   const { parsed, missing, corrupt } = await readJsonFile(storeFile);
   if (missing) return { state: { ...freshPeerBaselineState(), cold_start_reason: "missing_store" }, corrupt: false, missing: true };
   if (corrupt) return { state: { ...freshPeerBaselineState(), cold_start_reason: "corrupt_store" }, corrupt: true, missing: false };
+  if (lacksEstablishmentProvenance(parsed)) {
+    return { state: { ...freshPeerBaselineState(), cold_start_reason: "invalid_store_schema" }, corrupt: true, missing: false };
+  }
   return { state: normalizePeerBaselineState(parsed), corrupt: false, missing: false };
 }
 
@@ -324,12 +343,24 @@ export async function writePeerBaselineStore(descartesPaths, state) {
  * an all-historical tick-group still produces a `{count: 0, hasOverflow: false}` group, per
  * Decision 1/MUST-FIX 2's documented "real zero, not skipped" semantics.
  */
+// Security-sweep F3+F6 fix (2026-09-04 daybreak review): a sentinel DISTINCT from `undefined`
+// (markerless/legacy) for "a census marker landed but its evidence cannot be trusted" -- either
+// because the signature itself is present-but-invalid (F6: garbled/future/incompatible, was
+// previously coerced to the SAME `undefined` value as no-marker-at-all, so it silently pooled with
+// and scored against the trusted legacy-markerless regime — a fail-OPEN in the spike direction), or
+// because this tick carried a SECOND marker whose signature contradicts the first (F3: attacker-
+// controlled record order must not decide which of two conflicting markers "wins"). Never equal to
+// any real signature string (PEER_AVAILABILITY_SIGNATURE_PATTERN only matches "v1:..." strings) and
+// never equal to `undefined`, so it can never accidentally match `currentSignature` for a markerless
+// tick nor be treated as its own trustworthy regime.
+export const PEER_SIGNATURE_INVALID = Symbol("peer-availability-signature-invalid");
+
 export function groupPeerFactsByTick(points = []) {
   const byTs = new Map();
   for (const point of points ?? []) {
     if (!point || point.fact_name !== PEER_FACT_NAME || typeof point.ts !== "string") continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, availabilitySignature: undefined });
+      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, availabilitySignature: undefined, censusMarkerSeen: false });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === PEER_OVERFLOW_ENTITY_KEY) {
@@ -337,21 +368,27 @@ export function groupPeerFactsByTick(points = []) {
       continue;
     }
     if (point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY) {
-      // Sentinel unification (Stage 1 review must-fix, 2026-07-23): a non-string OR a
-      // string-but-not-shaped-like-a-real-signature availability_signature attribute
-      // (malformed/corrupt fact point, e.g. disk corruption of facts.jsonl that leaves the JSON
-      // line still parseable, or a future/incompatible marker producer) coerces to `undefined`,
-      // the exact same value a tick-group that never saw a marker point at all already produces
-      // (the "markerless" disposition, §2b/§2c) — see this module's own header comment and the
-      // plan's §2a rationale for why this is the stricter, fail-toward-silence choice. Stage 2
-      // adversarial-review fix (2026-07-23): a TYPE-ONLY guard is insufficient here -- a garbled
-      // string is still a string, and would otherwise be trusted verbatim as a poolable regime key
-      // (degrade-not-fabricate violation) -- so the value must additionally match
-      // PEER_AVAILABILITY_SIGNATURE_PATTERN, the exact closed-enum shape
+      // F6: a non-string OR a string-but-not-shaped-like-a-real-signature availability_signature
+      // attribute (malformed/corrupt fact point, e.g. disk corruption of facts.jsonl that leaves
+      // the JSON line still parseable, or a future/incompatible marker producer) resolves to the
+      // PEER_SIGNATURE_INVALID sentinel -- DISTINCT from the markerless `undefined` sentinel (Stage
+      // 2 adversarial-review fix, 2026-07-23, corrected 2026-09-04: a TYPE-ONLY guard is
+      // insufficient here -- a garbled string is still a string, and coercing it to the SAME value
+      // as no-marker-at-all would let it silently pool with and score against the trusted
+      // legacy-markerless regime, a fail-OPEN in the spike direction). Value must additionally
+      // match PEER_AVAILABILITY_SIGNATURE_PATTERN, the exact closed-enum shape
       // buildPeerAvailabilitySignature produces.
       const rawSignature = point.attributes?.availability_signature;
+      const resolvedSignature =
+        typeof rawSignature === "string" && PEER_AVAILABILITY_SIGNATURE_PATTERN.test(rawSignature) ? rawSignature : PEER_SIGNATURE_INVALID;
+      // F3: a SECOND census marker landing in this SAME tick whose resolved signature differs from
+      // the first is CONTRADICTORY in-tick evidence -- record order must never decide which marker
+      // "wins" (mirrors session-baseline.js's/service-baseline.js's own F3 fix). Fail closed to the
+      // SAME present-but-invalid sentinel F6 uses. An identical duplicate marker (same resolved
+      // signature) is not a contradiction and must not downgrade a benign double-write.
       group.availabilitySignature =
-        typeof rawSignature === "string" && PEER_AVAILABILITY_SIGNATURE_PATTERN.test(rawSignature) ? rawSignature : undefined;
+        group.censusMarkerSeen && resolvedSignature !== group.availabilitySignature ? PEER_SIGNATURE_INVALID : resolvedSignature;
+      group.censusMarkerSeen = true;
       continue;
     }
     if (point.attributes?.presence_state !== "observed_historical") {
@@ -388,6 +425,10 @@ function tickGroupDisposition(group) {
 // signature's own content, which is what the regime key (§2c) exists for.
 function dropTickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
+  // F6 fix: a present-but-invalid marker must fail closed like markerless is excluded from
+  // "complete" -- but it is its OWN disposition, distinct from "markerless", so it can never be
+  // conflated with (or silently trusted as) the legacy no-marker-at-all case.
+  if (group.availabilitySignature === PEER_SIGNATURE_INVALID) return "invalid";
   if (group.availabilitySignature === undefined) return "markerless";
   return "complete";
 }
@@ -426,17 +467,28 @@ function dropTickGroupDisposition(group) {
 export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_STDDEV_FLOOR, ewmaAlpha = DEFAULT_PEER_EWMA_ALPHA, minSampleCount = DEFAULT_PEER_MIN_SAMPLE_COUNT } = {}) {
   const mostRecentGroup = groups.length > 0 ? groups[groups.length - 1] : undefined;
   const currentSignature = mostRecentGroup?.availabilitySignature;
+  // F6 fix: a present-but-invalid marker (PEER_SIGNATURE_INVALID) is excluded from the pool
+  // UNCONDITIONALLY — never eligible to fold, and never able to become its own trusted "regime"
+  // even if two invalid-marker ticks happen to share the sentinel — fail closed, the same posture
+  // markerless already gets for peer.count_drop.
   const completeGroups = groups.filter(
-    (group) => tickGroupDisposition(group) === "complete" && group.availabilitySignature === currentSignature,
+    (group) => tickGroupDisposition(group) === "complete"
+      && group.availabilitySignature !== PEER_SIGNATURE_INVALID
+      && group.availabilitySignature === currentSignature,
   );
   const mostRecentIsOverflow = mostRecentGroup ? tickGroupDisposition(mostRecentGroup) === "overflow" : false;
+  // F6 fix: an invalid-marker most-recent tick must be excluded from SCORING too, not merely
+  // folding — "exclude from the spike fold AND score (fail closed)", distinct from overflow's own
+  // deliberate score-but-never-fold posture (a truncated count is still a real lower-bound
+  // observation; a garbled/contradictory marker is not evidence of anything at all).
+  const mostRecentIsInvalidSignature = currentSignature === PEER_SIGNATURE_INVALID;
 
   // The most recent COMPLETE tick-group, if the tail of `groups` is itself complete, is also the
   // tail of `completeGroups` (filtering preserves order and cannot re-order past the tail).
   // Excluding it here gives the "pre-overflow"/pre-latest-observation window stats used to score
   // lastObservation below, whether the tail is complete (excluded so it can score against a
-  // window that doesn't already include itself — self-dampening avoidance) or overflow (already
-  // absent from completeGroups, so nothing further to exclude).
+  // window that doesn't already include itself — self-dampening avoidance) or overflow/invalid
+  // (already absent from completeGroups, so nothing further to exclude).
   const preScoreGroups = (mostRecentGroup && !mostRecentIsOverflow) ? completeGroups.slice(0, -1) : completeGroups;
 
   let preScoreStats = emptyWelfordStats();
@@ -447,7 +499,7 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   }
 
   let lastObservation;
-  if (mostRecentGroup) {
+  if (mostRecentGroup && !mostRecentIsInvalidSignature) {
     const zScore = computeZScore(mostRecentGroup.count, preScoreStats.mean, preScoreStats.stddev, stddevFloor);
     lastObservation = {
       ts: mostRecentGroup.ts,
@@ -460,11 +512,12 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   }
 
   // Persisted stats: preScoreStats PLUS the most recent tick-group itself, but ONLY if it is
-  // "complete" — an overflow tick-group is NEVER folded into the persisted baseline, regardless
-  // of whether it was just scored above (score-but-never-fold).
+  // "complete" — an overflow OR invalid-marker tick-group is NEVER folded into the persisted
+  // baseline, regardless of whether it was just scored above (score-but-never-fold for overflow;
+  // neither scored nor folded for an invalid marker).
   let stats = preScoreStats;
   let ewmaState = preScoreEwma;
-  if (mostRecentGroup && !mostRecentIsOverflow) {
+  if (mostRecentGroup && !mostRecentIsOverflow && !mostRecentIsInvalidSignature) {
     stats = foldWelford(stats, mostRecentGroup.count);
     ewmaState = updateEwma(ewmaState, mostRecentGroup.count, ewmaAlpha);
   }
@@ -492,6 +545,12 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
 // session.count_drop's own pre-Slice-1-addendum era. peer.count_drop simply cannot fire until the
 // census marker has been live and accumulating for DEFAULT_PEER_MIN_SAMPLE_COUNT same-signature
 // ticks. This is intended, not a bug to route around.
+//
+// F6 fix (2026-09-04 daybreak review): the same "eligibleGroups is ALWAYS empty" reasoning above
+// now applies identically to a present-but-invalid marker (dropTickGroupDisposition's own
+// "invalid" disposition, distinct from "markerless") -- it can never also be "complete", so it is
+// excluded from both the fold AND the score with no further change needed here beyond
+// dropTickGroupDisposition's own fix.
 // ---------------------------------------------------------------------------------------------
 export function computeWindowedPeerDropStats(groups, { stddevFloor = DEFAULT_PEER_STDDEV_FLOOR, ewmaAlpha = DEFAULT_PEER_EWMA_ALPHA, minSampleCount = DEFAULT_PEER_MIN_SAMPLE_COUNT } = {}) {
   const mostRecentGroup = groups.length > 0 ? groups[groups.length - 1] : undefined;
@@ -701,10 +760,21 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
   const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
+  // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
+  // previously computed only after coldStartPendingThisTick, purely to gate the store WRITE) and
+  // added as a 5th arming term. A future/clock-rolled-back last_folded_ts means the persisted
+  // watermark cannot be trusted relative to the current clock: the groupMs<=nowMs filter above
+  // already excludes any pre-rollback (future-dated) history from `currentGroups`, so continuing
+  // to trust an "established" store here would score/fire peer.* novelty against a SHORTENED
+  // window that silently dropped the very history that would show a "deviation" as normal. Strict
+  // `> nowMs` (no tolerance), mirroring persistedAnchorMissingOrFuture's own strict comparison.
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
   const enteringColdStart = factsCorruptThisTick
     || storeLossThisTick
     || persistedAnchorMissingOrFuture
     || completenessLossAfterAnchor
+    || lastFoldedWasFuture
     || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
@@ -741,8 +811,9 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
     }
   }
 
-  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
-  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
+  // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
+  // needed here.
   const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
   const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
   const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);

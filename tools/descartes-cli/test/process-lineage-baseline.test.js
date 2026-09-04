@@ -136,6 +136,16 @@ test("groupProcessLineageFactsByTick is fail-closed for partial, unknown, and ma
   assert.equal(groups[3].censusState, "unknown");
 });
 
+test("groupProcessLineageFactsByTick (security-sweep F3): contradictory in-tick census markers fail closed to 'unknown' regardless of arrival order; identical duplicate markers do not downgrade", () => {
+  const ts = tickTs(0);
+  const partialThenComplete = groupProcessLineageFactsByTick([censusMarkerPoint(ts, "partial"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(partialThenComplete[0].censusState, "unknown", "attacker-controlled record order must not decide which marker wins");
+  const completeThenPartial = groupProcessLineageFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "partial")]);
+  assert.equal(completeThenPartial[0].censusState, "unknown");
+  const duplicateComplete = groupProcessLineageFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(duplicateComplete[0].censusState, "complete", "an identical duplicate marker (benign double-write) must not suppress a real complete tick");
+});
+
 test("detectNovelProcessLineageEdges requires prior complete history and fires only for first appearance", () => {
   const groups = groupProcessLineageFactsByTick(flatten([
     completeTick(tickTs(0)),
@@ -380,6 +390,32 @@ test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor 
   points = [...points, ...completeTick(tickTs(7), [["shell", "python"]])];
   const resumed = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(7) });
   assert.equal(resumed.length, 1, "novelty resumes after rollback recovery has been persisted");
+});
+
+test("computeProcessLineageBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated novel edge from the shortened post-rollback window", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
+  // watermark far in the future relative to the (now-corrected) clock below.
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
+
+  const points = flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]), // "shell->python" would read as novel in this shortened window
+  ]);
+
+  const result = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  const { state } = await loadProcessLineageBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
 });
 
 test("computeProcessLineageBaselineCandidates: intact history control still detects a novel edge", async () => {

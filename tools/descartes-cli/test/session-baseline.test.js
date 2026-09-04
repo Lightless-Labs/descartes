@@ -203,6 +203,16 @@ test("groupSessionFactsByTick: a garbled/unrecognized census_state marker value 
   assert.equal(groups[0].censusState, "unknown");
 });
 
+test("groupSessionFactsByTick (security-sweep F3): contradictory in-tick census markers fail closed to 'unknown' regardless of arrival order; identical duplicate markers do not downgrade", () => {
+  const ts = tickTs(0);
+  const partialThenComplete = groupSessionFactsByTick([censusMarkerPoint(ts, "partial"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(partialThenComplete[0].censusState, "unknown", "attacker-controlled record order must not decide which marker wins");
+  const completeThenPartial = groupSessionFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "partial")]);
+  assert.equal(completeThenPartial[0].censusState, "unknown");
+  const duplicateComplete = groupSessionFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(duplicateComplete[0].censusState, "complete", "an identical duplicate marker (benign double-write) must not suppress a real complete tick");
+});
+
 test("groupSessionFactsByTick: orders tick-groups ascending by ts regardless of input order", () => {
   const points = flatten([completeTick(tickTs(2), 1), completeTick(tickTs(0), 1), completeTick(tickTs(1), 1)]);
   const groups = groupSessionFactsByTick(points);
@@ -543,44 +553,44 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
 
 test("session.churn fires on a fingerprint change on an entity in the LATEST tick-group", () => {
   const points = [
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
   ];
   const churn = detectSessionChurn(points);
   assert.equal(churn.length, 1);
-  assert.deepEqual(churn[0], { entity_key: "e1", prior_fingerprint: "fp1", current_fingerprint: "fp2" });
+  assert.deepEqual(churn[0], { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "fp1", current_fingerprint: "fp2" });
 });
 
 test("session.churn non-fire: a single observation never churns (nothing to diff against)", () => {
-  const points = [sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete")];
+  const points = [sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete")];
   assert.deepEqual(detectSessionChurn(points), []);
 });
 
 test("session.churn non-fire: an unchanged fingerprint across two observations never churns", () => {
   const points = [
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "fp1"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(1), "complete"),
   ];
   assert.deepEqual(detectSessionChurn(points), []);
 });
 
 test("session.churn non-fire: an 'unknown' fingerprint (the screen-session case) on either side of the pair never churns", () => {
   const olderUnknown = [
-    sessionPoint(tickTs(0), "e1", "unknown"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "unknown"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
   ];
   assert.deepEqual(detectSessionChurn(olderUnknown), []);
   const newerUnknown = [
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "unknown"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "unknown"), censusMarkerPoint(tickTs(1), "complete"),
   ];
   assert.deepEqual(detectSessionChurn(newerUnknown), []);
 });
 
 test("session.churn non-fire: a STALE pair (entity churned, then absent from every tick through the latest) does not fire (must-fix 4 recency bound)", () => {
   const points = [
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
     censusMarkerPoint(tickTs(2), "complete"), // e1 absent from here on
     censusMarkerPoint(tickTs(3), "complete"),
     censusMarkerPoint(tickTs(4), "complete"), // latest complete tick-group
@@ -590,8 +600,8 @@ test("session.churn non-fire: a STALE pair (entity churned, then absent from eve
 
 test("session.churn non-fire: pre-existing-history-at-first-run (upgrade-day storm guard, must-fix 4) — weeks of already-differing MARKERLESS fingerprints emit ZERO churn on the first post-deploy call", () => {
   const legacyPoints = [
-    sessionPoint(tickTs(0), "e1", "fp-reboot-old"), // no census marker: pre-Slice-4-addendum history
-    sessionPoint(tickTs(24), "e1", "fp-reboot-new"), // simulates a reboot recreating the session
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp-reboot-old"), // no census marker: pre-Slice-4-addendum history
+    sessionPoint(tickTs(24), "session.tmux.aaaaaaaaaaaaaaaa", "fp-reboot-new"), // simulates a reboot recreating the session
   ];
   const firstPostDeployTick = [censusMarkerPoint(tickTs(48), "complete")]; // e1 absent this tick, but the marker exists now
   const churn = detectSessionChurn([...legacyPoints, ...firstPostDeployTick]);
@@ -600,19 +610,19 @@ test("session.churn non-fire: pre-existing-history-at-first-run (upgrade-day sto
 
 test("session.churn: a partial tick-group's own point is excluded from the pool (must-fix 2), but flanking complete observations still churn-compare correctly", () => {
   const points = [
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "fp-partial-noise"), censusMarkerPoint(tickTs(1), "partial"),
-    sessionPoint(tickTs(2), "e1", "fp2"), censusMarkerPoint(tickTs(2), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp-partial-noise"), censusMarkerPoint(tickTs(1), "partial"),
+    sessionPoint(tickTs(2), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(2), "complete"),
   ];
   const churn = detectSessionChurn(points);
   assert.equal(churn.length, 1);
-  assert.deepEqual(churn[0], { entity_key: "e1", prior_fingerprint: "fp1", current_fingerprint: "fp2" });
+  assert.deepEqual(churn[0], { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "fp1", current_fingerprint: "fp2" });
 });
 
 test("session.churn non-fire: a garbled/unrecognized census_state marker on the LATEST tick-group does NOT fire, even though the entity's fingerprint genuinely changed (adversarial-review regression, mirrors service-baseline's garbled-marker fix) -- a garbled census must never be treated as 'the latest complete tick-group' anchor", () => {
   const points = [
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
-    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "truncated-oops"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "truncated-oops"),
   ];
   assert.deepEqual(detectSessionChurn(points), [], "no other 'complete' tick-group exists in this pool, so the recency-bound anchor can never be satisfied");
 });
@@ -623,8 +633,8 @@ test("session.churn ignores a future complete group while still detecting a real
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-2) });
 
   let points = [
-    sessionPoint(tickTs(-1), "e1", "1111111111111111"), censusMarkerPoint(tickTs(-1), "complete"),
-    sessionPoint(tickTs(1), "e1", "2222222222222222"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(-1), "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"), censusMarkerPoint(tickTs(-1), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"), censusMarkerPoint(tickTs(1), "complete"),
   ];
   const options = {
     minSampleCount: 2,
@@ -636,7 +646,7 @@ test("session.churn ignores a future complete group while still detecting a real
 
   points = [
     ...points,
-    sessionPoint(tickTs(0), "e1", "2222222222222222"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"), censusMarkerPoint(tickTs(0), "complete"),
   ];
   const atNow = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
   const churn = atNow.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID);
@@ -645,13 +655,148 @@ test("session.churn ignores a future complete group while still detecting a real
   assert.equal(churn[0].diagnostics.current_fingerprint, "2222222222222222");
 });
 
+test("session.churn non-fire (security-sweep F5): a single tick carrying two rows for the same entity with differing fingerprints must not fabricate churn -- no distinct-tick evidence exists", () => {
+  const ts = tickTs(0);
+  const points = [
+    sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(ts, "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(points), [], "ambiguous same-tick evidence must yield no claim, not an arbitrary pick");
+});
+
+test("session.churn: a single tick carrying two IDENTICAL rows for the same entity is not ambiguous and falls through to a normal (non-firing, nothing-earlier-to-compare) evaluation", () => {
+  const ts = tickTs(0);
+  const points = [
+    sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerPoint(ts, "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(points), [], "a duplicate row with the SAME fingerprint is a benign double-write, not ambiguous, but there is still no strictly-earlier tick to compare against");
+});
+
+test("session.churn (security-sweep F5): a genuine cross-tick fingerprint change still fires even when the newest tick ALSO carries a duplicate row with the same (non-contradictory) fingerprint", () => {
+  const points = [
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"), // duplicate row, same fingerprint -- not ambiguous
+    censusMarkerPoint(tickTs(1), "complete"),
+  ];
+  const churn = detectSessionChurn(points);
+  assert.equal(churn.length, 1);
+  assert.deepEqual(churn[0], { entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" });
+});
+
+test("session.churn non-fire (security-sweep F5 residual 1, daybreak re-gate): the CHOSEN EARLIER tick can also carry >1 record for the entity with differing fingerprints -- array order must not decide which becomes 'older', so this must fail closed regardless of row order", () => {
+  const olderTs = tickTs(0);
+  const newerTs = tickTs(1);
+  // Row order within the ambiguous earlier tick is deliberately varied across the two builds below
+  // to prove the result is NOT array-order-dependent (pre-fix, one order fabricated an A->B churn
+  // while the reversed order emitted nothing -- both must now emit nothing).
+  const buildPoints = (firstFingerprint, secondFingerprint) => [
+    sessionPoint(olderTs, "session.tmux.aaaaaaaaaaaaaaaa", firstFingerprint),
+    sessionPoint(olderTs, "session.tmux.aaaaaaaaaaaaaaaa", secondFingerprint),
+    censusMarkerPoint(olderTs, "complete"),
+    sessionPoint(newerTs, "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(newerTs, "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(buildPoints("2222222222222222", "1111111111111111")), [], "ambiguous earlier-tick evidence must yield no claim (B-then-A order)");
+  assert.deepEqual(detectSessionChurn(buildPoints("1111111111111111", "2222222222222222")), [], "ambiguous earlier-tick evidence must yield no claim (A-then-B order), never array-order-dependent");
+});
+
+test("session.churn non-fire (security-sweep F5 residual 2, daybreak re-gate): an earlier candidate record whose ts is the SAME instant as the newest record, merely written in a different ISO string representation, must not be treated as strictly-earlier (chronological olderMs < newerMs, never string inequality)", () => {
+  const newerTs = tickTs(0); // toISOString() always includes milliseconds, e.g. "...T00:00:00.000Z"
+  const sameInstantDifferentRepr = newerTs.replace(".000Z", "Z"); // identical instant, different string
+  assert.notEqual(sameInstantDifferentRepr, newerTs, "fixture sanity: the two representations must actually differ as strings");
+  assert.equal(new Date(sameInstantDifferentRepr).getTime(), new Date(newerTs).getTime(), "fixture sanity: the two representations must parse to the identical instant");
+
+  const points = [
+    sessionPoint(sameInstantDifferentRepr, "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerPoint(sameInstantDifferentRepr, "complete"),
+    sessionPoint(newerTs, "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(newerTs, "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(points), [], "a same-instant, differently-formatted tick must not be treated as strictly-earlier -- no distinct-tick evidence actually exists");
+});
+
+test("session.churn non-fire (security-sweep F5 residual 3, daybreak re-gate round 3): the newest INSTANT can be split across two different ISO string representations with differing fingerprints -- ambiguity must be detected by parsed instant (ms), not string equality, regardless of row order", () => {
+  const olderTs = tickTs(0);
+  const newerTs = tickTs(1); // toISOString() always includes milliseconds, e.g. "...T01:00:00.000Z"
+  const newerTsAlt = newerTs.replace(".000Z", "Z"); // identical instant, different string
+  assert.notEqual(newerTsAlt, newerTs, "fixture sanity: the two representations must actually differ as strings");
+  assert.equal(new Date(newerTsAlt).getTime(), new Date(newerTs).getTime(), "fixture sanity: the two representations must parse to the identical instant");
+
+  const buildPoints = (firstFingerprint, secondFingerprint) => [
+    sessionPoint(olderTs, "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerPoint(olderTs, "complete"),
+    sessionPoint(newerTs, "session.tmux.aaaaaaaaaaaaaaaa", firstFingerprint),
+    censusMarkerPoint(newerTs, "complete"),
+    sessionPoint(newerTsAlt, "session.tmux.aaaaaaaaaaaaaaaa", secondFingerprint),
+    censusMarkerPoint(newerTsAlt, "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(buildPoints("2222222222222222", "3333333333333333")), [], "ambiguous same-instant newest-tick evidence (string form 1 first) must yield no claim");
+  assert.deepEqual(detectSessionChurn(buildPoints("3333333333333333", "2222222222222222")), [], "ambiguous same-instant newest-tick evidence (string form 2 first) must yield no claim, never array-order-dependent");
+});
+
+test("session.churn non-fire (security-sweep F5 residual 3, daybreak re-gate round 3): the CHOSEN EARLIER instant can also be split across two different ISO string representations with differing fingerprints -- ambiguity must be detected by parsed instant, not string equality", () => {
+  const olderTs = tickTs(0); // "...T00:00:00.000Z"
+  const olderTsAlt = olderTs.replace(".000Z", "Z"); // identical instant, different string
+  const newerTs = tickTs(1);
+  assert.notEqual(olderTsAlt, olderTs, "fixture sanity: the two representations must actually differ as strings");
+  assert.equal(new Date(olderTsAlt).getTime(), new Date(olderTs).getTime(), "fixture sanity: the two representations must parse to the identical instant");
+
+  const buildPoints = (firstFingerprint, secondFingerprint) => [
+    sessionPoint(olderTs, "session.tmux.aaaaaaaaaaaaaaaa", firstFingerprint),
+    censusMarkerPoint(olderTs, "complete"),
+    sessionPoint(olderTsAlt, "session.tmux.aaaaaaaaaaaaaaaa", secondFingerprint),
+    censusMarkerPoint(olderTsAlt, "complete"),
+    sessionPoint(newerTs, "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(newerTs, "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(buildPoints("1111111111111111", "4444444444444444")), [], "ambiguous same-instant earlier-tick evidence (string form 1 first) must yield no claim");
+  assert.deepEqual(detectSessionChurn(buildPoints("4444444444444444", "1111111111111111")), [], "ambiguous same-instant earlier-tick evidence (string form 2 first) must yield no claim, never array-order-dependent");
+});
+
+test("session.churn FIRES (security-sweep F5 residual, daybreak re-gate: false-negative fix): a GENUINE A->B change must not be suppressed by the K=1 recency bound merely because the newest record's tick ts is a different ISO string form of the SAME instant as latestCompleteTs -- the recency bound must compare parsed instants, not raw strings", () => {
+  const olderTs = tickTs(0); // "...T00:00:00.000Z"
+  const newestMsForm = tickTs(1); // "...T01:00:00.000Z"
+  const newestZForm = newestMsForm.replace(".000Z", "Z"); // identical instant, different string
+  assert.notEqual(newestZForm, newestMsForm, "fixture sanity: differ as strings");
+  assert.equal(new Date(newestZForm).getTime(), new Date(newestMsForm).getTime(), "fixture sanity: identical instant");
+  // The entity's genuine newest record lives in the complete tick keyed "...:01:00:00Z", while a
+  // SECOND complete census marker at the same instant but spelled "...:01:00:00.000Z" is appended
+  // last, so it sorts last among the equal-instant complete groups and becomes latestCompleteTs.
+  // Pre-fix, the K=1 gate's raw-string `newer.ts !== latestCompleteTs` then suppressed a real
+  // A->B change; comparing parsed instants admits it (both are the same instant).
+  const points = [
+    sessionPoint(olderTs, "session.tmux.aaaaaaaaaaaaaaaa", "1111111111111111"),
+    censusMarkerPoint(olderTs, "complete"),
+    sessionPoint(newestZForm, "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
+    censusMarkerPoint(newestZForm, "complete"),
+    censusMarkerPoint(newestMsForm, "complete"), // same instant, different string, sorts last -> latestCompleteTs
+  ];
+  assert.deepEqual(
+    detectSessionChurn(points),
+    [{ entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" }],
+    "a genuine A->B change at the latest instant must fire even when latestCompleteTs uses a different ISO string form of that instant",
+  );
+});
+
+test("session.churn (security-sweep F7): a churn entry whose entity_key does not match the translator's hashed session.<tmux|screen>.<16hex> shape is dropped, never republished into fingerprint/diagnostics", () => {
+  const points = [
+    sessionPoint(tickTs(0), "alice.internal", "1111111111111111"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), "alice.internal", "2222222222222222"), censusMarkerPoint(tickTs(1), "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(points), [], "a nonconforming (out-of-contract) entity_key must never surface in a churn candidate");
+});
+
 test("session.churn: an 'unknown'-disposition tick-group's own point is excluded from the pool even when it is NOT the latest tick (adversarial-review regression) -- a garbled census on an OLDER tick must never supply the prior_fingerprint side of a churn pair", () => {
   const points = [
     // tick0's census marker is garbled/unrecognized -> censusState "unknown". Without excluding
     // it from the pool, its session.presence point would wrongly anchor the "prior_fingerprint"
     // side of a churn pair against tick1's genuinely complete, latest observation.
-    sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "truncated-garbled"),
-    sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "truncated-garbled"),
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "complete"),
   ];
   assert.deepEqual(detectSessionChurn(points), [], "an 'unknown' tick-group's point must never feed either side of a churn pair, including the older side");
 });
@@ -781,6 +926,28 @@ test("computeSessionBaselineCandidates: rollback repairs a future anchor and wat
   assert.equal(resumed.some((candidate) => candidate.rule_id === SESSION_COUNT_DROP_RULE_ID), true, "session novelty resumes after rollback recovery has been persisted");
 });
 
+test("computeSessionBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated session.count_drop from the shortened post-rollback window", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
+  // watermark far in the future relative to the (now-corrected) clock below.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
+
+  const ticks = [completeTick(tickTs(0), 20), completeTick(tickTs(1), 20), completeTick(tickTs(2), 0)];
+  const points = flatten(ticks);
+
+  const result = await computeSessionBaselineCandidates(paths, {
+    now: tickTs(2),
+    minSampleCount: 2,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  const { state } = await loadSessionBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
+});
+
 test("computeSessionBaselineCandidates: intact history control still fires a real session.count_drop (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
@@ -805,25 +972,25 @@ test("computeSessionBaselineCandidates: one transient fact-history loss recovers
   const minHistoryTickCount = 2;
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
-  let points = [sessionPoint(tickTs(0), "e1", "fp1"), censusMarkerPoint(tickTs(0), "complete")];
+  let points = [sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(0), "complete")];
   let readResult = degradedReadResult([], tickTs(1));
   const options = { minHistoryTickCount, readFactPoints: async () => ({ ...readResult, points }) };
 
   // Loss tick: e1's fingerprint would change here (fp1 -> fp2) -- would churn if trusted.
-  points = [...points, sessionPoint(tickTs(1), "e1", "fp2"), censusMarkerPoint(tickTs(1), "complete")];
+  points = [...points, sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "complete")];
   const lossTick = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(1) });
   assert.deepEqual(lossTick, []);
 
   readResult = intactReadResult([]);
-  points = [...points, sessionPoint(tickTs(2), "e1", "fp2"), censusMarkerPoint(tickTs(2), "complete")]; // 1st re-accum tick
+  points = [...points, sessionPoint(tickTs(2), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(2), "complete")]; // 1st re-accum tick
   assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(2) }), []);
 
-  points = [...points, sessionPoint(tickTs(3), "e1", "fp2"), censusMarkerPoint(tickTs(3), "complete")]; // 2nd re-accum tick
+  points = [...points, sessionPoint(tickTs(3), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(3), "complete")]; // 2nd re-accum tick
   assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
   assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, false);
 
   // A genuinely new fingerprint change after re-establishment must fire normally.
-  points = [...points, sessionPoint(tickTs(4), "e1", "fp3"), censusMarkerPoint(tickTs(4), "complete")];
+  points = [...points, sessionPoint(tickTs(4), "session.tmux.aaaaaaaaaaaaaaaa", "fp3"), censusMarkerPoint(tickTs(4), "complete")];
   const resumed = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) });
   const churnCandidates = resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID);
   assert.equal(churnCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
@@ -835,16 +1002,16 @@ test("computeSessionBaselineCandidates: a clean tick cannot self-heal and fire s
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
   let points = [
-    sessionPoint(tickTs(1), "e1", "fp1"), censusMarkerPoint(tickTs(1), "complete"),
-    sessionPoint(tickTs(2), "e1", "fp1"), censusMarkerPoint(tickTs(2), "complete"),
-    sessionPoint(tickTs(3), "e1", "fp2"), censusMarkerPoint(tickTs(3), "complete"), // would churn if trusted
+    sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(2), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(2), "complete"),
+    sessionPoint(tickTs(3), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(3), "complete"), // would churn if trusted
   ];
   let readResult = degradedReadResult(points, tickTs(3));
   const options = { minHistoryTickCount: 1, readFactPoints: async () => ({ ...readResult, points }) };
 
   assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
 
-  points = [...points, sessionPoint(tickTs(4), "e1", "fp2"), censusMarkerPoint(tickTs(4), "complete")];
+  points = [...points, sessionPoint(tickTs(4), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(4), "complete")];
   readResult = intactReadResult([]);
   assert.deepEqual(
     await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) }),
@@ -875,7 +1042,7 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
   await fs.writeFile(storeFile, JSON.stringify(legacyState, null, 2), { mode: 0o600 });
 
   const ticks = [];
-  for (let i = 0; i < 5; i += 1) ticks.push(sessionPoint(tickTs(i), "e1", "fp1"), censusMarkerPoint(tickTs(i), "complete"));
+  for (let i = 0; i < 5; i += 1) ticks.push(sessionPoint(tickTs(i), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(i), "complete"));
   await appendFactPoints(paths, ticks, { now: tickTs(4) });
   await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
 
@@ -897,7 +1064,7 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
   let hour = 5;
   for (let i = 0; i < minHistoryTickCount; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, [sessionPoint(ts, "e1", "fp1"), censusMarkerPoint(ts, "complete")], { now: ts });
+    await appendFactPoints(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(ts, "complete")], { now: ts });
     await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
     hour += 1;
   }
@@ -909,9 +1076,53 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
 
   // And session.* novelty genuinely resumes afterward.
   const ts = tickTs(hour);
-  await appendFactPoints(paths, [sessionPoint(ts, "e1", "fp-changed"), censusMarkerPoint(ts, "complete")], { now: ts });
+  await appendFactPoints(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp-changed"), censusMarkerPoint(ts, "complete")], { now: ts });
   const resumed = await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
   assert.equal(resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 1);
+});
+
+test("loadSessionBaselineStore (security-sweep F1): a bare {cold_start_pending:false} with no last_folded_ts watermark carries zero establishment provenance and loads as invalid_store_schema (cold-start), while an otherwise-identical store WITH a valid watermark is trusted", async () => {
+  const paths = await tempPaths();
+  const { dir, storeFile } = resolveSessionBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
+  const forged = await loadSessionBaselineStore(paths);
+  assert.equal(forged.corrupt, true, "a bare cold_start_pending:false claim with no watermark must route through the same path as a corrupt/invalid store");
+  assert.equal(forged.state.cold_start_pending, true);
+  assert.equal(forged.state.cold_start_reason, "invalid_store_schema");
+
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false, last_folded_ts: tickTs(0) }), { mode: 0o600 });
+  const genuine = await loadSessionBaselineStore(paths);
+  assert.equal(genuine.corrupt, false);
+  assert.equal(genuine.state.cold_start_pending, false);
+});
+
+test("computeSessionBaselineCandidates (security-sweep F1): a forged {cold_start_pending:false} store with no watermark cold-starts (no fabricated session.count_drop), while a fully-established store with a real watermark still fires", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
+  ticks.push(completeTick(tickTs(30), 0)); // mass-drop tick -- would fire session.count_drop if trusted
+  const points = flatten(ticks);
+
+  const { dir, storeFile } = resolveSessionBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
+
+  const forged = await computeSessionBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(points),
+  });
+  assert.deepEqual(forged.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a session.count_drop claim");
+  assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, true);
+
+  // Control: an otherwise-identical, GENUINELY established store (real watermark) still fires.
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const genuine = await computeSessionBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(points),
+  });
+  assert.equal(genuine.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
 });
 
 // ---------------------------------------------------------------------------------------------

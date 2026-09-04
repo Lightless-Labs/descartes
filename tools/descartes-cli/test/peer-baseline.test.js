@@ -15,6 +15,7 @@ import {
   DEFAULT_PEER_STDDEV_FLOOR,
   PEER_COUNT_DROP_RULE_ID,
   PEER_COUNT_SPIKE_RULE_ID,
+  PEER_SIGNATURE_INVALID,
   buildCountDropCandidate,
   buildCountSpikeCandidate,
   computePeerBaselineCandidates,
@@ -313,22 +314,35 @@ test("groupPeerFactsByTick: a marker-less legacy tick-group still produces avail
   assert.equal(groups[0].availabilitySignature, undefined);
 });
 
-test("groupPeerFactsByTick: a marker point with a non-string/missing availability_signature attribute coerces to undefined, indistinguishable from a marker-less group (Decision 6 sentinel unification)", () => {
+test("groupPeerFactsByTick (security-sweep F6, supersedes 'Decision 6 sentinel unification'): a marker point with a non-string/missing availability_signature attribute coerces to the PEER_SIGNATURE_INVALID sentinel, DISTINCT from a marker-less group's undefined", () => {
   const malformedMarker = { ...censusMarkerPoint(tickTs(0)), attributes: { availability_signature: 12345 } };
   const groupsMalformed = groupPeerFactsByTick([...activeTick(tickTs(0), 3), malformedMarker]);
-  assert.equal(groupsMalformed[0].availabilitySignature, undefined);
+  assert.equal(groupsMalformed[0].availabilitySignature, PEER_SIGNATURE_INVALID);
+  assert.notEqual(groupsMalformed[0].availabilitySignature, undefined, "a present-but-invalid marker must never be indistinguishable from no-marker-at-all (F6)");
 
   const missingAttrMarker = { ...censusMarkerPoint(tickTs(1)), attributes: {} };
   const groupsMissing = groupPeerFactsByTick([...activeTick(tickTs(1), 2), missingAttrMarker]);
-  assert.equal(groupsMissing[0].availabilitySignature, undefined);
+  assert.equal(groupsMissing[0].availabilitySignature, PEER_SIGNATURE_INVALID);
 });
 
-test("groupPeerFactsByTick: a GARBLED-BUT-STRING-TYPED availability_signature (e.g. empty string, or a shape that does not match buildPeerAvailabilitySignature's 'v1:<5 closed-enum codes>' format) coerces to undefined -- a type-only guard is NOT enough (Stage 2 adversarial-review fix, 2026-07-23)", () => {
+test("groupPeerFactsByTick (security-sweep F6): a GARBLED-BUT-STRING-TYPED availability_signature (e.g. empty string, or a shape that does not match buildPeerAvailabilitySignature's 'v1:<5 closed-enum codes>' format) coerces to the PEER_SIGNATURE_INVALID sentinel, DISTINCT from marker-less undefined -- a type-only guard is NOT enough (Stage 2 adversarial-review fix, 2026-07-23; hardened 2026-09-04 so an invalid marker can no longer silently pool with the trusted legacy-markerless regime)", () => {
   for (const garbled of ["", "garbage", "v1:ok-ok-ok-ok", "v1:ok-ok-ok-ok-ok-ok", "v2:ok-ok-ok-ok-ok", "v1:ok-ok-injected-ok-ok", "not-even-versioned"]) {
     const marker = { ...censusMarkerPoint(tickTs(0)), attributes: { availability_signature: garbled } };
     const groups = groupPeerFactsByTick([...activeTick(tickTs(0), 3), marker]);
-    assert.equal(groups[0].availabilitySignature, undefined, `expected garbled signature ${JSON.stringify(garbled)} to coerce to undefined`);
+    assert.equal(groups[0].availabilitySignature, PEER_SIGNATURE_INVALID, `expected garbled signature ${JSON.stringify(garbled)} to coerce to PEER_SIGNATURE_INVALID`);
   }
+});
+
+test("groupPeerFactsByTick (security-sweep F3): contradictory in-tick census markers (two DIFFERENT valid signatures in one tick) fail closed to PEER_SIGNATURE_INVALID regardless of arrival order; identical duplicate markers do not downgrade", () => {
+  const ts = tickTs(0);
+  const markerA = { ...censusMarkerPoint(ts), attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } };
+  const markerB = { ...censusMarkerPoint(ts), attributes: { availability_signature: "v1:ok-ok-partial-ok-ok" } };
+  const aThenB = groupPeerFactsByTick([...activeTick(ts, 1), markerA, markerB]);
+  assert.equal(aThenB[0].availabilitySignature, PEER_SIGNATURE_INVALID, "attacker-controlled record order must not decide which marker wins");
+  const bThenA = groupPeerFactsByTick([...activeTick(ts, 1), markerB, markerA]);
+  assert.equal(bThenA[0].availabilitySignature, PEER_SIGNATURE_INVALID);
+  const duplicateA = groupPeerFactsByTick([...activeTick(ts, 1), markerA, { ...markerA }]);
+  assert.equal(duplicateA[0].availabilitySignature, "v1:ok-ok-ok-ok-ok", "an identical duplicate marker (benign double-write) must not suppress a real signature");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -370,6 +384,19 @@ test("computeWindowedPeerStats: an overflow tick-group is excluded from the wind
   const windowed = computeWindowedPeerStats(groups, { minSampleCount: 3 });
   assert.equal(windowed.stats.count, 3, "the overflow tick-group must not be folded into the windowed stats");
   assert.equal(windowed.stats.mean, 2);
+});
+
+test("computeWindowedPeerStats (security-sweep F6): a present-but-invalid marker on the most recent tick is excluded from BOTH scoring and folding -- contrast with overflow's own score-but-never-fold posture", () => {
+  const markerlessBaseline = [];
+  for (let i = 0; i < 30; i += 1) markerlessBaseline.push(...activeTick(tickTs(i), 1));
+  const invalidJumpTick = { ...censusMarkerPoint(tickTs(30), "v2:future-garbage") };
+  const ticks = [...markerlessBaseline, ...activeTick(tickTs(30), 10), invalidJumpTick];
+  const groups = groupPeerFactsByTick(ticks);
+  assert.equal(groups.at(-1).availabilitySignature, PEER_SIGNATURE_INVALID);
+
+  const windowed = computeWindowedPeerStats(groups, { minSampleCount: 30 });
+  assert.equal(windowed.last_observation, undefined, "an invalid-marker tick must not be scored -- no fabricated z-score/candidate basis, so no spike candidate can ever derive from it");
+  assert.equal(windowed.confidence_state, "provisional", "an invalid-marker regime can never itself be trusted/established -- mirrors the markerless-current-tick posture computeWindowedPeerDropStats already has (an invalid signature can never equal any group's signature, itself included, so the pool is empty on this tick)");
 });
 
 test(">cap-burst-fires fixture (Fable review MUST-FIX 3, hard requirement): a burst beyond the peer entity cap STILL fires peer.count_spike, scored at the capped count against the PRE-overflow window stats, while the tick is excluded from the persisted mean/variance recompute", async () => {
@@ -457,6 +484,16 @@ test("synthetic spike fixture: a mass odd-hour peer-login burst fires peer.count
   assert.equal(spike.diagnostics.observed_count, 8);
   assert.equal(spike.diagnostics.mean_before, 2);
   assert.equal(spike.diagnostics.confidence_state, "established");
+});
+
+test("computePeerBaselineCandidates (security-sweep F6): a present-but-invalid marker on the jump tick does NOT fire peer.count_spike -- fails closed, distinct from the truly-markerless jump tick control above (which DOES fire)", async () => {
+  const paths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2)); // markerless legacy baseline, same shape as the control above
+  ticks.push(...activeTickWithMarker(tickTs(30), 8, "v2:future-garbage")); // present-but-invalid marker on the jump tick
+  const candidates = await seedAndCompute(paths, ticks);
+  const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(spike, undefined, "a present-but-invalid marker must fail closed, never pool with (or be scored against) the trusted markerless regime");
 });
 
 test("MUST-FIX 1 (hard requirement): stored severity is capped at 'warning' UNCONDITIONALLY, even at an extreme z crossing CRITICAL_SIGMA-equivalent magnitude", async () => {
@@ -1075,6 +1112,28 @@ test("computePeerBaselineCandidates: an established future anchor is repaired fo
   assert.equal(state.cold_start_since_ts, tickTs(30));
 });
 
+test("computePeerBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated peer.count_spike from the shortened post-rollback window", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
+  // watermark far in the future relative to the (now-corrected) clock below.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
+
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
+  ticks.push(...activeTick(tickTs(30), 8)); // would fire peer.count_spike in this shortened window if trusted
+
+  const result = await computePeerBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(ticks),
+  });
+
+  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  const { state } = await loadPeerBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(30), "a real anchor must be synthesized at the injected now");
+});
+
 test("computePeerBaselineCandidates: intact history control still fires a real peer.count_spike (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
@@ -1266,6 +1325,49 @@ test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-sta
   await appendFactPoints(paths, activeTick(ts, 200), { now: ts });
   const resumed = await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
   assert.equal(resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1);
+});
+
+test("loadPeerBaselineStore (security-sweep F1): a bare {cold_start_pending:false} with no last_folded_ts watermark carries zero establishment provenance and loads as invalid_store_schema (cold-start), while an otherwise-identical store WITH a valid watermark is trusted", async () => {
+  const paths = await tempPaths();
+  const { dir, storeFile } = resolvePeerBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
+  const forged = await loadPeerBaselineStore(paths);
+  assert.equal(forged.corrupt, true, "a bare cold_start_pending:false claim with no watermark must route through the same path as a corrupt/invalid store");
+  assert.equal(forged.state.cold_start_pending, true);
+  assert.equal(forged.state.cold_start_reason, "invalid_store_schema");
+
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false, last_folded_ts: tickTs(0) }), { mode: 0o600 });
+  const genuine = await loadPeerBaselineStore(paths);
+  assert.equal(genuine.corrupt, false);
+  assert.equal(genuine.state.cold_start_pending, false);
+});
+
+test("computePeerBaselineCandidates (security-sweep F1): a forged {cold_start_pending:false} store with no watermark cold-starts (no fabricated peer.count_spike), while a fully-established store with a real watermark still fires", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
+  ticks.push(...activeTick(tickTs(30), 8)); // z = (8-2)/0.5 = 12 -- would fire if trusted
+
+  const { dir, storeFile } = resolvePeerBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
+
+  const forged = await computePeerBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(ticks),
+  });
+  assert.deepEqual(forged.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a peer.count_spike claim");
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, true);
+
+  // Control: an otherwise-identical, GENUINELY established store (real watermark) still fires.
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const genuine = await computePeerBaselineCandidates(paths, {
+    now: tickTs(30),
+    readFactPoints: async () => intactReadResult(ticks),
+  });
+  assert.equal(genuine.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
 });
 
 // ---------------------------------------------------------------------------------------------

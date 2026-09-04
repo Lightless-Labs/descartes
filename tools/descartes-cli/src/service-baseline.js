@@ -172,6 +172,22 @@ async function readJsonFile(file) {
   }
 }
 
+// Security-sweep F1 fix (2026-09-04 daybreak review): a bare `{cold_start_pending:false}` fragment
+// -- no `last_folded_ts` watermark, no real folded-tick provenance behind it -- must not be trusted
+// as a genuinely-established store just because normalizeServiceBaselineState's lenient per-field
+// defaulting can produce *something* from it (mirrors session-baseline.js's own F1 fix exactly; the
+// same gap exists here because this DISAPPEARANCE path deliberately kept lenient per-field
+// normalization instead of the sibling APPEARANCE path's exact-schema validation -- see this
+// module's "GATE DECISION" header comment further below for why). Pre-migration stores (missing
+// cold_start_pending entirely) are UNAFFECTED: `raw.cold_start_pending === false` is a strict
+// comparison, so a store that never wrote the field at all (undefined) still falls through to
+// normal lenient normalization, which already defaults it to pending.
+function lacksEstablishmentProvenance(raw) {
+  return Boolean(raw) && typeof raw === "object" && !Array.isArray(raw)
+    && raw.cold_start_pending === false
+    && !isValidIsoTimestamp(raw.last_folded_ts);
+}
+
 /**
  * ENOENT-tolerant (fresh state -> empty counters) and corrupt-tolerant (mirrors
  * session-baseline.js's loadSessionBaselineStore exactly): a corrupt/malformed file yields a fresh
@@ -191,6 +207,9 @@ export async function loadServiceBaselineStore(descartesPaths) {
   const { parsed, missing, corrupt } = await readJsonFile(storeFile);
   if (missing) return { state: { ...freshServiceBaselineState(), cold_start_reason: "missing_store" }, corrupt: false, missing: true };
   if (corrupt) return { state: { ...freshServiceBaselineState(), cold_start_reason: "corrupt_store" }, corrupt: true, missing: false };
+  if (lacksEstablishmentProvenance(parsed)) {
+    return { state: { ...freshServiceBaselineState(), cold_start_reason: "invalid_store_schema" }, corrupt: true, missing: false };
+  }
   return { state: normalizeServiceBaselineState(parsed), corrupt: false, missing: false };
 }
 
@@ -248,7 +267,7 @@ export function groupServiceFactsByTick(points = []) {
     if (!point || typeof point.ts !== "string") continue;
     if (point.fact_name !== SERVICE_PRESENCE_FACT_NAME && point.fact_name !== SERVICE_CENSUS_FACT_NAME) continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, censusState: undefined, entityKeys: new Set() });
+      byTs.set(point.ts, { ts: point.ts, censusState: undefined, censusMarkerSeen: false, entityKeys: new Set() });
     }
     const group = byTs.get(point.ts);
     if (point.fact_name === SERVICE_CENSUS_FACT_NAME) {
@@ -259,7 +278,14 @@ export function groupServiceFactsByTick(points = []) {
       // like "partial"/undefined, so no downstream change is needed to keep it out of the
       // established/comparison set.
       const rawState = point.attributes?.census_state;
-      group.censusState = rawState === "complete" ? "complete" : rawState === "partial" ? "partial" : "unknown";
+      const markerState = rawState === "complete" ? "complete" : rawState === "partial" ? "partial" : "unknown";
+      // Security-sweep F3 fix (2026-09-04 daybreak review): a SECOND census marker landing in this
+      // SAME tick whose classified state differs from the first is CONTRADICTORY in-tick evidence
+      // -- record order must never decide which marker "wins" (mirrors session-baseline.js's/
+      // process-lineage-baseline.js's own F3 fix exactly). Fail closed to "unknown". An identical
+      // duplicate marker is not a contradiction and must not downgrade a benign double-write.
+      group.censusState = group.censusMarkerSeen && markerState !== group.censusState ? "unknown" : markerState;
+      group.censusMarkerSeen = true;
       continue;
     }
     group.entityKeys.add(point.entity_key);
@@ -493,10 +519,21 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
   const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
+  // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
+  // previously computed only after `disappearances`, purely to gate the store WRITE) and added as
+  // a 5th arming term. A future/clock-rolled-back last_folded_ts means the persisted watermark
+  // cannot be trusted relative to the current clock: the groupMs<=nowMs filter above already
+  // excludes any pre-rollback (future-dated) history from `currentGroups`, so continuing to trust
+  // an "established" store here would fire a service.disappeared claim against a SHORTENED window
+  // that silently dropped the very history proving the service is still established. Strict `>
+  // nowMs` (no tolerance), mirroring persistedAnchorMissingOrFuture's own strict comparison.
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
   const enteringColdStart = factsCorruptThisTick
     || storeLossThisTick
     || persistedAnchorMissingOrFuture
     || completenessLossAfterAnchor
+    || lastFoldedWasFuture
     || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
@@ -553,8 +590,9 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
 
   const disappearances = detectServiceDisappearances(currentGroups, { nowMs, freshnessMs, minEstablishedCount });
 
-  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
-  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
+  // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
+  // needed here.
   const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
   const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
   const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
@@ -837,10 +875,21 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
   const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
+  // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
+  // previously computed only after `appearances`, purely to gate the store WRITE) and added as a
+  // 5th arming term -- mirrors the sibling disappearance path's own F4 fix above exactly. A
+  // future/clock-rolled-back last_folded_ts means the persisted watermark cannot be trusted
+  // relative to the current clock: the groupMs<=nowMs filter above already excludes any
+  // pre-rollback (future-dated) history from `currentGroups`, so continuing to trust an
+  // "established" store here would fire a service.appeared claim against a SHORTENED window that
+  // silently dropped the very history proving the service is old. Strict `> nowMs` (no tolerance).
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
   const enteringColdStart = factsCorruptThisTick
     || storeLossThisTick
     || persistedAnchorMissingOrFuture
     || completenessLossAfterAnchor
+    || lastFoldedWasFuture
     || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   const coldStartPendingThisTick = persistedState.cold_start_pending || enteringColdStart || !historyTrust.trust;
@@ -868,8 +917,9 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
     ? []
     : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount });
 
-  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
-  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
+  // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
+  // needed here.
   const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
   const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
   const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);

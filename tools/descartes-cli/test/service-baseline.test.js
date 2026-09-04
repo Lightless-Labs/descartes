@@ -314,6 +314,16 @@ test("groupServiceFactsByTick: orders tick-groups ascending by ts regardless of 
   assert.deepEqual(groups.map((g) => g.ts), [tickTs(0), tickTs(1), tickTs(2)]);
 });
 
+test("groupServiceFactsByTick (security-sweep F3): contradictory in-tick census markers fail closed to 'unknown' regardless of arrival order; identical duplicate markers do not downgrade", () => {
+  const ts = tickTs(0);
+  const partialThenComplete = groupServiceFactsByTick([censusMarkerPoint(ts, "partial"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(partialThenComplete[0].censusState, "unknown", "attacker-controlled record order must not decide which marker wins");
+  const completeThenPartial = groupServiceFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "partial")]);
+  assert.equal(completeThenPartial[0].censusState, "unknown");
+  const duplicateComplete = groupServiceFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(duplicateComplete[0].censusState, "complete", "an identical duplicate marker (benign double-write) must not suppress a real complete tick");
+});
+
 // ---------------------------------------------------------------------------------------------
 // detectServiceDisappearances.
 // ---------------------------------------------------------------------------------------------
@@ -644,6 +654,32 @@ test("computeServiceBaselineCandidates: degraded truncated history suppresses a 
   assert.equal(state.cold_start_pending, true);
 });
 
+test("computeServiceBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated service.disappeared from the shortened post-rollback window", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
+  // watermark far in the future relative to the (now-corrected) clock below.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
+
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a"]), // 3 sightings -- meets DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT
+    completeTick(tickTs(3), []), // svc-a would read as vanished in this shortened window
+  ]);
+
+  const result = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(3),
+    freshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  const { state } = await loadServiceBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(3), "a real anchor must be synthesized at the injected now");
+});
+
 test("computeServiceBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
@@ -833,6 +869,49 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
   await appendFactPoints(paths, completeTick(ts, []), { now: ts }); // svc-a genuinely vanishes
   const resumed = await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
   assert.equal(resumed.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1);
+});
+
+test("loadServiceBaselineStore (security-sweep F1): a bare {cold_start_pending:false} with no last_folded_ts watermark carries zero establishment provenance and loads as invalid_store_schema (cold-start), while an otherwise-identical store WITH a valid watermark is trusted", async () => {
+  const paths = await tempPaths();
+  const { dir, storeFile } = resolveServiceBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
+  const forged = await loadServiceBaselineStore(paths);
+  assert.equal(forged.corrupt, true, "a bare cold_start_pending:false claim with no watermark must route through the same path as a corrupt/invalid store");
+  assert.equal(forged.state.cold_start_pending, true);
+  assert.equal(forged.state.cold_start_reason, "invalid_store_schema");
+
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false, last_folded_ts: tickTs(0) }), { mode: 0o600 });
+  const genuine = await loadServiceBaselineStore(paths);
+  assert.equal(genuine.corrupt, false);
+  assert.equal(genuine.state.cold_start_pending, false);
+});
+
+test("computeServiceBaselineCandidates (security-sweep F1): a forged {cold_start_pending:false} store with no watermark cold-starts (no fabricated service.disappeared), while a fully-established store with a real watermark still fires", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const points = disappearanceFixturePoints();
+
+  const { dir, storeFile } = resolveServiceBaselineStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
+
+  const forged = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(30),
+    freshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+  assert.deepEqual(forged.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a service.disappeared claim");
+  assert.equal((await loadServiceBaselineStore(paths)).state.cold_start_pending, true);
+
+  // Control: an otherwise-identical, GENUINELY established store (real watermark) still fires.
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const genuine = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(30),
+    freshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+  assert.equal(genuine.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1031,6 +1110,33 @@ test("co-existence: a service that disappears then reappears exercises BOTH dete
   const appearanceState = (await loadServiceAppearanceBaselineStore(paths)).state;
   assert.equal(disappearanceState.last_folded_ts, tickTs(4));
   assert.equal(appearanceState.last_folded_ts, tickTs(4));
+});
+
+test("computeServiceAppearanceCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated service.appeared from the shortened post-rollback window", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
+  // watermark far in the future relative to the (now-corrected) clock below.
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
+
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a", "svc-new"]), // svc-new would read as newly-appeared in this shortened window
+  ]);
+
+  const result = await computeServiceAppearanceCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount: 2,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  const { state } = await loadServiceAppearanceBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
 });
 
 test("computeServiceAppearanceCandidates fails closed end-to-end when the persisted appearance-baseline-store file is corrupt, never fabricating the appearance that same history would otherwise fire", async () => {

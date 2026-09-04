@@ -222,6 +222,25 @@ async function readJsonFile(file) {
   }
 }
 
+// Security-sweep F1 fix (2026-09-04 daybreak review): a bare `{cold_start_pending:false}` fragment
+// -- no `last_folded_ts` watermark, no real folded-tick provenance behind it -- must not be trusted
+// as a genuinely-established store just because normalizeSessionBaselineState's lenient per-field
+// defaulting can produce *something* from it (the same fabrication-class gap process-lineage-
+// baseline.js/persistence-baseline.js already close with exact-schema validation). This is
+// DELIBERATELY narrower than those siblings' full exact-schema rejection -- see
+// normalizeSessionBaselineState's own comment for why lenient per-field normalization is kept here
+// (session's schema is richer: stats/last_observation/drop/availability_signature/skipped_* -- a
+// full closed-key-set validator would need to enumerate all of it, a separate follow-up) -- it only
+// closes the one load-bearing gap: an "established" claim with zero watermark provenance.
+// Pre-migration stores (missing cold_start_pending entirely) are UNAFFECTED: `raw.cold_start_pending
+// === false` is a strict comparison, so a store that never wrote the field at all (undefined) still
+// falls through to normal lenient normalization, which already defaults it to pending.
+function lacksEstablishmentProvenance(raw) {
+  return Boolean(raw) && typeof raw === "object" && !Array.isArray(raw)
+    && raw.cold_start_pending === false
+    && !isValidIsoTimestamp(raw.last_folded_ts);
+}
+
 /**
  * ENOENT-tolerant (fresh state -> empty/provisional baseline) and corrupt-tolerant (mirrors
  * provenance-store.js's loadSignatureStore / constraint-store.js's loadLearnedConfig: a
@@ -240,6 +259,9 @@ export async function loadSessionBaselineStore(descartesPaths) {
   // tick the store stays lost, rather than silently reusing a stale/undefined one.
   if (missing) return { state: { ...freshSessionBaselineState(), cold_start_reason: "missing_store" }, corrupt: false, missing: true };
   if (corrupt) return { state: { ...freshSessionBaselineState(), cold_start_reason: "corrupt_store" }, corrupt: true, missing: false };
+  if (lacksEstablishmentProvenance(parsed)) {
+    return { state: { ...freshSessionBaselineState(), cold_start_reason: "invalid_store_schema" }, corrupt: true, missing: false };
+  }
   return { state: normalizeSessionBaselineState(parsed), corrupt: false, missing: false };
 }
 
@@ -289,7 +311,7 @@ export function groupSessionFactsByTick(points = []) {
   for (const point of points ?? []) {
     if (!point || point.fact_name !== SESSION_FACT_NAME || typeof point.ts !== "string") continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, censusState: undefined, points: [] });
+      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, censusState: undefined, censusMarkerSeen: false, points: [] });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === SESSION_OVERFLOW_ENTITY_KEY) {
@@ -302,7 +324,16 @@ export function groupSessionFactsByTick(points = []) {
       // An unrecognized census_state value (corruption, future schema drift, a bug upstream) must
       // degrade to the fail-closed "unknown" disposition, not the max-trust one.
       const rawState = point.attributes?.census_state;
-      group.censusState = rawState === "complete" ? "complete" : rawState === "partial" ? "partial" : "unknown";
+      const markerState = rawState === "complete" ? "complete" : rawState === "partial" ? "partial" : "unknown";
+      // Security-sweep F3 fix (2026-09-04 daybreak review): a SECOND census marker landing in this
+      // SAME tick whose classified state differs from the first is CONTRADICTORY in-tick evidence
+      // -- record order (attacker-controlled if facts.jsonl is hand-edited/corrupted) must never
+      // decide which marker "wins". Fail closed to "unknown" regardless of arrival order. An
+      // identical duplicate marker (same classified state, including two independently-garbled
+      // "unknown" markers) is NOT a contradiction and must not downgrade/suppress a benign
+      // double-write.
+      group.censusState = group.censusMarkerSeen && markerState !== group.censusState ? "unknown" : markerState;
+      group.censusMarkerSeen = true;
       continue;
     }
     group.count += 1;
@@ -384,6 +415,18 @@ export function computeWindowedSessionStats(groups, { stddevFloor = DEFAULT_STDD
 // every tick, exactly like provenance-warnings.js's reduceLatestProvenanceWarnings pattern.
 // ---------------------------------------------------------------------------------------------
 
+// Security-sweep F7 fix (2026-09-04 daybreak review): the real translator (fact-translators.js
+// sessionEntityKey) ALWAYS emits entity_key in this exact hashed shape --
+// "session.<tmux|screen>.<16 lowercase hex chars>" -- for every session.presence point it produces.
+// A conforming producer never needs this check; it exists as a shape-validation backstop against a
+// nonconforming/out-of-contract fact source (hand-edited facts.jsonl, a future translator
+// regression) that could otherwise smuggle a raw, non-hashed identity string into churn's
+// diagnostics/fingerprint below. Deliberately SHAPE validation, not re-hashing: `fingerprint` in
+// buildChurnCandidates is `entry.entity_key` (the churn alertId's dedup key) -- re-hashing a
+// conforming entity_key here would change every existing session.churn alert id and break dedup on
+// upgrade, a documented behavioral invariant this fix must not touch.
+const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16}$/;
+
 /**
  * Must-fix 4 (recency bound, hard requirement): for each entity_key with two or more
  * session.presence points in the pool, compares the two most recent points' created_at_fingerprint.
@@ -403,6 +446,16 @@ export function computeWindowedSessionStats(groups, { stddevFloor = DEFAULT_STDD
  * included in the pool (so a stale/legacy pair can be found and shown NOT to fire via the recency
  * bound alone, per the plan's own upgrade-day-storm reasoning) but a markerless tick-group can
  * never itself be the "latest complete tick-group" anchor.
+ *
+ * Security-sweep F5 fix (2026-09-04 daybreak review): the "two most recent points" comparison MUST
+ * come from two DISTINCT observation ticks -- comparing two rows recorded within the SAME tick
+ * (e.g. a duplicate/racy emission) is not "resurrection between observations", it is ambiguous
+ * same-tick evidence, and fabricating churn from it would fire on a single shortened window rather
+ * than a genuine kill-then-resurrect observed BETWEEN ticks. If the newest tick itself carries more
+ * than one record for this entity with DIFFERING fingerprints, that tick's evidence is internally
+ * contradictory -- fail closed (no claim) rather than picking one arbitrarily. Otherwise the newest
+ * record is compared only against the most recent STRICTLY-EARLIER tick's record (`older.ts <
+ * newer.ts`); the must-fix-4 K=1 recency bound is unchanged.
  */
 export function detectSessionChurn(points = []) {
   const groups = groupSessionFactsByTick(points);
@@ -432,11 +485,61 @@ export function detectSessionChurn(points = []) {
     if (observations.length < 2) continue;
     observations.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
     const newer = observations[observations.length - 1];
-    const older = observations[observations.length - 2];
+    // F5 residual fix (2026-09-04 daybreak re-gate, round 3): "within one tick" means "within one
+    // INSTANT" -- both ambiguity-grouping filters below (and the older-search) MUST key on the
+    // parsed instant (ms), never the raw ts STRING. Two different ISO representations of the
+    // IDENTICAL instant (e.g. "...:00Z" vs "...:00.000Z") are unequal as strings but must still be
+    // grouped as the same tick for ambiguity purposes -- a string-keyed filter would silently split
+    // them into two "different" ticks, hiding a differing-fingerprint pair from the ambiguity check
+    // and letting array/sort order decide which becomes `older`, fabricating churn.
+    const newerMs = new Date(newer.ts).getTime();
+
+    // F5: same-tick ambiguity check. If the newest tick carries >1 record for this entity, a
+    // differing fingerprint among them is contradictory evidence WITHIN one tick -- never treated
+    // as "the" newer/older pair. Duplicate rows sharing the identical fingerprint are not
+    // contradictory (a benign double-emission), so they fall through to the normal comparison
+    // below unaffected.
+    const newestTickObservations = observations.filter((observation) => new Date(observation.ts).getTime() === newerMs);
+    if (newestTickObservations.length > 1 && new Set(newestTickObservations.map((observation) => observation.fingerprint)).size > 1) {
+      continue; // ambiguous same-tick evidence -- no claim
+    }
+
+    // F5 residual fix (round 2): the "strictly earlier" test MUST be chronological (olderMs <
+    // newerMs via Date.parse), never string inequality (`ts !== newer.ts`) -- the same
+    // same-instant/different-string gap as above would otherwise let a same-instant record be
+    // wrongly admitted as "older", fabricating churn from what is really same-tick evidence.
+    let older;
+    for (let index = observations.length - 1; index >= 0; index -= 1) {
+      if (new Date(observations[index].ts).getTime() < newerMs) {
+        older = observations[index];
+        break;
+      }
+    }
+    if (!older) continue; // nothing strictly earlier to compare against yet
+    const olderMs = new Date(older.ts).getTime();
+
+    // F5 residual fix (round 2/3): the SAME same-instant-ambiguity rule applied to the newest tick
+    // above must also apply to the chosen earlier tick -- it can equally carry >1 record for this
+    // entity with DIFFERING fingerprints (including two different string representations of the
+    // SAME instant), and picking one via array order would fabricate churn just as readily. Fail
+    // closed (no claim) rather than trying to salvage an unambiguous row out of an ambiguous tick.
+    const olderTickObservations = observations.filter((observation) => new Date(observation.ts).getTime() === olderMs);
+    if (olderTickObservations.length > 1 && new Set(olderTickObservations.map((observation) => observation.fingerprint)).size > 1) {
+      continue; // ambiguous same-tick evidence on the earlier side -- no claim
+    }
+
     if (!newer.fingerprint || !older.fingerprint) continue;
     if (newer.fingerprint === "unknown" || older.fingerprint === "unknown") continue;
     if (newer.fingerprint === older.fingerprint) continue;
-    if (newer.ts !== latestCompleteTs) continue; // must-fix 4 recency bound (K=1)
+    // must-fix 4 recency bound (K=1). Compared by PARSED INSTANT, not raw string: the newest
+    // record selected above may be a same-instant record written in a different ISO form than the
+    // census group's ts (e.g. "...:00Z" vs "...:00.000Z"), and a raw-string `!==` would then
+    // FALSE-NEGATIVE-suppress a genuine A->B change. Instant comparison keeps this consistent with
+    // the same-instant discipline used for the ambiguity grouping and the strictly-earlier search
+    // above (daybreak-blue F5 re-gate). Cannot fabricate: it only admits a change that already
+    // passed every ambiguity/chronology safeguard.
+    if (new Date(newer.ts).getTime() !== new Date(latestCompleteTs).getTime()) continue;
+    if (!SESSION_CHURN_ENTITY_KEY_PATTERN.test(entityKey)) continue; // F7: nonconforming entity_key shape, never republished
     churnEntries.push({ entity_key: entityKey, prior_fingerprint: older.fingerprint, current_fingerprint: newer.fingerprint });
   }
   return churnEntries;
@@ -575,10 +678,21 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
   const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
+  // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
+  // previously computed only after coldStartPendingThisTick, purely to gate the store WRITE) and
+  // added as a 5th arming term. A future/clock-rolled-back last_folded_ts means the persisted
+  // watermark cannot be trusted relative to the current clock: the groupMs<=nowMs filter above
+  // already excludes any pre-rollback (future-dated) history from `currentGroups`, so continuing
+  // to trust an "established" store here would score/fire session.* novelty against a SHORTENED
+  // window that silently dropped the very history that would show a "deviation" as normal. Strict
+  // `> nowMs` (no tolerance), mirroring persistedAnchorMissingOrFuture's own strict comparison.
+  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
+  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
   const enteringColdStart = factsCorruptThisTick
     || storeLossThisTick
     || persistedAnchorMissingOrFuture
     || completenessLossAfterAnchor
+    || lastFoldedWasFuture
     || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
@@ -610,8 +724,9 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     }
   }
 
-  const persistedLastFoldedMs = persistedState.last_folded_ts ? new Date(persistedState.last_folded_ts).getTime() : -Infinity;
-  const lastFoldedWasFuture = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs > nowMs;
+  // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
+  // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
+  // needed here.
   const lastFoldedMs = Number.isFinite(persistedLastFoldedMs) && persistedLastFoldedMs <= nowMs ? persistedLastFoldedMs : -Infinity;
   const effectiveLastFoldedTs = lastFoldedMs === -Infinity ? undefined : persistedState.last_folded_ts;
   const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);

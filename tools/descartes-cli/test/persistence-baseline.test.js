@@ -177,6 +177,16 @@ test("groupScheduledJobFactsByTick is fail-closed for partial, unknown, and mark
   assert.equal(groups[3].censusState, "unknown");
 });
 
+test("groupScheduledJobFactsByTick (security-sweep F3): contradictory in-tick census markers fail closed to 'unknown' regardless of arrival order; identical duplicate markers do not downgrade", () => {
+  const ts = tickTs(0);
+  const partialThenComplete = groupScheduledJobFactsByTick([censusMarkerPoint(ts, "partial"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(partialThenComplete[0].censusState, "unknown", "attacker-controlled record order must not decide which marker wins");
+  const completeThenPartial = groupScheduledJobFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "partial")]);
+  assert.equal(completeThenPartial[0].censusState, "unknown");
+  const duplicateComplete = groupScheduledJobFactsByTick([censusMarkerPoint(ts, "complete"), censusMarkerPoint(ts, "complete")]);
+  assert.equal(duplicateComplete[0].censusState, "complete", "an identical duplicate marker (benign double-write) must not suppress a real complete tick");
+});
+
 test("detectScheduledJobAppearances requires prior complete history and fires only for first appearance", () => {
   const groups = groupScheduledJobFactsByTick(flatten([
     completeTick(tickTs(0)),
@@ -351,6 +361,32 @@ test("computeScheduledJobBaselineCandidates: corrupt fact-history and genuine co
     writePersistenceBaselineStore: async () => {},
   });
   assert.deepEqual(coldStart, []);
+});
+
+test("computeScheduledJobBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated appearance from the shortened post-rollback window", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
+  // watermark far in the future relative to the (now-corrected) clock below.
+  await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
+
+  const points = flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [KEY_TIMER, KEY_CRON]), // KEY_CRON would read as newly-appeared in this shortened window
+  ]);
+
+  const result = await computeScheduledJobBaselineCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  const { state } = await loadPersistenceBaselineStore(paths);
+  assert.equal(state.cold_start_pending, true);
+  assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
 });
 
 test("computeScheduledJobBaselineCandidates: degraded/untrustworthy retained history suppresses a fabricated established-job alert", async () => {
