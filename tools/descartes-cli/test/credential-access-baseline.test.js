@@ -12,6 +12,7 @@ import {
   CREDENTIAL_ACCESS_RULE_ID,
   buildCredentialAccessCandidates,
   computeCredentialAccessCandidates,
+  createCredentialCollectionBreaker,
   detectCredentialAccess,
   isValidCredentialAccessBaselineStoreShape,
   loadCredentialAccessBaselineStore,
@@ -276,6 +277,121 @@ test("kill-switch: learned.json disabled -> [], zero I/O", async () => {
   });
   assert.deepEqual(result, []);
   assert.equal(collectCalls, 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// [BLOCKER fix] store I/O failure must not discard an already-computed positive finding or abort
+// the tick. Mirrors canary-baseline.js's own baseline-store discipline.
+// ---------------------------------------------------------------------------------------------
+
+test("[BLOCKER fix] a throwing loadCredentialAccessBaselineStore does not abort the tick: returns [] and does not write (no trustworthy baseline to diff against or fold onto)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  let writeCalled = false;
+  const result = await computeCredentialAccessCandidates(paths, {
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
+    loadCredentialAccessBaselineStore: async () => { const error = new Error("denied"); error.code = "EACCES"; throw error; },
+    writeCredentialAccessBaselineStore: async () => { writeCalled = true; },
+  });
+  assert.deepEqual(result, []);
+  assert.equal(writeCalled, false, "must not substitute an empty baseline and write -- that would clobber the real last-known-good baseline");
+});
+
+test("[BLOCKER fix] a throwing writeCredentialAccessBaselineStore does NOT discard the already-computed positive finding -- credential.access still fires", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeCredentialAccessBaselineStore(paths, { entries: { [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 } } });
+
+  const result = await computeCredentialAccessCandidates(paths, {
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
+    writeCredentialAccessBaselineStore: async () => { const error = new Error("read-only filesystem"); error.code = "EROFS"; throw error; },
+  });
+  assert.equal(result.length, 1, "the positive finding, already computed before the write throws, must survive");
+  assert.equal(result[0].rule_id, CREDENTIAL_ACCESS_RULE_ID);
+  assert.equal(result[0].diagnostics.trip_reason, "mtime_changed");
+});
+
+test("[BLOCKER fix] end-to-end with the real loadCredentialAccessBaselineStore: an unreadable store on disk (EISDIR) does not abort the tick", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const { dir, storeFile } = resolveCredentialAccessBaselineStorePaths(paths);
+  // Directory trick (mirrors canary-manifest.test.js's/canary-baseline.test.js's own pattern):
+  // making the store path itself a directory forces a real, non-ENOENT fs.readFile failure
+  // regardless of the test runner's uid.
+  await fs.mkdir(storeFile, { recursive: true });
+  const result = await computeCredentialAccessCandidates(paths, {
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry()] } }),
+  });
+  assert.deepEqual(result, []);
+  assert.equal((await fs.stat(dir)).isDirectory(), true, "sanity: the state dir itself is untouched");
+});
+
+// ---------------------------------------------------------------------------------------------
+// [HIGH fix] bounded per-tick collection deadline + in-memory circuit breaker: a single hung
+// lstat pass must not stall every future daemon tick.
+// ---------------------------------------------------------------------------------------------
+
+test("[HIGH fix] a hung collector is bounded by a per-tick deadline: computeCredentialAccessCandidates returns [] without waiting for it, and does not write the store", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  let writeCalled = false;
+  const start = Date.now();
+  const result = await computeCredentialAccessCandidates(paths, {
+    credentialCollectionDeadlineMs: 25,
+    credentialCollectionBreaker: createCredentialCollectionBreaker(), // isolated instance -- must not arm the module's shared default breaker
+    collectCredentialAccessEvidence: () => new Promise(() => {}), // never resolves
+    writeCredentialAccessBaselineStore: async () => { writeCalled = true; },
+  });
+  const elapsedMs = Date.now() - start;
+  assert.deepEqual(result, []);
+  assert.equal(writeCalled, false);
+  assert(elapsedMs < 2000, `expected collection to be bounded by its deadline, took ${elapsedMs}ms`);
+});
+
+test("[HIGH fix] a collector that resolves well within its deadline is unaffected by the deadline machinery", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const result = await computeCredentialAccessCandidates(paths, {
+    credentialCollectionDeadlineMs: 5000,
+    credentialCollectionBreaker: createCredentialCollectionBreaker(),
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
+  });
+  assert.deepEqual(result, [], "cold-start seed against an empty store -- no baseline to diff against yet");
+});
+
+test("[HIGH fix] in-memory circuit breaker: after a collection timeout, the next K ticks skip collection entirely (no new hung call, no new libuv thread leaked), then collection resumes", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const breaker = createCredentialCollectionBreaker();
+  let collectCalls = 0;
+  const hungCollector = () => { collectCalls += 1; return new Promise(() => {}); };
+
+  // Tick 1: the collector hangs -> the deadline trips -> the breaker arms for the next 2 ticks.
+  const first = await computeCredentialAccessCandidates(paths, {
+    credentialCollectionDeadlineMs: 25,
+    credentialCollectionBreakerTicks: 2,
+    credentialCollectionBreaker: breaker,
+    collectCredentialAccessEvidence: hungCollector,
+  });
+  assert.deepEqual(first, []);
+  assert.equal(collectCalls, 1);
+
+  // Ticks 2 and 3: the breaker is armed -> the collector is never even invoked.
+  const second = await computeCredentialAccessCandidates(paths, { credentialCollectionBreaker: breaker, collectCredentialAccessEvidence: hungCollector });
+  assert.deepEqual(second, []);
+  assert.equal(collectCalls, 1, "the breaker must skip collection entirely, not re-race a fresh hang");
+
+  const third = await computeCredentialAccessCandidates(paths, { credentialCollectionBreaker: breaker, collectCredentialAccessEvidence: hungCollector });
+  assert.deepEqual(third, []);
+  assert.equal(collectCalls, 1);
+
+  // Tick 4: the breaker has cleared -> collection resumes normally.
+  const fourth = await computeCredentialAccessCandidates(paths, {
+    credentialCollectionBreaker: breaker,
+    collectCredentialAccessEvidence: async () => { collectCalls += 1; return { status: "ok", result: { entries: [okEntry()] } }; },
+  });
+  assert.equal(collectCalls, 2);
+  assert.deepEqual(fourth, []);
 });
 
 // ---------------------------------------------------------------------------------------------

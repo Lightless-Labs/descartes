@@ -215,6 +215,61 @@ export function buildCredentialAccessCandidates(entries = []) {
   });
 }
 
+const CREDENTIAL_COLLECTION_TIMED_OUT = Symbol("credential-collection-timed-out");
+
+export const DEFAULT_CREDENTIAL_COLLECTION_DEADLINE_MS = 5_000;
+export const DEFAULT_CREDENTIAL_COLLECTION_BREAKER_TICKS = 5;
+
+/**
+ * [HIGH fix, no-lstat-deadline] Bounded per-tick deadline, mirroring daemon.js's own
+ * `withDeadline` discipline for the structural tick: `Promise.race` against a timer -- the
+ * original promise is left to settle on its own (never awaited further here), so this bounds how
+ * long `computeCredentialAccessCandidates` itself can stall the daemon tick, NOT how long the
+ * underlying sequential `lstat` loop keeps running in the background. All 8 v1 paths live under
+ * `$HOME`, so a single hung mount can still leave up to 8 libuv threadpool threads (default pool
+ * size 4) occupied regardless of this race -- see the circuit breaker below for the companion
+ * mitigation that stops a PERSISTENTLY hung mount from compounding that leak tick over tick. Full
+ * elimination needs out-of-process/threadpool-isolated collection (deferred-architectural).
+ */
+async function withCredentialCollectionDeadline(promise, deadlineMs) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(CREDENTIAL_COLLECTION_TIMED_OUT), deadlineMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * [HIGH fix, no-lstat-deadline] In-memory-only circuit breaker -- never persisted, resets on
+ * daemon restart, which is fine: its sole job is to bound concurrent in-flight collection
+ * attempts within a single process's lifetime. After `onTimeout(ticks)` arms it, `shouldSkip()`
+ * returns `true` for the next `ticks` calls to `onSkippedTick()`, so a persistently-hung mount is
+ * not re-raced (and does not leak yet more libuv threadpool threads) on every single tick.
+ * Exported as a factory so callers/tests can inject an isolated instance instead of sharing this
+ * module's own default singleton (`defaultCredentialCollectionBreaker` below), which every real
+ * daemon tick uses unless a caller overrides it via `options.credentialCollectionBreaker`.
+ */
+export function createCredentialCollectionBreaker() {
+  let skipRemaining = 0;
+  return {
+    shouldSkip() {
+      return skipRemaining > 0;
+    },
+    onTimeout(ticks) {
+      skipRemaining = Number.isFinite(ticks) && ticks > 0 ? ticks : 0;
+    },
+    onSkippedTick() {
+      skipRemaining = Math.max(0, skipRemaining - 1);
+    },
+  };
+}
+
+const defaultCredentialCollectionBreaker = createCredentialCollectionBreaker();
+
 /**
  * `loadLearnedConfig(...).enabled` short-circuit BEFORE any I/O, matching every sibling
  * `computeX...Candidates`. Performs its OWN single `lstat` pass (no `defaultDaemonProfile`/
@@ -229,19 +284,53 @@ export async function computeCredentialAccessCandidates(descartesPaths, options 
   const learnedConfig = await loadConfig(descartesPaths);
   if (!learnedConfig.enabled) return [];
 
+  // [HIGH fix] Circuit breaker check BEFORE any collection I/O -- see createCredentialCollection
+  // Breaker's own header comment.
+  const breaker = options.credentialCollectionBreaker ?? defaultCredentialCollectionBreaker;
+  if (breaker.shouldSkip()) {
+    breaker.onSkippedTick();
+    return [];
+  }
+
   const collectEvidence = options.collectCredentialAccessEvidence ?? collectCredentialAccessEvidence;
-  const envelope = await collectEvidence(options.collectorOptions ?? {});
+  const deadlineMs = options.credentialCollectionDeadlineMs ?? DEFAULT_CREDENTIAL_COLLECTION_DEADLINE_MS;
+  const envelope = await withCredentialCollectionDeadline(collectEvidence(options.collectorOptions ?? {}), deadlineMs);
+  if (envelope === CREDENTIAL_COLLECTION_TIMED_OUT) {
+    const breakerTicks = options.credentialCollectionBreakerTicks ?? DEFAULT_CREDENTIAL_COLLECTION_BREAKER_TICKS;
+    breaker.onTimeout(breakerTicks);
+    return [];
+  }
   const latestSnapshot = isValidCredentialSnapshotEnvelope(envelope) ? envelope.result.entries : [];
 
+  // [BLOCKER fix, store-I/O-discards-a-positive-finding] Store I/O failure must degrade only THIS
+  // detector, never abort the shared daemon tick (daemon.js's mainExtraCandidates has no
+  // per-detector catch of its own for a throw that escapes this function) -- mirrors
+  // canary-baseline.js's own baseline-store discipline (computeCanaryBaselineCandidates).
   const loadStore = options.loadCredentialAccessBaselineStore ?? loadCredentialAccessBaselineStore;
-  const { entries: previousEntries } = await loadStore(descartesPaths);
+  let previousEntries;
+  try {
+    ({ entries: previousEntries } = await loadStore(descartesPaths));
+  } catch {
+    // A genuinely unreadable store (EACCES/EISDIR/any non-ENOENT fs error) leaves no trustworthy
+    // baseline to diff against this tick. Do NOT substitute an empty baseline and then write --
+    // that would clobber the real last-known-good baseline and lose the very change being
+    // tracked (the exact hazard canary-baseline.js's own load-failure handling documents). Skip
+    // the whole tick instead: no comparison, no write, no fabricated finding.
+    return [];
+  }
 
   const { findings, nextEntries } = detectCredentialAccess(previousEntries, latestSnapshot, options);
 
+  // The positive finding above is already computed -- a store-write failure must not discard it.
   const writeStore = options.writeCredentialAccessBaselineStore ?? writeCredentialAccessBaselineStore;
-  await writeStore(descartesPaths, { entries: nextEntries });
+  try {
+    await writeStore(descartesPaths, { entries: nextEntries });
+  } catch {
+    // Degrade the store advance only; the alert below still fires regardless. The stable
+    // alertId dedup absorbs the re-fire once the store becomes writable again.
+  }
 
   // Positive direct evidence (see the module-header GATE DECISION) — emitted unconditionally,
-  // never suppressed by any completeness/cold-start lockout.
+  // never suppressed by any completeness/cold-start lockout or a failed store I/O step.
   return buildCredentialAccessCandidates(findings);
 }
