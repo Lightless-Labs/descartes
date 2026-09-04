@@ -340,11 +340,14 @@ export async function computeContainmentRecommendationCandidates(descartesPaths,
     alerts: options.alerts,
     notification_due_ids: options.notification_due_ids,
   };
-  const dueIds = new Set(evaluation?.notification_due_ids ?? []);
-  const alerts = evaluation?.alerts ?? [];
+  // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array notification_due_ids/alerts (a
+  // corrupt/foreign evaluation shape) must degrade to "nothing due"/"no alerts" -- not throw
+  // ("is not iterable") out of `new Set(...)` or the for-of loop below and abort the daemon tick.
+  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
+  const alerts = Array.isArray(evaluation?.alerts) ? evaluation.alerts : [];
 
   const candidates = [];
-  for (const alert of alerts ?? []) {
+  for (const alert of alerts) {
     if (alert?.status !== RECOMMENDATION_TRIGGER_STATUS || !dueIds.has(alert?.id)) continue;
     const recommendation = mapAlertToRecommendation(alert);
     if (!recommendation) continue;

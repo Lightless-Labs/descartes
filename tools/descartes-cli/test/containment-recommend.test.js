@@ -351,3 +351,29 @@ test("computeContainmentRecommendationCandidates: a garbled trigger (unrecognize
   });
   assert.deepEqual(candidates, []);
 });
+
+// daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a corrupt/foreign evaluation shape (a
+// non-array notification_due_ids/alerts) must degrade to zero candidates, never throw out of this
+// function and abort the daemon tick.
+
+test("computeContainmentRecommendationCandidates: object-typed notification_due_ids degrades to zero candidates rather than throwing", async () => {
+  const paths = await tempPaths();
+  const candidates = await computeContainmentRecommendationCandidates(paths, {
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readContainmentRecommendConfig: async () => ({ enabled: true }),
+    alerts: [activeCanaryTrippedAlert()],
+    notification_due_ids: { corrupt: "shape" },
+  });
+  assert.deepEqual(candidates, []);
+});
+
+test("computeContainmentRecommendationCandidates: object-typed alerts degrades to zero candidates rather than throwing", async () => {
+  const paths = await tempPaths();
+  const candidates = await computeContainmentRecommendationCandidates(paths, {
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readContainmentRecommendConfig: async () => ({ enabled: true }),
+    alerts: { corrupt: "shape" },
+    notification_due_ids: [],
+  });
+  assert.deepEqual(candidates, []);
+});

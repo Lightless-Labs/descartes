@@ -314,7 +314,12 @@ function auditRecordIsCritical(record) {
 function isWithinTrailingHour(recordTs, now, windowMs) {
   const nowMs = new Date(now).getTime();
   const tsMs = new Date(recordTs).getTime();
-  return Number.isFinite(tsMs) && nowMs - tsMs >= 0 && nowMs - tsMs < windowMs;
+  if (!Number.isFinite(tsMs)) return false;
+  // daybreak-blue #3 (HIGH) point 4: a future-dated record (the local clock stepped back, or a
+  // stray future ts) is CLAMPED into the trailing-hour window rather than excluded -- excluding it
+  // would under-count the budget (fail-open: admits an extra call). Only records genuinely older
+  // than windowMs are excluded.
+  return nowMs - tsMs < windowMs;
 }
 
 // S13 must-fix 2: partitions the trailing-hour audit history into per-class counts. These seed
@@ -325,11 +330,81 @@ function partitionRecentAuditCounts(records, now, windowMs = 60 * 60 * 1000) {
   let critical = 0;
   let nonCritical = 0;
   for (const record of records) {
+    // daybreak-blue #3 (HIGH) point 3: a successfully-PARSED record with a non-finite ts (e.g.
+    // `{"ts":"invalid",...}`) cannot be dated, so it cannot be aged out either -- count it as ONE
+    // in-window non-critical call rather than silently dropping it. Dropping it under-counts the
+    // trailing-hour budget (fail-open: admits an extra call), same failure mode as an unparseable
+    // line would cause if ignored outright. "non-critical" matches this file's existing conservative
+    // default for calls whose real class cannot be determined (see auditRecordIsCritical's own doc
+    // comment, just above).
+    if (!Number.isFinite(new Date(record?.ts).getTime())) {
+      nonCritical += 1;
+      continue;
+    }
     if (!isWithinTrailingHour(record.ts, now, windowMs)) continue;
     if (auditRecordIsCritical(record)) critical += 1;
     else nonCritical += 1;
   }
   return { critical, nonCritical };
+}
+
+// daybreak-blue #3 (HIGH) points 1-2: a STRICT, budget-local variant of readAuditRecords, used ONLY
+// to seed the trailing-hour budget counters in adjudicateAlertNotifications below. readAuditRecords
+// itself (and its export readAlertIntelligenceAudit) stay UNCHANGED -- calibration.js/tuning-store.js
+// rely on their tolerant "silently ignore corrupt lines" behavior for reporting, and this file's own
+// tests pin that tolerance.
+//
+// For the BUDGET seed, silently ignoring an unparseable line is a fail-open bug: the invariant this
+// gate exists to protect is "total LLM calls (trailing hour + this invocation) <= max_calls_per_hour"
+// -- an unparseable line that is quietly dropped is an unaccounted-for historical call, which can let
+// this tick over-admit.
+//
+// Policy: an unparseable line counts toward the budget IFF the nearest parseable record AFTER it (or
+// EOF, if none exists) is within the trailing-hour window. appendAuditRecord below always writes
+// `ts: now` and the file is append-ordered (monotonic ts) and never rotated/truncated by this
+// process, so a corrupt line is bounded by its neighbours:
+//   - a corrupt line followed by an OLD, out-of-window parseable record ages out (the corruption
+//     itself is old) -- this must NEVER count every corrupt line forever, since the file is never
+//     rotated and that would permanently wedge adjudication;
+//   - a corrupt line with NO following record (the last line in the file -- exactly what a write
+//     interrupted mid-append, e.g. by a crash, produces) fails closed and always counts, since a
+//     fresh truncation is exactly the case this policy must not silently ignore.
+// This must also NEVER "skip the tick outright on any corrupt line" -- that permanently wedges
+// adjudication into audit_unavailable just as badly as under-counting wedges it open.
+async function readBudgetAuditRecordsStrict(descartesPaths, now) {
+  const { auditFile } = resolveAlertIntelligencePaths(descartesPaths);
+  let contents;
+  try {
+    contents = await fs.readFile(auditFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const lines = contents.split("\n").filter((line) => line.trim());
+  const parsedByIndex = lines.map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      return undefined; // unparseable -- position preserved, bounded below
+    }
+  });
+  const records = [];
+  for (let index = 0; index < parsedByIndex.length; index += 1) {
+    const parsed = parsedByIndex[index];
+    if (parsed !== undefined) {
+      records.push(parsed);
+      continue;
+    }
+    let boundTs = now; // EOF (no following parseable record) -- fails closed, always counts.
+    for (let lookahead = index + 1; lookahead < parsedByIndex.length; lookahead += 1) {
+      if (parsedByIndex[lookahead] !== undefined) {
+        boundTs = parsedByIndex[lookahead].ts;
+        break;
+      }
+    }
+    records.push({ ts: boundTs, corrupt_line: true });
+  }
+  return records;
 }
 
 const BUDGET_EXHAUSTED_RULE_ID = "adjudication.budget_exhausted";
@@ -396,7 +471,10 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
 //     raw/unsanitized) — see buildSessionAlertNotificationDecision's service.disappeared branch
 //     below for the full rationale. session.*/peer.* bodies are unaffected by this exception.
 export async function emitSessionAlertSignals(descartesPaths, evaluation, options = {}) {
-  const dueIds = new Set(evaluation?.notification_due_ids ?? []);
+  // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array `notification_due_ids` (a
+  // corrupt/foreign evaluation shape) must degrade to "nothing due", not throw ("is not iterable")
+  // out of `new Set(...)` and abort the caller's tick.
+  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
   if (dueIds.size === 0) return { fired: [] };
 
   // Slice 4b Decision 3b (Fable review MUST-FIX 4): scoped to the LOCALLY-composed allowlist
@@ -404,12 +482,27 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   // SERVICE_DISAPPEARED_RULE_ID -- see ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS above), never the
   // general unknown-namespace bypass — a due metric/other alert never reaches this branch just
   // because it also happens to classify as unknown_namespace.
-  const dueSessionAlerts = (evaluation.alerts ?? []).filter(
+  //
+  // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array `evaluation.alerts` likewise
+  // degrades to `[]` rather than throwing ("...filter is not a function") on a corrupt/foreign shape.
+  const dueSessionAlerts = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).filter(
     (alert) => dueIds.has(alert.id) && ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
   );
   if (dueSessionAlerts.length === 0) return { fired: [] };
 
-  const deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
+  let deliverNotification;
+  try {
+    // daybreak-blue #7 (MEDIUM) point 1: this dynamic import is an unguarded await on the
+    // production path (it only runs when the DI seam, options.deliverNotification, is absent). A
+    // module-load failure (e.g. EIO/EACCES reading an uncached module file) must DEGRADE this one
+    // alert family (log + report every due alert as failed), never abort the whole daemon tick --
+    // mirrors the `dependencies_unavailable` pattern in adjudicateAlertNotifications below.
+    deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`descartes: emitSessionAlertSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due session-family alerts reported failed`);
+    return { fired: [], failed: dueSessionAlerts.map((dueAlert) => dueAlert.id) };
+  }
   const now = options.now ?? new Date().toISOString();
 
   // Reliability fix (canary v0 finalization, FIX-B): this loop was previously a bare, unguarded
@@ -431,8 +524,19 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   for (const alert of dueSessionAlerts) {
     const decision = buildSessionAlertNotificationDecision(alert);
     try {
-      await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
-      fired.push(alert.id);
+      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
+      // daybreak-blue #6 (MEDIUM): deliverNotificationDecision RESOLVES (it never throws) with a
+      // status enum -- "error"/"unavailable" mean the notification did NOT reach the operator, and
+      // must not be reported as fired. Every other resolved status ("recorded"/"delivered"/
+      // "skipped"/"disabled"/"cli_only", or a bare `undefined` from an older/simpler fake) is an
+      // intentional non-failure outcome -- "disabled"/"cli_only" are config states, not failures --
+      // and stays `fired`, matching this function's pre-existing "only a throw means failed"
+      // contract for those.
+      if (delivery?.status === "error" || delivery?.status === "unavailable") {
+        failed.push(alert.id);
+      } else {
+        fired.push(alert.id);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
@@ -1048,7 +1152,10 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
 
   let audit;
   try {
-    audit = await readAuditRecords(descartesPaths);
+    // daybreak-blue #3 (HIGH): the budget seed uses the STRICT, budget-local read
+    // (readBudgetAuditRecordsStrict, defined above) -- never the tolerant readAuditRecords used
+    // elsewhere in this file. See that function's own doc comment for the full corrupt-line policy.
+    audit = await readBudgetAuditRecordsStrict(descartesPaths, now);
   } catch (error) {
     console.warn(`descartes: alert intelligence audit read failed (${errorLabel(error)}); skipping adjudication this tick (budget cannot be computed)`);
     return { status: "audit_unavailable", decisions: [], excluded };

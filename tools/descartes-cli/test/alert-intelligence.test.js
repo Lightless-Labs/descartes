@@ -553,6 +553,100 @@ test("a non-critical alert is refused once non_critical_so_far reaches max - res
   assert.equal(result.dropped_total, 1);
 });
 
+// --- daybreak-blue #3 (HIGH): corrupt/invalid-ts audit records must fail CLOSED (never under-count
+// the trailing-hour budget) -------------------------------------------------------------------
+
+test("budget fail-closed: a parsed historical record with a non-finite ts counts as one in-window non-critical call", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-04T00:00:00.000Z" });
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(path.dirname(auditFile), { recursive: true });
+  // Parseable JSON, but `ts` itself does not parse to a valid Date -- this is a distinct case from
+  // an unparseable LINE (below): the record parses fine, only its ts field is garbage.
+  await fs.appendFile(auditFile, `${JSON.stringify({ ts: "invalid", status: "ok", alert_severity: "critical" })}\n`);
+
+  const prompts = [];
+  const dueAlert = alert({ id: "alert_after_bad_ts", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [dueAlert],
+    notification_due_ids: [dueAlert.id],
+  }, {
+    now: "2026-09-04T00:01:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+  });
+  assert.equal(prompts.length, 0, "the non-finite-ts historical record must count toward the budget, admitting zero new calls");
+  assert.notEqual(result.status, "ok");
+  assert.equal(result.dropped_total, 1);
+});
+
+test("budget fail-closed: a truncated/corrupt FINAL audit line (no following record to bound it) counts toward the budget", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-04T01:00:00.000Z" });
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(path.dirname(auditFile), { recursive: true });
+  // Simulates a write interrupted mid-JSON (e.g. a crash during appendFile): unparseable, and the
+  // LAST line in the file -- no following parseable record exists to bound it against, so this is
+  // the "fresh truncation" EOF case, which must fail closed and always count.
+  await fs.appendFile(auditFile, `{"ts":"2026-09-04T00:59:`);
+
+  const prompts = [];
+  const dueAlert = alert({ id: "alert_after_truncated_line", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [dueAlert],
+    notification_due_ids: [dueAlert.id],
+  }, {
+    now: "2026-09-04T01:00:30.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+  });
+  assert.equal(prompts.length, 0, "a truncated final audit line must fail closed and count toward the budget");
+  assert.notEqual(result.status, "ok");
+  assert.equal(result.dropped_total, 1);
+});
+
+test("budget fail-closed: a corrupt audit line bounded by an OLD (out-of-window) following record ages out, never wedging the budget forever", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-04T03:00:00.000Z" });
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(path.dirname(auditFile), { recursive: true });
+  // A corrupt line followed by a real, PARSEABLE record whose ts is over an hour old -- the corrupt
+  // line is bounded by an old neighbour and must age out (the audit file is never rotated, so
+  // permanently counting every corrupt line would wedge adjudication shut forever).
+  await fs.appendFile(auditFile, `not valid json at all\n${JSON.stringify({ ts: "2026-09-04T01:00:00.000Z", status: "ok", alert_severity: "warning" })}\n`);
+
+  const prompts = [];
+  const dueAlert = alert({ id: "alert_after_aged_corrupt_line", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [dueAlert],
+    notification_due_ids: [dueAlert.id],
+  }, {
+    now: "2026-09-04T03:00:10.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+  });
+  assert.equal(prompts.length, 1, "an old, out-of-window neighbour must let the corrupt line age out rather than permanently blocking the budget");
+  assert.equal(result.status, "ok");
+});
+
+test("budget fail-closed: a future-dated historical record (clock stepped back) is clamped into the trailing-hour budget, not skipped", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-04T04:00:00.000Z" });
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(path.dirname(auditFile), { recursive: true });
+  // A record dated in the FUTURE relative to the `now` used below (clock stepped back between ticks).
+  await fs.appendFile(auditFile, `${JSON.stringify({ ts: "2026-09-04T04:05:00.000Z", status: "ok", alert_severity: "warning" })}\n`);
+
+  const prompts = [];
+  const dueAlert = alert({ id: "alert_after_future_ts", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [dueAlert],
+    notification_due_ids: [dueAlert.id],
+  }, {
+    now: "2026-09-04T04:00:01.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+  });
+  assert.equal(prompts.length, 0, "a future-dated record must count toward the budget rather than being silently skipped");
+  assert.notEqual(result.status, "ok");
+});
+
 // --- S13 must-fix 3: deterministic budget_exhausted signal -------------------------------------
 
 test("budget_exhausted fires once per invocation with a counts-only body (no dropped title/diagnostics)", async () => {
@@ -1279,6 +1373,84 @@ test("emitSessionAlertSignals: a throwing deliverNotification (I/O failure) DEGR
   assert.deepEqual(result.failed, [tamperedAlert.id]);
   assert.equal(deliveries.length, 1, "the later due alert must still be delivered despite the earlier throw");
   assert.equal(deliveries[0].ruleId, SESSION_COUNT_DROP_RULE_ID);
+});
+
+// --- daybreak-blue #6 (MEDIUM): a RESOLVED (non-throwing) failed delivery must not be reported as
+// fired -------------------------------------------------------------------------------------------
+
+test("a resolved delivery with status 'error' is reported as failed, not fired", async () => {
+  const paths = await tempPaths();
+  const current = alert({
+    id: "alert_session_count_drop_err",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { notification_due_ids: [current.id], alerts: [current] }, {
+    now: "2026-09-04T00:00:00.000Z",
+    deliverNotification: async () => ({ status: "error" }),
+  });
+  assert.deepEqual(result.fired, []);
+  assert.deepEqual(result.failed, [current.id]);
+});
+
+test("a resolved delivery with status 'unavailable' is reported as failed, not fired", async () => {
+  const paths = await tempPaths();
+  const current = alert({
+    id: "alert_session_count_drop_unavail",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { notification_due_ids: [current.id], alerts: [current] }, {
+    now: "2026-09-04T00:00:00.000Z",
+    deliverNotification: async () => ({ status: "unavailable" }),
+  });
+  assert.deepEqual(result.fired, []);
+  assert.deepEqual(result.failed, [current.id]);
+});
+
+test("resolved delivery statuses undefined/recorded/delivered/skipped/disabled/cli_only all remain fired (non-regression)", async () => {
+  const paths = await tempPaths();
+  const statuses = [undefined, "recorded", "delivered", "skipped", "disabled", "cli_only"];
+  for (const status of statuses) {
+    const current = alert({
+      id: `alert_status_${String(status)}`,
+      rule_id: SESSION_COUNT_DROP_RULE_ID,
+      severity: "warning",
+      diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" },
+    });
+    const result = await emitSessionAlertSignals(paths, { notification_due_ids: [current.id], alerts: [current] }, {
+      now: "2026-09-04T00:00:00.000Z",
+      deliverNotification: async () => (status === undefined ? undefined : { status }),
+    });
+    assert.deepEqual(result.fired, [current.id], `status ${status} must stay fired`);
+    assert.deepEqual(result.failed, [], `status ${status} must not be reported as failed`);
+  }
+});
+
+// --- daybreak-blue #7 (MEDIUM): tick-survival -- one alert-family failure degrades, never aborts --
+
+test("emitSessionAlertSignals: object-typed notification_due_ids degrades to fired:[] rather than throwing (tick survives)", async () => {
+  const paths = await tempPaths();
+  const current = alert({
+    id: "alert_session_count_drop_shape",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: "warning",
+    diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" },
+  });
+  const result = await emitSessionAlertSignals(paths, { notification_due_ids: { corrupt: "shape" }, alerts: [current] }, {
+    now: "2026-09-04T00:00:00.000Z",
+  });
+  assert.deepEqual(result, { fired: [] });
+});
+
+test("emitSessionAlertSignals: object-typed alerts degrades to fired:[] rather than throwing (tick survives)", async () => {
+  const paths = await tempPaths();
+  const result = await emitSessionAlertSignals(paths, { notification_due_ids: ["alert_x"], alerts: { corrupt: "shape" } }, {
+    now: "2026-09-04T00:00:00.000Z",
+  });
+  assert.deepEqual(result, { fired: [] });
 });
 
 test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS matches the two session rule_ids exactly, both classifying to unknown_namespace", () => {
