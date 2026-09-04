@@ -777,6 +777,89 @@ function buildSessionAlertNotificationDecision(alert) {
   return { notify: true, severity: "warning", title: "Descartes: session alert", body: `rule_id=${alert?.rule_id}` };
 }
 
+// Fix for: "core resource alerts depend on the model route" — daemon./system./disk. classify as
+// namespace "metric" (classifyAlertNamespace) and are therefore structurally excluded from
+// emitSessionAlertSignals' ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS allowlist; their only other
+// delivery path, adjudicateAlertNotifications, returns { status: "disabled", decisions: [] }
+// immediately whenever alert-intelligence.json's `enabled` is false (the DEFAULT state) — so these
+// alerts never notify unless the operator also opts into the LLM. This function is a deterministic,
+// non-LLM fallback that fires ONLY when alert-intelligence is not enabled at all, so the moment a
+// user opts in (config.enabled:true), behavior for "metric" is 100% unchanged from today: the LLM
+// still governs whether/how to notify, still respects enabled_namespaces (including an explicit
+// `disable-namespace metric`), still respects the rate-limit/critical-reservation budget. This
+// function never calls an LLM, never creates a session, and its notification body is built purely
+// from the alert's own already-normalized, non-LLM title/summary (alert-store.js normalizeAlertRecord,
+// same fields `descartes alerts list` already prints) — no new text-generation or sanitization surface.
+//
+// Deliberately a NEW sibling function, never a widening of ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS
+// or of emitSessionAlertSignals itself — that allowlist and its "never delivered by this branch"
+// contract (see the fixed test suite above) stay exactly as composed.
+export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation, options = {}) {
+  const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
+  // Core gate: fires ONLY when the LLM route is off entirely. An operator who has opted in keeps
+  // today's exact behavior, INCLUDING an explicit `disable-namespace metric` (which must still
+  // suppress delivery — this fallback must not silently reintroduce delivery a consenting operator
+  // deliberately turned off for that specific namespace while intelligence itself stays on).
+  //
+  // `config.enabled` alone is NOT a sufficient gate here: readAlertIntelligenceConfig degrades to
+  // `enabled:false` (plus an additive `unavailable`/`corrupt` marker -- see that function's own
+  // doc comment) on a transient read/parse failure of an alert-intelligence.json that may genuinely
+  // hold `enabled:true` + `disable-namespace metric` on disk. Treating that degraded read as "the
+  // LLM route is off" would let this fallback silently reintroduce delivery for a namespace a
+  // consenting operator explicitly opted out of, for the duration of the fault. Fail closed
+  // (deliver nothing) on an unreadable/corrupt config instead -- symmetric with how
+  // adjudicateAlertNotifications itself already treats these markers (config.enabled stays false,
+  // so it also short-circuits to zero LLM calls; neither path fires while the config is unreadable).
+  if (config.enabled || config.unavailable || config.corrupt) {
+    return { fired: [], skipped: config.enabled ? "intelligence_enabled" : "intelligence_config_unavailable" };
+  }
+
+  // daybreak-blue #7 (MEDIUM) point 2 precedent, applied here too: a corrupt/foreign evaluation
+  // shape degrades to "nothing due", not a throw that aborts the caller's tick.
+  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
+  if (dueIds.size === 0) return { fired: [] };
+
+  const dueMetricAlerts = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).filter((alert) => {
+    if (!dueIds.has(alert.id)) return false;
+    const { namespace, hardExcluded } = classifyAlertNamespace(alert?.rule_id);
+    return !hardExcluded && namespace === "metric";
+  });
+  if (dueMetricAlerts.length === 0) return { fired: [] };
+
+  let deliverNotification;
+  try {
+    deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`descartes: emitMetricAlertFallbackSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due metric-family alerts reported failed`);
+    return { fired: [], failed: dueMetricAlerts.map((a) => a.id) };
+  }
+  const now = options.now ?? new Date().toISOString();
+
+  // Same "one alert's delivery failure must degrade, never abort the tick" discipline as
+  // emitSessionAlertSignals' own FIX-B loop above.
+  const fired = [];
+  const failed = [];
+  for (const alert of dueMetricAlerts) {
+    const decision = {
+      notify: true,
+      severity: alert.severity === "critical" ? "critical" : "warning",
+      title: alert.title,
+      body: alert.summary || alert.title,
+    };
+    try {
+      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
+      if (delivery?.status === "error" || delivery?.status === "unavailable") failed.push(alert.id);
+      else fired.push(alert.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
+      failed.push(alert.id);
+    }
+  }
+  return { fired, failed };
+}
+
 // Slice 6 (observed-incident collectors plan) Decision 3, must-fix 3/1, defense-in-depth: re-runs
 // sanitizeDiagnostics() on stored diagnostics immediately before they reach the prompt, rather
 // than trusting the candidate builder's own write-time sanitization alone. Module-wide (every

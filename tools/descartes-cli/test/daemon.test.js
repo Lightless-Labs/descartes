@@ -935,6 +935,35 @@ test("S7a wiring: with zero shadow constraints, a structural tick produces no sh
   await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
 });
 
+// Finding F2-Tier1: the configured learned-config fact_store_max_bytes must reach the live
+// appendFactPoints call site as options.maxBytes, so an operator has an actual lever to stop
+// routine bytecap eviction (previously hardcoded to fact-store.js's DEFAULT_FACT_MAX_BYTES with
+// no override surface at all).
+test("structural fact-persist threads learned-config fact_store_max_bytes into appendFactPoints as options.maxBytes", async () => {
+  const paths = await tempPaths();
+  const seenOptions = [];
+  const spyAppendFactPoints = async (spyPaths, points, options) => {
+    seenOptions.push(options);
+    return appendFactPointsAndCommit(spyPaths, points, options);
+  };
+
+  await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456 }),
+    appendFactPoints: spyAppendFactPoints,
+  });
+
+  assert.equal(seenOptions.length, 1);
+  assert.equal(seenOptions[0].maxBytes, 123456);
+});
+
 test("S7a wiring: with one shadow constraint and a matching fact, exactly one shadow-violations.jsonl record is appended per structural tick", async () => {
   const paths = await tempPaths();
   await writeConstraints(paths, [shadowConstraintFixture()]);
@@ -2316,6 +2345,104 @@ test("Slice 4, Decision 2b: deliverSessionAlerts:false opts the daemon tick out 
   // The candidate is still persisted (visible via `descartes alerts`) -- only active delivery is skipped.
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.ok(alert);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Finding F6: core resource ("metric" namespace: daemon./system./disk.) alerts must deliver
+// deterministically when notification delivery is enabled, regardless of the separate
+// alert-intelligence (LLM) opt-in — mirrors the Slice 4 session.*/peer.* deterministic-delivery
+// wiring immediately above, via the new sibling emitMetricAlertFallbackSignals branch.
+// ---------------------------------------------------------------------------------------------
+
+function highMemoryCollectors() {
+  return {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0, 0, 0],
+      uptime_seconds: 1,
+      memory: { used_fraction: 0.95, free_bytes: 1 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+}
+
+test("F6: a due system.memory.sustained_high is delivered through the deterministic metric-alert fallback when alert-intelligence is at its default (disabled) state", async () => {
+  const paths = await tempPaths();
+  const profile = slice6Profile();
+  const collectors = highMemoryCollectors();
+  const deliveries = [];
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; };
+
+  // Two sustained high-memory ticks are required for system.memory.sustained_high to fire (see
+  // alert-store.js's thresholds.minSustainedSamples, and the identical rationale at the S-live-1
+  // "fixed-rule alert and an active-constraint alert coexist" test above).
+  await runDaemonIteration(paths, { profile, collectors, ts: "2026-05-24T00:00:00.000Z", now: "2026-05-24T00:00:00.000Z", deliverNotification });
+  const result = await runDaemonIteration(paths, { profile, collectors, ts: "2026-05-24T00:01:00.000Z", now: "2026-05-24T00:01:00.000Z", deliverNotification });
+
+  const memoryAlert = result.alerts.alerts.find((a) => a.rule_id === "system.memory.sustained_high");
+  assert.ok(memoryAlert, "expected system.memory.sustained_high to be active after 2 sustained high-memory samples");
+
+  const memoryDeliveries = deliveries.filter((entry) => entry.opts.ruleId === "system.memory.sustained_high");
+  assert.equal(memoryDeliveries.length, 1, "expected exactly one deterministic delivery for the due metric alert");
+  assert.equal(memoryDeliveries[0].decision.notify, true);
+
+  // Simultaneously: alert-intelligence (the LLM route) is untouched and reports its own default
+  // "disabled" status — proving delivery happened WITHOUT the LLM opt-in, the literal F6 repro.
+  assert.equal(result.alertIntelligence.status, "disabled");
+  assert.ok(result.metricAlertFallback, "expected a metricAlertFallback result on the daemon iteration");
+});
+
+test("F6: an operator who has opted into alert-intelligence keeps the LLM's exclusive judgment — the fallback does not also deliver a raw notification when the (fake) LLM route returns notify:false", async () => {
+  const paths = await tempPaths();
+  const profile = slice6Profile();
+  const collectors = highMemoryCollectors();
+  const deliveries = [];
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; };
+  // Fake adjudicateAlertNotifications standing in for a real LLM call that judged this alert
+  // not worth notifying — the DI seam already used by the "S13 I/O hardening" tests above.
+  const adjudicateAlertNotificationsFake = async (descartesPaths, evaluation, options) => ({
+    status: "ok",
+    decisions: (evaluation.alerts ?? [])
+      .filter((a) => (evaluation.notification_due_ids ?? []).includes(a.id))
+      .map((a) => ({ alert_id: a.id, notify: false })),
+  });
+
+  await runDaemonIteration(paths, {
+    profile, collectors, ts: "2026-05-24T00:00:00.000Z", now: "2026-05-24T00:00:00.000Z",
+    deliverNotification,
+    alertIntelligenceConfig: { enabled: true },
+    adjudicateAlertNotifications: adjudicateAlertNotificationsFake,
+  });
+  const result = await runDaemonIteration(paths, {
+    profile, collectors, ts: "2026-05-24T00:01:00.000Z", now: "2026-05-24T00:01:00.000Z",
+    deliverNotification,
+    alertIntelligenceConfig: { enabled: true },
+    adjudicateAlertNotifications: adjudicateAlertNotificationsFake,
+  });
+
+  const memoryAlert = result.alerts.alerts.find((a) => a.rule_id === "system.memory.sustained_high");
+  assert.ok(memoryAlert, "expected system.memory.sustained_high to be active after 2 sustained high-memory samples");
+
+  assert.deepEqual(result.metricAlertFallback, { fired: [], skipped: "intelligence_enabled" }, "the fallback must not run at all once alert-intelligence is enabled");
+  const memoryDeliveries = deliveries.filter((entry) => entry.opts.ruleId === "system.memory.sustained_high");
+  assert.equal(memoryDeliveries.length, 0, "no raw notification for this rule_id: the LLM's own notify:false decision governs, undisturbed by the fallback");
+});
+
+test("F6: options.deliverMetricAlertFallback === false opts the daemon tick out of the new branch entirely (no metricAlertFallback, no deliverNotification call for the metric alert)", async () => {
+  const paths = await tempPaths();
+  const profile = slice6Profile();
+  const collectors = highMemoryCollectors();
+  const deliveries = [];
+  const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
+
+  await runDaemonIteration(paths, { profile, collectors, ts: "2026-05-24T00:00:00.000Z", now: "2026-05-24T00:00:00.000Z", deliverNotification, deliverMetricAlertFallback: false });
+  const result = await runDaemonIteration(paths, { profile, collectors, ts: "2026-05-24T00:01:00.000Z", now: "2026-05-24T00:01:00.000Z", deliverNotification, deliverMetricAlertFallback: false });
+
+  const memoryAlert = result.alerts.alerts.find((a) => a.rule_id === "system.memory.sustained_high");
+  assert.ok(memoryAlert, "the candidate is still persisted — only active delivery is skipped");
+  assert.equal(result.metricAlertFallback, undefined);
+  assert.equal(deliveries.some((entry) => entry.ruleId === "system.memory.sustained_high"), false);
 });
 
 test("Slice 4: computeSessionBaselineCandidates candidate shape matches the existing extraCandidates sources (byte-identical structural key set)", async () => {

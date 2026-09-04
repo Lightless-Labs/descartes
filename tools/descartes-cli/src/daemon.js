@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import { adjudicateAlertNotifications, emitSessionAlertSignals } from "./alert-intelligence.js";
+import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { evaluateAndPersistAlerts } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
@@ -607,7 +607,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // the error message must survive to feed status.state/storage_write_error below.
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
             try {
-              structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts });
+              // Finding F2-Tier1: thread the operator-configurable learned-config
+              // fact_store_max_bytes (validated/fail-closed in constraint-store.js's
+              // normalizeLearnedConfig) into the live call site as options.maxBytes -- this is
+              // the only lever an operator has to stop routine bytecap eviction short of a code
+              // change. learnedConfig is already loaded and enabled-checked above in this same
+              // structural-tick block.
+              structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, maxBytes: learnedConfig.fact_store_max_bytes });
             } catch (error) {
               structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
               console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
@@ -806,11 +812,36 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         undefined,
       )
     : undefined;
+  // Finding F6: read alert-intelligence config ONCE and share it with both the new deterministic
+  // metric-alert fallback below AND the existing adjudicateAlertNotifications call, so the two
+  // branches' enablement checks are atomic within one tick (an operator flipping
+  // `alerts intelligence enable` mid-tick can otherwise, in principle, land between two independent
+  // file reads and cause one alert to be delivered twice in the same tick, worded differently).
+  // Gated on `alerts` (mainAlerts) being truthy, same as every consumer below -- when
+  // options.evaluateAlerts is false there is nothing to adjudicate/deliver this tick, so this must
+  // not add a config read that wasn't there before.
+  const alertIntelligenceConfig = alerts ? (options.alertIntelligenceConfig ?? await readAlertIntelligenceConfig(descartesPaths)) : undefined;
+  // Finding F6, additive: core resource ("metric" namespace: daemon./system./disk.) alerts have no
+  // non-LLM delivery path today — emitSessionAlertSignals' allowlist deliberately excludes them
+  // (see that function's own header comment), and adjudicateAlertNotifications (the LLM path)
+  // returns zero decisions whenever alert-intelligence is at its default (disabled) state. This
+  // sibling branch delivers those alerts deterministically whenever the LLM route is off, and gets
+  // completely out of the way (zero deliveries) the moment an operator opts into alert-intelligence
+  // — see emitMetricAlertFallbackSignals' own header comment for the full invariant-preservation
+  // rationale. Same DI-seam + safeCandidates discipline as sessionAlertDelivery immediately above.
+  const emitMetricFallback = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
+  const metricAlertFallback = alerts && options.deliverMetricAlertFallback !== false
+    ? await safeCandidates(
+        "metric-alert-fallback",
+        () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig }),
+        undefined,
+      )
+    : undefined;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
-    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts })
+    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig })
     : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, structuralEvidence, structuralFacts, shadowEvaluation };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

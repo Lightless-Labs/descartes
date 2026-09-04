@@ -12,6 +12,7 @@ import {
   adjudicateAlertNotifications,
   alertIntelligencePrompt,
   classifyAlertNamespace,
+  emitMetricAlertFallbackSignals,
   emitSessionAlertSignals,
   normalizeAlertIntelligenceConfig,
   normalizeAlertNotificationDecision,
@@ -1590,6 +1591,200 @@ test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS matches the two session rule_ids exa
   for (const ruleId of DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS) {
     assert.equal(classifyAlertNamespace(ruleId).namespace, undefined);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Finding F6: emitMetricAlertFallbackSignals — deterministic, non-LLM local delivery for the
+// "metric" namespace (daemon./system./disk.) so core resource alerts notify even when
+// alert-intelligence.json is at its default (disabled) state. Fires ONLY when config.enabled is
+// false; an operator who has opted into alert intelligence keeps today's exact LLM-adjudicated
+// behavior (including a per-namespace disable-namespace opt-out), since this branch never runs
+// once config.enabled is true.
+// ---------------------------------------------------------------------------------------------
+
+test("emitMetricAlertFallbackSignals delivers a due system.memory.sustained_high through deliverNotificationDecision, using the alert's own title/summary verbatim, when config.enabled is false", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const memoryAlert = alert({
+    id: "alert_memory",
+    rule_id: "system.memory.sustained_high",
+    severity: "critical",
+    title: "Sustained high memory pressure",
+    summary: "Memory used stayed at or above 95% for 3 samples.",
+  });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    config: { enabled: false },
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [memoryAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].opts.ruleId, "system.memory.sustained_high");
+  assert.equal(deliveries[0].opts.alertId, memoryAlert.id);
+  assert.equal(deliveries[0].decision.notify, true);
+  assert.equal(deliveries[0].decision.severity, "critical");
+  assert.equal(deliveries[0].decision.title, "Sustained high memory pressure");
+  assert.equal(deliveries[0].decision.body, "Memory used stayed at or above 95% for 3 samples.");
+});
+
+test("emitMetricAlertFallbackSignals delivers a due disk.space.high_used_fraction, severity mapped from alert.severity (non-critical -> warning)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const diskAlert = alert({
+    id: "alert_disk",
+    rule_id: "disk.space.high_used_fraction",
+    severity: "warning",
+    title: "High disk usage",
+    summary: "Disk / used_fraction 0.98 >= threshold 0.9.",
+  });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [diskAlert], notification_due_ids: [diskAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    config: { enabled: false },
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [diskAlert.id]);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.equal(deliveries[0].decision.title, "High disk usage");
+});
+
+test("emitMetricAlertFallbackSignals delivers a due daemon.status.not_ok", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const daemonAlert = alert({
+    id: "alert_daemon_status",
+    rule_id: "daemon.status.not_ok",
+    severity: "critical",
+    title: "Descartes daemon not ok",
+    summary: "The daemon reported status 'error'.",
+  });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [daemonAlert], notification_due_ids: [daemonAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    config: { enabled: false },
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [daemonAlert.id]);
+  assert.equal(deliveries[0].opts.ruleId, "daemon.status.not_ok");
+});
+
+test("emitMetricAlertFallbackSignals: config.enabled true -> { fired: [], skipped: 'intelligence_enabled' } and zero deliverNotification calls — the critical non-regression proving the opted-in LLM path is untouched", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "critical" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    config: { enabled: true },
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result, { fired: [], skipped: "intelligence_enabled" });
+  assert.equal(deliverCalled, false);
+});
+
+test("emitMetricAlertFallbackSignals: an unreadable/unavailable config (readAlertIntelligenceConfig's degrade-not-fabricate marker) fails CLOSED -- zero deliveries -- rather than treating the read failure as 'the LLM route is off'", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "critical" });
+  // Mirrors readAlertIntelligenceConfig's own non-ENOENT-read-failure shape: `enabled` is false
+  // only because the read failed, not because the operator disabled intelligence -- the config on
+  // disk may genuinely hold enabled:true + disable-namespace metric.
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    config: { enabled: false, unavailable: true },
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result, { fired: [], skipped: "intelligence_config_unavailable" });
+  assert.equal(deliverCalled, false);
+});
+
+test("emitMetricAlertFallbackSignals: a corrupt config (readAlertIntelligenceConfig's `corrupt` marker) likewise fails CLOSED -- zero deliveries", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "critical" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    config: { enabled: false, corrupt: true },
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result, { fired: [], skipped: "intelligence_config_unavailable" });
+  assert.equal(deliverCalled, false);
+});
+
+test("emitMetricAlertFallbackSignals fires ONLY for metric-namespace rule_ids — a due session.count_drop / canary.tripped alert mixed into the same due-set is never delivered by this function", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const sessionAlert = alert({ id: "alert_session_count_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical" });
+  const canaryAlert = alert({ id: "alert_canary_tripped", rule_id: CANARY_TRIPPED_RULE_ID, severity: "critical" });
+  const result = await emitMetricAlertFallbackSignals(
+    paths,
+    { alerts: [memoryAlert, sessionAlert, canaryAlert], notification_due_ids: [memoryAlert.id, sessionAlert.id, canaryAlert.id] },
+    {
+      now: "2026-07-14T00:01:00.000Z",
+      config: { enabled: false },
+      deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+    },
+  );
+  assert.deepEqual(result.fired, [memoryAlert.id]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].ruleId, "system.memory.sustained_high");
+});
+
+test("emitMetricAlertFallbackSignals: a throwing deliverNotification (I/O failure) DEGRADES that single delivery — never aborts the tick — and later due metric alerts still get delivered", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const badAlert = alert({ id: "alert_disk", rule_id: "disk.space.high_used_fraction", severity: "critical" });
+  const okAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const deliverNotification = async (descartesPaths, decision, opts) => {
+    if (opts.ruleId === "disk.space.high_used_fraction") throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    deliveries.push(opts);
+    return { status: "recorded" };
+  };
+  const result = await emitMetricAlertFallbackSignals(
+    paths,
+    { alerts: [badAlert, okAlert], notification_due_ids: [badAlert.id, okAlert.id] },
+    { now: "2026-07-14T00:01:00.000Z", config: { enabled: false }, deliverNotification },
+  );
+  assert.deepEqual(result.fired, [okAlert.id]);
+  assert.deepEqual(result.failed, [badAlert.id]);
+  assert.equal(deliveries.length, 1, "the later due alert must still be delivered despite the earlier throw");
+  assert.equal(deliveries[0].ruleId, "system.memory.sustained_high");
+});
+
+test("emitMetricAlertFallbackSignals: zero due ids -> [] with no deliverNotification call at all", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [], notification_due_ids: [] }, {
+    config: { enabled: false },
+    deliverNotification: async () => { deliverCalled = true; },
+  });
+  assert.deepEqual(result, { fired: [] });
+  assert.equal(deliverCalled, false);
+});
+
+test("emitMetricAlertFallbackSignals: object-typed notification_due_ids/alerts degrade to fired:[] rather than throwing (tick survives)", async () => {
+  const paths = await tempPaths();
+  const current = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const resultA = await emitMetricAlertFallbackSignals(paths, { notification_due_ids: { corrupt: "shape" }, alerts: [current] }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: { enabled: false },
+  });
+  assert.deepEqual(resultA, { fired: [] });
+  const resultB = await emitMetricAlertFallbackSignals(paths, { notification_due_ids: ["alert_x"], alerts: { corrupt: "shape" } }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: { enabled: false },
+  });
+  assert.deepEqual(resultB, { fired: [] });
+});
+
+test("emitMetricAlertFallbackSignals: no explicit options.config reads it via readAlertIntelligenceConfig — default (unwritten) config is enabled:false, so a due metric alert is still delivered", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-07-14T00:01:00.000Z",
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [memoryAlert.id]);
+  assert.equal(deliveries.length, 1);
 });
 
 // ---------------------------------------------------------------------------------------------
