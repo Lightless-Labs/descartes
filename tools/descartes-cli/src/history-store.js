@@ -131,8 +131,23 @@ export async function appendMetricPoints(descartesPaths, points, options = {}) {
   if (normalized.length > 0) {
     await fs.appendFile(storePaths.metricsFile, normalized.map(encodeJsonLine).join(""), { mode: 0o600 });
   }
-  const retention = await enforceHistoryRetention(descartesPaths, options);
-  return { written_count: normalized.length, retention };
+  // Finding F4-B2 (daybreak-blue BLOCKER): enforceHistoryRetention runs AFTER the append above has
+  // already durably succeeded -- so a retention-only failure (e.g. a disk fault on its tmp+rename)
+  // must never make THIS function throw. Before this fix it did: the caller's own throw-fallback
+  // (daemon.js's safeCandidates) then reported `written_count: 0`, fabricating a zero even though
+  // `normalized.length` records genuinely reached disk, and the retention error itself was
+  // discarded entirely (never surfaced as anything). Retention is now non-fatal: report the real
+  // count and, if retention failed, an honestly-named `retention_error` alongside it -- this
+  // function now throws only when the append itself failed (records genuinely never persisted, so
+  // `written_count: 0` from a caller's fallback is then honest).
+  let retention;
+  let retentionError;
+  try {
+    retention = await enforceHistoryRetention(descartesPaths, options);
+  } catch (error) {
+    retentionError = error instanceof Error ? error.message : String(error);
+  }
+  return { written_count: normalized.length, retention, ...(retentionError ? { retention_error: retentionError } : {}) };
 }
 
 export async function readMetricPoints(descartesPaths, options = {}) {

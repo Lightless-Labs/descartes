@@ -445,16 +445,21 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
 // passing `undefined` explicitly, which the emitSessionAlertSignals site legitimately needs to do,
 // would silently fall through to the default instead of getting `undefined` back.)
 //
-// Finding F4, additive: extended one layer earlier (persistence-before-evaluation) to a THIRD
-// fallback shape family -- `{ written_count: 0, retention: undefined }` -- for the metric-persist
-// (appendMetricPoints) and structural fact-persist (appendFactPoints) calls, and to a bare
-// `undefined` for writeStructuralCheckpoint (a checkpoint that doesn't advance this tick just
-// retries next tick, already-tolerated). This shape is deliberately honest, not a plausible-
-// looking guess: zero genuinely were written this tick, and retention state is genuinely unknown
-// -- never synthesize a retention object that didn't happen. writeDaemonStatus is NOT wrapped with
-// safeCandidates -- see its own handling below, which must preserve genuine collector-derived
-// `state` rather than substitute a fallback record disconnected from what this tick actually
-// observed.
+// Finding F4, additive: extended one layer earlier (persistence-before-evaluation) with a bare
+// `undefined` fallback for writeStructuralCheckpoint (a checkpoint that doesn't advance this tick
+// just retries next tick, already-tolerated). writeDaemonStatus is NOT wrapped with safeCandidates
+// -- see its own handling below, which must preserve genuine collector-derived `state` rather than
+// substitute a fallback record disconnected from what this tick actually observed.
+//
+// Finding F4-B1/F4-B2 (daybreak-blue CONFIRMED BLOCKER re-gate): the metric-persist
+// (appendMetricPoints) and structural fact-persist (appendFactPoints) calls below are ALSO
+// deliberately NOT wrapped with safeCandidates, for the same reason writeDaemonStatus isn't --
+// safeCandidates logs a warning but DISCARDS the thrown error, so a genuine append failure could
+// never reach this tick's own status.state/storage_write_error, and daemon.status.not_ok could
+// never fire from it (the fabrication F4-B1 closes). Both persist calls use their own inline
+// try/catch instead, degrading to the same honest `{ written_count: 0, retention: undefined }`
+// shape on an append failure while preserving the error message for the status record built
+// below.
 async function safeCandidates(label, produce, fallback) {
   try {
     return await produce();
@@ -463,6 +468,15 @@ async function safeCandidates(label, produce, fallback) {
     console.warn(`[daemon] detector '${label}' failed this tick, degrading to no candidates: ${message}`);
     return fallback;
   }
+}
+
+// Finding F4-B1/F4-B2: joins zero or more possibly-undefined error messages into one honestly-
+// complete string (rather than one silently overwriting/discarding another on the rare tick where
+// more than one persistence step fails), or `undefined` if none are present -- used to fold the
+// metric-persist / structural-fact-persist / writeDaemonStatus failure messages into statusRecord.
+function combineErrors(...messages) {
+  const present = messages.filter(Boolean);
+  return present.length > 0 ? present.join("; ") : undefined;
 }
 
 export async function runDaemonIteration(descartesPaths, options = {}) {
@@ -479,18 +493,27 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const points = metricPointsFromEvidence(evidence, { ts });
   // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
   // degrades this tick's write result to an honest zero rather than aborting the entire tick
-  // before evaluateAndPersistAlerts ever runs.
+  // before evaluateAndPersistAlerts ever runs. Finding F4-B1/F4-B2 re-gate: inline try/catch, not
+  // safeCandidates (see that helper's own doc comment above) -- the failure message must survive
+  // to feed this tick's own status.state/storage_write_error below, not merely be logged and
+  // discarded. appendMetricPoints itself now treats a RETENTION-only failure as non-fatal (see
+  // history-store.js) and returns it as `write.retention_error` instead of throwing, so this catch
+  // is reached only on a genuine append failure (records never reached disk).
   const appendMetrics = options.appendMetricPoints ?? appendMetricPoints;
-  const write = await safeCandidates(
-    "metric-persist",
-    () => appendMetrics(descartesPaths, points, {
+  let write;
+  let metricPersistError;
+  try {
+    write = await appendMetrics(descartesPaths, points, {
       ts,
       retentionMs: options.retentionMs,
       maxBytes: options.maxBytes,
       now: options.now ?? ts,
-    }),
-    { written_count: 0, retention: undefined },
-  );
+    });
+  } catch (error) {
+    metricPersistError = error instanceof Error ? error.message : String(error);
+    console.warn(`[daemon] metric-persist failed this tick (${metricPersistError}); degrading to written_count: 0, not fabricating a write`);
+    write = { written_count: 0, retention: undefined };
+  }
 
   // Independent, slower structural (services/network/scheduled-jobs) cadence. Gated behind the
   // already-shipped configDir/learned.json kill switch, checked before any work is attempted
@@ -498,6 +521,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let structuralEvidence;
   let structuralCollectorStatuses;
   let structuralFacts;
+  // Finding F4-B1/F4-B2: captured alongside structuralFacts (rather than discarded by
+  // safeCandidates -- see its doc comment above) so a genuine structural-fact append failure can
+  // feed this tick's own status.state/storage_write_error below.
+  let structuralFactPersistError;
   let shadowEvaluation;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
@@ -575,13 +602,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           if (factPoints.length > 0) {
             // Finding F4: same isolation as the metric-persist call above -- a storage fault here
             // must not abort the tick before evaluateAndPersistAlerts, and must not fabricate a
-            // retention outcome that did not happen.
+            // retention outcome that did not happen. Finding F4-B1/F4-B2 re-gate: inline
+            // try/catch, not safeCandidates -- same reasoning as the metric-persist call above,
+            // the error message must survive to feed status.state/storage_write_error below.
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
-            structuralFacts = await safeCandidates(
-              "structural-fact-persist",
-              () => appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts }),
-              { written_count: 0, retention: undefined },
-            );
+            try {
+              structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts });
+            } catch (error) {
+              structuralFactPersistError = error instanceof Error ? error.message : String(error);
+              console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
+              structuralFacts = { written_count: 0, retention: undefined };
+            }
           }
 
           // Slice S7a, additive: evaluate any status:"shadow" constraints against the
@@ -615,23 +646,41 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // Finding F4, THE FABRICATION TRAP: `statusRecord` is built here, BEFORE attempting the disk
   // write, entirely from real data already computed this tick (genuine collector evidence, the
   // genuine metric-write result above) -- so it is honest regardless of whether the write below
-  // succeeds. On a write failure we must NOT fall back to some other hardcoded/default record and
-  // must NOT touch `state` (which means "collector health", not "persistence health") -- doing
-  // either would fabricate daemon health in the exact tick where persistence just demonstrably
-  // failed, suppressing daemon.status.not_ok precisely when a storage fault should be visible.
-  // Instead: on failure, log it and add ONE new, honestly-named field (`storage_write_error`) to
-  // the SAME genuine record, and use that in-memory record for the rest of the tick regardless of
+  // succeeds.
+  //
+  // Finding F4-B1 re-gate (daybreak-blue CONFIRMED BLOCKER): `state` used to be HARDCODED to "ok"
+  // here, unconditionally -- so neither a genuine collector error NOR a genuine persistence
+  // failure this tick could ever be reflected in it, and alert-store.js's daemon.status.not_ok
+  // rule (which fires whenever state is not "ok"/"stopped") could never fire from either. `state`
+  // is now DERIVED from real evidence already computed this tick: "error" when a collector
+  // genuinely reported status:"error" (an "unable" collector -- e.g. a platform-inapplicable one
+  // -- is deliberately NOT treated as a failure; over-firing daemon.status.not_ok on a benign
+  // "unable" every tick would be its own fabrication in the other direction), OR when this tick's
+  // own metric/structural-fact persist genuinely failed (an append error, or a non-fatal
+  // retention_error surfaced by appendMetricPoints/appendFactPoints -- Finding F4-B2, see
+  // history-store.js/fact-store.js). Otherwise "ok". On a write failure below we must NOT fall
+  // back to some other hardcoded/default record -- doing so would fabricate daemon health in the
+  // exact tick where persistence just demonstrably failed. Instead: on failure, log it and fold
+  // the failure into the SAME genuine record (adding `storage_write_error` and forcing
+  // `state: "error"`, since the write itself is a persistence failure this tick regardless of what
+  // collectors reported), and use that in-memory record for the rest of the tick regardless of
   // whether the disk write succeeded -- so evaluateAndPersistAlerts (and everything downstream) is
   // still reached, unconditionally, with real data.
+  const collectorHasError = evidence.some((envelope) => envelope.status === "error")
+    || (structuralCollectorStatuses ?? []).some((entry) => entry.status === "error");
+  const storageWriteError = combineErrors(metricPersistError, structuralFactPersistError);
+  const retentionError = combineErrors(write.retention_error, structuralFacts?.retention_error);
   const statusRecord = {
     ts,
-    state: "ok",
+    state: collectorHasError || storageWriteError || retentionError ? "error" : "ok",
     mode: options.mode ?? "foreground",
     profile,
     collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),
     points_written: write.written_count,
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
+    ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
+    ...(retentionError ? { retention_error: retentionError } : {}),
   };
   const persistStatus = options.writeDaemonStatus ?? writeDaemonStatus;
   let status;
@@ -640,7 +689,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[daemon] writeDaemonStatus failed this tick (${message}); continuing with the in-memory status, not fabricating health`);
-    status = { ...statusRecord, storage_write_error: message };
+    // Finding F4-B1: a writeDaemonStatus failure IS itself a genuine persistence failure this
+    // tick, so `state` must become "error" here too -- never left as whatever statusRecord.state
+    // happened to already be (which could still be "ok" if collectors and the earlier persist
+    // steps were all healthy). combineErrors preserves an earlier same-tick storageWriteError
+    // (e.g. metric-persist also failed) rather than one overwriting the other.
+    status = {
+      ...statusRecord,
+      state: "error",
+      storage_write_error: combineErrors(statusRecord.storage_write_error, message),
+    };
   }
   // Regression fix (sol re-review of the 7.2 re-phasing): computing the detector candidates
   // MUTATES detector stores (baseline folds, credential/lineage advances), so it must NOT run

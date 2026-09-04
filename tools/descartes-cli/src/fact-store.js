@@ -337,8 +337,21 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   if (normalized.length > 0) {
     await fs.appendFile(storePaths.factsFile, normalized.map(encodeJsonLine).join(""), { mode: 0o600 });
   }
-  const retention = await enforceFactRetention(descartesPaths, options);
-  return { written_count: normalized.length, retention };
+  // Finding F4-B2 (daybreak-blue BLOCKER), mirrors appendMetricPoints: enforceFactRetention runs
+  // AFTER the append above has already durably succeeded, so a retention-only failure must never
+  // make this function throw -- that would make the caller's throw-fallback report a fabricated
+  // `written_count: 0` even though `normalized.length` records genuinely reached disk, and would
+  // discard the retention error entirely. Retention is now non-fatal: report the real count and,
+  // if retention failed, an honestly-named `retention_error` alongside it. This function now
+  // throws only when the append itself failed (records genuinely never persisted).
+  let retention;
+  let retentionError;
+  try {
+    retention = await enforceFactRetention(descartesPaths, options);
+  } catch (error) {
+    retentionError = error instanceof Error ? error.message : String(error);
+  }
+  return { written_count: normalized.length, retention, ...(retentionError ? { retention_error: retentionError } : {}) };
 }
 
 /**

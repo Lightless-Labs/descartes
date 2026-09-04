@@ -3645,7 +3645,11 @@ test("F4: a throwing appendMetricPoints degrades the metric-persist step to an h
   }
 
   // The tick completed -- a metric-persist throw did not crash the daemon.
-  assert.equal(result.status.state, "ok");
+  // Finding F4-B1 re-gate: a genuine append failure is now surfaced as state:"error" (it used to
+  // be hardcoded "ok", which is the exact fabrication F4-B1 closes -- see the fresh assertions
+  // below).
+  assert.equal(result.status.state, "error");
+  assert.equal(result.status.storage_write_error, "simulated appendMetricPoints failure (ENOSPC)");
 
   // Honest degraded shape: zero written this tick, retention state unknown -- never a guessed
   // plausible-looking retention object.
@@ -3667,6 +3671,13 @@ test("F4: a throwing appendMetricPoints degrades the metric-persist step to an h
   assert.ok(samplesMissing, "expected the existing daemon.samples.missing watchdog rule to fire from the genuine zero-point-count evidence");
   assert.equal(samplesMissing.status, "active");
   assert.equal(samplesMissing.diagnostics.point_count, 0);
+
+  // F4-B1: the now-genuinely-"error" status.state itself reaches alert-store.js's existing
+  // daemon.status.not_ok rule -- the watchdog that a hardcoded state:"ok" made permanently unable
+  // to fire from a persistence failure.
+  const notOk = result.alerts.alerts.find((alert) => alert.rule_id === "daemon.status.not_ok");
+  assert.ok(notOk, "expected daemon.status.not_ok to fire now that state genuinely reflects the persist failure");
+  assert.equal(notOk.status, "active");
 
   assert.ok(
     warnings.some((w) => w.includes("metric-persist") && w.includes("simulated appendMetricPoints failure (ENOSPC)")),
@@ -3700,11 +3711,16 @@ test("F4: a throwing appendFactPoints during a structural-due tick degrades the 
   }
 
   // The tick completed -- a structural fact-persist throw did not crash the daemon.
-  assert.equal(result.status.state, "ok");
-  // Honest degraded shape, matching appendFactPoints' real success shape (fact-store.js:341).
+  // Finding F4-B1 re-gate: a genuine append failure now surfaces as state:"error" (previously
+  // hardcoded "ok" regardless).
+  assert.equal(result.status.state, "error");
+  assert.equal(result.status.storage_write_error, "simulated appendFactPoints failure (EROFS)");
+  // Honest degraded shape, matching appendFactPoints' real success shape (fact-store.js).
   assert.deepEqual(result.structuralFacts, { written_count: 0, retention: undefined });
   // The structural collection itself (evidence collection, independent of the fact-persist call)
-  // still completed and is reflected in status -- only the persist step degraded.
+  // still completed and is reflected in status -- only the persist step degraded. The collector
+  // statuses themselves are still genuinely "ok" -- state:"error" here comes from the persist
+  // failure, not from any collector.
   assert.equal(result.status.structural_collector_statuses.length, 3);
   assert(result.status.structural_collector_statuses.every((entry) => entry.status === "ok"));
 
@@ -3794,18 +3810,20 @@ test("F4 fabrication trap: a throwing writeDaemonStatus does NOT crash the tick 
   // The tick completed -- a status-write throw did not crash the daemon.
   assert.ok(result.status, "an in-memory status must still exist for this tick even though the disk write failed");
 
-  // THE FABRICATION TRAP: state must be the genuine, already-computed collector-derived value
-  // (here "ok", because the collectors really did succeed this tick) -- NOT a hardcoded fallback
-  // disconnected from what actually happened, and never defaulted/omitted in a way that would make
-  // downstream reads treat the daemon as healthy independent of the real collector evidence.
-  assert.equal(result.status.state, baseline.status.state);
+  // THE FABRICATION TRAP, F4-B1 re-gate: writeDaemonStatus failing IS itself a genuine
+  // persistence failure this tick, so `state` must become "error" -- never silently disconnected
+  // from what actually happened (the old hardcoded "ok" made a write failure invisible to
+  // daemon.status.not_ok). Every OTHER field stays the genuine, already-computed collector-derived
+  // value (byte-identical to the successful-write baseline) -- nothing else is a hardcoded
+  // fallback.
+  assert.equal(result.status.state, "error");
+  assert.equal(baseline.status.state, "ok", "the baseline tick had no genuine failure, so its state is the real 'ok'");
   assert.equal(result.status.mode, baseline.status.mode);
   assert.deepEqual(result.status.collector_statuses, baseline.status.collector_statuses);
   assert.equal(result.status.points_written, baseline.status.points_written);
   assert.deepEqual(result.status.retention, baseline.status.retention);
 
-  // The ONLY difference from a successful write is the new, honestly-named field -- never an
-  // overload of `state` (which means collector health, not persistence health).
+  // The only OTHER difference from a successful write is the new, honestly-named field.
   assert.equal(result.status.storage_write_error, "simulated writeDaemonStatus failure (ENOSPC)");
   assert.equal(baseline.status.storage_write_error, undefined);
 
@@ -3824,4 +3842,108 @@ test("F4 fabrication trap: a throwing writeDaemonStatus does NOT crash the tick 
   // reader hitting the stale prior file, not a fabricated fresh-looking one, is the honest outcome.
   const onDisk = await readDaemonStatus(paths);
   assert.equal(onDisk, undefined, "no prior status existed and the failed write must not have produced one");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Finding F4-B1 (daybreak-blue CONFIRMED BLOCKER): status.state used to be HARDCODED to "ok",
+// unconditionally -- so neither a genuine collector error NOR a genuine persistence failure could
+// ever be reflected in it, and alert-store.js's existing daemon.status.not_ok rule (which fires
+// whenever state is not "ok"/"stopped") could never fire from either. These tests prove state is
+// now genuinely derived: from real collector-reported "error" status (never from the benign
+// "unable" a platform-inapplicable collector reports), and from a genuine metric/structural-fact
+// persistence failure (an append error, or a non-fatal retention_error -- Finding F4-B2, see
+// history-store.js/fact-store.js).
+// ---------------------------------------------------------------------------------------------
+
+test("F4-B1: a collector reporting status \"error\" makes status.state \"error\" (never the old hardcoded \"ok\"), and daemon.status.not_ok fires from it", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: {
+      system: async () => envelope("system-overview", "collect_system", { load_average: [0, 0, 0] }, "error"),
+      processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+      disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+    },
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+  });
+
+  assert.equal(result.status.state, "error");
+  const notOk = result.alerts.alerts.find((alert) => alert.rule_id === "daemon.status.not_ok");
+  assert.ok(notOk, "expected daemon.status.not_ok to fire from a genuine collector error");
+  assert.equal(notOk.status, "active");
+});
+
+test("F4-B1: a collector reporting status \"unable\" (e.g. platform-inapplicable) does NOT flip status.state to \"error\" -- only a genuine \"error\" does, avoiding daemon.status.not_ok over-firing every tick", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: {
+      system: async () => envelope("system-overview", "collect_system", {}, "unable"),
+      processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+      disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+    },
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+  });
+
+  assert.equal(result.status.state, "ok");
+  const notOk = result.alerts.alerts.find((alert) => alert.rule_id === "daemon.status.not_ok");
+  assert.equal(notOk, undefined, "an 'unable' (platform-inapplicable) collector must not be treated as a failure");
+});
+
+test("F4-B2: a non-fatal retention_error from the metric-persist writer surfaces into status.state \"error\" and status.retention_error, while the real written_count is preserved (never a fabricated zero)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    // Mirrors appendMetricPoints' real F4-B2 success-with-retention_error shape (history-store.js):
+    // the append genuinely succeeded (written_count: 7), only retention failed.
+    appendMetricPoints: async () => ({ written_count: 7, retention: undefined, retention_error: "simulated enforceHistoryRetention failure (EISDIR)" }),
+  });
+
+  assert.equal(result.status.state, "error");
+  assert.equal(result.status.points_written, 7, "the real written_count must be reported, never fabricated to 0 just because retention failed");
+  assert.equal(result.write.written_count, 7);
+  assert.equal(result.status.retention_error, "simulated enforceHistoryRetention failure (EISDIR)");
+  assert.equal(result.status.storage_write_error, undefined, "a retention-only failure is not an append failure -- must not be misreported as one");
+
+  const constraintAlert = result.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(constraintAlert, "a completely unrelated real alert must still fire this tick");
+  const notOk = result.alerts.alerts.find((alert) => alert.rule_id === "daemon.status.not_ok");
+  assert.ok(notOk, "expected daemon.status.not_ok to fire from the genuine retention failure");
+});
+
+test("F4-B2: a non-fatal retention_error from the structural fact-persist writer surfaces into status.state \"error\" and status.retention_error", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    loadLearnedConfig: async () => ({ enabled: true }),
+    // Mirrors appendFactPoints' real F4-B2 success-with-retention_error shape (fact-store.js): the
+    // append genuinely succeeded, only retention failed.
+    appendFactPoints: async () => ({ written_count: 3, retention: undefined, retention_error: "simulated enforceFactRetention failure (EISDIR)" }),
+  });
+
+  assert.equal(result.status.state, "error");
+  assert.equal(result.structuralFacts.written_count, 3);
+  assert.equal(result.status.retention_error, "simulated enforceFactRetention failure (EISDIR)");
+  assert.equal(result.status.storage_write_error, undefined, "a retention-only failure is not an append failure -- must not be misreported as one");
+  // The structural collectors themselves genuinely succeeded -- state:"error" here comes from the
+  // persist step's retention_error, not from any collector.
+  assert(result.status.structural_collector_statuses.every((entry) => entry.status === "ok"));
 });

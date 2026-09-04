@@ -184,3 +184,42 @@ test("F4: readDaemonStatus fails loudly (never fabricates) on a status file corr
 
   await assert.rejects(readDaemonStatus(paths), SyntaxError);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Finding F4-B2 (daybreak-blue BLOCKER): enforceHistoryRetention runs AFTER appendMetricPoints'
+// own fs.appendFile has already durably succeeded. Before this fix, a retention-only failure (a
+// throw from enforceHistoryRetention) propagated straight out of appendMetricPoints -- so
+// daemon.js's throw-fallback reported a fabricated written_count:0 even though the records
+// genuinely reached metrics.jsonl, and the retention error itself was discarded entirely (never
+// surfaced anywhere). Retention must be non-fatal: the real written_count is reported, and a
+// retention failure surfaces as an honestly-named retention_error instead of an escaping throw.
+// ---------------------------------------------------------------------------------------------
+
+test("F4-B2: a retention failure after a successful append does not throw -- appendMetricPoints reports the real written_count plus a retention_error, and the records genuinely reached disk", async () => {
+  const paths = await tempPaths();
+  const storePaths = resolveHistoryStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+
+  // enforceHistoryRetention writes its kept-records output via a `${metricsFile}.${process.pid}.tmp`
+  // tmp+rename. Pre-creating a DIRECTORY at that exact path forces its own `fs.writeFile(tmpFile,
+  // ...)` to fail with a genuine EISDIR -- a deterministic real fs failure, no DI seam needed
+  // (appendMetricPoints/enforceHistoryRetention take none for this).
+  const retentionTmpFile = `${storePaths.metricsFile}.${process.pid}.tmp`;
+  await fs.mkdir(retentionTmpFile);
+
+  const points = [
+    { ts: "2026-05-24T00:00:00.000Z", metric_name: "system.load.1m", value: 1, unit: "load_average" },
+    { ts: "2026-05-24T00:00:01.000Z", metric_name: "system.load.1m", value: 2, unit: "load_average" },
+  ];
+
+  const result = await appendMetricPoints(paths, points, { now: "2026-05-24T00:00:02.000Z" });
+
+  assert.equal(result.written_count, 2, "the append genuinely succeeded before retention ran -- the real count must be reported, never a fabricated 0");
+  assert.equal(result.retention, undefined, "no genuine retention outcome exists on this failure -- must not synthesize one");
+  assert.match(result.retention_error, /EISDIR/);
+
+  // The records really are on disk -- readMetricPoints reads metricsFile directly, unaffected by
+  // (and not blocked by) the still-failing retention tmp path.
+  const read = await readMetricPoints(paths);
+  assert.equal(read.points.length, 2);
+});

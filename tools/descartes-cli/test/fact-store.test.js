@@ -339,3 +339,43 @@ test("readFactPoints counts a disk record with over-cap attributes as schema_inv
   assert.equal(points.length, 1);
   assert.equal(points[0].entity_key, "nginx");
 });
+
+// ---------------------------------------------------------------------------------------------
+// Finding F4-B2 (daybreak-blue BLOCKER), mirrors history-store.test.js: enforceFactRetention runs
+// AFTER appendFactPoints' own fs.appendFile has already durably succeeded. Before this fix, a
+// retention-only failure propagated straight out of appendFactPoints -- so daemon.js's
+// throw-fallback reported a fabricated written_count:0 even though the records genuinely reached
+// facts.jsonl, and the retention error itself was discarded entirely. Retention must be
+// non-fatal: the real written_count is reported, and a retention failure surfaces as an honestly-
+// named retention_error instead of an escaping throw.
+// ---------------------------------------------------------------------------------------------
+
+test("F4-B2: a retention failure after a successful append does not throw -- appendFactPoints reports the real written_count plus a retention_error, and the records genuinely reached disk", async () => {
+  const paths = await tempPaths();
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+
+  // enforceFactRetention's own fs.writeFile(tmpFile, ...) (fact-store.js:~309-310) runs BEFORE it
+  // ever touches the integrity ledger -- so pre-creating a DIRECTORY at that exact
+  // `${factsFile}.${process.pid}.tmp` path forces a genuine EISDIR right there, with no torn
+  // ledger state. Deterministic real fs failure, no DI seam needed.
+  const retentionTmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
+  await fs.mkdir(retentionTmpFile);
+
+  const ts = "2026-07-10T00:00:00.000Z";
+  const factPoints = [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+    { fact_name: "service.presence", entity_key: "postgres.service", attributes: { running: "true" } },
+  ];
+
+  const result = await appendFactPoints(paths, factPoints, { ts, now: ts });
+
+  assert.equal(result.written_count, 2, "the append genuinely succeeded before retention ran -- the real count must be reported, never a fabricated 0");
+  assert.equal(result.retention, undefined, "no genuine retention outcome exists on this failure -- must not synthesize one");
+  assert.match(result.retention_error, /EISDIR/);
+
+  // The records really are on disk -- readFactPoints reads facts.jsonl directly, unaffected by
+  // (and not blocked by) the still-failing retention tmp path.
+  const { points } = await readFactPoints(paths, { now: ts });
+  assert.equal(points.length, 2);
+});
