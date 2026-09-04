@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
-import { readFactPoints } from "./fact-store.js";
+import { DEFAULT_FACT_MAX_BYTES, readFactPoints } from "./fact-store.js";
 
 export const SCHEMA_VERSION = 1;
 export const CONSTRAINT_STATUSES = ["draft", "shadow", "review-ready", "active", "retired"];
@@ -173,10 +173,26 @@ export async function writeConstraints(descartesPaths, constraints) {
   return normalized;
 }
 
+// Finding F2-Tier1: mirrors enforceFactRetention's own BLOCKER #1 finite/non-negative
+// validation pattern (fact-store.js:216-221) -- a bad configured value must never silently
+// disable the byte cap. Unlike enforceFactRetention (which throws on a genuinely-untrusted
+// direct call), learned.json is operator-editable config: an invalid override fails CLOSED to
+// the same DEFAULT_FACT_MAX_BYTES the store already used before this field existed, rather than
+// throwing out of a daemon iteration or leaving the cap unset (which enforceFactRetention would
+// itself default identically, but leaving it ambiguous here would hide a bad operator edit
+// instead of naming it via the round-tripped, always-present field below). Zero is deliberately
+// NOT accepted here (unlike enforceFactRetention's own >= 0) -- a configured cap must be a
+// genuine byte budget, not a way to silently zero out capacity through this surface.
+function normalizeFactStoreMaxBytes(value) {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
+}
+
 export function normalizeLearnedConfig(config = {}) {
   return {
     enabled: config.enabled === true,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
+    fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
   };
 }
 
@@ -252,7 +268,17 @@ function unknownFactStoreCompleteness() {
     age_evicted_total: 0,
     first_degraded_ts: null,
     continuity_ok: null,
+    // Finding F2-Tier1, additive read-only reporting fields (no trust-decision involvement):
+    // let an operator distinguish "one old bytecap event years ago" from "evicting every single
+    // tick, right now" and see how much history is actually retained, not just a cumulative
+    // lifetime total.
+    last_bytecap_evict_ts: null,
+    continuity_oldest_ts: null,
   };
+}
+
+function isNullableTimestampString(value) {
+  return value === null || (typeof value === "string" && Number.isFinite(Date.parse(value)));
 }
 
 function selectFactStoreCompleteness(completeness) {
@@ -267,6 +293,8 @@ function selectFactStoreCompleteness(completeness) {
     age_evicted_total: Number.isInteger(completeness.age_evicted_total) ? completeness.age_evicted_total : 0,
     first_degraded_ts: typeof completeness.first_degraded_ts === "string" ? completeness.first_degraded_ts : null,
     continuity_ok: [true, false, null].includes(completeness.continuity_ok) ? completeness.continuity_ok : null,
+    last_bytecap_evict_ts: isNullableTimestampString(completeness.last_bytecap_evict_ts) ? completeness.last_bytecap_evict_ts : null,
+    continuity_oldest_ts: isNullableTimestampString(completeness.continuity_oldest_ts) ? completeness.continuity_oldest_ts : null,
   };
 }
 

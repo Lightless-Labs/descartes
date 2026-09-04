@@ -85,6 +85,47 @@ test("age eviction alone leaves completeness intact", async () => {
   assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.age_evicted_total, 1);
   assert.equal(read.completeness.first_degraded_ts, null);
+  // Finding F2-Tier1, additive coverage-loss reporting field: mirrors ledger.continuity.oldest_ts
+  // so an operator can see how much history is actually retained, not just a cumulative total.
+  assert.equal(read.completeness.continuity_oldest_ts, NOW);
+});
+
+// --- Finding F2-Tier1: buildCompleteness surfaces continuity_oldest_ts (read-only reporting,
+// additive -- sourced straight from ledger.continuity.oldest_ts, no trust-decision involvement) ---
+
+test("buildCompleteness surfaces continuity_oldest_ts from the ledger on an intact/degraded read", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [
+    { ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} },
+  ], { now: NOW });
+  await enforceFactRetention(paths, { now: NOW });
+  const ledger = await readLedger(paths);
+  assert.equal(ledger.continuity.oldest_ts, NOW);
+
+  const read = await readFactPoints(paths, { now: NOW });
+  assert.equal(read.completeness.continuity_oldest_ts, NOW);
+});
+
+test("buildCompleteness reports continuity_oldest_ts: null before any retention pass has ever run (no ledger)", () => {
+  const live = { record_count: 0, bytes: 0, raw_bytes: Buffer.alloc(0), exists: false, newest_ts: null };
+  const completeness = buildCompleteness(null, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW));
+  assert.equal(completeness.status, "unknown");
+  assert.equal(completeness.continuity_oldest_ts, null);
+});
+
+test("buildCompleteness surfaces continuity_oldest_ts even on a broken-continuity (unknown) read", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [
+    { ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} },
+  ], { now: NOW });
+  await enforceFactRetention(paths, { now: NOW });
+  const storePaths = resolveFactStorePaths(paths);
+  // Truncate the live file so observeFactContinuity reports "broken" for the next read.
+  await fs.writeFile(storePaths.factsFile, "");
+
+  const read = await readFactPoints(paths, { now: NOW });
+  assert.equal(read.completeness.status, "unknown");
+  assert.equal(read.completeness.continuity_oldest_ts, NOW);
 });
 
 test("buildCompleteness does not degrade an intact read for a future ledger loss timestamp", async () => {

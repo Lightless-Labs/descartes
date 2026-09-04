@@ -427,6 +427,11 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
       age_evicted_total: base.age_evicted_total,
       first_degraded_ts: base.first_degraded_ts,
       continuity_ok: null,
+      // Finding F2-Tier1, additive read-only reporting: mirrors ledger.continuity.oldest_ts so
+      // an operator can see how much fact history is actually retained (not just a cumulative
+      // lifetime eviction total) even on an unknown/broken-continuity read -- no trust-decision
+      // code path consults this field.
+      continuity_oldest_ts: base.continuity.oldest_ts,
     };
   }
   // A future-dated continuity break (last_continuity_break_ts > nowMs) while the live store
@@ -457,6 +462,7 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
       age_evicted_total: base.age_evicted_total,
       first_degraded_ts: base.first_degraded_ts,
       continuity_ok: continuityOk,
+      continuity_oldest_ts: base.continuity.oldest_ts,
     };
   }
 
@@ -478,5 +484,6 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
     age_evicted_total: base.age_evicted_total,
     first_degraded_ts: base.first_degraded_ts,
     continuity_ok: base.continuity.continuity_ok,
+    continuity_oldest_ts: base.continuity.oldest_ts,
   };
 }

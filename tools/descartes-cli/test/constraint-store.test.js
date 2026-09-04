@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints } from "../src/fact-store.js";
+import { appendFactPoints, DEFAULT_FACT_MAX_BYTES } from "../src/fact-store.js";
 import { isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import {
   DEFAULT_SOAK_DAYS,
@@ -15,6 +15,7 @@ import {
   checkShadowSoak,
   loadConstraints,
   loadLearnedConfig,
+  normalizeLearnedConfig,
   promoteDraftsToShadow,
   promoteReviewReadyToActive,
   promoteShadowToReviewReady,
@@ -258,6 +259,46 @@ test("loadLearnedConfig fails closed to disabled (does not throw) when learned.j
   assert.equal(config.enabled, false);
 });
 
+// --- Finding F2-Tier1: configurable fact-store byte cap (fact_store_max_bytes) ---
+// Mirrors enforceFactRetention's existing BLOCKER #1 finite/non-negative validation pattern
+// (fact-store.js:216-221): a bad configured value must never silently disable capping, so
+// normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES on anything that is not a
+// finite, positive number, rather than passing the bad value through or leaving it unset.
+
+test("normalizeLearnedConfig accepts a valid finite positive fact_store_max_bytes override", () => {
+  const config = normalizeLearnedConfig({ fact_store_max_bytes: 1024 });
+  assert.equal(config.fact_store_max_bytes, 1024);
+});
+
+test("normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES when fact_store_max_bytes is missing", () => {
+  const config = normalizeLearnedConfig({});
+  assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+});
+
+for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, "garbage", null]) {
+  test(`normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES on invalid fact_store_max_bytes: ${String(badValue)}`, () => {
+    const config = normalizeLearnedConfig({ fact_store_max_bytes: badValue });
+    assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  });
+}
+
+test("writeLearnedConfig/loadLearnedConfig round-trip a valid fact_store_max_bytes override", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: 2048 });
+
+  const reread = await loadLearnedConfig(paths);
+  assert.equal(reread.fact_store_max_bytes, 2048);
+});
+
+test("writeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES when given an invalid fact_store_max_bytes", async () => {
+  const paths = await tempPaths();
+  const written = await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: -5 });
+  assert.equal(written.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+
+  const reread = await loadLearnedConfig(paths);
+  assert.equal(reread.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+});
+
 // --- descartes learned enable | disable | status (CLI) — the kill switch is operationally
 // load-bearing but had no command to flip it; users had to hand-edit learned.json. ---
 
@@ -345,8 +386,10 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
     "age_evicted_total",
     "bytecap_evicted_total",
     "continuity_ok",
+    "continuity_oldest_ts",
     "corrupt_dropped_total",
     "first_degraded_ts",
+    "last_bytecap_evict_ts",
     "schema_invalid_dropped_total",
     "status",
   ].sort());
@@ -357,6 +400,8 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   assert.equal(completeness.age_evicted_total, 0);
   assert.equal(completeness.first_degraded_ts, null);
   assert.equal(completeness.continuity_ok, true);
+  assert.equal(completeness.last_bytecap_evict_ts, null);
+  assert.equal(completeness.continuity_oldest_ts, now);
   for (const identityField of ["entity_key", "fact_name", "attributes", "generation", "source_tool", "sensitivity"]) {
     assert.equal(JSON.stringify(completeness).includes(identityField), false, `identity field leaked: ${identityField}`);
   }
@@ -369,6 +414,38 @@ test("descartes learned status --json degrades to unknown when fact history was 
   const completeness = JSON.parse(lines[0]).learned_config.fact_store_completeness;
   assert.equal(completeness.status, "unknown");
   assert.equal(completeness.continuity_ok, null);
+  assert.equal(completeness.last_bytecap_evict_ts, null);
+  assert.equal(completeness.continuity_oldest_ts, null);
+});
+
+// Finding F2-Tier1: coverage-loss reporting. Real (not hand-authored-fixture) sustained
+// bytecap eviction pressure via appendFactPoints -> enforceFactRetention, so an operator can
+// SEE via `descartes learned status --json` when normal eviction is degrading novelty coverage
+// (last_bytecap_evict_ts stamped, continuity_oldest_ts advancing) rather than only observing a
+// cumulative lifetime bytecap_evicted_total with no sense of "is this happening right now".
+test("descartes learned status --json surfaces last_bytecap_evict_ts and continuity_oldest_ts once bytecap eviction is real and ongoing", async () => {
+  const paths = await tempPaths();
+  const day1 = "2026-07-11T00:00:00.000Z";
+  const day2 = "2026-07-12T00:00:00.000Z";
+
+  // Tiny (but not zero) maxBytes forces routine bytecap eviction while still keeping room for
+  // exactly the single newest record (a maxBytes too small to keep even one record would evict
+  // everything, leaving continuity_oldest_ts null -- not the sustained-but-nonempty pressure
+  // this finding is about).
+  await appendFactPoints(paths, [
+    { ts: day1, fact_name: "service.presence", entity_key: "one", attributes: {} },
+  ], { now: day1, maxBytes: 150 });
+  await appendFactPoints(paths, [
+    { ts: day2, fact_name: "service.presence", entity_key: "two", attributes: {} },
+  ], { now: day2, maxBytes: 150 });
+
+  const lines = [];
+  await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => lines.push(line) });
+  const completeness = JSON.parse(lines[0]).learned_config.fact_store_completeness;
+
+  assert.equal(completeness.bytecap_evicted_total > 0, true);
+  assert.equal(completeness.last_bytecap_evict_ts, day2);
+  assert.equal(typeof completeness.continuity_oldest_ts, "string");
 });
 
 test("descartes learned status never mutates learned.json (read-only)", async () => {
