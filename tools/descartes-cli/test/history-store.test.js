@@ -9,8 +9,10 @@ import {
   buildHistorySummary,
   enforceHistoryRetention,
   parseDurationMs,
+  readDaemonStatus,
   readMetricPoints,
   resolveHistoryStorePaths,
+  writeDaemonStatus,
 } from "../src/history-store.js";
 
 async function tempPaths() {
@@ -118,4 +120,67 @@ test("history retention enforces maximum bytes by keeping newest records", async
   assert(points.length >= 1);
   assert.equal(points.at(-1).metric_name, "metric.three");
   assert(!points.some((point) => point.metric_name === "metric.one"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Finding F4 fix: both writeDaemonStatus (daemon-status.json, a single JSON object -- a torn
+// write is NOT self-healing, unlike metrics.jsonl's line-oriented format) and
+// enforceHistoryRetention's metrics.jsonl rewrite now use the same tmp+rename idiom already used
+// elsewhere in the codebase (constraint-store.js, fact-store.js, daemon.js's own
+// writeStructuralCheckpoint), instead of a direct fs.writeFile that a process crash mid-write can
+// leave truncated.
+// ---------------------------------------------------------------------------------------------
+
+test("F4: writeDaemonStatus round-trips through readDaemonStatus", async () => {
+  const paths = await tempPaths();
+  const written = await writeDaemonStatus(paths, { ts: "2026-05-24T00:00:00.000Z", state: "ok", mode: "foreground" });
+  assert.equal(written.state, "ok");
+
+  const read = await readDaemonStatus(paths);
+  assert.deepEqual(read, written);
+});
+
+test("F4: writeDaemonStatus writes atomically -- an interruption before the rename leaves the live status file untouched", async () => {
+  const paths = await tempPaths();
+  await writeDaemonStatus(paths, { ts: "2026-05-24T00:00:00.000Z", state: "ok", mode: "foreground" });
+  const beforeInterrupt = await readDaemonStatus(paths);
+
+  const storePaths = resolveHistoryStorePaths(paths);
+
+  // Simulate a process death after the tmp file is written but before the rename commits it --
+  // mirroring fact-store.js's beforeFactsRename/afterFactsRename DI-hook convention.
+  await assert.rejects(
+    writeDaemonStatus(paths, { ts: "2026-05-24T00:01:00.000Z", state: "ok", mode: "foreground" }, {
+      beforeStatusRename: async () => {
+        throw new Error("simulated crash before rename");
+      },
+    }),
+    /simulated crash before rename/,
+  );
+
+  // The live file was never touched by the interrupted write -- reading it back gives the OLD
+  // status, not a torn/partial one and not the new one either. (The `.tmp` file itself is left
+  // behind on this failure path -- same no-cleanup-on-failure idiom as writeStructuralCheckpoint /
+  // fact-store.js's enforceFactRetention; nothing in this codebase cleans it up on a thrown
+  // beforeFactsRename/beforeStatusRename hook, so we don't assert its absence.)
+  const afterInterrupt = await readDaemonStatus(paths);
+  assert.deepEqual(afterInterrupt, beforeInterrupt);
+
+  const dirEntries = await fs.readdir(storePaths.dir);
+  assert.ok(dirEntries.includes(path.basename(storePaths.statusFile)), "the live status file must still be present");
+  assert.ok(
+    dirEntries.some((name) => name.startsWith(`${path.basename(storePaths.statusFile)}.`) && name.endsWith(".tmp")),
+    "the tmp file from the interrupted write is left behind, not renamed over the live file",
+  );
+});
+
+test("F4: readDaemonStatus fails loudly (never fabricates) on a status file corrupted by something other than writeDaemonStatus itself -- degrade-not-fabricate means an unreadable status must not be silently reported as absent or healthy", async () => {
+  const paths = await tempPaths();
+  const storePaths = resolveHistoryStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  // A truncated JSON object -- e.g. a torn write from BEFORE this fix, or filesystem corruption
+  // unrelated to writeDaemonStatus's own (now-atomic) operation.
+  await fs.writeFile(storePaths.statusFile, '{"ts":"2026-05-24T00:00:00.000Z","state":"ok"', "utf8");
+
+  await assert.rejects(readDaemonStatus(paths), SyntaxError);
 });

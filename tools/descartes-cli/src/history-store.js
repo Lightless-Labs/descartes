@@ -106,7 +106,16 @@ export async function enforceHistoryRetention(descartesPaths, options = {}) {
 
   const keptLines = keptReversed.reverse();
   await ensureHistoryDir(descartesPaths);
-  await fs.writeFile(storePaths.metricsFile, keptLines.join(""), { mode: 0o600 });
+  // F4 fix: tmp+rename (atomic), matching constraint-store.js / fact-store.js / daemon.js's own
+  // writeStructuralCheckpoint. Previously a direct fs.writeFile here was a deliberate, documented
+  // deviation (see fact-store.js's enforceFactRetention comment, which contrasted itself against
+  // this file) on the reasoning that metrics.jsonl's line-oriented format degrades gracefully
+  // (readJsonLines skips a corrupt trailing line rather than failing the whole read) -- that
+  // reasoning was about *relative* stakes, not that atomicity would be harmful, so making this
+  // atomic too costs nothing and removes even the "one dropped line" exposure.
+  const tmpFile = `${storePaths.metricsFile}.${process.pid}.tmp`;
+  await fs.writeFile(tmpFile, keptLines.join(""), { mode: 0o600 });
+  await fs.rename(tmpFile, storePaths.metricsFile);
   return {
     kept_count: keptLines.length,
     dropped_count: records.length - keptLines.length,
@@ -232,14 +241,26 @@ export async function buildHistorySummary(descartesPaths, options = {}) {
   };
 }
 
-export async function writeDaemonStatus(descartesPaths, status) {
+// F4 fix: tmp+rename (atomic), identical idiom to writeStructuralCheckpoint (daemon.js) /
+// constraint-store.js's writers. daemon-status.json is a single JSON object, not JSONL -- unlike
+// metrics.jsonl (readJsonLines tolerates and skips a corrupt trailing line), a torn write here is
+// NOT self-healing: readDaemonStatus only special-cases ENOENT, so a truncated file throws an
+// uncaught JSON.parse SyntaxError for every reader (alert-store.js's daemonStatus fallback,
+// history.js, triage.js). `options.beforeStatusRename`/`afterStatusRename` are optional DI hooks
+// (mirroring fact-store.js's beforeFactsRename/afterFactsRename) for tests to simulate an
+// interruption between the tmp write and the rename.
+export async function writeDaemonStatus(descartesPaths, status, options = {}) {
   await ensureHistoryDir(descartesPaths);
   const storePaths = resolveHistoryStorePaths(descartesPaths);
   const record = {
     ts: new Date().toISOString(),
     ...status,
   };
-  await fs.writeFile(storePaths.statusFile, JSON.stringify(record, null, 2), { mode: 0o600 });
+  const tmpFile = `${storePaths.statusFile}.${process.pid}.tmp`;
+  await fs.writeFile(tmpFile, JSON.stringify(record, null, 2), { mode: 0o600 });
+  if (options.beforeStatusRename) await options.beforeStatusRename();
+  await fs.rename(tmpFile, storePaths.statusFile);
+  if (options.afterStatusRename) await options.afterStatusRename();
   return record;
 }
 

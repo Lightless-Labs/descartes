@@ -346,8 +346,9 @@ export async function readStructuralCheckpoint(descartesPaths) {
 
 /**
  * Atomic tmp+rename write (0o600 file / 0o700 dir), mirroring constraint-store.js's writers —
- * deliberately atomic, unlike writeDaemonStatus's direct write, because a torn checkpoint write
- * could cause structural collection to run every tick forever.
+ * a torn checkpoint write could cause structural collection to run every tick forever. (Finding
+ * F4: history-store.js's writeDaemonStatus now uses the same tmp+rename idiom too, closing what
+ * used to be the one non-atomic write in this file's persistence path.)
  */
 export async function writeStructuralCheckpoint(descartesPaths, checkpoint = {}) {
   const dir = structuralCheckpointDir(descartesPaths);
@@ -443,6 +444,17 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
 // delivery this tick" shape. (Deliberately NOT a `fallback = []` default parameter -- a caller
 // passing `undefined` explicitly, which the emitSessionAlertSignals site legitimately needs to do,
 // would silently fall through to the default instead of getting `undefined` back.)
+//
+// Finding F4, additive: extended one layer earlier (persistence-before-evaluation) to a THIRD
+// fallback shape family -- `{ written_count: 0, retention: undefined }` -- for the metric-persist
+// (appendMetricPoints) and structural fact-persist (appendFactPoints) calls, and to a bare
+// `undefined` for writeStructuralCheckpoint (a checkpoint that doesn't advance this tick just
+// retries next tick, already-tolerated). This shape is deliberately honest, not a plausible-
+// looking guess: zero genuinely were written this tick, and retention state is genuinely unknown
+// -- never synthesize a retention object that didn't happen. writeDaemonStatus is NOT wrapped with
+// safeCandidates -- see its own handling below, which must preserve genuine collector-derived
+// `state` rather than substitute a fallback record disconnected from what this tick actually
+// observed.
 async function safeCandidates(label, produce, fallback) {
   try {
     return await produce();
@@ -465,12 +477,20 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE * structuralIntervalMs;
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
-  const write = await appendMetricPoints(descartesPaths, points, {
-    ts,
-    retentionMs: options.retentionMs,
-    maxBytes: options.maxBytes,
-    now: options.now ?? ts,
-  });
+  // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
+  // degrades this tick's write result to an honest zero rather than aborting the entire tick
+  // before evaluateAndPersistAlerts ever runs.
+  const appendMetrics = options.appendMetricPoints ?? appendMetricPoints;
+  const write = await safeCandidates(
+    "metric-persist",
+    () => appendMetrics(descartesPaths, points, {
+      ts,
+      retentionMs: options.retentionMs,
+      maxBytes: options.maxBytes,
+      now: options.now ?? ts,
+    }),
+    { written_count: 0, retention: undefined },
+  );
 
   // Independent, slower structural (services/network/scheduled-jobs) cadence. Gated behind the
   // already-shipped configDir/learned.json kill switch, checked before any work is attempted
@@ -553,8 +573,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             ...factPointsFromScheduledJobsEvidence(structuralEvidence, { ts }),
           ];
           if (factPoints.length > 0) {
+            // Finding F4: same isolation as the metric-persist call above -- a storage fault here
+            // must not abort the tick before evaluateAndPersistAlerts, and must not fabricate a
+            // retention outcome that did not happen.
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
-            structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts });
+            structuralFacts = await safeCandidates(
+              "structural-fact-persist",
+              () => appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts }),
+              { written_count: 0, retention: undefined },
+            );
           }
 
           // Slice S7a, additive: evaluate any status:"shadow" constraints against the
@@ -572,13 +599,31 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
           shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
         }
+        // Finding F4: a throw here (e.g. a disk fault) must not abort the tick. Safe by the file's
+        // own existing reasoning (checkpoint doc comment above): a checkpoint that doesn't advance
+        // just means structural work retries next tick, already-tolerated for the timeout case.
         const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
-        await writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts });
+        await safeCandidates(
+          "structural-checkpoint-persist",
+          () => writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts }),
+          undefined,
+        );
       }
     }
   }
 
-  const status = await writeDaemonStatus(descartesPaths, {
+  // Finding F4, THE FABRICATION TRAP: `statusRecord` is built here, BEFORE attempting the disk
+  // write, entirely from real data already computed this tick (genuine collector evidence, the
+  // genuine metric-write result above) -- so it is honest regardless of whether the write below
+  // succeeds. On a write failure we must NOT fall back to some other hardcoded/default record and
+  // must NOT touch `state` (which means "collector health", not "persistence health") -- doing
+  // either would fabricate daemon health in the exact tick where persistence just demonstrably
+  // failed, suppressing daemon.status.not_ok precisely when a storage fault should be visible.
+  // Instead: on failure, log it and add ONE new, honestly-named field (`storage_write_error`) to
+  // the SAME genuine record, and use that in-memory record for the rest of the tick regardless of
+  // whether the disk write succeeded -- so evaluateAndPersistAlerts (and everything downstream) is
+  // still reached, unconditionally, with real data.
+  const statusRecord = {
     ts,
     state: "ok",
     mode: options.mode ?? "foreground",
@@ -587,7 +632,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     points_written: write.written_count,
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
-  });
+  };
+  const persistStatus = options.writeDaemonStatus ?? writeDaemonStatus;
+  let status;
+  try {
+    status = await persistStatus(descartesPaths, statusRecord);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[daemon] writeDaemonStatus failed this tick (${message}); continuing with the in-memory status, not fabricating health`);
+    status = { ...statusRecord, storage_write_error: message };
+  }
   // Regression fix (sol re-review of the 7.2 re-phasing): computing the detector candidates
   // MUTATES detector stores (baseline folds, credential/lineage advances), so it must NOT run
   // when evaluateAlerts is false — otherwise the next enabled tick treats the changed state as

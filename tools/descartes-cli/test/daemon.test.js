@@ -3605,3 +3605,223 @@ test("Cross-cutting SURVIVABILITY fix: an injected emitSessionAlertSignals throw
     `expected a warning naming the failing delivery producer, got: ${JSON.stringify(warnings)}`,
   );
 });
+
+// ---------------------------------------------------------------------------------------------
+// Finding F4 fix: before this fix, the metric-persist call (appendMetricPoints), the structural
+// fact-persist call (appendFactPoints), writeStructuralCheckpoint, and writeDaemonStatus were all
+// unguarded I/O sitting BEFORE evaluateAndPersistAlerts in the tick -- a throw from any one of
+// them (ENOSPC/EACCES/EROFS on a disk-pressure host) aborted the ENTIRE tick, so
+// evaluateAndPersistAlerts (and therefore the daemon's own daemon.status.*/daemon.samples.* dead-
+// daemon detection) never ran. These tests extend the same safeCandidates()-isolation discipline
+// already proven above one layer earlier (persistence-before-evaluation), and separately prove the
+// writeDaemonStatus fabrication trap is avoided: a storage-write failure must never make the
+// in-memory status silently look healthy (no hardcoded state, no synthesized retention).
+// ---------------------------------------------------------------------------------------------
+
+test("F4: a throwing appendMetricPoints degrades the metric-persist step to an honest zero-write result instead of aborting the tick -- evaluateAndPersistAlerts still runs, with a warning logged", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: S_LIVE_1_TICK_TS,
+      now: S_LIVE_1_TICK_TS,
+      appendMetricPoints: async () => {
+        throw new Error("simulated appendMetricPoints failure (ENOSPC)");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // The tick completed -- a metric-persist throw did not crash the daemon.
+  assert.equal(result.status.state, "ok");
+
+  // Honest degraded shape: zero written this tick, retention state unknown -- never a guessed
+  // plausible-looking retention object.
+  assert.deepEqual(result.write, { written_count: 0, retention: undefined });
+
+  // evaluateAndPersistAlerts was still reached this tick -- a completely unrelated detector's real
+  // alert (the violated active constraint) still made it through to persistence.
+  const constraintAlert = result.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(constraintAlert, "expected the active-constraint alert to still fire even though metric-persist threw");
+  assert.equal(constraintAlert.status, "active");
+
+  // THE ACTUAL F4 THESIS, proven directly: this tick's own metric points genuinely never reached
+  // metrics.jsonl (the write threw), so historySummary.point_count is genuinely 0 for this window
+  // -- alert-store.js's EXISTING daemon.samples.missing rule (alert-store.js:112-119) fires from
+  // that real, honest evidence. Before this fix, evaluateAndPersistAlerts was never reached at all
+  // on this failure, so this "daemon is dark" signal could never surface. No fabricated metric
+  // value is claimed anywhere -- only the honest "samples missing" family fires.
+  const samplesMissing = result.alerts.alerts.find((alert) => alert.rule_id === "daemon.samples.missing");
+  assert.ok(samplesMissing, "expected the existing daemon.samples.missing watchdog rule to fire from the genuine zero-point-count evidence");
+  assert.equal(samplesMissing.status, "active");
+  assert.equal(samplesMissing.diagnostics.point_count, 0);
+
+  assert.ok(
+    warnings.some((w) => w.includes("metric-persist") && w.includes("simulated appendMetricPoints failure (ENOSPC)")),
+    `expected a warning naming the failing metric-persist step, got: ${JSON.stringify(warnings)}`,
+  );
+});
+
+test("F4: a throwing appendFactPoints during a structural-due tick degrades the structural fact-persist step instead of aborting the tick, with a warning logged", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: structuralProfile(),
+      collectors: fastCollectorFakes(),
+      structuralCollectors: structuralCollectorFakesWithFacts(),
+      ts: "2026-05-24T00:00:00.000Z",
+      now: 0,
+      readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+      loadLearnedConfig: async () => ({ enabled: true }),
+      appendFactPoints: async () => {
+        throw new Error("simulated appendFactPoints failure (EROFS)");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // The tick completed -- a structural fact-persist throw did not crash the daemon.
+  assert.equal(result.status.state, "ok");
+  // Honest degraded shape, matching appendFactPoints' real success shape (fact-store.js:341).
+  assert.deepEqual(result.structuralFacts, { written_count: 0, retention: undefined });
+  // The structural collection itself (evidence collection, independent of the fact-persist call)
+  // still completed and is reflected in status -- only the persist step degraded.
+  assert.equal(result.status.structural_collector_statuses.length, 3);
+  assert(result.status.structural_collector_statuses.every((entry) => entry.status === "ok"));
+
+  assert.ok(
+    warnings.some((w) => w.includes("simulated appendFactPoints failure (EROFS)")),
+    `expected a warning naming the failing structural fact-persist step, got: ${JSON.stringify(warnings)}`,
+  );
+});
+
+test("F4: a throwing writeStructuralCheckpoint degrades instead of aborting the tick -- the checkpoint simply stays unadvanced (already-tolerated retry-next-tick behaviour), with a warning logged", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: structuralProfile(),
+      collectors: fastCollectorFakes(),
+      structuralCollectors: structuralCollectorFakes(),
+      ts: "2026-05-24T00:00:00.000Z",
+      now: 0,
+      readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+      loadLearnedConfig: async () => ({ enabled: true }),
+      writeStructuralCheckpoint: async () => {
+        throw new Error("simulated writeStructuralCheckpoint failure (EACCES)");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // The tick completed -- a checkpoint-write throw did not crash the daemon, and structural
+  // collection itself still ran and is reflected in status.
+  assert.equal(result.status.state, "ok");
+  assert.equal(result.status.structural_collector_statuses.length, 3);
+
+  // The on-disk checkpoint genuinely was not advanced (readStructuralCheckpoint still reports no
+  // prior run) -- this is the same, already-tolerated "retry next tick" behaviour the file's own
+  // comment documents for the timeout case, not a new risk.
+  const checkpoint = await readStructuralCheckpoint(paths);
+  assert.equal(checkpoint.last_structural_run_ms, undefined);
+
+  assert.ok(
+    warnings.some((w) => w.includes("simulated writeStructuralCheckpoint failure (EACCES)")),
+    `expected a warning naming the failing checkpoint-persist step, got: ${JSON.stringify(warnings)}`,
+  );
+});
+
+test("F4 fabrication trap: a throwing writeDaemonStatus does NOT crash the tick and does NOT fabricate a healthy status -- the in-memory status handed downstream carries the genuine collector-derived state plus an honest storage_write_error field, byte-identical to a successful write otherwise", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+
+  // Baseline: the same tick, same inputs, with writeDaemonStatus succeeding for real.
+  const baselinePaths = await tempPaths();
+  await writeLearnedConfig(baselinePaths, { enabled: true });
+  await writeConstraints(baselinePaths, [activeConstraintFixture()]);
+  await appendFactPoints(baselinePaths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+  const baseline = await runIsolatedDaemonTick(baselinePaths);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: S_LIVE_1_TICK_TS,
+      now: S_LIVE_1_TICK_TS,
+      writeDaemonStatus: async () => {
+        throw new Error("simulated writeDaemonStatus failure (ENOSPC)");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // The tick completed -- a status-write throw did not crash the daemon.
+  assert.ok(result.status, "an in-memory status must still exist for this tick even though the disk write failed");
+
+  // THE FABRICATION TRAP: state must be the genuine, already-computed collector-derived value
+  // (here "ok", because the collectors really did succeed this tick) -- NOT a hardcoded fallback
+  // disconnected from what actually happened, and never defaulted/omitted in a way that would make
+  // downstream reads treat the daemon as healthy independent of the real collector evidence.
+  assert.equal(result.status.state, baseline.status.state);
+  assert.equal(result.status.mode, baseline.status.mode);
+  assert.deepEqual(result.status.collector_statuses, baseline.status.collector_statuses);
+  assert.equal(result.status.points_written, baseline.status.points_written);
+  assert.deepEqual(result.status.retention, baseline.status.retention);
+
+  // The ONLY difference from a successful write is the new, honestly-named field -- never an
+  // overload of `state` (which means collector health, not persistence health).
+  assert.equal(result.status.storage_write_error, "simulated writeDaemonStatus failure (ENOSPC)");
+  assert.equal(baseline.status.storage_write_error, undefined);
+
+  // Everything downstream of the status write still ran unconditionally: evaluateAndPersistAlerts
+  // was reached and received this exact in-memory status.
+  assert.ok(result.alerts, "evaluateAndPersistAlerts must still run even though writeDaemonStatus threw");
+  const constraintAlert = result.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(constraintAlert, "a real alert must still fire this tick even though the status write failed");
+
+  assert.ok(
+    warnings.some((w) => w.includes("writeDaemonStatus") && w.includes("simulated writeDaemonStatus failure (ENOSPC)")),
+    `expected a warning naming the writeDaemonStatus failure, got: ${JSON.stringify(warnings)}`,
+  );
+
+  // The on-disk status file was never written for this tick (the write genuinely failed) -- a
+  // reader hitting the stale prior file, not a fabricated fresh-looking one, is the honest outcome.
+  const onDisk = await readDaemonStatus(paths);
+  assert.equal(onDisk, undefined, "no prior status existed and the failed write must not have produced one");
+});
