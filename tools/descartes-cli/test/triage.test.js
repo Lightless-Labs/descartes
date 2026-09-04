@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateHistorySelection, parseTriageArgs } from "../src/triage.js";
+import { evaluateHistorySelection, parseTriageArgs, unverifiedEvidenceRefs } from "../src/triage.js";
 
 function historySummary(lastTs = "2026-05-28T12:00:00.000Z", pointCount = 1) {
   return {
@@ -97,4 +97,24 @@ test("forced history selection uses available summary even when stale", () => {
   });
   assert.equal(selected.used, true);
   assert.equal(selected.skip_reason, undefined);
+});
+
+// F7 fix C: surfaces dangling evidence_refs citations as metadata without rejecting or rewriting
+// the model's free-text diagnosis prose (honest-uncertainty, not mechanical verification).
+test("unverifiedEvidenceRefs flags evidence_refs that do not resolve to real collected evidence ids", () => {
+  const evidence = [{ id: "system-overview" }, { id: "top-processes" }];
+  const diagnosis = { evidence_refs: ["system-overview", "fabricated-id", "top-processes"] };
+
+  assert.deepEqual(unverifiedEvidenceRefs(diagnosis, evidence), ["fabricated-id"]);
+});
+
+test("unverifiedEvidenceRefs returns empty when every cited ref resolves", () => {
+  const evidence = [{ id: "system-overview" }];
+  const diagnosis = { evidence_refs: ["system-overview"] };
+
+  assert.deepEqual(unverifiedEvidenceRefs(diagnosis, evidence), []);
+});
+
+test("unverifiedEvidenceRefs tolerates a diagnosis with no evidence_refs array (e.g. raw_text fallback)", () => {
+  assert.deepEqual(unverifiedEvidenceRefs({ raw_text: "not json" }, []), []);
 });

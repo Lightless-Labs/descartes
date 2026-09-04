@@ -37,3 +37,16 @@ test("fallback diagnosis does not claim evidence was collected when evidence is 
   assert.match(diagnosis.explanation, /no evidence was available/);
   assert.deepEqual(diagnosis.evidence_refs, []);
 });
+
+test("fallback diagnosis treats an all-unable evidence array as no usable evidence, not as collected evidence", () => {
+  const diagnosis = fallbackDiagnosis(
+    "my machine is slow",
+    [{ id: "system-overview", status: "unable", confidence: 0 }],
+    [],
+    "provider timed out"
+  );
+
+  assert.equal(diagnosis.fallback, true);
+  assert.match(diagnosis.summary, /could not collect evidence/);
+  assert.doesNotMatch(diagnosis.summary, /Descartes collected evidence, but/);
+});

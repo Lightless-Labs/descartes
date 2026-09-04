@@ -1,6 +1,8 @@
+import { isUsableEvidence } from "./triage-guard.js";
+
 export function fallbackDiagnosis(prompt, evidence, findings, llmError) {
   const substantiveFindings = findings.filter((finding) => finding.id !== "insufficient_evidence");
-  const hasEvidence = evidence.length > 0;
+  const hasEvidence = evidence.some(isUsableEvidence);
   const emptyEvidenceSummary = llmError
     ? "Descartes could not collect evidence and the LLM request failed."
     : "Descartes could not collect evidence and the model returned no diagnosis text.";

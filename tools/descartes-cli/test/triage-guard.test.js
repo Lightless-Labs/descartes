@@ -4,6 +4,8 @@ import {
   createEvidenceGuardState,
   evidenceGuardDiagnostics,
   evidenceRequiredRetryPrompt,
+  hasCollectedEvidence,
+  isUsableEvidence,
   markEvidenceGuardFallback,
   markEvidenceGuardRetry,
   markEvidenceGuardSatisfied,
@@ -70,6 +72,52 @@ test("evidence retry prompt explicitly requires Descartes evidence tools", () =>
   assert.match(prompt, /must now call collect_triage_evidence/);
   assert.match(prompt, /targeted Descartes evidence tools/);
   assert.match(prompt, /return only valid JSON/);
+});
+
+test("isUsableEvidence rejects failed-collector envelopes and accepts everything else", () => {
+  assert.equal(isUsableEvidence({ id: "system-overview", status: "unable", confidence: 0 }), false);
+  assert.equal(isUsableEvidence({ id: "system-overview", status: "ok" }), true);
+  assert.equal(isUsableEvidence({ id: "containers", status: "unsupported" }), true);
+  assert.equal(isUsableEvidence({ id: "vms", status: "unknown" }), true);
+  assert.equal(isUsableEvidence({ id: "system-overview" }), true);
+  assert.equal(isUsableEvidence(undefined), false);
+  assert.equal(isUsableEvidence(null), false);
+});
+
+test("hasCollectedEvidence ignores unable-status entries but counts a single usable entry among them", () => {
+  assert.equal(hasCollectedEvidence([{ id: "system-overview", status: "unable", confidence: 0 }]), false);
+  assert.equal(hasCollectedEvidence([
+    { id: "system-overview", status: "unable", confidence: 0 },
+    { id: "disk-usage", status: "unable", confidence: 0 },
+  ]), false);
+  assert.equal(hasCollectedEvidence([
+    { id: "system-overview", status: "unable", confidence: 0 },
+    { id: "top-processes", status: "ok" },
+  ]), true);
+  assert.equal(hasCollectedEvidence([]), false);
+});
+
+test("evidence guard retries then falls back when every collected envelope is status unable across both rounds", () => {
+  const guard = createEvidenceGuardState({ investigationEnabled: true });
+  const failedEvidence = [{ id: "system-overview", status: "unable", confidence: 0 }];
+
+  assert.equal(shouldRetryForEvidence({ guard, assistantText: "Looks fine", evidence: failedEvidence }), true);
+  markEvidenceGuardRetry(guard);
+  assert.equal(guard.retry_count, 1);
+
+  // Second round still only produced failed envelopes.
+  assert.equal(shouldRetryForEvidence({ guard, assistantText: "Still looks fine", evidence: failedEvidence }), false);
+  markEvidenceGuardSatisfied(guard, failedEvidence);
+  assert.equal(guard.outcome, "retry_requested", "must not be marked satisfied by unable-only evidence");
+  assert.equal(shouldFallbackForNoEvidence({ guard, assistantText: "Still looks fine", evidence: failedEvidence }), true);
+  markEvidenceGuardFallback(guard);
+
+  assert.deepEqual(evidenceGuardDiagnostics(guard), {
+    enabled: true,
+    outcome: "fallback_precollected",
+    retry_count: 1,
+    fallback_reason: "no_evidence_after_retry",
+  });
 });
 
 test("evidence guard is disabled for no-investigate synthesis", () => {

@@ -204,6 +204,18 @@ function parseDiagnosisJson(text) {
   }
 }
 
+// Fix C (F7): surfaces citation drift between the model's free-text evidence_refs and the real
+// collected evidence ids as metadata for the operator. This does NOT mechanically verify the
+// model's natural-language diagnosis prose -- it only checks that cited ids resolve to something
+// this session actually collected, honestly flagging what it cannot verify rather than pretending
+// dangling citations are trustworthy.
+export function unverifiedEvidenceRefs(diagnosis, evidence) {
+  const evidenceIds = new Set((evidence ?? []).map((item) => item.id));
+  return Array.isArray(diagnosis?.evidence_refs)
+    ? diagnosis.evidence_refs.filter((ref) => !evidenceIds.has(ref))
+    : [];
+}
+
 function renderFallbackHuman(prompt, diagnosis, evidence, findings) {
   const evidenceLines = findings.length > 0
     ? findings.map((finding) => `  - ${finding.summary} [${(finding.evidence_refs ?? []).join(", ")}]`)
@@ -318,6 +330,7 @@ export async function runTriage(paths, args) {
       history_freshness_ms: historySelection.freshness_ms,
       history_max_age_ms: historySelection.max_age_ms,
       history_daemon_status: historySelection.daemon_status,
+      unverified_evidence_refs: unverifiedEvidenceRefs(diagnosis, evidence),
       history_summary: historySummary ? {
         point_count: historySummary.point_count,
         matched_point_count: historySummary.matched_point_count,

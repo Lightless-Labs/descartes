@@ -7,8 +7,18 @@ export function createEvidenceGuardState({ investigationEnabled }) {
   };
 }
 
+// Deliberately a narrow denylist on the one status string the codebase already uses uniformly to
+// mean "no real signal was obtained" (envelope.js's shared catch-all, and every tool's own
+// envelopeStatus() helper). Do NOT also exclude "unknown"/"unsupported"/"partial"/"warning" --
+// those statuses mean a collector genuinely ran and returned a real (if ambiguous or degraded)
+// fact; excluding them would over-gate in the other direction (spurious retries/fallback on
+// legitimate empty-but-successful results).
+export function isUsableEvidence(item) {
+  return Boolean(item) && item.status !== "unable";
+}
+
 export function hasCollectedEvidence(evidence) {
-  return Array.isArray(evidence) && evidence.length > 0;
+  return Array.isArray(evidence) && evidence.some(isUsableEvidence);
 }
 
 export function shouldRetryForEvidence({ guard, assistantText, evidence, maxRetries = 1 }) {

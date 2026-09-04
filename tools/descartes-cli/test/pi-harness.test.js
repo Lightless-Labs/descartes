@@ -32,6 +32,35 @@ test("collect_recent_logs window_minutes schema bound stays in lockstep with log
   assert.equal(logsTool.parameters.properties.window_minutes.maximum, MAX_WINDOW_MINUTES);
 });
 
+// F3 gap fix (must-fix 1): collect_services' on-demand tool result must never leak the
+// AUTHORITATIVE, up-to-~1000-entry `services_census` (tools/services.js's
+// DEFAULT_SERVICE_CENSUS_CEILING) -- that field exists for the daemon's service-baseline
+// machinery only. This tool's own parameter schema (service_limit, max 200 here / 80 by
+// default) promises a presentation-bounded result, so services_census must be stripped before
+// the model ever sees it, in both the structured `details` and the stringified `content` text
+// (what the model actually reads). collectServiceEvidence itself always populates
+// services_census (see tools/services.js), so this is a real regression guard, not vacuous.
+test("collect_services tool result omits services_census, keeping only the presentation-bounded services field", async () => {
+  const paths = resolveDescartesPaths();
+  const tools = createEvidenceTools(paths);
+  const servicesTool = tools.find((tool) => tool.name === "collect_services");
+  assert.ok(servicesTool, "expected collect_services to be registered");
+
+  const toolResult = await servicesTool.execute("test-call-id", {});
+
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(toolResult.details.result, "services_census"),
+    false,
+    "services_census must not reach the model's tool result",
+  );
+  assert.ok(Array.isArray(toolResult.details.result.services), "the presentation-bounded services field must still be present");
+  assert.equal(
+    toolResult.content[0].text.includes("services_census"),
+    false,
+    "the stringified tool-result text must not mention services_census either",
+  );
+});
+
 test("createEvidenceTools includes inspect_runtime_provenance with a single-target parameter contract", () => {
   const paths = resolveDescartesPaths();
   const tools = createEvidenceTools(paths);
@@ -90,4 +119,57 @@ test("inspect_runtime_provenance's executor threads paths into resolveProvenance
   assert.equal(envelope.result.resolved.pid, process.pid);
   assert.equal(envelope.result.privilege.mechanism, "unprivileged");
   assert.equal(envelope.result.privilege.elevated_used, false);
+});
+
+// F7 fix B: derive_findings must only ever see evidence this session's own collector tool calls
+// actually produced (referenced by id), never a model-fabricated evidence envelope passed inline.
+test("derive_findings resolves ids from this session's own prior collect_system call and reports a never-collected id as unresolved", async () => {
+  const paths = resolveDescartesPaths();
+  const tools = createEvidenceTools(paths);
+  const collectSystem = tools.find((tool) => tool.name === "collect_system");
+  const deriveFindingsTool = tools.find((tool) => tool.name === "derive_findings");
+  assert.ok(collectSystem);
+  assert.ok(deriveFindingsTool);
+
+  const collected = await collectSystem.execute("call-1", {});
+  const realId = collected.details.id;
+  assert.ok(realId, "collect_system's envelope must carry a real id to reference");
+
+  const result = await deriveFindingsTool.execute("call-2", {
+    evidence_ids: [realId, "fabricated-evidence-id-never-collected"],
+  });
+
+  assert.deepEqual(result.details.unresolved_evidence_ids, ["fabricated-evidence-id-never-collected"]);
+  // The real envelope actually reached deriveFindings: findings is an array (possibly empty
+  // depending on host load), not a rejection -- what matters is the fabricated id did not
+  // silently pass through as if it had been collected.
+  assert.ok(Array.isArray(result.details.findings));
+});
+
+test("derive_findings called with no prior collector call in this session cannot produce a fabricated finding", async () => {
+  const paths = resolveDescartesPaths();
+  const tools = createEvidenceTools(paths);
+  const deriveFindingsTool = tools.find((tool) => tool.name === "derive_findings");
+
+  const result = await deriveFindingsTool.execute("call-1", {
+    evidence_ids: ["system-overview"],
+    // A model attempting to smuggle a self-fabricated envelope inline; the new schema only
+    // accepts evidence_ids (strings), so this key is not even part of the accepted shape.
+  });
+
+  assert.deepEqual(result.details.unresolved_evidence_ids, ["system-overview"]);
+  // No resolved evidence reached deriveFindings, so it explicitly represents insufficient
+  // evidence (degrade-not-fabricate) rather than fabricating a resource-pressure finding.
+  assert.deepEqual(result.details.findings.map((finding) => finding.id), ["insufficient_evidence"]);
+});
+
+test("derive_findings tool schema only accepts evidence_ids (string refs), not inline evidence envelopes", () => {
+  const paths = resolveDescartesPaths();
+  const tools = createEvidenceTools(paths);
+  const deriveFindingsTool = tools.find((tool) => tool.name === "derive_findings");
+
+  assert.ok(deriveFindingsTool.parameters.properties.evidence_ids, "expected an evidence_ids parameter");
+  assert.equal(deriveFindingsTool.parameters.properties.evidence_ids.type, "array");
+  assert.equal(deriveFindingsTool.parameters.properties.evidence_ids.items.type, "string");
+  assert.equal(deriveFindingsTool.parameters.properties.evidence, undefined, "must not accept a raw model-supplied evidence array");
 });
