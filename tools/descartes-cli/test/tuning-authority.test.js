@@ -23,7 +23,7 @@ import {
   validateTuningDecisionRecord,
   writeTuningDecisions,
 } from "../src/tuning-authority.js";
-import { loadTuningCandidates, tuningCandidateId, writeTuningCandidates } from "../src/tuning-store.js";
+import { loadTuningCandidates, resolveTuningStorePaths, tuningCandidateId, writeTuningCandidates } from "../src/tuning-store.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-tuning-authority-test-"));
@@ -447,28 +447,64 @@ test("a denial never fabricates a wrong-nonce attempt on an already-decided reco
 });
 
 // ============================================================================================
-// MUST-FIX 4 -- malformed-retune rejection is fail-closed end-to-end through the authority gate
+// MUST-FIX 4 -- malformed-retune rejection is fail-closed at the STORE BOUNDARY (security-sweep F6)
 // ============================================================================================
-
-test("MUST-FIX 4: approving a retune candidate whose proposed.expected is malformed fails the WHOLE attempt closed -- no candidate flip, no decision flip, no constraints.json write", async () => {
+//
+// Originally this asserted the AUTHORITY gate (decideTuningApproval) fails closed at APPLY time on a
+// malformed proposed.expected. Security-sweep F6 hardened tuning-store.js so a malformed retune
+// candidate is rejected EARLIER and cannot be persisted OR loaded at all -- writeTuningCandidates
+// throws, loadTuningCandidates drops it -- so the apply-time path is unreachable THROUGH THE STORE
+// by design (exactly F6's "never persisted / never review-ready" guarantee). The apply-time backstop
+// itself still exists (constraint-store.js:688) and is covered in isolation by constraint-store.test.js
+// ("REJECTS a non-finite value"). This test now pins the STRONGER, EARLIER guarantee at the same
+// authority-facing boundary: a malformed retune never reaches the gate, and the live monitor is never
+// touched.
+test("MUST-FIX 4 (F6): a malformed retune candidate is rejected at the store boundary -- write throws, a raw round-tripped one is dropped at load -- so it can never reach the authority gate or mutate a live constraint", async () => {
   const paths = await tempPaths();
   const constraint = activeConstraint();
   await writeConstraints(paths, [constraint]);
-  const candidate = reviewReadyRetuneCandidate({ proposed: { expected: { comparator: "gte", value: Number.NaN } } });
-  await writeTuningCandidates(paths, [candidate]);
-  const now = "2026-07-10T00:00:00.000Z";
-  const { approval } = await mintPendingTuningApproval(paths, candidate, { now });
+  const malformed = reviewReadyRetuneCandidate({ proposed: { expected: { comparator: "gte", value: Number.NaN } } });
 
-  await assert.rejects(() => decideTuningApproval(paths, candidate.id, approval.nonce, "approved", { now }), /proposedExpected must be/);
+  // (1) Write-time gate: the malformed retune candidate cannot be persisted into the store the
+  // authority reads -- writeTuningCandidates validates every record and throws before any file write.
+  await assert.rejects(
+    () => writeTuningCandidates(paths, [malformed]),
+    /requires proposed\.expected to be/,
+    "a malformed retune candidate must be rejected at write, never persisted",
+  );
+  assert.deepEqual(
+    (await loadTuningCandidates(paths)).candidates,
+    [],
+    "nothing was written -- the tmp+rename never completed, so no malformed candidate reached the store",
+  );
 
+  // (2) Load-time gate (defense-in-depth for a hand-edited / round-tripped store where an overflow
+  // was persisted as JSON null): a malformed retune record placed RAW on disk is silently dropped by
+  // loadTuningCandidates, so it never becomes a review-ready candidate the authority could approve.
+  const { tuningCandidatesFile } = resolveTuningStorePaths(paths);
+  await fs.mkdir(path.dirname(tuningCandidatesFile), { recursive: true });
+  await fs.writeFile(
+    tuningCandidatesFile,
+    JSON.stringify(
+      { schema_version: 1, candidates: [{ ...malformed, proposed: { expected: { comparator: "gte", value: null } } }] },
+      null,
+      2,
+    ),
+    { mode: 0o600 },
+  );
+  assert.deepEqual(
+    (await loadTuningCandidates(paths)).candidates,
+    [],
+    "a raw round-tripped malformed retune must be dropped at load, never surfaced to the authority",
+  );
+
+  // (3) The live monitor is untouched throughout: constraints.json is byte-identical.
   const { constraints } = await loadConstraints(paths);
-  assert.deepEqual(constraints[0].expected, { comparator: "gte", value: 1000 }, "constraints.json must be byte-identical -- the malformed retune never wrote anything");
-
-  const { candidates } = await loadTuningCandidates(paths);
-  assert.equal(candidates[0].status, "review-ready", "the candidate must stay review-ready (correctable/retryable), never silently flipped to approved");
-
-  const { decisions } = await loadTuningDecisions(paths);
-  assert.equal(decisions.find((d) => d.id === approval.id).status, "pending", "the pending approval record must stay pending, not silently consumed");
+  assert.deepEqual(
+    constraints[0].expected,
+    { comparator: "gte", value: 1000 },
+    "no malformed retune ever mutated the live constraint",
+  );
 });
 
 // ============================================================================================

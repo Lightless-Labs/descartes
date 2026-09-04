@@ -58,11 +58,11 @@ function portPoint({ entityKey = "tcp:127.0.0.1:5432", ts, owner = "postgres", o
   return point;
 }
 
-function stableServiceHistory({ entityKey = "nginx.service", running = "true", count = 3, spanDays = 8 } = {}) {
+function stableServiceHistory({ entityKey = "nginx.service", running = "true", count = 3, spanDays = 8, sourceEnvelopeId = "services" } = {}) {
   const points = [];
   for (let index = 0; index < count; index += 1) {
     const ts = BASE_TS + Math.round((spanDays * DAY_MS * index) / Math.max(1, count - 1));
-    points.push(servicePoint({ entityKey, ts, running }));
+    points.push(servicePoint({ entityKey, ts, running, sourceEnvelopeId }));
   }
   return points;
 }
@@ -199,6 +199,15 @@ test("mineConstraintCandidates(factHistory, snapshots, options) — snapshots om
   assert.deepEqual(withEmptyArray, withSnapshotData);
 });
 
+test("F8: mineConstraintCandidates does not crash on a very large confirming sample set (Math.min/max(...arr) spread overflows the call stack around ~125k elements)", () => {
+  const factHistory = stableServiceHistory({ count: 200_000, spanDays: 8 });
+  const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].provenance.samples, 200_000);
+  assert.equal(candidates[0].first_observed, new Date(BASE_TS).toISOString());
+  assert.equal(candidates[0].last_verified, new Date(BASE_TS + 8 * DAY_MS).toISOString());
+});
+
 // --- Sanitization gate (HARD GATE) ---
 
 test("an adversarial fact whose entity_key is a raw path cannot produce a constraint whose id/family/target carries a raw path", () => {
@@ -227,6 +236,59 @@ test("an entirely-unsafe entity_key (nothing survives sanitization) is dropped r
   const factHistory = stableServiceHistory({ entityKey: "////" });
   const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
   assert.deepEqual(candidates, []);
+});
+
+test("F4: a hostile observedValue (hand-edited/regressed facts.jsonl, not a normal-operation translator output) is sanitized before entering expected.value and both fixtures", () => {
+  const hostileValue = "/etc/passwd";
+  const points = [0, 1, 2].map((i) => ({
+    ts: new Date(BASE_TS + i * 4 * DAY_MS).toISOString(),
+    fact_name: "service.presence",
+    entity_key: "nginx.service",
+    attributes: { running: hostileValue, manager: "systemd" },
+    source_envelope_id: "services",
+    source_tool: "collect_services",
+    sensitivity: "operational",
+  }));
+  const candidates = mineConstraintCandidates(points, [], { now: BASE_TS + 8 * DAY_MS });
+
+  assert.equal(candidates.length, 1);
+  const [candidate] = candidates;
+  assert.equal(candidate.expected.value.includes("/"), false, `expected.value ${candidate.expected.value} must not carry a raw path`);
+  assert(isSafeEnumString(candidate.expected.value));
+  for (const fixture of candidate.fixtures) {
+    const value = fixture.input["service.presence"];
+    assert.equal(value.includes("/"), false, `fixture value ${value} must not carry a raw path`);
+  }
+});
+
+test("F4: an observedValue that survives sanitization into nothing safe drops the group entirely, rather than mining a constraint with an unsafe expected.value", () => {
+  const points = [0, 1, 2].map((i) => ({
+    ts: new Date(BASE_TS + i * 4 * DAY_MS).toISOString(),
+    fact_name: "service.presence",
+    entity_key: "nginx.service",
+    attributes: { running: "////", manager: "systemd" },
+    source_envelope_id: "services",
+    source_tool: "collect_services",
+    sensitivity: "operational",
+  }));
+  const candidates = mineConstraintCandidates(points, [], { now: BASE_TS + 8 * DAY_MS });
+  assert.deepEqual(candidates, []);
+});
+
+test("F4: a hostile source_envelope_id (hand-edited/regressed facts.jsonl) is sanitized before entering provenance.source_collectors, and dropped outright if nothing safe survives", () => {
+  const points = [
+    ...stableServiceHistory({ sourceEnvelopeId: "/etc/passwd" }),
+    servicePoint({ ts: BASE_TS + 8 * DAY_MS, sourceEnvelopeId: "////" }),
+  ];
+  const candidates = mineConstraintCandidates(points, [], { now: BASE_TS + 8 * DAY_MS });
+
+  assert.equal(candidates.length, 1);
+  const [candidate] = candidates;
+  assert(candidate.provenance.source_collectors.length > 0);
+  for (const collector of candidate.provenance.source_collectors) {
+    assert.equal(collector.includes("/"), false, `source_collectors entry ${collector} must not carry a raw path`);
+    assert(isSafeEnumString(collector));
+  }
 });
 
 // --- Target-truncation collision (Codex review finding #8): two long entity_keys sharing a

@@ -333,21 +333,36 @@ function denialReason(promotions, constraintId, nonce, nowMs) {
 /**
  * Appends a denial entry to the promotion record the attempt actually targeted: the
  * nonce-matching record (attributing a replay of a consumed nonce to the record it belongs to),
- * else the live `pending` record being attacked. It is a no-op (nothing written) when neither
- * exists — including the "cannot skip review" case (no record at all). It NEVER falls back to an
- * arbitrary already-decided record, which would fabricate a wrong-nonce attempt in the audit
- * trail of a promotion that was never the target. Never changes a record's `status`/`decided_at`;
- * only appends to audit_transitions, so an already-decided record's decision is never overwritten.
+ * else the currently-VALID (unexpired) `pending` record being attacked, else any pending record
+ * (F5: never merely the first pending one in array order — see isUnexpiredPending below). It is a
+ * no-op (nothing written) when neither exists — including the "cannot skip review" case (no
+ * record at all). It NEVER falls back to an arbitrary already-decided record, which would
+ * fabricate a wrong-nonce attempt in the audit trail of a promotion that was never the target.
+ * Never changes a record's `status`/`decided_at`; only appends to audit_transitions, so an
+ * already-decided record's decision is never overwritten.
  */
 async function logDenial(descartesPaths, promotions, constraintId, nonce, reason, options = {}) {
   const candidates = (promotions ?? []).filter((record) => record?.promotion_ref === constraintId);
   if (candidates.length === 0) return promotions;
 
+  const nowIso = normalizeIso(options.now ?? new Date().toISOString());
+  const nowMs = new Date(nowIso).getTime();
+  // Attribute the denial to the record whose nonce was actually supplied; else to the currently-
+  // VALID (unexpired) pending record being attacked -- NOT merely the first pending one in array
+  // order (mirrors tuning-authority.js's logTuningDenial fix, F5): expired promotion records keep
+  // status:"pending" (only their `expiry` ages out), so a stale-expired and a freshly-re-minted
+  // valid record can coexist as pending, and picking the first would misattribute the denial to
+  // the stale record's audit trail. Falls back to any pending record only if none are still valid.
+  const isUnexpiredPending = (record) => {
+    if (record.status !== "pending") return false;
+    const expiryMs = new Date(record.expiry).getTime();
+    return Number.isFinite(expiryMs) && expiryMs > nowMs;
+  };
   const target =
     candidates.find((record) => record.nonce === nonce)
+    ?? candidates.find(isUnexpiredPending)
     ?? candidates.find((record) => record.status === "pending");
   if (!target) return promotions;
-  const nowIso = normalizeIso(options.now ?? new Date().toISOString());
   const updated = promotions.map((record) => {
     if (record !== target) return record;
     return {

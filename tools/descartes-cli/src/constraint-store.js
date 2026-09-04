@@ -563,10 +563,23 @@ export const SEED_CONSTRAINTS = [
  * without re-scanning the result.
  */
 export function promoteReviewReadyToActive(constraints, constraintId, options = {}) {
+  const source = constraints ?? [];
+
+  // F2: a duplicate id (two records sharing constraintId, both status:"review-ready") can only
+  // arise from direct constraints.json authoring -- the same trust boundary as the deferred F1
+  // file-authored-active item, granting an attacker nothing beyond it. Still, `.map` alone would
+  // flip EVERY matching record, silently violating the one-approval-one-record invariant. Fail
+  // closed via the SAME sentinel this function already returns on every other precondition
+  // failure (activated:false, input untouched) -- the caller (promotion-store.js's
+  // decideConstraintPromotion) already routes activated:false through its transition_failed
+  // logDenial-audit branch before throwing, so this never needs its own raw throw.
+  const matchCount = source.filter((constraint) => constraint?.id === constraintId && constraint?.status === "review-ready").length;
+  if (matchCount > 1) return { constraints: source, activated: false };
+
   const ts = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const note = options.note ?? "human-approved via descartes learned approve";
   let activated = false;
-  const updated = (constraints ?? []).map((constraint) => {
+  const updated = source.map((constraint) => {
     if (!constraint || constraint.id !== constraintId || constraint.status !== "review-ready") return constraint;
     activated = true;
     return {
@@ -602,10 +615,22 @@ export function promoteReviewReadyToActive(constraints, constraintId, options = 
  * with a matching id but a different status) passes through unchanged.
  */
 export function retireActiveConstraint(constraints, constraintId, options = {}) {
+  const source = constraints ?? [];
+
+  // F2: a duplicate id (two active-status records sharing constraintId) requires direct
+  // constraints.json authoring -- the same trust boundary as the deferred F1 item. `.map` alone
+  // would retire EVERY matching record; throw (consistent with this function's existing
+  // throw-on-precondition-failure contract below) so the caller's fail-closed catch takes over
+  // rather than silently mutating more than the one approved record.
+  const matchCount = source.filter((constraint) => constraint?.id === constraintId && constraint?.status === "active").length;
+  if (matchCount > 1) {
+    throw new Error(`retireActiveConstraint: ambiguous duplicate active-status records found for id ${JSON.stringify(constraintId)}`);
+  }
+
   const ts = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const note = options.note ?? "tuning-approved retirement (chronically noisy)";
   let retired = false;
-  const updated = (constraints ?? []).map((constraint) => {
+  const updated = source.map((constraint) => {
     if (!constraint || constraint.id !== constraintId || constraint.status !== "active") return constraint;
     retired = true;
     return {
@@ -634,7 +659,11 @@ export function retireActiveConstraint(constraints, constraintId, options = {}) 
 // === "gte" or "lte" (never "eq"/pattern -- categorical targets have no retune path), and a
 // finite numeric `value` (Number.isFinite, which -- unlike coercing Number(value) first --
 // rejects a string/NaN/Infinity/undefined outright rather than silently coercing a string).
-function isValidNumericExpected(expected) {
+// Exported (additive, F6) so tuning-store.js's validateTuningCandidate can reuse this exact
+// numeric-shape predicate for retune candidates rather than duplicating it — one definition of
+// "valid numeric expected", shared by the write-time gate here and the tuning-candidate
+// validation gate there.
+export function isValidNumericExpected(expected) {
   return !!expected
     && typeof expected === "object"
     && !Array.isArray(expected)
@@ -660,10 +689,22 @@ export function applyApprovedRetune(constraints, constraintId, proposedExpected,
     );
   }
 
+  const source = constraints ?? [];
+
+  // F2: a duplicate id (two active-status records sharing constraintId) requires direct
+  // constraints.json authoring -- the same trust boundary as the deferred F1 item. `.map` alone
+  // would retune EVERY matching record; throw (consistent with this function's existing
+  // throw-on-precondition-failure contract below) so the caller's fail-closed catch takes over
+  // rather than silently retuning more than the one approved record.
+  const matchCount = source.filter((constraint) => constraint?.id === constraintId && constraint?.status === "active").length;
+  if (matchCount > 1) {
+    throw new Error(`applyApprovedRetune: ambiguous duplicate active-status records found for id ${JSON.stringify(constraintId)}`);
+  }
+
   const ts = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const note = options.note ?? "tuning-approved retune";
   let updatedAny = false;
-  const updated = (constraints ?? []).map((constraint) => {
+  const updated = source.map((constraint) => {
     if (!constraint || constraint.id !== constraintId || constraint.status !== "active") return constraint;
     updatedAny = true;
     return {

@@ -145,6 +145,41 @@ test("validateTuningCandidate rejects a bad kind/status/granularity/missing fiel
   assert.throws(() => validateTuningCandidate(draftTuningCandidate({ schema_version: undefined })), /numeric schema_version/);
 });
 
+test("F6: validateTuningCandidate accepts a retune record with a well-formed numeric proposed.expected", () => {
+  const record = draftTuningCandidate({
+    kind: "retune",
+    proposed: { expected: { comparator: "gte", value: 950 } },
+  });
+  assert.equal(validateTuningCandidate(record), true);
+});
+
+test("F6: validateTuningCandidate rejects a retune record whose proposed.expected.value overflowed to Infinity -- never persisted", () => {
+  const record = draftTuningCandidate({
+    kind: "retune",
+    proposed: { expected: { comparator: "lte", value: Infinity } },
+  });
+  assert.throws(() => validateTuningCandidate(record), /proposed\.expected/);
+});
+
+test("F6: validateTuningCandidate rejects a retune record whose proposed.expected round-tripped to null (JSON.stringify(Infinity) -> null) -- never review-ready", () => {
+  const record = draftTuningCandidate({
+    kind: "retune",
+    proposed: { expected: null },
+  });
+  assert.throws(() => validateTuningCandidate(record), /proposed\.expected/);
+});
+
+test("F6: validateTuningCandidate rejects a retune record with a non-gte/lte comparator or missing proposed entirely", () => {
+  assert.throws(
+    () => validateTuningCandidate(draftTuningCandidate({ kind: "retune", proposed: { expected: { comparator: "eq", value: 1 } } })),
+    /proposed\.expected/,
+  );
+  assert.throws(
+    () => validateTuningCandidate(draftTuningCandidate({ kind: "retune", proposed: null })),
+    /proposed\.expected/,
+  );
+});
+
 test("writeTuningCandidates/loadTuningCandidates round-trip", async () => {
   const paths = await tempPaths();
   const candidate = draftTuningCandidate();
@@ -222,6 +257,18 @@ test("proposeRetune: eq/pattern comparator -> undefined (categorical has no nume
 test("proposeRetune: empty observedValues -> undefined, never +/-Infinity", () => {
   assert.equal(proposeRetune("gte", []), undefined);
   assert.equal(proposeRetune("lte", []), undefined);
+});
+
+test("F6: proposeRetune never returns a non-finite result -- an extreme observed value that would overflow past the margin -> undefined, not Infinity", () => {
+  // Number.MAX_VALUE * (1 + DEFAULT_RETUNE_MARGIN_PCT) overflows to +Infinity (the lte ceiling
+  // loosens UPWARD, i.e. multiplies by a factor > 1 -- the only direction that can overflow).
+  assert.equal(proposeRetune("lte", [Number.MAX_VALUE]), undefined);
+});
+
+test("F8: proposeRetune does not crash on a very large observedValues array (Math.min/max(...arr) spread overflows the call stack around ~125k elements)", () => {
+  const values = Array.from({ length: 200_000 }, (_, i) => i);
+  assert.equal(proposeRetune("gte", values), 0 * (1 - DEFAULT_RETUNE_MARGIN_PCT));
+  assert.equal(proposeRetune("lte", values), 199_999 * (1 + DEFAULT_RETUNE_MARGIN_PCT));
 });
 
 // ============================================================================================

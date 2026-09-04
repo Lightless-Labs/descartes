@@ -627,6 +627,19 @@ test("promoteReviewReadyToActive only touches the named constraint, leaving ever
   assert.equal(constraints.find((c) => c.id === "constraint.other").status, "review-ready");
 });
 
+test("F2: promoteReviewReadyToActive with a DUPLICATE id (two review-ready records sharing the same id) fails closed -- activated:false, constraints array unchanged, no record mutated", () => {
+  const dup1 = draftConstraint({ status: "review-ready", promotion_history: [{ ts: "2026-07-08T00:00:00.000Z", from: "shadow", to: "review-ready", actor: "deterministic-gate" }] });
+  const dup2 = draftConstraint({ status: "review-ready", promotion_history: [{ ts: "2026-07-09T00:00:00.000Z", from: "shadow", to: "review-ready", actor: "deterministic-gate" }] });
+  const other = draftConstraint({ id: "constraint.other", status: "review-ready" });
+  const input = [dup1, dup2, other];
+
+  const { constraints, activated } = promoteReviewReadyToActive(input, dup1.id, { now: "2026-07-10T00:00:00.000Z" });
+
+  assert.equal(activated, false, "must not activate when the id is ambiguous across multiple records");
+  assert.deepEqual(constraints, input, "the input must be returned unchanged, not partially mutated");
+  assert.equal(constraints.filter((c) => c.id === dup1.id && c.status === "active").length, 0, "neither duplicate was flipped to active");
+});
+
 test("promoteReviewReadyToActive's function body contains exactly one status:\"active\" literal (source-level proof there is no second, stray writer inside it)", async () => {
   const source = await fs.readFile(path.resolve(import.meta.dirname, "../src/constraint-store.js"), "utf8");
   const helperStart = source.indexOf("export function promoteReviewReadyToActive");
@@ -703,6 +716,16 @@ test("retireActiveConstraint throws on a non-active constraint (e.g. still revie
   assert.throws(() => retireActiveConstraint([reviewReady], reviewReady.id), /no status:"active" constraint found/);
 });
 
+test("F2: retireActiveConstraint throws (never silently retires one of them) when TWO active records share the same id", () => {
+  const dup1 = activeNumericConstraint();
+  const dup2 = activeNumericConstraint({ last_verified: "2026-07-05T00:00:00.000Z" });
+  const input = [dup1, dup2];
+  assert.throws(() => retireActiveConstraint(input, dup1.id), /duplicate|ambiguous/i);
+  // Fail-closed: the caller catches the throw and writes nothing (constraint-store.test.js
+  // exercises the pure function directly -- the no-partial-write guarantee lives in the throw
+  // itself, mirrored by applyApprovedRetune's identical precondition below).
+});
+
 test("applyApprovedRetune: a VALID loosened gte value persists and changes evaluateConstraints' live output", () => {
   const target = activeNumericConstraint({ expected: { comparator: "gte", value: 1000 } });
   const factLookup = () => 800; // violates the current gte:1000 floor
@@ -729,6 +752,13 @@ test("applyApprovedRetune throws (does not silently no-op) when the id does not 
 test("applyApprovedRetune throws on a non-active constraint -- precondition is status===\"active\"", () => {
   const shadow = activeNumericConstraint({ status: "shadow" });
   assert.throws(() => applyApprovedRetune([shadow], shadow.id, { comparator: "gte", value: 1 }), /no status:"active" constraint found/);
+});
+
+test("F2: applyApprovedRetune throws (never retunes one of them arbitrarily) when TWO active records share the same id", () => {
+  const dup1 = activeNumericConstraint();
+  const dup2 = activeNumericConstraint({ last_verified: "2026-07-05T00:00:00.000Z" });
+  const input = [dup1, dup2];
+  assert.throws(() => applyApprovedRetune(input, dup1.id, { comparator: "gte", value: 750 }), /duplicate|ambiguous/i);
 });
 
 // --- MUST-FIX 4 (plan §5.7/§5.9): shape validation prevents a silent live-monitor disable ---

@@ -10,6 +10,7 @@
 
 import crypto from "node:crypto";
 import { buildConstraintTarget, loadConstraints, SCHEMA_VERSION, writeConstraints } from "./constraint-store.js";
+import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { parseDurationMs } from "./history-store.js";
 import { readFactPoints } from "./fact-store.js";
@@ -83,6 +84,25 @@ function groupFactPoints(factHistory) {
   return [...groups.values()];
 }
 
+// F8: loop-based min/max, NOT Math.min(...arr)/Math.max(...arr) -- a spread of a large array
+// (observed empirically: ~125k+ elements) blows the call stack with a RangeError. Identical
+// numeric result to the spread form for every array that doesn't crash it.
+function arrayMin(values) {
+  let min = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] < min) min = values[i];
+  }
+  return min;
+}
+
+function arrayMax(values) {
+  let max = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] > max) max = values[i];
+  }
+  return max;
+}
+
 function differentFixtureValue(observedValue) {
   if (observedValue === "true") return "false";
   if (observedValue === "false") return "true";
@@ -125,11 +145,22 @@ function buildMinedConstraint(group, { minObservationDays, nowIso }) {
   const observedValue = confirming[0]?.attributes?.[attributeKey];
   if (observedValue === undefined) return undefined;
 
+  // F4, defense-in-depth (mirrors the target re-sanitization above): in normal operation
+  // observedValue/source_envelope_id are already safe (fact-translators.js writes closed-enum
+  // attribute values and a fixed collector label) -- this guards the case this file's own doc
+  // comment above already names, a hand-edited/regressed facts.jsonl, not a normal-operation
+  // leak. An observedValue that sanitizes into nothing safe drops the whole group (degrade,
+  // never fabricate — same posture as the target/attribute-missing checks above).
+  const safeObservedValue = sanitizeIdentityString(String(observedValue));
+  if (safeObservedValue === undefined) return undefined;
+
   const timestampsMs = confirming.map((point) => new Date(point.ts).getTime()).filter(Number.isFinite);
   if (timestampsMs.length === 0) return undefined;
-  const firstObservedMs = Math.min(...timestampsMs);
-  const lastVerifiedMs = Math.max(...timestampsMs);
-  const sourceCollectors = [...new Set(confirming.map((point) => point.source_envelope_id).filter(Boolean))];
+  const firstObservedMs = arrayMin(timestampsMs);
+  const lastVerifiedMs = arrayMax(timestampsMs);
+  const sourceCollectors = [
+    ...new Set(confirming.map((point) => sanitizeIdentityString(point.source_envelope_id)).filter((value) => value !== undefined)),
+  ];
   const confidence = Math.min(1, Math.max(0, confirming.length / all.length));
 
   return {
@@ -137,7 +168,7 @@ function buildMinedConstraint(group, { minObservationDays, nowIso }) {
     kind: "constraint",
     family,
     target,
-    expected: { comparator: "eq", value: String(observedValue) },
+    expected: { comparator: "eq", value: safeObservedValue },
     status: "draft",
     confidence,
     provenance: {
@@ -147,8 +178,8 @@ function buildMinedConstraint(group, { minObservationDays, nowIso }) {
       mined_at: nowIso,
     },
     fixtures: [
-      { input: { [fact_name]: observedValue }, expect_match: true },
-      { input: { [fact_name]: differentFixtureValue(String(observedValue)) }, expect_match: false },
+      { input: { [fact_name]: safeObservedValue }, expect_match: true },
+      { input: { [fact_name]: differentFixtureValue(safeObservedValue) }, expect_match: false },
     ],
     promotion_history: [],
     first_observed: new Date(firstObservedMs).toISOString(),
@@ -194,7 +225,7 @@ export function mineConstraintCandidates(factHistory, snapshots, options = {}) {
 
     const timestampsMs = group.confirming.map((point) => new Date(point.ts).getTime()).filter(Number.isFinite);
     if (timestampsMs.length === 0) continue;
-    const spanMs = Math.max(...timestampsMs) - Math.min(...timestampsMs);
+    const spanMs = arrayMax(timestampsMs) - arrayMin(timestampsMs);
     if (spanMs < minSpanMs) continue;
 
     const attributeKey = KEY_ATTRIBUTE_BY_FACT_NAME[group.fact_name];

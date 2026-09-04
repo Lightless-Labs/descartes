@@ -572,6 +572,48 @@ test("a denial never fabricates a wrong-nonce attempt on an already-decided reco
   assert.equal(constraints.find((c) => c.id === constraint.id).status, "review-ready", "the constraint was not activated");
 });
 
+test("F5: a denial is attributed to the currently-VALID pending record, not a stale-expired one that still carries status:pending (mirrors tuning-authority.js's logTuningDenial fix)", async () => {
+  const paths = await tempPaths();
+  const now = Date.parse("2026-07-10T00:05:00.000Z");
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+
+  // 'old': minted earlier, already expired by `now`, but still status:"pending" (only `expiry`
+  // ages out — nothing flips status on expiry). First in array order, which is exactly what the
+  // old first-pending-in-array-order fallback would have wrongly targeted.
+  const old = {
+    id: "promotion.old",
+    nonce: "nonce-old",
+    promotion_ref: constraint.id,
+    status: "pending",
+    expiry: "2026-07-10T00:01:00.000Z",
+    evidence_refs: [],
+    audit_transitions: [],
+  };
+  // 'new': freshly re-issued, still valid at `now`, coexisting with the stale 'old' record.
+  const fresh = {
+    id: "promotion.new",
+    nonce: "nonce-new",
+    promotion_ref: constraint.id,
+    status: "pending",
+    expiry: "2026-07-11T00:00:00.000Z",
+    evidence_refs: [],
+    audit_transitions: [],
+  };
+  await writePromotions(paths, [old, fresh]);
+
+  // A garbage nonce matches neither record: it must deny closed AND attribute the denial to the
+  // live, unexpired 'new' record under actual attack — never to the coexisting stale-expired one.
+  await assert.rejects(() => decideConstraintPromotion(paths, constraint.id, "garbage-nonce", "approved", { now }));
+
+  const { promotions } = await loadPromotions(paths);
+  const oldAfter = promotions.find((r) => r.id === "promotion.old");
+  const newAfter = promotions.find((r) => r.id === "promotion.new");
+  assert.deepEqual(oldAfter.audit_transitions, [], "the stale-expired record must NOT get the denial");
+  assert.equal(newAfter.audit_transitions.length, 1, "the denial is attributed to the live unexpired record");
+  assert.equal(newAfter.audit_transitions[0].action, "denied");
+});
+
 // --- reconcileOrphanedPendings (Codex "spot C": orphaned pending promotions) ---
 
 test("reconcileOrphanedPendings (pure): only pendings whose constraint is NOT review-ready are closed; live/decided records untouched by identity", () => {

@@ -34,6 +34,7 @@ import { evaluateExpected } from "./constraint-eval.js";
 import {
   buildConstraintTarget,
   checkShadowSoak,
+  isValidNumericExpected,
   loadConstraints,
   loadLearnedConfig,
 } from "./constraint-store.js";
@@ -115,6 +116,19 @@ export function validateTuningCandidate(record) {
 
   if (typeof record.applied !== "boolean") {
     throw new Error("Tuning candidate record requires a boolean applied field");
+  }
+
+  // F6: a "retune" candidate's proposed.expected must be the exact numeric shape
+  // constraint-store.js's applyApprovedRetune and evaluateExpected support -- reusing its own
+  // isValidNumericExpected predicate, not a re-derived copy. Rejects at write time (proposeRetune
+  // can never emit a non-finite value post-F6, but this is defense-in-depth against any other
+  // producer) AND at load time (a malformed record that reached constraints.json before this fix
+  // -- e.g. Infinity round-tripped through JSON.stringify to null -- is dropped by
+  // loadTuningCandidates rather than silently reaching review-ready).
+  if (record.kind === "retune" && !isValidNumericExpected(record.proposed?.expected)) {
+    throw new Error(
+      `Tuning candidate record of kind "retune" requires proposed.expected to be { comparator: "gte"|"lte", value: <finite number> }, got: ${JSON.stringify(record.proposed?.expected)}`,
+    );
   }
 
   if (!Number.isFinite(Number(record.schema_version))) {
@@ -263,6 +277,25 @@ function factHistoryFor(factHistoryByTarget, target) {
   return factHistoryByTarget[target] ?? [];
 }
 
+// F8: loop-based min/max, NOT Math.min(...arr)/Math.max(...arr) -- a spread of a large array
+// (observed empirically: ~125k+ elements) blows the call stack with a RangeError. Identical
+// numeric result to the spread form for every array that doesn't crash it.
+function arrayMin(values) {
+  let min = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] < min) min = values[i];
+  }
+  return min;
+}
+
+function arrayMax(values) {
+  let max = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] > max) max = values[i];
+  }
+  return max;
+}
+
 /**
  * Pure, deterministic proposal for a LOOSENED numeric threshold (plan §5.3): a `gte` floor moves
  * down to just past the lowest observed value; a `lte` ceiling moves up to just past the highest.
@@ -273,14 +306,21 @@ function factHistoryFor(factHistoryByTarget, target) {
  * Caveat (plan §5.3, noted not fixed in v1): the margin only "loosens away from zero" when the
  * extreme value is positive — for a negative-valued domain this would tighten, not loosen. None
  * of v1's real numeric targets have a negative domain; flagged for any future one that might.
+ *
+ * F6: also guards the overflow case — an extreme observed value pushed past the margin can
+ * overflow to +/-Infinity (e.g. a `lte` ceiling near Number.MAX_VALUE). Number.isFinite(result)
+ * catches that alongside the empty-values case above, so this NEVER returns a non-finite value
+ * for validateTuningCandidate/writeTuningCandidates to reject later — it is never proposed at all.
  */
 export function proposeRetune(comparator, observedValues, options = {}) {
   const marginPct = options.marginPct ?? DEFAULT_RETUNE_MARGIN_PCT;
   const values = Array.isArray(observedValues) ? observedValues : [];
   if (values.length === 0) return undefined;
-  if (comparator === "gte") return Math.min(...values) * (1 - marginPct);
-  if (comparator === "lte") return Math.max(...values) * (1 + marginPct);
-  return undefined;
+  let result;
+  if (comparator === "gte") result = arrayMin(values) * (1 - marginPct);
+  else if (comparator === "lte") result = arrayMax(values) * (1 + marginPct);
+  else return undefined;
+  return Number.isFinite(result) ? result : undefined;
 }
 
 /**
