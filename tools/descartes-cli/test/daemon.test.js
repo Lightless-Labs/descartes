@@ -3456,3 +3456,152 @@ test("Slice 7.2 wiring: byte-identical real alerts when BOTH the learned kill sw
   assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Cross-cutting SURVIVABILITY fix (docs/reviews/2026-09-04-daybreak-security-sweep.md): before
+// this fix, `mainExtraCandidates` (~daemon.js L594-630) was one array literal spreading all
+// twelve detector calls -- if ANY one threw, the whole array build threw and aborted the entire
+// daemon tick, blinding every OTHER detector for that tick. The separate
+// computeContainmentRecommendationCandidates call and the emitSessionAlertSignals call site had
+// the identical exposure. Each call site is now wrapped in safeCandidates(), which degrades a
+// throw to a safe fallback (logged, never silent) for THAT producer THIS tick only. Each detector
+// (and the containment/delivery call sites) now also has a DI seam (options.<fn> ?? <fn>,
+// mirroring the file's existing pattern for e.g. adjudicateAlertNotifications) so a test can
+// inject a throw into exactly one producer without disturbing the rest.
+// ---------------------------------------------------------------------------------------------
+
+test("Cross-cutting SURVIVABILITY fix: one throwing detector degrades to zero candidates for itself only, and does not blind the OTHER detectors' candidates for the tick -- with a warning logged naming it", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let withThrow;
+  try {
+    withThrow = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: S_LIVE_1_TICK_TS,
+      now: S_LIVE_1_TICK_TS,
+      computeCorrelationCandidates: async () => {
+        throw new Error("simulated computeCorrelationCandidates failure");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // The tick completed -- one detector throwing did not crash the daemon.
+  assert.equal(withThrow.status.state, "ok");
+
+  // A completely different detector's real alert (the violated active constraint) still made it
+  // through to persistence -- the throw did not blind the other eleven detectors.
+  const constraintAlert = withThrow.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  assert.ok(constraintAlert, "expected the active-constraint alert to still fire even though a sibling detector threw");
+  assert.equal(constraintAlert.status, "active");
+  const persisted = await readAlertRecords(paths);
+  assert.ok(persisted.some((alert) => alert.id === constraintAlert.id && alert.status === "active"));
+
+  // A warning was logged naming the failing detector.
+  assert.ok(
+    warnings.some((w) => w.includes("correlation") && w.includes("simulated computeCorrelationCandidates failure")),
+    `expected a warning naming the failing detector, got: ${JSON.stringify(warnings)}`,
+  );
+
+  // Differential check: the throwing detector contributed EXACTLY zero candidates -- byte-
+  // identical to the same tick with that detector overridden to succeed with none.
+  const emptyPaths = await tempPaths();
+  await writeLearnedConfig(emptyPaths, { enabled: true });
+  await writeConstraints(emptyPaths, [activeConstraintFixture()]);
+  await appendFactPoints(emptyPaths, [
+    { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
+  ], { now: S_LIVE_1_TICK_TS });
+  const withEmptySuccess = await runDaemonIteration(emptyPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: S_LIVE_1_TICK_TS,
+    now: S_LIVE_1_TICK_TS,
+    computeCorrelationCandidates: async () => [],
+  });
+  assert.deepEqual(withThrow.alerts.alerts, withEmptySuccess.alerts.alerts);
+  assert.deepEqual(withThrow.alerts.candidates, withEmptySuccess.alerts.candidates);
+});
+
+test("Cross-cutting SURVIVABILITY fix: an injected computeContainmentRecommendationCandidates throw does not crash the tick and does not clobber the main evaluation's real alerts -- it degrades to no containment recommendation, with a warning logged", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeContainmentRecommendConfig(paths, { enabled: true });
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: hour(30),
+      now: hour(30),
+      computeContainmentRecommendationCandidates: async () => {
+        throw new Error("simulated computeContainmentRecommendationCandidates failure");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(result.status.state, "ok");
+  const peerAlert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.ok(peerAlert && peerAlert.status === "active", "the main evaluation's real peer.count_spike alert must survive a containment-phase throw");
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false, "the containment candidate itself degrades to none when its producer throws");
+  assert.ok(
+    warnings.some((w) => w.includes("containment-recommendation") && w.includes("simulated computeContainmentRecommendationCandidates failure")),
+    `expected a warning naming the failing containment producer, got: ${JSON.stringify(warnings)}`,
+  );
+});
+
+test("Cross-cutting SURVIVABILITY fix: an injected emitSessionAlertSignals throw does not crash the tick and does not clobber the already-persisted alerts -- sessionAlertDelivery degrades to undefined, with a warning logged", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPoints(paths, ticks, { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: hour(30),
+      now: hour(30),
+      emitSessionAlertSignals: async () => {
+        throw new Error("simulated emitSessionAlertSignals failure");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(result.status.state, "ok");
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(sessionAlert, "the underlying session.count_drop alert (persisted before delivery runs) must survive a delivery-phase throw");
+  assert.equal(result.sessionAlertDelivery, undefined, "delivery degrades to undefined, matching the existing 'no delivery this tick' shape, rather than crashing the tick");
+  assert.ok(
+    warnings.some((w) => w.includes("session-alert-delivery") && w.includes("simulated emitSessionAlertSignals failure")),
+    `expected a warning naming the failing delivery producer, got: ${JSON.stringify(warnings)}`,
+  );
+});

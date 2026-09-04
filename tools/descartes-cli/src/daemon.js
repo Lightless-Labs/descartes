@@ -429,6 +429,30 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
   }
 }
 
+// docs/reviews/2026-09-04-daybreak-security-sweep.md, cross-cutting SURVIVABILITY finding: each
+// detector/producer below is independent evidence about the host. Before this helper, the
+// `mainExtraCandidates` build below (and, via the identical exposure, the separate
+// computeContainmentRecommendationCandidates call and the emitSessionAlertSignals call site)
+// awaited each producer in one array/expression -- so ANY one of them throwing (a bad fact-store
+// read, a store file that slipped past its own module's corrupt-file tolerance, etc.) aborted the
+// WHOLE build, blinding every OTHER detector for the entire tick. safeCandidates() isolates that:
+// a thrown error degrades to `fallback` (logged, never silent) for THIS detector THIS tick only --
+// every other producer still runs and still reaches evaluateAndPersistAlerts. `fallback` is always
+// passed explicitly by every call site below (never defaulted): `[]` for the candidate-array
+// producers, `undefined` for the emitSessionAlertSignals call site, matching its existing "no
+// delivery this tick" shape. (Deliberately NOT a `fallback = []` default parameter -- a caller
+// passing `undefined` explicitly, which the emitSessionAlertSignals site legitimately needs to do,
+// would silently fall through to the default instead of getting `undefined` back.)
+async function safeCandidates(label, produce, fallback) {
+  try {
+    return await produce();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[daemon] detector '${label}' failed this tick, degrading to no candidates: ${message}`);
+    return fallback;
+  }
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
@@ -573,19 +597,39 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let mainExtraCandidates;
   let mainAlerts;
   if (options.evaluateAlerts !== false) {
+    // Per-detector DI seams (mirrors the file's existing options.<fn> ?? <fn> pattern, e.g.
+    // loadLearnedConfig/readFactPoints/adjudicateAlertNotifications above) so a single detector
+    // can be overridden in isolation -- both for tests injecting a throwing detector, and for any
+    // future caller needing to substitute one producer without touching the other eleven.
+    const computeActiveConstraint = options.computeActiveConstraintCandidates ?? computeActiveConstraintCandidates;
+    const computeProvenanceWarning = options.computeProvenanceWarningCandidates ?? computeProvenanceWarningCandidates;
+    const computeProvenanceIdentity = options.computeProvenanceIdentityCandidates ?? computeProvenanceIdentityCandidates;
+    const computeSessionBaseline = options.computeSessionBaselineCandidates ?? computeSessionBaselineCandidates;
+    const computeCorrelation = options.computeCorrelationCandidates ?? computeCorrelationCandidates;
+    const computePeerBaseline = options.computePeerBaselineCandidates ?? computePeerBaselineCandidates;
+    const computeServiceBaseline = options.computeServiceBaselineCandidates ?? computeServiceBaselineCandidates;
+    const computeCanaryBaseline = options.computeCanaryBaselineCandidates ?? computeCanaryBaselineCandidates;
+    const computeProcessLineageBaseline = options.computeProcessLineageBaselineCandidates ?? computeProcessLineageBaselineCandidates;
+    const computeScheduledJobBaseline = options.computeScheduledJobBaselineCandidates ?? computeScheduledJobBaselineCandidates;
+    const computeServiceAppearance = options.computeServiceAppearanceCandidates ?? computeServiceAppearanceCandidates;
+    const computeCredentialAccess = options.computeCredentialAccessCandidates ?? computeCredentialAccessCandidates;
+    // Cross-cutting SURVIVABILITY fix: each entry is now individually fail-soft via
+    // safeCandidates() -- a throw from any one detector degrades to [] (+ a warning) for that
+    // detector THIS tick only, instead of aborting the whole array build and silently dropping
+    // every OTHER detector's candidates for the tick. Order/arguments unchanged from before.
     mainExtraCandidates = [
-          ...await computeActiveConstraintCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeProvenanceWarningCandidates(descartesPaths, options),
-          ...await computeProvenanceIdentityCandidates(descartesPaths, options),
-          ...await computeSessionBaselineCandidates(descartesPaths, options),
-          ...await computeCorrelationCandidates(descartesPaths, options),
-          ...await computePeerBaselineCandidates(descartesPaths, options),
-          ...await computeServiceBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeCanaryBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeProcessLineageBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeScheduledJobBaselineCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeServiceAppearanceCandidates(descartesPaths, { ...options, activeFreshnessMs }),
-          ...await computeCredentialAccessCandidates(descartesPaths, options),
+          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...options, activeFreshnessMs }), []),
+          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, options), []),
+          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, options), []),
+          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, options), []),
+          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, options), []),
+          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, options), []),
+          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
+          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
+          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
+          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
+          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...options, activeFreshnessMs }), []),
+          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, options), []),
         ];
     mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,
@@ -603,10 +647,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // Containment is a second phase: it consumes only the main evaluation's current active alerts
     // and notification-due IDs. Re-merge the first phase's candidates so shared recovery semantics
     // do not recover sibling alert families during the containment persistence pass.
-    const containmentCandidates = await computeContainmentRecommendationCandidates(descartesPaths, {
+    // Same DI-seam + safeCandidates discipline as the twelve detectors above: a throw here must
+    // not blind the main evaluation's alerts, which are already computed and only being re-merged.
+    const computeContainmentRecommendation = options.computeContainmentRecommendationCandidates ?? computeContainmentRecommendationCandidates;
+    const containmentCandidates = await safeCandidates("containment-recommendation", () => computeContainmentRecommendation(descartesPaths, {
       ...options,
       evaluation: mainAlerts,
-    });
+    }), []);
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
       now: ts,
       daemonStatus: status,
@@ -634,8 +681,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // Slice 4b Decision 3b (Fable review MUST-FIX 4): emitSessionAlertSignals now also delivers a
   // due peer.count_spike (also unknown_namespace, per Decision 3) through this identical branch —
   // the widened allowlist is composed inside alert-intelligence.js itself, not here.
+  // Same DI-seam + safeCandidates discipline as above: a throw out of delivery must not crash the
+  // tick or clobber the alerts already persisted by evaluateAndPersistAlerts. Fallback is
+  // `undefined`, matching this branch's existing "no delivery this tick" shape (deliverSessionAlerts:
+  // false / no alerts), not `[]` -- emitSessionAlertSignals returns a delivery-result object, not a
+  // candidate array.
+  const emitSessionAlerts = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
   const sessionAlertDelivery = alerts && options.deliverSessionAlerts !== false
-    ? await emitSessionAlertSignals(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification })
+    ? await safeCandidates(
+        "session-alert-delivery",
+        () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification }),
+        undefined,
+      )
     : undefined;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
   const alertIntelligence = alerts && options.adjudicateAlerts !== false
