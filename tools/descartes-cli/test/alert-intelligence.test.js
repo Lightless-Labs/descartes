@@ -5,12 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import {
   ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
+  DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS,
   DEFAULT_ENABLED_NAMESPACES,
   KNOWN_ALERT_NAMESPACES,
   adjudicateAlertNotifications,
   alertIntelligencePrompt,
   classifyAlertNamespace,
   emitSessionAlertSignals,
+  normalizeAlertIntelligenceConfig,
   normalizeAlertNotificationDecision,
   readAlertIntelligenceAudit,
   readAlertIntelligenceConfig,
@@ -155,6 +157,55 @@ function fakeCreateSession(prompts, decision) {
     selectedThinkingLevel: "low",
     session: fakeSession(prompts, decision),
   });
+}
+
+// F5 fix: a session whose prompt() never settles on its own -- it only settles once abort() is
+// called, mimicking a well-behaved cancellable provider request (the assumption F5's fix depends
+// on; see fixspec item 7's dependency-verification caveat). `state.abortCalls` lets a test assert
+// abort() was actually invoked exactly once.
+function fakeHangingSession() {
+  const state = { abortCalls: 0 };
+  let rejectPrompt;
+  const session = {
+    messages: [],
+    async prompt(promptText) {
+      session.lastPrompt = promptText;
+      return new Promise((_resolve, reject) => {
+        rejectPrompt = reject;
+      });
+    },
+    abort() {
+      state.abortCalls += 1;
+      if (rejectPrompt) rejectPrompt(new Error("session aborted by fake (deadline)"));
+      return Promise.resolve();
+    },
+    dispose() {},
+  };
+  return { session, state };
+}
+
+// F5 fix, fabrication trap: a session whose abort() does NOT cancel the underlying prompt() call
+// -- prompt() keeps running and eventually RESOLVES with syntactically-valid decision JSON, well
+// after the deadline fired. Simulates "abort() is a no-op for an in-flight single completion
+// request" (fixspec item 7). Proves the `if (timedOut) throw` guard fires regardless of how
+// prompt() ultimately settles, not only on rejection.
+function fakeResolvesAfterDeadlineSession(resolveDelayMs, decision, { abortThrows = false } = {}) {
+  const state = { abortCalls: 0 };
+  const session = {
+    messages: [],
+    async prompt(promptText) {
+      session.lastPrompt = promptText;
+      await new Promise((resolve) => setTimeout(resolve, resolveDelayMs));
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+    },
+    abort() {
+      state.abortCalls += 1;
+      if (abortThrows) throw new Error("abort blew up synchronously");
+      // Deliberately does NOT reject/resolve the pending prompt() -- the no-op-abort case.
+    },
+    dispose() {},
+  };
+  return { session, state };
 }
 
 test("alert intelligence config is disabled by default and persists explicit opt-in", async () => {
@@ -2211,4 +2262,201 @@ test("Slice 6, Decision 3 negative test: compactAlert's re-sanitization redacts 
   assert.equal(prompt.includes(unsafeValue), false, "the raw unsafe value must never reach the rendered prompt text");
   const context = extractPromptContext(prompt);
   assert.equal(context.alerts[0].diagnostics.args.redacted, true);
+});
+
+// --- F5 fix: bound the LLM adjudication call with a deadline + real cancellation --------------
+// CRITICAL FABRICATION + RACE TRAP. See docs/plans fixspec F5. Invariants under test:
+//  - a hung session.prompt() must not block a daemon tick indefinitely (bounded wall-clock time)
+//  - a timed-out call must never be allowed to fall through to lastAssistantText/parseDecisionJson
+//    and produce a status:"ok" fabricated decision, regardless of whether the awaited promise
+//    ultimately rejects OR resolves after the deadline fires
+//  - a timed-out call must still consume exactly one budget slot (S13 must-fix 2)
+//  - a timer-callback throw (e.g. a synchronously-throwing abort()) must never crash the tick
+//  - deliverNotification must never be called for a timed-out adjudication
+
+test("normalizeAlertIntelligenceConfig defaults model_deadline_ms and clamps invalid/non-positive values to the default", () => {
+  assert.equal(normalizeAlertIntelligenceConfig({}).model_deadline_ms, DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS);
+  assert.equal(normalizeAlertIntelligenceConfig({ model_deadline_ms: 12345 }).model_deadline_ms, 12345);
+  assert.equal(normalizeAlertIntelligenceConfig({ model_deadline_ms: -5 }).model_deadline_ms, DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS);
+  assert.equal(normalizeAlertIntelligenceConfig({ model_deadline_ms: 0 }).model_deadline_ms, DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS);
+  assert.equal(normalizeAlertIntelligenceConfig({ model_deadline_ms: "not-a-number" }).model_deadline_ms, DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS);
+});
+
+test("F5: a hung session.prompt() is bounded by model_deadline_ms, aborted exactly once, recorded as status:\"error\" (never \"ok\"), and never delivers a notification", async () => {
+  const paths = await tempPaths();
+  const { session, state } = fakeHangingSession();
+  let deliverCalls = 0;
+  const start = Date.now();
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 25 }),
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+    deliverNotification: async () => { deliverCalls += 1; return { delivered: true }; },
+  });
+  const elapsedMs = Date.now() - start;
+
+  assert(elapsedMs < 2000, `expected the adjudication to be bounded by its deadline, took ${elapsedMs}ms`);
+  assert.equal(state.abortCalls, 1, "expected session.abort() to have been called exactly once");
+  assert.equal(deliverCalls, 0, "a timed-out call must never deliver a notification");
+
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.equal(audit[0].decision, undefined, "no decision may be recorded for a timed-out call");
+  assert.equal(audit[0].delivery, undefined);
+  assert.equal(result.status, "ok"); // the tick itself completed and recorded an honest error, not a rate-limit/degraded state
+  assert.equal(result.decisions.length, 1);
+  assert.equal(result.decisions[0].status, "error");
+});
+
+test("F5 fabrication trap: a session.prompt() that RESOLVES after the deadline with syntactically-valid decision JSON must still be recorded as status:\"error\", never status:\"ok\" with a decision", async () => {
+  const paths = await tempPaths();
+  const { session, state } = fakeResolvesAfterDeadlineSession(60, {
+    notify: true,
+    severity: "critical",
+    title: "A decision the model never actually finished rendering",
+    body: "This must never reach the audit trail as a real decision.",
+    reason: "partial/truncated content that happens to parse as JSON",
+    evidence_refs: [],
+  });
+  let deliverCalls = 0;
+
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 15 }),
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+    deliverNotification: async () => { deliverCalls += 1; return { delivered: true }; },
+  });
+
+  assert.equal(state.abortCalls, 1);
+  assert.equal(deliverCalls, 0, "a decision the model never finished rendering before the deadline must never be delivered");
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.notEqual(audit[0].status, "ok");
+  assert.equal(audit[0].decision, undefined);
+  assert.match(audit[0].error, /model_deadline_exceeded/);
+  assert.equal(result.decisions[0].status, "error");
+});
+
+test("F5 crash-safety: a synchronously-throwing abort() does not crash the tick -- it still degrades gracefully to a status:\"error\" record", async () => {
+  const paths = await tempPaths();
+  const { session, state } = fakeResolvesAfterDeadlineSession(40, { notify: false }, { abortThrows: true });
+
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 10 }),
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+  });
+
+  assert.equal(state.abortCalls, 1, "abort() must still have been attempted despite throwing");
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.equal(result.status, "ok");
+});
+
+test("F5: a normal call well within its deadline is byte-identical to pre-fix behavior", async () => {
+  const paths = await tempPaths();
+  const prompts = [];
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 5000 }),
+    createSession: fakeCreateSession(prompts, {
+      notify: true,
+      severity: "warning",
+      title: "Memory pressure is high",
+      body: "Memory has stayed above the configured threshold.",
+      reason: "The deterministic memory rule is active.",
+      evidence_refs: ["alert:alert_memory"],
+    }),
+  });
+
+  assert.equal(result.status, "ok");
+  assert.equal(prompts.length, 1);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "ok");
+  assert.equal(audit[0].decision.notify, true);
+  assert.equal(audit[0].decision.title, "Memory pressure is high");
+});
+
+test("F5 budget invariant: a timed-out call still consumes exactly one admission slot, starving a subsequent alert in the same tick", async () => {
+  const paths = await tempPaths();
+  const { session } = fakeHangingSession();
+  const alerts = [
+    alert({ id: "alert_budget_1", rule_id: "system.memory.sustained_high", severity: "warning" }),
+    alert({ id: "alert_budget_2", rule_id: "disk.space.high_used_fraction", severity: "warning" }),
+  ];
+  let createSessionCalls = 0;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts,
+    notification_due_ids: alerts.map((entry) => entry.id),
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 1, critical_reservation: 0, model_deadline_ms: 15 }),
+    createSession: async () => { createSessionCalls += 1; return { selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }; },
+  });
+
+  assert.equal(createSessionCalls, 1, "only the first (timed-out) alert should have been admitted -- the budget slot was already spent");
+  assert.equal(result.dropped_total, 1, "the second alert must have been dropped for budget reasons, not attempted");
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].alert_id, "alert_budget_1");
+  assert.equal(audit[0].status, "error");
+});
+
+test("F5 budget_exhausted must stay reserved for real rate-limiting: a model-deadline timeout must not itself emit a misleading budget_exhausted signal", async () => {
+  const paths = await tempPaths();
+  const { session } = fakeHangingSession();
+  const budgetSignals = [];
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0, model_deadline_ms: 15 }),
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+    deliverNotification: async (descartesPaths, decision) => { budgetSignals.push(decision); return { delivered: true }; },
+  });
+
+  assert.equal(result.dropped_total, 0, "a timeout is not a budget drop");
+  assert.equal(result.budget_exhausted, undefined, "budget_exhausted must only fire when droppedTotal > 0 (real rate-limiting), never on a model timeout");
+  assert.equal(budgetSignals.length, 0);
+});
+
+test("F5: the call site reads model_deadline_ms directly off a raw (never normalized) options.config, not only via normalizeAlertIntelligenceConfig", async () => {
+  const paths = await tempPaths();
+  const { session, state } = fakeHangingSession();
+  // Deliberately a raw literal, bypassing normalizeAlertIntelligenceConfig/writeAlertIntelligenceConfig
+  // entirely -- mirrors how options.config can be supplied directly per adjudicateAlertNotifications'
+  // own signature. enabled_namespaces is spelled out by hand (rather than relying on
+  // normalizeEnabledNamespaces' default) precisely because this config is never normalized.
+  const rawConfig = { enabled: true, max_calls_per_hour: 5, critical_reservation: 0, enabled_namespaces: ["metric"], model_deadline_ms: 15 };
+  const start = Date.now();
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-04T00:00:00.000Z",
+    config: rawConfig,
+    createSession: async () => ({ selectedModel: { provider: "test", id: "model" }, selectedThinkingLevel: "low", session }),
+  });
+  const elapsedMs = Date.now() - start;
+
+  assert(elapsedMs < 2000, `expected the raw config's model_deadline_ms to bound the call, took ${elapsedMs}ms`);
+  assert.equal(state.abortCalls, 1);
+  assert.equal(result.decisions[0].status, "error");
 });

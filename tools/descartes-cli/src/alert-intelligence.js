@@ -77,6 +77,15 @@ export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
 // adjudication. Default reserves exactly one call/hour for critical alerts.
 export const DEFAULT_ALERT_INTELLIGENCE_CRITICAL_RESERVATION = 1;
 
+// F5 fix: bounds the per-alert LLM call (createSession + session.prompt()) so a hung/slow model
+// request cannot freeze a daemon tick indefinitely. Kept meaningfully UNDER the daemon's fast-tick
+// interval, mirroring this codebase's own existing precedent (daemon.js's structural-collector
+// deadline is 45_000ms against a 60_000ms DEFAULT_DAEMON_INTERVAL_MS) -- do not raise this to
+// 60_000+ms, which would let one adjudication push a tick past its own interval by design. Raising
+// config.thinking_level trades adjudication quality against this same budget; that tension is an
+// operator decision, not something a longer default should paper over.
+export const DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS = 30_000;
+
 // S13 must-fix 1: the CLOSED set of namespaces that MAY ever be opted into LLM adjudication.
 // "learned" is deliberately never a member of this list -- it is hard-excluded below, not merely
 // defaulted off, and `normalizeEnabledNamespaces`/the alerts.js CLI reject it explicitly.
@@ -130,6 +139,15 @@ function normalizeEnabledNamespaces(value) {
   return filtered.length > 0 ? filtered : [...DEFAULT_ENABLED_NAMESPACES];
 }
 
+// F5 fix: shared by normalizeAlertIntelligenceConfig (for config persisted/read through the normal
+// path) AND read directly at the adjudication call site (see adjudicateAlertNotifications below) --
+// the call site cannot assume normalization already ran, since options.config may be supplied as a
+// raw, un-normalized literal.
+function resolveModelDeadlineMs(value) {
+  const raw = Number(value);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ALERT_INTELLIGENCE_MODEL_DEADLINE_MS;
+}
+
 function normalizeCriticalReservation(value, maxCallsPerHour) {
   const raw = Number(value ?? DEFAULT_ALERT_INTELLIGENCE_CRITICAL_RESERVATION);
   const base = Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_ALERT_INTELLIGENCE_CRITICAL_RESERVATION;
@@ -148,6 +166,9 @@ export function normalizeAlertIntelligenceConfig(config = {}) {
     thinking_level: config.thinking_level ? String(config.thinking_level) : undefined,
     max_calls_per_hour: normalizedMax,
     critical_reservation: normalizeCriticalReservation(config.critical_reservation, normalizedMax),
+    // F5 fix: see resolveModelDeadlineMs's own doc comment for why this is also read raw, directly
+    // off config, at the adjudication call site below -- not only here.
+    model_deadline_ms: resolveModelDeadlineMs(config.model_deadline_ms),
     enabled_namespaces: normalizeEnabledNamespaces(config.enabled_namespaces),
     // S13 must-fix 5: these flags were already normalized pre-S13 but never actually wired into
     // the prompt -- see adjudicateAlertNotifications, which now gates historySummary/daemonStatus
@@ -1226,6 +1247,9 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
       const { namespace } = classifyAlertNamespace(alert.rule_id);
       let promptText;
       let appended;
+      // F5 fix: read directly off the (possibly un-normalized) config, not a normalized variable --
+      // see resolveModelDeadlineMs's doc comment.
+      const deadlineMs = resolveModelDeadlineMs(config.model_deadline_ms);
       try {
         // S13 must-fix 5: include_history_summary/include_daemon_status are wired here -- omitted
         // entirely (undefined, not just falsy) rather than unconditionally included as pre-S13.
@@ -1234,12 +1258,80 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           historySummary: config.include_history_summary ? evaluation.history_summary : undefined,
           daemonStatus: config.include_daemon_status ? evaluation.daemon_status : undefined,
         });
-        const result = await createSession(descartesPaths, {
+
+        // F5 fix, step 2 (lower risk than the prompt() bound below -- createPrivateSession does
+        // local fs/registry work with no side effects on audit/notification state, so a
+        // race-and-abandon is acceptable here, unlike session.prompt() below). Bound it so a hung
+        // session-creation call cannot itself freeze the tick; attach cleanup so an eventually-
+        // resolving abandoned session doesn't leak.
+        const createSessionPromise = createSession(descartesPaths, {
           modelPattern: config.model_pattern,
           thinkingLevel: config.thinking_level,
         });
+        let sessionCreateTimedOut = false;
+        let sessionCreateTimer;
+        const sessionCreateDeadline = new Promise((resolve) => {
+          sessionCreateTimer = setTimeout(() => {
+            sessionCreateTimedOut = true;
+            resolve(undefined);
+          }, deadlineMs);
+        });
+        let result;
+        try {
+          result = await Promise.race([createSessionPromise, sessionCreateDeadline]);
+        } finally {
+          clearTimeout(sessionCreateTimer);
+        }
+        if (sessionCreateTimedOut) {
+          // Never await the abandoned promise here -- that would reintroduce the exact hang this
+          // guards against. If/when it eventually settles on its own, dispose the session it
+          // produced so a late-arriving session doesn't leak a live process/connection.
+          createSessionPromise.then((raced) => {
+            try {
+              raced?.session?.dispose?.();
+            } catch {
+              // A throwing dispose() on an already-abandoned session has nothing left to do with
+              // the error but drop it.
+            }
+          }).catch(() => {});
+          throw new Error("model_session_deadline_exceeded");
+        }
         session = result.session;
-        await session.prompt(promptText);
+
+        // F5 fix, step 1 (THE critical fix): bound session.prompt() with a deadline AND real
+        // cancellation on the SAME awaited promise -- deliberately NOT a race-and-abandon like
+        // step 2 above. deliverNotification and safeAppendAuditRecord below have real side effects
+        // (an OS notification; an append to the budget-critical llm-decisions.jsonl audit trail);
+        // an abandoned continuation racing a LATER tick's own calls would risk duplicate/
+        // out-of-order operator notifications and a genuine race on the append-only audit trail
+        // S13 must-fix 2's budget accounting depends on being accurate and serial.
+        let timedOut = false;
+        const deadlineTimer = setTimeout(() => {
+          timedOut = true;
+          // Must never throw synchronously or leave a rejected promise unhandled -- a
+          // timer-callback exception is an uncaught exception that kills the daemon process,
+          // exactly the class of crash S13 5b / 4d350f7 exist to prevent. Mirrors the
+          // session?.dispose?.() guard idiom in the outer finally below.
+          try {
+            session?.abort?.()?.catch?.(() => {});
+          } catch {
+            // Swallow -- see comment above.
+          }
+        }, deadlineMs);
+        try {
+          await session.prompt(promptText);
+        } finally {
+          clearTimeout(deadlineTimer);
+        }
+        // MUST run before touching session.messages: abort() may make prompt() RESOLVE with
+        // partial/streamed content rather than reject (fixspec item 7's no-op-abort case). Falling
+        // through to lastAssistantText/parseDecisionJson on a timed-out call risks
+        // normalizeAlertNotificationDecision's lenient defaults turning a truncated/partial
+        // response into a spuriously "ok" audit record carrying a decision the model never
+        // actually finished rendering -- a fabricated adjudication outcome (NEVER-FABRICATE).
+        // Treat ANY timeout identically, regardless of how prompt() settled.
+        if (timedOut) throw new Error("model_deadline_exceeded");
+
         const rawText = lastAssistantText(session.messages);
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
         const delivery = decision.notify
