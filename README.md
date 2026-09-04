@@ -36,6 +36,7 @@ identity, architecture, and conventions this repo follows.
 - [Login and model selection](#login-and-model-selection)
 - [JSON output](#json-output)
 - [Safety and privacy invariants](#safety-and-privacy-invariants)
+- [Field-level data handling](#field-level-data-handling)
 - [Supported platforms](#supported-platforms)
 - [Descartes-owned paths](#descartes-owned-paths)
 - [Repository layout](#repository-layout)
@@ -54,8 +55,11 @@ identity, architecture, and conventions this repo follows.
 | **Evidence freeze** | Makes a read-only forensic evidence bundle. An operator starts it (`descartes incident freeze`). | Live |
 | **Remediation and host actions** | No general action tool exists yet. Descartes changes only its own daemon service and its alert-state files. | Not yet |
 
-The self-learning and defensive detection functions are **off by default**. They go quiet
-when in doubt. They do not make a false alarm. See the [current limits](#current-limits).
+The self-learning and defensive detection functions are **off by default**. A detector
+that cannot establish a trustworthy baseline goes quiet instead of guessing, so it never
+fabricates a "first time seen" claim from lost or incomplete history. That is a specific
+guarantee, not a promise against every false positive or every missed attack. See the
+[current limits](#current-limits).
 
 ## Status
 
@@ -66,8 +70,11 @@ This is version 0. It has these parts:
 - a self-learning subsystem (off by default).
 
 The self-learning subsystem mines rules and baselines from the machine history. It also
-runs defensive detectors: novelty baselines, deception canaries, and intrusion signals.
-These detectors go quiet when in doubt. They do not make a false alarm.
+runs defensive detectors: novelty baselines, deception canaries, and intrusion signals. A
+novelty detector that cannot trust its own history goes quiet rather than guessing, so it
+never fabricates a "first time seen" claim. Positive-evidence detectors (credential access,
+canaries) are not gated this way and fire on any matching metadata change, benign or not.
+See [current limits](#current-limits).
 
 The durable core will move to Rust over time. The current CLI uses Node.js, because this
 lets the tool ship quickly. The CLI includes the agent harness and the subscription login.
@@ -293,7 +300,8 @@ happens without a human decision.
 ### Defensive detectors
 
 These detectors run inside the daemon tick. They are deterministic and use no LLM, except
-where noted. They read only the host's own facts. They hash identity values at the source.
+where noted. They read only the host's own facts. Field-level identity handling is not
+uniform — see [Field-level data handling](#field-level-data-handling).
 
 Each novelty detector is completeness-gated. When its fact history is incomplete, damaged,
 or changed, the detector emits nothing. This state is "cold-start". The detector does not
@@ -309,7 +317,7 @@ direct observation. They are not gated. Descartes never discards a real event.
 | Service baseline | A known service that disappears, or a new service that appears (`service.disappeared`, `service.appeared`). | launchd and systemd census |
 | Scheduled-job baseline | A new cron or scheduled job — a common persistence foothold (`scheduled_job.appeared`). | cron, systemd-timer, and launchd census |
 | Process lineage | A new exec-chain edge — an unusual child process (`process.lineage_edge`). | process parent and child census |
-| Credential access | A read or a rewrite of a watched credential file (`credential.access`). This is positive evidence, not gated. | two `lstat` snapshots (mtime and inode); `lstat` only; never reads the contents |
+| Credential access | A metadata change to a watched credential file: its mtime or inode changes, from a write or a replace (`credential.access`). It does not detect a plain read — a read does not change mtime or inode. It does not detect a permission change — a `chmod` changes only ctime, which the detector does not track. This is positive evidence, not gated. | two `lstat` snapshots (mtime and inode); `lstat` only; never reads the contents |
 | Deception canaries | A touch of a honey-token file, or a change to the canary manifest or store (`canary.tripped`, `canary.tampered`). | filesystem tripwire |
 | Incident correlation | A mass session drop together with an odd-hour, unknown peer login. | cross-stream join (optional, separately-gated LLM adjudication) |
 | Provenance and identity | A process or a listening socket whose provenance or identity signature moves away from its baseline. | process ancestry and hashed identity signatures |
@@ -337,6 +345,12 @@ These are the limits of the defensive layer today:
   for a baseline. A new install reports nothing. A detector that recovers from a real
   history loss also reports nothing. Recovery after a real loss takes up to the
   fact-retention window. This delay is deliberate and safe.
+- **Ordinary retention churn can extend cold-start, not just a real loss.** The fact-store
+  byte cap evicts old points during routine use, and every eviction marks that stretch of
+  history "degraded"; baseline readers reject degraded history. On a host whose full
+  retention window churns before the cap clears, a detector can stay in cold-start for
+  longer than the nominal recovery window, and today there is no separate status for
+  "blocked by ordinary eviction" versus "recovering from a real loss".
 - **Host-edge scope.** Descartes watches the local host. It does not watch the cloud plane
   or the cluster plane.
 - **Polling, not real-time.** Detection runs on the daemon cycle. A fast action between two
@@ -398,9 +412,11 @@ includes these items:
 - Alert-intelligence LLM wakeups are off by default. When on, they are rate-limited and
   audited. That path has no remediation or shell tools (`enableTools:false`).
 - Notification delivery is off by default. It needs an explicit setup and test step.
-- Descartes hashes or buckets every identity value at the source: PIDs, ports, users, hosts,
-  IPs, and paths. This happens before the value enters any store. Each domain uses its own
-  fixed scheme.
+- Descartes hashes most detector identity values at the source with a domain-specific
+  SHA-256 scheme before they are persisted. This is not universal — see [Field-level data
+  handling](#field-level-data-handling) for what is hashed, what is only sanitized to a
+  human-readable local form, and what a triage session can send to the selected model
+  provider.
 - Missing or damaged evidence becomes `unknown` or a skip. Descartes never invents a
   security signal or a health signal.
 - `descartes incident freeze` saves a Descartes-owned forensic evidence bundle. It calls
@@ -413,6 +429,32 @@ includes these items:
   writes to a Pi-owned path.
 
 For the complete safety-invariant list, see `AGENTS.md`.
+
+## Field-level data handling
+
+| Field | Local fact-store / metric history | Sent to the model during `triage` |
+|---|---|---|
+| tmux/screen session name | SHA-256 hash (session.name) | not sent |
+| cron / systemd-timer / launchd job identity | SHA-256 hash | not sent |
+| process exec-chain edge (parent/child comm) | SHA-256 hash | not sent |
+| watched credential path | SHA-256 hash (`path_hash`); contents never read | not sent |
+| launchd/systemd service name | sanitized (charset-substituted, truncated) — human-readable form stays in local history | not sent |
+| canary id | sanitized, not hashed | not sent |
+| listening socket protocol/address/port and owning command | sanitized, not hashed — an IP and port stay legible in local history | not sent |
+| top-process command | raw, in local metric history (`sensitivity: process_identity`) | **raw**, in the compact evidence summary sent to the selected model provider |
+| top-process PID and (truncated) args | not persisted to metric history | **raw**, in the compact evidence summary sent to the selected model provider |
+| hostname | not persisted to metric history; appears in the transient triage evidence envelope and in an `incident freeze` bundle if you take one (freeze bundles stay local — never sent to an LLM) | **raw**, in the compact evidence summary sent to the selected model provider |
+| disk mount point | raw, in local metric history (`sensitivity: path`) | **raw**, but only for a filesystem at ≥90% used, up to 8, as part of `pressured_filesystems` |
+| disk filesystem device path | raw, in local metric history (`sensitivity: path`) | not sent |
+
+`descartes incident freeze` and the local `history`/`alerts` commands only ever touch the
+local, Descartes-owned store — nothing there leaves the host. A `triage` request is
+operator-initiated diagnosis: the compact evidence summary above is sent to whichever model
+provider you logged into with `descartes login`, per request, only when you run `triage`.
+Alert-intelligence wakeups (opt-in, `descartes alerts intelligence enable`) are a separate,
+rate-limited, audited background disclosure path with no tool/shell access
+(`enableTools:false`); it builds its own sanitized alert-record prompts and does not reuse
+this same compact-evidence payload.
 
 ## Supported platforms
 
