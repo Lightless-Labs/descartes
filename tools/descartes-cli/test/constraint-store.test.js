@@ -13,6 +13,7 @@ import {
   applyApprovedRetune,
   buildConstraintTarget,
   checkShadowSoak,
+  isValidExpectedShape,
   loadConstraints,
   loadLearnedConfig,
   normalizeLearnedConfig,
@@ -83,7 +84,11 @@ function wellFormedConstraint(overrides = {}) {
     kind: "constraint",
     family: "service-presence",
     target: "service.example",
-    expected: { present: true },
+    // L1 fix: { present: true } is not a shape evaluateExpected (constraint-eval.js) ever
+    // treats as supported:true -- it matched nothing before this fixture fix and was a
+    // placeholder referenced nowhere in src/. Use a real supported shape (categorical eq)
+    // so this helper keeps producing genuinely well-formed, live-evaluable records.
+    expected: { comparator: "eq", value: "true" },
     status: "active",
     confidence: 0.9,
     provenance: {
@@ -149,6 +154,122 @@ test("validateConstraint rejects out-of-range confidence", () => {
 test("validateConstraint rejects missing schema_version", () => {
   const record = wellFormedConstraint({ schema_version: undefined });
   assert.throws(() => validateConstraint(record), /schema_version/);
+});
+
+// --- L1 fix: validateConstraint must REJECT a malformed target/expected at write time AND
+// drop it at load time, mirroring validateTuningCandidate's F6 pattern and evaluateExpected's
+// (constraint-eval.js) own "supported" contract -- a malformed shape must never persist as an
+// inert, never-firing status:"active" monitor.
+
+test("validateConstraint rejects a non-string target (object)", () => {
+  const record = wellFormedConstraint({ target: { bad: true } });
+  assert.throws(() => validateConstraint(record), /target/);
+});
+
+test("validateConstraint rejects a non-string target (array)", () => {
+  const record = wellFormedConstraint({ target: [] });
+  assert.throws(() => validateConstraint(record), /target/);
+});
+
+test("validateConstraint rejects a non-string target (number)", () => {
+  const record = wellFormedConstraint({ target: 123 });
+  assert.throws(() => validateConstraint(record), /target/);
+});
+
+test("validateConstraint rejects an empty-string target", () => {
+  const record = wellFormedConstraint({ target: "" });
+  assert.throws(() => validateConstraint(record), /target/);
+});
+
+test("validateConstraint rejects a malformed expected shape (array)", () => {
+  const record = wellFormedConstraint({ expected: [] });
+  assert.throws(() => validateConstraint(record), /expected/);
+});
+
+test("validateConstraint rejects a malformed expected shape (unsupported comparator)", () => {
+  const record = wellFormedConstraint({ expected: { comparator: "bogus", value: 1 } });
+  assert.throws(() => validateConstraint(record), /expected/);
+});
+
+test("validateConstraint rejects a malformed expected shape (unsupported pattern)", () => {
+  const record = wellFormedConstraint({ expected: { pattern: "starts_with:x" } });
+  assert.throws(() => validateConstraint(record), /expected/);
+});
+
+test("validateConstraint rejects a malformed expected shape (empty object)", () => {
+  const record = wellFormedConstraint({ expected: {} });
+  assert.throws(() => validateConstraint(record), /expected/);
+});
+
+test("validateConstraint accepts every shape evaluateExpected supports", () => {
+  assert.doesNotThrow(() => validateConstraint(wellFormedConstraint({ expected: { comparator: "gte", value: 1000 } })));
+  assert.doesNotThrow(() => validateConstraint(wellFormedConstraint({ expected: { comparator: "lte", value: 60_000 } })));
+  assert.doesNotThrow(() => validateConstraint(wellFormedConstraint({ expected: { comparator: "eq", value: 42 } })));
+  assert.doesNotThrow(() => validateConstraint(wellFormedConstraint({ expected: { comparator: "eq", value: "true" } })));
+  assert.doesNotThrow(() => validateConstraint(wellFormedConstraint({ expected: { pattern: "ends_with:/descartes" } })));
+});
+
+test("isValidExpectedShape mirrors evaluateExpected's supported contract", () => {
+  assert.equal(isValidExpectedShape({ comparator: "gte", value: 1000 }), true);
+  assert.equal(isValidExpectedShape({ comparator: "lte", value: 60_000 }), true);
+  assert.equal(isValidExpectedShape({ comparator: "eq", value: 42 }), true);
+  assert.equal(isValidExpectedShape({ comparator: "eq", value: "true" }), true);
+  assert.equal(isValidExpectedShape({ pattern: "ends_with:/descartes" }), true);
+  assert.equal(isValidExpectedShape([]), false);
+  assert.equal(isValidExpectedShape({}), false);
+  assert.equal(isValidExpectedShape(null), false);
+  assert.equal(isValidExpectedShape({ comparator: "bogus", value: 1 }), false);
+  assert.equal(isValidExpectedShape({ pattern: "starts_with:x" }), false);
+});
+
+test("writeConstraints rejects a malformed record before writing anything (all-or-nothing)", async () => {
+  const paths = await tempPaths();
+  const malformed = wellFormedConstraint({ id: "constraint.test.malformed", target: { bad: true } });
+
+  await assert.rejects(() => writeConstraints(paths, [malformed]));
+
+  const { constraintsFile } = resolveConstraintStorePaths(paths);
+  await assert.rejects(() => fs.access(constraintsFile), /ENOENT/);
+});
+
+test("writeConstraints leaves an existing store untouched when a later write is rejected", async () => {
+  const paths = await tempPaths();
+  const good = wellFormedConstraint({ id: "constraint.test.good" });
+  await writeConstraints(paths, [good]);
+
+  const { constraintsFile } = resolveConstraintStorePaths(paths);
+  const before = await fs.readFile(constraintsFile, "utf8");
+
+  const malformed = wellFormedConstraint({ id: "constraint.test.malformed", expected: [] });
+  await assert.rejects(() => writeConstraints(paths, [good, malformed]));
+
+  const after = await fs.readFile(constraintsFile, "utf8");
+  assert.equal(after, before);
+});
+
+test("loadConstraints drops a malformed record but keeps the valid one, corrupt_count stays 0", async () => {
+  const paths = await tempPaths();
+  const { dir, constraintsFile } = resolveConstraintStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+  const good = wellFormedConstraint({ id: "constraint.test.good" });
+  const malformed = wellFormedConstraint({ id: "constraint.test.malformed", target: { bad: true } });
+  await fs.writeFile(
+    constraintsFile,
+    JSON.stringify({ schema_version: 1, constraints: [malformed, good] }, null, 2),
+    { mode: 0o600 },
+  );
+
+  const { constraints, corrupt_count } = await loadConstraints(paths);
+  assert.equal(corrupt_count, 0);
+  assert.deepEqual(constraints.map((c) => c.id), [good.id]);
+});
+
+test("regression: every SEED_CONSTRAINTS entry and a representative miner draft still validate", () => {
+  for (const seed of SEED_CONSTRAINTS) {
+    assert.doesNotThrow(() => validateConstraint(seed));
+  }
+  assert.doesNotThrow(() => validateConstraint(draftConstraint()));
 });
 
 test("atomic write then read round-trips seed constraints", async () => {

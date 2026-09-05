@@ -71,6 +71,26 @@ function normalizeIso(ts, field = "timestamp") {
   return date.toISOString();
 }
 
+// L1 fix: mirrors constraint-eval.js's evaluateExpected() "supported" contract EXACTLY (not
+// isValidNumericExpected below, which is deliberately narrower -- gte/lte-only, numeric-only --
+// for applyApprovedRetune's retune-specific gate). Without this, validateConstraint's old
+// expected check only rejected undefined/null, so a shape like `expected: []` or
+// `{comparator:"bogus"}` would pass write-time validation and loadConstraints' per-record
+// tolerance, persisting as a status:"active" record that evaluateExpected always returns
+// {supported:false} for -- a permanently inert, never-firing "active" monitor. This predicate
+// closes that gap by accepting exactly the same three shapes evaluateExpected treats as
+// supported:true (including its Number(value) coercion for numeric-looking strings), so no
+// constraint that is actually evaluable today becomes unwritable/unloadable.
+export function isValidExpectedShape(expected) {
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) return false;
+  if (typeof expected.comparator === "string"
+      && ["gte", "lte", "eq"].includes(expected.comparator)
+      && Number.isFinite(Number(expected.value))) return true;
+  if (expected.comparator === "eq" && typeof expected.value === "string") return true;
+  if (typeof expected.pattern === "string" && /^ends_with:.*$/.test(expected.pattern)) return true;
+  return false;
+}
+
 /**
  * Validates a constraint-shaped LearnedArtifact record (plan §3.3, constraint-only for Slice 1).
  * Throws a descriptive Error on the first invalid/missing required field; returns true otherwise.
@@ -90,11 +110,23 @@ export function validateConstraint(record) {
   const family = String(record.family ?? "").trim();
   if (!family) throw new Error("Constraint record requires a non-empty family");
 
-  const target = String(record.target ?? "").trim();
-  if (!target) throw new Error("Constraint record requires a non-empty target");
+  // L1 fix: was `String(record.target ?? "").trim()`, which coerces ANY value (an object
+  // stringifies to the non-empty "[object Object]" and passed). A real type check is required
+  // so a non-string target can never be written or survive a load.
+  if (typeof record.target !== "string" || !record.target.trim()) {
+    throw new Error("Constraint record requires target to be a non-empty string");
+  }
 
   if (record.expected === undefined || record.expected === null) {
     throw new Error("Constraint record requires expected");
+  }
+
+  // L1 fix: the old check above only rejected undefined/null -- `expected: []` or an
+  // unsupported comparator/pattern shape passed with zero shape validation. isValidExpectedShape
+  // mirrors evaluateExpected's exact "supported" contract so a shape that would never fire is
+  // rejected here instead of persisting as an inert status:"active" monitor.
+  if (!isValidExpectedShape(record.expected)) {
+    throw new Error(`Constraint record expected must be a shape evaluateExpected supports (comparator gte|lte|eq with a numeric value, categorical eq with a string value, or pattern "ends_with:..."), got: ${JSON.stringify(record.expected)}`);
   }
 
   if (!CONSTRAINT_STATUSES.includes(record.status)) {
