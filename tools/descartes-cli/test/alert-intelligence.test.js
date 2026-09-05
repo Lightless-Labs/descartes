@@ -147,7 +147,9 @@ function fakeSession(prompts, decision) {
     messages: [],
     async prompt(promptText) {
       prompts.push(promptText);
-      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+      // A1 fix: a genuine completion requires stopReason:"stop" -- this fake represents a real,
+      // successful, non-truncated model response.
+      this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(decision) }] });
     },
     dispose() {},
   };
@@ -198,7 +200,7 @@ function fakeResolvesAfterDeadlineSession(resolveDelayMs, decision, { abortThrow
     async prompt(promptText) {
       session.lastPrompt = promptText;
       await new Promise((resolve) => setTimeout(resolve, resolveDelayMs));
-      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+      this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(decision) }] });
     },
     abort() {
       state.abortCalls += 1;
@@ -229,7 +231,7 @@ function fakeBusyWaitSession(busyMs, decision) {
         // Deliberately synchronous -- starves the event loop (and the deadline timer with it) for
         // the duration, unlike a setTimeout-based delay.
       }
-      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+      this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(decision) }] });
     },
     abort() {
       state.abortCalls += 1;
@@ -257,7 +259,7 @@ function fakeMonotonicBusyWaitSession(busyMs, decision) {
         // Deliberately synchronous -- starves the event loop (and the deadline timer with it) for
         // the duration, immune to any Date.now() manipulation by the caller.
       }
-      this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify(decision) }] });
+      this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(decision) }] });
     },
     abort() {
       state.abortCalls += 1;
@@ -369,7 +371,7 @@ test("enabled alert intelligence wakes fake LLM and records audited decision", a
         messages: [],
         async prompt(prompt) {
           prompts.push(prompt);
-          this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify({
+          this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({
             notify: true,
             severity: "warning",
             title: "Memory pressure is high",
@@ -405,7 +407,7 @@ test("alert intelligence respects max calls per hour", async () => {
     session: {
       messages: [],
       async prompt() {
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "{\"notify\":false}" }] });
+        this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "{\"notify\":false}" }] });
       },
       dispose() {},
     },
@@ -916,7 +918,7 @@ test("critical due alerts are processed before non-critical ones within a tick",
         messages: [],
         async prompt(promptText) {
           order.push(promptText.includes(critical.id) ? "critical" : "non-critical");
-          this.messages.push({ role: "assistant", content: [{ type: "text", text: JSON.stringify({ notify: false }) }] });
+          this.messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ notify: false }) }] });
         },
         dispose() {},
       },
@@ -1785,6 +1787,87 @@ test("emitMetricAlertFallbackSignals: no explicit options.config reads it via re
   });
   assert.deepEqual(result.fired, [memoryAlert.id]);
   assert.equal(deliveries.length, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// A2 fix: emitMetricAlertFallbackSignals must honor an explicit `disable-namespace metric` opt-out
+// EVEN while alert-intelligence itself is off (config.enabled:false). `disable` (alerts.js) only
+// flips `enabled` -- it never touches enabled_namespaces -- so a prior deliberate opt-out
+// (enabled_namespaces:[] or an array excluding "metric") survives a later `disable` and must still
+// suppress this deterministic fallback, not resurrect delivery.
+// ---------------------------------------------------------------------------------------------
+
+test("A2: emitMetricAlertFallbackSignals skips delivery when enabled:false but enabled_namespaces explicitly excludes metric (the disable-then-disable-namespace regression)", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "critical" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-09-04T00:01:00.000Z",
+    // Reproduces: `alerts intelligence enable` -> `disable-namespace metric` -> `disable`.
+    config: { enabled: false, enabled_namespaces: [] },
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result, { fired: [], skipped: "metric_namespace_disabled" });
+  assert.equal(deliverCalled, false);
+});
+
+test("A2: emitMetricAlertFallbackSignals still fires when enabled:false and enabled_namespaces explicitly includes metric (guards against over-correction)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-09-04T00:01:00.000Z",
+    config: { enabled: false, enabled_namespaces: ["metric"] },
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [memoryAlert.id]);
+  assert.equal(deliveries.length, 1);
+});
+
+test("A2: emitMetricAlertFallbackSignals skips when enabled_namespaces excludes metric but includes another namespace (an inclusion check on 'metric', not 'array non-empty')", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-09-04T00:01:00.000Z",
+    config: { enabled: false, enabled_namespaces: ["constraint"] },
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result, { fired: [], skipped: "metric_namespace_disabled" });
+  assert.equal(deliverCalled, false);
+});
+
+test("A2: a default (never-touched) config -- enabled_namespaces undefined -- still delivers a due metric alert while enabled:false (default users see zero behavior change)", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-09-04T00:01:00.000Z",
+    config: { enabled: false },
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; },
+  });
+  assert.deepEqual(result.fired, [memoryAlert.id]);
+  assert.equal(deliveries.length, 1);
+});
+
+test("A2 round-trip: enable -> disable-namespace metric -> disable, then a real (non-injected) config read still skips the fallback for the due metric alert", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true }, { now: "2026-09-04T00:00:00.000Z" });
+  const current = await readAlertIntelligenceConfig(paths);
+  await writeAlertIntelligenceConfig(paths, { ...current, enabled_namespaces: current.enabled_namespaces.filter((ns) => ns !== "metric") }, { now: "2026-09-04T00:00:10.000Z" });
+  const afterNamespaceDisable = await readAlertIntelligenceConfig(paths);
+  await writeAlertIntelligenceConfig(paths, { ...afterNamespaceDisable, enabled: false }, { now: "2026-09-04T00:00:20.000Z" });
+
+  let deliverCalled = false;
+  const memoryAlert = alert({ id: "alert_memory", rule_id: "system.memory.sustained_high", severity: "warning" });
+  // No options.config -- forces the real readAlertIntelligenceConfig read, exercising the exact
+  // operator sequence from the finding end-to-end.
+  const result = await emitMetricAlertFallbackSignals(paths, { alerts: [memoryAlert], notification_due_ids: [memoryAlert.id] }, {
+    now: "2026-09-04T00:01:00.000Z",
+    deliverNotification: async () => { deliverCalled = true; return { status: "recorded" }; },
+  });
+  assert.deepEqual(result, { fired: [], skipped: "metric_namespace_disabled" });
+  assert.equal(deliverCalled, false);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -2856,4 +2939,235 @@ test("F5-B2 daybreak-blue re-gate BLOCKER 3: the deadline belt is monotonic -- f
   assert.equal(audit[0].decision, undefined);
   assert.match(audit[0].error, /model_deadline_exceeded/);
   assert.equal(result.decisions[0].status, "error");
+});
+
+// ---------------------------------------------------------------------------------------------
+// A1 fix (NEVER-FABRICATE): a model response that beats the F5 deadline but was never a genuine,
+// complete text completion (truncated by the provider's own max-token limit, errored mid-stream,
+// or aborted for a reason other than our own deadline) must never be trusted as "ok". Only the
+// real pi-ai stopReason:"stop" is a genuine completion; anything else (or a missing stopReason)
+// must throw model_response_incomplete BEFORE parseDecisionJson, caught by the existing catch and
+// recorded status:"error" with zero delivery.
+// ---------------------------------------------------------------------------------------------
+
+function fakeSessionWithStopReason(stopReason, text, messageExtra = {}) {
+  const session = {
+    messages: [],
+    async prompt(promptText) {
+      session.lastPrompt = promptText;
+      const message = { role: "assistant", content: [{ type: "text", text }], ...messageExtra };
+      if (stopReason !== undefined) message.stopReason = stopReason;
+      session.messages.push(message);
+    },
+    dispose() {},
+  };
+  return session;
+}
+
+function fakeCreateSessionWithStopReason(stopReason, text, messageExtra = {}) {
+  return async () => ({
+    selectedModel: { provider: "test", id: "model" },
+    selectedThinkingLevel: "low",
+    session: fakeSessionWithStopReason(stopReason, text, messageExtra),
+  });
+}
+
+test("A1: stopReason 'length' with an empty-but-valid JSON body is rejected as model_response_incomplete, never recorded ok, never delivered", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-05T00:00:00.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }),
+    createSession: fakeCreateSessionWithStopReason("length", "{}"),
+    deliverNotification: async () => { deliverCalled = true; return { delivered: true }; },
+  });
+  assert.equal(result.status, "ok", "the tick itself completed and recorded an honest error, not a rate-limit/degraded state");
+  assert.equal(result.decisions[0].status, "error");
+  assert.equal(deliverCalled, false);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].status, "error");
+  assert.equal(audit[0].decision, undefined);
+  assert.match(audit[0].error, /model_response_incomplete/);
+  assert.match(audit[0].error, /length/);
+});
+
+test("A1: stopReason 'length' with a syntactically-valid {\"notify\":false} body is STILL rejected -- a truncated false-negative must not silently suppress an alert as a trusted 'ok'", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-05T00:00:10.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }),
+    createSession: fakeCreateSessionWithStopReason("length", JSON.stringify({ notify: false })),
+    deliverNotification: async () => { deliverCalled = true; return { delivered: true }; },
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(result.decisions[0].status, "error");
+  assert.equal(deliverCalled, false);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit[0].status, "error");
+  assert.match(audit[0].error, /model_response_incomplete/);
+});
+
+test("A1: stopReason 'error' with an errorMessage is rejected, and the clamped errorMessage text is recorded in the audit error", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-05T00:00:20.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }),
+    createSession: fakeCreateSessionWithStopReason("error", "partial", { errorMessage: "provider rate limit exceeded" }),
+    deliverNotification: async () => { deliverCalled = true; return { delivered: true }; },
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(result.decisions[0].status, "error");
+  assert.equal(deliverCalled, false);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit[0].status, "error");
+  assert.match(audit[0].error, /model_response_incomplete/);
+  assert.match(audit[0].error, /provider rate limit exceeded/);
+});
+
+test("A1: stopReason 'aborted' is rejected, never recorded ok", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-05T00:00:30.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }),
+    createSession: fakeCreateSessionWithStopReason("aborted", JSON.stringify({ notify: true, severity: "critical", title: "x", body: "y" })),
+    deliverNotification: async () => { deliverCalled = true; return { delivered: true }; },
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(result.decisions[0].status, "error");
+  assert.equal(deliverCalled, false);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit[0].status, "error");
+  assert.match(audit[0].error, /model_response_incomplete/);
+  assert.match(audit[0].error, /aborted/);
+});
+
+test("A1: a missing/undefined stopReason (malformed/fake message shape) is rejected as 'missing', never trusted", async () => {
+  const paths = await tempPaths();
+  let deliverCalled = false;
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-05T00:00:40.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }),
+    createSession: fakeCreateSessionWithStopReason(undefined, JSON.stringify({ notify: false })),
+    deliverNotification: async () => { deliverCalled = true; return { delivered: true }; },
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(result.decisions[0].status, "error");
+  assert.equal(deliverCalled, false);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit[0].status, "error");
+  assert.match(audit[0].error, /model_response_incomplete/);
+  assert.match(audit[0].error, /missing/);
+});
+
+test("A1 regression: stopReason 'stop' (a genuine completion) is unchanged -- still recorded ok and delivered", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const result = await adjudicateAlertNotifications(paths, {
+    alerts: [alert()],
+    notification_due_ids: ["alert_memory"],
+  }, {
+    now: "2026-09-05T00:00:50.000Z",
+    config: normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }),
+    createSession: fakeCreateSessionWithStopReason("stop", JSON.stringify({ notify: true, severity: "warning", title: "Memory pressure", body: "Elevated.", reason: "r" })),
+    deliverNotification: async (descartesPaths, decision, opts) => { deliveries.push({ decision, opts }); return { delivered: true }; },
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(deliveries.length, 1);
+  const audit = await readAlertIntelligenceAudit(paths);
+  assert.equal(audit[0].status, "ok");
+  assert.equal(audit[0].decision.notify, true);
+});
+
+// ---------------------------------------------------------------------------------------------
+// A5 fix: the trailing-hour BUDGET WINDOW is bounded by a monotonic (process.hrtime.bigint-based)
+// anchor, so a forward wall-clock jump between two live calls against the same audit path (NTP
+// resync, VM/laptop suspend-resume) cannot free budget it hasn't actually earned. This is strictly
+// fail-closed -- it can only delay an admission, never wrongly admit one.
+// ---------------------------------------------------------------------------------------------
+
+test("A5: an instantaneous wall-clock jump (+2h) with real elapsed process time of only a few ms does NOT free the budget -- the earlier record still counts", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-05T00:00:00.000Z" });
+
+  let monoNs = 0n;
+  const fakeMono = () => monoNs;
+
+  const prompts = [];
+  const first = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_a5_first" })],
+    notification_due_ids: ["alert_a5_first"],
+  }, {
+    now: "2026-09-05T00:00:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+    budgetClock: { hrtimeNow: fakeMono },
+  });
+  assert.equal(first.status, "ok", "the first call establishes the anchor and is admitted normally");
+  assert.equal(prompts.length, 1);
+
+  // Simulate an instantaneous wall-clock step: `now` jumps forward 2 hours, but the injected
+  // monotonic clock only advances 5ms -- real elapsed process time did NOT actually pass.
+  monoNs += 5_000_000n; // 5ms in nanoseconds
+  const second = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_a5_second" })],
+    notification_due_ids: ["alert_a5_second"],
+  }, {
+    now: "2026-09-05T02:00:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+    budgetClock: { hrtimeNow: fakeMono },
+  });
+  assert.notEqual(second.status, "ok", "the wall-clock jump must not be trusted to free the budget");
+  assert.equal(prompts.length, 1, "no second LLM call should have been admitted");
+  assert.equal(second.dropped_total, 1);
+});
+
+test("A5 regression: a REAL elapsed hour (wall clock and monotonic clock both advance by ~2h) genuinely frees the budget", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-05T00:00:00.000Z" });
+
+  let monoNs = 0n;
+  const fakeMono = () => monoNs;
+
+  const prompts = [];
+  const first = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_a5_regress_first" })],
+    notification_due_ids: ["alert_a5_regress_first"],
+  }, {
+    now: "2026-09-05T00:00:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+    budgetClock: { hrtimeNow: fakeMono },
+  });
+  assert.equal(first.status, "ok");
+  assert.equal(prompts.length, 1);
+
+  // Both clocks advance by a CONSISTENT 2 real hours -- ordinary aging-out must still work.
+  monoNs += 7_200_000_000_000n; // 2h in nanoseconds
+  const second = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_a5_regress_second" })],
+    notification_due_ids: ["alert_a5_regress_second"],
+  }, {
+    now: "2026-09-05T02:00:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+    budgetClock: { hrtimeNow: fakeMono },
+  });
+  assert.equal(second.status, "ok", "a genuinely-elapsed hour must still free the budget -- the fix must not regress ordinary aging-out");
+  assert.equal(prompts.length, 2);
 });

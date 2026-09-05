@@ -271,6 +271,20 @@ function lastAssistantText(messages = []) {
   return "";
 }
 
+// A1 fix (NEVER-FABRICATE): returns the last assistant MESSAGE OBJECT (not just its text), so a
+// caller can inspect stopReason and read the response text off the SAME object -- avoiding the
+// mismatch risk of pairing lastAssistantText's own independent backwards-scan (which skips
+// assistant messages with empty text) against a separate stopReason lookup. Mirrors
+// assistantStopReasonFromMessages in src/triage-diagnostics.js:11-17, which reads this exact real
+// pi-ai field for the identical purpose.
+function lastAssistantMessage(messages = []) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "assistant") return message;
+  }
+  return undefined;
+}
+
 async function readAuditRecords(descartesPaths) {
   const { auditFile } = resolveAlertIntelligencePaths(descartesPaths);
   let contents;
@@ -309,6 +323,56 @@ async function appendAuditRecord(descartesPaths, record) {
 // tests never cross-pollute each other's degraded state. See adjudicateAlertNotifications' probe
 // -heal logic and the documentation comment above it for the full rationale.
 const auditWriteDegradedPaths = new Set();
+
+// A5 fix -- bounds the trailing-hour BUDGET WINDOW computation against a forward wall-clock jump
+// (NTP resync, VM/laptop suspend-resume) that would otherwise age out genuinely-recent audit
+// records and under-count the budget (fail-open: admits an extra call). IN-PROCESS only (never
+// persisted -- same rationale as auditWriteDegradedPaths above), keyed by the RESOLVED audit-file
+// path for the same per-install/per-test isolation. Does NOT bound isWithinTrailingHour's existing
+// backward-clock-step clamp, the `ts` written into audit records, or readAuditRecords/
+// readAlertIntelligenceAudit -- scope is the budget-window arithmetic only.
+const budgetClockAnchors = new Map();
+
+// Returns a `now` value that is safe to feed into the budget-window computation
+// (readBudgetAuditRecordsStrict / partitionRecentAuditCounts) ONLY -- never used for the audit
+// record `ts`, prompt/session context, or any other timestamp in adjudicateAlertNotifications.
+//
+// First observation for a given auditFile (fresh process, or first call this process makes against
+// this path): nothing to compare against yet, so `now` is returned unchanged and an anchor is
+// recorded. This matches the already-accepted <=1-per-restart residual doctrine documented above
+// (a freshly-started process has no in-memory latch state either).
+//
+// On every subsequent call, the wall-clock delta since the anchor is compared against the REAL
+// (monotonic, process.hrtime.bigint-based) elapsed delta plus a small tolerance. An ordinary tick
+// advances both deltas together, so the anchor is simply refreshed and `now` passes through
+// unchanged. A forward jump -- wall time advancing far faster than real elapsed process time --
+// is clamped to `anchor + monoDelta + tolerance`: strictly conservative (can only ever SHRINK the
+// apparent elapsed time relative to the raw value), so this can only turn a would-be under-count
+// into an over-count, never the reverse. Fail closed, never fail open.
+function boundBudgetNow(auditFile, now, { hrtimeNow = () => process.hrtime.bigint(), toleranceMs = 2000 } = {}) {
+  const nowMs = new Date(now).getTime();
+  if (!Number.isFinite(nowMs)) return now; // let existing downstream non-finite-ts handling apply
+  const nowMono = hrtimeNow();
+  const anchor = budgetClockAnchors.get(auditFile);
+  if (!anchor) {
+    budgetClockAnchors.set(auditFile, { wallMs: nowMs, monoNs: nowMono });
+    return now;
+  }
+  const wallDeltaMs = nowMs - anchor.wallMs;
+  const monoDeltaMs = Number(nowMono - anchor.monoNs) / 1e6;
+  if (wallDeltaMs <= monoDeltaMs + toleranceMs) {
+    // Ordinary tick (includes any BACKWARD step -- already handled by isWithinTrailingHour's own
+    // future-ts clamp elsewhere; nothing to bound here).
+    budgetClockAnchors.set(auditFile, { wallMs: nowMs, monoNs: nowMono });
+    return now;
+  }
+  // Wall clock advanced implausibly faster than real elapsed process time -- the anomalous
+  // forward-jump case. Advance the anchor by the REAL elapsed time (+ tolerance) instead of the
+  // suspect wall-clock jump, so the anchor itself never silently re-baselines off the anomaly.
+  const effectiveMs = anchor.wallMs + monoDeltaMs + toleranceMs;
+  budgetClockAnchors.set(auditFile, { wallMs: effectiveMs, monoNs: nowMono });
+  return new Date(effectiveMs).toISOString();
+}
 
 // Never throws: swallows any appendFn failure, console.warns, and returns null so a caller can
 // distinguish "recorded" (truthy) from "not recorded" (null) without a second try/catch. Accepts
@@ -814,6 +878,18 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     return { fired: [], skipped: config.enabled ? "intelligence_enabled" : "intelligence_config_unavailable" };
   }
 
+  // Honor an explicit `disable-namespace metric` even while intelligence itself is off: `disable`
+  // (alerts.js) only flips `enabled`, it never touches enabled_namespaces, so a prior deliberate
+  // opt-out (persisted as enabled_namespaces:[] or an array without "metric") survives a later
+  // `disable`. Reuses normalizeEnabledNamespaces so an unset/undefined value still defaults to
+  // DEFAULT_ENABLED_NAMESPACES (["metric"]) -- every existing default-state caller keeps firing --
+  // while a present, explicitly empty/metric-excluding array is respected as-is, matching this
+  // function's own header comment above ("still respects enabled_namespaces (including an explicit
+  // disable-namespace metric)") for the enabled:false branch too, not only the enabled:true one.
+  if (!normalizeEnabledNamespaces(config.enabled_namespaces).includes("metric")) {
+    return { fired: [], skipped: "metric_namespace_disabled" };
+  }
+
   // daybreak-blue #7 (MEDIUM) point 2 precedent, applied here too: a corrupt/foreign evaluation
   // shape degrades to "nothing due", not a throw that aborts the caller's tick.
   const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
@@ -1255,17 +1331,23 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     ...eligibleAlerts.filter((alert) => alert.severity !== "critical"),
   ];
 
+  // A5 fix: bound ONLY the budget-window arithmetic below against a forward wall-clock jump
+  // (NTP resync, VM/laptop suspend-resume) -- see boundBudgetNow's own doc comment above. `now`
+  // itself (audit record `ts`, prompt/session context, probe append, budget_exhausted timing) stays
+  // untouched everywhere else in this function.
+  const budgetNow = boundBudgetNow(auditFile, now, options.budgetClock);
+
   let audit;
   try {
     // daybreak-blue #3 (HIGH): the budget seed uses the STRICT, budget-local read
     // (readBudgetAuditRecordsStrict, defined above) -- never the tolerant readAuditRecords used
     // elsewhere in this file. See that function's own doc comment for the full corrupt-line policy.
-    audit = await readBudgetAuditRecordsStrict(descartesPaths, now);
+    audit = await readBudgetAuditRecordsStrict(descartesPaths, budgetNow);
   } catch (error) {
     console.warn(`descartes: alert intelligence audit read failed (${errorLabel(error)}); skipping adjudication this tick (budget cannot be computed)`);
     return { status: "audit_unavailable", decisions: [], excluded };
   }
-  const historical = partitionRecentAuditCounts(audit, now);
+  const historical = partitionRecentAuditCounts(audit, budgetNow);
   // RUNNING per-class counters, seeded from trailing-hour audit history and incremented as calls
   // are admitted within this loop -- this is what lets "so_far" include calls already made earlier
   // in THIS invocation, which a one-shot remaining/slice computation could not express.
@@ -1449,7 +1531,24 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         // runs, but real elapsed time already tells the truth.
         if (timedOut || performance.now() - promptStartedMs >= deadlineMs) throw new Error("model_deadline_exceeded");
 
-        const rawText = lastAssistantText(session.messages);
+        // A1 fix (NEVER-FABRICATE): the F5 deadline guard above only bounds wall-clock TIME -- a
+        // response that arrives promptly but was truncated by the provider's own max-token limit,
+        // errored mid-stream, or was aborted for a reason other than our own deadline must never be
+        // trusted as a genuine completion. Only stopReason === "stop" is a real, complete, non-tool-
+        // call text response (see src/triage-diagnostics.js for the same real pi-ai field read for
+        // the identical purpose). "toolUse" is unreachable here (createPrivateAlertSession forces
+        // enableTools:false) but is rejected defensively too; a missing/undefined stopReason (the
+        // field is non-optional on a real harness message) indicates a malformed/fake message and is
+        // rejected as "missing". This is an allowlist, not a denylist.
+        const finalAssistantMessage = lastAssistantMessage(session.messages);
+        const stopReason = finalAssistantMessage?.stopReason;
+        if (stopReason !== "stop") {
+          const detail = stopReason === "error" && finalAssistantMessage?.errorMessage
+            ? `: ${clampString(finalAssistantMessage.errorMessage, 200)}`
+            : "";
+          throw new Error(`model_response_incomplete:${stopReason ?? "missing"}${detail}`);
+        }
+        const rawText = contentToText(finalAssistantMessage.content).trim();
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
         const delivery = decision.notify
           ? await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id })
