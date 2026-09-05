@@ -730,6 +730,142 @@ test("descartes learned review never writes constraints.json while reconciling (
   assert.equal(after, before, "reconciliation is a promotion-only hygiene pass; constraints.json is untouched");
 });
 
+// ============================================================================================
+// L3 (daybreak sweep): extend the Astra-F2 count-and-fail-closed one-approval-one-record guard
+// to decideConstraintPromotion's reject branch, which had NO matchCount guard at all and whose
+// own map predicate didn't even re-check status -- a duplicate-id reject could force-retire every
+// record sharing that id regardless of its own status.
+// ============================================================================================
+
+test("L3: reject with an AMBIGUOUS duplicate (two review-ready records sharing the same id) fails closed via the audited denial helper -- never force-retires both", async () => {
+  const paths = await tempPaths();
+  const dup1 = reviewReadyConstraint();
+  const dup2 = reviewReadyConstraint({ promotion_history: [{ ts: "2026-07-09T00:00:00.000Z", from: "shadow", to: "review-ready", actor: "deterministic-gate" }] });
+  await writeConstraints(paths, [dup1, dup2]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, dup1, { now });
+
+  await assert.rejects(
+    () => decideConstraintPromotion(paths, dup1.id, minted.nonce, "rejected", { now }),
+    /ambiguous duplicate review-ready/,
+  );
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.filter((c) => c.status === "review-ready").length, 2, "neither duplicate was retired");
+  assert.equal(constraints.filter((c) => c.status === "retired").length, 0, "no record was force-retired");
+
+  const { promotions } = await loadPromotions(paths);
+  const record = promotions.find((p) => p.id === minted.id);
+  assert.equal(record.status, "pending", "the promotion record itself is not consumed by an ambiguous-duplicate denial");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "ambiguous_duplicate_review_ready"));
+});
+
+test("L3: reject with a duplicate id where only ONE record is review-ready never force-retires the OTHER-status record as a side effect (map guard now re-checks its own status precondition)", async () => {
+  const paths = await tempPaths();
+  const reviewReady = reviewReadyConstraint();
+  const activeDup = reviewReadyConstraint({ status: "active" }); // same id as reviewReady, different status
+  await writeConstraints(paths, [reviewReady, activeDup]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, reviewReady, { now });
+
+  const result = await decideConstraintPromotion(paths, reviewReady.id, minted.nonce, "rejected", { now });
+  assert.equal(result.constraint.status, "retired");
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.filter((c) => c.status === "active").length, 1, "the active-status duplicate must be untouched by the reject");
+  assert.equal(constraints.filter((c) => c.status === "retired").length, 1, "exactly the one intended record is retired");
+});
+
+// ============================================================================================
+// L4 (daybreak sweep): logDenial must AUDIT a denial attempt against a target with NO pending
+// authority record at all (candidates.length===0), rather than silently no-op'ing. Deny-by-default
+// authority logic (matchPendingPromotion) is untouched -- this is purely an audit-completeness fix.
+// ============================================================================================
+
+test("L4: approve with an unknown constraint id fails closed AND is audited (a phantom denied record is written, not a silent no-op)", async () => {
+  const paths = await tempPaths();
+  await writeConstraints(paths, []);
+  await assert.rejects(
+    () => runLearnedApprove(paths, ["constraint.does.not.exist", "--nonce", "some-nonce"], { now: "2026-07-10T00:00:00.000Z", output: () => {} }),
+    /no such constraint/,
+  );
+
+  const { promotions } = await loadPromotions(paths);
+  const record = promotions.find((p) => p.promotion_ref === "constraint.does.not.exist");
+  assert(record, "a denial against an unknown constraint id must leave a persisted audit trace");
+  assert.equal(record.status, "denied");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "constraint_not_found"));
+});
+
+test("L4: approve with NO promotion record at all denies AND persists the audit trail (reason: no_pending_promotion)", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  // Deliberately never called runLearnedReview/mintPendingPromotion -- promotions.json is empty.
+
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "anything"], { now: "2026-07-10T00:00:00.000Z", output: () => {} }),
+    /no_pending_promotion/,
+  );
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "review-ready");
+
+  const { promotions } = await loadPromotions(paths);
+  const record = promotions.find((p) => p.promotion_ref === constraint.id);
+  assert(record, "a denial against a target with zero promotion records must still be persisted");
+  assert.equal(record.status, "denied");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "no_pending_promotion"));
+});
+
+test("L4: a phantom denial record is never mistaken for granted authority -- matchPendingPromotion still denies against it", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "anything"], { now: "2026-07-10T00:00:00.000Z", output: () => {} }),
+    /no_pending_promotion/,
+  );
+  // The phantom "denied" record now exists for this constraint id. A second approve attempt
+  // (even with the SAME nonce) must still deny closed -- "denied" is never usable authority.
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "anything"], { now: "2026-07-10T00:01:00.000Z", output: () => {} }),
+  );
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "review-ready", "still never activated");
+});
+
+test("L4: a REPLAYED identical (constraintId, nonce) probe against a never-reviewed constraint dedups into ONE phantom record with two audit entries, not two records", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "same-nonce"], { now: "2026-07-10T00:00:00.000Z", output: () => {} }),
+  );
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "same-nonce"], { now: "2026-07-10T00:01:00.000Z", output: () => {} }),
+  );
+
+  const { promotions } = await loadPromotions(paths);
+  const matching = promotions.filter((p) => p.promotion_ref === constraint.id);
+  assert.equal(matching.length, 1, "an identical-nonce replay must dedup into the SAME record, not spam a new one each time");
+  assert.equal(matching[0].audit_transitions.filter((t) => t.action === "denied").length, 2, "both attempts are recorded in the one record's history");
+});
+
+test("L4: logDenial's phantom-record fix never touches constraints.json", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  const { constraintsFile } = resolveConstraintStorePaths(paths);
+  const before = await fs.readFile(constraintsFile, "utf8");
+
+  await assert.rejects(() => runLearnedApprove(paths, [constraint.id, "--nonce", "anything"], { now: "2026-07-10T00:00:00.000Z", output: () => {} }));
+
+  const after = await fs.readFile(constraintsFile, "utf8");
+  assert.equal(after, before, "an audited denial must never touch constraints.json");
+});
+
 test("a reconciled promotion record is inert — its nonce can never approve, even if the constraint were review-ready again", async () => {
   const paths = await tempPaths();
   const constraint = reviewReadyConstraint();

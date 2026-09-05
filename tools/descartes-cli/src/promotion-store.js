@@ -40,7 +40,16 @@ export const DEFAULT_PROMOTION_EXPIRY_MS = 24 * 60 * 60 * 1000;
 // retires a constraint and NEVER un-does an approval; it only closes a promotion record that is
 // already unusable. Not a member of the "usable" set findValidPendingPromotion/matchPendingPromotion
 // filter on (status:"pending"), so a reconciled record is inert by construction.
-export const PROMOTION_STATUSES = ["pending", "approved", "rejected", "reconciled"];
+// "denied" (daybreak-sweep "L4" fix): a terminal, non-authorizing status for a phantom,
+// audit-only record minted by logDenial when a denial attempt targets a constraint id with NO
+// live promotion record to attach the denial to (candidates.length===0 -- unknown constraint id,
+// or a review-ready constraint that was never sent through `descartes learned review`). Deny-by-
+// default is completely unaffected: matchPendingPromotion/isUnexpiredPending both gate strictly
+// on status==="pending", so a "denied" record can never be mistaken for, or fall back into,
+// granted authority -- it exists purely so a denied attempt leaves a persistent audit trace
+// instead of silently vanishing (plan §5 acceptance: "denied attempts do not silently disappear",
+// which previously held only when SOME promotion record already existed for the target).
+export const PROMOTION_STATUSES = ["pending", "approved", "rejected", "reconciled", "denied"];
 
 export function resolvePromotionStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "authority");
@@ -343,10 +352,42 @@ function denialReason(promotions, constraintId, nonce, nowMs) {
  */
 async function logDenial(descartesPaths, promotions, constraintId, nonce, reason, options = {}) {
   const candidates = (promotions ?? []).filter((record) => record?.promotion_ref === constraintId);
-  if (candidates.length === 0) return promotions;
-
   const nowIso = normalizeIso(options.now ?? new Date().toISOString());
   const nowMs = new Date(nowIso).getTime();
+
+  if (candidates.length === 0) {
+    // L4 (daybreak sweep): deny-by-default must remain AUDITED even when no promotion record
+    // exists yet for this constraint id (unknown constraint id, or review-ready but never sent
+    // through `descartes learned review`). Previously this branch silently returned `promotions`
+    // unchanged -- the caller's Error correctly denied the action, but zero persistent trace of
+    // the attempt existed anywhere. Mint a phantom, audit-only "denied" record instead.
+    //
+    // id: the SAME deterministic promotionRecordId(constraintId, nonce) a real pending record
+    // would use, so a REPLAYED identical (constraintId, nonce) pair produces the SAME id: the
+    // next call's `candidates` will be non-empty (this phantom now exists) and the
+    // nonce-matching branch below appends to its audit_transitions instead of minting a
+    // duplicate -- deduping replay into one record's history, not spamming new records.
+    // nonce: never let an empty/undefined nonce reach validatePromotionRecord's non-empty-nonce
+    // check and throw INSIDE this denial-logging path, which would mask the real deny-by-default
+    // Error the caller is supposed to see.
+    const safeNonce = String(nonce ?? "").trim() || "unknown";
+    const phantom = {
+      id: promotionRecordId(constraintId, safeNonce),
+      nonce: safeNonce,
+      promotion_ref: constraintId,
+      bounded_summary: "unknown",
+      evidence_refs: [],
+      requested_at: nowIso,
+      expiry: nowIso, // already-expired by construction; irrelevant since status is never "pending"
+      decided_at: nowIso,
+      status: "denied",
+      audit_transitions: [{ ts: nowIso, action: "denied", actor: "human-cli", reason, note: options.note }],
+    };
+    const updated = [...(promotions ?? []), phantom];
+    await writePromotions(descartesPaths, updated);
+    return updated;
+  }
+
   // Attribute the denial to the record whose nonce was actually supplied; else to the currently-
   // VALID (unexpired) pending record being attacked -- NOT merely the first pending one in array
   // order (mirrors tuning-authority.js's logTuningDenial fix, F5): expired promotion records keep
@@ -440,8 +481,24 @@ export async function decideConstraintPromotion(descartesPaths, constraintId, no
     }
     updatedConstraints = result.constraints;
   } else {
+    // L3 (daybreak sweep): extend the Astra-F2 count-and-fail-closed one-approval-one-record
+    // guard (constraint-store.js's promoteReviewReadyToActive/retireActiveConstraint/
+    // applyApprovedRetune) to this reject branch, which previously had NO matchCount guard at
+    // all -- a duplicate id (two constraint records sharing constraintId, both review-ready) must
+    // fail closed via the SAME audited denial helper every other precondition failure in this
+    // function already routes through, never a raw throw that skips audit.
+    const matchCount = constraints.filter((candidate) => candidate?.id === constraintId && candidate?.status === "review-ready").length;
+    if (matchCount > 1) {
+      await logDenial(descartesPaths, promotions, constraintId, nonce, "ambiguous_duplicate_review_ready", { now: nowIso, note: options.note });
+      throw new Error(`Cannot reject ${constraintId}: ambiguous duplicate review-ready records found for this id.`);
+    }
     updatedConstraints = constraints.map((candidate) => {
-      if (candidate.id !== constraintId) return candidate;
+      // Defense-in-depth (mirrors promoteReviewReadyToActive's own predicate at
+      // constraint-store.js:611): re-check the candidate's OWN status, not just its id. Without
+      // this, a duplicate id where only ONE record is review-ready (matchCount===1, so the guard
+      // above never fires) would still force-retire every OTHER-status record sharing the id --
+      // strictly broader than "flip the intended review-ready record".
+      if (candidate.id !== constraintId || candidate.status !== "review-ready") return candidate;
       return {
         ...candidate,
         status: "retired",

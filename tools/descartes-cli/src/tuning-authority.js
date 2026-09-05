@@ -50,7 +50,13 @@ export const SCHEMA_VERSION = 1;
 // Single-user local CLI, same posture as promotion-store.js's own default (24h).
 export const DEFAULT_TUNING_APPROVAL_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
-export const TUNING_APPROVAL_STATUSES = ["pending", "approved", "rejected"];
+// "denied" (daybreak-sweep "L4" fix, mirrored from promotion-store.js's PROMOTION_STATUSES): a
+// terminal, non-authorizing status for a phantom, audit-only record minted by logTuningDenial
+// when a denial attempt targets a tuning candidate id with NO live decision record to attach the
+// denial to (candidates.length===0). Deny-by-default is completely unaffected:
+// matchPendingTuningApproval gates strictly on status==="pending", so a "denied" record can never
+// be mistaken for, or fall back into, granted authority.
+export const TUNING_APPROVAL_STATUSES = ["pending", "approved", "rejected", "denied"];
 
 const CONSTRAINT_VIOLATION_PREFIX = "constraint.violation.";
 
@@ -274,10 +280,40 @@ function tuningDenialReason(decisions, tuningCandidateId, nonce, nowMs) {
  */
 async function logTuningDenial(descartesPaths, decisions, tuningCandidateId, nonce, reason, options = {}) {
   const candidates = (decisions ?? []).filter((record) => record?.tuning_candidate_ref === tuningCandidateId);
-  if (candidates.length === 0) return decisions;
-
   const nowIso = normalizeIso(options.now ?? new Date().toISOString());
   const nowMs = new Date(nowIso).getTime();
+
+  if (candidates.length === 0) {
+    // L4 (daybreak sweep, mirrored from promotion-store.js's logDenial): deny-by-default must
+    // remain AUDITED even when no decision record exists yet for this candidate id (unknown
+    // candidate id, or review-ready but never sent through `descartes learned tuning review`).
+    // Previously this branch silently returned `decisions` unchanged. Mint a phantom, audit-only
+    // "denied" record instead.
+    //
+    // id: the SAME deterministic tuningApprovalRecordId(tuningCandidateId, nonce) a real pending
+    // record would use, so a REPLAYED identical (tuningCandidateId, nonce) pair produces the SAME
+    // id and dedups into one record's audit_transitions rather than spamming duplicates.
+    // nonce: never let an empty/undefined nonce reach validateTuningDecisionRecord's
+    // non-empty-nonce check and throw INSIDE this denial-logging path, masking the real
+    // deny-by-default Error the caller is supposed to see.
+    const safeNonce = String(nonce ?? "").trim() || "unknown";
+    const phantom = {
+      id: tuningApprovalRecordId(tuningCandidateId, safeNonce),
+      nonce: safeNonce,
+      tuning_candidate_ref: tuningCandidateId,
+      bounded_summary: "unknown",
+      evidence_refs: [],
+      requested_at: nowIso,
+      expiry: nowIso, // already-expired by construction; irrelevant since status is never "pending"
+      decided_at: nowIso,
+      status: "denied",
+      audit_transitions: [{ ts: nowIso, action: "denied", actor: "human-cli", reason, note: options.note }],
+    };
+    const updated = [...(decisions ?? []), phantom];
+    await writeTuningDecisions(descartesPaths, updated);
+    return updated;
+  }
+
   // Attribute the denial to the record whose nonce was actually supplied; else to the currently-
   // VALID (unexpired) pending record being attacked -- NOT merely the first pending one in array
   // order (adversarial-review finding): expired decision records keep status:"pending" (only their
@@ -407,6 +443,21 @@ export async function decideTuningApproval(descartesPaths, tuningCandidateId, no
     );
   }
 
+  // L3 (daybreak sweep): extend the Astra-F2 count-and-fail-closed one-approval-one-record guard
+  // to this function, which previously had NO matchCount guard at all. `candidates` above was
+  // resolved via a single `.find` (first match), so dispatchApprovedTuning only ever mutates ONE
+  // candidate's underlying artifact -- but the bookkeeping maps below (`updatedCandidates`/
+  // `updatedDecisions`) unconditionally stamp status:decision (and, on approve, the SAME
+  // applied/apply_note from that single dispatch) onto EVERY record sharing tuningCandidateId,
+  // falsely recording a never-actually-dispatched duplicate as approved/applied or rejected.
+  // Placed BEFORE any mutation/dispatch for BOTH decisions, routed through the same audited
+  // denial helper every other precondition failure in this function already uses.
+  const matchCount = candidates.filter((entry) => entry?.id === tuningCandidateId && entry?.status === "review-ready").length;
+  if (matchCount > 1) {
+    await logTuningDenial(descartesPaths, decisions, tuningCandidateId, nonce, "ambiguous_duplicate_candidate", { now: nowIso, note: options.note });
+    throw new Error(`Cannot ${verb} ${tuningCandidateId}: ambiguous duplicate review-ready candidate records found for this id.`);
+  }
+
   let updatedConstraints;
   let applied = false;
   let applyNote = null;
@@ -430,7 +481,13 @@ export async function decideTuningApproval(descartesPaths, tuningCandidateId, no
   }
 
   const updatedCandidates = candidates.map((entry) => {
-    if (entry.id !== tuningCandidateId) return entry;
+    // Defense-in-depth (daybreak re-gate L3): mutate ONLY the review-ready record for this id —
+    // matching promotion-store.js's own guard. The promotion_history entry below hardcodes
+    // from:"review-ready", so mutating a same-id record in any other status would stamp a false
+    // transition; leaving non-review-ready id-matches untouched keeps one-approval-one-record honest
+    // even when a duplicate id coexists in another status (the count guard above only fires on >1
+    // review-ready matches).
+    if (entry.id !== tuningCandidateId || entry.status !== "review-ready") return entry;
     return {
       ...entry,
       status: decision,

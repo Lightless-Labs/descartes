@@ -581,6 +581,115 @@ test("promote_shadow_hint approval is a pure no-op on constraints.json -- applie
 });
 
 // ============================================================================================
+// L3 (daybreak sweep): extend the Astra-F2 count-and-fail-closed one-approval-one-record guard
+// to decideTuningApproval, which had NO matchCount guard at all -- a duplicate-id decision would
+// unconditionally stamp status:approved/rejected (and, on approve, applied:true/apply_note) onto
+// EVERY review-ready candidate record sharing that id, even though the live constraint mutation
+// itself only ever fires once (dispatchApprovedTuning only ever sees the single `.find`-matched
+// candidate) -- corrupting the tuning audit trail for a duplicate that was never actually acted on.
+// ============================================================================================
+
+test("L3: approve with an AMBIGUOUS duplicate (two review-ready candidate records sharing the same id) fails closed via the audited denial helper before ANY dispatch/mutation", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const dup1 = reviewReadyRetireCandidate();
+  const dup2 = reviewReadyRetireCandidate({ mined_at: "2026-07-02T00:00:00.000Z" }); // same id, both review-ready
+  await writeTuningCandidates(paths, [dup1, dup2]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { approval: minted } = await mintPendingTuningApproval(paths, dup1, { now });
+
+  await assert.rejects(
+    () => decideTuningApproval(paths, dup1.id, minted.nonce, "approved", { now }),
+    /ambiguous duplicate review-ready/,
+  );
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "active", "the target constraint must never be touched -- dispatch never runs when ambiguous");
+
+  const { candidates } = await loadTuningCandidates(paths);
+  assert.equal(candidates.filter((c) => c.status === "review-ready").length, 2, "neither duplicate candidate record's status changed");
+
+  const { decisions } = await loadTuningDecisions(paths);
+  const record = decisions.find((d) => d.id === minted.id);
+  assert.equal(record.status, "pending", "the decision record itself is not consumed by an ambiguous-duplicate denial");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "ambiguous_duplicate_candidate"));
+});
+
+test("L3: reject with an AMBIGUOUS duplicate candidate id also fails closed -- neither duplicate is falsely flipped to rejected", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const dup1 = reviewReadyRetireCandidate();
+  const dup2 = reviewReadyRetireCandidate({ mined_at: "2026-07-02T00:00:00.000Z" });
+  await writeTuningCandidates(paths, [dup1, dup2]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { approval: minted } = await mintPendingTuningApproval(paths, dup1, { now });
+
+  await assert.rejects(
+    () => decideTuningApproval(paths, dup1.id, minted.nonce, "rejected", { now }),
+    /ambiguous duplicate review-ready/,
+  );
+
+  const { candidates } = await loadTuningCandidates(paths);
+  assert.equal(candidates.filter((c) => c.status === "review-ready").length, 2, "neither duplicate was falsely flipped to rejected");
+  assert.equal(candidates.filter((c) => c.status === "rejected").length, 0);
+});
+
+// ============================================================================================
+// L4 (daybreak sweep): logTuningDenial must AUDIT a denial attempt against a target with NO
+// pending authority record at all (candidates.length===0), mirroring promotion-store.js's fix.
+// Deny-by-default authority logic (matchPendingTuningApproval) is untouched.
+// ============================================================================================
+
+test("L4: approve with an unknown candidate id fails closed AND is audited (a phantom denied record is written, not a silent no-op)", async () => {
+  const paths = await tempPaths();
+  await assert.rejects(
+    () => decideTuningApproval(paths, "tuning.doesnotexist", "any-nonce", "approved", { now: "2026-07-10T00:00:00.000Z" }),
+    /no such tuning candidate/,
+  );
+
+  const { decisions } = await loadTuningDecisions(paths);
+  const record = decisions.find((d) => d.tuning_candidate_ref === "tuning.doesnotexist");
+  assert(record, "a denial against an unknown candidate id must leave a persisted audit trace");
+  assert.equal(record.status, "denied");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "candidate_not_found"));
+});
+
+test("L4: approve with NO pending approval record at all denies AND persists the audit trail (reason: no_pending_tuning_approval)", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const candidate = reviewReadyRetireCandidate();
+  await writeTuningCandidates(paths, [candidate]);
+
+  await assert.rejects(
+    () => decideTuningApproval(paths, candidate.id, "never-minted-nonce", "approved", { now: "2026-07-10T00:00:00.000Z" }),
+    /no_pending_tuning_approval/,
+  );
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "active");
+
+  const { decisions } = await loadTuningDecisions(paths);
+  const record = decisions.find((d) => d.tuning_candidate_ref === candidate.id);
+  assert(record, "a denial against a target with zero decision records must still be persisted");
+  assert.equal(record.status, "denied");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "no_pending_tuning_approval"));
+});
+
+test("L4: a REPLAYED identical (candidateId, nonce) probe against a never-reviewed candidate dedups into ONE phantom record with two audit entries", async () => {
+  const paths = await tempPaths();
+  await assert.rejects(() => decideTuningApproval(paths, "tuning.doesnotexist", "same-nonce", "approved", { now: "2026-07-10T00:00:00.000Z" }));
+  await assert.rejects(() => decideTuningApproval(paths, "tuning.doesnotexist", "same-nonce", "approved", { now: "2026-07-10T00:01:00.000Z" }));
+
+  const { decisions } = await loadTuningDecisions(paths);
+  const matching = decisions.filter((d) => d.tuning_candidate_ref === "tuning.doesnotexist");
+  assert.equal(matching.length, 1, "an identical-nonce replay must dedup into the SAME record, not spam a new one each time");
+  assert.equal(matching[0].audit_transitions.filter((t) => t.action === "denied").length, 2);
+});
+
+// ============================================================================================
 // reject
 // ============================================================================================
 
