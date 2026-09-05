@@ -318,6 +318,53 @@ test("applyAlertCandidates scoped by coveredRuleIds only recovers rule_ids it ha
   assert.equal(canaryAfter.status, "active", "non-covered rule_id must never be touched by a scoped recovery pass");
 });
 
+test("readAlertRecords quarantines a single malformed persisted record instead of aborting the whole read", async () => {
+  const paths = await tempPaths();
+  const storePaths = resolveAlertStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true, mode: 0o700 });
+  const good = {
+    id: "alert_good",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Sustained high memory pressure",
+    summary: "Memory high",
+    evidence_refs: ["history-summary"],
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T00:01:00.000Z",
+    last_notified: null,
+    cooldown_until: null,
+    acknowledged_at: null,
+    diagnostics: {},
+  };
+  const bad = { id: "bad", rule_id: "x", first_seen: "not-a-date" };
+  await fs.writeFile(storePaths.alertsFile, JSON.stringify({ version: 1, alerts: [good, bad] }, null, 2), { mode: 0o600 });
+
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  let records;
+  try {
+    records = await readAlertRecords(paths);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(records.length, 1, "the valid record must survive; only the malformed one is quarantined");
+  assert.equal(records[0].id, "alert_good");
+  assert(warnings.length > 0, "a quarantined record must be surfaced via console.warn");
+  assert(warnings.some((line) => line.includes("bad")), "the warning should identify the quarantined record");
+});
+
+test("readAlertRecords still rejects on whole-file JSON corruption (distinct, more severe case)", async () => {
+  const paths = await tempPaths();
+  const storePaths = resolveAlertStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storePaths.alertsFile, "{not json", { mode: 0o600 });
+
+  await assert.rejects(() => readAlertRecords(paths));
+});
+
 test("evaluateAlerts never writes; evaluateAndPersistAlerts does", async () => {
   const paths = await tempPaths();
   await appendMetricPoints(paths, [

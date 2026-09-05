@@ -206,7 +206,29 @@ export async function readAlertRecords(descartesPaths) {
   try {
     const parsed = JSON.parse(await fs.readFile(alertsFile, "utf8"));
     const rawAlerts = Array.isArray(parsed) ? parsed : parsed.alerts;
-    return (rawAlerts ?? []).map(normalizeAlertRecord);
+    // Tolerate a single malformed persisted record (bad rule_id, unparseable first_seen/
+    // last_seen/last_notified/cooldown_until/acknowledged_at date) instead of letting
+    // Array.prototype.map's implicit re-throw abort the entire read: one bad record must not
+    // blind the whole alert pipeline for this tick. Quarantine per-record and surface a count
+    // via console.warn; every OTHER field in normalizeAlertRecord already degrades to a safe
+    // default rather than throwing. Whole-file corruption (unparseable JSON, non-ENOENT fs
+    // errors) is a distinct, more severe case and must keep propagating unchanged — see the
+    // catch block below, which this loop does not touch.
+    const normalized = [];
+    let quarantinedCount = 0;
+    for (const rawAlert of rawAlerts ?? []) {
+      try {
+        normalized.push(normalizeAlertRecord(rawAlert));
+      } catch (recordError) {
+        quarantinedCount += 1;
+        const identifier = rawAlert?.id ?? rawAlert?.rule_id ?? "<unknown>";
+        console.warn(`descartes: quarantined malformed alert record (id/rule_id=${identifier}): ${recordError?.message ?? recordError}`);
+      }
+    }
+    if (quarantinedCount > 0) {
+      console.warn(`descartes: readAlertRecords quarantined ${quarantinedCount} malformed record(s) out of ${(rawAlerts ?? []).length}`);
+    }
+    return normalized;
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
