@@ -291,6 +291,60 @@ test("F4: a hostile source_envelope_id (hand-edited/regressed facts.jsonl) is sa
   }
 });
 
+test("F4: an observedValue that sanitizes to exactly the 64-char bound does not produce an over-length negative fixture (differentFixtureValue's 'not-' prefix must not push the fixture past MAX_STRING_LENGTH)", () => {
+  // "a".repeat(100) collapses (no unsafe chars to replace) then truncates to exactly 64
+  // "a" characters -- a legitimate, non-hostile boundary case (plan §L6 evidence: any raw
+  // value >=64 chars after normal collapsing hits this, not just hand-edited facts.jsonl).
+  const longSafeValue = "a".repeat(100);
+  const points = [0, 1, 2].map((i) => ({
+    ts: new Date(BASE_TS + i * 4 * DAY_MS).toISOString(),
+    fact_name: "service.presence",
+    entity_key: "nginx.service",
+    attributes: { running: longSafeValue, manager: "systemd" },
+    source_envelope_id: "services",
+    source_tool: "collect_services",
+    sensitivity: "operational",
+  }));
+  const candidates = mineConstraintCandidates(points, [], { now: BASE_TS + 8 * DAY_MS });
+
+  assert.equal(candidates.length, 1);
+  const [candidate] = candidates;
+  assert.equal(candidate.expected.value.length, 64);
+  assert(isSafeEnumString(candidate.expected.value));
+
+  assert.equal(candidate.fixtures.length, 2);
+  const fixtureValues = new Set();
+  for (const fixture of candidate.fixtures) {
+    const value = fixture.input["service.presence"];
+    assert(isSafeEnumString(value), `fixture value ${JSON.stringify(value)} must satisfy isSafeEnumString (length<=64, safe charset)`);
+    fixtureValues.add(value);
+  }
+  // Positive (expect_match:true) and negative (expect_match:false) fixture values must
+  // remain distinct even after both are bounded to the same 64-char sanitizer contract.
+  assert.equal(fixtureValues.size, 2);
+});
+
+test("F4: a degenerate negative-fixture collision (the sanitized negative fixture would equal the positive value) drops the whole group rather than emitting an ambiguous fixture pair", () => {
+  // \"not-\".repeat(16) is a fixed point of `differentFixtureValue` + `sanitizeIdentityString`:
+  // it is already a 64-char safe string, so it IS safeObservedValue; differentFixtureValue
+  // then produces \"not-\" + that 64-char string (68 chars), which sanitizeIdentityString
+  // truncates back down to exactly \"not-\".repeat(16) again -- colliding with the positive
+  // fixture. Degrade-don't-fabricate: drop the group rather than persist expect_match:true
+  // and expect_match:false fixtures carrying the identical value.
+  const fixedPointValue = "not-".repeat(16);
+  const points = [0, 1, 2].map((i) => ({
+    ts: new Date(BASE_TS + i * 4 * DAY_MS).toISOString(),
+    fact_name: "service.presence",
+    entity_key: "nginx.service",
+    attributes: { running: fixedPointValue, manager: "systemd" },
+    source_envelope_id: "services",
+    source_tool: "collect_services",
+    sensitivity: "operational",
+  }));
+  const candidates = mineConstraintCandidates(points, [], { now: BASE_TS + 8 * DAY_MS });
+  assert.deepEqual(candidates, []);
+});
+
 // --- Target-truncation collision (Codex review finding #8): two long entity_keys sharing a
 // 64-char sanitized prefix used to collide onto the SAME constraint target, so "latest wins"
 // evaluation silently evaluated two distinct constraints against one fact. ---

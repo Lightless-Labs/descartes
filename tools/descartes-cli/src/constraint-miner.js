@@ -154,6 +154,19 @@ function buildMinedConstraint(group, { minObservationDays, nowIso }) {
   const safeObservedValue = sanitizeIdentityString(String(observedValue));
   if (safeObservedValue === undefined) return undefined;
 
+  // Re-sanitize the derived negative fixture through the SAME sanitizer/bound contract the
+  // positive value just passed (F4/L6, defense-in-depth): differentFixtureValue's `not-${x}`
+  // concatenation can push an already-61-to-64-char safeObservedValue past MAX_STRING_LENGTH,
+  // which isSafeEnumString's length<=64 check would otherwise reject only at persistence time
+  // (constraint-store.js's validateConstraint never inspects `fixtures` at all). Re-running it
+  // through sanitizeIdentityString is idempotent/a no-op for every value that isn't at this
+  // boundary (sanitizeIdentityString on an already-safe, already-short string returns it
+  // unchanged), so eval semantics are preserved everywhere except the boundary. A degenerate
+  // collision (negative fixture sanitizing to the same value as the positive one) is treated
+  // the same as "nothing safe survived" -- degrade, never persist an ambiguous fixture pair.
+  const negativeFixtureValue = sanitizeIdentityString(differentFixtureValue(safeObservedValue));
+  if (negativeFixtureValue === undefined || negativeFixtureValue === safeObservedValue) return undefined;
+
   const timestampsMs = confirming.map((point) => new Date(point.ts).getTime()).filter(Number.isFinite);
   if (timestampsMs.length === 0) return undefined;
   const firstObservedMs = arrayMin(timestampsMs);
@@ -179,7 +192,7 @@ function buildMinedConstraint(group, { minObservationDays, nowIso }) {
     },
     fixtures: [
       { input: { [fact_name]: safeObservedValue }, expect_match: true },
-      { input: { [fact_name]: differentFixtureValue(safeObservedValue) }, expect_match: false },
+      { input: { [fact_name]: negativeFixtureValue }, expect_match: false },
     ],
     promotion_history: [],
     first_observed: new Date(firstObservedMs).toISOString(),
