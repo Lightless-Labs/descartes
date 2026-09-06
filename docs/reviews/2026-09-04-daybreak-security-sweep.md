@@ -16,13 +16,61 @@
 | fact-store | all plain-JSON never-fabricate findings CLOSED (3 rounds); **#3 clock-rollback DEFERRED → operator** | `5faf51f` | ✅ re-gated (3 rounds) |
 | positive-evidence — credential | BLOCKER #1 store-I/O + HIGH #3 lstat-bound CLOSED | `74cc39c` | ✅ (part of positive-evidence rounds) |
 | positive-evidence — canary | collision + oversized + `schema_invalid` trip-suppression CLOSED (rounds 2–4); **clean-delete DEFERRED → operator** | `7452de7` | ✅ re-gated (3 rounds) |
-| action-and-llm-surface | #3 fail-closed budget + #6 observable delivery-failure + #7 tick-survival CLOSED; #1/#2 deferred (write-ahead/lock) | `121071e` | ⚠️ committed on Opus review + TDD (not separately re-gated) |
-| learned-promotion-tuning | F5/F6/F4/F8/F2 defense-in-depth CLOSED; **F1/F3/F7 DEFERRED → trusted-state** | `884f69f` | ⚠️ committed on Opus review + TDD (not separately re-gated) |
+| action-and-llm-surface | #3 fail-closed budget + #6 observable delivery-failure + #7 tick-survival CLOSED; #1/#2 deferred (write-ahead/lock) | `121071e` | ✅ **re-gated 2026-09-06 (3 rounds) → READY** — A1/A2/A6 CLOSED; A5 clock-class deferred (see below) |
+| learned-promotion-tuning | F5/F6/F4/F8/F2 defense-in-depth CLOSED; **F1/F3/F7 DEFERRED → trusted-state** | `884f69f` | ✅ **re-gated 2026-09-06 (3 rounds) → READY** — L1/L3/L4/L6 CLOSED |
 | statistical-novelty | F5 (3 rounds + K=1) / F4 / F1 / F7 fabrication CLOSED; F3/F6 closed-for-fabrication (observability deferred); F2/F8 deferred | `ab2cca9` | ✅ re-gated (F5 caught twice + final) |
 
 **The four "deferred" security items are ONE threat-model boundary, not four decisions.** fact-store #3 (clock-rollback → intact), canary clean-delete (manifest removal suppresses a real trip), and learned-promotion-tuning F1/F3/F7 (file-authored `active`, non-atomic authority writes, unbounded store parse) ALL share the single precondition **"an attacker who can write Descartes's trusted same-user state files."** Descartes explicitly declares that outside its threat model (promotion-store.js:30-31; SEED_CONSTRAINTS are hand-authored `active` records). The answer to all four is the same one slice: **state-file attestation / off-host signing** (per MEMORY "off-host attestation" future work). fact-store #3 and canary clean-delete ALSO reverse deliberate, test-pinned behavior, so they additionally need an operator design sign-off before any code change (not autonomous). Treat these as a single "trusted-same-user-state" package for the owner decision.
 
 **Deferred OBSERVABILITY residuals (statistical, NOT fabrication):** F3 silent census-contradiction suppression + F6 silent unsupported-signature (`v2:`) mute — the fail-closed suppression is correct; they should emit a positive integrity signal. F6 also carries a **forward-compat footgun**: a future Descartes `availability_signature` `v2:` schema bump will SILENTLY dark `peer.count_spike` until the pattern is updated. See each area's "Deferred / architectural" section below.
+
+---
+
+## 2026-09-06 — independent daybreak re-gate of the two ⚠️ areas (asymmetry closed)
+
+The two rows above originally shipped via Sonnet-implement → Sonnet/Opus-review, **without** a
+separate `gpt-daybreak-blue-latest` re-gate — the same pipeline that (in the parallel Astra work)
+was proven to miss fabrication BLOCKERs the frontier reviewer catches. This pass closed that gap:
+each area was independently re-gated (codex, read-only, `model_reasoning_effort=high`), findings
+triaged verify-don't-worship, in-scope items fixed TDD + adversarially verified, then re-gated again
+(capped ~3 rounds/area). Both reached **READY**.
+
+**action-and-llm-surface → READY (with one scoped, operator-authorized deferral).**
+- **A1 (fabrication, CLOSED):** a truncated/aborted/errored model response (`stopReason !== "stop"`)
+  was parsed as a trusted decision — a `stopReason:"length"` `{"notify":false}` body could silently
+  suppress a real alert as `ok`. Now gated on `lastAssistantMessage` + `stopReason === "stop"`
+  before `parseDecisionJson`. Commit `fdd7f00`.
+- **A2 (metric opt-out, CLOSED):** namespace opt-out honored fail-closed. `fdd7f00`.
+- **A6 (robustness, CLOSED):** one malformed audit/alert record no longer aborts the whole read;
+  it is quarantined per-record. `35d3fec`.
+- **A5 (budget wall-clock, DEFERRED → trusted-time slice):** three re-gate rounds each surfaced a
+  *new* wall-clock-manipulation vector against the trailing-hour LLM-call budget (forward-jump →
+  per-tick accumulation → backward-step-then-restore). Root cause is structural — a persisted
+  wall-clock record `ts` mixed with process-local timing — and the monotonic-anchor patch attempted
+  in rounds 1–3 was **reverted** (`649ec12`) because `CLOCK_MONOTONIC` pauses across suspend and
+  silently darkened the LLM route after laptop sleep on Linux (Tier 1). Per the stopping rule
+  (commit what's solidly closed; escalate a same-interplay residual rather than whack-a-mole), the
+  whole class is deferred to `todos/2026-09-06-llm-budget-trusted-time.md` (write-ahead audit +
+  trusted monotonic sequence), consolidated with A3/A4. **Severity:** bounded *over-call* of an
+  opt-in/rate-limited/audited/no-tools path requiring local clock-stepping privilege — cost, not
+  fabrication/suppression/authority. This row is READY on an operator-authorized disposition of a
+  literal daybreak NOT READY, not a daybreak all-clear on A5.
+
+**learned-promotion-tuning → READY.**
+- **L1 (CLOSED):** `validateConstraint` rejects a malformed `target`/`expected` at both write and
+  load. `fa2e24e`.
+- **L3 (CLOSED):** denial/selection is order-independent (`id + status==="review-ready"`), with a
+  `>1`-review-ready count-guard that fails closed and audits. `50a396d`, `fa50461`.
+- **L4 (CLOSED):** no-pending diagnosis excludes phantom `"denied"` records and appends exactly one
+  denial transition per attempt. `50a396d`, `fa50461`.
+- **L6 (CLOSED):** the miner's derived negative fixture is bounded/re-sanitized. `44251e7`.
+- No new `status:"active"` string literal introduced (source-grep guard intact). Focused suites
+  green each round.
+
+**Still deferred (unchanged by this re-gate):** the F1/F3/F7 trusted-same-user-state package, and
+now the A5/A3/A4 LLM-budget clock class — both require a trust anchor Descartes does not yet have
+(state-file attestation / off-host signing; trusted monotonic time). See the trusted-state step-①
+plan under `docs/plans/` for the first concrete step.
 
 ---
 
