@@ -337,41 +337,50 @@ const budgetClockAnchors = new Map();
 // (readBudgetAuditRecordsStrict / partitionRecentAuditCounts) ONLY -- never used for the audit
 // record `ts`, prompt/session context, or any other timestamp in adjudicateAlertNotifications.
 //
-// First observation for a given auditFile (fresh process, or first call this process makes against
-// this path): nothing to compare against yet, so `now` is returned unchanged and an anchor is
-// recorded. This matches the already-accepted <=1-per-restart residual doctrine documented above
-// (a freshly-started process has no in-memory latch state either).
+// round-3 fix (daybreak re-gate round 2): the round-2 version of this function RE-BASELINED the
+// anchor on every call -- including the anomalous-jump branch, which advanced it to
+// `anchor.wallMs + monoDeltaMs + toleranceMs`. That looked conservative for a single jump, but once
+// the anchor was behind real wall-clock time, EVERY subsequent tick still saw a huge wallDelta
+// (real wall vs. the far-behind anchor), so it stayed "anomalous" and added +toleranceMs on top of
+// that tick's real elapsed time, every tick. That per-tick surplus ACCUMULATES: after enough ticks
+// the clamped `now` had advanced further than real elapsed time by more than the trailing-hour
+// window's slack, aging out a record that had NOT actually aged out and wrongly admitting a second
+// call. See the "A5 round-3" test below for the repro (59 ticks of a real 60s each accumulate
+// ~118s of pure artifact on top of the genuine ~59 real minutes elapsed).
 //
-// On every subsequent call, the wall-clock delta since the anchor is compared against the REAL
-// (monotonic, process.hrtime.bigint-based) elapsed delta plus a small tolerance. An ordinary tick
-// advances both deltas together, so the anchor is simply refreshed and `now` passes through
-// unchanged. A forward jump -- wall time advancing far faster than real elapsed process time --
-// is clamped to `anchor + monoDelta + tolerance`: strictly conservative (can only ever SHRINK the
-// apparent elapsed time relative to the raw value), so this can only turn a would-be under-count
-// into an over-count, never the reverse. Fail closed, never fail open.
-function boundBudgetNow(auditFile, now, { hrtimeNow = () => process.hrtime.bigint(), toleranceMs = 2000 } = {}) {
+// The fix removes the accumulation by never re-baselining the anchor at all: it is captured ONCE,
+// on first observation for a given auditFile, and held as a STABLE baseline for the lifetime of
+// this process (or until whatever clears budgetClockAnchors). budgetNow is then computed as
+// `min(nowMs, anchor.wallMs + realMonotonicElapsedSinceAnchor)` -- i.e. wall-clock time is allowed
+// to advance budgetNow only as far as real monotonic elapsed time since the anchor says it may.
+// This can only ever CAP/delay budgetNow relative to the raw wall clock, never let it run ahead --
+// so a record can never be aged out earlier than real elapsed time justifies (fail closed, never
+// fail open), and because the anchor never moves there is nothing left to accumulate tick over
+// tick. In the ordinary case (wall clock and monotonic clock advance together, the overwhelmingly
+// common case) `anchor.wallMs + monoElapsedMs` tracks `nowMs` almost exactly, so budgetNow == nowMs
+// and normal aging-out is unaffected (see the "A5 regression" real-elapsed-hour test below).
+//
+// ACKNOWLEDGED-DEFERRED (round 3, not fixed here): a process whose FIRST anchor is captured at an
+// ALREADY-jumped wall time has nothing to compare against and cannot detect that the anchor itself
+// is wrong -- no in-process signal distinguishes "wall was already off when this process started"
+// from "wall is correct". Closing that residual needs a persisted trusted time source and is
+// deferred to the budget-hardening/trusted-time slice alongside A3/A4; it does not regress on this
+// fix (round 2 had the identical fresh-process blind spot).
+function boundBudgetNow(auditFile, now, { hrtimeNow = () => process.hrtime.bigint() } = {}) {
   const nowMs = new Date(now).getTime();
   if (!Number.isFinite(nowMs)) return now; // let existing downstream non-finite-ts handling apply
   const nowMono = hrtimeNow();
   const anchor = budgetClockAnchors.get(auditFile);
   if (!anchor) {
+    // First observation for this auditFile: nothing to compare against yet, so `now` passes
+    // through unchanged. The baseline recorded here is STABLE -- it is never overwritten again
+    // (see the round-3 fix comment above for why re-baselining is exactly the round-2 bug).
     budgetClockAnchors.set(auditFile, { wallMs: nowMs, monoNs: nowMono });
     return now;
   }
-  const wallDeltaMs = nowMs - anchor.wallMs;
-  const monoDeltaMs = Number(nowMono - anchor.monoNs) / 1e6;
-  if (wallDeltaMs <= monoDeltaMs + toleranceMs) {
-    // Ordinary tick (includes any BACKWARD step -- already handled by isWithinTrailingHour's own
-    // future-ts clamp elsewhere; nothing to bound here).
-    budgetClockAnchors.set(auditFile, { wallMs: nowMs, monoNs: nowMono });
-    return now;
-  }
-  // Wall clock advanced implausibly faster than real elapsed process time -- the anomalous
-  // forward-jump case. Advance the anchor by the REAL elapsed time (+ tolerance) instead of the
-  // suspect wall-clock jump, so the anchor itself never silently re-baselines off the anomaly.
-  const effectiveMs = anchor.wallMs + monoDeltaMs + toleranceMs;
-  budgetClockAnchors.set(auditFile, { wallMs: effectiveMs, monoNs: nowMono });
-  return new Date(effectiveMs).toISOString();
+  const monoElapsedMs = Number(nowMono - anchor.monoNs) / 1e6;
+  const boundedMs = Math.min(nowMs, anchor.wallMs + monoElapsedMs);
+  return new Date(boundedMs).toISOString();
 }
 
 // Never throws: swallows any appendFn failure, console.warns, and returns null so a caller can

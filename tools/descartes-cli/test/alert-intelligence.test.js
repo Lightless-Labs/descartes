@@ -3171,3 +3171,60 @@ test("A5 regression: a REAL elapsed hour (wall clock and monotonic clock both ad
   assert.equal(second.status, "ok", "a genuinely-elapsed hour must still free the budget -- the fix must not regress ordinary aging-out");
   assert.equal(prompts.length, 2);
 });
+
+// ---------------------------------------------------------------------------------------------
+// A5 round-3 fix (daybreak re-gate round 2): the round-2 clamp above ("effectiveMs = anchor.wallMs
+// + monoDeltaMs + toleranceMs", with the anchor then RE-BASELINED to that clamped effectiveMs)
+// still let a forward wall-clock jump free budget it hadn't earned -- just delayed rather than
+// prevented. Once the anchor is anomalous, EVERY subsequent tick still sees a huge wallDelta
+// (real wall vs. the far-behind clamped anchor), stays "anomalous", and adds +toleranceMs on top
+// of the real per-tick elapsed time. That per-tick surplus accumulates: after enough ticks the
+// clamped budgetNow has advanced further than real elapsed time by more than the window's slack,
+// and a record that has NOT actually aged out gets wrongly treated as aged out, wrongly admitting
+// a second call. The round-3 fix removes the accumulation entirely by never re-baselining the
+// anchor at all (first observation only) and bounding budgetNow as
+// min(nowMs, anchor.wallMs + realMonotonicElapsedSinceAnchor) -- see boundBudgetNow's doc comment.
+// ---------------------------------------------------------------------------------------------
+
+test("A5 round-3: an instantaneous +2h wall jump followed by 59 real 60s monotonic ticks never accumulates enough apparent elapsed time to wrongly admit a second call", async () => {
+  const paths = await tempPaths();
+  await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 1, critical_reservation: 0 }, { now: "2026-09-05T00:00:00.000Z" });
+
+  let monoNs = 0n;
+  const fakeMono = () => monoNs;
+  const prompts = [];
+
+  const first = await adjudicateAlertNotifications(paths, {
+    alerts: [alert({ id: "alert_a5r3_first" })],
+    notification_due_ids: ["alert_a5r3_first"],
+  }, {
+    now: "2026-09-05T00:00:00.000Z",
+    createSession: fakeCreateSession(prompts, { notify: false }),
+    budgetClock: { hrtimeNow: fakeMono },
+  });
+  assert.equal(first.status, "ok", "the first call establishes the anchor and is admitted normally");
+  assert.equal(prompts.length, 1);
+
+  // Instantaneous wall-clock jump: +2h wall, monotonic clock has not moved yet (mirrors the
+  // daybreak repro's initial jump before the tick loop below starts).
+  let wallMs = Date.parse("2026-09-05T02:00:00.000Z");
+
+  // 59 ticks of a REAL 60s each -- both wall clock and monotonic clock genuinely advance together
+  // from here on (this is NOT another jump; it is ordinary elapsed process time after the jump).
+  // 59 * 60s = 3540s (59 real minutes), strictly under the 3600s trailing-hour window, so a
+  // correct implementation must refuse every single one of these calls.
+  for (let tick = 0; tick < 59; tick++) {
+    monoNs += 60_000_000_000n; // + 60s in ns
+    wallMs += 60_000; // + 60s
+    const result = await adjudicateAlertNotifications(paths, {
+      alerts: [alert({ id: `alert_a5r3_tick_${tick}` })],
+      notification_due_ids: [`alert_a5r3_tick_${tick}`],
+    }, {
+      now: new Date(wallMs).toISOString(),
+      createSession: fakeCreateSession(prompts, { notify: false }),
+      budgetClock: { hrtimeNow: fakeMono },
+    });
+    assert.notEqual(result.status, "ok", `tick ${tick}: an under-1-real-hour elapsed budget window must not wrongly admit a second call`);
+  }
+  assert.equal(prompts.length, 1, "no second LLM call should ever have been admitted across all 59 post-jump ticks");
+});
