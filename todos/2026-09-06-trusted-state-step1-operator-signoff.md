@@ -16,20 +16,31 @@ cannot ship autonomously — the operator must sign off on each reversal.
 
 ## The test-pinned reversals (each needs an explicit yes/no)
 
-1. **fact-store #3 — future-dated loss currently reads `intact`.** `fact-store-integrity.test.js:83`
-   and `:109` (and `fact-store-completeness.test.js:110`) assert `intact` for future-dated
-   losses/breaks; the 361–375 comment defends it as a clock artifact. Step ① makes a real loss count
-   (degraded) and clamps the loss timestamp down to `now` so it ages out normally. **Reversal:** three
-   named test expectations flip to `degraded`/`unknown`.
-2. **canary clean-delete — a removed manifest entry currently suppresses further trips.**
-   `canary-baseline.test.js:363` (`:749/:868/:995`) pin "a canary removed from the current manifest
-   produces no further trips" → `[]`. Step ①'s canary-trip-as-event (bound to the manifest digest at
-   observation) means an attacker-forced clean-delete no longer silently suppresses an
-   already-observed trip. **Reversal:** those decommission-suppression assertions flip (cost: one
-   trailing trip after a legitimate decommission — arguably desirable).
-3. **`integrity_level` honest label.** Introduces `unprotected_same_uid` as an explicit, truthful
-   integrity label rather than an implied-trusted state. Low-risk, but it is a public-surface change
-   worth an explicit ack.
+**Authoritative sign-off surface: `docs/plans/2026-09-06-trusted-state-step-1.md` §8.1** — the plan
+re-verified every ref against the current working tree (the sweep's earlier `:83/:109`-era numbers
+had shifted after the re-gate commits). The scope was deliberately **minimized to exactly THREE
+assertions**; the naive form of the fix would have flipped six more (a garbage-id trip fabrication +
+five detector rollback-recovery tests) and introduced a fail-STUCK denial-of-detection — all
+**avoided** by the corrected design (plan §8.2), which is why the sign-off ask is this small.
+
+1. **R1 — fact-store #3, future-dated loss (`fact-store-integrity.test.js:149`, test `:131`).**
+   `buildCompleteness` currently returns `status:"intact"` for a future `last_corrupt_ts`; the fix
+   makes it `"degraded"`. **Reversal:** `intact → degraded` (+ rename the pinned title).
+2. **R2 — fact-store #3, future continuity break (`fact-store-integrity.test.js:180`, test `:157`).**
+   Same file, a future break with live `ok` currently reads `intact`; the fix makes it `"degraded"`.
+   **Reversal:** `intact → degraded` (+ rename).
+3. **R4 — canary clean-delete (`canary-baseline.test.js:396`, test `:363`).** A clean-deleted
+   (`{canaries:[]}`, `read_ok:true`) established `credential` whose facts show a real
+   `atime_advanced` trip is currently suppressed (`deepEqual([])`); the fix fires one genuine
+   `canary.tripped`. **Reversal:** `[] → one trip` (cost: one trailing trip after a legitimate
+   decommission — arguably desirable; + rename).
+
+**Not a test reversal, but a public-surface ack (plan §8.4):** Component D introduces the honest
+`integrity_level: unprotected_same_uid` label — no assertion flips, but it is a truthful
+public-surface change worth an explicit yes. **Scope guard:** the fix to fact-store #3 is confined
+to `buildCompleteness`; it deliberately does **not** touch `hasLossEventAfter` /
+`factHistoryTrustworthy` (doing so is the withdrawn R3 — it would break the five rollback-recovery
+tests and create the DoS). All manifest-digest work is deferred to the plan's Phase 3.
 
 ## Why it's safe to do step ① before full attestation
 
