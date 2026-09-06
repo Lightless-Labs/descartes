@@ -34,6 +34,29 @@ Three independent code-grounded reviewers overturned an earlier (ungrounded) cle
   anchor-relative re-establishment gate + the local duplicates, not the DoS argument (R1 also
   violates that).
 
+**Update (2026-09-06, later): R1's three required fixes are now specified as a Phase-1 scope change**
+— the "Revision: R1 made signable" at the end of `docs/plans/2026-09-06-trusted-state-step-1.md`
+(delegated + adversarially verified; the verify pass caught that the fabricated-recovery fix must
+patch BOTH of daemon.js's alert-persist call sites, not one). With it, R1 is signable as one Phase-1
+unit with R2/R4/D. Two **new operator design calls** the revision surfaces, to make when signing:
+
+1. **Clamp clock-attacker scope** — ship the forward-dated-marker retention clamp *unguarded* against
+   a deliberate same-uid clock attacker in Phase 1 (**recommended** — no wall-clock-only guard can
+   work; a genuine clock correction and an attacker rollback are indistinguishable without `boot_id`,
+   which is the Phase-3 real fix; the residual is a one-step-narrower version of a capability that
+   same-uid attacker already has), vs. withhold the clamp until Phase 3 (leaves the *common*
+   accidental forward-clock-drift case unbounded-until-manual meanwhile — which §5.6 pt 5 itself
+   calls "strictly worse").
+2. **`canary.tampered` rule-sharing** — that rule_id covers both a history-gated output
+   (`canary_vanished`) and two non-history-gated tamper reasons (`manifest_unreadable`, isolated
+   entity); **cover it wholesale** in the no-fabricated-recovery fix (**recommended** — the two legit
+   reasons also freeze, but fail-stuck/bounded to genuinely-untrustworthy-history ticks) vs. leave it
+   uncovered (a documented `canary_vanished` residual).
+
+Prerequisite now tracked: [[2026-09-06-fact-store-future-dated-facts-wedge]] — a live pre-existing bug
+(a forward-clock future-dated *fact* wedges continuity to `unknown` permanently); it must land first
+because the clamp can't work while a future fact defeats it.
+
 The reversal descriptions below stand as the literal test-pin surface; the verdicts above are the
 grounded recommendation. Everything is an operator decision — nothing here is adopted.
 
