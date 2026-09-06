@@ -866,6 +866,136 @@ test("L4: logDenial's phantom-record fix never touches constraints.json", async 
   assert.equal(after, before, "an audited denial must never touch constraints.json");
 });
 
+// ============================================================================================
+// L3/L4 round 3 (daybreak re-gate round 2): two residuals from the round-1 L3/L4 fixes above.
+//
+// L3 residual: decideConstraintPromotion's constraint lookup was `constraints.find(id-match)` --
+// order-dependent. If an EARLIER same-id record sits in another status (active/retired) and the
+// SOLE review-ready record is later in the array, `.find` picks the earlier wrong-status record
+// and denies via "constraint_not_review_ready" BEFORE the count guard (matchCount>1) ever runs --
+// over-fail-closed on a genuinely legitimate single approval. The fix selects by id AND
+// status:"review-ready" so the match is order-independent; a genuine duplicate (>1 review-ready
+// records sharing the id) must still fail closed via the existing audited guards.
+//
+// L4 residual: logDenial's phantom "denied" record (minted for a no-live-record denial attempt)
+// self-suppressed every LATER attempt with a DIFFERENT nonce -- that later attempt matches
+// neither a nonce nor a pending record among `candidates` (the phantom is status:"denied", not
+// "pending"), so `if (!target) return promotions;` silently no-op'd, leaving only the FIRST
+// no-pending attempt audited. The fix appends a new denied transition to the existing phantom on
+// every such attempt instead of short-circuiting once one exists -- one phantom RECORD per
+// constraint id, N audited transitions for N attempts.
+// ============================================================================================
+
+test("L3 round-3: approve SUCCEEDS when an EARLIER same-id record is ACTIVE and the sole review-ready record is later in the array (order-independent matcher)", async () => {
+  const paths = await tempPaths();
+  const activeDup = reviewReadyConstraint({ status: "active" }); // earlier, same id, WRONG status
+  const reviewReady = reviewReadyConstraint(); // later, same id, the one eligible record
+  await writeConstraints(paths, [activeDup, reviewReady]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, reviewReady, { now });
+
+  const result = await decideConstraintPromotion(paths, reviewReady.id, minted.nonce, "approved", { now });
+  assert.equal(result.constraint.status, "active", "the legitimate single review-ready record must be approved, not wrongly denied");
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.filter((c) => c.status === "active").length, 2, "the pre-existing active dup is untouched, plus the newly activated record");
+  assert.equal(constraints.filter((c) => c.status === "review-ready").length, 0);
+});
+
+test("L3 round-3: approve SUCCEEDS when an EARLIER same-id record is RETIRED and the sole review-ready record is later in the array (order-independent matcher)", async () => {
+  const paths = await tempPaths();
+  const retiredDup = reviewReadyConstraint({ status: "retired" }); // earlier, same id, WRONG status
+  const reviewReady = reviewReadyConstraint(); // later, same id, the one eligible record
+  await writeConstraints(paths, [retiredDup, reviewReady]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, reviewReady, { now });
+
+  const result = await decideConstraintPromotion(paths, reviewReady.id, minted.nonce, "approved", { now });
+  assert.equal(result.constraint.status, "active", "the legitimate single review-ready record must be approved, not wrongly denied");
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.filter((c) => c.status === "retired").length, 1, "the pre-existing retired dup is untouched");
+  assert.equal(constraints.filter((c) => c.status === "active").length, 1);
+});
+
+test("L3 round-3: reject SUCCEEDS when an EARLIER same-id record is ACTIVE and the sole review-ready record is later in the array (order-independent matcher)", async () => {
+  const paths = await tempPaths();
+  const activeDup = reviewReadyConstraint({ status: "active" }); // earlier, same id, WRONG status
+  const reviewReady = reviewReadyConstraint(); // later, same id, the one eligible record
+  await writeConstraints(paths, [activeDup, reviewReady]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, reviewReady, { now });
+
+  const result = await decideConstraintPromotion(paths, reviewReady.id, minted.nonce, "rejected", { now });
+  assert.equal(result.constraint.status, "retired", "the legitimate single review-ready record must be rejected, not wrongly denied");
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.filter((c) => c.status === "active").length, 1, "the pre-existing active dup is untouched by the reject");
+  assert.equal(constraints.filter((c) => c.status === "retired").length, 1);
+});
+
+test("L3 round-3: approve with TWO genuinely-duplicate review-ready same-id records + one nonce still fails closed AUDITED (order-independence never weakens the duplicate guard)", async () => {
+  const paths = await tempPaths();
+  const dup1 = reviewReadyConstraint();
+  const dup2 = reviewReadyConstraint({ promotion_history: [{ ts: "2026-07-09T00:00:00.000Z", from: "shadow", to: "review-ready", actor: "deterministic-gate" }] });
+  await writeConstraints(paths, [dup1, dup2]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { promotion: minted } = await mintPendingPromotion(paths, dup1, { now });
+
+  await assert.rejects(
+    () => decideConstraintPromotion(paths, dup1.id, minted.nonce, "approved", { now }),
+    /transition failed/,
+  );
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints.filter((c) => c.status === "review-ready").length, 2, "neither duplicate was activated");
+
+  const { promotions } = await loadPromotions(paths);
+  const record = promotions.find((p) => p.id === minted.id);
+  assert.equal(record.status, "pending", "the promotion record itself is not consumed by the duplicate denial");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "transition_failed"));
+});
+
+test("L4 round-3: TWO distinct no-pending attempts (different nonces) leave TWO audited denial transitions, not one -- a phantom must never self-suppress a later attempt", async () => {
+  const paths = await tempPaths();
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "nonce-A"], { now: "2026-07-10T00:00:00.000Z", output: () => {} }),
+    /no_pending_promotion/,
+  );
+  await assert.rejects(
+    () => runLearnedApprove(paths, [constraint.id, "--nonce", "nonce-B"], { now: "2026-07-10T00:01:00.000Z", output: () => {} }),
+    /no_pending_promotion/,
+  );
+
+  const { promotions } = await loadPromotions(paths);
+  const matching = promotions.filter((p) => p.promotion_ref === constraint.id);
+  assert.equal(matching.length, 1, "still only ONE phantom RECORD per constraint id, never one per distinct nonce");
+  assert.equal(matching[0].status, "denied");
+  assert.equal(matching[0].audit_transitions.filter((t) => t.action === "denied").length, 2, "both distinct-nonce attempts must be audited");
+});
+
+test("L4 round-3 scope guard: a WRONG-nonce attempt against an already-decided record (no live pending, no phantom yet) stays the spot-B no-op -- it must NOT fabricate a new phantom record", async () => {
+  const paths = await tempPaths();
+  const now = Date.parse("2026-07-10T00:00:00.000Z");
+  const constraint = reviewReadyConstraint();
+  await writeConstraints(paths, [constraint]);
+  const expiry = new Date(now + DEFAULT_PROMOTION_EXPIRY_MS).toISOString();
+  const decided = { id: "promotion.decided", nonce: "nonce-decided", promotion_ref: constraint.id, status: "approved", expiry, evidence_refs: [], audit_transitions: [] };
+  await writePromotions(paths, [decided]);
+
+  await assert.rejects(
+    () => decideConstraintPromotion(paths, constraint.id, "garbage-nonce", "approved", { now }),
+    /already_decided/,
+  );
+
+  const { promotions } = await loadPromotions(paths);
+  assert.equal(promotions.length, 1, "no phantom is fabricated next to a real already-decided record");
+  assert.deepEqual(promotions[0].audit_transitions, [], "the already-decided record's audit trail remains untouched");
+});
+
 test("a reconciled promotion record is inert — its nonce can never approve, even if the constraint were review-ready again", async () => {
   const paths = await tempPaths();
   const constraint = reviewReadyConstraint();

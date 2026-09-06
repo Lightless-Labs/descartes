@@ -690,6 +690,133 @@ test("L4: a REPLAYED identical (candidateId, nonce) probe against a never-review
 });
 
 // ============================================================================================
+// L3/L4 round 3 (daybreak re-gate round 2): two residuals from the round-1 L3/L4 fixes above,
+// mirrored from promotion-store.js's own round-3 fix.
+//
+// L3 residual: decideTuningApproval's candidate lookup was `candidates.find(id-match)` --
+// order-dependent. If an EARLIER same-id record sits in another status (approved/rejected) and
+// the SOLE review-ready record is later in the array, `.find` picks the earlier wrong-status
+// record and denies via "candidate_not_review_ready" BEFORE the matchCount>1 guard ever runs --
+// over-fail-closed on a genuinely legitimate single approval/reject.
+//
+// L4 residual: logTuningDenial's phantom "denied" record self-suppressed every LATER attempt
+// with a DIFFERENT nonce, exactly like promotion-store.js's logDenial.
+// ============================================================================================
+
+test("L3 round-3: approve SUCCEEDS when an EARLIER same-id candidate record is REJECTED and the sole review-ready record is later in the array (order-independent matcher)", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const rejectedDup = reviewReadyRetireCandidate({ status: "rejected", mined_at: "2026-07-02T00:00:00.000Z" }); // earlier, same id, WRONG status
+  const reviewReady = reviewReadyRetireCandidate(); // later, same id, the one eligible record
+  await writeTuningCandidates(paths, [rejectedDup, reviewReady]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { approval: minted } = await mintPendingTuningApproval(paths, reviewReady, { now });
+
+  const result = await decideTuningApproval(paths, reviewReady.id, minted.nonce, "approved", { now });
+  assert.equal(result.candidate.status, "approved", "the legitimate single review-ready record must be approved, not wrongly denied");
+
+  const { candidates } = await loadTuningCandidates(paths);
+  assert.equal(candidates.filter((c) => c.status === "rejected").length, 1, "the pre-existing rejected dup is untouched");
+  assert.equal(candidates.filter((c) => c.status === "approved").length, 1);
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "retired", "the approved retire dispatch still fires against the live constraint");
+});
+
+test("L3 round-3: reject SUCCEEDS when an EARLIER same-id candidate record is APPROVED and the sole review-ready record is later in the array (order-independent matcher)", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const approvedDup = reviewReadyRetireCandidate({ status: "approved", mined_at: "2026-07-02T00:00:00.000Z" }); // earlier, same id, WRONG status
+  const reviewReady = reviewReadyRetireCandidate(); // later, same id, the one eligible record
+  await writeTuningCandidates(paths, [approvedDup, reviewReady]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { approval: minted } = await mintPendingTuningApproval(paths, reviewReady, { now });
+
+  const result = await decideTuningApproval(paths, reviewReady.id, minted.nonce, "rejected", { now });
+  assert.equal(result.candidate.status, "rejected", "the legitimate single review-ready record must be rejected, not wrongly denied");
+
+  const { candidates } = await loadTuningCandidates(paths);
+  assert.equal(candidates.filter((c) => c.status === "approved").length, 1, "the pre-existing approved dup is untouched by the reject");
+  assert.equal(candidates.filter((c) => c.status === "rejected").length, 1);
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "active", "a rejected candidate never dispatches any mutation");
+});
+
+test("L3 round-3: approve with TWO genuinely-duplicate review-ready same-id candidate records + one nonce still fails closed AUDITED (order-independence never weakens the duplicate guard)", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const dup1 = reviewReadyRetireCandidate();
+  const dup2 = reviewReadyRetireCandidate({ mined_at: "2026-07-02T00:00:00.000Z" });
+  await writeTuningCandidates(paths, [dup1, dup2]);
+  const now = "2026-07-10T00:00:00.000Z";
+  const { approval: minted } = await mintPendingTuningApproval(paths, dup1, { now });
+
+  await assert.rejects(
+    () => decideTuningApproval(paths, dup1.id, minted.nonce, "approved", { now }),
+    /ambiguous duplicate review-ready/,
+  );
+
+  const { constraints } = await loadConstraints(paths);
+  assert.equal(constraints[0].status, "active", "the target constraint must never be touched -- dispatch never runs when ambiguous");
+
+  const { candidates } = await loadTuningCandidates(paths);
+  assert.equal(candidates.filter((c) => c.status === "review-ready").length, 2, "neither duplicate candidate record's status changed");
+
+  const { decisions } = await loadTuningDecisions(paths);
+  const record = decisions.find((d) => d.id === minted.id);
+  assert.equal(record.status, "pending", "the decision record itself is not consumed by the duplicate denial");
+  assert(record.audit_transitions.some((t) => t.action === "denied" && t.reason === "ambiguous_duplicate_candidate"));
+});
+
+test("L4 round-3: TWO distinct no-pending attempts (different nonces) leave TWO audited denial transitions, not one -- a phantom must never self-suppress a later attempt", async () => {
+  const paths = await tempPaths();
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const candidate = reviewReadyRetireCandidate();
+  await writeTuningCandidates(paths, [candidate]);
+
+  await assert.rejects(
+    () => decideTuningApproval(paths, candidate.id, "nonce-A", "approved", { now: "2026-07-10T00:00:00.000Z" }),
+    /no_pending_tuning_approval/,
+  );
+  await assert.rejects(
+    () => decideTuningApproval(paths, candidate.id, "nonce-B", "approved", { now: "2026-07-10T00:01:00.000Z" }),
+    /no_pending_tuning_approval/,
+  );
+
+  const { decisions } = await loadTuningDecisions(paths);
+  const matching = decisions.filter((d) => d.tuning_candidate_ref === candidate.id);
+  assert.equal(matching.length, 1, "still only ONE phantom RECORD per candidate id, never one per distinct nonce");
+  assert.equal(matching[0].status, "denied");
+  assert.equal(matching[0].audit_transitions.filter((t) => t.action === "denied").length, 2, "both distinct-nonce attempts must be audited");
+});
+
+test("L4 round-3 scope guard: a WRONG-nonce attempt against an already-decided record (no live pending, no phantom yet) stays the spot-B no-op -- it must NOT fabricate a new phantom record", async () => {
+  const paths = await tempPaths();
+  const now = Date.parse("2026-07-10T00:00:00.000Z");
+  const constraint = activeConstraint();
+  await writeConstraints(paths, [constraint]);
+  const candidate = reviewReadyRetireCandidate();
+  await writeTuningCandidates(paths, [candidate]);
+  const expiry = new Date(now + DEFAULT_TUNING_APPROVAL_EXPIRY_MS).toISOString();
+  const decided = { id: "tuning.decided", nonce: "nonce-decided", tuning_candidate_ref: candidate.id, status: "approved", expiry, evidence_refs: [], audit_transitions: [] };
+  await writeTuningDecisions(paths, [decided]);
+
+  await assert.rejects(
+    () => decideTuningApproval(paths, candidate.id, "garbage-nonce", "approved", { now }),
+    /already_decided/,
+  );
+
+  const { decisions } = await loadTuningDecisions(paths);
+  assert.equal(decisions.length, 1, "no phantom is fabricated next to a real already-decided record");
+  assert.deepEqual(decisions[0].audit_transitions, [], "the already-decided record's audit trail remains untouched");
+});
+
+// ============================================================================================
 // reject
 // ============================================================================================
 

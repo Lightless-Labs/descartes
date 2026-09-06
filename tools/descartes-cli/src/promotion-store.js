@@ -321,15 +321,21 @@ function matchPendingPromotion(promotions, constraintId, nonce, nowMs) {
  */
 function denialReason(promotions, constraintId, nonce, nowMs) {
   const forConstraint = (promotions ?? []).filter((record) => record?.promotion_ref === constraintId);
-  if (forConstraint.length === 0) return "no_pending_promotion";
-  const pending = forConstraint.filter((record) => record.status === "pending");
+  // L4 round-3 (daybreak re-gate round 2): a phantom "denied" record (audit-only, minted by
+  // logDenial for a PRIOR no-live-record attempt against this id) is not a genuine decision --
+  // exclude it before diagnosing. Without this, a SECOND no-pending attempt (after the phantom
+  // from the first attempt already exists) would be mislabeled "already_decided" instead of the
+  // accurate "no_pending_promotion", even though no human ever decided anything.
+  const real = forConstraint.filter((record) => record.status !== "denied");
+  if (real.length === 0) return "no_pending_promotion";
+  const pending = real.filter((record) => record.status === "pending");
   if (pending.length === 0) {
     // Honest attribution: distinguish a system-reconciled orphan (a pending closed by
     // `learned review` because its constraint left review-ready) from a genuine human
     // approve/reject. Only when NO real decision exists and a reconciled record does — otherwise a
     // real decision took precedence and "already_decided" is the accurate reason.
-    const humanDecided = forConstraint.some((record) => record.status === "approved" || record.status === "rejected");
-    if (!humanDecided && forConstraint.some((record) => record.status === "reconciled")) return "orphan_reconciled";
+    const humanDecided = real.some((record) => record.status === "approved" || record.status === "rejected");
+    if (!humanDecided && real.some((record) => record.status === "reconciled")) return "orphan_reconciled";
     return "already_decided";
   }
   const nonceMatches = pending.filter((record) => record.nonce === nonce);
@@ -343,50 +349,28 @@ function denialReason(promotions, constraintId, nonce, nowMs) {
  * Appends a denial entry to the promotion record the attempt actually targeted: the
  * nonce-matching record (attributing a replay of a consumed nonce to the record it belongs to),
  * else the currently-VALID (unexpired) `pending` record being attacked, else any pending record
- * (F5: never merely the first pending one in array order — see isUnexpiredPending below). It is a
- * no-op (nothing written) when neither exists — including the "cannot skip review" case (no
- * record at all). It NEVER falls back to an arbitrary already-decided record, which would
- * fabricate a wrong-nonce attempt in the audit trail of a promotion that was never the target.
- * Never changes a record's `status`/`decided_at`; only appends to audit_transitions, so an
- * already-decided record's decision is never overwritten.
+ * (F5: never merely the first pending one in array order — see isUnexpiredPending below); else,
+ * when no live/matching record exists at all, an audit-only phantom "denied" record (L4, appended
+ * to on every subsequent no-live-record attempt — see below). It NEVER falls back to an arbitrary
+ * already-decided (approved/rejected/reconciled) record, which would fabricate a wrong-nonce
+ * attempt in the audit trail of a promotion that was never the target — that specific case remains
+ * a no-op. Never changes a record's `status`/`decided_at`; only appends to audit_transitions, so
+ * an already-decided record's decision is never overwritten.
  */
 async function logDenial(descartesPaths, promotions, constraintId, nonce, reason, options = {}) {
   const candidates = (promotions ?? []).filter((record) => record?.promotion_ref === constraintId);
   const nowIso = normalizeIso(options.now ?? new Date().toISOString());
   const nowMs = new Date(nowIso).getTime();
+  const denialEntry = { ts: nowIso, action: "denied", actor: "human-cli", reason, note: options.note };
 
-  if (candidates.length === 0) {
-    // L4 (daybreak sweep): deny-by-default must remain AUDITED even when no promotion record
-    // exists yet for this constraint id (unknown constraint id, or review-ready but never sent
-    // through `descartes learned review`). Previously this branch silently returned `promotions`
-    // unchanged -- the caller's Error correctly denied the action, but zero persistent trace of
-    // the attempt existed anywhere. Mint a phantom, audit-only "denied" record instead.
-    //
-    // id: the SAME deterministic promotionRecordId(constraintId, nonce) a real pending record
-    // would use, so a REPLAYED identical (constraintId, nonce) pair produces the SAME id: the
-    // next call's `candidates` will be non-empty (this phantom now exists) and the
-    // nonce-matching branch below appends to its audit_transitions instead of minting a
-    // duplicate -- deduping replay into one record's history, not spamming new records.
-    // nonce: never let an empty/undefined nonce reach validatePromotionRecord's non-empty-nonce
-    // check and throw INSIDE this denial-logging path, which would mask the real deny-by-default
-    // Error the caller is supposed to see.
-    const safeNonce = String(nonce ?? "").trim() || "unknown";
-    const phantom = {
-      id: promotionRecordId(constraintId, safeNonce),
-      nonce: safeNonce,
-      promotion_ref: constraintId,
-      bounded_summary: "unknown",
-      evidence_refs: [],
-      requested_at: nowIso,
-      expiry: nowIso, // already-expired by construction; irrelevant since status is never "pending"
-      decided_at: nowIso,
-      status: "denied",
-      audit_transitions: [{ ts: nowIso, action: "denied", actor: "human-cli", reason, note: options.note }],
-    };
-    const updated = [...(promotions ?? []), phantom];
+  const appendTo = async (target) => {
+    const updated = promotions.map((record) => (record !== target ? record : {
+      ...record,
+      audit_transitions: [...(record.audit_transitions ?? []), denialEntry],
+    }));
     await writePromotions(descartesPaths, updated);
     return updated;
-  }
+  };
 
   // Attribute the denial to the record whose nonce was actually supplied; else to the currently-
   // VALID (unexpired) pending record being attacked -- NOT merely the first pending one in array
@@ -399,21 +383,64 @@ async function logDenial(descartesPaths, promotions, constraintId, nonce, reason
     const expiryMs = new Date(record.expiry).getTime();
     return Number.isFinite(expiryMs) && expiryMs > nowMs;
   };
-  const target =
+  const liveTarget =
     candidates.find((record) => record.nonce === nonce)
     ?? candidates.find(isUnexpiredPending)
     ?? candidates.find((record) => record.status === "pending");
-  if (!target) return promotions;
-  const updated = promotions.map((record) => {
-    if (record !== target) return record;
-    return {
-      ...record,
-      audit_transitions: [
-        ...(record.audit_transitions ?? []),
-        { ts: nowIso, action: "denied", actor: "human-cli", reason, note: options.note },
-      ],
-    };
-  });
+  if (liveTarget) return appendTo(liveTarget);
+
+  // No live (nonce-matched / pending) record to attribute this denial to: either NO promotion
+  // record has EVER existed for this constraint id (candidates.length===0 -- unknown constraint
+  // id, or review-ready but never sent through `descartes learned review`), or the only
+  // candidate(s) left are terminal, audit-only phantom "denied" records minted by a PRIOR call to
+  // this exact branch. In BOTH of those cases, deny-by-default must still leave an audited trace
+  // (plan §5: "denied attempts do not silently disappear") -- a third case, only genuine
+  // already-decided records remaining, is handled separately by the scope guard below and stays
+  // the pre-existing spot-B no-op.
+  //
+  // L3/L4 round-3 (daybreak re-gate round 2): a phantom's mere PRESENCE must never self-suppress
+  // auditing of a LATER, distinct-nonce attempt against the same constraint id -- the round-1 fix
+  // minted a phantom on the FIRST such attempt but then silently no-op'd (`return promotions`)
+  // every subsequent attempt whose nonce didn't happen to match that phantom's, because a
+  // "denied"-status record never satisfies the nonce/pending lookup above. Fixed by APPENDING to
+  // the existing phantom here instead of short-circuiting once one is found, so N distinct
+  // no-live-record attempts accumulate as N audited transitions -- never by minting a new phantom
+  // RECORD per attempt (which would grow promotions.json unboundedly).
+  const existingPhantom = candidates.find((record) => record.status === "denied");
+  if (existingPhantom) return appendTo(existingPhantom);
+
+  // Scope guard (unchanged from round-1): if `candidates` is non-empty here, every one of them is
+  // a genuine already-decided (approved/rejected/reconciled) record -- liveTarget above already
+  // caught anything pending, and existingPhantom above already caught any phantom. Never fabricate
+  // a phantom next to a real decision record just because THIS attempt's nonce didn't match it;
+  // that remains the spot-B no-op (a wrong-nonce probe against an already-decided record leaves no
+  // new trace, exactly as before this round-3 fix).
+  if (candidates.length > 0) return promotions;
+
+  // The very first no-live-record attempt for this constraint id: mint the phantom.
+  // id: promotionRecordId(constraintId, safeNonce) purely so a REPLAYED identical
+  // (constraintId, nonce) pair used for THIS first attempt is deterministic (and, via the
+  // nonce-matching lookup above, dedups into this same record on an exact-nonce replay). Every
+  // LATER attempt -- same or different nonce -- is found via the `existingPhantom` lookup above
+  // (by status, not by id), so the id's nonce-derivation no longer gates dedup beyond this first
+  // mint.
+  // nonce: never let an empty/undefined nonce reach validatePromotionRecord's non-empty-nonce
+  // check and throw INSIDE this denial-logging path, which would mask the real deny-by-default
+  // Error the caller is supposed to see.
+  const safeNonce = String(nonce ?? "").trim() || "unknown";
+  const phantom = {
+    id: promotionRecordId(constraintId, safeNonce),
+    nonce: safeNonce,
+    promotion_ref: constraintId,
+    bounded_summary: "unknown",
+    evidence_refs: [],
+    requested_at: nowIso,
+    expiry: nowIso, // already-expired by construction; irrelevant since status is never "pending"
+    decided_at: nowIso,
+    status: "denied",
+    audit_transitions: [denialEntry],
+  };
+  const updated = [...(promotions ?? []), phantom];
   await writePromotions(descartesPaths, updated);
   return updated;
 }
@@ -446,16 +473,26 @@ export async function decideConstraintPromotion(descartesPaths, constraintId, no
   const verb = decision === "approved" ? "approve" : "reject";
 
   const { constraints } = await loadConstraints(descartesPaths);
-  const constraint = constraints.find((candidate) => candidate?.id === constraintId);
+  const matchingConstraints = constraints.filter((candidate) => candidate?.id === constraintId);
   const { promotions } = await loadPromotions(descartesPaths);
 
-  if (!constraint) {
+  if (matchingConstraints.length === 0) {
     await logDenial(descartesPaths, promotions, constraintId, nonce, "constraint_not_found", { now: nowIso, note: options.note });
     throw new Error(`Cannot ${verb} ${constraintId}: no such constraint.`);
   }
-  if (constraint.status !== "review-ready") {
+  // L3 round-3 (daybreak re-gate round 2): select by id AND status:"review-ready" -- the
+  // eligible pending state for THIS decision -- never merely the first id-match. A bare
+  // `.find(id-match)` is order-dependent: when an EARLIER same-id record sits in another status
+  // (active, retired) and the SOLE review-ready record is later in `constraints`, picking the
+  // first would deny a LEGITIMATE single approval/reject right here, before either count guard
+  // below (this function's reject-branch matchCount, or promoteReviewReadyToActive's own
+  // matchCount on the approve path) ever runs -- an over-fail-closed false denial. Filtering to
+  // status:"review-ready" makes the match order-INDEPENDENT; a genuine duplicate (>1 review-ready
+  // records sharing this id) still fails closed via those existing audited guards, unweakened.
+  const reviewReadyMatches = matchingConstraints.filter((candidate) => candidate?.status === "review-ready");
+  if (reviewReadyMatches.length === 0) {
     await logDenial(descartesPaths, promotions, constraintId, nonce, "constraint_not_review_ready", { now: nowIso, note: options.note });
-    throw new Error(`Cannot ${verb} ${constraintId}: status is "${constraint.status}", not "review-ready".`);
+    throw new Error(`Cannot ${verb} ${constraintId}: status is "${matchingConstraints[0].status}", not "review-ready".`);
   }
 
   const match = matchPendingPromotion(promotions, constraintId, nonce, nowMs);
@@ -532,8 +569,15 @@ export async function decideConstraintPromotion(descartesPaths, constraintId, no
   await writeConstraints(descartesPaths, updatedConstraints);
   await writePromotions(descartesPaths, updatedPromotions);
 
+  // L3 round-3 (daybreak re-gate round 2): resolve the returned `constraint` by ARRAY POSITION,
+  // not by re-`.find`-ing on id -- by this point reviewReadyMatches.length===1 is guaranteed (a
+  // duplicate already threw above), so its index in the ORIGINAL `constraints` array pinpoints
+  // exactly the record this decision transitioned, even when an OTHER-status same-id record
+  // (which `.find(id-match)` would wrongly surface instead) sits earlier in the array.
+  const matchedIndex = constraints.indexOf(reviewReadyMatches[0]);
+
   return {
-    constraint: updatedConstraints.find((candidate) => candidate.id === constraintId),
+    constraint: updatedConstraints[matchedIndex],
     promotion: updatedPromotions.find((record) => record.id === match.id),
   };
 }
