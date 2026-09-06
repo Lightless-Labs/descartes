@@ -324,64 +324,21 @@ async function appendAuditRecord(descartesPaths, record) {
 // -heal logic and the documentation comment above it for the full rationale.
 const auditWriteDegradedPaths = new Set();
 
-// A5 fix -- bounds the trailing-hour BUDGET WINDOW computation against a forward wall-clock jump
-// (NTP resync, VM/laptop suspend-resume) that would otherwise age out genuinely-recent audit
-// records and under-count the budget (fail-open: admits an extra call). IN-PROCESS only (never
-// persisted -- same rationale as auditWriteDegradedPaths above), keyed by the RESOLVED audit-file
-// path for the same per-install/per-test isolation. Does NOT bound isWithinTrailingHour's existing
-// backward-clock-step clamp, the `ts` written into audit records, or readAuditRecords/
-// readAlertIntelligenceAudit -- scope is the budget-window arithmetic only.
-const budgetClockAnchors = new Map();
-
-// Returns a `now` value that is safe to feed into the budget-window computation
-// (readBudgetAuditRecordsStrict / partitionRecentAuditCounts) ONLY -- never used for the audit
-// record `ts`, prompt/session context, or any other timestamp in adjudicateAlertNotifications.
-//
-// round-3 fix (daybreak re-gate round 2): the round-2 version of this function RE-BASELINED the
-// anchor on every call -- including the anomalous-jump branch, which advanced it to
-// `anchor.wallMs + monoDeltaMs + toleranceMs`. That looked conservative for a single jump, but once
-// the anchor was behind real wall-clock time, EVERY subsequent tick still saw a huge wallDelta
-// (real wall vs. the far-behind anchor), so it stayed "anomalous" and added +toleranceMs on top of
-// that tick's real elapsed time, every tick. That per-tick surplus ACCUMULATES: after enough ticks
-// the clamped `now` had advanced further than real elapsed time by more than the trailing-hour
-// window's slack, aging out a record that had NOT actually aged out and wrongly admitting a second
-// call. See the "A5 round-3" test below for the repro (59 ticks of a real 60s each accumulate
-// ~118s of pure artifact on top of the genuine ~59 real minutes elapsed).
-//
-// The fix removes the accumulation by never re-baselining the anchor at all: it is captured ONCE,
-// on first observation for a given auditFile, and held as a STABLE baseline for the lifetime of
-// this process (or until whatever clears budgetClockAnchors). budgetNow is then computed as
-// `min(nowMs, anchor.wallMs + realMonotonicElapsedSinceAnchor)` -- i.e. wall-clock time is allowed
-// to advance budgetNow only as far as real monotonic elapsed time since the anchor says it may.
-// This can only ever CAP/delay budgetNow relative to the raw wall clock, never let it run ahead --
-// so a record can never be aged out earlier than real elapsed time justifies (fail closed, never
-// fail open), and because the anchor never moves there is nothing left to accumulate tick over
-// tick. In the ordinary case (wall clock and monotonic clock advance together, the overwhelmingly
-// common case) `anchor.wallMs + monoElapsedMs` tracks `nowMs` almost exactly, so budgetNow == nowMs
-// and normal aging-out is unaffected (see the "A5 regression" real-elapsed-hour test below).
-//
-// ACKNOWLEDGED-DEFERRED (round 3, not fixed here): a process whose FIRST anchor is captured at an
-// ALREADY-jumped wall time has nothing to compare against and cannot detect that the anchor itself
-// is wrong -- no in-process signal distinguishes "wall was already off when this process started"
-// from "wall is correct". Closing that residual needs a persisted trusted time source and is
-// deferred to the budget-hardening/trusted-time slice alongside A3/A4; it does not regress on this
-// fix (round 2 had the identical fresh-process blind spot).
-function boundBudgetNow(auditFile, now, { hrtimeNow = () => process.hrtime.bigint() } = {}) {
-  const nowMs = new Date(now).getTime();
-  if (!Number.isFinite(nowMs)) return now; // let existing downstream non-finite-ts handling apply
-  const nowMono = hrtimeNow();
-  const anchor = budgetClockAnchors.get(auditFile);
-  if (!anchor) {
-    // First observation for this auditFile: nothing to compare against yet, so `now` passes
-    // through unchanged. The baseline recorded here is STABLE -- it is never overwritten again
-    // (see the round-3 fix comment above for why re-baselining is exactly the round-2 bug).
-    budgetClockAnchors.set(auditFile, { wallMs: nowMs, monoNs: nowMono });
-    return now;
-  }
-  const monoElapsedMs = Number(nowMono - anchor.monoNs) / 1e6;
-  const boundedMs = Math.min(nowMs, anchor.wallMs + monoElapsedMs);
-  return new Date(boundedMs).toISOString();
-}
+// REVERTED (daybreak re-gate round 3, 2026-09-06): an in-process monotonic (process.hrtime.bigint)
+// anchor previously bounded the trailing-hour budget window against a forward wall-clock jump. It
+// was removed -- do NOT reintroduce a wall-clock-anchor patch here. process.hrtime maps to
+// CLOCK_MONOTONIC on Linux (Tier 1), which PAUSES across suspend: after a laptop sleep the bounded
+// clock lags real wall by the sleep duration, every audit record (stamped with raw wall `ts`) then
+// reads as future-dated, and isWithinTrailingHour's fail-closed future-ts clamp counts it in-window
+// INDEFINITELY -- silently darkening the LLM route until daemon restart. That daily benign
+// over-suppression on the common deployment is a worse trade than the rare adversarial over-call
+// the anchor prevented, and forward-jump protection vs. suspend robustness are indistinguishable
+// without an external time source. The whole class (forward jump, backward-then-restore,
+// fresh-process, suspend drift) is therefore deferred to the budget-hardening/trusted-time slice
+// alongside A3/A4 -- a write-ahead audit with a trusted monotonic sequence, not a wall-clock patch
+// (see todos/2026-09-06-llm-budget-trusted-time.md). The budget window now uses raw `now` directly;
+// the backward-clock-step case stays covered by isWithinTrailingHour's future-ts clamp below, which
+// is independent of this removed anchor.
 
 // Never throws: swallows any appendFn failure, console.warns, and returns null so a caller can
 // distinguish "recorded" (truthy) from "not recorded" (null) without a second try/catch. Accepts
@@ -1340,23 +1297,21 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     ...eligibleAlerts.filter((alert) => alert.severity !== "critical"),
   ];
 
-  // A5 fix: bound ONLY the budget-window arithmetic below against a forward wall-clock jump
-  // (NTP resync, VM/laptop suspend-resume) -- see boundBudgetNow's own doc comment above. `now`
-  // itself (audit record `ts`, prompt/session context, probe append, budget_exhausted timing) stays
-  // untouched everywhere else in this function.
-  const budgetNow = boundBudgetNow(auditFile, now, options.budgetClock);
-
+  // The budget window uses raw `now` (see the REVERTED note above boundBudgetNow's former home for
+  // why the monotonic anchor was removed). The backward-clock-step case is handled fail-closed by
+  // isWithinTrailingHour's future-ts clamp; the forward-jump / suspend-drift class is the deferred
+  // budget-hardening/trusted-time slice.
   let audit;
   try {
     // daybreak-blue #3 (HIGH): the budget seed uses the STRICT, budget-local read
     // (readBudgetAuditRecordsStrict, defined above) -- never the tolerant readAuditRecords used
     // elsewhere in this file. See that function's own doc comment for the full corrupt-line policy.
-    audit = await readBudgetAuditRecordsStrict(descartesPaths, budgetNow);
+    audit = await readBudgetAuditRecordsStrict(descartesPaths, now);
   } catch (error) {
     console.warn(`descartes: alert intelligence audit read failed (${errorLabel(error)}); skipping adjudication this tick (budget cannot be computed)`);
     return { status: "audit_unavailable", decisions: [], excluded };
   }
-  const historical = partitionRecentAuditCounts(audit, budgetNow);
+  const historical = partitionRecentAuditCounts(audit, now);
   // RUNNING per-class counters, seeded from trailing-hour audit history and incremented as calls
   // are admitted within this loop -- this is what lets "so_far" include calls already made earlier
   // in THIS invocation, which a one-shot remaining/slice computation could not express.
