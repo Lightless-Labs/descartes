@@ -18,6 +18,14 @@ import {
 export const DEFAULT_FACT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const DEFAULT_FACT_MAX_BYTES = 5 * 1024 * 1024; // 5MB
 
+// Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact continuity wedge.
+// A fact whose ts exceeds nowMs + this tolerance is untrustworthy provenance for continuity
+// purposes -- structurally the same class of problem as a corrupt/schema-invalid record -- and
+// is dropped from retention's candidates the same way. Generous by design (hours, not minutes):
+// enough to absorb NTP resync jitter, DST edge cases, and post-suspend catch-up without treating
+// ordinary clock skew as an incident. An engineering default, not an operator-facing knob.
+export const FUTURE_FACT_TOLERANCE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 // daybreak-blue security sweep (2026-09-04), fact-store HIGH #5 (cheap-caps portion): bound
 // attribute-key count/length and fact_name/entity_key/source_* lengths so a doctored fact
 // point can't be fully built (and later stored/read back as normal) before any cap applies.
@@ -248,9 +256,17 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
     }
   }
 
+  // Fix 0: a fact whose ts is beyond nowMs + FUTURE_FACT_TOLERANCE_MS is dropped BEFORE it can
+  // ever become a retention candidate, so it can never contaminate last_rewrite_newest_ts
+  // (fact-store-integrity.js's continuity anchor). cutoffMs <= nowMs < futureThresholdMs always
+  // (retentionMs/FUTURE_FACT_TOLERANCE_MS are both non-negative), so the three partitions below
+  // are mutually exclusive and jointly exhaustive over validRecords -- the sum-invariant right
+  // below stays a straightforward four-term sum.
+  const futureThresholdMs = nowMs + FUTURE_FACT_TOLERANCE_MS;
+  const futureDropped = validRecords.filter(({ tsMs }) => tsMs > futureThresholdMs);
   const ageEvicted = validRecords.filter(({ tsMs }) => tsMs < cutoffMs);
   const candidates = validRecords
-    .filter(({ tsMs }) => tsMs >= cutoffMs)
+    .filter(({ tsMs }) => tsMs >= cutoffMs && tsMs <= futureThresholdMs)
     .sort((left, right) => left.tsMs - right.tsMs);
 
   const keptReversed = [];
@@ -271,7 +287,7 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   // be either kept or counted as an observable eviction (age/bytecap) -- no valid record may
   // silently vanish from the accounting. This is a defense-in-depth backstop against this bug
   // and any future silent-drop class, regardless of which input caused it.
-  if (keptRecords.length + ageEvicted.length + bytecapEvicted !== validRecords.length) {
+  if (keptRecords.length + ageEvicted.length + bytecapEvicted + futureDropped.length !== validRecords.length) {
     throw new Error("enforceFactRetention accounting mismatch: kept + evicted counts do not sum to the valid record count");
   }
   const counts = {
@@ -279,6 +295,7 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
     schema_invalid_count: schemaInvalid.length,
     age_evicted_count: ageEvicted.length,
     bytecap_evicted_count: bytecapEvicted,
+    future_fact_count: futureDropped.length,
   };
   const outputContents = keptLines.join("");
   const outputRawBytes = Buffer.from(outputContents);
@@ -317,11 +334,12 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   await writeFactIntegrityLedger(descartesPaths, finalizeFactIntegrityLedger(prepared.ledger, prepared.passId, { allowRecovery: prepared.recoverPending }));
   return {
     kept_count: keptLines.length,
-    dropped_count: schemaInvalid.length + ageEvicted.length + bytecapEvicted,
+    dropped_count: schemaInvalid.length + ageEvicted.length + bytecapEvicted + futureDropped.length,
     corrupt_dropped_count: corruptBefore,
     schema_invalid_dropped_count: schemaInvalid.length,
     age_evicted_count: ageEvicted.length,
     bytecap_evicted_count: bytecapEvicted,
+    future_fact_dropped_count: futureDropped.length,
     bytes: usedBytes,
   };
 }

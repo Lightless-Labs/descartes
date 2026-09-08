@@ -17,6 +17,11 @@ const LEDGER_KEYS = [
   "last_continuity_break_ts",
   "first_degraded_ts",
   "continuity",
+  // Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact continuity
+  // wedge. Mirrors corrupt_dropped_total/last_corrupt_ts exactly -- a cumulative lifetime
+  // total plus a most-recent-event marker for the new loss channel.
+  "future_fact_dropped_total",
+  "last_future_fact_ts",
 ];
 const CONTINUITY_KEYS = [
   "record_count_hwm",
@@ -39,6 +44,8 @@ const PENDING_PASS_KEYS = [
   "output_newest_ts",
   "output_bytes",
   "output_digest",
+  // Fix 0: mirrors corrupt_count exactly.
+  "future_fact_count",
 ];
 
 export function resolveFactIntegrityPaths(descartesPaths) {
@@ -74,7 +81,40 @@ export function createFactIntegrityLedger() {
     last_continuity_break_ts: null,
     first_degraded_ts: null,
     continuity: emptyContinuity(),
+    future_fact_dropped_total: 0,
+    last_future_fact_ts: null,
   };
+}
+
+// Fix 0 migration: a ledger written before this revision shipped (or a hand-built test/ops
+// fixture pinned to the pre-fix0 shape) lacks future_fact_dropped_total/last_future_fact_ts
+// (and pending_pass, if present, lacks future_fact_count). Per §5.3's boot_id migration
+// discipline pulled one phase earlier for this one field: bootstrap the missing keys with
+// their zero-value defaults BEFORE validation, rather than letting a merely-old-shaped (but
+// otherwise coherent) ledger fail closed as "invalid" and take the continuity-break-stamping
+// bootstrap path. This only ever ADDS defaulted keys that are absent -- it never touches a
+// key that is already present (including a deliberately-wrong value under test), so it cannot
+// rescue a ledger that is invalid for any other reason, and it cannot mask the identity-
+// bearing-extra-keys rejection (fact-store-integrity.test.js's "must-not-persist" coverage),
+// which only ever adds keys, never removes/renames them.
+function migrateLedgerShape(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const migrated = { ...raw };
+  if (!Object.prototype.hasOwnProperty.call(migrated, "future_fact_dropped_total")) {
+    migrated.future_fact_dropped_total = 0;
+  }
+  if (!Object.prototype.hasOwnProperty.call(migrated, "last_future_fact_ts")) {
+    migrated.last_future_fact_ts = null;
+  }
+  if (migrated.continuity && typeof migrated.continuity === "object" && !Array.isArray(migrated.continuity)) {
+    const pendingPass = migrated.continuity.pending_pass;
+    if (pendingPass && typeof pendingPass === "object" && !Array.isArray(pendingPass)) {
+      if (!Object.prototype.hasOwnProperty.call(pendingPass, "future_fact_count")) {
+        migrated.continuity = { ...migrated.continuity, pending_pass: { ...pendingPass, future_fact_count: 0 } };
+      }
+    }
+  }
+  return migrated;
 }
 
 function isNullableTimestamp(value) {
@@ -113,6 +153,7 @@ function isValidPendingPass(value) {
     Number.isSafeInteger(value.schema_invalid_count) && value.schema_invalid_count >= 0 &&
     Number.isSafeInteger(value.bytecap_evicted_count) && value.bytecap_evicted_count >= 0 &&
     Number.isSafeInteger(value.age_evicted_count) && value.age_evicted_count >= 0 &&
+    Number.isSafeInteger(value.future_fact_count) && value.future_fact_count >= 0 &&
     Number.isSafeInteger(value.output_record_count) && value.output_record_count >= 0 &&
     Number.isSafeInteger(value.output_bytes) && value.output_bytes >= 0 &&
     isNullableTimestamp(value.output_newest_ts) &&
@@ -133,11 +174,12 @@ export function isValidFactIntegrityLedger(value) {
     "schema_invalid_dropped_total",
     "bytecap_evicted_total",
     "age_evicted_total",
+    "future_fact_dropped_total",
   ];
   if (!hasExactKeys(value, LEDGER_KEYS)) return false;
   if (value.schema_version !== FACT_INTEGRITY_SCHEMA_VERSION || typeof value.generation !== "string" || !value.generation) return false;
   if (totals.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)) return false;
-  if (["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "first_degraded_ts"].some((key) => !isNullableTimestamp(value[key]))) return false;
+  if (["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "first_degraded_ts", "last_future_fact_ts"].some((key) => !isNullableTimestamp(value[key]))) return false;
 
   const continuity = value.continuity;
   if (!continuity || typeof continuity !== "object" || Array.isArray(continuity)) return false;
@@ -161,6 +203,7 @@ export function isValidFactIntegrityLedger(value) {
   if (value.corrupt_dropped_total > 0 && value.last_corrupt_ts === null) return false;
   if (value.schema_invalid_dropped_total > 0 && value.last_schema_invalid_ts === null) return false;
   if (value.bytecap_evicted_total > 0 && value.last_bytecap_evict_ts === null) return false;
+  if (value.future_fact_dropped_total > 0 && value.last_future_fact_ts === null) return false;
   if (continuity.continuity_ok === false && value.last_continuity_break_ts === null) return false;
   return true;
 }
@@ -176,7 +219,7 @@ export async function readFactIntegrityLedger(descartesPaths) {
   }
 
   try {
-    const ledger = JSON.parse(contents);
+    const ledger = migrateLedgerShape(JSON.parse(contents));
     return isValidFactIntegrityLedger(ledger)
       ? { ledger, reason: null }
       : { ledger: null, reason: "invalid" };
@@ -321,11 +364,44 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
     priorPending.output_newest_ts === outputNewestTs &&
     priorPending.output_digest === outputDigest;
   const offset = alreadyCounted ? priorPending : null;
-  const addCount = (key, value) => Math.max(0, value - (offset?.[key] ?? 0));
+  // counts.future_fact_count defaults to 0 (not required of every caller -- prepareFactIntegrityLedger
+  // is called directly, without it, by fact-store-integrity.test.js's pass_id-exhaustion coverage);
+  // an undefined value must never reach addSaturating below (NaN would poison the safe-integer check
+  // and saturate every total to MAX_SAFE_INTEGER on this pass).
+  const addCount = (key, value) => Math.max(0, (value ?? 0) - (offset?.[key] ?? 0));
   const corruptDelta = addCount("corrupt_count", counts.corrupt_count);
   const schemaInvalidDelta = addCount("schema_invalid_count", counts.schema_invalid_count);
   const bytecapDelta = addCount("bytecap_evicted_count", counts.bytecap_evicted_count);
   const ageDelta = addCount("age_evicted_count", counts.age_evicted_count);
+  const futureFactDelta = addCount("future_fact_count", counts.future_fact_count);
+
+  // Fix 1 (trusted-state step-1 revision, "R1 made signable"): bounded blind. Pull any of the
+  // loss-timestamp fields (and first_degraded_ts, audit-trail-only) that sit FORWARD of this
+  // pass's own nowIso down to nowIso, BEFORE the stamping below applies this pass's own fresh
+  // deltas. Turns an unbounded fail-STUCK blind (a far-future marker that would otherwise hold
+  // buildCompleteness "degraded" until real wall time catches up to it -- no fixed bound) into
+  // a bounded, one-window blind for the common non-adversarial case (NTP glitch / misconfigured
+  // clock / DST bug) this fix actually targets. Deliberately UNGUARDED against a deliberate
+  // same-uid clock-control attacker in Phase 1 (operator-accepted decision, plan §"Fix 1" /
+  // open_decisions) -- a wall-clock-only backward-step guard cannot distinguish a genuine
+  // forward-clock correction from an attacker's rollback (both look identical to a wall-clock-
+  // only observer); a real guard needs boot_id (Phase 3). The residual this accepts is a strict
+  // subset of a capability the same-uid attacker already has today via a coincident fresh delta
+  // on the same rolled-back tick (:403-406 below, unconditional even pre-fix) -- this just
+  // removes the "needs a fresh delta this tick" coincidence requirement for that already-in-scope
+  // attacker (§3: "a same-uid attacker is defeated" is explicitly NOT a step-1 claim).
+  const nowMsForClamp = Date.parse(nowIso);
+  const clampForward = (value) => {
+    if (value === null) return value;
+    const valueMs = Date.parse(value);
+    return Number.isFinite(valueMs) && Number.isFinite(nowMsForClamp) && valueMs > nowMsForClamp ? nowIso : value;
+  };
+  next.last_corrupt_ts = clampForward(next.last_corrupt_ts);
+  next.last_schema_invalid_ts = clampForward(next.last_schema_invalid_ts);
+  next.last_bytecap_evict_ts = clampForward(next.last_bytecap_evict_ts);
+  next.last_continuity_break_ts = clampForward(next.last_continuity_break_ts);
+  next.first_degraded_ts = clampForward(next.first_degraded_ts);
+  next.last_future_fact_ts = clampForward(next.last_future_fact_ts);
 
   // daybreak-blue re-gate HIGH #2: a total already at Number.MAX_SAFE_INTEGER is itself a
   // valid, safe integer, but `total + delta` (delta > 0) overflows into an UNSAFE integer --
@@ -357,11 +433,16 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
   next.schema_invalid_dropped_total = addSaturating(next.schema_invalid_dropped_total, schemaInvalidDelta);
   next.bytecap_evicted_total = addSaturating(next.bytecap_evicted_total, bytecapDelta);
   next.age_evicted_total = addSaturating(next.age_evicted_total, ageDelta);
+  next.future_fact_dropped_total = addSaturating(next.future_fact_dropped_total, futureFactDelta);
   if (corruptDelta > 0) next.last_corrupt_ts = nowIso;
   if (schemaInvalidDelta > 0) next.last_schema_invalid_ts = nowIso;
   if (bytecapDelta > 0) next.last_bytecap_evict_ts = nowIso;
   if (effectiveContinuityBreak || invalidLedgerBootstrap) next.last_continuity_break_ts = nowIso;
-  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + effectiveContinuityBreak + invalidLedgerBootstrap) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
+  // Fix 0: last_future_fact_ts is always stamped with THIS pass's real nowIso -- never the
+  // dropped record's own claimed future ts (see enforceFactRetention's counts.future_fact_count
+  // callsite) -- mirroring last_corrupt_ts/last_schema_invalid_ts/last_bytecap_evict_ts exactly.
+  if (futureFactDelta > 0) next.last_future_fact_ts = nowIso;
+  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + futureFactDelta + effectiveContinuityBreak + invalidLedgerBootstrap) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
 
   next.continuity = {
     record_count_hwm: Math.max(next.continuity.record_count_hwm, live.record_count, outputRecords.length),
@@ -378,6 +459,9 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
       schema_invalid_count: counts.schema_invalid_count,
       bytecap_evicted_count: counts.bytecap_evicted_count,
       age_evicted_count: counts.age_evicted_count,
+      // counts.future_fact_count defaults to 0 for a caller that predates fix 0 (mirrors
+      // addCount's own default above).
+      future_fact_count: counts.future_fact_count ?? 0,
       output_record_count: outputRecords.length,
       output_newest_ts: outputNewestTs,
       output_bytes: outputBytes,
@@ -403,11 +487,64 @@ export function finalizeFactIntegrityLedger(ledger, passId, { allowRecovery = fa
   return next;
 }
 
-function lossAtOrAfter(timestamp, asOfMs, nowMs) {
+// R1 (trusted-state step-1 revision, "R1 made signable"): the `lossMs <= upperBoundMs` clause
+// that used to drop a future-dated loss from this evaluation is REMOVED. A future-dated loss is
+// a real loss with an untrustworthy timestamp, not a non-event -- it must count. No nowMs bound
+// remains here at all (see Fix 1's clamp, and buildCompleteness's own future_loss_fields, for
+// how a future marker is surfaced/bounded instead of silently excluded).
+function lossAtOrAfter(timestamp, asOfMs) {
   if (timestamp === null) return false;
   const lossMs = Date.parse(timestamp);
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Number.POSITIVE_INFINITY;
-  return lossMs >= asOfMs && lossMs <= upperBoundMs;
+  return lossMs >= asOfMs;
+}
+
+// The five loss-timestamp channels buildCompleteness's degraded evaluation consults. Order is
+// significant for degraded_reason's channel attribution below (last_future_fact_ts first: a
+// future-fact-only incident should report as such, not be absorbed into a same-tick continuity-
+// break attribution).
+const LOSS_CHANNEL_FIELDS = [
+  "last_future_fact_ts",
+  "last_corrupt_ts",
+  "last_schema_invalid_ts",
+  "last_bytecap_evict_ts",
+  "last_continuity_break_ts",
+];
+
+// Fix 2 (surfacing, additive, no trust-decision path touched): the subset of last_*_ts field
+// names whose parsed value is strictly after nowMs -- i.e. still forward-dated as of this read.
+// Purely diagnostic: no code path below or elsewhere consults this to make a trust decision.
+function futureLossFields(base, nowMs) {
+  if (!Number.isFinite(nowMs)) return [];
+  return LOSS_CHANNEL_FIELDS.filter((field) => {
+    const value = base[field];
+    if (value === null) return false;
+    const valueMs = Date.parse(value);
+    return Number.isFinite(valueMs) && valueMs > nowMs;
+  });
+}
+
+// Fix 2: the field set every buildCompleteness return branch shares (a deepEqual fixture across
+// branches -- see fact-store-integrity.test.js -- is the signal this was done inconsistently).
+function commonCompletenessFields(base, nowMs) {
+  return {
+    last_corrupt_ts: base.last_corrupt_ts,
+    last_schema_invalid_ts: base.last_schema_invalid_ts,
+    last_bytecap_evict_ts: base.last_bytecap_evict_ts,
+    last_continuity_break_ts: base.last_continuity_break_ts,
+    last_future_fact_ts: base.last_future_fact_ts,
+    corrupt_dropped_total: base.corrupt_dropped_total,
+    schema_invalid_dropped_total: base.schema_invalid_dropped_total,
+    bytecap_evicted_total: base.bytecap_evicted_total,
+    age_evicted_total: base.age_evicted_total,
+    future_fact_dropped_total: base.future_fact_dropped_total,
+    first_degraded_ts: base.first_degraded_ts,
+    // Finding F2-Tier1, additive read-only reporting: mirrors ledger.continuity.oldest_ts so
+    // an operator can see how much fact history is actually retained (not just a cumulative
+    // lifetime eviction total) even on an unknown/broken-continuity read -- no trust-decision
+    // code path consults this field.
+    continuity_oldest_ts: base.continuity.oldest_ts,
+    future_loss_fields: futureLossFields(base, nowMs),
+  };
 }
 
 export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINITY, currentCounts = {}, nowMs) {
@@ -417,73 +554,50 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
   if (continuityObservation === "broken") {
     return {
       status: "unknown",
-      last_corrupt_ts: base.last_corrupt_ts,
-      last_schema_invalid_ts: base.last_schema_invalid_ts,
-      last_bytecap_evict_ts: base.last_bytecap_evict_ts,
-      last_continuity_break_ts: base.last_continuity_break_ts,
-      corrupt_dropped_total: base.corrupt_dropped_total,
-      schema_invalid_dropped_total: base.schema_invalid_dropped_total,
-      bytecap_evicted_total: base.bytecap_evicted_total,
-      age_evicted_total: base.age_evicted_total,
-      first_degraded_ts: base.first_degraded_ts,
+      ...commonCompletenessFields(base, nowMs),
       continuity_ok: null,
-      // Finding F2-Tier1, additive read-only reporting: mirrors ledger.continuity.oldest_ts so
-      // an operator can see how much fact history is actually retained (not just a cumulative
-      // lifetime eviction total) even on an unknown/broken-continuity read -- no trust-decision
-      // code path consults this field.
-      continuity_oldest_ts: base.continuity.oldest_ts,
+      degraded_reason: "continuity_unknown",
     };
   }
-  // A future-dated continuity break (last_continuity_break_ts > nowMs) while the live store
-  // currently observes "ok" is a clock-rollback artifact for THIS read: the live facts match the
-  // ledger, so a stale continuity_ok:false must not latch this read to "unknown" until wall time
-  // reaches the future timestamp. Treat continuity as ok here and fall through to the normal,
-  // nowMs-bounded loss-channel evaluation (which already excludes the future break, so the read
-  // resolves to intact/degraded on real in-window losses only). The durable continuity_ok repair
-  // happens on the next retention pass. Normal/aged breaks (break <= nowMs) are unaffected.
+  // R2 (trusted-state step-1 revision, "R1 made signable"): the clock-rollback-artifact override
+  // that used to flip a stale continuity_ok:false back to true whenever last_continuity_break_ts
+  // sat in the future is REMOVED (dead code once R1 ships -- byte-identical status output to
+  // R1-only, see the revision's own review note). continuityOk now mirrors the ledger's own
+  // recorded value whenever the live observation itself is resolvable ("ok"/"broken"); only an
+  // unresolvable ("unknown") live observation forces continuityOk to null.
   const rawContinuityOk = ledger?.continuity.continuity_ok ?? null;
-  const continuityBreakMs = base.last_continuity_break_ts !== null ? Date.parse(base.last_continuity_break_ts) : Number.NaN;
-  const continuityBreakIsFuture = Number.isFinite(nowMs) && Number.isFinite(continuityBreakMs) && continuityBreakMs > nowMs;
-  const continuityOk = continuityObservation === "unknown"
-    ? null
-    : rawContinuityOk === false && continuityObservation === "ok" && continuityBreakIsFuture
-      ? true
-      : rawContinuityOk;
+  const continuityOk = continuityObservation === "unknown" ? null : rawContinuityOk;
   if (!ledger || continuityObservation === "unknown" || continuityOk !== true) {
+    const status = continuityOk === false && lossAtOrAfter(base.last_continuity_break_ts, asOfMs) ? "degraded" : "unknown";
     return {
-      status: continuityOk === false && lossAtOrAfter(base.last_continuity_break_ts, asOfMs, nowMs) ? "degraded" : "unknown",
-      last_corrupt_ts: base.last_corrupt_ts,
-      last_schema_invalid_ts: base.last_schema_invalid_ts,
-      last_bytecap_evict_ts: base.last_bytecap_evict_ts,
-      last_continuity_break_ts: base.last_continuity_break_ts,
-      corrupt_dropped_total: base.corrupt_dropped_total,
-      schema_invalid_dropped_total: base.schema_invalid_dropped_total,
-      bytecap_evicted_total: base.bytecap_evicted_total,
-      age_evicted_total: base.age_evicted_total,
-      first_degraded_ts: base.first_degraded_ts,
+      status,
+      ...commonCompletenessFields(base, nowMs),
       continuity_ok: continuityOk,
-      continuity_oldest_ts: base.continuity.oldest_ts,
+      degraded_reason: status === "degraded" ? "continuity_break" : "continuity_unknown",
     };
   }
 
-  const degraded = thisReadHasLoss || [
-    base.last_corrupt_ts,
-    base.last_schema_invalid_ts,
-    base.last_bytecap_evict_ts,
-    base.last_continuity_break_ts,
-  ].some((timestamp) => lossAtOrAfter(timestamp, asOfMs, nowMs));
+  if (thisReadHasLoss) {
+    return {
+      status: "degraded",
+      ...commonCompletenessFields(base, nowMs),
+      continuity_ok: base.continuity.continuity_ok,
+      degraded_reason: "this_read_loss",
+    };
+  }
+  const lossChannel = LOSS_CHANNEL_FIELDS.find((field) => lossAtOrAfter(base[field], asOfMs));
+  const degraded = lossChannel !== undefined;
+  const degradedReason = !degraded
+    ? "none"
+    : lossChannel === "last_future_fact_ts"
+      ? "future_fact"
+      : Number.isFinite(nowMs) && base[lossChannel] !== null && Date.parse(base[lossChannel]) > nowMs
+        ? "future_loss"
+        : "in_window_loss";
   return {
     status: degraded ? "degraded" : "intact",
-    last_corrupt_ts: base.last_corrupt_ts,
-    last_schema_invalid_ts: base.last_schema_invalid_ts,
-    last_bytecap_evict_ts: base.last_bytecap_evict_ts,
-    last_continuity_break_ts: base.last_continuity_break_ts,
-    corrupt_dropped_total: base.corrupt_dropped_total,
-    schema_invalid_dropped_total: base.schema_invalid_dropped_total,
-    bytecap_evicted_total: base.bytecap_evicted_total,
-    age_evicted_total: base.age_evicted_total,
-    first_degraded_ts: base.first_degraded_ts,
+    ...commonCompletenessFields(base, nowMs),
     continuity_ok: base.continuity.continuity_ok,
-    continuity_oldest_ts: base.continuity.oldest_ts,
+    degraded_reason: degradedReason,
   };
 }

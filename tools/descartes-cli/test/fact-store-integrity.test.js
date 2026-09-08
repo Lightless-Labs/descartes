@@ -126,9 +126,60 @@ test("buildCompleteness surfaces continuity_oldest_ts even on a broken-continuit
   const read = await readFactPoints(paths, { now: NOW });
   assert.equal(read.completeness.status, "unknown");
   assert.equal(read.completeness.continuity_oldest_ts, NOW);
+  assert.equal(read.completeness.degraded_reason, "continuity_unknown");
 });
 
-test("buildCompleteness does not degrade an intact read for a future ledger loss timestamp", async () => {
+// Fix 2 acceptance #11 (trusted-state step-1 revision, "R1 made signable"): degraded_reason and
+// future_loss_fields must be present with the IDENTICAL key set on all three buildCompleteness
+// return branches (the "broken"/continuity_ok:false-or-unknown/degraded-or-intact branches) --
+// a deepEqual key-set diff across branches is the signal this was done inconsistently.
+test("buildCompleteness's field shape (incl. degraded_reason/future_loss_fields) is identical across all three return branches", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [
+    { ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} },
+  ], { now: NOW });
+  await enforceFactRetention(paths, { now: NOW }); // second pass -> continuity_ok:true (proven intact)
+  const ledger = await readLedger(paths);
+
+  // Branch 1: "broken" (live record_count regressed below the committed count).
+  const brokenResult = buildCompleteness(
+    ledger,
+    { record_count: 0, bytes: 0, raw_bytes: Buffer.alloc(0), exists: true, newest_ts: null },
+    Number.NEGATIVE_INFINITY, {}, Date.parse(NOW),
+  );
+  assert.equal(brokenResult.status, "unknown");
+
+  // Branch 2: continuityObservation "unknown" (no ledger at all -- first-ever read).
+  const unknownResult = buildCompleteness(
+    null,
+    { record_count: 0, bytes: 0, raw_bytes: Buffer.alloc(0), exists: false, newest_ts: null },
+    Number.NEGATIVE_INFINITY, {}, Date.parse(NOW),
+  );
+  assert.equal(unknownResult.status, "unknown");
+
+  // Branch 3: continuityOk === true, resolves intact (the real, proven-intact store read).
+  const intactResult = (await readFactPoints(paths, { now: NOW })).completeness;
+  assert.equal(intactResult.status, "intact");
+
+  const keySets = [brokenResult, unknownResult, intactResult].map((result) => Object.keys(result).sort());
+  assert.deepEqual(keySets[0], keySets[1]);
+  assert.deepEqual(keySets[1], keySets[2]);
+  for (const result of [brokenResult, unknownResult, intactResult]) {
+    assert.ok("degraded_reason" in result, "degraded_reason missing");
+    assert.ok(Array.isArray(result.future_loss_fields), "future_loss_fields missing or not an array");
+  }
+  assert.equal(brokenResult.degraded_reason, "continuity_unknown");
+  assert.equal(unknownResult.degraded_reason, "continuity_unknown");
+  assert.equal(intactResult.degraded_reason, "none");
+});
+
+// R1 (trusted-state step-1 revision, "R1 made signable"): PINNED REVERSAL. Was
+// "buildCompleteness does not degrade an intact read for a future ledger loss timestamp" —
+// intentionally flipped. A future-dated loss is a real loss with an untrustworthy timestamp,
+// not a non-event: reading it back as "intact" let a clock artifact (or a same-uid attacker
+// stepping the clock forward, recording a loss, then restoring it) silently launder a genuine
+// loss into a trusted read. It must now fail closed to "degraded" regardless of asOfMs/nowMs.
+test("buildCompleteness degrades a read for a future ledger loss timestamp instead of reading intact (R1)", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, [], { now: NOW });
   await enforceFactRetention(paths, { now: NOW });
@@ -144,17 +195,24 @@ test("buildCompleteness does not degrade an intact read for a future ledger loss
     newest_ts: null,
   };
 
-  assert.equal(
-    buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW)).status,
-    "intact",
-  );
+  const atNow = buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW));
+  assert.equal(atNow.status, "degraded");
+  assert.equal(atNow.degraded_reason, "future_loss");
+  assert.deepEqual(atNow.future_loss_fields, ["last_corrupt_ts"]);
   assert.equal(
     buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(futureLoss)).status,
     "degraded",
   );
 });
 
-test("buildCompleteness treats a future continuity break (continuity_ok:false) with an 'ok' observation as a rollback artifact, not a permanent 'unknown'", async () => {
+// R2 (trusted-state step-1 revision, "R1 made signable"): PINNED REVERSAL. Was
+// "buildCompleteness treats a future continuity break (continuity_ok:false) with an 'ok'
+// observation as a rollback artifact, not a permanent 'unknown'" — intentionally flipped. The
+// clock-rollback-artifact override this test pinned is now dead code: once R1 ships, a future
+// last_continuity_break_ts already resolves to "degraded" via the (now-unbounded) loss-channel
+// evaluation, so the override that used to flip a stale continuity_ok:false back to true is a
+// no-op removal (byte-identical status output to R1-only — see the revision's own review note).
+test("buildCompleteness degrades (not intact) for a future continuity break even though the live store observes 'ok' (R2, R1-dependent no-op)", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, [], { now: NOW });
   await enforceFactRetention(paths, { now: NOW });
@@ -173,12 +231,12 @@ test("buildCompleteness treats a future continuity break (continuity_ok:false) w
     newest_ts: null,
   };
 
-  // now is BEFORE the future break: the stale continuity_ok:false must NOT latch this read to
-  // "unknown" — the live store is fine right now, so the read is intact.
-  assert.equal(
-    buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW)).status,
-    "intact",
-  );
+  // now is BEFORE the future break: post-R1/R2 this now fails closed to "degraded" (the
+  // future-dated break is a real loss with an untrustworthy timestamp, not a non-event).
+  const atNow = buildCompleteness(ledger, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW));
+  assert.equal(atNow.status, "degraded");
+  assert.equal(atNow.degraded_reason, "continuity_break");
+  assert.deepEqual(atNow.future_loss_fields, ["last_continuity_break_ts"]);
   // Control: when the break is at/within the current epoch (not future), continuity_ok:false is a
   // real break -> degraded (unchanged behavior).
   assert.equal(
@@ -458,6 +516,74 @@ test("readFactPoints throws on a malformed/negative windowMs or non-finite now i
   await assert.rejects(() => readFactPoints(paths, { now: NOW, windowMs: NaN }), /windowMs/);
   await assert.rejects(() => readFactPoints(paths, { now: NOW, windowMs: -1000 }), /windowMs/);
   await assert.rejects(() => readFactPoints(paths, { now: "garbage" }), /now/);
+});
+
+// Fix 0 migration (trusted-state step-1 revision, "R1 made signable"): every ledger written by
+// Descartes BEFORE this revision shipped is missing future_fact_dropped_total/last_future_fact_ts
+// (and, if a pass ever crashed mid-write, pending_pass.future_fact_count too). Without
+// migration, the FIRST tick after deploy would find every on-disk ledger "invalid" (a merely
+// old-shaped, otherwise-perfectly-coherent ledger, hasExactKeys-rejected for missing keys) ->
+// invalidLedgerBootstrap -> a continuity-break marker stamped on every store, degrading
+// everything for a full retention window on upgrade. This is the load-bearing case: readFactIntegrityLedger
+// must migrate (bootstrap the two/three missing keys to their zero-value defaults), not fail closed.
+test("readFactIntegrityLedger migrates a pre-fix0 ledger missing future_fact_dropped_total/last_future_fact_ts instead of failing closed as invalid", async () => {
+  const paths = await tempPaths();
+  const { integrityFile } = resolveFactIntegrityPaths(paths);
+  const { dir } = resolveFactStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true });
+
+  const preFix0 = createFactIntegrityLedger();
+  delete preFix0.future_fact_dropped_total;
+  delete preFix0.last_future_fact_ts;
+  assert.equal(Object.prototype.hasOwnProperty.call(preFix0, "future_fact_dropped_total"), false);
+  await fs.writeFile(integrityFile, JSON.stringify(preFix0));
+
+  const read = await readFactIntegrityLedger(paths);
+  assert.equal(read.reason, null, "a merely old-shaped (pre-fix0) ledger must migrate, not fail closed as invalid");
+  assert.equal(read.ledger.future_fact_dropped_total, 0);
+  assert.equal(read.ledger.last_future_fact_ts, null);
+
+  // A subsequent retention pass over the migrated ledger must NOT itself be treated as a
+  // continuity break (which the "invalid"/"unreadable" bootstrap path WOULD stamp -- see
+  // prepareFactIntegrityLedger's invalidLedgerBootstrap) -- confirming the migrated ledger is
+  // genuinely accepted as coherent, not merely tolerated as a fresh bootstrap in disguise.
+  await appendFactPoints(paths, [
+    { ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} },
+  ], { now: NOW });
+  const afterPass = await readLedger(paths);
+  assert.equal(afterPass.last_continuity_break_ts, null, "migration must not itself be treated as a continuity break");
+});
+
+test("readFactIntegrityLedger migrates a pre-fix0 ledger with a PENDING pass missing future_fact_count", async () => {
+  const paths = await tempPaths();
+  const { integrityFile } = resolveFactIntegrityPaths(paths);
+  const { dir } = resolveFactStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true });
+
+  const preFix0 = createFactIntegrityLedger();
+  delete preFix0.future_fact_dropped_total;
+  delete preFix0.last_future_fact_ts;
+  // A pending_pass with the pre-fix0 9-key shape (no future_fact_count), coherent with the
+  // (empty) continuity fields it's paired with -- simulates a pass that crash-looped between
+  // the ledger write and the facts rename, BEFORE this revision ever shipped.
+  preFix0.continuity.pending_pass = {
+    pass_id: 1,
+    corrupt_count: 0,
+    schema_invalid_count: 0,
+    bytecap_evicted_count: 0,
+    age_evicted_count: 0,
+    output_record_count: 0,
+    output_newest_ts: null,
+    output_bytes: 0,
+    output_digest: null,
+  };
+  await fs.writeFile(integrityFile, JSON.stringify(preFix0));
+
+  const read = await readFactIntegrityLedger(paths);
+  assert.equal(read.reason, null, "a pre-fix0 ledger with a pending pass missing future_fact_count must migrate, not fail closed");
+  assert.equal(read.ledger.continuity.pending_pass.future_fact_count, 0);
+  assert.equal(read.ledger.future_fact_dropped_total, 0);
+  assert.equal(read.ledger.last_future_fact_ts, null);
 });
 
 // daybreak-blue security sweep, fact-store HIGH #3: a hand-crafted ledger with

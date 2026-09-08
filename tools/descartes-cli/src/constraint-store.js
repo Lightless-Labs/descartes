@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { DEFAULT_FACT_MAX_BYTES, readFactPoints } from "./fact-store.js";
+import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
 export const SCHEMA_VERSION = 1;
 export const CONSTRAINT_STATUSES = ["draft", "shadow", "review-ready", "active", "retired"];
@@ -281,7 +282,13 @@ function learnedConfigUsage() {
 Flips or reports configDir/learned.json's { enabled } kill switch, which gates ALL automatic/
 background learned-constraint work (shadow evaluation logging, active-constraint real alerting).
 'enable'/'disable' are idempotent — flipping to the state it's already in is a no-op status-wise
-(still refreshes updated_at) and always prints a confirmation.`;
+(still refreshes updated_at) and always prints a confirmation.
+
+'status --json' additionally reports fact_store_completeness, windowed at the same default
+(31-day) horizon the completeness-gated baseline detectors resolve for their own reads by
+default. A detector invoked with a non-default baselineFactWindowMs override may see a
+different completeness than this fixed diagnostic surface reports — this is a diagnostic, not
+an exact per-detector trust mirror.`;
 }
 
 function renderLearnedConfigStatus(config, configFile) {
@@ -290,6 +297,9 @@ function renderLearnedConfigStatus(config, configFile) {
   if (config.updated_at) lines.push(`Last updated: ${config.updated_at}`);
   return lines.join("\n");
 }
+
+const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "none"];
+const LOSS_TS_FIELD_NAMES = ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"];
 
 function unknownFactStoreCompleteness() {
   return {
@@ -306,6 +316,18 @@ function unknownFactStoreCompleteness() {
     // lifetime total.
     last_bytecap_evict_ts: null,
     continuity_oldest_ts: null,
+    // Fix 2 (trusted-state step-1 revision, "R1 made signable"): additive surfacing fields, plus
+    // the two loss-ts fields (last_corrupt_ts/last_schema_invalid_ts/last_continuity_break_ts)
+    // this selector used to strip -- an operator diagnosing a degraded store needs to see WHICH
+    // channel and WHEN, not just the aggregate status. None of this is consulted by any
+    // trust-decision path (same precedent as continuity_oldest_ts above).
+    last_corrupt_ts: null,
+    last_schema_invalid_ts: null,
+    last_continuity_break_ts: null,
+    last_future_fact_ts: null,
+    future_fact_dropped_total: 0,
+    degraded_reason: "none",
+    future_loss_fields: [],
   };
 }
 
@@ -313,7 +335,7 @@ function isNullableTimestampString(value) {
   return value === null || (typeof value === "string" && Number.isFinite(Date.parse(value)));
 }
 
-function selectFactStoreCompleteness(completeness) {
+export function selectFactStoreCompleteness(completeness) {
   if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) {
     return unknownFactStoreCompleteness();
   }
@@ -327,12 +349,35 @@ function selectFactStoreCompleteness(completeness) {
     continuity_ok: [true, false, null].includes(completeness.continuity_ok) ? completeness.continuity_ok : null,
     last_bytecap_evict_ts: isNullableTimestampString(completeness.last_bytecap_evict_ts) ? completeness.last_bytecap_evict_ts : null,
     continuity_oldest_ts: isNullableTimestampString(completeness.continuity_oldest_ts) ? completeness.continuity_oldest_ts : null,
+    // Fix 2: no longer stripped, plus the new future-fact channel/reporting fields.
+    last_corrupt_ts: isNullableTimestampString(completeness.last_corrupt_ts) ? completeness.last_corrupt_ts : null,
+    last_schema_invalid_ts: isNullableTimestampString(completeness.last_schema_invalid_ts) ? completeness.last_schema_invalid_ts : null,
+    last_continuity_break_ts: isNullableTimestampString(completeness.last_continuity_break_ts) ? completeness.last_continuity_break_ts : null,
+    last_future_fact_ts: isNullableTimestampString(completeness.last_future_fact_ts) ? completeness.last_future_fact_ts : null,
+    future_fact_dropped_total: Number.isInteger(completeness.future_fact_dropped_total) ? completeness.future_fact_dropped_total : 0,
+    degraded_reason: DEGRADED_REASONS.includes(completeness.degraded_reason) ? completeness.degraded_reason : "none",
+    future_loss_fields: Array.isArray(completeness.future_loss_fields)
+      ? completeness.future_loss_fields.filter((field) => LOSS_TS_FIELD_NAMES.includes(field))
+      : [],
   };
 }
 
+// Fix 2: readFactPoints with no windowMs defaults buildCompleteness's asOfMs to
+// Number.NEGATIVE_INFINITY (fact-store.js), so `descartes learned status` used to report
+// "degraded" for ANY loss ever recorded, with no way to tell "just happened" from "years ago,
+// long since aged out for every real detector". Window it at the SAME constant the
+// completeness-gated baseline families (session/service/peer/process-lineage/persistence-
+// baseline) resolve for their own default readFactPoints calls, so this surface reports what the
+// detectors actually see by default -- a detector invoked with a non-default
+// baselineFactWindowMs override still diverges from this fixed surface (a diagnostic surface,
+// not a trust decision; documented in the CLI help text, not claimed as exact per-detector
+// parity). The raw last_*_ts fields and future_loss_fields are ALSO always printed alongside the
+// windowed status (selectFactStoreCompleteness above) so an out-of-window or future-dated loss
+// stays visible even when the windowed status itself reads "intact" -- windowing alone would
+// hide old losses from view, and surfacing alone would leave the windowed status meaningless.
 async function readFactStoreCompleteness(descartesPaths) {
   try {
-    const readResult = await readFactPoints(descartesPaths);
+    const readResult = await readFactPoints(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS });
     return selectFactStoreCompleteness(readResult?.completeness);
   } catch {
     return unknownFactStoreCompleteness();
@@ -384,10 +429,29 @@ export async function runLearnedConfigCommand(descartesPaths, subcommand, args, 
   else {
     const statusText = renderLearnedConfigStatus(config, configFile);
     output(factStoreCompleteness
-      ? `${statusText}\nFact-store completeness: ${factStoreCompleteness.status}`
+      ? `${statusText}\n${renderFactStoreCompletenessText(factStoreCompleteness)}`
       : statusText);
   }
   return result;
+}
+
+// Fix 2 (trusted-state step-1 revision, "R1 made signable"): the review's core undiscoverability
+// complaint was that an operator without --json had no way to see WHY a store reads degraded,
+// or that a loss marker is dated in the future. Surface that here too -- the --json payload
+// (selectFactStoreCompleteness, above) is still the primary/complete surface, this is a
+// human-readable summary of the same fields, shown only when there is something to explain.
+function renderFactStoreCompletenessText(completeness) {
+  const lines = [`Fact-store completeness: ${completeness.status}`];
+  if (completeness.status !== "intact") {
+    lines.push(`  Reason: ${completeness.degraded_reason}`);
+    if (completeness.future_loss_fields.length > 0) {
+      lines.push(`  Future-dated (untrustworthy clock) fields: ${completeness.future_loss_fields.join(", ")}`);
+    }
+    for (const field of ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"]) {
+      if (completeness[field] !== null) lines.push(`  ${field}: ${completeness[field]}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 // --- Slice S7a, additive: draft->shadow / shadow->review-ready status-transition helpers ---

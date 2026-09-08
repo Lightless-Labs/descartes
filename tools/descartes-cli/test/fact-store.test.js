@@ -10,6 +10,7 @@ import {
   DEFAULT_FACT_MAX_BYTES,
   DEFAULT_FACT_RETENTION_MS,
   enforceFactRetention,
+  FUTURE_FACT_TOLERANCE_MS,
   MAX_FACT_ATTRIBUTE_COUNT,
   MAX_FACT_ATTRIBUTE_KEY_LENGTH,
   MAX_FACT_ENTITY_KEY_LENGTH,
@@ -20,6 +21,7 @@ import {
   readFactPoints,
   resolveFactStorePaths,
 } from "../src/fact-store.js";
+import { readFactIntegrityLedger } from "../src/fact-store-integrity.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-fact-store-test-"));
@@ -425,4 +427,257 @@ test("F4-B2 empty-message edge: a retention failure with NO message still surfac
   // (and not blocked by) the still-failing retention tmp path.
   const { points } = await readFactPoints(paths, { now: ts });
   assert.equal(points.length, 2);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact continuity wedge.
+// enforceFactRetention drops a fact whose ts exceeds nowMs + FUTURE_FACT_TOLERANCE_MS from
+// candidates BEFORE it can ever contaminate last_rewrite_newest_ts, counts it, and stamps a new
+// last_future_fact_ts loss marker with the pass's REAL now -- never the record's own claimed ts.
+// ---------------------------------------------------------------------------------------------
+
+test("enforceFactRetention drops a future-dated fact (beyond FUTURE_FACT_TOLERANCE_MS), counts it, and stamps last_future_fact_ts at real now", async () => {
+  const paths = await tempPaths();
+  const now = "2026-07-10T00:00:00.000Z";
+  const nowMs = Date.parse(now);
+  const future = new Date(nowMs + FUTURE_FACT_TOLERANCE_MS + 60_000).toISOString();
+
+  // A brand-new store's ledger only reaches continuity_ok:true after a SECOND clean pass (the
+  // bootstrap pass itself commits continuity_ok:null -- pre-existing behavior, unrelated to fix
+  // 0; see fact-store-integrity.test.js's "reaches intact after two clean passes"). Establish a
+  // provably-continuous baseline FIRST so the assertions below isolate fix 0's own effect rather
+  // than this unrelated first-run ambiguity.
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: now },
+  ], { now });
+  await enforceFactRetention(paths, { now });
+
+  const written = await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "real", attributes: {}, ts: now },
+    { fact_name: "service.presence", entity_key: "future", attributes: {}, ts: future },
+  ], { now });
+  assert.equal(written.written_count, 2, "both records genuinely reach disk on append -- the wedge fix is a RETENTION-time drop, not an append-time rejection");
+  assert.equal(written.retention.future_fact_dropped_count, 1);
+  assert.equal(written.retention.kept_count, 2); // baseline (prior pass) + real
+  assert.equal(written.retention.dropped_count, 1);
+
+  // "fresh incident, post-fix" shape (plan §"Fix 0", "Recovery shape this produces"): the future
+  // fact never reaches last_rewrite_newest_ts, so there is no wedge at all -- the read degrades
+  // immediately via the new loss channel, not "unknown".
+  const read = await readFactPoints(paths, { now });
+  assert.deepEqual(read.points.map((p) => p.entity_key).sort(), ["baseline", "real"]);
+  assert.equal(read.completeness.status, "degraded");
+  assert.equal(read.completeness.degraded_reason, "future_fact");
+  assert.equal(read.completeness.last_future_fact_ts, now);
+  assert.equal(read.completeness.future_fact_dropped_total, 1);
+  assert.deepEqual(read.completeness.future_loss_fields, []); // stamped at real now, not itself future
+
+  const { ledger } = await readFactIntegrityLedger(paths);
+  assert.equal(ledger.future_fact_dropped_total, 1);
+  assert.equal(ledger.last_future_fact_ts, now);
+  assert.equal(ledger.continuity.last_rewrite_newest_ts, now, "the dropped future record must never reach the continuity anchor");
+});
+
+test("enforceFactRetention's sum-invariant holds across kept + age-evicted + bytecap-evicted + future-dropped", async () => {
+  const paths = await tempPaths();
+  const now = "2026-07-10T00:00:00.000Z";
+  const nowMs = Date.parse(now);
+  const retentionMs = 24 * 60 * 60 * 1000;
+  const old = new Date(nowMs - retentionMs - 60_000).toISOString(); // age-evicted
+  const kept = now; // kept
+  const future = new Date(nowMs + FUTURE_FACT_TOLERANCE_MS + 60_000).toISOString(); // future-dropped
+
+  const written = await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "old", attributes: {}, ts: old },
+    { fact_name: "service.presence", entity_key: "kept", attributes: {}, ts: kept },
+    { fact_name: "service.presence", entity_key: "future", attributes: {}, ts: future },
+  ], { now, retentionMs });
+
+  const retention = written.retention;
+  assert.equal(retention.kept_count + retention.age_evicted_count + retention.bytecap_evicted_count + retention.future_fact_dropped_count, 3);
+  assert.equal(retention.age_evicted_count, 1);
+  assert.equal(retention.future_fact_dropped_count, 1);
+  assert.equal(retention.kept_count, 1);
+});
+
+test("a record within FUTURE_FACT_TOLERANCE_MS of now is NOT treated as a future-fact drop (generous tolerance, not a hair-trigger)", async () => {
+  const paths = await tempPaths();
+  const now = "2026-07-10T00:00:00.000Z";
+  const nowMs = Date.parse(now);
+  const withinTolerance = new Date(nowMs + FUTURE_FACT_TOLERANCE_MS - 60_000).toISOString();
+
+  // See the preceding test's comment: a brand-new store needs a second clean pass before
+  // continuity_ok resolves to true, independent of fix 0.
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: now },
+  ], { now });
+  await enforceFactRetention(paths, { now });
+
+  const written = await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "near-future", attributes: {}, ts: withinTolerance },
+  ], { now });
+  assert.equal(written.retention.future_fact_dropped_count, 0);
+  assert.equal(written.retention.kept_count, 2); // baseline (prior pass) + near-future
+
+  const read = await readFactPoints(paths, { now });
+  assert.equal(read.completeness.status, "intact");
+  assert.equal(read.completeness.degraded_reason, "none");
+});
+
+// The realistic daemon-shaped incident: a forward-clock tick writes a future fact with ts===now
+// (daemon.js derives both from the same stepped-forward wall clock, so the fix-0 write-path drop
+// above does NOT catch it at write time -- tsMs is not beyond nowMs+tol relative to ITS OWN
+// tick's nowMs). The wedge only becomes visible once the clock is restored to real time and a
+// LATER append-triggering pass evaluates the same on-disk future fact against a real nowMs.
+// Pin the ACTUAL bounded recovery shape here rather than the plan's simplified prose: the FIRST
+// post-incident append-triggering pass computed by comparing the pre-rewrite live disk state
+// (which still holds the poisoned future fact) against the antecedent pass's own poisoned
+// last_rewrite_newest_ts observes continuityObservation:"unknown" for ITS OWN commit -- so a read
+// performed strictly BETWEEN that pass and the next one reads "unknown" (honest, not "intact",
+// but also not yet "degraded" -- the plan's "resolves the same pass" framing does not hold for
+// this ts===now incident shape; see this test's own trailing note). The pass's own COMMITTED
+// output is nonetheless future-fact-free (last_rewrite_newest_ts is clean), so the FOLLOWING
+// append-triggering pass's OWN observation is unambiguous ("ok", genuinely, not via any
+// recovery/promotion special-case) and a read after THAT pass shows "degraded" via the new
+// last_future_fact_ts channel -- bounded to exactly two append-triggering passes from incident
+// start to "resolved, honestly degraded, not permanently wedged".
+test("a pre-existing (ts===now) future-fact incident wedges continuity for exactly one transitional append-pass, then resolves to a real (not permanently-stuck) degraded read", async () => {
+  const paths = await tempPaths();
+  const t0 = "2026-07-10T00:00:00.000Z";
+  const tFutureIncident = new Date(Date.parse(t0) + 400 * 24 * 60 * 60 * 1000).toISOString(); // clock stepped ~1yr forward
+  const tReal = "2026-07-10T00:05:00.000Z"; // clock restored; well beyond tFutureIncident's tolerance window
+  const tReal2 = "2026-07-10T00:10:00.000Z";
+
+  // Pass A: baseline real fact.
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: t0 },
+  ], { now: t0 });
+
+  // Pass A2 (the poisoning tick): daemon.js derives BOTH ts and now from the same stepped-forward
+  // clock, so fix 0's write-time filter does not catch this -- tsMs === nowMs, never beyond
+  // nowMs+tol relative to its own (poisoned) now.
+  const poisoned = await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "poisoned", attributes: {}, ts: tFutureIncident },
+  ], { now: tFutureIncident });
+  assert.equal(poisoned.retention.future_fact_dropped_count, 0, "ts===now this tick -- fix 0's write-time filter cannot catch a same-tick clock excursion");
+  const { ledger: afterPoison } = await readFactIntegrityLedger(paths);
+  assert.equal(afterPoison.continuity.last_rewrite_newest_ts, tFutureIncident, "the poisoned future fact IS committed as the continuity anchor by this pass -- this is the wedge fix 0's recovery path must resolve");
+
+  // Pass B (transitional): clock restored to real time. This append-triggering pass's OWN
+  // continuity observation compares the pre-rewrite live disk (still holding the poisoned fact)
+  // against the antecedent pass's poisoned last_rewrite_newest_ts -> "unknown" for THIS pass's
+  // commit, even though this pass's fix-0 filter DOES drop the now-far-future record from its
+  // own output (tReal + tol is nowhere near tFutureIncident).
+  const transitional = await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "recovery-b", attributes: {}, ts: tReal },
+  ], { now: tReal });
+  assert.equal(transitional.retention.future_fact_dropped_count, 1, "this pass's real nowMs now catches the far-future record");
+
+  const readAfterB = await readFactPoints(paths, { now: tReal });
+  // Honest, bounded-but-not-yet-resolved: NOT "intact" (a real loss occurred and is not yet
+  // provably continuous), and the plan's own simplified "resolves the same pass" framing does
+  // not hold for this incident shape -- this is a deviation from the plan's prose, not from its
+  // governing invariant (never fabricate intact; never stay wedged forever). See deviations_from_spec.
+  assert.equal(readAfterB.completeness.status, "unknown");
+  assert.notEqual(readAfterB.completeness.status, "intact");
+  const { ledger: afterB } = await readFactIntegrityLedger(paths);
+  assert.equal(afterB.last_future_fact_ts, tReal, "the marker is stamped at THIS pass's real now, never the record's own claimed future ts");
+  assert.equal(afterB.continuity.last_rewrite_newest_ts, tReal, "pass B's OWN committed output is future-fact-free -- the anchor is no longer poisoned going forward");
+
+  // Pass C (the following append-triggering pass): this pass's own continuity observation
+  // compares pre-rewrite live disk (pass B's clean output + this new fact) against pass B's
+  // now-clean last_rewrite_newest_ts -- genuinely "ok", not via any recovery special-case.
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "recovery-c", attributes: {}, ts: tReal2 },
+  ], { now: tReal2 });
+
+  const readAfterC = await readFactPoints(paths, { now: tReal2 });
+  assert.equal(readAfterC.completeness.continuity_ok, true);
+  assert.equal(readAfterC.completeness.status, "degraded"); // the future-fact loss is real and within window
+  assert.equal(readAfterC.completeness.degraded_reason, "future_fact");
+  assert.notEqual(readAfterC.completeness.status, "unknown", "must not stay permanently wedged -- this is the bug fix 0 exists to close");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fix 1 (trusted-state step-1 revision, "R1 made signable"): the bounded-blind retention-time
+// clamp in prepareFactIntegrityLedger. A forward-dated loss MARKER (not just the future-fact
+// wedge fix 0 handles) is pulled down to nowIso on the next append-triggering pass, turning an
+// unbounded fail-STUCK blind into a bounded, one-window blind -- WITHOUT ever erasing the loss
+// itself (the total counters are untouched; only the timestamp moves).
+// ---------------------------------------------------------------------------------------------
+
+test("Fix 1: a forward-dated last_corrupt_ts marker (stamped alongside the same-tick future-fact incident) is clamped to real now on the next pass, ages out for a windowed read, and stays degraded unwindowed -- without erasing the loss", async () => {
+  const paths = await tempPaths();
+  const t0 = "2026-07-10T00:00:00.000Z";
+  const tFutureIncident = new Date(Date.parse(t0) + 400 * 24 * 60 * 60 * 1000).toISOString(); // clock stepped ~1yr forward
+  const tReal = "2026-07-10T00:05:00.000Z"; // clock restored
+  const tReal2 = "2026-07-10T00:10:00.000Z";
+
+  // Baseline: one real fact, two clean passes -> continuity_ok:true.
+  await appendFactPoints(paths, [
+    { ts: t0, fact_name: "service.presence", entity_key: "baseline", attributes: {} },
+  ], { now: t0 });
+  await enforceFactRetention(paths, { now: t0 });
+
+  // The poisoning tick: BOTH anomalies land in the SAME forward-clock pass -- a genuine corrupt
+  // line already on disk (manually injected, simulating an unrelated concurrent loss) AND a
+  // future-dated fact whose ts===now this pass (so fix 0's write-time filter cannot catch it,
+  // exactly like the plain future-fact wedge test above). This pass's own nowIso is itself the
+  // poisoned tFutureIncident, so last_corrupt_ts gets stamped at that SAME forward-dated value.
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.appendFile(storePaths.factsFile, [
+    "not-json",
+    JSON.stringify({ ts: tFutureIncident, fact_name: "service.presence", entity_key: "poisoned", attributes: {} }),
+  ].join("\n") + "\n");
+  await enforceFactRetention(paths, { now: tFutureIncident });
+  const afterPoison = await readFactIntegrityLedger(paths);
+  assert.equal(afterPoison.ledger.last_corrupt_ts, tFutureIncident, "the corrupt-loss marker is genuinely stamped at the poisoned nowIso this pass");
+  assert.equal(afterPoison.ledger.corrupt_dropped_total, 1);
+  assert.equal(afterPoison.ledger.continuity.last_rewrite_newest_ts, tFutureIncident);
+
+  // Transitional pass (clock restored to real time): fix 0's write-time filter now drops the
+  // still-on-disk future fact (real nowMs, far past its tolerance window). No NEW corrupt line
+  // lands this pass, so last_corrupt_ts is not freshly re-stamped by the ordinary
+  // corruptDelta>0 path -- it is carried forward from the prior pass UNLESS the clamp acts on
+  // it. This is precisely the case the clamp exists for.
+  await appendFactPoints(paths, [
+    { ts: tReal, fact_name: "service.presence", entity_key: "recovery-b", attributes: {} },
+  ], { now: tReal });
+  const afterClampPass = await readFactIntegrityLedger(paths);
+  assert.equal(afterClampPass.ledger.last_corrupt_ts, tReal, "Fix 1: the forward-dated marker is clamped down to THIS pass's real nowIso");
+  assert.equal(afterClampPass.ledger.last_future_fact_ts, tReal);
+  // Never-fabricate / never-erase: the loss itself (the totals) must be completely unaffected by
+  // the clamp -- only the TIMESTAMP moved, nothing about "a loss occurred" was rewritten away.
+  assert.equal(afterClampPass.ledger.corrupt_dropped_total, 1, "the clamp must NEVER erase a genuine loss -- only pull its marker forward-of-now down to nowIso");
+  assert.equal(afterClampPass.ledger.future_fact_dropped_total, 1);
+
+  const readAfterClampPass = await readFactPoints(paths, { now: tReal });
+  assert.equal(readAfterClampPass.completeness.status, "unknown"); // one transitional pass, as in the plain wedge test above
+
+  // The following append-triggering pass resolves continuity genuinely (not via any
+  // recovery/promotion special-case -- see the plain wedge test's own commentary).
+  await appendFactPoints(paths, [
+    { ts: tReal2, fact_name: "service.presence", entity_key: "recovery-c", attributes: {} },
+  ], { now: tReal2 });
+
+  const readAfterC = await readFactPoints(paths, { now: tReal2 });
+  assert.equal(readAfterC.completeness.continuity_ok, true);
+  assert.equal(readAfterC.completeness.status, "degraded"); // both clamped/stamped markers (tReal) are real, in-window losses
+  // Both markers are now real (non-future) timestamps relative to tReal2 -- no future_loss_fields.
+  assert.deepEqual(readAfterC.completeness.future_loss_fields, []);
+
+  // Acceptance #10: bounded to one window for a WINDOWED read, once the clock is corrected and
+  // that read's own asOfMs advances past the clamped timestamp plus the window.
+  const shortWindowMs = 1000;
+  const stillWithinWindow = await readFactPoints(paths, { now: new Date(Date.parse(tReal) + shortWindowMs).toISOString(), windowMs: shortWindowMs });
+  assert.equal(stillWithinWindow.completeness.status, "degraded");
+  const agedOut = await readFactPoints(paths, { now: new Date(Date.parse(tReal) + shortWindowMs + 1).toISOString(), windowMs: shortWindowMs });
+  assert.equal(agedOut.completeness.status, "intact", "bounded to exactly one window once the clamped timestamp ages out of a WINDOWED read");
+
+  // Acceptance #9/#12 (corrected from the plan's simplified prose): the CLI's unwindowed path
+  // (no windowMs, asOfMs=-Infinity) has no upper age bound on any loss channel -- this stays
+  // "degraded" indefinitely across further passes, with no ledger reset. This is honest
+  // (unrelated to and unchanged by this revision), not a self-recovery claim.
+  const unwindowedFarFuture = await readFactPoints(paths, { now: new Date(Date.parse(tReal) + 365 * 24 * 60 * 60 * 1000).toISOString() });
+  assert.equal(unwindowedFarFuture.completeness.status, "degraded");
 });

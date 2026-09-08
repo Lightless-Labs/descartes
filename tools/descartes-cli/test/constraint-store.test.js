@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints, DEFAULT_FACT_MAX_BYTES } from "../src/fact-store.js";
+import { appendFactPoints, DEFAULT_FACT_MAX_BYTES, resolveFactStorePaths } from "../src/fact-store.js";
 import { isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import {
   DEFAULT_SOAK_DAYS,
@@ -503,14 +503,26 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   const payload = JSON.parse(lines[0]);
   const completeness = payload.learned_config.fact_store_completeness;
 
+  // Fix 2 (trusted-state step-1 revision, "R1 made signable"): ADDITIVE fixture update -- the
+  // three previously-stripped loss-ts fields (last_corrupt_ts/last_schema_invalid_ts/
+  // last_continuity_break_ts) are no longer stripped, plus the new future-fact channel/
+  // reporting fields (last_future_fact_ts, future_fact_dropped_total, degraded_reason,
+  // future_loss_fields). No existing field is removed or renamed.
   assert.deepEqual(Object.keys(completeness).sort(), [
     "age_evicted_total",
     "bytecap_evicted_total",
     "continuity_ok",
     "continuity_oldest_ts",
     "corrupt_dropped_total",
+    "degraded_reason",
     "first_degraded_ts",
+    "future_fact_dropped_total",
+    "future_loss_fields",
     "last_bytecap_evict_ts",
+    "last_continuity_break_ts",
+    "last_corrupt_ts",
+    "last_future_fact_ts",
+    "last_schema_invalid_ts",
     "schema_invalid_dropped_total",
     "status",
   ].sort());
@@ -523,6 +535,13 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   assert.equal(completeness.continuity_ok, true);
   assert.equal(completeness.last_bytecap_evict_ts, null);
   assert.equal(completeness.continuity_oldest_ts, now);
+  assert.equal(completeness.last_corrupt_ts, null);
+  assert.equal(completeness.last_schema_invalid_ts, null);
+  assert.equal(completeness.last_continuity_break_ts, null);
+  assert.equal(completeness.last_future_fact_ts, null);
+  assert.equal(completeness.future_fact_dropped_total, 0);
+  assert.equal(completeness.degraded_reason, "none");
+  assert.deepEqual(completeness.future_loss_fields, []);
   for (const identityField of ["entity_key", "fact_name", "attributes", "generation", "source_tool", "sensitivity"]) {
     assert.equal(JSON.stringify(completeness).includes(identityField), false, `identity field leaked: ${identityField}`);
   }
@@ -537,6 +556,8 @@ test("descartes learned status --json degrades to unknown when fact history was 
   assert.equal(completeness.continuity_ok, null);
   assert.equal(completeness.last_bytecap_evict_ts, null);
   assert.equal(completeness.continuity_oldest_ts, null);
+  assert.equal(completeness.degraded_reason, "continuity_unknown");
+  assert.deepEqual(completeness.future_loss_fields, []);
 });
 
 // Finding F2-Tier1: coverage-loss reporting. Real (not hand-authored-fixture) sustained
@@ -567,6 +588,49 @@ test("descartes learned status --json surfaces last_bytecap_evict_ts and continu
   assert.equal(completeness.bytecap_evicted_total > 0, true);
   assert.equal(completeness.last_bytecap_evict_ts, day2);
   assert.equal(typeof completeness.continuity_oldest_ts, "string");
+});
+
+// Fix 2 (trusted-state step-1 revision, "R1 made signable"): the review's core undiscoverability
+// complaint was that an operator running `descartes learned status` WITHOUT --json had no way to
+// see why the store was degraded, or that a loss marker was future-dated. The plain-text summary
+// now explains a non-intact status, not just names it.
+test("descartes learned status (non-JSON) explains a degraded status with its reason and raw loss timestamps, not just the bare word 'degraded'", async () => {
+  const paths = await tempPaths();
+  // readFactStoreCompleteness (constraint-store.js) does not thread an injected `now` through to
+  // its readFactPoints call -- it windows at DEFAULT_BASELINE_FACT_WINDOW_MS against the REAL
+  // wall clock. Use the real current time here so the fixture's loss marker lands inside that
+  // window regardless of when this test runs (a fixed past date, e.g. "2026-07-11", would fall
+  // outside a 31-day real-clock window and the read would resolve "intact" instead).
+  const now = new Date().toISOString();
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  await fs.writeFile(storePaths.factsFile, "not-json\n");
+  await appendFactPoints(paths, [], { now });
+  await appendFactPoints(paths, [], { now }); // second clean pass -> continuity_ok:true, status: degraded (not unknown)
+
+  const lines = [];
+  await runLearnedConfigCommand(paths, "status", [], { output: (line) => lines.push(line) });
+  assert.equal(lines.length, 1);
+  const text = lines[0];
+  assert.match(text, /Fact-store completeness: degraded/);
+  assert.match(text, /Reason: this_read_loss|Reason: in_window_loss/);
+  assert.match(text, new RegExp(`last_corrupt_ts: ${now}`));
+
+  // The intact case (no existing test pins the exact non-JSON shape) stays exactly
+  // "Fact-store completeness: intact" with no trailing explanatory lines, byte-identical to the
+  // pre-fix-2 output for this line -- explanatory lines are added only when status !== "intact"
+  // (which includes "unknown", not just "degraded" -- a fresh/never-written store benefits from
+  // the same explanation).
+  const intactPaths = await tempPaths();
+  await appendFactPoints(intactPaths, [
+    { ts: now, fact_name: "service.presence", entity_key: "one", attributes: {} },
+  ], { now });
+  await appendFactPoints(intactPaths, [], { now }); // second clean pass -> continuity_ok:true, intact
+  const intactLines = [];
+  await runLearnedConfigCommand(intactPaths, "status", [], { output: (line) => intactLines.push(line) });
+  assert.equal(intactLines.length, 1);
+  assert.ok(intactLines[0].endsWith("Fact-store completeness: intact"), intactLines[0]);
+  assert.equal(intactLines[0].split("Fact-store completeness:").length, 2, "no extra 'Reason:'/last_*_ts lines when the status needs no explanation");
 });
 
 test("descartes learned status never mutates learned.json (read-only)", async () => {

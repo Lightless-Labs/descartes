@@ -5,10 +5,12 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { evaluateAndPersistAlerts } from "./alert-store.js";
+import { evaluateAndPersistAlerts, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
-import { loadConstraints, loadLearnedConfig } from "./constraint-store.js";
+import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
   factPointsFromNetworkEvidence,
   factPointsFromCanaryEvidence,
@@ -19,14 +21,19 @@ import {
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
-import { computeCorrelationCandidates } from "./incident-correlation.js";
-import { computePeerBaselineCandidates } from "./peer-baseline.js";
-import { computeServiceAppearanceCandidates, computeServiceBaselineCandidates } from "./service-baseline.js";
-import { computeProcessLineageBaselineCandidates } from "./process-lineage-baseline.js";
-import { computeSessionBaselineCandidates } from "./session-baseline.js";
-import { computeCanaryBaselineCandidates } from "./canary-baseline.js";
+import { computeCorrelationCandidates, CORRELATION_RULE_ID } from "./incident-correlation.js";
+import { computePeerBaselineCandidates, PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
+import {
+  computeServiceAppearanceCandidates,
+  computeServiceBaselineCandidates,
+  SERVICE_APPEARED_RULE_ID,
+  SERVICE_DISAPPEARED_RULE_ID,
+} from "./service-baseline.js";
+import { computeProcessLineageBaselineCandidates, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
+import { computeSessionBaselineCandidates, SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
+import { computeCanaryBaselineCandidates, CANARY_TAMPERED_RULE_ID } from "./canary-baseline.js";
 import { loadCanaryManifest } from "./canary-manifest.js";
-import { computeScheduledJobBaselineCandidates } from "./persistence-baseline.js";
+import { computeScheduledJobBaselineCandidates, SCHEDULED_JOB_APPEARED_RULE_ID } from "./persistence-baseline.js";
 import { computeCredentialAccessCandidates } from "./credential-access-baseline.js";
 import { computeContainmentRecommendationCandidates } from "./containment-recommend.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
@@ -61,6 +68,43 @@ export const DEFAULT_STRUCTURAL_TICK_DEADLINE_MS = 45 * 1000;
 // missed/slow structural ticks before a constraint stops evaluating. Pinned to the STRUCTURAL
 // interval, NEVER the fast tick — those facts only refresh on the structural cadence.
 export const ACTIVE_FRESHNESS_MULTIPLE = 3;
+
+// Fix 3 (trusted-state step-1 revision, "R1 made signable"): the rule_ids of every alert family
+// whose EMISSION is gated on factHistoryTrustworthy (i.e. would fall silent -- not merely stay
+// quiet on genuinely-clean evidence -- whenever this tick's fact-history is untrustworthy).
+// Verified by direct read of each source file, not grep alone (see the revision's own doc):
+// canary-baseline.js's non-trip paths only (coldStartPendingThisTick, driven by
+// !historyTrust.trust) -- R4/A1 exempts genuine canary.tripped trips from this lockout, so
+// CANARY_TRIPPED_RULE_ID is deliberately NOT in this set; incident-correlation.js;
+// peer-baseline.js; persistence-baseline.js; process-lineage-baseline.js; service-baseline.js
+// (both disappearance and appearance); session-baseline.js.
+//
+// CANARY_TAMPERED_RULE_ID is included WHOLESALE (operator-accepted decision, plan's
+// open_decisions): it is shared between one history-gated reason (canary_vanished) and two
+// non-history-gated tamper reasons (manifest_unreadable, isolated entity). Including it wholesale
+// freezes those two legitimate reasons too during a history-degraded tick (fail-stuck, bounded,
+// acceptable per doctrine) rather than leaving canary_vanished's own fabricated-recovery gap open.
+//
+// constraint.violation.* (per-constraint, dynamic rule_ids from constraint-eval.js) is
+// deliberately NOT enumerated here -- active-constraint evaluation does not gate on
+// factHistoryTrustworthy at all (computeActiveConstraintCandidates's own doc comment: "no
+// completeness gate needed... already follows 'no fact, no claim'"), so it must stay eligible
+// for recovery regardless of this tick's fact-history trust. coveredRuleIds below is built as a
+// COMPLEMENT (FIXED_ALERT_RULE_IDS ∪ currently-persisted rule_ids, minus this set) rather than a
+// hardcoded allowlist, precisely so a dynamic non-history-gated rule_id like this is never
+// wrongly excluded from recovery eligibility.
+export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
+  SERVICE_DISAPPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  SESSION_COUNT_DROP_RULE_ID,
+  SESSION_CHURN_RULE_ID,
+  PEER_COUNT_SPIKE_RULE_ID,
+  PEER_COUNT_DROP_RULE_ID,
+  PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+  SCHEDULED_JOB_APPEARED_RULE_ID,
+  CORRELATION_RULE_ID,
+  CANARY_TAMPERED_RULE_ID,
+]);
 
 export function defaultDaemonProfile() {
   return {
@@ -649,6 +693,54 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
   }
 
+  // Fix 2/Fix 3 (trusted-state step-1 revision, "R1 made signable"): ONE shared fact-history
+  // read this tick, sourced identically for (a) the statusRecord's fact_store_completeness line
+  // below and (b) scoping coveredRuleIds away from HISTORY_DEPENDENT_ALERT_RULE_IDS at BOTH
+  // evaluateAndPersistAlerts call sites below whenever this tick's fact-history is untrustworthy
+  // (no fabricated recovery -- alert-store.js's applyAlertCandidates would otherwise mark a
+  // suppressed history-dependent family's persisted alert "recovered" just because its absent
+  // candidate is indistinguishable from a genuine clear). Gated behind the SAME learned.json
+  // kill switch every other fact-history consumer in this file already checks BEFORE any I/O --
+  // when learned is disabled there is no fact store to protect, and this stays a true no-op
+  // (byte-identical to the pre-revision fast path; this file's repeated "no I/O when disabled"
+  // tests pin exactly this).
+  const loadLearnedConfigForHistory = options.loadLearnedConfig ?? loadLearnedConfig;
+  const learnedConfigForHistory = await loadLearnedConfigForHistory(descartesPaths);
+  let factStoreCompleteness;
+  let coveredRuleIds;
+  if (learnedConfigForHistory.enabled) {
+    const readFactsForHistory = options.readFactPoints ?? readFactPoints;
+    let factHistoryReadResult;
+    try {
+      factHistoryReadResult = await readFactsForHistory(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS, now: nowMs });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[daemon] fact-history read failed this tick (${message}); degrading to unknown completeness, not fabricating trust`);
+      factHistoryReadResult = undefined;
+    }
+    factStoreCompleteness = selectFactStoreCompleteness(factHistoryReadResult?.completeness);
+    const historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
+    if (!historyTrust.trust) {
+      const readAlerts = options.readAlertRecords ?? readAlertRecords;
+      let persistedAlerts = [];
+      try {
+        persistedAlerts = await readAlerts(descartesPaths);
+      } catch {
+        persistedAlerts = [];
+      }
+      // Complement, not a hardcoded allowlist (see HISTORY_DEPENDENT_ALERT_RULE_IDS's own doc
+      // comment): FIXED_ALERT_RULE_IDS ∪ every rule_id currently persisted, minus the
+      // history-dependent set -- so a dynamic non-history-gated rule_id (e.g.
+      // constraint.violation.<family>) stays eligible for recovery regardless of this tick's
+      // fact-history trust, while every history-dependent family freezes in place (no recovery,
+      // no fabricated clear) until trust is re-established.
+      coveredRuleIds = new Set(
+        [...FIXED_ALERT_RULE_IDS, ...persistedAlerts.map((alert) => alert.rule_id)]
+          .filter((ruleId) => !HISTORY_DEPENDENT_ALERT_RULE_IDS.has(ruleId)),
+      );
+    }
+  }
+
   // Finding F4, THE FABRICATION TRAP: `statusRecord` is built here, BEFORE attempting the disk
   // write, entirely from real data already computed this tick (genuine collector evidence, the
   // genuine metric-write result above) -- so it is honest regardless of whether the write below
@@ -687,6 +779,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
+    ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
   };
   const persistStatus = options.writeDaemonStatus ?? writeDaemonStatus;
   let status;
@@ -758,6 +851,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
         extraCandidates: mainExtraCandidates,
+        // Fix 3: identical value at both call sites (see the containment call below) --
+        // undefined (unrestricted, today's exact default behavior) whenever fact-history is
+        // trustworthy or learned is disabled; a computed complement Set otherwise.
+        coveredRuleIds,
       });
   }
   let alerts = mainAlerts;
@@ -778,6 +875,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historySummary: mainAlerts.history_summary,
       windowMs: options.alertWindowMs,
       extraCandidates: [...mainAlerts.candidates, ...mainExtraCandidates, ...containmentCandidates],
+      // Fix 3: the SAME value as the main call above -- this unconditional second phase
+      // independently reproduces the identical fabricated-recovery bug if left unpatched
+      // (verified: it computes its own isCovered from its own coveredRuleIds; patching only the
+      // main call is insufficient).
+      coveredRuleIds,
     });
     alerts = {
       ...containmentAlerts,

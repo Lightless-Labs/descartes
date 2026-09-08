@@ -29,7 +29,8 @@ import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../
 import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { readAlertRecords } from "../src/alert-store.js";
+import { readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
+import { CANARY_TAMPERED_RULE_ID } from "../src/canary-baseline.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
 import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
@@ -4136,4 +4137,145 @@ test("F4-B1 empty-message edge: a throwing appendMetricPoints with NO message st
     warnings.some((w) => w.includes("metric-persist")),
     `expected a warning naming the failing metric-persist step even with an empty error message, got: ${JSON.stringify(warnings)}`,
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fix 3 (trusted-state step-1 revision, "R1 made signable"): no fabricated recovery. When this
+// tick's fact-history is untrustworthy, a suppressed history-dependent detector's absent
+// candidate must NOT flip an existing active/acknowledged alert for that family to "recovered"
+// -- daemon.js scopes coveredRuleIds away from HISTORY_DEPENDENT_ALERT_RULE_IDS at BOTH
+// evaluateAndPersistAlerts call sites (main + containment). These tests drive the daemon's REAL
+// two-phase tick via runDaemonIteration (not a single direct evaluateAndPersistAlerts call), so
+// they exercise both call sites together -- a fix that patched only one would still fail here.
+// ---------------------------------------------------------------------------------------------
+
+test("Fix 3: a genuinely degraded fact-history freezes a suppressed history-dependent alert (session.count_drop) and the wholesale-covered canary.tampered, real two-phase tick", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  await fs.writeFile(storePaths.factsFile, "not-json\n");
+  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window
+  // corrupt-line loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what
+  // daemon.js's own shared Fix-2/Fix-3 read will observe this tick.
+  await appendFactPoints(paths, [], { now });
+  await appendFactPoints(paths, [], { now });
+  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(degradedRead.completeness.status, "degraded");
+  assert.equal(degradedRead.completeness.corrupt_dropped_total, 1);
+
+  // Pre-existing active alerts: one history-dependent family (session.count_drop), plus the
+  // wholesale-covered canary.tampered rule_id (shared with the non-history-gated tamper reasons
+  // -- included per the operator-accepted decision, plan's open_decisions).
+  await writeAlertRecords(paths, [
+    {
+      rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+      title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+    {
+      rule_id: CANARY_TAMPERED_RULE_ID, fingerprint: "canary_vanished", status: "active", severity: "warning",
+      title: "Canary tampered", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+  ]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // This tick's detectors for the families under test genuinely return [] -- exactly the
+    // shape a real coldStartPendingThisTick lockout (or an equivalent history-dependent gate)
+    // would produce while history is untrustworthy.
+    computeSessionBaselineCandidates: async () => [],
+    computeCanaryBaselineCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
+  assert.ok(sessionAlert, "the alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(sessionAlert.status, "active", "must NOT be fabricated-recovered by a suppressed history-dependent detector's absent candidate");
+  assert.ok(canaryAlert, "the canary.tampered alert must still be PRESENT");
+  assert.equal(canaryAlert.status, "active", "canary.tampered is wholesale-covered by HISTORY_DEPENDENT_ALERT_RULE_IDS and must also stay frozen");
+
+  // Confirm on disk too (both persistence passes -- main then containment -- already ran by the
+  // time runDaemonIteration resolves), not just the in-memory result.
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
+  assert.equal(persisted.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID)?.status, "active");
+
+  // Fix 2 acceptance: the daemon status record carries fact_store_completeness this tick,
+  // reflecting the same genuinely-degraded read that drove the coveredRuleIds scoping above.
+  assert.equal(result.status.fact_store_completeness?.status, "degraded");
+});
+
+test("Fix 3 control: the SAME suppressed-detector shape genuinely recovers its alert once fact-history is trustworthy (proves the freeze is trust-scoped, not unconditional)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // A real, intact (not degraded) windowed fact-history read: one fact + a second clean pass.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [
+    {
+      rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+      title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+    {
+      rule_id: CANARY_TAMPERED_RULE_ID, fingerprint: "canary_vanished", status: "active", severity: "warning",
+      title: "Canary tampered", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+  ]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => [],
+    computeCanaryBaselineCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
+  assert.equal(sessionAlert.status, "recovered", "with TRUSTWORTHY history, an absent candidate must still genuinely recover its alert (unchanged, pre-existing behavior)");
+  assert.equal(canaryAlert.status, "recovered");
+});
+
+test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the containment phase re-merges main's candidates and independently computes its own isCovered, so a fix scoped to only the main call would leave this red", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  await fs.writeFile(storePaths.factsFile, "not-json\n");
+  await appendFactPoints(paths, [], { now });
+  await appendFactPoints(paths, [], { now });
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  // No containment opt-in is configured, so computeContainmentRecommendationCandidates returns
+  // [] and the containment call's extraCandidates is just [...mainAlerts.candidates,
+  // ...mainExtraCandidates] -- still a REAL second evaluateAndPersistAlerts call with its own
+  // coveredRuleIds computation, exactly the call site the plan's adversarial-verification note
+  // (2026-09-06) found unpatched in the original scoping.
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionAlert.status, "active", "the containment (second) persistence pass must not independently recover the alert its own coveredRuleIds computation would otherwise mark absent");
 });

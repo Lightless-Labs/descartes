@@ -203,7 +203,16 @@ test("Slice 6 day-1 no-storm: empty alert-history and empty fact-history -> [], 
 test("Slice 6 positive fixture (motivating incident shape): odd-hour, low-prior-tick peer within window of a session.count_drop anchor fires exactly one correlation candidate, with severity capped at warning even for a CRITICAL anchor", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 3);
+  // now = day 0, hour 13 -- NOT hour 3 (fix-0 collateral, trusted-state step-1 revision): fix 0's
+  // future-fact continuity wedge fix (fact-store.js's enforceFactRetention) now genuinely drops a
+  // fact whose ts exceeds nowMs + FUTURE_FACT_TOLERANCE_MS; regularPeerPoints' day-0 point lands
+  // at hour 12, which was 9h AFTER a `now` of hour 3 (and thus a real future-dated fact once fix
+  // 0 shipped -- the fixture predates fix 0 and never intended to simulate a future-clock
+  // scenario). Hour 13 keeps every existing assertion valid (anchorTs stays within the 24h
+  // lookback; peer-anchor proximity/odd-hour/novelty are anchor/peer-relative, not now-relative)
+  // while putting regularPeerPoints' own history safely in the past relative to now, same as
+  // every OTHER regularPeerPoints call site in this file that isn't hour-3-adjacent.
+  const now = dayTs(0, 13);
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs, { severity: "critical" })],
     factPoints: [
@@ -326,7 +335,9 @@ test("Slice 8: intact history does not defeat the existing cold-start gate", asy
 test("Slice 6 positive fixture, warning-anchor variant: severity stays capped at warning (proves the cap actually caps rather than coinciding with a warning fixture)", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 3);
+  // now = hour 13, not hour 3 -- see the identical fix-0-collateral comment on the "motivating
+  // incident shape" positive fixture above.
+  const now = dayTs(0, 13);
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs, { severity: "warning" })],
     factPoints: [
@@ -345,7 +356,9 @@ test("Slice 6 positive fixture, warning-anchor variant: severity stays capped at
 test("Slice 6: a session.churn anchor also correlates, with its own entity-hash fingerprint carried through", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 3);
+  // now = hour 13, not hour 3 -- see the identical fix-0-collateral comment on the "motivating
+  // incident shape" positive fixture above.
+  const now = dayTs(0, 13);
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_CHURN_RULE_ID, anchorTs, { severity: "warning", fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" })],
     factPoints: [
@@ -497,7 +510,9 @@ test("Slice 4c regression (must-fix 4): marker-only (zero-peer) census ticks spa
 test("Slice 4c regression positive control: a real, established (post-cold-start) peer still correlates when census-marker ticks are also present in the read window", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 3);
+  // now = hour 13, not hour 3 -- see the fix-0-collateral comment on the "motivating incident
+  // shape" positive fixture above.
+  const now = dayTs(0, 13);
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
     factPoints: [
@@ -519,7 +534,9 @@ test("Slice 4c regression positive control: a real, established (post-cold-start
 test("Slice 6 ranking/pool-size fixture: two qualifying peers for the same anchor -> exactly one candidate (closest wins), candidate_pool_size reflects the true qualifying count", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2, 0);
-  const now = dayTs(0, 3);
+  // now = hour 13, not hour 3 -- see the fix-0-collateral comment on the "motivating incident
+  // shape" positive fixture above.
+  const now = dayTs(0, 13);
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
     factPoints: [
@@ -576,7 +593,9 @@ test("Slice 6 lookback-bound / old-history no-storm: several weeks of old, other
 test("Slice 6 recovery: a candidate that fired on tick N is absent on tick N+1 once its anchor ages past the lookback, and applyAlertCandidates marks it recovered via the existing, unmodified recovery path", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const nowTick1 = dayTs(0, 3);
+  // now = hour 13, not hour 3 -- see the fix-0-collateral comment on the "motivating incident
+  // shape" positive fixture above.
+  const nowTick1 = dayTs(0, 13);
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],
     factPoints: [
@@ -617,7 +636,9 @@ test("Slice 6 recovery: a candidate that fired on tick N is absent on tick N+1 o
 test("Slice 6 must-fix 2 (schema-pinned, strengthened per adversarial review): EVERY correlation candidate diagnostic + title/summary is a hash / integer / closed-enum — there is no free-form field a raw identifier could ride on", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 3);
+  // now = hour 13, not hour 3 -- see the fix-0-collateral comment on the "motivating incident
+  // shape" positive fixture above.
+  const now = dayTs(0, 13);
 
   await seed(paths, {
     alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)],

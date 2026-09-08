@@ -360,7 +360,14 @@ test("compute folds counters once and rebuilds candidates on repeated calls", as
   }
 });
 
-test("manifest-gated: a canary removed from the current manifest produces no further trips", async () => {
+// R4 (trusted-state step-1 revision, "R1 made signable"): PINNED REVERSAL. Was "manifest-gated:
+// a canary removed from the current manifest produces no further trips" — intentionally
+// flipped. canary.tripped is POSITIVE, completeness-proven two-snapshot evidence; a clean-delete
+// of the manifest entry (a plain-JSON edit an attacker who can write canaries.json can always
+// perform) must never retroactively suppress an already-genuine trip (A1, plan §4.2). The
+// manifest gate is REPLACED by an empty/garbage-id guard (§8.2's negative control at `////`
+// stays `[]` — see the "garbage id" test below, unaffected by this reversal).
+test("A1: a canary clean-deleted from the current manifest still fires its genuine, already-observed trip (manifest membership no longer suppresses positive evidence)", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-baseline-"));
   const paths = { stateDir: root };
   const points = [
@@ -381,9 +388,9 @@ test("manifest-gated: a canary removed from the current manifest produces no fur
     });
     assert.equal(stillPresent.length, 1);
 
-    // Same stale trip-shaped facts, but the manifest no longer lists "credential" — simulating
-    // canaries.json having the entry removed (also covers emptied/corrupted/unreadable, since
-    // loadCanaryManifest degrades all of those to the identical `{ canaries: [] }` shape).
+    // Same genuine trip-shaped facts, but the manifest no longer lists "credential" —
+    // simulating canaries.json having the entry cleanly removed (`{canaries:[]}`, read_ok:true,
+    // no invalid_entries -- a legitimate decommission, not a corrupt/unreadable manifest).
     const decommissioned = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 3,
@@ -393,7 +400,9 @@ test("manifest-gated: a canary removed from the current manifest produces no fur
       writeCanaryBaselineStore: async (_paths, next) => next,
       loadCanaryManifest: async () => ({ canaries: [] }),
     });
-    assert.deepEqual(decommissioned, []);
+    assert.equal(decommissioned.length, 1);
+    assert.equal(decommissioned[0].rule_id, "canary.tripped");
+    assert.equal(decommissioned[0].diagnostics.trip_reason, "atime_advanced");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
