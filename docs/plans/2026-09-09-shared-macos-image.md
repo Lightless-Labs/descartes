@@ -1,6 +1,6 @@
 # Shared macOS CI image migration
 
-Status: independently source-reviewed; native image bake1 and fresh-plugin clone2 passed. Consumer CI execution pending.
+Status: independently source-reviewed; native image bake1 and fresh-plugin clone2 passed. Consumer CI270 passed on published main4a5aed4.
 Reviewed: 2026-09-09 by gpt-5.6-sol; 8 focused helper cases passed independently, including actual Bash/zsh invocation.
 Owner direction September 9: all compatible macOS builds use one shared image with baked toolchains, retaining disposable job clones. No additional agents.
 
@@ -15,3 +15,5 @@ Luna owns `.buildkite/pipeline.yml`, `scripts/use-ci-node.sh`, and `scripts/test
 Actual acceptance: fresh clone proves baked Node and normal noninteractive tool PATH; one Descartes macOS CI build must execute successfully using the shared image. No signing/notarization release is required or inferred by this infrastructure migration. Existing product validation gates remain unchanged.
 
 Native evidence: [bake1](https://buildkite.com/la-bande-a-bonnot/shared-macos-image/builds/1) at `07d530050ded01a8b41dbbaf552f256b3e770057`; [fresh clone2](https://buildkite.com/la-bande-a-bonnot/shared-macos-image/builds/2) at `0597acf8257aa828c76203b2535c9bedf59b2b2f`. Full shared toolchain/compiler smoke passed; plugin log records exact clone stop/delete. Root helper checks also passed8/8. No Descartes app CI or release is inferred.
+
+Completed: 2026-09-09 for this Descartes migration. [CI270](https://buildkite.com/la-bande-a-bonnot/descartes/builds/270) executed the shared-image macOS job with Nodev22.21.1 and1942 tests passing/0 failing/34 skips; both Linux jobs passed. Exact job-clone stop/delete observed. Tag-only notifier release did not run. No app product behavior was changed.
