@@ -106,6 +106,23 @@ export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
   CANARY_TAMPERED_RULE_ID,
 ]);
 
+// Component D (trusted-state step-1, §7): an honest, truthful integrity-mode LABEL, not a trust
+// decision. "unprotected_same_uid" means Descartes provides no independent protection against
+// modification of its own state (facts.jsonl, integrity.json, daemon-status.json, constraints,
+// canary manifest, ...) by any process running under the same UID as Descartes itself -- same-UID
+// write access is, today, unconditionally trusted. It LOWERS the implied assurance (states the
+// mode is unprotected); it can never over-claim. Future rungs this enum is expected to grow into
+// as later phases land real protection (none implemented yet, none implied by this value):
+// "protected_local" (privilege-separated service UID / minimal daemon, threat-model step 2),
+// "witnessed" (authenticated ledger / witness, threat-model steps 3-4), and beyond that
+// interactive-hardware-approval and full attestation (threat-model steps 5-6, out of scope --
+// see plan §12). Consulted by NO trust-decision code path anywhere in this codebase -- it is
+// display/disclosure only, exactly like continuity_oldest_ts (fact-store-integrity.js). Do not
+// add a branch (`=== INTEGRITY_LEVEL_UNPROTECTED_SAME_UID` or any other comparison) that gates
+// trust, suppression, recovery, promotion, or alerting on this value; the only permitted use is
+// unconditionally including it verbatim on an operator-visible status surface.
+export const INTEGRITY_LEVEL_UNPROTECTED_SAME_UID = "unprotected_same_uid";
+
 export function defaultDaemonProfile() {
   return {
     interval_ms: DEFAULT_DAEMON_INTERVAL_MS,
@@ -780,6 +797,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
+    // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
+    // property, so it is unconditional here (unlike the ...(x ? {...} : {}) spreads above, which
+    // are conditional on genuinely-computed-this-tick evidence). Display/disclosure only -- see
+    // INTEGRITY_LEVEL_UNPROTECTED_SAME_UID's doc comment for the never-consulted-by-trust-logic
+    // invariant.
+    integrity_level: INTEGRITY_LEVEL_UNPROTECTED_SAME_UID,
   };
   const persistStatus = options.writeDaemonStatus ?? writeDaemonStatus;
   let status;
@@ -1149,6 +1172,13 @@ export async function daemonServiceStatus(descartesPaths, options = {}) {
     install_path: spec.install_path,
     log_dir: spec.log_dir,
     ...(await runtimeStatusForSpec(spec, options)),
+    // Component D, Fix-2-correction surface (trusted-state step-1 §7 / "R1 made signable" Fix 2):
+    // daemonServiceStatus (not daemon-status.json) is what `descartes daemon status --json`
+    // actually shows -- it never reads daemon-status.json (only spec.install_path via
+    // readFileIfPresent, see above), so the label is added here directly, independent of the
+    // daemon-status.json record's own copy (statusRecord, above). Same installation-mode
+    // constant, display/disclosure only.
+    integrity_level: INTEGRITY_LEVEL_UNPROTECTED_SAME_UID,
   };
 }
 
@@ -1248,7 +1278,8 @@ function daemonUsage() {
   descartes daemon run --foreground [--once] [--interval <duration>]
 
 Install writes an idempotent user-level launchd/systemd service file. Start/stop load and unload it through the user service manager.
-The foreground daemon loop is read-only, performs background LLM calls only if alert intelligence is explicitly enabled, and takes no remediation actions.`;
+The foreground daemon loop is read-only, performs background LLM calls only if alert intelligence is explicitly enabled, and takes no remediation actions.
+'status' reports integrity_level: "unprotected_same_uid" -- Descartes provides no independent protection against modification of its own state by a process running under the same UID. This is an honest disclosure of the current installation mode, not a trust decision.`;
 }
 
 function parseRunArgs(rest) {
@@ -1320,6 +1351,10 @@ export function renderDaemonResult(command, result) {
   if (result.runtime_status) lines.push(`Runtime status: ${result.runtime_status}`);
   if (result.enablement_status) lines.push(`Enablement: ${result.enablement_status}`);
   if (result.content_matches === false) lines.push("Service file drift: yes");
+  // Component D: display/disclosure only, guarded on presence like every other optional line
+  // here -- install/start/stop/uninstall results never carry integrity_level, so their renders
+  // stay unchanged.
+  if (result.integrity_level) lines.push(`Integrity: ${result.integrity_level} (no independent protection against modification of Descartes state by a same-UID process)`);
 
   if (command === "install" && ["installed", "updated", "unchanged"].includes(result.status)) {
     lines.push("Next: run `descartes daemon start` to load/start the user service.");

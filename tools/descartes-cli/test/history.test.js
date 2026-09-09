@@ -92,6 +92,21 @@ test("renderHistorySummary switches verbose mode explicitly", () => {
   assert.match(renderHistorySummary(summary(), daemonStatus, { verbose: true }), /count=3, last=/);
 });
 
+// Component D (trusted-state step-1, §7): the history summary already reads/renders daemon
+// status ("Daemon: ok (foreground)" above), so the honest integrity_level label belongs on the
+// same surface, additively, guarded on presence (a pre-Component-D-vintage daemon-status.json
+// record has no such field and must render unchanged).
+test("history summaries disclose integrity_level when the daemon status record carries it", () => {
+  const withLabel = { ...daemonStatus, integrity_level: "unprotected_same_uid" };
+  assert.match(renderCompactHistorySummary(summary(), withLabel), /Integrity: unprotected_same_uid/);
+  assert.match(renderVerboseHistorySummary(summary(), withLabel), /Integrity: unprotected_same_uid/);
+});
+
+test("history summaries omit the integrity line for a daemon status record without integrity_level", () => {
+  assert(!renderCompactHistorySummary(summary(), daemonStatus).includes("Integrity:"));
+  assert(!renderVerboseHistorySummary(summary(), daemonStatus).includes("Integrity:"));
+});
+
 test("compact history summary explains empty windows", () => {
   const output = renderCompactHistorySummary(summary({ point_count: 0, metrics: [] }), undefined);
   assert.match(output, /No recent metric history is available/);

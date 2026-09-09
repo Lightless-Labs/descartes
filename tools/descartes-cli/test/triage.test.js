@@ -1,6 +1,22 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { evaluateHistorySelection, parseTriageArgs, unverifiedEvidenceRefs } from "../src/triage.js";
+import { evaluateHistorySelection, parseTriageArgs, selectTriageHistory, unverifiedEvidenceRefs } from "../src/triage.js";
+import { writeDaemonStatus } from "../src/history-store.js";
+import { resolveDescartesPaths } from "../src/paths.js";
+
+async function tempPaths() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-triage-test-"));
+  return resolveDescartesPaths({
+    HOME: root,
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    XDG_DATA_HOME: path.join(root, "data"),
+    XDG_STATE_HOME: path.join(root, "state"),
+    XDG_CACHE_HOME: path.join(root, "cache"),
+  });
+}
 
 function historySummary(lastTs = "2026-05-28T12:00:00.000Z", pointCount = 1) {
   return {
@@ -97,6 +113,25 @@ test("forced history selection uses available summary even when stale", () => {
   });
   assert.equal(selected.used, true);
   assert.equal(selected.skip_reason, undefined);
+});
+
+// Component D (trusted-state step-1, §7): a real-path test (real writeDaemonStatus +
+// selectTriageHistory, no mock) proving the label survives triage's own
+// sanitizeHistoryDaemonStatus allow-list selector (an internal, non-exported closed-key picker --
+// see triage.js) rather than being silently stripped. evaluateHistorySelection's own
+// state !== "ok" gate is a pre-existing decision path untouched by this change; this test asserts
+// only that the label is disclosed on the diagnostics surface, never that it is consulted.
+test("Component D: selectTriageHistory's sanitized daemon_status carries integrity_level through", async () => {
+  const paths = await tempPaths();
+  await writeDaemonStatus(paths, {
+    state: "ok",
+    mode: "foreground",
+    profile: { interval_ms: 60_000 },
+    integrity_level: "unprotected_same_uid",
+  });
+
+  const selection = await selectTriageHistory(paths, { historyMode: "auto" });
+  assert.equal(selection.daemon_status.integrity_level, "unprotected_same_uid");
 });
 
 // F7 fix C: surfaces dangling evidence_refs citations as metadata without rejecting or rewriting

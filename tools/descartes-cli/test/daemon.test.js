@@ -150,6 +150,32 @@ test("foreground daemon iteration writes metric history and daemon status", asyn
   assert(summary.metrics.some((metric) => metric.metric_name === "system.memory.used_fraction"));
 });
 
+// Component D (trusted-state step-1, §7): the honest integrity_level label. Additive-only, a
+// LABEL not a trust decision -- covered here as (a) the in-memory statusRecord returned by
+// runDaemonIteration and (b) the same field surviving the real writeDaemonStatus tmp+rename
+// round-trip, i.e. what an operator actually sees on disk in daemon-status.json (the "operator
+// actually SEES it" surface named in the plan, not just an in-memory shape).
+test("Component D: runDaemonIteration's status record carries integrity_level: unprotected_same_uid, on disk too", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
+  const collectors = {
+    system: async () => envelope("system-overview", "collect_system", {
+      load_average: [0.1, 0.2, 0.3],
+      uptime_seconds: 10,
+      memory: { used_fraction: 0.4, free_bytes: 1234 },
+      swap: { used_bytes: 0 },
+    }),
+    processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+    disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+  };
+
+  const result = await runDaemonIteration(paths, { collectors, ts, now: ts });
+  assert.equal(result.status.integrity_level, "unprotected_same_uid");
+
+  const onDisk = await readDaemonStatus(paths);
+  assert.equal(onDisk.integrity_level, "unprotected_same_uid");
+});
+
 test("daemon install is idempotent for launchd user agents", async () => {
   const paths = await tempPaths();
   const env = { HOME: path.dirname(path.dirname(paths.stateDir)) };
@@ -166,6 +192,11 @@ test("daemon install is idempotent for launchd user agents", async () => {
   const status = await daemonServiceStatus(paths, options);
   assert.equal(status.status, "installed");
   assert.equal(status.content_matches, true);
+  // Component D, Fix-2-correction surface: daemonServiceStatus (what `descartes daemon status
+  // --json` actually calls) never reads daemon-status.json (verified: it only reads
+  // spec.install_path via readFileIfPresent), so the label must be present on ITS OWN return
+  // value directly, independent of the daemon-status.json record written by runDaemonIteration.
+  assert.equal(status.integrity_level, "unprotected_same_uid");
 });
 
 test("daemon install updates drifted systemd user unit and uninstall is idempotent", async () => {
@@ -392,6 +423,30 @@ test("daemon lifecycle renderer is human-readable and omits service file content
   assert.match(output, /Service manager: launchd-user/);
   assert.match(output, /Next: run `descartes daemon start`/);
   assert(!output.includes("<plist>"));
+});
+
+test("Component D: daemon lifecycle renderer discloses integrity_level when present, omits it when absent", () => {
+  const withLabel = renderDaemonResult("status", {
+    status: "installed",
+    service_manager: "launchd-user",
+    label: "com.lightless-labs.descartes.daemon",
+    install_path: "/Users/alice/Library/LaunchAgents/com.lightless-labs.descartes.daemon.plist",
+    log_dir: "/Users/alice/.local/state/descartes/daemon",
+    integrity_level: "unprotected_same_uid",
+  });
+  assert.match(withLabel, /Integrity: unprotected_same_uid/);
+
+  // Non-status daemon commands (install/start/stop/uninstall results) never carry
+  // integrity_level -- their renders must stay byte-identical (additive-guarded, same idiom as
+  // every other optional line in renderDaemonResult).
+  const withoutLabel = renderDaemonResult("install", {
+    status: "installed",
+    service_manager: "launchd-user",
+    label: "com.lightless-labs.descartes.daemon",
+    install_path: "/Users/alice/Library/LaunchAgents/com.lightless-labs.descartes.daemon.plist",
+    log_dir: "/Users/alice/.local/state/descartes/daemon",
+  });
+  assert(!withoutLabel.includes("Integrity:"));
 });
 
 // --- Slice S6a: structural (services/network/scheduled-jobs) collection cadence ---
@@ -622,9 +677,12 @@ test("default profile's structural block is inert without the learned.json kill 
 
   assert(!("structural_collector_statuses" in result.status));
   assert.equal(result.structuralEvidence, undefined);
+  // Component D: additive fixture update (same precedent as fact_store_completeness/
+  // continuity_oldest_ts before it) -- integrity_level is an unconditional field now present on
+  // every statusRecord, this fast path included.
   assert.deepEqual(
     Object.keys(result.status).sort(),
-    ["collector_statuses", "mode", "points_written", "profile", "retention", "state", "ts"].sort(),
+    ["collector_statuses", "integrity_level", "mode", "points_written", "profile", "retention", "state", "ts"].sort(),
   );
 
   await assert.rejects(() => fs.access(resolveStructuralCheckpointPath(paths)));

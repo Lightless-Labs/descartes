@@ -108,6 +108,9 @@ export function renderVerboseHistorySummary(summary, daemonStatus) {
   lines.push(`Range: ${summary.since} → ${summary.until}`);
   if (summary.truncated) lines.push(`Point limit: showing newest ${summary.point_count} of ${summary.matched_point_count} matching points (limit ${summary.point_limit}).`);
   if (daemonStatus) lines.push(`Daemon status: ${daemonStatus.state ?? "unknown"} at ${daemonStatus.ts ?? "unknown time"}`);
+  // Component D (trusted-state step-1, §7): additive, display/disclosure only -- guarded on
+  // presence so a pre-Component-D daemon-status.json record renders unchanged.
+  if (daemonStatus?.integrity_level) lines.push(`Integrity: ${daemonStatus.integrity_level}`);
   if (summary.corrupt_count > 0) lines.push(`Skipped corrupt history records: ${summary.corrupt_count}`);
   if (summary.metrics.length === 0) {
     lines.push("No metric history is available for this window.");
@@ -127,6 +130,9 @@ export function renderCompactHistorySummary(summary, daemonStatus) {
   lines.push(`History summary: ${summary.point_count} points over ${window}${summary.truncated ? ` (newest ${summary.point_count} of ${summary.matched_point_count}, limit ${summary.point_limit})` : ""}`);
   lines.push(`Last sample: ${lastSampleDescription(summary, daemonStatus)}${cadence ? ` (cadence ${cadence})` : ""}`);
   lines.push(`Daemon: ${daemonStatus?.state ?? "unknown"}${daemonStatus?.mode ? ` (${daemonStatus.mode})` : ""}`);
+  // Component D (trusted-state step-1, §7): additive, display/disclosure only -- guarded on
+  // presence so a pre-Component-D daemon-status.json record renders unchanged.
+  if (daemonStatus?.integrity_level) lines.push(`Integrity: ${daemonStatus.integrity_level}`);
   if (summary.corrupt_count > 0) lines.push(`Skipped corrupt history records: ${summary.corrupt_count}`);
   if (summary.metrics.length === 0) {
     lines.push("No recent metric history is available for this window.");

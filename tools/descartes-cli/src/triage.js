@@ -79,6 +79,10 @@ function sanitizeHistoryDaemonStatus(status) {
     ts: status.ts,
     interval_ms: status.profile?.interval_ms,
     points_written: status.points_written,
+    // Component D (trusted-state step-1, §7): additive, display/disclosure only -- not consulted
+    // by evaluateHistorySelection (which reads the original, unsanitized daemonStatus for its own
+    // state !== "ok" gate, unaffected by this addition).
+    integrity_level: status.integrity_level,
   };
 }
 
