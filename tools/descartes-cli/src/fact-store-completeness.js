@@ -3,6 +3,16 @@ const LOSS_TIMESTAMP_FIELDS = [
   "last_schema_invalid_ts",
   "last_bytecap_evict_ts",
   "last_continuity_break_ts",
+  // BLOCKER 2 (daybreak re-gate): Fix 0 added last_future_fact_ts to buildCompleteness's
+  // degraded-array (fact-store-integrity.js's LOSS_CHANNEL_FIELDS) so a THIS-WINDOW future-fact
+  // loss degrades status -- but this anchor-relative check is a SEPARATE trust decision, keyed
+  // off the raw marker regardless of whether it has aged out of the current read window. Safe to
+  // include unconditionally (no R3-style DoS): last_future_fact_ts is always stamped with the
+  // pass's real nowIso when the future fact was dropped (see fact-store-integrity.js's own
+  // comment on this), never the record's own claimed future ts -- so it is a genuine past/current
+  // timestamp that ages out of hasLossEventAfter's upper-bound clause exactly like every other
+  // loss channel, never a permanent lockout.
+  "last_future_fact_ts",
 ];
 
 function isObject(value) {

@@ -31,21 +31,24 @@ import {
 } from "./service-baseline.js";
 import { computeProcessLineageBaselineCandidates, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "./process-lineage-baseline.js";
 import { computeSessionBaselineCandidates, SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
-import { computeCanaryBaselineCandidates, CANARY_TAMPERED_RULE_ID } from "./canary-baseline.js";
+import { computeCanaryBaselineCandidates, CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
 import { loadCanaryManifest } from "./canary-manifest.js";
 import { computeScheduledJobBaselineCandidates, SCHEDULED_JOB_APPEARED_RULE_ID } from "./persistence-baseline.js";
-import { computeCredentialAccessCandidates } from "./credential-access-baseline.js";
-import { computeContainmentRecommendationCandidates } from "./containment-recommend.js";
+import { computeCredentialAccessCandidates, CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
+import { computeContainmentRecommendationCandidates, containmentRecommendationRuleIds } from "./containment-recommend.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
 import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, collectProcessLineageEvidence } from "./tools/processes.js";
 import { computeProvenanceIdentityCandidates } from "./tools/provenance-identity.js";
+import { IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID, UNKNOWN_IDENTITY_RULE_ID } from "./provenance-store.js";
 import {
   collectProvenanceWarningsEvidence,
   computeProvenanceWarningCandidates,
+  DELETED_EXE_RULE_ID,
   provenanceWarningFactPoints,
+  PUBLIC_BIND_RULE_ID,
 } from "./tools/provenance-warnings.js";
 import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
@@ -521,14 +524,109 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
 // try/catch instead, degrading to the same honest `{ written_count: 0, retention: undefined }`
 // shape on an append failure while preserving the error message for the status record built
 // below.
-async function safeCandidates(label, produce, fallback) {
+//
+// BLOCKER 1 re-gate (daybreak-blue CONFIRMED BLOCKER, fabricated alert recovery on detector
+// FAILURE): degrading a throw to `fallback` (above) is correct for THIS tick's candidate build,
+// but it also made a genuine exception indistinguishable from a genuine "nothing to report" clear
+// downstream, at the coveredRuleIds/recovery boundary -- an exception is not evidence of absence.
+// The optional `failedLabels` Set (passed by every call site whose family must be withheld from
+// recovery on its own failure, never defaulted) records `label` here, at the exact moment the
+// exception is caught, so the caller can exclude that family's rule_ids from coveredRuleIds
+// afterwards. A caller that omits `failedLabels` (none currently do, but the parameter stays
+// optional rather than required) simply does not participate in that exclusion.
+async function safeCandidates(label, produce, fallback, failedLabels) {
   try {
     return await produce();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[daemon] detector '${label}' failed this tick, degrading to no candidates: ${message}`);
+    failedLabels?.add(label);
     return fallback;
   }
+}
+
+// BLOCKER 1 re-gate: the rule_ids each fast-tick detector (keyed by the exact `label` string
+// passed to its own safeCandidates call site below) can ever emit -- consulted ONLY to compute
+// which rule_ids must be excluded from coveredRuleIds when that detector's label appears in
+// `failedLabels` (i.e. it genuinely threw this tick), never to make any other decision. Two
+// detectors are deliberately ABSENT here because their rule_id sets are not fixed/static; each is
+// handled by ruleIdsForFailedLabel below instead:
+//   - "active-constraint": constraint.violation.<family> is dynamic (family is an
+//     operator/mined constraint field, not a fixed enum) -- matched by prefix against this
+//     tick's persisted rule_ids instead of a hardcoded list.
+//   - "containment-recommendation": containment-recommend.js already exports the exact closed
+//     set its own RECOMMEND_MAP can ever produce (containmentRecommendationRuleIds()) -- reused
+//     verbatim, never hand-duplicated here.
+const DETECTOR_FAILURE_RULE_IDS = {
+  "provenance-warning": [DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID],
+  "provenance-identity": [UNKNOWN_IDENTITY_RULE_ID, IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID],
+  session: [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID],
+  correlation: [CORRELATION_RULE_ID],
+  peer: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID],
+  service: [SERVICE_DISAPPEARED_RULE_ID],
+  canary: [CANARY_TRIPPED_RULE_ID, CANARY_TAMPERED_RULE_ID],
+  "process-lineage": [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID],
+  "scheduled-job": [SCHEDULED_JOB_APPEARED_RULE_ID],
+  "service-appearance": [SERVICE_APPEARED_RULE_ID],
+  "credential-access": [CREDENTIAL_ACCESS_RULE_ID],
+};
+
+const CONSTRAINT_VIOLATION_RULE_ID_PREFIX = "constraint.violation.";
+
+// Returns the rule_ids a single failed detector label must have excluded from coveredRuleIds.
+// `persistedRuleIds` (this tick's currently-persisted alert rule_ids) is needed only for
+// "active-constraint"'s dynamic prefix match -- every other label resolves from the static table
+// above and ignores it.
+function ruleIdsForFailedLabel(label, persistedRuleIds) {
+  if (label === "active-constraint") {
+    return persistedRuleIds.filter((ruleId) => ruleId.startsWith(CONSTRAINT_VIOLATION_RULE_ID_PREFIX));
+  }
+  if (label === "containment-recommendation") {
+    return containmentRecommendationRuleIds();
+  }
+  return DETECTOR_FAILURE_RULE_IDS[label] ?? [];
+}
+
+// BLOCKER 1 re-gate: builds the SAME coveredRuleIds shape Fix 3 already computed (a complement of
+// FIXED_ALERT_RULE_IDS ∪ this tick's persisted rule_ids, minus an exclusion set), now folding in
+// THREE restriction sources -- history-untrusted (existing, HISTORY_DEPENDENT_ALERT_RULE_IDS,
+// applied only when `!historyTrust.trust`), any genuinely-failed detector this tick (new, applied
+// UNCONDITIONALLY, regardless of history trust), and an optional caller-supplied
+// `alwaysExcludedRuleIds` (new, applied UNCONDITIONALLY, independent of trust or failure -- see
+// its call-site doc comment below for why the MAIN call needs this and the containment call does
+// not) -- so recovery is authorized only for families that were both (a) evaluated against
+// trustworthy history and (b) actually ran without throwing, at the ONE call site that ever
+// legitimately evaluates them. Returns `undefined` (fully unrestricted, byte-identical to the
+// pre-fix default) only when NONE of the three restrictions apply -- the branch that must stay a
+// true no-op for the "zero I/O when nothing is wrong" tick.
+async function computeCoveredRuleIds(descartesPaths, options, { historyTrust, failedLabels, alwaysExcludedRuleIds = [] }) {
+  const historyUntrusted = historyTrust?.trust === false;
+  if (!historyUntrusted && failedLabels.size === 0 && alwaysExcludedRuleIds.length === 0) return undefined;
+
+  const readAlerts = options.readAlertRecords ?? readAlertRecords;
+  let persistedAlerts = [];
+  try {
+    persistedAlerts = await readAlerts(descartesPaths);
+  } catch {
+    persistedAlerts = [];
+  }
+  const persistedRuleIds = persistedAlerts.map((alert) => alert.rule_id);
+
+  const excludedRuleIds = new Set([
+    ...(historyUntrusted ? HISTORY_DEPENDENT_ALERT_RULE_IDS : []),
+    ...alwaysExcludedRuleIds,
+  ]);
+  for (const label of failedLabels) {
+    for (const ruleId of ruleIdsForFailedLabel(label, persistedRuleIds)) excludedRuleIds.add(ruleId);
+  }
+
+  // Complement, not a hardcoded allowlist (see HISTORY_DEPENDENT_ALERT_RULE_IDS's own doc
+  // comment): FIXED_ALERT_RULE_IDS ∪ every rule_id currently persisted, minus the excluded set --
+  // so a dynamic non-excluded rule_id stays eligible for recovery, while every excluded family
+  // freezes in place (no recovery, no fabricated clear) until it is genuinely re-evaluated.
+  return new Set(
+    [...FIXED_ALERT_RULE_IDS, ...persistedRuleIds].filter((ruleId) => !excludedRuleIds.has(ruleId)),
+  );
 }
 
 // Finding F4-B1/F4-B2: joins zero or more possibly-undefined error messages into one honestly-
@@ -721,10 +819,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // when learned is disabled there is no fact store to protect, and this stays a true no-op
   // (byte-identical to the pre-revision fast path; this file's repeated "no I/O when disabled"
   // tests pin exactly this).
+  //
+  // BLOCKER 1 re-gate: only `historyTrust` itself (the TRUST DECISION) is computed here, at the
+  // same point as before -- the actual coveredRuleIds Set is now built LATER, via
+  // computeCoveredRuleIds, after the twelve fast-tick detectors below have run and
+  // `failedDetectorLabels` is known. A detector's genuine exception is exactly as disqualifying
+  // for recovery as untrustworthy history, and that can only be known once the detectors have
+  // actually been attempted this tick.
   const loadLearnedConfigForHistory = options.loadLearnedConfig ?? loadLearnedConfig;
   const learnedConfigForHistory = await loadLearnedConfigForHistory(descartesPaths);
   let factStoreCompleteness;
-  let coveredRuleIds;
+  let historyTrust;
   if (learnedConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
     let factHistoryReadResult;
@@ -736,26 +841,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       factHistoryReadResult = undefined;
     }
     factStoreCompleteness = selectFactStoreCompleteness(factHistoryReadResult?.completeness);
-    const historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
-    if (!historyTrust.trust) {
-      const readAlerts = options.readAlertRecords ?? readAlertRecords;
-      let persistedAlerts = [];
-      try {
-        persistedAlerts = await readAlerts(descartesPaths);
-      } catch {
-        persistedAlerts = [];
-      }
-      // Complement, not a hardcoded allowlist (see HISTORY_DEPENDENT_ALERT_RULE_IDS's own doc
-      // comment): FIXED_ALERT_RULE_IDS ∪ every rule_id currently persisted, minus the
-      // history-dependent set -- so a dynamic non-history-gated rule_id (e.g.
-      // constraint.violation.<family>) stays eligible for recovery regardless of this tick's
-      // fact-history trust, while every history-dependent family freezes in place (no recovery,
-      // no fabricated clear) until trust is re-established.
-      coveredRuleIds = new Set(
-        [...FIXED_ALERT_RULE_IDS, ...persistedAlerts.map((alert) => alert.rule_id)]
-          .filter((ruleId) => !HISTORY_DEPENDENT_ALERT_RULE_IDS.has(ruleId)),
-      );
-    }
+    historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
   }
 
   // Finding F4, THE FABRICATION TRAP: `statusRecord` is built here, BEFORE attempting the disk
@@ -830,6 +916,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // mainExtraCandidates; that block only runs when mainAlerts is truthy, i.e. when the branch ran.
   let mainExtraCandidates;
   let mainAlerts;
+  let coveredRuleIds;
+  // BLOCKER 1 re-gate: every safeCandidates call below that produces alert candidates (the twelve
+  // fast-tick detectors AND, further down, the containment-recommendation phase) shares this ONE
+  // Set, so a label recorded here reflects a genuine exception this tick regardless of which call
+  // site caught it. Read at two different points in time deliberately (see coveredRuleIds and
+  // containmentCoveredRuleIds below) -- the main call's coveredRuleIds is computed once the twelve
+  // detectors have run but strictly BEFORE containment-recommendation is even attempted, which is
+  // exactly the phase-appropriate boundary: containment's own failure cannot retroactively affect
+  // a persistence pass that already happened.
+  const failedDetectorLabels = new Set();
   if (options.evaluateAlerts !== false) {
     // Per-detector DI seams (mirrors the file's existing options.<fn> ?? <fn> pattern, e.g.
     // loadLearnedConfig/readFactPoints/adjudicateAlertNotifications above) so a single detector
@@ -851,20 +947,63 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // safeCandidates() -- a throw from any one detector degrades to [] (+ a warning) for that
     // detector THIS tick only, instead of aborting the whole array build and silently dropping
     // every OTHER detector's candidates for the tick. Order/arguments unchanged from before.
+    // BLOCKER 1 re-gate: `failedDetectorLabels` is now threaded as safeCandidates' 4th argument at
+    // every one of these twelve call sites, so a genuine exception here is ALSO recorded (not just
+    // degraded to `[]`) for the coveredRuleIds computation below.
     mainExtraCandidates = [
-          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...options, activeFreshnessMs }), []),
-          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, options), []),
-          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, options), []),
-          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, options), []),
-          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, options), []),
-          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, options), []),
-          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
-          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
-          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
-          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...options, activeFreshnessMs }), []),
-          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...options, activeFreshnessMs }), []),
-          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, options), []),
+          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
+          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, options), [], failedDetectorLabels),
+          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, options), [], failedDetectorLabels),
+          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, options), [], failedDetectorLabels),
+          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, options), [], failedDetectorLabels),
+          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, options), [], failedDetectorLabels),
+          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
+          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
+          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
+          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
+          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
+          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, options), [], failedDetectorLabels),
         ];
+    // BLOCKER 1 re-gate: computed HERE, after the twelve detectors above have actually run (so
+    // failedDetectorLabels reflects this tick's real outcome) and BEFORE the main persistence
+    // call below -- authorizes recovery only for rule_ids that are neither history-dependent
+    // (while history is untrustworthy, unchanged from Fix 3) NOR owned by a detector that
+    // genuinely threw this tick (new). `undefined` (fully unrestricted) whenever none of the
+    // restrictions below apply -- byte-identical to the pre-fix default for the common,
+    // nothing-wrong tick.
+    //
+    // alwaysExcludedRuleIds: containmentRecommendationRuleIds() -- containment.recommend.* is
+    // EXCLUSIVELY evaluated by the second (containment) persistence pass below, which
+    // structurally cannot run before this main call: computeContainmentRecommendationCandidates
+    // consumes THIS call's own `mainAlerts` result as its input (see its own doc comment in
+    // containment-recommend.js). This main call can therefore never know, at this point, whether
+    // containment will succeed or throw this tick -- so it must NEVER authorize recovery for
+    // containment.recommend.* itself (unconditionally, every tick), leaving that authority
+    // exclusively with the containment call, which DOES know its own outcome by the time it runs.
+    // Absent this, an unrestricted main call would mark a still-active containment.recommend.*
+    // record "recovered" here whenever it is simply absent from mainExtraCandidates (which is
+    // ALWAYS, every tick, success or failure -- containment candidates are never part of
+    // mainExtraCandidates) -- ordinarily self-healed the same tick when the containment call
+    // re-derives and reactivates the same candidate, but NOT when containment itself throws,
+    // which is exactly BLOCKER 1's phase-appropriate-coverage requirement.
+    // NOT gated on learned.json: the 12 detectors above run regardless of the kill switch, so a
+    // detector EXCEPTION must exclude its family from recovery ALWAYS. Gating the whole computation
+    // on learnedConfigForHistory.enabled (an earlier attempt) reopened BLOCKER 1 on the DEFAULT
+    // learned-disabled path -- a throwing detector (e.g. canary-baseline, which has no learned gate)
+    // still fabricated a "recovered". So the call is unconditional; computeCoveredRuleIds internally
+    // early-returns undefined with ZERO I/O when nothing warrants a restriction (historyTrust is
+    // undefined when learned is disabled -> historyUntrusted false -> no fact read). The containment
+    // exclusion (alwaysExcludedRuleIds) is passed ONLY when learned is enabled: containment is inert
+    // when learned is off (Slice 7.2 -> zero recommendations, and a stale recommendation SHOULD then
+    // recover), so there is nothing to withhold, and passing [] keeps the early-return firing on the
+    // normal learned-off tick -- preserving this file's "no I/O when the kill switch is off"
+    // invariant. A genuine detector failure still forces its family's exclusion via failedLabels on
+    // EITHER path.
+    coveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
+      historyTrust,
+      failedLabels: failedDetectorLabels,
+      alwaysExcludedRuleIds: learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : [],
+    });
     mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,
         daemonStatus: status,
@@ -874,9 +1013,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
         extraCandidates: mainExtraCandidates,
-        // Fix 3: identical value at both call sites (see the containment call below) --
-        // undefined (unrestricted, today's exact default behavior) whenever fact-history is
-        // trustworthy or learned is disabled; a computed complement Set otherwise.
+        // Fix 3 / BLOCKER 1 re-gate: the history-untrusted and failed-main-detector restrictions
+        // are applied identically at both this call and the containment call below (shared base);
+        // this call ADDITIONALLY, always, withholds containment.recommend.* itself (see this
+        // coveredRuleIds computation's own doc comment above) since containment is the only phase
+        // that ever legitimately evaluates it. `undefined` (unrestricted, today's exact default
+        // behavior) only when none of that applies; a computed complement Set otherwise.
         coveredRuleIds,
       });
   }
@@ -887,22 +1029,47 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // do not recover sibling alert families during the containment persistence pass.
     // Same DI-seam + safeCandidates discipline as the twelve detectors above: a throw here must
     // not blind the main evaluation's alerts, which are already computed and only being re-merged.
+    // BLOCKER 1 re-gate: this call also threads `failedDetectorLabels` -- a genuine
+    // computeContainmentRecommendationCandidates exception must withhold ITS OWN
+    // containment.recommend.* rule_ids from recovery too (phase-appropriate: only for this,
+    // second, persistence pass -- the main call above already ran without knowing whether
+    // containment would fail).
     const computeContainmentRecommendation = options.computeContainmentRecommendationCandidates ?? computeContainmentRecommendationCandidates;
     const containmentCandidates = await safeCandidates("containment-recommendation", () => computeContainmentRecommendation(descartesPaths, {
       ...options,
       evaluation: mainAlerts,
-    }), []);
+    }), [], failedDetectorLabels);
+    // BLOCKER 1 re-gate, phase-appropriate coverage: computed SEPARATELY from the main call's
+    // coveredRuleIds -- this is the ONE call site where containment.recommend.* is ever
+    // legitimately evaluated, so (unlike the main call above) it does NOT pass
+    // alwaysExcludedRuleIds: containment.recommend.* stays eligible for recovery whenever
+    // containment-recommendation genuinely ran this tick (whether it found something or
+    // genuinely found nothing -- both are real evaluations, matching this module's own documented
+    // "load-bearing fail-closed transition" for a genuine opt-in-off/trigger-cleared recovery).
+    // When containment-recommendation itself just threw, "containment-recommendation" is already
+    // in failedDetectorLabels (recorded by safeCandidates above) and ruleIdsForFailedLabel excludes
+    // its closed rule_id set exactly like any other failed detector -- so a genuine exception still
+    // cannot fabricate a recovery of its own family, matching every other detector's protection.
+    // Same history-untrusted and failed-main-detector restrictions as the main call otherwise
+    // (shared base, applied identically at both sites); `undefined` (fully unrestricted, no extra
+    // I/O) whenever containment succeeds and nothing else this tick warrants a restriction.
+    const containmentCoveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
+      historyTrust,
+      failedLabels: failedDetectorLabels,
+    });
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
       now: ts,
       daemonStatus: status,
       historySummary: mainAlerts.history_summary,
       windowMs: options.alertWindowMs,
       extraCandidates: [...mainAlerts.candidates, ...mainExtraCandidates, ...containmentCandidates],
-      // Fix 3: the SAME value as the main call above -- this unconditional second phase
-      // independently reproduces the identical fabricated-recovery bug if left unpatched
-      // (verified: it computes its own isCovered from its own coveredRuleIds; patching only the
-      // main call is insufficient).
-      coveredRuleIds,
+      // Fix 3 / BLOCKER 1 re-gate: the SAME shared-base restriction as the main call above, plus
+      // (only when containment-recommendation itself just failed) the phase-appropriate
+      // containment.recommend.* exclusion -- this unconditional second phase independently
+      // reproduces the identical fabricated-recovery bug if left unpatched (verified: it computes
+      // its own isCovered from its own coveredRuleIds; patching only the main call is
+      // insufficient).
+      coveredRuleIds: containmentCoveredRuleIds,
     });
     alerts = {
       ...containmentAlerts,

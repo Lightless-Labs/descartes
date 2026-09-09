@@ -121,6 +121,12 @@ const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
   "last_schema_invalid_ts",
   "last_bytecap_evict_ts",
   "last_continuity_break_ts",
+  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
+  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
+  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
+  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
+  // out of the read window).
+  "last_future_fact_ts",
 ];
 
 function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {

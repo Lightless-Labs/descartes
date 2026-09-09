@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention, FUTURE_FACT_TOLERANCE_MS, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { factHistoryTrustworthy } from "../src/fact-store-completeness.js";
 
 async function tempPaths() {
@@ -25,6 +25,12 @@ const LOSS_CHANNELS = [
   "last_schema_invalid_ts",
   "last_bytecap_evict_ts",
   "last_continuity_break_ts",
+  // BLOCKER 2 (daybreak re-gate): last_future_fact_ts must be a first-class anchor-relative loss
+  // channel exactly like its four siblings above -- Fix 0 stamped it into buildCompleteness's
+  // degraded-array, but it was never added to factHistoryTrustworthy's own LOSS_TIMESTAMP_FIELDS,
+  // so a future-fact loss whose marker aged out of the read window (status back to "intact")
+  // could never be seen by the anchor-relative hasLossEventAfter check below.
+  "last_future_fact_ts",
 ];
 
 function cleanReadResult(overrides = {}) {
@@ -323,4 +329,49 @@ test("a truncated history suppresses a novelty-style absence claim", async () =>
   const read = await readFactPoints(paths, { now: NOW });
   const noveltyGate = (candidate) => read.completeness.status === "intact" && !read.points.some((point) => point.entity_key === candidate);
   assert.equal(noveltyGate("missing-peer"), false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// BLOCKER 2 (daybreak re-gate) real-store regression: a genuine future-fact loss whose marker has
+// aged out of the read window (buildCompleteness reports "intact" again -- window-relative, per
+// fact-store-integrity.js's lossAtOrAfter(asOfMs)) must still fail an anchor OLDER than the loss
+// via factHistoryTrustworthy's anchor-relative check, exactly like the other four loss channels
+// already do. Pre-fix, LOSS_TIMESTAMP_FIELDS omitted last_future_fact_ts entirely, so
+// hasLossEventAfter never inspected it and this scenario fabricated trust:true.
+// ---------------------------------------------------------------------------------------------
+
+test("BLOCKER 2: a future-fact loss whose marker aged out of the read window still fails an anchor older than the loss", async () => {
+  const paths = await tempPaths();
+  const lossNow = "2026-01-01T00:00:00.000Z";
+  const lossNowMs = Date.parse(lossNow);
+  const future = new Date(lossNowMs + FUTURE_FACT_TOLERANCE_MS + 60_000).toISOString();
+
+  // Establish a provably-continuous baseline first (a brand-new store's ledger only reaches
+  // continuity_ok:true after a second clean pass -- see fact-store.test.js's Fix 0 tests for the
+  // same two-pass discipline), then drop a genuine future-dated fact at lossNow so
+  // last_future_fact_ts is stamped with lossNow (the real pass time, never the record's own
+  // claimed future ts).
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: lossNow },
+  ], { now: lossNow });
+  await enforceFactRetention(paths, { now: lossNow });
+  await appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "future", attributes: {}, ts: future },
+  ], { now: lossNow });
+
+  // Read a month later with a 31-day window: the loss marker (lossNow) is now older than the
+  // read window's lower bound, so buildCompleteness's window-relative lossAtOrAfter(asOfMs) no
+  // longer sees it -- status reports "intact" ("window-intact"), NOT "degraded". This is the
+  // exact repro shape: status:intact, yet a genuine future-fact loss actually occurred.
+  const readNow = "2026-02-02T00:00:00.000Z";
+  const windowMs = 31 * 24 * 60 * 60 * 1000;
+  const read = await readFactPoints(paths, { now: readNow, windowMs });
+  assert.equal(read.completeness.status, "intact", "the loss marker must have genuinely aged out of the read window for this to be the real repro");
+  assert.equal(read.completeness.last_future_fact_ts, lossNow, "the raw marker itself is still carried on every read regardless of window aging");
+
+  // An anchor that PREDATES the genuine future-fact loss must never be trusted: the detector
+  // whose anchor this is has not observed history since before the loss occurred.
+  const anchorTs = "2025-12-31T23:59:59.000Z";
+  const trust = factHistoryTrustworthy(read, { anchorTs, nowMs: Date.parse(readNow) });
+  assert.deepEqual(trust, { trust: false, reason: "history_degraded" }, "an anchor older than an aged-out future-fact marker must not be fabricated as trustworthy");
 });

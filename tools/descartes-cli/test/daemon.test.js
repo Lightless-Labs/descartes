@@ -30,7 +30,7 @@ import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStor
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
-import { CANARY_TAMPERED_RULE_ID } from "../src/canary-baseline.js";
+import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-baseline.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
 import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
@@ -4336,4 +4336,202 @@ test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the contain
 
   const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.equal(sessionAlert.status, "active", "the containment (second) persistence pass must not independently recover the alert its own coveredRuleIds computation would otherwise mark absent");
+});
+
+// ---------------------------------------------------------------------------------------------
+// BLOCKER 1 (daybreak re-gate CONFIRMED BLOCKER): fabricated alert recovery on detector FAILURE,
+// not just history-suppression. safeCandidates() converts a detector EXCEPTION into `[]` --
+// before this fix, coveredRuleIds was only restricted `!historyTrust.trust`, so a THROWING
+// detector whose fact-history is otherwise TRUSTWORTHY left its family's rule_ids covered and
+// its active/acknowledged alert got flipped to "recovered" (fabricated: the family was never
+// actually re-evaluated this tick, an exception is not a genuine clear). Recovery is now
+// authorized only for SUCCESSFULLY-evaluated families: a failed detector's own rule_ids are
+// excluded from coveredRuleIds regardless of history trust.
+// ---------------------------------------------------------------------------------------------
+
+test("BLOCKER 1: a detector EXCEPTION (fact-history otherwise TRUSTWORTHY) must not fabricate a recovery of its own alert family, real two-phase tick", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // A real, intact (not degraded) windowed fact-history read -- this tick's history IS
+  // trustworthy, so under the pre-fix code coveredRuleIds stays `undefined` (fully unrestricted)
+  // and ONLY the detector's own genuine exception can explain a fabricated recovery here.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      computeSessionBaselineCandidates: async () => {
+        throw new Error("simulated computeSessionBaselineCandidates failure");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(sessionAlert, "the alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(
+    sessionAlert.status,
+    "active",
+    "a genuine detector EXCEPTION must never be indistinguishable from a genuine clear -- must NOT be fabricated-recovered even though fact-history is trustworthy this tick",
+  );
+
+  // Confirm on disk too (both persistence passes already ran by the time runDaemonIteration
+  // resolves), not just the in-memory result.
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
+
+  assert.ok(
+    warnings.some((w) => w.includes("session") && w.includes("simulated computeSessionBaselineCandidates failure")),
+    `expected a warning naming the failing detector, got: ${JSON.stringify(warnings)}`,
+  );
+});
+
+test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even when learned.json is DISABLED (the default) -- canary-baseline has no learned gate, so its exception must not fabricate a recovery on the learned-off path", async () => {
+  const paths = await tempPaths();
+  // learned.json intentionally NOT written -> disabled (the default out-of-the-box state). An
+  // earlier fix gated the main-call coveredRuleIds computation on learned.enabled, which reopened
+  // BLOCKER 1 here: canary-baseline has no learned gate, so a genuine exception still flipped its
+  // own active alert to "recovered" on the default path. The failed-detector exclusion must apply
+  // ALWAYS (detector failure is orthogonal to the learned kill switch).
+  const now = S_LIVE_1_TICK_TS;
+  await writeAlertRecords(paths, [{
+    rule_id: CANARY_TRIPPED_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Canary tripped", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      computeCanaryBaselineCandidates: async () => {
+        throw new Error("simulated computeCanaryBaselineCandidates failure (learned off)");
+      },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID);
+  assert.equal(
+    canaryAlert?.status,
+    "active",
+    "learned-disabled must NOT exempt a failed detector from the recovery-exclusion (BLOCKER 1 must stay closed on the default path)",
+  );
+  const persisted = await readAlertRecords(paths);
+  assert.equal(
+    persisted.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID)?.status,
+    "active",
+    "on disk too -- the main pass must not persist a fabricated recovery on the learned-disabled path",
+  );
+});
+
+test("BLOCKER 1 control: a DIFFERENT family that genuinely ran and returned [] this tick must still recover even though a sibling detector threw (no over-restriction)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+
+  await writeAlertRecords(paths, [
+    {
+      rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+      title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+    {
+      rule_id: CORRELATION_RULE_ID, fingerprint: "global", status: "active", severity: "warning",
+      title: "Correlation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+  ]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => {
+      throw new Error("simulated computeSessionBaselineCandidates failure");
+    },
+    // Genuinely evaluated, genuinely absent -- a real clear, not a swallowed exception.
+    computeCorrelationCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const correlationAlert = result.alerts.alerts.find((a) => a.rule_id === CORRELATION_RULE_ID);
+  assert.equal(sessionAlert.status, "active", "the FAILED family must stay frozen (no fabricated recovery)");
+  assert.equal(
+    correlationAlert.status,
+    "recovered",
+    "a family that genuinely ran and returned [] must still recover -- excluding a failed sibling's rule_ids must not over-restrict an unrelated, successfully-evaluated family",
+  );
+});
+
+test("BLOCKER 1, phase-appropriate coverage: a containment-phase detector EXCEPTION must not fabricate a recovery of its own containment.recommend.* alert before containment succeeds", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeContainmentRecommendConfig(paths, { enabled: true });
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPoints(paths, [], { now: hour(30) });
+
+  const tick1 = await runIsolatedDaemonTick(paths, hour(30));
+  const active = tick1.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");
+  assert.ok(active, "expected a genuine containment.recommend.block on tick 1");
+  assert.equal(active.status, "active");
+
+  // Tick 2: the underlying trigger (peer.count_spike) is genuinely STILL active -- fact-history is
+  // unchanged and re-derives it fresh every tick. Only the containment-recommendation detector
+  // itself throws this tick; this is NOT the opt-in-toggled-off case and NOT the trigger-cleared
+  // case (both already covered by pre-existing tests) -- it isolates the detector's own exception.
+  const tick2Ts = new Date(Date.parse(hour(30)) + 60 * 1000).toISOString();
+  const tick2 = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: tick2Ts,
+    now: tick2Ts,
+    computeContainmentRecommendationCandidates: async () => {
+      throw new Error("simulated computeContainmentRecommendationCandidates failure");
+    },
+  });
+
+  const peerStillActive = tick2.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.ok(peerStillActive && peerStillActive.status === "active", "the underlying trigger must genuinely still be active on tick 2 -- only the containment detector itself failed");
+
+  const recommendation = tick2.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");
+  assert.ok(recommendation, "the previously-active recommendation record must still be PRESENT, not silently dropped");
+  assert.equal(
+    recommendation.status,
+    "active",
+    "a containment-phase detector EXCEPTION must not fabricate a recovery of its own containment alert before containment itself succeeds again",
+  );
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === "containment.recommend.block")?.status, "active");
 });
