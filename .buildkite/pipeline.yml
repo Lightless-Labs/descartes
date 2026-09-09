@@ -104,10 +104,10 @@ steps:
       queue: "ci-macos-apple-silicon"
     plugins:
       - github.com/Lightless-Labs/tart-ci#v0.2.4:
-          # Pin the source image digest so Tart can reuse the host cache across jobs.
+          # Use the validated shared Rust/Bazel/Node image so Tart can reuse the host cache across jobs.
           # The plugin still clones this source to a fresh buildkite-tart-ci-* VM per job
           # and deletes only that per-job clone during cleanup.
-          image: "ghcr.io/cirruslabs/macos-sequoia-base@sha256:fdd8b72a6ee46fc8ad35dc1b9f3b1f162b6607b82a584947d20bb28d3dcb99ed"
+          image: "ci-macos-rust-bazel-ios-20260909-v1"
           os: "macos"
           always_pull: false
           headless: true
@@ -118,34 +118,7 @@ steps:
         export HOME=/Users/admin
       fi
 
-      install_node() {
-        local node_version="22.21.1"
-        local uname_s uname_m node_platform archive_ext archive_url node_dir tmp_archive
-        uname_s="$$(uname -s)"
-        uname_m="$$(uname -m)"
-
-        case "$$uname_s-$$uname_m" in
-          Darwin-arm64)
-            node_platform="darwin-arm64"
-            archive_ext="tar.gz"
-            ;;
-          *)
-            echo "Unsupported macOS Node.js platform: $$uname_s $$uname_m" >&2
-            exit 1
-            ;;
-        esac
-
-        node_dir="$$HOME/.local/node-v$$node_version-$$node_platform"
-        if [[ ! -x "$$node_dir/bin/node" ]]; then
-          mkdir -p "$$node_dir"
-          tmp_archive="$$(mktemp)"
-          archive_url="https://nodejs.org/dist/v$$node_version/node-v$$node_version-$$node_platform.$$archive_ext"
-          curl --proto '=https' --tlsv1.2 -fsSL "$$archive_url" -o "$$tmp_archive"
-          tar -xzf "$$tmp_archive" -C "$$node_dir" --strip-components=1
-          rm -f "$$tmp_archive"
-        fi
-        export PATH="$$node_dir/bin:$$PATH"
-      }
+      source scripts/use-ci-node.sh
 
       prepare_guest_checkout() {
         local source_dir work_dir
@@ -157,7 +130,6 @@ steps:
         cd "$$work_dir"
       }
 
-      install_node
       prepare_guest_checkout
       node --version
       npm --version
@@ -180,10 +152,10 @@ steps:
       queue: "ci-macos-apple-silicon"
     plugins:
       - github.com/Lightless-Labs/tart-ci#v0.2.4:
-          # Pin the source image digest so Tart can reuse the host cache across jobs.
+          # Use the validated shared Rust/Bazel/Node image so Tart can reuse the host cache across jobs.
           # The plugin still clones this source to a fresh buildkite-tart-ci-* VM per job
           # and deletes only that per-job clone during cleanup.
-          image: "ghcr.io/cirruslabs/macos-sequoia-base@sha256:fdd8b72a6ee46fc8ad35dc1b9f3b1f162b6607b82a584947d20bb28d3dcb99ed"
+          image: "ci-macos-rust-bazel-ios-20260909-v1"
           os: "macos"
           always_pull: false
           headless: true
@@ -199,34 +171,7 @@ steps:
         export HOME=/Users/admin
       fi
 
-      install_node() {
-        local node_version="22.21.1"
-        local uname_s uname_m node_platform archive_ext archive_url node_dir tmp_archive
-        uname_s="$$(uname -s)"
-        uname_m="$$(uname -m)"
-
-        case "$$uname_s-$$uname_m" in
-          Darwin-arm64)
-            node_platform="darwin-arm64"
-            archive_ext="tar.gz"
-            ;;
-          *)
-            echo "Unsupported macOS Node.js platform: $$uname_s $$uname_m" >&2
-            exit 1
-            ;;
-        esac
-
-        node_dir="$$HOME/.local/node-v$$node_version-$$node_platform"
-        if [[ ! -x "$$node_dir/bin/node" ]]; then
-          mkdir -p "$$node_dir"
-          tmp_archive="$$(mktemp)"
-          archive_url="https://nodejs.org/dist/v$$node_version/node-v$$node_version-$$node_platform.$$archive_ext"
-          curl --proto '=https' --tlsv1.2 -fsSL "$$archive_url" -o "$$tmp_archive"
-          tar -xzf "$$tmp_archive" -C "$$node_dir" --strip-components=1
-          rm -f "$$tmp_archive"
-        fi
-        export PATH="$$node_dir/bin:$$PATH"
-      }
+      source scripts/use-ci-node.sh
 
       prepare_guest_checkout() {
         local source_dir work_dir
@@ -239,7 +184,6 @@ steps:
         cd "$$work_dir"
       }
 
-      install_node
       prepare_guest_checkout
       node --version
       npm --version
