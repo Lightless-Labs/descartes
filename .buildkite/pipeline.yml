@@ -107,7 +107,7 @@ steps:
           # Use the validated shared Rust/Bazel/Node image so Tart can reuse the host cache across jobs.
           # The plugin still clones this source to a fresh buildkite-tart-ci-* VM per job
           # and deletes only that per-job clone during cleanup.
-          image: "ci-macos-rust-bazel-ios-20260909-v1"
+          image: "ci-macos-rust-bazel-ios-20260910-v2"
           os: "macos"
           always_pull: false
           headless: true
@@ -155,7 +155,7 @@ steps:
           # Use the validated shared Rust/Bazel/Node image so Tart can reuse the host cache across jobs.
           # The plugin still clones this source to a fresh buildkite-tart-ci-* VM per job
           # and deletes only that per-job clone during cleanup.
-          image: "ci-macos-rust-bazel-ios-20260909-v1"
+          image: "ci-macos-rust-bazel-ios-20260910-v2"
           os: "macos"
           always_pull: false
           headless: true
