@@ -1,7 +1,9 @@
 # Protection Contract Slice 1 — Truthful Service and Filesystem Coverage and Assessment
 
+> **⛔ SUPERSEDED / ABANDONED (2026-09-10).** The owner rejected this whole direction: an owner-declared "protect this service at this threshold, notify this channel" contract is "OTel + a local PagerDuty, done worse," and it walks away from the product's actual point — an agent that *discovers* what's running and *learns* to monitor it, rather than one you configure. Do NOT build from this plan (or its `-daybreak.md` variant). The replacement direction is **watch-by-default**: [`docs/plans/2026-09-10-watch-by-default-slice-1.md`](2026-09-10-watch-by-default-slice-1.md). Kept only as a record of the abandoned branch; its code-grounded collector findings remain useful reference.
+
 **Date:** 2026-09-09
-**Status:** PLAN — reconciled canonical plan
+**Status:** SUPERSEDED (was: PLAN — reconciled canonical plan)
 
 **Provenance:** This document merges two committed plans into the single canonical slice-1 plan, replacing both as the thing to build from.
 - **Base (architecture, adopted verbatim in substance):** `docs/plans/2026-09-09-protection-contract-slice-1-daybreak.md` — the independent daybreak-blue plan. Its daemon-integrated contract-driven collection phase, 3-axis coverage model, freshness rules, and required-collector-failure → daemon `state:"error"` behavior are the adopted architecture.

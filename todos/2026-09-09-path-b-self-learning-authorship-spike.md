@@ -1,7 +1,16 @@
 # Path B: finish the self-learning authorship spike to a real go/no-go
 
 **Created:** 2026-09-09
-**Status:** queued — **next-highest priority after Path A** (protection-contract slice, `docs/plans/2026-09-09-protection-contract-slice-1.md`)
+**Status:** queued — the **deeper follow-on** to the watch-by-default slice (below)
+
+> **Re-scope note (2026-09-10):** "Path A" (the protection contract) was **abandoned** — reinventing
+> OTel + local PagerDuty, away from the discover-and-learn point. The real near-term prerequisite for
+> this authorship spike is now [`docs/plans/2026-09-10-watch-by-default-slice-1.md`](../docs/plans/2026-09-10-watch-by-default-slice-1.md):
+> make the deterministic discover→learn→flag-new/removed loop run **by default**. This spike (the
+> agent *authoring its own* detectors and proving they beat a deterministic baseline) rides on top of
+> that default-on watch population — which is what generates the outcome/correction records the
+> go/no-go measures against. The A-before-B dependency below still holds, just with "A" now being the
+> watch-by-default slice, not the protection contract.
 **Area:** the learned subsystem (Slice-1 behavioral model) — `model-ir.js`, `model-ladder.js`, `constraint-miner.js`, `calibration.js`, promotion/tuning authority
 **Relates to:** the standing self-learning initiative ([[descartes-self-learning-monitoring-initiative]]), `docs/plans/2026-09-03-slice-1-behavioral-model-spike.md`, `todos/2026-07-09-self-learning-stratified-monitoring.md`, `docs/design/autonomy-doctrine.md` ([[descartes-autonomy-doctrine-no-uac-gate]]), and the 2026-09-05 critique §5/§7.
 
