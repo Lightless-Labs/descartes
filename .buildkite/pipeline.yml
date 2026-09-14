@@ -159,7 +159,7 @@ steps:
           os: "macos"
           always_pull: false
           headless: true
-          doppler_token_secret: DOPPLER_DESCARTES_PRD_NOTARISATION
+          doppler_token_secret: DOPPLER_SERVICE_ACCOUNT_TOKEN
           env:
             - BUILDKITE_TAG
     artifact_paths:

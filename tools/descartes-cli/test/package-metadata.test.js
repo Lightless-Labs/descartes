@@ -108,7 +108,7 @@ test("macOS notifier release scripts are maintainer-only and use the assigned bu
   assert.match(buildkitePipeline, /artifact_paths:\n\s+- "\.build\/macos-notifier\/release\/\*"/);
   assert.match(buildkitePipeline, /DESCARTES_SHARED_CHECKOUT_DIR/);
   assert.match(buildkitePipeline, /scripts\/release-macos-notifier-buildkite\.sh/);
-  assert.match(buildkitePipeline, /doppler_token_secret: DOPPLER_DESCARTES_PRD_NOTARISATION/);
+  assert.match(buildkitePipeline, /doppler_token_secret: DOPPLER_SERVICE_ACCOUNT_TOKEN/);
   assert.match(buildkitePipeline, /env:\n\s+- BUILDKITE_TAG/);
   assert.doesNotMatch(buildkitePipeline, /export MACOS_DEVELOPER_ID_CERT_P12_BASE64/);
   assert.doesNotMatch(buildkitePipeline, /Bande-a-Bonnot\/tart-ci/);
