@@ -132,6 +132,7 @@ Use a common result shape for tool outputs. Exact Rust types may evolve, but pre
 - For non-trivial milestones, create/update a plan under `docs/plans/`.
 - When a plan is deepened, reviewed, completed, or amended, update its header with the date and reason.
 - Document durable learnings in `docs/solutions/`.
+- **Multi-model review & planning:** for planning depth, adversarial review, or a second opinion, use the external-model roster (daybreak-blue / Astra via codex, Fable via the Agent tool, Sonnet/ultracode) per `docs/solutions/2026-09-14-multi-model-review-and-planning-playbook.md` — it has the invocation discipline (esp. codex `--approve-for-me` so file reads don't hang), the planning patterns, and the direction-before-execution + verify-don't-worship + gate-every-green disciplines. Reserve a **daybreak-blue re-gate for security-critical code before shipping**.
 - Keep generated artifacts, logs, and machine-local captures out of git unless explicitly curated and scrubbed.
 
 ## Quick Commands
