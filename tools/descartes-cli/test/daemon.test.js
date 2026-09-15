@@ -4645,13 +4645,17 @@ test("BLOCKER 1: a detector EXCEPTION (fact-history otherwise TRUSTWORTHY) must 
   );
 });
 
-test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even when learned.json is DISABLED (the default) -- canary-baseline has no learned gate, so its exception must not fabricate a recovery on the learned-off path", async () => {
+test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even when BOTH learned.json and watch.json are DISABLED -- canary-baseline has no learned gate, so its exception must not fabricate a recovery regardless of either kill switch", async () => {
   const paths = await tempPaths();
-  // learned.json intentionally NOT written -> disabled (the default out-of-the-box state). An
-  // earlier fix gated the main-call coveredRuleIds computation on learned.enabled, which reopened
-  // BLOCKER 1 here: canary-baseline has no learned gate, so a genuine exception still flipped its
-  // own active alert to "recovered" on the default path. The failed-detector exclusion must apply
-  // ALWAYS (detector failure is orthogonal to the learned kill switch).
+  // learned.json intentionally NOT written -> disabled (the default out-of-the-box state for
+  // AUTHOR). An earlier fix gated the main-call coveredRuleIds computation on learned.enabled,
+  // which reopened BLOCKER 1 here: canary-baseline has no learned gate, so a genuine exception
+  // still flipped its own active alert to "recovered" on that gated-off path. The failed-detector
+  // exclusion must apply ALWAYS (detector failure is orthogonal to either kill switch). Watch-by-
+  // default slice 1: watch.json's real ENOENT default is enabled:true (the opposite of
+  // learned.json's), so it must be injected explicitly disabled here too -- otherwise this test
+  // would no longer guard against the equivalent regression re-gating on watchConfig.enabled
+  // instead (e.g. via a future `baseline disable`), since watch would be silently ON by default.
   const now = S_LIVE_1_TICK_TS;
   await writeAlertRecords(paths, [{
     rule_id: CANARY_TRIPPED_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
@@ -4667,8 +4671,9 @@ test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even whe
       collectors: fastCollectorFakes(),
       ts: now,
       now,
+      loadWatchConfig: async () => ({ enabled: false }),
       computeCanaryBaselineCandidates: async () => {
-        throw new Error("simulated computeCanaryBaselineCandidates failure (learned off)");
+        throw new Error("simulated computeCanaryBaselineCandidates failure (learned/watch off)");
       },
     });
   } finally {
@@ -4679,13 +4684,13 @@ test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even whe
   assert.equal(
     canaryAlert?.status,
     "active",
-    "learned-disabled must NOT exempt a failed detector from the recovery-exclusion (BLOCKER 1 must stay closed on the default path)",
+    "learned/watch-disabled must NOT exempt a failed detector from the recovery-exclusion (BLOCKER 1 must stay closed regardless of either kill switch)",
   );
   const persisted = await readAlertRecords(paths);
   assert.equal(
     persisted.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID)?.status,
     "active",
-    "on disk too -- the main pass must not persist a fabricated recovery on the learned-disabled path",
+    "on disk too -- the main pass must not persist a fabricated recovery on the learned/watch-disabled path",
   );
 });
 

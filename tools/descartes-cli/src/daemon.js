@@ -1021,13 +1021,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // mainExtraCandidates) -- ordinarily self-healed the same tick when the containment call
     // re-derives and reactivates the same candidate, but NOT when containment itself throws,
     // which is exactly BLOCKER 1's phase-appropriate-coverage requirement.
-    // NOT gated on learned.json: the 12 detectors above run regardless of the kill switch, so a
-    // detector EXCEPTION must exclude its family from recovery ALWAYS. Gating the whole computation
-    // on watchConfigForHistory.enabled (an earlier attempt) would reopen BLOCKER 1 on the DEFAULT
-    // watch-disabled path -- a throwing detector (e.g. canary-baseline, which has no watch gate)
-    // would still fabricate a "recovered". So the call is unconditional; computeCoveredRuleIds
-    // internally early-returns undefined with ZERO I/O when nothing warrants a restriction
-    // (historyTrust is undefined when watch is disabled -> historyUntrusted false -> no fact read).
+    // NOT gated on any kill switch: the 12 detectors above run regardless, so a detector EXCEPTION
+    // must exclude its family from recovery ALWAYS. Gating the whole computation on the kill
+    // switch's enabled flag (an earlier attempt did exactly this on learned.enabled) reopened
+    // BLOCKER 1: a throwing detector with no gate of its own (e.g. canary-baseline) still
+    // fabricated a "recovered" whenever that flag was off. The same regression is reachable again
+    // via watchConfigForHistory.enabled now that watch.json exists -- watch defaults ON, so it
+    // isn't the common case today, but an operator running `baseline disable` (or a fresh
+    // ENOENT-disabled watch.json) reaches it exactly the same way learned-disabled did before this
+    // slice (regression-tested: daemon.test.js's "BLOCKER 1 re-gate" test drives BOTH flags
+    // disabled). So the call stays unconditional; computeCoveredRuleIds internally early-returns
+    // undefined with ZERO I/O when nothing warrants a restriction (historyTrust is undefined when
+    // watch is disabled -> historyUntrusted false -> no fact read).
     // The containment exclusion (alwaysExcludedRuleIds) stays scoped to the AUTHOR flag (plan
     // §3.2/§12.3 fact 2: containment stays opt-in, unmoved by this slice) -- loaded independently
     // here since the fact-history read above no longer loads learnedConfig at all. Passed ONLY
