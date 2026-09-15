@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { writeLearnedConfig } from "../src/constraint-store.js";
+import { writeWatchConfig } from "../src/watch-store.js";
 import { isFixedLengthHexHash, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
 import { factPointsFromServiceEvidence, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
@@ -152,7 +152,7 @@ function degradedReadResult(points, lossTs = tickTs(2)) {
 async function seedAndCompute(paths, points, options = {}) {
   const lastTs = points.reduce((max, p) => Math.max(max, new Date(p.ts).getTime()), 0);
   const now = options.now ?? new Date(lastTs).toISOString();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Slice 6 (fact-store completeness hardening) gave service-baseline.js its own persistent
   // cold-start lockout, mirroring process-lineage-baseline.js's/session-baseline.js's/
   // peer-baseline.js's: a brand-new store starts cold_start_pending, and a single one-shot
@@ -447,9 +447,9 @@ test("detectServiceDisappearances: different entity_keys never interfere with ea
 // buildDisappearedCandidates / computeServiceBaselineCandidates.
 // ---------------------------------------------------------------------------------------------
 
-test("computeServiceBaselineCandidates: learned.json disabled -> [], zero I/O (readFactPoints/loadServiceBaselineStore never called)", async () => {
+test("computeServiceBaselineCandidates: watch.json disabled -> [], zero I/O (readFactPoints/loadServiceBaselineStore never called)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: false });
   let readCalled = false;
   let loadStoreCalled = false;
   const candidates = await computeServiceBaselineCandidates(paths, {
@@ -515,7 +515,7 @@ test("computeServiceBaselineCandidates: store write is skipped on a tick with ze
   const paths = await tempPaths();
   const ticks = [...establishedTicks(["svc-a"], 3), completeTick(tickTs(3), [])];
   const now = tickTs(3);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout (this test
   // is about the write-skip/at-most-one-write convention, not the lockout, which has its own
   // dedicated coverage further down) and confirm the shared integrity ledger to 'intact'.
@@ -544,7 +544,7 @@ test("fold-time-only counter increment (Stage 1 review must-fix 3): disappearanc
   const paths = await tempPaths();
   const ticks = [...establishedTicks(["svc-a"], 3), completeTick(tickTs(3), [])]; // svc-a disappears at tick 3
   const now = tickTs(3);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout (this test
   // is about the fold-time-only counter convention, not the lockout) and confirm the shared
   // integrity ledger to 'intact'.
@@ -575,7 +575,7 @@ test("fold-time-only counter increment: skipped_partial_tick_count increments ex
   const paths = await tempPaths();
   const ticks = [...establishedTicks(["svc-a"], 3), partialTick(tickTs(3), ["svc-a"])];
   const now = tickTs(3);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout and confirm
   // the shared integrity ledger to 'intact' (see the "disappearance_event_count" fold-time test
   // above for the identical rationale).
@@ -595,7 +595,7 @@ test("re-emission every call: candidate list is rebuilt fresh from the current w
   const paths = await tempPaths();
   const ticks = [...establishedTicks(["svc-a"], 3), completeTick(tickTs(3), [])];
   const now = tickTs(3);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Fact-store completeness hardening (Slice 6): pre-establish the cold-start lockout and confirm
   // the shared integrity ledger to 'intact' (see the fold-time tests above for the identical
   // rationale) — this test is about re-emission, not the lockout.
@@ -631,7 +631,7 @@ test("computeServiceBaselineCandidates end-to-end: an established service disapp
 
 test("computeServiceBaselineCandidates: readFactPoints window bound is threaded through (regression: fact points outside baselineFactWindowMs are excluded)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await appendFactPoints(paths, completeTick(tickTs(0), ["svc-a"]), { now: tickTs(0) });
   // A direct readFactPoints call with a tiny window relative to `now` should see nothing.
   const now = tickTs(1000);
@@ -665,7 +665,7 @@ function disappearanceFixturePoints() {
 
 test("computeServiceBaselineCandidates: degraded truncated history suppresses a fabricated service.disappeared (an established service must not read as vanished just because retention scrubbed the history that would have shown it as present)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = disappearanceFixturePoints();
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
@@ -684,7 +684,7 @@ test("computeServiceBaselineCandidates: degraded truncated history suppresses a 
 
 test("computeServiceBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated service.disappeared from the shortened post-rollback window", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
   // watermark far in the future relative to the (now-corrected) clock below.
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
@@ -710,7 +710,7 @@ test("computeServiceBaselineCandidates (security-sweep F4): an established store
 
 test("computeServiceBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeServiceBaselineStore(paths, {
     cold_start_pending: true,
     cold_start_since_ts: tickTs(10),
@@ -728,7 +728,7 @@ test("computeServiceBaselineCandidates: a future pending anchor re-arms at the i
 
 test("computeServiceBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeServiceBaselineStore(paths, {
     cold_start_pending: true,
     cold_start_since_ts: tickTs(10),
@@ -762,7 +762,7 @@ test("computeServiceBaselineCandidates: rollback repairs a future anchor and wat
 
 test("computeServiceBaselineCandidates: intact history control still fires a real service.disappeared (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = disappearanceFixturePoints();
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
@@ -778,7 +778,7 @@ test("computeServiceBaselineCandidates: intact history control still fires a rea
 
 test("computeServiceBaselineCandidates: one transient fact-history loss recovers after minHistoryTickCount genuinely-new clean ticks (recovery-latch fix, bounded not permanent)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
@@ -815,7 +815,7 @@ test("computeServiceBaselineCandidates: one transient fact-history loss recovers
 
 test("computeServiceBaselineCandidates: a clean tick cannot self-heal and fire service.disappeared in the same breath fact-history loss is first observed on the prior tick", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
   // ticks 0-2: svc-a established. tick 3: a normal complete tick (svc-a still present) observed
@@ -845,7 +845,7 @@ test("computeServiceBaselineCandidates: a clean tick cannot self-heal and fire s
 
 test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-starts once on first read, then recovers after minHistoryTickCount clean ticks (per-detector P8 analog)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
 
   // Simulate a store written by a pre-Slice-6 daemon: no cold_start_pending/_reason/_since_ts at
@@ -917,7 +917,7 @@ test("loadServiceBaselineStore (security-sweep F1): a bare {cold_start_pending:f
 
 test("computeServiceBaselineCandidates (security-sweep F1): a forged {cold_start_pending:false} store with no watermark cold-starts (no fabricated service.disappeared), while a fully-established store with a real watermark still fires", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = disappearanceFixturePoints();
 
   const { dir, storeFile } = resolveServiceBaselineStorePaths(paths);
@@ -1111,12 +1111,12 @@ test("buildAppearedCandidates hashes identity under service.appeared's OWN domai
   assert.notEqual(candidate.fingerprint, createHash("sha256").update(`service.disappeared:svc-new`).digest("hex").slice(0, 16));
 });
 
-test("computeServiceAppearanceCandidates checks learned.json before any fact/store I/O", async () => {
+test("computeServiceAppearanceCandidates checks watch.json before any fact/store I/O", async () => {
   const paths = await tempPaths();
   let readCalls = 0;
   let loadCalls = 0;
   const result = await computeServiceAppearanceCandidates(paths, {
-    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadServiceAppearanceBaselineStore: async () => { loadCalls += 1; return { state: normalizeServiceAppearanceBaselineState() }; },
   });
@@ -1132,7 +1132,7 @@ test("computeServiceAppearanceCandidates folds counters once and emits an appear
     completeTick(tickTs(1), ["svc-a"]),
     completeTick(tickTs(2), ["svc-a", "svc-new"]),
   ]);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await appendFactPoints(paths, [], { now: tickTs(2) });
@@ -1145,7 +1145,7 @@ test("computeServiceAppearanceCandidates folds counters once and emits an appear
 
 test("co-existence: a service that disappears then reappears exercises BOTH detectors correctly without cross-contaminating each other's fold checkpoints (O3)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
@@ -1182,7 +1182,7 @@ test("co-existence: a service that disappears then reappears exercises BOTH dete
 
 test("computeServiceAppearanceCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated service.appeared from the shortened post-rollback window", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
   // watermark far in the future relative to the (now-corrected) clock below.
   await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
@@ -1209,7 +1209,7 @@ test("computeServiceAppearanceCandidates (security-sweep F4): an established sto
 
 test("computeServiceAppearanceCandidates fails closed end-to-end when the persisted appearance-baseline-store file is corrupt, never fabricating the appearance that same history would otherwise fire", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = flatten([
     completeTick(tickTs(0), ["svc-a"]),
     completeTick(tickTs(1), ["svc-a"]),
@@ -1227,7 +1227,7 @@ test("computeServiceAppearanceCandidates fails closed end-to-end when the persis
 
 test("computeServiceAppearanceCandidates: degraded/untrustworthy retained history suppresses a fabricated established-service appearance alert", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const truncatedPoints = flatten([
     completeTick(tickTs(1), ["svc-a"]),
     completeTick(tickTs(2), ["svc-a"]),

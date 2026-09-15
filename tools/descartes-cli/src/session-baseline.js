@@ -27,7 +27,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { alertId } from "./alert-store.js";
-import { loadLearnedConfig } from "./constraint-store.js";
+import { loadWatchConfig } from "./watch-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
@@ -609,10 +609,11 @@ export function buildChurnCandidates(churnEntries = []) {
 
 /**
  * Matches computeProvenanceWarningCandidates' exact signature/short-circuit shape: gated by the
- * same loadLearnedConfig(...).enabled short-circuit-to-[] BEFORE any I/O. Called on every daemon
- * tick (~60s) from runDaemonIteration's extraCandidates concat, not just on a structural-due
- * tick — an already-collected fact must be able to fire (or keep firing / recover) an alert
- * without waiting for the next hourly structural collection.
+ * same loadWatchConfig(...).enabled short-circuit-to-[] BEFORE any I/O (watch-by-default slice 1,
+ * plan §3.4/§12.1 -- moved off constraint-store.js's loadLearnedConfig; peer/session joined WATCH
+ * per plan §11 #1). Called on every daemon tick (~60s) from runDaemonIteration's extraCandidates
+ * concat, not just on a structural-due tick — an already-collected fact must be able to fire (or
+ * keep firing / recover) an alert without waiting for the next hourly structural collection.
  *
  * Fast-tick-vs-hourly-fold hazard (must-fix 5): readFactPoints is intentionally NOT skipped on
  * fast ticks (churn is recomputed fresh every call; the windowed stats recompute needs to check
@@ -621,9 +622,9 @@ export function buildChurnCandidates(churnEntries = []) {
  * structural collections performs no disk write and leaves the persisted state untouched.
  */
 export async function computeSessionBaselineCandidates(descartesPaths, options = {}) {
-  const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
-  const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return [];
+  const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
+  const watchConfig = await loadConfig(descartesPaths);
+  if (!watchConfig.enabled) return [];
 
   const minSampleCount = options.minSampleCount ?? DEFAULT_MIN_SAMPLE_COUNT;
   const stddevFloor = options.stddevFloor ?? DEFAULT_STDDEV_FLOOR;

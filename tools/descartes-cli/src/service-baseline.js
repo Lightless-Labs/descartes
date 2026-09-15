@@ -35,7 +35,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { alertId } from "./alert-store.js";
-import { loadLearnedConfig } from "./constraint-store.js";
+import { loadWatchConfig } from "./watch-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
@@ -443,7 +443,8 @@ export function buildDisappearedCandidates(entries = []) {
 
 /**
  * Same signature/short-circuit shape as every sibling: gated by the same
- * loadLearnedConfig(...).enabled short-circuit-to-[] BEFORE any I/O.
+ * loadWatchConfig(...).enabled short-circuit-to-[] BEFORE any I/O (watch-by-default slice 1,
+ * plan §3.4/§12.1 -- moved off constraint-store.js's loadLearnedConfig).
  *
  * Fold-time-only increment semantics (plan's Stage-1 review must-fix 3, pinned here as a normative
  * rule): skipped_partial_tick_count and disappearance_event_count increment ONLY at fold time —
@@ -463,9 +464,9 @@ export function buildDisappearedCandidates(entries = []) {
  * store write happened that tick.
  */
 export async function computeServiceBaselineCandidates(descartesPaths, options = {}) {
-  const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
-  const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return []; // default-OFF kill switch, checked before ANY I/O
+  const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
+  const watchConfig = await loadConfig(descartesPaths);
+  if (!watchConfig.enabled) return []; // default-ON WATCH kill switch, checked before ANY I/O
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS; // reused from welford-stats.js — generic read-window bound, not a Welford use
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT;
@@ -839,14 +840,15 @@ export function buildAppearedCandidates(entries = []) {
 
 /**
  * Same signature/short-circuit shape as computeServiceBaselineCandidates: gated by the same
- * loadLearnedConfig(...).enabled short-circuit-to-[] BEFORE any I/O. Threads its OWN persistent
- * cold-start lockout (separate store, see resolveServiceAppearanceBaselineStorePaths/O3) so an
- * appearance fold and a disappearance fold can never mutually skip a tick.
+ * loadWatchConfig(...).enabled short-circuit-to-[] BEFORE any I/O (watch-by-default slice 1,
+ * plan §3.4/§12.1). Threads its OWN persistent cold-start lockout (separate store, see
+ * resolveServiceAppearanceBaselineStorePaths/O3) so an appearance fold and a disappearance fold
+ * can never mutually skip a tick.
  */
 export async function computeServiceAppearanceCandidates(descartesPaths, options = {}) {
-  const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
-  const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return [];
+  const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
+  const watchConfig = await loadConfig(descartesPaths);
+  if (!watchConfig.enabled) return [];
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   // Persistent-lockout re-accumulation gate (distinct from detectServiceAppearances' own

@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { appendFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildLineageEntityKey, PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME, PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY, PROCESS_LINEAGE_EDGE_FACT_NAME } from "../src/fact-translators.js";
-import { writeLearnedConfig } from "../src/constraint-store.js";
+import { writeWatchConfig } from "../src/watch-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
   DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
@@ -189,12 +189,12 @@ test("buildNovelEdgeCandidates hashes identity, sanitizes diagnostics, and caps 
   assert.equal(JSON.stringify(candidate).includes(entityKey), false);
 });
 
-test("computeProcessLineageBaselineCandidates checks learned.json before any fact/store I/O", async () => {
+test("computeProcessLineageBaselineCandidates checks watch.json before any fact/store I/O", async () => {
   const paths = await tempPaths();
   let readCalls = 0;
   let loadCalls = 0;
   const result = await computeProcessLineageBaselineCandidates(paths, {
-    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadProcessLineageBaselineStore: async () => { loadCalls += 1; return { state: normalizeProcessLineageBaselineState() }; },
   });
@@ -210,7 +210,7 @@ test("computeProcessLineageBaselineCandidates folds counters once and emits a no
     completeTick(tickTs(1)),
     completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
   ]);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Prime the baseline store as already-established (past the persistent cold-start lockout
   // added below) -- this test is about the fold/counter bookkeeping, not the lockout itself,
   // which gets its own dedicated tests further down. A genuinely-established store must carry a
@@ -237,7 +237,7 @@ test("computeProcessLineageBaselineCandidates folds counters once and emits a no
 
 test("computeProcessLineageBaselineCandidates fails closed end-to-end when facts.jsonl has a genuinely corrupt line, never fabricating the novel edge that same history would otherwise fire", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Prime as already-established so the "clean" sanity-control call below can actually fire --
   // proving the corrupted-facts case really would fabricate an alert absent the corrupt gate.
   // (A valid last_folded_ts is required for the store to actually count as established.)
@@ -269,7 +269,7 @@ test("computeProcessLineageBaselineCandidates fails closed end-to-end when facts
 
 test("computeProcessLineageBaselineCandidates fails closed end-to-end when the persisted baseline-store file is corrupt", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = flatten([
     completeTick(tickTs(0)),
     completeTick(tickTs(1)),
@@ -287,7 +287,7 @@ test("computeProcessLineageBaselineCandidates fails closed end-to-end when the p
 
 test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine cold-start both fail closed to zero claims (fixture-driven)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = flatten([
     completeTick(tickTs(0)),
     completeTick(tickTs(1)),
@@ -320,7 +320,7 @@ test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine 
 
 test("computeProcessLineageBaselineCandidates: degraded truncated history suppresses a fabricated established-edge alert", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const truncatedPoints = flatten([
     completeTick(tickTs(1)),
@@ -343,7 +343,7 @@ test("computeProcessLineageBaselineCandidates: degraded truncated history suppre
 
 test("computeProcessLineageBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeProcessLineageBaselineStore(paths, {
     cold_start_pending: true,
     cold_start_since_ts: tickTs(10),
@@ -361,7 +361,7 @@ test("computeProcessLineageBaselineCandidates: a future pending anchor re-arms a
 
 test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeProcessLineageBaselineStore(paths, {
     cold_start_pending: true,
     cold_start_since_ts: tickTs(10),
@@ -394,7 +394,7 @@ test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor 
 
 test("computeProcessLineageBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated novel edge from the shortened post-rollback window", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
   // watermark far in the future relative to the (now-corrected) clock below.
   await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
@@ -420,7 +420,7 @@ test("computeProcessLineageBaselineCandidates (security-sweep F4): an establishe
 
 test("computeProcessLineageBaselineCandidates: intact history control still detects a novel edge", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = flatten([
     completeTick(tickTs(0)),
     completeTick(tickTs(1)),
@@ -441,7 +441,7 @@ test("computeProcessLineageBaselineCandidates: intact history control still dete
 
 test("computeProcessLineageBaselineCandidates: one transient fact-history loss recovers after clean ticks", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
@@ -472,7 +472,7 @@ test("computeProcessLineageBaselineCandidates: one transient fact-history loss r
 
 test("computeProcessLineageBaselineCandidates: a clean tick cannot self-heal and fire after fact-history loss", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
   let points = flatten([completeTick(tickTs(1)), completeTick(tickTs(2)), completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]])]);
@@ -503,7 +503,7 @@ test("computeProcessLineageBaselineCandidates: a clean tick cannot self-heal and
 
 test("computeProcessLineageBaselineCandidates: a corrupt baseline store forces a PERSISTENT cold-start -- corrupt tick then the self-healed tick right after both stay at zero (not 0-then-1)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
 
   // Prime the store as already-established, so the failure below is attributable to the
@@ -550,7 +550,7 @@ test("computeProcessLineageBaselineCandidates: a corrupt baseline store forces a
 
 test("computeProcessLineageBaselineCandidates: a missing baseline store with retained fact-history is cold-start, not trust -- it does not fire on the very first (or second) tick", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
 
   // Retained fact-history: a full, clean, multi-tick window already sitting in facts.jsonl --
@@ -569,7 +569,7 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
   // run below really would fabricate the "shell->python" alert had the missing store been
   // trusted immediately instead of gated.
   const controlPaths = await tempPaths();
-  await writeLearnedConfig(controlPaths, { enabled: true });
+  await writeWatchConfig(controlPaths, { enabled: true });
   await writeProcessLineageBaselineStore(controlPaths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
   await settleFactStore(controlPaths, tickTs(2));
@@ -604,7 +604,7 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
 
 test("computeProcessLineageBaselineCandidates: a parseable-but-schema-invalid baseline store (valid JSON, wrong shape) is treated as corrupt -- cold-start, zero novel-edge, and a real anchor is set", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = flatten([
     completeTick(tickTs(0)),
@@ -617,7 +617,7 @@ test("computeProcessLineageBaselineCandidates: a parseable-but-schema-invalid ba
   // immediately -- proving the schema-invalid store below really would fabricate the alert had it
   // been trusted at face value instead of being validated.
   const controlPaths = await tempPaths();
-  await writeLearnedConfig(controlPaths, { enabled: true });
+  await writeWatchConfig(controlPaths, { enabled: true });
   await writeProcessLineageBaselineStore(controlPaths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
   await settleFactStore(controlPaths, tickTs(2));
@@ -643,7 +643,7 @@ test("computeProcessLineageBaselineCandidates: a parseable-but-schema-invalid ba
 
 test("computeProcessLineageBaselineCandidates: an old-format/empty baseline store enters cold-start with a real anchor and ACTUALLY re-establishes after enough new complete ticks (not Infinity/never)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
 
   // Old-format/empty store: valid JSON, but an empty object -- no schema_version, no fields at
@@ -687,7 +687,7 @@ test("computeProcessLineageBaselineCandidates: an old-format/empty baseline stor
 
 test("computeProcessLineageBaselineCandidates: a fully schema-valid established store is trusted immediately -- no regression from the schema-validation fix", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = flatten([
     completeTick(tickTs(0)),
@@ -734,7 +734,7 @@ test("computeProcessLineageBaselineCandidates: a fully schema-valid established 
 
 test("computeProcessLineageBaselineCandidates: gpt-5.6-sol TERMINAL fix -- an established store MISSING last_folded_ts is rejected into cold-start (zero novel-edge), while the identical store WITH last_folded_ts trusts and fires", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = flatten([
     completeTick(tickTs(0)),
@@ -774,7 +774,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol TERMINAL fix -- an es
   // established and trusts+fires immediately -- proving the rejection above is really about the
   // missing field, not some other accidental mismatch.
   const controlPaths = await tempPaths();
-  await writeLearnedConfig(controlPaths, { enabled: true });
+  await writeWatchConfig(controlPaths, { enabled: true });
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
   await settleFactStore(controlPaths, tickTs(2));
   const controlStoreWithLastFolded = { ...minimalStoreMissingLastFolded, last_folded_ts: tickTs(-1) };
@@ -788,7 +788,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol TERMINAL fix -- an es
 
 test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a foreign/unknown top-level key is rejected into cold-start", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = flatten([
     completeTick(tickTs(0)),
@@ -820,7 +820,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a
 
 test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a negative or fractional counter is rejected into cold-start", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = flatten([
     completeTick(tickTs(0)),
@@ -859,7 +859,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a
 
 test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- an exact-valid established store (every required field present and in range) still trusts and fires, no regression", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const points = flatten([
     completeTick(tickTs(0)),

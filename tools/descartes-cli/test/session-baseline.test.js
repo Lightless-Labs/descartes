@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { writeLearnedConfig } from "../src/constraint-store.js";
+import { writeWatchConfig } from "../src/watch-store.js";
 import { isFixedLengthHexHash, isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
@@ -137,7 +137,7 @@ function degradedReadResult(points, lossTs = tickTs(2)) {
 async function seedAndCompute(paths, points, options = {}) {
   const lastTs = points.reduce((max, p) => Math.max(max, new Date(p.ts).getTime()), 0);
   const now = options.now ?? new Date(lastTs).toISOString();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Slice 4 (fact-store completeness hardening) gave session-baseline.js its own persistent
   // cold-start lockout, mirroring process-lineage-baseline.js's: a brand-new store starts
   // cold_start_pending, and a single one-shot append+compute call (exactly this helper's shape)
@@ -423,7 +423,7 @@ test("OVERFLOW-tick skip, driven end-to-end (must-fix 5): skipped_overflow_tick_
 
 test("gradual-drift fixture, pinned to a stated realistic rate (~1 session/day over 15 days): no false alarm at any daily step", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const TICKS_PER_DAY = 24;
   const DAYS = 15; // "2-3 weeks" per the plan; 15 days sits at its lower bound, kept short for test runtime
   let hour = 0;
@@ -444,7 +444,7 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 session/day o
 
 test("regime-change fixture: a sustained, legitimate shift from N to M<N eventually RECOVERS (stops firing) without any operator action", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Slice 4: pre-establish the cold-start lockout (see seedAndCompute's comment above) -- this
   // fixture drives appendFactPoints/computeSessionBaselineCandidates directly rather than through
   // seedAndCompute, so it needs the same pre-seed + ledger-confirmation applied by hand.
@@ -494,7 +494,7 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   ticks.push(completeTick(tickTs(30), 0));
   const points = flatten(ticks);
   const now = tickTs(30);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Slice 4: pre-establish the cold-start lockout (see seedAndCompute's comment above) -- this
   // fixture drives appendFactPoints/computeSessionBaselineCandidates directly.
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
@@ -520,7 +520,7 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   const ticks = [];
   for (let i = 0; i < 5; i += 1) ticks.push(completeTick(tickTs(i), 10));
   const now = tickTs(4);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await appendFactPoints(paths, flatten(ticks), { now });
   // Slice 4: confirm the integrity ledger to 'intact' before the repeated-call phase below -- a
   // fresh ledger's first retention pass reads 'unknown' (bootstrap), which would otherwise keep
@@ -629,7 +629,7 @@ test("session.churn non-fire: a garbled/unrecognized census_state marker on the 
 
 test("session.churn ignores a future complete group while still detecting a real current-tick churn", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-2) });
 
   let points = [
@@ -856,7 +856,7 @@ test("GARBLED-MARKER on an OLDER (non-latest) tick, end-to-end (adversarial-revi
 
 test("computeSessionBaselineCandidates: degraded truncated history suppresses a fabricated session.count_drop (an established pattern must not read as anomalous just because retention scrubbed the history that would have shown it as normal)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
@@ -877,7 +877,7 @@ test("computeSessionBaselineCandidates: degraded truncated history suppresses a 
 
 test("computeSessionBaselineCandidates: a future pending anchor re-arms at the injected now", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeSessionBaselineStore(paths, {
     cold_start_pending: true,
     cold_start_since_ts: tickTs(10),
@@ -895,7 +895,7 @@ test("computeSessionBaselineCandidates: a future pending anchor re-arms at the i
 
 test("computeSessionBaselineCandidates: rollback repairs a future anchor and watermark, then persists re-established trust", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeSessionBaselineStore(paths, {
     cold_start_pending: true,
     cold_start_since_ts: tickTs(10),
@@ -928,7 +928,7 @@ test("computeSessionBaselineCandidates: rollback repairs a future anchor and wat
 
 test("computeSessionBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated session.count_drop from the shortened post-rollback window", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
   // watermark far in the future relative to the (now-corrected) clock below.
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
@@ -950,7 +950,7 @@ test("computeSessionBaselineCandidates (security-sweep F4): an established store
 
 test("computeSessionBaselineCandidates: intact history control still fires a real session.count_drop (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
   ticks.push(completeTick(tickTs(30), 0));
@@ -968,7 +968,7 @@ test("computeSessionBaselineCandidates: intact history control still fires a rea
 
 test("computeSessionBaselineCandidates: one transient fact-history loss recovers after minHistoryTickCount genuinely-new clean ticks (recovery-latch fix, bounded not permanent)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
@@ -998,7 +998,7 @@ test("computeSessionBaselineCandidates: one transient fact-history loss recovers
 
 test("computeSessionBaselineCandidates: a clean tick cannot self-heal and fire session.* novelty in the same breath fact-history loss is first observed on the prior tick", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
 
   let points = [
@@ -1023,7 +1023,7 @@ test("computeSessionBaselineCandidates: a clean tick cannot self-heal and fire s
 
 test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-starts once on first read, then recovers after minHistoryTickCount clean ticks (per-detector P8 analog)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
 
   // Simulate a store written by a pre-Slice-4 daemon: no cold_start_pending/_reason/_since_ts at
@@ -1099,7 +1099,7 @@ test("loadSessionBaselineStore (security-sweep F1): a bare {cold_start_pending:f
 
 test("computeSessionBaselineCandidates (security-sweep F1): a forged {cold_start_pending:false} store with no watermark cold-starts (no fabricated session.count_drop), while a fully-established store with a real watermark still fires", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
   ticks.push(completeTick(tickTs(30), 0)); // mass-drop tick -- would fire session.count_drop if trusted
@@ -1207,22 +1207,26 @@ test("writeSessionBaselineStore writes 0o600 via atomic tmp+rename (no leftover 
   assert.equal(entries.some((entry) => entry.endsWith(".tmp")), false);
 });
 
-test("computeSessionBaselineCandidates short-circuits to [] before any I/O when learned.json is disabled", async () => {
+test("computeSessionBaselineCandidates short-circuits to [] before any I/O when watch.json is disabled", async () => {
   const paths = await tempPaths();
   let ioAttempted = false;
   const result = await computeSessionBaselineCandidates(paths, {
-    loadLearnedConfig: async () => ({ enabled: false }),
-    readFactPoints: async () => { ioAttempted = true; throw new Error("readFactPoints must not be called while learned.json is disabled"); },
-    loadSessionBaselineStore: async () => { ioAttempted = true; throw new Error("loadSessionBaselineStore must not be called while learned.json is disabled"); },
+    loadWatchConfig: async () => ({ enabled: false }),
+    readFactPoints: async () => { ioAttempted = true; throw new Error("readFactPoints must not be called while watch.json is disabled"); },
+    loadSessionBaselineStore: async () => { ioAttempted = true; throw new Error("loadSessionBaselineStore must not be called while watch.json is disabled"); },
   });
   assert.deepEqual(result, []);
   assert.equal(ioAttempted, false);
 });
 
-test("computeSessionBaselineCandidates calls the real (default) loadLearnedConfig when not injected, and returns [] on a fresh state dir (learned.json absent = disabled by default)", async () => {
+test("computeSessionBaselineCandidates calls the real (default) loadWatchConfig when not injected -- watch.json defaults to enabled:true (the inversion of learned.json's old enabled:false), so a fresh state dir now proceeds PAST the gate and reaches real I/O, returning [] only for lack of history (cold-start), not a kill switch", async () => {
   const paths = await tempPaths();
-  const result = await computeSessionBaselineCandidates(paths, {});
+  let readCalled = false;
+  const result = await computeSessionBaselineCandidates(paths, {
+    readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args); },
+  });
   assert.deepEqual(result, []);
+  assert.equal(readCalled, true, "watch.json's real ENOENT default is enabled:true (watch-by-default slice 1) -- unlike the pre-split default, I/O IS attempted even with nothing injected");
 });
 
 // ---------------------------------------------------------------------------------------------

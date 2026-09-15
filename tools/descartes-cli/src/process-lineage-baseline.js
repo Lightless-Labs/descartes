@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { alertId } from "./alert-store.js";
-import { loadLearnedConfig } from "./constraint-store.js";
+import { loadWatchConfig } from "./watch-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
@@ -305,10 +305,13 @@ export function buildNovelEdgeCandidates(entries = []) {
   });
 }
 
+// Watch-by-default slice 1 (plan §3.4/§12.1): gated by loadWatchConfig(...).enabled -- moved off
+// constraint-store.js's loadLearnedConfig. Everything below the gate (cold-start lockout,
+// readFactPoints, store load/write, candidate building) is unchanged.
 export async function computeProcessLineageBaselineCandidates(descartesPaths, options = {}) {
-  const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
-  const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return [];
+  const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
+  const watchConfig = await loadConfig(descartesPaths);
+  if (!watchConfig.enabled) return [];
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const readFacts = options.readFactPoints ?? readFactPoints;

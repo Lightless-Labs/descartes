@@ -11,7 +11,7 @@ import {
   SCHEDULED_JOB_PRESENCE_FACT_NAME,
   buildScheduledJobEntityKey,
 } from "../src/fact-translators.js";
-import { writeLearnedConfig } from "../src/constraint-store.js";
+import { writeWatchConfig } from "../src/watch-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
   DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
@@ -253,12 +253,12 @@ test("buildScheduledJobAppearedCandidates hashes identity, sanitizes diagnostics
 // computeScheduledJobBaselineCandidates: kill-switch, fold-once counters, cold-start lockout
 // ---------------------------------------------------------------------------------------------
 
-test("computeScheduledJobBaselineCandidates checks learned.json before any fact/store I/O", async () => {
+test("computeScheduledJobBaselineCandidates checks watch.json before any fact/store I/O", async () => {
   const paths = await tempPaths();
   let readCalls = 0;
   let loadCalls = 0;
   const result = await computeScheduledJobBaselineCandidates(paths, {
-    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadPersistenceBaselineStore: async () => { loadCalls += 1; return { state: normalizePersistenceBaselineState() }; },
   });
@@ -274,7 +274,7 @@ test("computeScheduledJobBaselineCandidates folds counters once and emits an app
     completeTick(tickTs(1)),
     completeTick(tickTs(2), [KEY_TIMER, KEY_CRON]),
   ]);
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await settleFactStore(paths, tickTs(2));
@@ -290,7 +290,7 @@ test("computeScheduledJobBaselineCandidates folds counters once and emits an app
 
 test("computeScheduledJobBaselineCandidates: fold-time-only counters increment exactly once per newly-observed tick-group, not per recompute", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   const points = flatten([completeTick(tickTs(0)), completeTick(tickTs(1)), completeTick(tickTs(2), [KEY_TIMER, KEY_CRON])]);
   await appendFactPoints(paths, points, { now: tickTs(2) });
@@ -307,7 +307,7 @@ test("computeScheduledJobBaselineCandidates: fold-time-only counters increment e
 
 test("computeScheduledJobBaselineCandidates fails closed end-to-end when facts.jsonl has a genuinely corrupt line, never fabricating the appearance that same history would otherwise fire", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   const points = flatten([completeTick(tickTs(0)), completeTick(tickTs(1)), completeTick(tickTs(2), [KEY_TIMER, KEY_CRON])]);
 
@@ -325,7 +325,7 @@ test("computeScheduledJobBaselineCandidates fails closed end-to-end when facts.j
 
 test("computeScheduledJobBaselineCandidates fails closed end-to-end when the persisted baseline-store file is corrupt", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = flatten([completeTick(tickTs(0)), completeTick(tickTs(1)), completeTick(tickTs(2), [KEY_TIMER, KEY_CRON])]);
   await appendFactPoints(paths, points, { now: tickTs(2) });
 
@@ -339,7 +339,7 @@ test("computeScheduledJobBaselineCandidates fails closed end-to-end when the per
 
 test("computeScheduledJobBaselineCandidates: corrupt fact-history and genuine cold-start both fail closed to zero claims (fixture-driven)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const points = flatten([completeTick(tickTs(0)), completeTick(tickTs(1)), completeTick(tickTs(2), [KEY_TIMER, KEY_CRON])]);
 
   const corrupt = await computeScheduledJobBaselineCandidates(paths, {
@@ -365,7 +365,7 @@ test("computeScheduledJobBaselineCandidates: corrupt fact-history and genuine co
 
 test("computeScheduledJobBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated appearance from the shortened post-rollback window", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   // Simulates a store folded during a fast-clock/NTP-glitch era: cold_start_pending:false with a
   // watermark far in the future relative to the (now-corrected) clock below.
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(1000) });
@@ -391,7 +391,7 @@ test("computeScheduledJobBaselineCandidates (security-sweep F4): an established 
 
 test("computeScheduledJobBaselineCandidates: degraded/untrustworthy retained history suppresses a fabricated established-job alert", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
   const truncatedPoints = flatten([
     completeTick(tickTs(1)),
@@ -414,7 +414,7 @@ test("computeScheduledJobBaselineCandidates: degraded/untrustworthy retained his
 
 test("computeScheduledJobBaselineCandidates: a corrupt baseline store forces a PERSISTENT cold-start -- corrupt tick then the self-healed tick right after both stay at zero (not 0-then-1); a second genuinely-new complete tick since the reset re-establishes, and the detector fires normally afterward (positive control)", async () => {
   const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: true });
   const minHistoryTickCount = 2;
 
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
@@ -449,12 +449,12 @@ test("computeScheduledJobBaselineCandidates: a corrupt baseline store forces a P
   assert.equal(resumed.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
 });
 
-test("computeScheduledJobBaselineCandidates with learned.json disabled makes ZERO calls into readFactPoints/loadPersistenceBaselineStore", async () => {
+test("computeScheduledJobBaselineCandidates with watch.json disabled makes ZERO calls into readFactPoints/loadPersistenceBaselineStore", async () => {
   const paths = await tempPaths();
   let readCalls = 0;
   let loadCalls = 0;
   const result = await computeScheduledJobBaselineCandidates(paths, {
-    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadPersistenceBaselineStore: async () => { loadCalls += 1; return { state: normalizePersistenceBaselineState() }; },
   });
