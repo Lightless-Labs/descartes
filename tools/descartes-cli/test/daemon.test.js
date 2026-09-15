@@ -526,14 +526,15 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
   // Slice S4 sibling-default consistency (plan section 4): provenance defaults true, matching
-  // its three siblings exactly — still gated end-to-end by the outer learned.json kill switch.
+  // its three siblings exactly — still gated end-to-end by the outer watch.json kill switch
+  // (watch-by-default slice 1, §3.2/§12; watch.json itself now defaults enabled:true).
   assert(profile.structural.collectors.provenance.enabled);
   // Slice 1 (observed-incident collectors plan) sibling-default consistency: sessions defaults
-  // true, matching its siblings exactly — still gated end-to-end by the outer learned.json kill
+  // true, matching its siblings exactly — still gated end-to-end by the outer watch.json kill
   // switch, and this collector itself never emits an alert candidate (pure L0 fact source).
   assert(profile.structural.collectors.sessions.enabled);
   // Slice 3 (observed-incident collectors plan) sibling-default consistency: vpn-peer-status
-  // defaults true, matching its siblings exactly — same outer learned.json kill switch, and this
+  // defaults true, matching its siblings exactly — same outer watch.json kill switch, and this
   // collector ALSO never emits an alert candidate (pure L0 fact source, RESOLVED option 1).
   assert(profile.structural.collectors["vpn-peer-status"].enabled);
   assert(profile.structural.collectors["tailscale-status"].enabled);
@@ -659,7 +660,7 @@ test("runDaemonIteration with a structural-less profile writes no structural che
   await assert.rejects(() => fs.access(resolveStructuralCheckpointPath(paths)));
 });
 
-test("default profile's structural block is inert without the learned.json kill switch (byte-identical fast path)", async () => {
+test("default profile's structural block is inert without the watch.json kill switch (byte-identical fast path)", async () => {
   const paths = await tempPaths();
   const ts = "2026-05-24T00:00:00.000Z";
   const neverCallStructural = {
@@ -838,7 +839,7 @@ test("a structural tick that completes well within its deadline is unaffected by
   assert(result.status.structural_collector_statuses.every((entry) => entry.status === "ok"));
 });
 
-test("kill switch: structural collection is skipped entirely while learned.json enabled is false, even when due", async () => {
+test("kill switch: structural collection is skipped entirely while watch.json enabled is false, even when due", async () => {
   const paths = await tempPaths();
   const structuralCalls = [];
 
@@ -865,6 +866,71 @@ test("kill switch: structural collection is skipped entirely while learned.json 
 
   const checkpointAfter = await readStructuralCheckpoint(paths);
   assert.equal(checkpointAfter.last_structural_run_ms, 0, "checkpoint must not advance while the kill switch is off");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Watch-by-default slice 1 (plan §8 step 2): the two cross-flag pinned tests the plan calls for
+// explicitly, beyond the Fix-3 regression above -- both flag combinations that were previously
+// impossible (there was only ever one flag) and must now be asserted directly, not left implicit.
+// ---------------------------------------------------------------------------------------------
+
+test("watch-by-default slice 1: watch OFF + author ON collects NOTHING -- AUTHOR starves without WATCH, by design (shadow evaluation is nested INSIDE the watch block, with no independent path in)", async () => {
+  const paths = await tempPaths();
+  const structuralCalls = [];
+  await writeConstraints(paths, [shadowConstraintFixture()]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(structuralCalls),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadWatchConfig: async () => ({ enabled: false }),
+    loadLearnedConfig: async () => ({ enabled: true }),
+  });
+
+  assert.deepEqual(structuralCalls, [], "no structural collector may run while watch is off, regardless of learned/AUTHOR's state");
+  assert.equal(result.structuralEvidence, undefined);
+  assert.equal(result.structuralFacts, undefined);
+  assert.equal(result.shadowEvaluation, undefined, "AUTHOR starves without WATCH by design -- a real status:\"shadow\" constraint exists, but its evaluation is gated on the nested learnedConfig check the (closed) WATCH block never reaches");
+  assert(!("structural_collector_statuses" in result.status));
+  await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
+});
+
+test("watch-by-default slice 1: watch ON + author OFF collects structural facts and computes historyTrust, but never evaluates shadow constraints (the nested AUTHOR AND-gate holds even while WATCH is on)", async () => {
+  const paths = await tempPaths();
+  await writeConstraints(paths, [shadowConstraintFixture()]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: structuralCollectorFakesWithFacts(),
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadWatchConfig: async () => ({ enabled: true }),
+    loadLearnedConfig: async () => ({ enabled: false }),
+  });
+
+  // Structural collection genuinely ran (WATCH on) and persisted real facts -- this is exactly the
+  // default (watch-on, author-off) population's expected behavior.
+  assert.notEqual(result.structuralEvidence, undefined);
+  assert.notEqual(result.structuralFacts, undefined);
+  assert(result.structuralFacts.written_count > 0, "expected real structural facts to be persisted under watch:true/author:false");
+
+  // The shared fact-history trust read (§3.2's load-bearing finding, its OWN independent
+  // watchConfig load) also ran -- independent of AUTHOR -- and is reflected on the status record.
+  assert.notEqual(result.status.fact_store_completeness, undefined, "the fact-history trust read must run under watch:true regardless of author's state");
+
+  // But shadow-constraint evaluation -- nested inside the WATCH block on its OWN AUTHOR
+  // (learned.json) check -- did NOT run, even though a real status:"shadow" constraint exists.
+  assert.equal(result.shadowEvaluation, undefined, "shadow evaluation must stay gated on AUTHOR even while WATCH is on");
+  await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
 });
 
 // --- Slice S6b, additive follow-up: structural evidence -> fact-points -> facts.jsonl ---
@@ -902,7 +968,7 @@ test("S6b wiring: structural evidence is translated into fact-points and persist
   assert(points.some((point) => point.fact_name === SCHEDULED_JOB_CENSUS_FACT_NAME && point.entity_key === SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY && point.attributes.census_state === "complete"));
 });
 
-test("S6b wiring: no fact-points are persisted while the learned.json kill switch is off, even with populated structural evidence available", async () => {
+test("S6b wiring: no fact-points are persisted while the watch.json kill switch is off, even with populated structural evidence available", async () => {
   const paths = await tempPaths();
   const result = await runDaemonIteration(paths, {
     collectors: fastCollectorFakes(),
@@ -1017,7 +1083,7 @@ test("S7a wiring: with zero shadow constraints, a structural tick produces no sh
 // appendFactPoints call site as options.maxBytes, so an operator has an actual lever to stop
 // routine bytecap eviction (previously hardcoded to fact-store.js's DEFAULT_FACT_MAX_BYTES with
 // no override surface at all).
-test("structural fact-persist threads learned-config fact_store_max_bytes into appendFactPoints as options.maxBytes", async () => {
+test("structural fact-persist threads watch-config fact_store_max_bytes (not learned-config's) into appendFactPoints as options.maxBytes", async () => {
   const paths = await tempPaths();
   const seenOptions = [];
   const spyAppendFactPoints = async (spyPaths, points, options) => {
@@ -1034,13 +1100,16 @@ test("structural fact-persist threads learned-config fact_store_max_bytes into a
     now: Date.parse("2026-05-24T00:00:00.000Z"),
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
-    loadLearnedConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456 }),
+    // Deliberately DIFFERENT values (watch-by-default slice 1, plan §12.3 fact 3): the structural
+    // fact-store byte cap now sources from watchConfig, not learnedConfig, so this pins WHICH
+    // source actually wins -- a shared value on both flags (as before the split) couldn't tell.
+    loadLearnedConfig: async () => ({ enabled: true, fact_store_max_bytes: 111111 }),
     loadWatchConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456 }),
     appendFactPoints: spyAppendFactPoints,
   });
 
   assert.equal(seenOptions.length, 1);
-  assert.equal(seenOptions[0].maxBytes, 123456);
+  assert.equal(seenOptions[0].maxBytes, 123456, "maxBytes must come from watchConfig.fact_store_max_bytes, not learnedConfig's");
 });
 
 test("S7a wiring: with one shadow constraint and a matching fact, exactly one shadow-violations.jsonl record is appended per structural tick", async () => {
@@ -1721,7 +1790,7 @@ test("Slice 1: the sessions sub-collector runs on a structural-due tick alongsid
   assert.equal(sessionPoint.attributes.window_count_bucket, "2-4");
 });
 
-test("Slice 1: no session fact-points are persisted while the learned.json kill switch is off, even with populated session evidence available (byte-identical fast path)", async () => {
+test("Slice 1: no session fact-points are persisted while the watch.json kill switch is off, even with populated session evidence available (byte-identical fast path)", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     ...structuralCollectorFakes(),
@@ -1916,7 +1985,7 @@ test("Slice 3: the vpn-peer-status sub-collector runs on a structural-due tick a
   assert.equal(peerPoint.attributes.presence_state, "observed_active");
 });
 
-test("Slice 3: no peer fact-points are persisted while the learned.json kill switch is off, even with populated peer evidence available (byte-identical fast path)", async () => {
+test("Slice 3: no peer fact-points are persisted while the watch.json kill switch is off, even with populated peer evidence available (byte-identical fast path)", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     ...structuralCollectorFakes(),
@@ -2261,7 +2330,7 @@ test("Slice 4: byte-identical real alerts when the learned kill switch is off, e
   assert.deepEqual(withSessions.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withSessions.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withSessions.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the watch.json kill switch is off");
 
   const persisted = await readAlertRecords(withSessionsPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID || alert.rule_id === SESSION_CHURN_RULE_ID), false);
@@ -3356,7 +3425,7 @@ test("Service-appearance wiring: computeServiceAppearanceCandidates reaches the 
   assert.equal(state.appeared_event_count, 1);
 });
 
-test("Service-appearance: byte-identical real alerts when the learned kill switch is off, even with service fact-history present that would otherwise appear-fire, and no I/O is attempted for it", async () => {
+test("Service-appearance: byte-identical real alerts when the watch kill switch is off, even with service fact-history present that would otherwise appear-fire, and no I/O is attempted for it", async () => {
   const baselinePaths = await tempPaths();
   const baseline = await runIsolatedDaemonTick(baselinePaths);
 
@@ -3365,10 +3434,25 @@ test("Service-appearance: byte-identical real alerts when the learned kill switc
   for (let i = 0; i < 3; i += 1) ticks.push(...completeServiceTick(hour(i), ["worker.service"]));
   ticks.push(...completeServiceTick(hour(3), ["worker.service", "new-backdoor.service"]));
   await appendFactPoints(withServicesPaths, ticks, { now: hour(3) });
-  const withServices = await runIsolatedDaemonTick(withServicesPaths, hour(3));
+  // Watch-by-default slice 1 (§12.1): computeServiceAppearanceCandidates now gates on
+  // watch.json, which defaults enabled:true on ENOENT -- explicitly disabled here (with a spy)
+  // so this test's "no I/O is attempted" claim is enforced, not merely an accidental pass masked
+  // by the appearance detector's own cold-start lockout (only 4 ticks seeded here, short of
+  // DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT=6, which would ALSO suppress the alert even if watch
+  // were left on and real I/O occurred).
+  let readFactsCalled = false;
+  const withServices = await runDaemonIteration(withServicesPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(3),
+    now: hour(3),
+    loadWatchConfig: async () => ({ enabled: false }),
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+  });
 
   assert.deepEqual(withServices.alerts.alerts, baseline.alerts.alerts);
   assert.equal(withServices.alerts.alerts.some((a) => a.rule_id === SERVICE_APPEARED_RULE_ID), false);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the watch.json kill switch is off");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -3693,19 +3777,34 @@ test("Slice 7.2 wiring, THE LOAD-BEARING FAIL-CLOSED TRANSITION (Definition of D
   assert.ok(tick3.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID)?.status === "active", "the trigger itself is still active on tick 3 -- confirms this is the opt-in's own doing, not the trigger clearing");
 });
 
-test("Slice 7.2 wiring: byte-identical real alerts when BOTH the learned kill switch and the containment opt-in are off, even with peer fact-history present that would otherwise trigger a recommendation, and no I/O is attempted for it", async () => {
+test("Slice 7.2 wiring: byte-identical real alerts when watch, learned, AND the containment opt-in are all off, even with peer fact-history present that would otherwise trigger a recommendation, and no I/O is attempted for it", async () => {
   const baselinePaths = await tempPaths();
   const baseline = await runIsolatedDaemonTick(baselinePaths);
 
   const withHistoryPaths = await tempPaths();
   await appendFactPoints(withHistoryPaths, containmentPeerSpikeTicks(), { now: hour(30) });
   // Neither learned.json nor containment-recommend.json is ever written here -> both default OFF,
-  // exactly like the baseline above.
-  const withHistory = await runIsolatedDaemonTick(withHistoryPaths, hour(30));
+  // exactly like the baseline above. Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates
+  // (the underlying trigger this test seeds) has itself MOVED to watch.json, which defaults
+  // enabled:true on ENOENT -- explicitly disabled here too (with a spy), so the "no I/O is
+  // attempted" claim is enforced rather than an accidental pass masked by peer-baseline's own
+  // fresh-store cold-start lockout (no prior fold ever ran here, so reestablishedTickCount stays
+  // at 0 regardless of how much raw fact-history exists, suppressing the alert independent of
+  // watch's state -- exactly the "quieter for longer, never wrong" property §7 describes).
+  let readFactsCalled = false;
+  const withHistory = await runDaemonIteration(withHistoryPaths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: hour(30),
+    now: hour(30),
+    loadWatchConfig: async () => ({ enabled: false }),
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+  });
 
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the watch.json kill switch is off");
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -141,32 +141,35 @@ export function defaultDaemonProfile() {
         services: { enabled: true },
         network: { enabled: true },
         "scheduled-jobs": { enabled: true },
-        // Slice S4: default true, matching its siblings exactly — still safe/byte-identical
-        // for any operator who hasn't opted into learned features at all, because the outer
-        // configDir/learned.json {enabled:false} kill switch gates the entire structural tick
-        // (including this sub-collector) before any of it runs. See plan section 4.
+        // Slice S4: default true, matching its siblings exactly. Watch-by-default slice 1
+        // (§3.2/§12): the outer gate for this whole structural tick is now configDir/watch.json's
+        // WATCH flag, which itself defaults enabled:true -- so this sub-collector runs by default
+        // on a fresh install too (that is the point of this slice), not merely "byte-identical
+        // because the gate was off". configDir/learned.json (AUTHOR) is unaffected. See plan
+        // section 4 and docs/plans/2026-09-10-watch-by-default-slice-1.md.
         provenance: { enabled: true },
         // Slice 1 (observed-incident collectors plan): default true, matching its siblings
-        // exactly — still safe/byte-identical for any operator who hasn't opted into learned
-        // features, because the outer configDir/learned.json {enabled:false} kill switch gates
-        // the entire structural tick (including this sub-collector) before any of it runs. Pure
-        // read-only L0 fact source (tmux/screen census) — this slice emits NO alert candidates
-        // (no extraCandidates addition below; see docs/plans/2026-07-13-observed-incident-
-        // collectors.md Slice 1). Alerting on session-count deviation/churn is Slice 4's job.
+        // exactly. Runs under the same default-ON watch.json gate as the rest of the structural
+        // tick (watch-by-default slice 1, §3.2/§12). Pure read-only L0 fact source (tmux/screen
+        // census) — this slice emits NO alert candidates (no extraCandidates addition below; see
+        // docs/plans/2026-07-13-observed-incident-collectors.md Slice 1). Alerting on
+        // session-count deviation/churn is Slice 4's job (and, per watch-by-default slice 1 §11
+        // #1, that alerting itself now also runs under the default-ON watch.json gate).
         sessions: { enabled: true },
         // Slice 3 (observed-incident collectors plan): default true, matching its siblings
-        // exactly — same outer learned.json kill switch, same structural-tick deadline/discard
-        // discipline. Pure read-only L0 fact source (SSH/VPN peer census) — this slice ALSO
-        // emits NO alert candidates (no extraCandidates addition below; see docs/plans/
-        // 2026-07-13-observed-incident-collectors.md Slice 3's Alert-emission scope decision,
-        // RESOLVED option 1). Alerting on unattributed/odd-hour peer logins is Slice 4/6's job.
+        // exactly — same outer watch.json gate (watch-by-default slice 1, §3.2/§12), same
+        // structural-tick deadline/discard discipline. Pure read-only L0 fact source (SSH/VPN peer
+        // census) — this slice ALSO emits NO alert candidates (no extraCandidates addition below;
+        // see docs/plans/2026-07-13-observed-incident-collectors.md Slice 3's Alert-emission scope
+        // decision, RESOLVED option 1). Alerting on unattributed/odd-hour peer logins is Slice
+        // 4/6's job (also now watch-gated, §11 #1).
         "vpn-peer-status": { enabled: true },
-        // Pure read-only Tailscale/tailnet L0 fact source, default true under the same learned
-        // kill switch and with no extraCandidates addition.
+        // Pure read-only Tailscale/tailnet L0 fact source, default true under the same watch.json
+        // gate and with no extraCandidates addition.
         "tailscale-status": { enabled: true },
         // Canary collection is default-enabled like the other read-only structural collectors,
         // but remains byte-identical for existing installations because an absent/empty manifest
-        // produces no canary facts and the outer learned.json gate still controls this tick.
+        // produces no canary facts, regardless of watch.json's now-default-ON gate.
         canary: { enabled: true },
         "process-lineage": { enabled: true },
       },
