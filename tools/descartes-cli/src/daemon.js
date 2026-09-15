@@ -834,26 +834,28 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // suppressed history-dependent family's persisted alert "recovered" just because its absent
   // candidate is indistinguishable from a genuine clear).
   //
-  // Watch-by-default slice 1 (plan §3.2/§12.3 fact 1, load-bearing): gated on configDir/
-  // watch.json's WATCH flag, NOT configDir/learned.json's AUTHOR flag. HISTORY_DEPENDENT_ALERT_
-  // RULE_IDS (above) already covers all six watch-tier detector families (service.appeared/
-  // disappeared, session.churn/count_drop, peer.count_spike/drop, process.lineage.novel_edge,
-  // scheduled_job.appeared) plus correlation/canary.tampered -- every one of those now runs under
-  // WATCH, default-on. Leaving this read gated on the AUTHOR flag would mean `historyTrust` stays
-  // `undefined` for the default (watch-on, author-off) population, and computeCoveredRuleIds would
-  // fall back to unrestricted recovery for exactly the families this slice turns on by default --
-  // silently reopening the fabricated-recovery hole Fix 3 closed. (Regression-tested: see
-  // daemon.test.js's "watch-by-default Fix-3 regression" test, a real red->green against this
-  // exact finding.) AUTHOR is a strict addition on top of WATCH's fact substrate (mining/shadow/
-  // active-constraint evaluation are meaningless without structural facts, which only exist when
-  // watch is on), so gating on watchConfig.enabled alone is sufficient -- no OR of the two flags
-  // is needed. Loaded via its OWN independent options.loadWatchConfig ?? loadWatchConfig call
-  // (not folded into the structural-tick block's watchConfig above): this read sits OUTSIDE the
-  // `if (structuralProfile?.interval_ms)` guard and runs on EVERY fast tick, not just a
-  // structural-due one, so it must not depend on that block having run this tick. When watch is
-  // disabled there is no fact store to protect, and this stays a true no-op (byte-identical to
-  // the pre-revision fast path; this file's repeated "no I/O when disabled" tests pin exactly
-  // this, now against watch.json instead of learned.json).
+  // Watch-by-default slice 1 BLOCKER fix (Fable interim adversarial pass, post-Step-3): gated on
+  // watchConfig.enabled **OR** learnedConfig.enabled, NOT watch alone. HISTORY_DEPENDENT_ALERT_
+  // RULE_IDS (above) covers all six watch-tier detector families (service.appeared/disappeared,
+  // session.churn/count_drop, peer.count_spike/drop, process.lineage.novel_edge,
+  // scheduled_job.appeared) -- those six genuinely did all move to WATCH -- PLUS correlation and
+  // canary.tampered, which did NOT move: computeCorrelationCandidates (incident-correlation.js)
+  // and computeCanaryBaselineCandidates (canary-baseline.js) are still gated on learnedConfig
+  // ONLY. A watch-only gate here left a real gap: with watch:false + learned:true, this read
+  // never ran (historyTrust stayed undefined), yet correlation/canary genuinely ran (learned on)
+  // and genuinely went silent on degraded history -- their absent candidates then read as a
+  // genuine clear and got fabricated-"recovered", exactly the hole Fix 3 exists to close.
+  // Regression-tested: daemon.test.js's "watch-by-default BLOCKER regression" test, a real
+  // red->green against this exact finding (mirrors the earlier "watch-by-default Fix-3
+  // regression" test, which covers the inverse watch:true/learned:false population -- together
+  // the two tests cover both halves of the OR). When BOTH flags are disabled there is no fact
+  // store to protect, and this stays a true no-op (byte-identical to the pre-revision fast path;
+  // this file's repeated "no I/O when disabled" tests pin exactly this). Both configs are loaded
+  // via their OWN independent options.load*Config ?? load*Config calls (not folded into the
+  // structural-tick block's watchConfig above, and the learnedConfig loaded here is reused below
+  // at the containment-exclusion call site rather than loaded a third time): this read sits
+  // OUTSIDE the `if (structuralProfile?.interval_ms)` guard and runs on EVERY fast tick, not just
+  // a structural-due one, so it must not depend on that block having run this tick.
   //
   // BLOCKER 1 re-gate: only `historyTrust` itself (the TRUST DECISION) is computed here, at the
   // same point as before -- the actual coveredRuleIds Set is now built LATER, via
@@ -863,9 +865,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // actually been attempted this tick.
   const loadWatchConfigForHistory = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfigForHistory = await loadWatchConfigForHistory(descartesPaths);
+  const loadLearnedConfigForHistory = options.loadLearnedConfig ?? loadLearnedConfig;
+  const learnedConfigForHistory = await loadLearnedConfigForHistory(descartesPaths);
   let factStoreCompleteness;
   let historyTrust;
-  if (watchConfigForHistory.enabled) {
+  if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
     let factHistoryReadResult;
     try {
@@ -1022,31 +1026,35 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // re-derives and reactivates the same candidate, but NOT when containment itself throws,
     // which is exactly BLOCKER 1's phase-appropriate-coverage requirement.
     // NOT gated on any kill switch: the 12 detectors above run regardless, so a detector EXCEPTION
-    // must exclude its family from recovery ALWAYS. Gating the whole computation on the kill
+    // must exclude its family from recovery ALWAYS. Gating the whole computation on a kill
     // switch's enabled flag (an earlier attempt did exactly this on learned.enabled) reopened
-    // BLOCKER 1: a throwing detector with no gate of its own (e.g. canary-baseline) still
-    // fabricated a "recovered" whenever that flag was off. The same regression is reachable again
-    // via watchConfigForHistory.enabled now that watch.json exists -- watch defaults ON, so it
-    // isn't the common case today, but an operator running `baseline disable` (or a fresh
-    // ENOENT-disabled watch.json) reaches it exactly the same way learned-disabled did before this
-    // slice (regression-tested: daemon.test.js's "BLOCKER 1 re-gate" test drives BOTH flags
-    // disabled). So the call stays unconditional; computeCoveredRuleIds internally early-returns
-    // undefined with ZERO I/O when nothing warrants a restriction (historyTrust is undefined when
-    // watch is disabled -> historyUntrusted false -> no fact read).
+    // BLOCKER 1: a throwing detector still fabricated a "recovered" whenever that flag was off,
+    // REGARDLESS of whether the throwing detector has its own gate (a "no gate of its own"
+    // detector like canary-baseline was the sharpest illustration of the bug, not a description of
+    // canary itself -- canary-baseline.js IS learned-gated, same as correlation; see the
+    // fact-history-read comment above for the two-flag-OR fix to the sibling gap this created).
+    // The same whole-computation-gated regression is reachable via either watchConfigForHistory.
+    // enabled or learnedConfigForHistory.enabled now that both exist -- watch defaults ON, so
+    // watch-disabled isn't the common case today, but an operator running `baseline disable` (or
+    // a fresh ENOENT-disabled watch.json) reaches it exactly the same way learned-disabled did
+    // before this slice (regression-tested: daemon.test.js's "BLOCKER 1 re-gate" test drives BOTH
+    // flags disabled). So the call stays unconditional; computeCoveredRuleIds internally
+    // early-returns undefined with ZERO I/O when nothing warrants a restriction (historyTrust is
+    // undefined when BOTH watch and learned are disabled -> historyUntrusted false -> no fact
+    // read).
     // The containment exclusion (alwaysExcludedRuleIds) stays scoped to the AUTHOR flag (plan
-    // §3.2/§12.3 fact 2: containment stays opt-in, unmoved by this slice) -- loaded independently
-    // here since the fact-history read above no longer loads learnedConfig at all. Passed ONLY
-    // when learned is enabled: containment is inert when learned is off (Slice 7.2 -> zero
-    // recommendations, and a stale recommendation SHOULD then recover), so there is nothing to
-    // withhold, and passing [] keeps the early-return firing on the normal learned-off tick --
-    // preserving this file's "no I/O when the kill switch is off" invariant. A genuine detector
-    // failure still forces its family's exclusion via failedLabels on EITHER path.
-    const loadLearnedConfigForContainment = options.loadLearnedConfig ?? loadLearnedConfig;
-    const learnedConfigForContainment = await loadLearnedConfigForContainment(descartesPaths);
+    // §3.2/§12.3 fact 2: containment stays opt-in, unmoved by this slice) -- reuses
+    // learnedConfigForHistory (loaded once, above, for the fact-history-read OR) rather than
+    // loading learnedConfig a third time. Passed ONLY when learned is enabled: containment is
+    // inert when learned is off (Slice 7.2 -> zero recommendations, and a stale recommendation
+    // SHOULD then recover), so there is nothing to withhold, and passing [] keeps the early-return
+    // firing on the normal learned-off/watch-off tick -- preserving this file's "no I/O when both
+    // kill switches are off" invariant. A genuine detector failure still forces its family's
+    // exclusion via failedLabels on EITHER path.
     coveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
-      alwaysExcludedRuleIds: learnedConfigForContainment.enabled ? containmentRecommendationRuleIds() : [],
+      alwaysExcludedRuleIds: learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : [],
     });
     mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,

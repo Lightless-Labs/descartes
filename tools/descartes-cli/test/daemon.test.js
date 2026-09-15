@@ -4545,6 +4545,79 @@ test("watch-by-default Fix-3 regression: a genuinely degraded fact-history must 
   assert.equal(result.status.fact_store_completeness?.status, "degraded");
 });
 
+// Watch-by-default slice 1, BLOCKER (Fable interim adversarial pass, post-Step-3): the mirror
+// image of the "watch-by-default Fix-3 regression" test above, for the MIXED watch:false/
+// learned:true population. `correlation` (incident-correlation.js) and `canary.tampered`
+// (canary-baseline.js) are BOTH still gated on learnedConfig ONLY -- they never moved to watch --
+// yet both rule_ids are in HISTORY_DEPENDENT_ALERT_RULE_IDS. Before the fix, the shared
+// fact-history trust read was gated on watchConfigForHistory.enabled ALONE: with watch off, the
+// read never runs, historyTrust stays undefined, historyUntrusted is false, and neither rule_id is
+// excluded from coveredRuleIds -- even though `learned:true` means both detectors DO run this tick
+// and genuinely go silent on degraded history. Their absent candidates then read as a genuine
+// clear and get fabricated-"recovered". Pre-split, learned:true always ran this read; this is a
+// real regression introduced by watch-by-default slice 1's naive OR-less gate, not a pre-existing
+// gap.
+test("watch-by-default BLOCKER regression: a genuinely degraded fact-history must freeze correlation/canary.tampered even when WATCH is OFF and only AUTHOR/learned is on (the mixed population)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: false });
+  const now = S_LIVE_1_TICK_TS;
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  await fs.writeFile(storePaths.factsFile, "not-json\n");
+  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window
+  // corrupt-line loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what
+  // daemon.js's own shared Fix-2/Fix-3 read will observe this tick (once it runs at all).
+  await appendFactPoints(paths, [], { now });
+  await appendFactPoints(paths, [], { now });
+  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(degradedRead.completeness.status, "degraded");
+  assert.equal(degradedRead.completeness.corrupt_dropped_total, 1);
+
+  // Pre-existing active alerts: correlation.login_kill_proximity and canary.tampered -- both
+  // still learned-gated (unmoved), both history-dependent.
+  await writeAlertRecords(paths, [
+    {
+      rule_id: CORRELATION_RULE_ID, fingerprint: "global", status: "active", severity: "warning",
+      title: "Correlated login/kill proximity", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+    {
+      rule_id: CANARY_TAMPERED_RULE_ID, fingerprint: "canary_vanished", status: "active", severity: "warning",
+      title: "Canary tampered", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+  ]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // Both detectors genuinely RUN this tick (learned:true) and genuinely return [] -- exactly
+    // the shape their own completeness-gated cold-start lockout would produce while history is
+    // untrustworthy. Neither throws, so failedDetectorLabels stays empty for them -- the ONLY
+    // thing that can protect their alerts here is historyTrust/HISTORY_DEPENDENT_ALERT_RULE_IDS.
+    computeCorrelationCandidates: async () => [],
+    computeCanaryBaselineCandidates: async () => [],
+  });
+
+  const correlationAlert = result.alerts.alerts.find((a) => a.rule_id === CORRELATION_RULE_ID);
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
+  assert.ok(correlationAlert, "the correlation alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(correlationAlert.status, "active", "must NOT be fabricated-recovered: correlation is learned-gated (still runs), history is degraded, and watch being off must not blind the shared history-trust read to that");
+  assert.ok(canaryAlert, "the canary.tampered alert must still be PRESENT");
+  assert.equal(canaryAlert.status, "active", "canary.tampered is wholesale-covered by HISTORY_DEPENDENT_ALERT_RULE_IDS and must also stay frozen");
+
+  // Confirm on disk too (both persistence passes -- main then containment -- already ran by the
+  // time runDaemonIteration resolves), not just the in-memory result.
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === CORRELATION_RULE_ID)?.status, "active");
+  assert.equal(persisted.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID)?.status, "active");
+
+  // The shared fact-history trust read must have actually run (protected by learned:true via the
+  // OR), reflecting the genuinely-degraded read on the status record.
+  assert.equal(result.status.fact_store_completeness?.status, "degraded");
+});
+
 test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the containment phase re-merges main's candidates and independently computes its own isCovered, so a fix scoped to only the main call would leave this red", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
@@ -4645,17 +4718,21 @@ test("BLOCKER 1: a detector EXCEPTION (fact-history otherwise TRUSTWORTHY) must 
   );
 });
 
-test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even when BOTH learned.json and watch.json are DISABLED -- canary-baseline has no learned gate, so its exception must not fabricate a recovery regardless of either kill switch", async () => {
+test("BLOCKER 1 re-gate: the failed-detector recovery-exclusion applies even when BOTH learned.json and watch.json are DISABLED -- the injected throw bypasses canary-baseline's own (real) learned gate via the DI seam, so its exception must not fabricate a recovery regardless of either kill switch", async () => {
   const paths = await tempPaths();
   // learned.json intentionally NOT written -> disabled (the default out-of-the-box state for
   // AUTHOR). An earlier fix gated the main-call coveredRuleIds computation on learned.enabled,
-  // which reopened BLOCKER 1 here: canary-baseline has no learned gate, so a genuine exception
-  // still flipped its own active alert to "recovered" on that gated-off path. The failed-detector
-  // exclusion must apply ALWAYS (detector failure is orthogonal to either kill switch). Watch-by-
-  // default slice 1: watch.json's real ENOENT default is enabled:true (the opposite of
-  // learned.json's), so it must be injected explicitly disabled here too -- otherwise this test
-  // would no longer guard against the equivalent regression re-gating on watchConfig.enabled
-  // instead (e.g. via a future `baseline disable`), since watch would be silently ON by default.
+  // which reopened BLOCKER 1 here: computeCanaryBaselineCandidates IS gated on learnedConfig in
+  // its real implementation (canary-baseline.js) -- but the injected replacement below (the file's
+  // options.<fn> ?? <fn> DI seam) throws UNCONDITIONALLY, before ever reaching that real gate, so
+  // this exercises the bypass path exactly as a genuine uncaught exception in production would
+  // (a bug, a permissions error, a corrupt manifest read -- none of which check learned.json
+  // first either). The failed-detector exclusion must apply ALWAYS (detector failure is
+  // orthogonal to either kill switch). Watch-by-default slice 1: watch.json's real ENOENT default
+  // is enabled:true (the opposite of learned.json's), so it must be injected explicitly disabled
+  // here too -- otherwise this test would no longer guard against the equivalent regression
+  // re-gating on watchConfig.enabled instead (e.g. via a future `baseline disable`), since watch
+  // would be silently ON by default.
   const now = S_LIVE_1_TICK_TS;
   await writeAlertRecords(paths, [{
     rule_id: CANARY_TRIPPED_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
