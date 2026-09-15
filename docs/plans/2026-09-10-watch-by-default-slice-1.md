@@ -2,6 +2,7 @@
 
 **Date:** 2026-09-10
 **Status:** PLAN
+**Addendum:** 2026-09-15 — execution-time dispatch addendum added (§12), the source of truth for the implementer where it and the body disagree: the six-file gate-move list (§3.4's "four" is STALE — peer/session joined WATCH per §11 #1), the Step-0 test-injection categorization rule (three buckets), and three grounded do-not-move/independent-load facts re-read from the seams. Baseline suite green at 1942/0/34 before build.
 
 **Goal (one line):** split Descartes' single `learnedConfig.enabled` kill switch into a default-on **WATCH** layer (structural inventory collection + the deterministic new/removed change-detectors) and a still-default-off **AUTHOR** layer (constraint mining/promotion/tuning), add a visible per-domain "still learning vs. watching" surface, and route the four watch-tier novelty detectors' output through the existing alert pipeline with honest labels — turning Descartes into a default, no-config, discover-and-flag monitor.
 
@@ -216,6 +217,51 @@ descartes watch enable|disable [--json]          # the new watch.json kill switc
 5. **Existing-install migration and consent.** Per §3.5's three cases: is there a first-run notice, an upgrade-time prompt, or any explicit consent surface for the population that goes from "Descartes does nothing extra" to "Descartes is now watching my machine's service/job/process inventory" with no action on their part? This is a real product decision for a defensive-security tool, not a formality — flagged explicitly per the task's own instruction to surface it. Relatedly, does an existing explicit `learned disable` (case 3, distinguishable via `updated_at`) get honored as "and don't turn WATCH on either," or is it ignored as out-of-scope for a flag that, at the time it was set, didn't distinguish watch from author?
 6. **README/marketing-language consequence.** `README.md:52-58,272-296,341` currently states the self-learning/defensive-detection subsystem is uniformly "off by default" behind "one kill switch." This slice makes that literally false for four specific alert families. The updated language needs to say, accurately, "structural watching is on by default; authoring/promotion stays opt-in" — a wording and framing decision, not just a mechanical doc sync.
 7. **Six-hour default learning window.** Reasonable for an operator who explicitly opted in; is it still the right default when watching turns on for everyone, unannounced, on install? No detector-constant retuning is in scope (§10), but the *product* question of whether the default learning window is appropriate for a default-on product is open.
+
+---
+
+## 12. Dispatch addendum (2026-09-15) — execution-time corrections, load-bearing
+
+This section is the **source of truth for the implementer**. Where it and the plan body (§1–§11) disagree, this section wins — it reflects the §11 operator resolutions plus a grounded re-read of the seams on 2026-09-15.
+
+### 12.1 SIX detector files move to WATCH, not four
+
+§3.4's body predates the §11 #1 resolution and still says "four" and explicitly excludes peer/session. That is **STALE**. The full set of gate-moves — in each, replace the internal `const learnedConfig = await loadConfig(...); if (!learnedConfig.enabled) return [];` short-circuit with the equivalent read against `loadWatchConfig` (via the same `options.loadWatchConfig ?? loadWatchConfig` DI seam); everything below the gate (cold-start lockout, `readFactPoints`, store load/write, candidate building) is unchanged:
+
+1. `service-baseline.js` → `computeServiceBaselineCandidates` (`:466-468`) — `service.disappeared`
+2. `service-baseline.js` → `computeServiceAppearanceCandidates` (`:847-849`) — `service.appeared`
+3. `persistence-baseline.js` → `computeScheduledJobBaselineCandidates` (`:295-297`) — `scheduled_job.appeared`
+4. `process-lineage-baseline.js` → `computeProcessLineageBaselineCandidates` (`:309-311`) — `process.lineage.novel_edge`
+5. `peer-baseline.js` → `computePeerBaselineCandidates` (`:704-706`) — `peer.count_spike` / `peer.count_drop`
+6. `session-baseline.js` → `computeSessionBaselineCandidates` (`:624-626`) — `session.churn` / `session.count_drop`
+
+**VERIFIED 2026-09-15:** `HISTORY_DEPENDENT_ALERT_RULE_IDS` (`daemon.js:99-110`) ALREADY contains all six families' rule ids (`SERVICE_DISAPPEARED/APPEARED`, `SESSION_COUNT_DROP/CHURN`, `PEER_COUNT_SPIKE/DROP`, `PROCESS_LINEAGE_NOVEL_EDGE`, `SCHEDULED_JOB_APPEARED`). So moving the `historyTrust` read to WATCH (§3.2) protects peer/session too — that Set needs no change.
+
+### 12.2 Step 0 — the test-injection rule (categorized)
+
+The rule is **NOT** "default watch to `{enabled:false}`". It is: **an existing test's injected `loadWatchConfig` must equal whatever `loadLearnedConfig` was for that test** — this preserves today's single-flag semantics by construction. Only NEW tests diverge the two flags. `daemon.test.js` has **no shared options-builder helper** — ~34 inline `loadLearnedConfig: async () => ({enabled:true})` literals plus ~11 "intentionally not injected → real ENOENT default (disabled)" sites. Three buckets:
+
+- **Bucket 1 — daemon-level tests** (`daemon.test.js`, `canary-baseline.test.js`, `evidence-freeze.test.js`, and any daemon-driving test): for each injection site, ADD a `loadWatchConfig` injection MATCHING that site's learned value. **Critical:** the ~11 `daemon.test.js` sites that DON'T inject `loadLearnedConfig` (relying on the real ENOENT→disabled default) MUST now explicitly inject `loadWatchConfig: async () => ({enabled:false})` — otherwise they hit the new WATCH default `{enabled:true}` and silently perform structural I/O they were pinning as silent. This is the copy-paste blast radius; verify per-site.
+- **Bucket 2 — the six moving detectors' own tests** (`service-baseline`, `persistence-baseline`, `process-lineage-baseline`, `peer-baseline`, `session-baseline`): RENAME the injected `loadLearnedConfig` → `loadWatchConfig` (the detector no longer reads `learned` at all).
+- **Bucket 3 — non-moving detectors / stores** (`provenance-identity`, `provenance-warnings`, `credential-access-baseline`, `incident-correlation`, `containment-recommend`, `constraint-store`, `calibration`, `provenance-elevated-config`): UNCHANGED — they still gate on `learned`.
+
+### 12.3 Three grounded do-not-move / independent-load facts (`daemon.js`)
+
+1. **Fact-history trust read** (`:829-845`) moves to `watchConfig.enabled`, loaded via its OWN `options.loadWatchConfig ?? loadWatchConfig` call — it sits OUTSIDE the `if (structuralProfile?.interval_ms)` guard and runs every fast tick, so its watch load must stay independent of the structural block (do NOT fold it into the outer block's config load).
+2. **Containment exclusion** (`:1005`, `alwaysExcludedRuleIds: <flag> ? containmentRecommendationRuleIds() : []`) STAYS on the AUTHOR (`learned`) flag. Since the history read above it no longer loads `learnedConfig`, load a `learnedConfig` value separately for this line. Do NOT move it to watch (§3.2 already says this — restated because the variable it used to reuse is going away).
+3. **Fact-store byte cap** (`:775`, `maxBytes: learnedConfig.fact_store_max_bytes`) is inside the block moving to the WATCH gate and governs the now-default WATCH fact store. `normalizeWatchConfig` MUST mirror `normalizeLearnedConfig` exactly — INCLUDING `fact_store_max_bytes` and `updated_at` — and this call site reads `watchConfig.fact_store_max_bytes`. (Leave `fact_store_max_bytes` on `learned.json`'s normalizer too, for that file's byte-identity; the daemon's structural-append path just sources it from watch now.)
+
+### 12.4 The Fix-3 regression test must be a REAL red→green
+
+Do the naive split FIRST as an explicit intermediate state: move the structural-tick outer gate + the six detector gates to WATCH, but LEAVE `:829-845` on `learnedConfig`. Add the regression test — clone last week's existing Fix-3 test (the one asserting a persisted history-dependent family is NOT fabricated-"recovered" under untrustworthy history) but under `learned:false, watch:true`. RUN it, OBSERVE it fail (recovery fabricated for the six families in the default watch-on/author-off population). THEN move `:829-845` to `watchConfig.enabled`, RUN it, observe green. This proves §3.2's finding is real (playbook: "gate every green / a real red").
+
+### 12.5 CLI naming (fold §11 #2 through consistently)
+
+§11 #2 renamed the surface to `baseline status` / `baseline inspect` but did not name the kill-switch verbs. Use `descartes baseline enable | disable` for the `watch.json` switch (NOT §5's `watch enable/disable`). `descartes alerts watch` stays untouched. `descartes learned status/enable/disable` stays AUTHOR-scoped, unchanged.
+
+### 12.6 Delegation / gating shape
+
+Steps 1–3 (`watch.json` store → daemon seam split + Fix-3 move → six detector gate-moves) are the ONLY fabrication-relevant surface and the default-on flip → Sonnet TDD → 3-lens verify → architect runs full suite → **daybreak-blue re-gate on that diff** → commit. Steps 4–8 (first-cold-start reason, `baseline status/inspect` CLI, `constraint-store.js:269-291` usage-text fix, migration tests, README "off by default" rewrite `README.md:52-58,272-296,341` + HANDOFF) are additive/UX → Sonnet + 3-lens is proportionate; no daybreak round needed.
 
 ---
 
