@@ -8,6 +8,7 @@ import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessi
 import { evaluateAndPersistAlerts, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
+import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
@@ -674,9 +675,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     write = { written_count: 0, retention: undefined };
   }
 
-  // Independent, slower structural (services/network/scheduled-jobs) cadence. Gated behind the
-  // already-shipped configDir/learned.json kill switch, checked before any work is attempted
-  // (convention #4) — when disabled, this block reads nothing else and writes nothing.
+  // Independent, slower structural (services/network/scheduled-jobs) cadence. Gated behind
+  // configDir/watch.json's WATCH-layer kill switch (watch-by-default slice 1, plan
+  // docs/plans/2026-09-10-watch-by-default-slice-1.md §3.2/§12 -- moved off configDir/
+  // learned.json, which now gates only the AUTHOR layer below; watch.json defaults ON, unlike
+  // learned's default-off), checked before any work is attempted (convention #4) — when
+  // disabled, this block reads nothing else and writes nothing.
   let structuralEvidence;
   let structuralCollectorStatuses;
   let structuralFacts;
@@ -687,9 +691,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let shadowEvaluation;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
-    const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
-    const learnedConfig = await loadConfig(descartesPaths);
-    if (learnedConfig.enabled) {
+    const loadWatch = options.loadWatchConfig ?? loadWatchConfig;
+    const watchConfig = await loadWatch(descartesPaths);
+    if (watchConfig.enabled) {
       const readCheckpoint = options.readStructuralCheckpoint ?? readStructuralCheckpoint;
       const checkpoint = await readCheckpoint(descartesPaths);
       const lastRunMs = Number.isFinite(checkpoint?.last_structural_run_ms) ? checkpoint.last_structural_run_ms : -Infinity;
@@ -722,8 +726,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // Slice S6b, additive follow-up to S6a: translate this tick's structural evidence
           // into categorical fact-points and persist them. Only reachable here — i.e. only
           // when structural collection actually completed this tick (not timed out) and the
-          // learned kill switch is enabled (already gated by the enclosing `if
-          // (learnedConfig.enabled)` block above) — never on a timed-out/partial tick, which
+          // watch kill switch is enabled (already gated by the enclosing `if
+          // (watchConfig.enabled)` block above) — never on a timed-out/partial tick, which
           // discards its evidence entirely rather than persisting a partial fact snapshot.
           const factPoints = [
             ...factPointsFromCanaryEvidence(structuralEvidence, { ts }),
@@ -766,13 +770,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // the error message must survive to feed status.state/storage_write_error below.
             const appendFacts = options.appendFactPoints ?? appendFactPoints;
             try {
-              // Finding F2-Tier1: thread the operator-configurable learned-config
-              // fact_store_max_bytes (validated/fail-closed in constraint-store.js's
-              // normalizeLearnedConfig) into the live call site as options.maxBytes -- this is
-              // the only lever an operator has to stop routine bytecap eviction short of a code
-              // change. learnedConfig is already loaded and enabled-checked above in this same
-              // structural-tick block.
-              structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, maxBytes: learnedConfig.fact_store_max_bytes });
+              // Finding F2-Tier1 (re-sourced onto watch.json, plan §12.3 fact 3): thread the
+              // operator-configurable fact_store_max_bytes (validated/fail-closed in
+              // watch-store.js's normalizeWatchConfig, which mirrors constraint-store.js's own
+              // normalizeLearnedConfig exactly) into the live call site as options.maxBytes --
+              // this is the only lever an operator has to stop routine bytecap eviction short of
+              // a code change. watchConfig is already loaded and enabled-checked above in this
+              // same structural-tick block; the WATCH-tier fact store is what this cap now
+              // governs, since structural collection/persistence runs under watchConfig.enabled.
+              structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, maxBytes: watchConfig.fact_store_max_bytes });
             } catch (error) {
               structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
               console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
@@ -780,20 +786,29 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             }
           }
 
-          // Slice S7a, additive: evaluate any status:"shadow" constraints against the
-          // accumulated fact-history and log the results (fired and non-fired) to
-          // shadow-violations.jsonl. Reuses this same structural-tick gate (structuralDue +
-          // loadLearnedConfig(...).enabled, both already checked above) and the same
-          // wall-clock cadence/checkpoint — no new timer, no new checkpoint. Only reached on
-          // a successful (non-timed-out) structural tick, matching the "partial results
-          // discarded, not partially persisted" discipline the timeout branch already
-          // follows. A cheap no-op whenever no constraint is status:"shadow" (true for the
-          // entire lifetime of this plan until S7a's own promoteDraftsToShadow first runs).
-          // Writes only to shadow-violations.jsonl — never constraints.json, never
-          // alerts.json/notifications (evaluateAndLogShadowConstraints never imports
-          // alert-store.js).
-          const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
-          shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
+          // Slice S7a, additive, RE-GATED (watch-by-default slice 1, plan §3.2): shadow-constraint
+          // evaluation stays on the AUTHOR flag, nested INSIDE the WATCH block, as a genuine
+          // two-flag AND — not a rename. It only means anything once the AUTHOR pipeline has
+          // produced status:"shadow" constraints, so it must not start running the moment WATCH
+          // (default-on) turns on by itself; loaded independently from watchConfig here, on
+          // purpose, so the two flags can never be conflated. Evaluate any status:"shadow"
+          // constraints against the accumulated fact-history and log the results (fired and
+          // non-fired) to shadow-violations.jsonl. Reuses this same structural-tick gate
+          // (structuralDue + watchConfig.enabled, both already checked above) plus this nested
+          // learnedConfig.enabled check, and the same wall-clock cadence/checkpoint — no new
+          // timer, no new checkpoint. Only reached on a successful (non-timed-out) structural
+          // tick, matching the "partial results discarded, not partially persisted" discipline
+          // the timeout branch already follows. A cheap no-op whenever no constraint is
+          // status:"shadow" (true for the entire lifetime of this plan until S7a's own
+          // promoteDraftsToShadow first runs). Writes only to shadow-violations.jsonl — never
+          // constraints.json, never alerts.json/notifications (evaluateAndLogShadowConstraints
+          // never imports alert-store.js).
+          const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
+          const learnedConfig = await loadConfig(descartesPaths);
+          if (learnedConfig.enabled) {
+            const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
+            shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
+          }
         }
         // Finding F4: a throw here (e.g. a disk fault) must not abort the tick. Safe by the file's
         // own existing reasoning (checkpoint doc comment above): a checkpoint that doesn't advance
@@ -814,11 +829,28 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // evaluateAndPersistAlerts call sites below whenever this tick's fact-history is untrustworthy
   // (no fabricated recovery -- alert-store.js's applyAlertCandidates would otherwise mark a
   // suppressed history-dependent family's persisted alert "recovered" just because its absent
-  // candidate is indistinguishable from a genuine clear). Gated behind the SAME learned.json
-  // kill switch every other fact-history consumer in this file already checks BEFORE any I/O --
-  // when learned is disabled there is no fact store to protect, and this stays a true no-op
-  // (byte-identical to the pre-revision fast path; this file's repeated "no I/O when disabled"
-  // tests pin exactly this).
+  // candidate is indistinguishable from a genuine clear).
+  //
+  // Watch-by-default slice 1 (plan §3.2/§12.3 fact 1, load-bearing): gated on configDir/
+  // watch.json's WATCH flag, NOT configDir/learned.json's AUTHOR flag. HISTORY_DEPENDENT_ALERT_
+  // RULE_IDS (above) already covers all six watch-tier detector families (service.appeared/
+  // disappeared, session.churn/count_drop, peer.count_spike/drop, process.lineage.novel_edge,
+  // scheduled_job.appeared) plus correlation/canary.tampered -- every one of those now runs under
+  // WATCH, default-on. Leaving this read gated on the AUTHOR flag would mean `historyTrust` stays
+  // `undefined` for the default (watch-on, author-off) population, and computeCoveredRuleIds would
+  // fall back to unrestricted recovery for exactly the families this slice turns on by default --
+  // silently reopening the fabricated-recovery hole Fix 3 closed. (Regression-tested: see
+  // daemon.test.js's "watch-by-default Fix-3 regression" test, a real red->green against this
+  // exact finding.) AUTHOR is a strict addition on top of WATCH's fact substrate (mining/shadow/
+  // active-constraint evaluation are meaningless without structural facts, which only exist when
+  // watch is on), so gating on watchConfig.enabled alone is sufficient -- no OR of the two flags
+  // is needed. Loaded via its OWN independent options.loadWatchConfig ?? loadWatchConfig call
+  // (not folded into the structural-tick block's watchConfig above): this read sits OUTSIDE the
+  // `if (structuralProfile?.interval_ms)` guard and runs on EVERY fast tick, not just a
+  // structural-due one, so it must not depend on that block having run this tick. When watch is
+  // disabled there is no fact store to protect, and this stays a true no-op (byte-identical to
+  // the pre-revision fast path; this file's repeated "no I/O when disabled" tests pin exactly
+  // this, now against watch.json instead of learned.json).
   //
   // BLOCKER 1 re-gate: only `historyTrust` itself (the TRUST DECISION) is computed here, at the
   // same point as before -- the actual coveredRuleIds Set is now built LATER, via
@@ -826,11 +858,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // `failedDetectorLabels` is known. A detector's genuine exception is exactly as disqualifying
   // for recovery as untrustworthy history, and that can only be known once the detectors have
   // actually been attempted this tick.
-  const loadLearnedConfigForHistory = options.loadLearnedConfig ?? loadLearnedConfig;
-  const learnedConfigForHistory = await loadLearnedConfigForHistory(descartesPaths);
+  const loadWatchConfigForHistory = options.loadWatchConfig ?? loadWatchConfig;
+  const watchConfigForHistory = await loadWatchConfigForHistory(descartesPaths);
   let factStoreCompleteness;
   let historyTrust;
-  if (learnedConfigForHistory.enabled) {
+  if (watchConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
     let factHistoryReadResult;
     try {
@@ -988,21 +1020,25 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // which is exactly BLOCKER 1's phase-appropriate-coverage requirement.
     // NOT gated on learned.json: the 12 detectors above run regardless of the kill switch, so a
     // detector EXCEPTION must exclude its family from recovery ALWAYS. Gating the whole computation
-    // on learnedConfigForHistory.enabled (an earlier attempt) reopened BLOCKER 1 on the DEFAULT
-    // learned-disabled path -- a throwing detector (e.g. canary-baseline, which has no learned gate)
-    // still fabricated a "recovered". So the call is unconditional; computeCoveredRuleIds internally
-    // early-returns undefined with ZERO I/O when nothing warrants a restriction (historyTrust is
-    // undefined when learned is disabled -> historyUntrusted false -> no fact read). The containment
-    // exclusion (alwaysExcludedRuleIds) is passed ONLY when learned is enabled: containment is inert
-    // when learned is off (Slice 7.2 -> zero recommendations, and a stale recommendation SHOULD then
-    // recover), so there is nothing to withhold, and passing [] keeps the early-return firing on the
-    // normal learned-off tick -- preserving this file's "no I/O when the kill switch is off"
-    // invariant. A genuine detector failure still forces its family's exclusion via failedLabels on
-    // EITHER path.
+    // on watchConfigForHistory.enabled (an earlier attempt) would reopen BLOCKER 1 on the DEFAULT
+    // watch-disabled path -- a throwing detector (e.g. canary-baseline, which has no watch gate)
+    // would still fabricate a "recovered". So the call is unconditional; computeCoveredRuleIds
+    // internally early-returns undefined with ZERO I/O when nothing warrants a restriction
+    // (historyTrust is undefined when watch is disabled -> historyUntrusted false -> no fact read).
+    // The containment exclusion (alwaysExcludedRuleIds) stays scoped to the AUTHOR flag (plan
+    // §3.2/§12.3 fact 2: containment stays opt-in, unmoved by this slice) -- loaded independently
+    // here since the fact-history read above no longer loads learnedConfig at all. Passed ONLY
+    // when learned is enabled: containment is inert when learned is off (Slice 7.2 -> zero
+    // recommendations, and a stale recommendation SHOULD then recover), so there is nothing to
+    // withhold, and passing [] keeps the early-return firing on the normal learned-off tick --
+    // preserving this file's "no I/O when the kill switch is off" invariant. A genuine detector
+    // failure still forces its family's exclusion via failedLabels on EITHER path.
+    const loadLearnedConfigForContainment = options.loadLearnedConfig ?? loadLearnedConfig;
+    const learnedConfigForContainment = await loadLearnedConfigForContainment(descartesPaths);
     coveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
-      alwaysExcludedRuleIds: learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : [],
+      alwaysExcludedRuleIds: learnedConfigForContainment.enabled ? containmentRecommendationRuleIds() : [],
     });
     mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,

@@ -26,6 +26,7 @@ import {
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
+import { writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
@@ -673,6 +674,11 @@ test("default profile's structural block is inert without the learned.json kill 
     ts,
     now: ts,
     evaluateAlerts: false,
+    // Watch-by-default slice 1: the structural block's outer gate moved to watch.json's default-
+    // ON flag (§3.2/§12), so this test's "kill switch off" premise must now be spelled out
+    // explicitly rather than relying on the real ENOENT default, which would otherwise be
+    // enabled:true and defeat this test's whole point.
+    loadWatchConfig: async () => ({ enabled: false }),
   });
 
   assert(!("structural_collector_statuses" in result.status));
@@ -703,6 +709,7 @@ test("structural collection runs only when wall-clock due, using an injected che
       return storedCheckpoint;
     },
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   };
 
   // First tick: no checkpoint yet -> due, runs structural collection.
@@ -741,6 +748,7 @@ test("a large wall-clock gap triggers exactly one catch-up structural collection
       return storedCheckpoint;
     },
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   };
 
   // Simulate the process being "down" for 3x the structural interval.
@@ -766,6 +774,7 @@ test("writeDaemonStatus includes structural_collector_statuses only on a structu
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.deepEqual(result.status.structural_collector_statuses, [
@@ -798,6 +807,7 @@ test("a hung structural collector is bounded by its deadline, marked unable, and
       return checkpoint;
     },
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
   const elapsedMs = Date.now() - start;
 
@@ -821,6 +831,7 @@ test("a structural tick that completes well within its deadline is unaffected by
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.equal(result.status.structural_collector_statuses.length, 3);
@@ -841,8 +852,11 @@ test("kill switch: structural collection is skipped entirely while learned.json 
     evaluateAlerts: false,
     ts: "2026-05-25T00:00:00.000Z",
     now: 24 * 3600000,
-    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
-    // behavior, which is enabled:false when configDir/learned.json is absent.
+    // Watch-by-default slice 1: this "kill switch" is now watch.json's WATCH flag, not
+    // learned.json's AUTHOR flag -- the structural block's outer gate moved (§3.2/§12). watch.json
+    // defaults to enabled:true on ENOENT (the opposite of learned.json), so the disabled case this
+    // test exercises must be injected explicitly.
+    loadWatchConfig: async () => ({ enabled: false }),
   });
 
   assert.deepEqual(structuralCalls, []);
@@ -871,6 +885,7 @@ test("S6b wiring: structural evidence is translated into fact-points and persist
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.notEqual(result.structuralFacts, undefined);
@@ -895,8 +910,10 @@ test("S6b wiring: no fact-points are persisted while the learned.json kill switc
     ts: "2026-05-24T00:00:00.000Z",
     now: 0,
     evaluateAlerts: false,
-    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
-    // behavior, which is enabled:false when configDir/learned.json is absent.
+    // Watch-by-default slice 1: structural fact-persistence now gates on watch.json's WATCH flag
+    // (§3.2/§12), which defaults to enabled:true on ENOENT -- injected explicitly disabled here so
+    // this test still exercises the "kill switch off" path it's named for.
+    loadWatchConfig: async () => ({ enabled: false }),
   });
 
   assert.equal(result.structuralFacts, undefined);
@@ -924,6 +941,7 @@ test("S6b wiring: a timed-out structural tick discards its evidence entirely —
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.equal(result.structuralEvidence, undefined);
@@ -987,6 +1005,7 @@ test("S7a wiring: with zero shadow constraints, a structural tick produces no sh
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.equal(result.shadowEvaluation.evaluated_count, 0);
@@ -1016,6 +1035,7 @@ test("structural fact-persist threads learned-config fact_store_max_bytes into a
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456 }),
+    loadWatchConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456 }),
     appendFactPoints: spyAppendFactPoints,
   });
 
@@ -1037,6 +1057,7 @@ test("S7a wiring: with one shadow constraint and a matching fact, exactly one sh
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
     appendFactPoints: appendFactPointsAndCommit,
   });
 
@@ -1050,7 +1071,7 @@ test("S7a wiring: with one shadow constraint and a matching fact, exactly one sh
   assert.equal(records[0].fired, false);
 });
 
-test("S7a wiring: reuses the S6a structural-tick gate (structuralDue, kill switch) — no shadow evaluation runs while the kill switch is off, even with a shadow constraint present", async () => {
+test("S7a wiring: reuses the S6a structural-tick gate (structuralDue) plus its own nested AUTHOR gate — no shadow evaluation runs while learned.json is off, even with WATCH on and a shadow constraint present", async () => {
   const paths = await tempPaths();
   await writeConstraints(paths, [shadowConstraintFixture()]);
 
@@ -1060,8 +1081,13 @@ test("S7a wiring: reuses the S6a structural-tick gate (structuralDue, kill switc
     ts: "2026-05-24T00:00:00.000Z",
     now: Date.parse("2026-05-24T00:00:00.000Z"),
     evaluateAlerts: false,
-    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
-    // behavior, which is enabled:false when configDir/learned.json is absent.
+    // Watch-by-default slice 1 (§3.2): shadow evaluation is now gated by a NESTED AUTHOR
+    // (learned.json) check inside the WATCH block, a genuine two-flag AND. WATCH is explicitly ON
+    // here (structural collection runs, producing real facts) specifically to prove the nested
+    // gate, not the outer one, is what withholds shadow evaluation. loadLearnedConfig
+    // intentionally not injected: defaults to real constraint-store.js behavior, which is
+    // enabled:false when configDir/learned.json is absent.
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.equal(result.shadowEvaluation, undefined);
@@ -1087,6 +1113,7 @@ test("S7a wiring: shadow evaluation only runs on a successful (non-timed-out) st
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.equal(result.shadowEvaluation, undefined);
@@ -1108,6 +1135,7 @@ test("S7a wiring: over N simulated structural ticks spanning multiple days, one 
       ts: new Date(simulatedNowMs).toISOString(),
       now: simulatedNowMs,
       loadLearnedConfig: async () => ({ enabled: true }),
+      loadWatchConfig: async () => ({ enabled: true }),
       appendFactPoints: appendFactPointsAndCommit,
     });
     simulatedNowMs += profile.structural.interval_ms;
@@ -1142,6 +1170,7 @@ test("S7a load-bearing safety regression: a shadow constraint that would obvious
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
     appendFactPoints: appendFactPointsAndCommit,
   });
 
@@ -1473,13 +1502,18 @@ test("S4: byte-identical real alerts when the learned kill switch is off, even w
   await appendFactPoints(withWarningPaths, [publicBindWarningFactFixture(), deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
   // configDir/learned.json intentionally never written here -> loadLearnedConfig defaults to
   // { enabled: false }, exactly like the pre-S4 baseline above — computeProvenanceWarningCandidates
-  // must short-circuit to [] before ever calling readFactPoints.
+  // must short-circuit to [] before ever calling readFactPoints. Watch-by-default slice 1: the
+  // shared fact-history trust read (daemon.js's Fix 2/Fix 3 block) is now gated on watch.json,
+  // which defaults enabled:true on ENOENT -- explicitly disabled here too, so this test's "no I/O
+  // at all while the kill switch is off" premise still holds under the split (the injected spy
+  // below can't distinguish which call site would otherwise trigger it).
   let readFactsCalled = false;
   const withWarning = await runDaemonIteration(withWarningPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: S_LIVE_1_TICK_TS,
     now: S_LIVE_1_TICK_TS,
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
       return readFactPoints(...args);
@@ -1583,6 +1617,7 @@ test("S4 structural wiring: the provenance sub-collector runs on a structural-du
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "provenance"]);
@@ -1620,6 +1655,7 @@ test("S4 structural wiring: a timed-out structural tick (provenance hangs) disca
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async (_paths, checkpoint) => checkpoint,
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
@@ -1669,6 +1705,7 @@ test("Slice 1: the sessions sub-collector runs on a structural-due tick alongsid
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "sessions"]);
@@ -1707,8 +1744,10 @@ test("Slice 1: no session fact-points are persisted while the learned.json kill 
     ts: "2026-05-24T00:00:00.000Z",
     now: 0,
     evaluateAlerts: false,
-    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
-    // behavior, which is enabled:false when configDir/learned.json is absent.
+    // Watch-by-default slice 1: structural fact-persistence now gates on watch.json's WATCH flag
+    // (§3.2/§12), which defaults to enabled:true on ENOENT -- injected explicitly disabled here so
+    // this test still exercises the "kill switch off" path it's named for.
+    loadWatchConfig: async () => ({ enabled: false }),
   });
 
   assert.equal(result.structuralFacts, undefined);
@@ -1824,6 +1863,7 @@ test("tailscale structural wiring persists hashed peer facts and adds no new ale
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   const { points } = await readFactPoints(paths);
@@ -1858,6 +1898,7 @@ test("Slice 3: the vpn-peer-status sub-collector runs on a structural-due tick a
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
   });
 
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "vpn-peer-status"]);
@@ -1892,8 +1933,10 @@ test("Slice 3: no peer fact-points are persisted while the learned.json kill swi
     ts: "2026-05-24T00:00:00.000Z",
     now: 0,
     evaluateAlerts: false,
-    // loadLearnedConfig intentionally not injected: defaults to real constraint-store.js
-    // behavior, which is enabled:false when configDir/learned.json is absent.
+    // Watch-by-default slice 1: structural fact-persistence now gates on watch.json's WATCH flag
+    // (§3.2/§12), which defaults to enabled:true on ENOENT -- injected explicitly disabled here so
+    // this test still exercises the "kill switch off" path it's named for.
+    loadWatchConfig: async () => ({ enabled: false }),
   });
 
   assert.equal(result.structuralFacts, undefined);
@@ -2198,15 +2241,17 @@ test("Slice 4: byte-identical real alerts when the learned kill switch is off, e
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
   await appendFactPoints(withSessionsPaths, ticks, { now: hour(30) });
-  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
-  // { enabled: false }, exactly like the baseline above — computeSessionBaselineCandidates must
-  // short-circuit to [] before ever calling readFactPoints.
+  // Watch-by-default slice 1 (§12.1): computeSessionBaselineCandidates now gates on watch.json,
+  // not learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so
+  // it still short-circuits to [] before ever calling readFactPoints, and so the shared
+  // fact-history trust read (also watch-gated, §3.2) doesn't call the spy below either.
   let readFactsCalled = false;
   const withSessions = await runDaemonIteration(withSessionsPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: S_LIVE_1_TICK_TS,
     now: S_LIVE_1_TICK_TS,
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
       return readFactPoints(...args);
@@ -2616,7 +2661,10 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
   await appendFactPoints(withHistoryPaths, correlationFixtureFactPoints(), { now: hour(30) });
   // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
   // { enabled: false }, exactly like the baseline above — computeCorrelationCandidates must
-  // short-circuit to [] before ever calling readFactPoints/readAlertRecords.
+  // short-circuit to [] before ever calling readFactPoints/readAlertRecords. Watch-by-default
+  // slice 1: correlation itself is unmoved (still learned-gated), but the shared fact-history
+  // trust read (§3.2) is now watch-gated and defaults enabled:true on ENOENT -- explicitly
+  // disabled here too so it doesn't call the readFactPoints spy below either.
   let readFactsCalled = false;
   let readAlertsCalled = false;
   const withHistory = await runDaemonIteration(withHistoryPaths, {
@@ -2624,6 +2672,7 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
     collectors: fastCollectorFakes(),
     ts: hour(30),
     now: hour(30),
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
       return readFactPoints(...args);
@@ -2637,7 +2686,7 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json/watch.json kill switches are off");
   assert.equal(readAlertsCalled, false, "readAlertRecords (the correlation module's own hook) must never be called while the learned.json kill switch is off");
 
   const persisted = await readAlertRecords(withHistoryPaths);
@@ -2664,15 +2713,17 @@ test("Slice 4b: byte-identical real alerts when the learned kill switch is off, 
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
   ticks.push(...completePeerTick(hour(30), 8));
   await appendFactPoints(withPeersPaths, ticks, { now: hour(30) });
-  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
-  // { enabled: false }, exactly like the baseline above — computePeerBaselineCandidates must
-  // short-circuit to [] before ever calling readFactPoints.
+  // Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates now gates on watch.json, not
+  // learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so it
+  // still short-circuits to [] before ever calling readFactPoints, and so the shared fact-history
+  // trust read (also watch-gated, §3.2) doesn't call the spy below either.
   let readFactsCalled = false;
   const withPeers = await runDaemonIteration(withPeersPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: S_LIVE_1_TICK_TS,
     now: S_LIVE_1_TICK_TS,
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
       return readFactPoints(...args);
@@ -2682,7 +2733,7 @@ test("Slice 4b: byte-identical real alerts when the learned kill switch is off, 
   assert.deepEqual(withPeers.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withPeers.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withPeers.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the watch.json kill switch is off");
 
   const persisted = await readAlertRecords(withPeersPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === PEER_COUNT_SPIKE_RULE_ID), false);
@@ -2851,15 +2902,17 @@ test("Slice 4c: byte-identical real alerts when the learned kill switch is off, 
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
   ticks.push(...completePeerTickWithMarker(hour(30), 1));
   await appendFactPoints(withPeersPaths, ticks, { now: hour(30) });
-  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
-  // { enabled: false } -- computePeerBaselineCandidates must short-circuit to [] (both
-  // directions) before ever calling readFactPoints.
+  // Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates now gates on watch.json, not
+  // learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so it
+  // still short-circuits to [] (both directions) before ever calling readFactPoints, and so the
+  // shared fact-history trust read (also watch-gated, §3.2) doesn't call the spy below either.
   let readFactsCalled = false;
   const withPeers = await runDaemonIteration(withPeersPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: S_LIVE_1_TICK_TS,
     now: S_LIVE_1_TICK_TS,
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
       return readFactPoints(...args);
@@ -2869,7 +2922,7 @@ test("Slice 4c: byte-identical real alerts when the learned kill switch is off, 
   assert.deepEqual(withPeers.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withPeers.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withPeers.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the watch.json kill switch is off");
 
   const persisted = await readAlertRecords(withPeersPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === PEER_COUNT_DROP_RULE_ID), false);
@@ -3107,18 +3160,23 @@ test("Scheduled-job persistence: byte-identical real alerts when the learned kil
   const withJobsPaths = await tempPaths();
   const { ticks } = scheduledJobNoveltyFixtureFactPoints();
   await appendFactPoints(withJobsPaths, ticks, { now: hour(6) });
+  // Watch-by-default slice 1 (§12.1): computeScheduledJobBaselineCandidates now gates on
+  // watch.json, not learned.json -- explicitly disabled here (watch.json defaults enabled:true on
+  // ENOENT) so it still short-circuits to [] before ever calling readFactPoints, and so the shared
+  // fact-history trust read (also watch-gated, §3.2) doesn't call the spy below either.
   let readFactsCalled = false;
   const withJobs = await runDaemonIteration(withJobsPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: hour(6),
     now: hour(6),
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
   });
 
   assert.deepEqual(withJobs.alerts.alerts, baseline.alerts.alerts);
   assert.equal(withJobs.alerts.alerts.some((a) => a.rule_id === SCHEDULED_JOB_APPEARED_RULE_ID), false);
-  assert.equal(readFactsCalled, false, "computeScheduledJobBaselineCandidates must short-circuit before ever calling readFactPoints while the kill switch is off");
+  assert.equal(readFactsCalled, false, "computeScheduledJobBaselineCandidates must short-circuit before ever calling readFactPoints while the watch.json kill switch is off");
 });
 
 // 30 complete censuses in which "worker.service" is present (establishing it -- the default
@@ -3169,15 +3227,17 @@ test("Service-disappearance: byte-identical real alerts when the learned kill sw
 
   const withServicesPaths = await tempPaths();
   await appendFactPoints(withServicesPaths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
-  // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
-  // { enabled: false }, exactly like the baseline above — computeServiceBaselineCandidates must
-  // short-circuit to [] before ever calling readFactPoints.
+  // Watch-by-default slice 1 (§12.1): computeServiceBaselineCandidates now gates on watch.json,
+  // not learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so
+  // it still short-circuits to [] before ever calling readFactPoints, and so the shared
+  // fact-history trust read (also watch-gated, §3.2) doesn't call the spy below either.
   let readFactsCalled = false;
   const withServices = await runDaemonIteration(withServicesPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: S_LIVE_1_TICK_TS,
     now: S_LIVE_1_TICK_TS,
+    loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
       return readFactPoints(...args);
@@ -3187,7 +3247,7 @@ test("Service-disappearance: byte-identical real alerts when the learned kill sw
   assert.deepEqual(withServices.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withServices.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withServices.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json kill switch is off");
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the watch.json kill switch is off");
 
   const persisted = await readAlertRecords(withServicesPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === SERVICE_DISAPPEARED_RULE_ID), false);
@@ -3563,6 +3623,10 @@ test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the 
   // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
   // { enabled: false } -- computeContainmentRecommendationCandidates must short-circuit to []
   // before ever calling readAlertRecords, exactly like every sibling extraCandidates source.
+  // Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates (the underlying trigger this
+  // test seeds) has itself MOVED to watch.json, which defaults enabled:true on ENOENT -- so it
+  // must be explicitly disabled here too, or peer.count_spike would now genuinely fire regardless
+  // of learned.json's state, defeating this test's "nothing fires" premise.
   await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
 
   let readAlertsCalled = false;
@@ -3571,11 +3635,12 @@ test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the 
     collectors: fastCollectorFakes(),
     ts: hour(30),
     now: hour(30),
+    loadWatchConfig: async () => ({ enabled: false }),
     readAlertRecords: async (...args) => { readAlertsCalled = true; return readAlertRecords(...args); },
   });
 
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false);
-  assert.equal(result.alerts.alerts.some((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "learned.json OFF also gates the underlying peer-baseline detector itself");
+  assert.equal(result.alerts.alerts.some((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "watch.json OFF also gates the underlying peer-baseline detector itself (moved off learned.json, §12.1)");
   assert.equal(readAlertsCalled, false, "readAlertRecords (containment-recommend's own hook, passed through daemon options) must never be called while learned.json is OFF");
 });
 
@@ -3888,6 +3953,7 @@ test("F4: a throwing appendFactPoints during a structural-due tick degrades the 
       now: 0,
       readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
       loadLearnedConfig: async () => ({ enabled: true }),
+      loadWatchConfig: async () => ({ enabled: true }),
       appendFactPoints: async () => {
         throw new Error("simulated appendFactPoints failure (EROFS)");
       },
@@ -3933,6 +3999,7 @@ test("F4: a throwing writeStructuralCheckpoint degrades instead of aborting the 
       now: 0,
       readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
       loadLearnedConfig: async () => ({ enabled: true }),
+      loadWatchConfig: async () => ({ enabled: true }),
       writeStructuralCheckpoint: async () => {
         throw new Error("simulated writeStructuralCheckpoint failure (EACCES)");
       },
@@ -4120,6 +4187,7 @@ test("F4-B2: a non-fatal retention_error from the structural fact-persist writer
     now: 0,
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
     // Mirrors appendFactPoints' real F4-B2 success-with-retention_error shape (fact-store.js): the
     // append genuinely succeeded, only retention failed.
     appendFactPoints: async () => ({ written_count: 3, retention: undefined, retention_error: "simulated enforceFactRetention failure (EISDIR)" }),
@@ -4304,6 +4372,78 @@ test("Fix 3 control: the SAME suppressed-detector shape genuinely recovers its a
   const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
   assert.equal(sessionAlert.status, "recovered", "with TRUSTWORTHY history, an absent candidate must still genuinely recover its alert (unchanged, pre-existing behavior)");
   assert.equal(canaryAlert.status, "recovered");
+});
+
+// Watch-by-default slice 1 (docs/plans/2026-09-10-watch-by-default-slice-1.md §12.4): a REAL
+// red->green regression proving the plan's §3.2 finding. The default population after this slice
+// is watch:true (structural collection + the six novelty detectors run), author/learned:false
+// (mining/shadow/active-constraint evaluation stay off) -- the OPPOSITE flag combination from
+// every Fix-3 test above, which all use learned:true. Before this fix, the fact-history trust
+// read (`historyTrust`) was gated on the AUTHOR flag alone, so on this exact default population it
+// never ran, `historyTrust` stayed undefined, and coveredRuleIds fell back to fully-unrestricted
+// recovery -- silently reopening the fabricated-recovery hole Fix 3 closed, for exactly the alert
+// families this slice turns on by default. This test is cloned from the first Fix-3 test above
+// (same shape: degraded fact-history, a pre-persisted active history-dependent alert, a
+// suppressed detector), with ONLY the config flags inverted.
+test("watch-by-default Fix-3 regression: a genuinely degraded fact-history must freeze a suppressed history-dependent alert even when AUTHOR/learned is OFF and only WATCH is on (the default population)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  await fs.writeFile(storePaths.factsFile, "not-json\n");
+  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window
+  // corrupt-line loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what
+  // daemon.js's own shared Fix-2/Fix-3 read will observe this tick.
+  await appendFactPoints(paths, [], { now });
+  await appendFactPoints(paths, [], { now });
+  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(degradedRead.completeness.status, "degraded");
+  assert.equal(degradedRead.completeness.corrupt_dropped_total, 1);
+
+  // Pre-existing active alerts: one history-dependent family (session.count_drop), plus the
+  // wholesale-covered canary.tampered rule_id.
+  await writeAlertRecords(paths, [
+    {
+      rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+      title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+    {
+      rule_id: CANARY_TAMPERED_RULE_ID, fingerprint: "canary_vanished", status: "active", severity: "warning",
+      title: "Canary tampered", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+  ]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // This tick's detectors for the families under test genuinely return [] -- exactly the
+    // shape a real coldStartPendingThisTick lockout (or an equivalent history-dependent gate)
+    // would produce while history is untrustworthy.
+    computeSessionBaselineCandidates: async () => [],
+    computeCanaryBaselineCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
+  assert.ok(sessionAlert, "the alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(sessionAlert.status, "active", "must NOT be fabricated-recovered by a suppressed history-dependent detector's absent candidate, even with learned/AUTHOR disabled");
+  assert.ok(canaryAlert, "the canary.tampered alert must still be PRESENT");
+  assert.equal(canaryAlert.status, "active", "canary.tampered is wholesale-covered by HISTORY_DEPENDENT_ALERT_RULE_IDS and must also stay frozen");
+
+  // Confirm on disk too (both persistence passes -- main then containment -- already ran by the
+  // time runDaemonIteration resolves), not just the in-memory result.
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
+  assert.equal(persisted.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID)?.status, "active");
+
+  // Fix 2 acceptance, re-verified on the watch-gated path: the daemon status record still carries
+  // fact_store_completeness this tick, reflecting the same genuinely-degraded read that drove the
+  // coveredRuleIds scoping above.
+  assert.equal(result.status.fact_store_completeness?.status, "degraded");
 });
 
 test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the containment phase re-merges main's candidates and independently computes its own isCovered, so a fix scoped to only the main call would leave this red", async () => {
