@@ -64,6 +64,51 @@ test("loadWatchConfig fails CLOSED to the ENABLED default (does not throw) when 
   assert.equal(config.corrupt, true);
 });
 
+// --- Schema-malformed-but-syntactically-valid JSON (LOW, daybreak-blue re-gate): the file parses
+// fine as JSON, but its shape isn't a valid watch.json -- this must still be flagged corrupt:true
+// for diagnostic honesty, even though it happens to normalize to the same safe default either
+// way. Distinct from the malformed-JSON case above (a JSON.parse syntax failure). ---
+
+test("loadWatchConfig marks corrupt:true for a syntactically-valid but schema-invalid array root ([]), while still failing closed to enabled:true", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveWatchStorePaths(paths);
+  await fs.mkdir(path.dirname(configFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(configFile, "[]", { mode: 0o600 });
+
+  const config = await loadWatchConfig(paths);
+  assert.equal(config.enabled, true);
+  assert.equal(config.corrupt, true, "an array root is not a valid watch.json shape and must be flagged, even though it still normalizes to the safe default");
+});
+
+test("loadWatchConfig marks corrupt:true when enabled is present but not a boolean (e.g. the string \"false\"), while still failing closed to enabled:true", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveWatchStorePaths(paths);
+  await fs.mkdir(path.dirname(configFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(configFile, JSON.stringify({ enabled: "false" }), { mode: 0o600 });
+
+  const config = await loadWatchConfig(paths);
+  assert.equal(config.enabled, true, "a non-boolean enabled value is not the literal false, so it still normalizes to this store's safe default");
+  assert.equal(config.corrupt, true, "a string \"false\" is an operator typo, not a valid boolean -- must be flagged, not silently accepted");
+});
+
+test("loadWatchConfig does NOT mark corrupt:true for a genuinely valid { enabled: false }", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveWatchStorePaths(paths);
+  await fs.mkdir(path.dirname(configFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(configFile, JSON.stringify({ enabled: false }), { mode: 0o600 });
+
+  const config = await loadWatchConfig(paths);
+  assert.equal(config.enabled, false);
+  assert.equal(config.corrupt, undefined, "a genuinely valid schema must not be flagged corrupt");
+});
+
+test("loadWatchConfig on ENOENT (file absent) still does not mark corrupt:true -- unchanged by the schema-validation addition", async () => {
+  const paths = await tempPaths();
+  const config = await loadWatchConfig(paths);
+  assert.equal(config.enabled, true);
+  assert.equal(config.corrupt, undefined);
+});
+
 // --- fact_store_max_bytes / updated_at: normalizeWatchConfig mirrors normalizeLearnedConfig's
 // shape exactly (plan §12.3 fact 3), so the daemon's structural-append path can source
 // options.maxBytes from watchConfig instead of learnedConfig. ---

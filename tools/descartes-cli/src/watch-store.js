@@ -55,6 +55,22 @@ export function normalizeWatchConfig(config = {}) {
   };
 }
 
+// Schema-malformed-but-syntactically-valid-JSON detection (LOW, daybreak-blue re-gate): `[]` (a
+// root that parses fine but isn't a plain object) or an `enabled` field present but not a boolean
+// (e.g. the string "false") would otherwise silently normalize through normalizeWatchConfig's
+// fail-safe-on defaults with NO corrupt marker at all -- hiding a real operator typo/config bug
+// from diagnostics, even though the resulting `.enabled` value happens to still land on this
+// store's safe default. Checked against the PARSED root, before normalization, so a schema
+// violation here is never confused with normalizeWatchConfig's own deliberately-lenient
+// value-range tolerance (e.g. an out-of-range fact_store_max_bytes is a valid number failing a
+// range check, not a schema violation, and correctly stays uncorrupted per that field's own
+// existing fail-closed-to-default contract).
+function isSchemaValidWatchConfig(parsed) {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  if ("enabled" in parsed && typeof parsed.enabled !== "boolean") return false;
+  return true;
+}
+
 /**
  * Reads the WATCH-layer (structural inventory + deterministic novelty-detector) enablement switch
  * from configDir/watch.json. Defaults to { enabled: true } when the file is absent -- the one
@@ -70,7 +86,13 @@ export async function loadWatchConfig(descartesPaths) {
     throw error;
   }
   try {
-    return normalizeWatchConfig(JSON.parse(contents));
+    const parsed = JSON.parse(contents);
+    const normalized = normalizeWatchConfig(parsed);
+    // Retains the enabled-by-default (fail-safe-on) behavior: normalizeWatchConfig already
+    // normalizes every schema-invalid shape below to `enabled: true` on its own (its `!== false`
+    // inversion treats a non-boolean/absent `enabled` as "not the literal false"), so this only
+    // ADDS the diagnostic marker -- it never changes what `.enabled` resolves to.
+    return isSchemaValidWatchConfig(parsed) ? normalized : { ...normalized, corrupt: true };
   } catch {
     // Malformed JSON: fail CLOSED to this store's ENABLED default rather than throwing out of a
     // daemon iteration -- mirrors loadLearnedConfig's own corrupt-file tolerance. `corrupt: true`
