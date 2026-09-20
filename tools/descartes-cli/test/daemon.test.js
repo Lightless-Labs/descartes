@@ -4,12 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS,
   collectDaemonEvidence,
   collectStructuralEvidence,
   daemonServiceStatus,
   defaultDaemonProfile,
   DEFAULT_STRUCTURAL_INTERVAL_MS,
   DEFAULT_STRUCTURAL_TICK_DEADLINE_MS,
+  HISTORY_DEPENDENT_ALERT_RULE_IDS,
   installDaemonService,
   metricPointsFromEvidence,
   parseLaunchdPrintState,
@@ -23,6 +25,7 @@ import {
   runForegroundDaemonLoop,
   uninstallDaemonService,
   validateDaemonProfile,
+  WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS,
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
@@ -4681,6 +4684,120 @@ test("watch-by-default BLOCKER-2 regression: a persisted history-dependent alert
   // reading facts, not by reading them and finding them untrustworthy.
   assert.equal(readFactsCalled, false, "readFactPoints must never be called while BOTH watch.json and learned.json are disabled");
   assert.equal(result.status.fact_store_completeness, undefined, "nothing to display when both tiers are disabled and no read was attempted");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Watch-by-default slice 1, BLOCKER-3 (daybreak-blue re-gate round 2, the ROOT of the class --
+// subsumes BLOCKER-1/BLOCKER-2): global historyTrust alone cannot authorize recovery. A detector
+// can short-circuit to [] for a reason ORTHOGONAL to history trust -- its OWNING tier is disabled
+// -- even while the OTHER tier's fact-history read is perfectly INTACT/trustworthy. Both tests
+// below use INTACT history deliberately (unlike every earlier Fix-3/BLOCKER-1/BLOCKER-2
+// regression test, which all use DEGRADED history) -- the bug is NOT about untrustworthy history
+// at all; it's about a disabled tier's detector never having evaluated this tick regardless of
+// how trustworthy the history is.
+// ---------------------------------------------------------------------------------------------
+
+test("watch-by-default BLOCKER-3 regression (author-owned): correlation/canary.tampered must NOT be fabricated-recovered under watch:true/learned:false (the DEFAULT population) even with fully INTACT fact-history", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // A real, intact (not degraded) windowed fact-history read: one fact + a second clean pass --
+  // deliberately trustworthy, so historyUntrusted is false and the ONLY thing that can still
+  // protect these alerts is tier-ownership exclusion.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  // Pre-existing active alerts: correlation.login_kill_proximity and canary.tampered -- both
+  // AUTHOR-owned (still learned-gated, unmoved).
+  await writeAlertRecords(paths, [
+    {
+      rule_id: CORRELATION_RULE_ID, fingerprint: "global", status: "active", severity: "warning",
+      title: "Correlated login/kill proximity", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+    {
+      rule_id: CANARY_TAMPERED_RULE_ID, fingerprint: "canary_vanished", status: "active", severity: "warning",
+      title: "Canary tampered", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+    },
+  ]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // Both detectors genuinely short-circuit to [] because their OWNING tier (learned) is off --
+    // NOT because history is untrustworthy (it's intact). Neither throws.
+    computeCorrelationCandidates: async () => [],
+    computeCanaryBaselineCandidates: async () => [],
+  });
+
+  const correlationAlert = result.alerts.alerts.find((a) => a.rule_id === CORRELATION_RULE_ID);
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
+  assert.ok(correlationAlert, "the correlation alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(correlationAlert.status, "active", "must NOT be fabricated-recovered: correlation's owning tier (learned) is off, so its detector never evaluated this tick, regardless of how trustworthy the (watch-protected) fact-history is");
+  assert.ok(canaryAlert, "the canary.tampered alert must still be PRESENT");
+  assert.equal(canaryAlert.status, "active", "same reasoning: canary.tampered is AUTHOR-owned and must stay frozen while learned is off, intact history notwithstanding");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === CORRELATION_RULE_ID)?.status, "active");
+  assert.equal(persisted.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID)?.status, "active");
+});
+
+test("watch-by-default BLOCKER-3 regression (watch-owned): session.count_drop must NOT be fabricated-recovered under watch:false/learned:true even with fully INTACT fact-history", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeWatchConfig(paths, { enabled: false });
+  const now = S_LIVE_1_TICK_TS;
+
+  // A real, intact (not degraded) windowed fact-history read -- deliberately trustworthy.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  // Pre-existing active alert: session.count_drop -- WATCH-owned (one of the six moved detectors).
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // Genuinely short-circuits to [] because its OWNING tier (watch) is off -- NOT because
+    // history is untrustworthy (it's intact).
+    computeSessionBaselineCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(sessionAlert, "the alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(sessionAlert.status, "active", "must NOT be fabricated-recovered: session.count_drop's owning tier (watch) is off, so its detector never evaluated this tick, regardless of how trustworthy the (learned-protected) fact-history is");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
+});
+
+test("drift guard: WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS ∪ AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS equals HISTORY_DEPENDENT_ALERT_RULE_IDS exactly -- a future history-dependent family MUST be assigned a tier or this fails", () => {
+  const union = new Set([...WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS, ...AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS]);
+  assert.equal(union.size, HISTORY_DEPENDENT_ALERT_RULE_IDS.size, "the two tier sets must partition HISTORY_DEPENDENT_ALERT_RULE_IDS with no member left unassigned (and no duplicate assignment collapsing the union below the original size)");
+  for (const ruleId of HISTORY_DEPENDENT_ALERT_RULE_IDS) {
+    assert.ok(union.has(ruleId), `${ruleId} is in HISTORY_DEPENDENT_ALERT_RULE_IDS but assigned to neither tier -- BLOCKER-3's fix cannot protect it`);
+  }
+  // No rule_id is double-assigned to BOTH tiers (a rule_id owned by both would be over-excluded
+  // whenever either tier is off, even if the OTHER tier that also "owns" it is enabled).
+  for (const ruleId of WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS) {
+    assert.equal(AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS.has(ruleId), false, `${ruleId} is assigned to BOTH tiers`);
+  }
 });
 
 test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the containment phase re-merges main's candidates and independently computes its own isCovered, so a fix scoped to only the main call would leave this red", async () => {

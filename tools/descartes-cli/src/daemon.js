@@ -110,6 +110,37 @@ export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
   CANARY_TAMPERED_RULE_ID,
 ]);
 
+// BLOCKER-3 (daybreak-blue re-gate round 2, the root of the class -- subsumes BLOCKER-1/BLOCKER-2):
+// global `historyTrust` alone is not enough to authorize recovery. A detector can short-circuit to
+// [] for a reason ORTHOGONAL to history trust: its OWNING tier (watch.json or learned.json) is
+// disabled this tick. Two real reproductions, BOTH with INTACT (trustworthy) history:
+//   - watch:true, learned:false (the DEFAULT population): correlation/canary.tampered's detectors
+//     are learned-gated and short-circuit; the watch-enabled history read is trustworthy, so
+//     computeCoveredRuleIds's early return fires (unrestricted) and their absent candidates get
+//     fabricated-"recovered", even though those detectors never actually evaluated this tick.
+//   - watch:false, learned:true: the six watch-gated detectors short-circuit; learned-on makes the
+//     shared read trustworthy and (via containment) defeats the early return, but the resulting
+//     exclusion set only ever covered containment.recommend.* -- none of the six watch-owned
+//     families -- so they stay "covered" and get fabricated-"recovered" too.
+// The fix: partition HISTORY_DEPENDENT_ALERT_RULE_IDS by which tier's detector actually owns each
+// rule_id, and ALWAYS exclude a tier's families from recovery whenever that tier is disabled --
+// independent of global history trust. A family is recovery-eligible only if its owning tier's
+// detector genuinely ran this tick (never fabricate: silence from a disabled tier is not a clear).
+export const WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS = new Set([
+  SERVICE_DISAPPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  SESSION_COUNT_DROP_RULE_ID,
+  SESSION_CHURN_RULE_ID,
+  PEER_COUNT_SPIKE_RULE_ID,
+  PEER_COUNT_DROP_RULE_ID,
+  PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+  SCHEDULED_JOB_APPEARED_RULE_ID,
+]);
+export const AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS = new Set([
+  CORRELATION_RULE_ID,
+  CANARY_TAMPERED_RULE_ID,
+]);
+
 // Component D (trusted-state step-1, §7): an honest, truthful integrity-mode LABEL, not a trust
 // decision. "unprotected_same_uid" means Descartes provides no independent protection against
 // modification of its own state (facts.jsonl, integrity.json, daemon-status.json, constraints,
@@ -893,7 +924,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // RULE_IDS families freeze (never fabricate) rather than silently recover; this self-heals the
     // moment either tier is re-enabled and a real read resumes. `factStoreCompleteness` stays
     // `undefined` -- there is genuinely nothing to display when disabled, this is not itself a
-    // fact-store read result.
+    // fact-store read result. BLOCKER-3 (daybreak-blue round 2) ADDITIONALLY covers this same
+    // both-off case via tier-ownership exclusion (WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS ∪
+    // AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS, both non-empty when both tiers are off) at both
+    // computeCoveredRuleIds call sites below -- this `{trust:false}` branch is now defense-in-depth
+    // for the both-off case specifically, not the only thing protecting it; it remains load-bearing
+    // on its own for a genuinely-degraded read when at least one tier IS enabled.
     historyTrust = { trust: false };
   }
 
@@ -1056,19 +1092,37 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // early-returns undefined with ZERO I/O when nothing warrants a restriction (historyTrust is
     // undefined when BOTH watch and learned are disabled -> historyUntrusted false -> no fact
     // read).
-    // The containment exclusion (alwaysExcludedRuleIds) stays scoped to the AUTHOR flag (plan
+    // The containment exclusion (first spread below) stays scoped to the AUTHOR flag (plan
     // §3.2/§12.3 fact 2: containment stays opt-in, unmoved by this slice) -- reuses
     // learnedConfigForHistory (loaded once, above, for the fact-history-read OR) rather than
     // loading learnedConfig a third time. Passed ONLY when learned is enabled: containment is
     // inert when learned is off (Slice 7.2 -> zero recommendations, and a stale recommendation
-    // SHOULD then recover), so there is nothing to withhold, and passing [] keeps the early-return
-    // firing on the normal learned-off/watch-off tick -- preserving this file's "no I/O when both
-    // kill switches are off" invariant. A genuine detector failure still forces its family's
-    // exclusion via failedLabels on EITHER path.
+    // SHOULD then recover), so there is nothing to withhold.
+    //
+    // BLOCKER-3 re-gate (daybreak-blue round 2, the root of the class): the second and third
+    // spreads below add tier-ownership exclusion, independent of global historyTrust --
+    // WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS whenever watch is off, AUTHOR_OWNED_HISTORY_
+    // DEPENDENT_RULE_IDS whenever learned is off (see their own doc comment above
+    // HISTORY_DEPENDENT_ALERT_RULE_IDS for the full reproduction). This is NOT redundant with
+    // history-untrusted exclusion: a tier can be disabled while the OTHER tier's history read is
+    // perfectly trustworthy (e.g. the DEFAULT watch:true/learned:false population), in which case
+    // historyUntrusted is false but the disabled tier's own detectors still never ran this tick --
+    // silence from a disabled tier is not a genuine clear, regardless of how trustworthy the
+    // fact-history happens to be. This DOES mean alwaysExcludedRuleIds.length === 0 (hence the
+    // early-return "zero I/O" fast path) is no longer reachable on a tick where either tier is
+    // off -- true for the default population itself (learned off by default) -- but that I/O is
+    // one cheap local alert-record read, not a fact-store read; the fact store's own "no I/O when
+    // disabled" invariant is untouched by this (cc21f35's else-branch still holds: no fact read
+    // happens when both tiers are off). A genuine detector failure still forces its family's
+    // exclusion via failedLabels on top of all three sources, on either call site.
     coveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
-      alwaysExcludedRuleIds: learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : [],
+      alwaysExcludedRuleIds: [
+        ...(learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : []),
+        ...(watchConfigForHistory.enabled ? [] : WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS),
+        ...(learnedConfigForHistory.enabled ? [] : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS),
+      ],
     });
     mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
         now: ts,
@@ -1107,21 +1161,33 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }), [], failedDetectorLabels);
     // BLOCKER 1 re-gate, phase-appropriate coverage: computed SEPARATELY from the main call's
     // coveredRuleIds -- this is the ONE call site where containment.recommend.* is ever
-    // legitimately evaluated, so (unlike the main call above) it does NOT pass
-    // alwaysExcludedRuleIds: containment.recommend.* stays eligible for recovery whenever
-    // containment-recommendation genuinely ran this tick (whether it found something or
-    // genuinely found nothing -- both are real evaluations, matching this module's own documented
-    // "load-bearing fail-closed transition" for a genuine opt-in-off/trigger-cleared recovery).
-    // When containment-recommendation itself just threw, "containment-recommendation" is already
-    // in failedDetectorLabels (recorded by safeCandidates above) and ruleIdsForFailedLabel excludes
-    // its closed rule_id set exactly like any other failed detector -- so a genuine exception still
-    // cannot fabricate a recovery of its own family, matching every other detector's protection.
+    // legitimately evaluated, so (unlike the main call above) it does NOT add
+    // containmentRecommendationRuleIds() to alwaysExcludedRuleIds: containment.recommend.* stays
+    // eligible for recovery whenever containment-recommendation genuinely ran this tick (whether
+    // it found something or genuinely found nothing -- both are real evaluations, matching this
+    // module's own documented "load-bearing fail-closed transition" for a genuine opt-in-off/
+    // trigger-cleared recovery). When containment-recommendation itself just threw,
+    // "containment-recommendation" is already in failedDetectorLabels (recorded by safeCandidates
+    // above) and ruleIdsForFailedLabel excludes its closed rule_id set exactly like any other
+    // failed detector -- so a genuine exception still cannot fabricate a recovery of its own
+    // family, matching every other detector's protection.
+    // BLOCKER-3 re-gate (daybreak-blue round 2): the SAME tier-ownership exclusion as the main
+    // call above IS added here though -- this second persistence pass re-derives its own
+    // coveredRuleIds independently (BLOCKER 1's phase-appropriate-coverage requirement), so a
+    // tier-disabled family must be protected at THIS call site too, not just the main one, or a
+    // fix scoped to only the main call would leave this pass fabricating the exact same recovery
+    // (mirrors Fix 3's own "BOTH evaluateAndPersistAlerts call sites are patched" precedent).
     // Same history-untrusted and failed-main-detector restrictions as the main call otherwise
     // (shared base, applied identically at both sites); `undefined` (fully unrestricted, no extra
-    // I/O) whenever containment succeeds and nothing else this tick warrants a restriction.
+    // I/O) only when both tiers are enabled AND containment succeeds AND nothing else this tick
+    // warrants a restriction.
     const containmentCoveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
+      alwaysExcludedRuleIds: [
+        ...(watchConfigForHistory.enabled ? [] : WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS),
+        ...(learnedConfigForHistory.enabled ? [] : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS),
+      ],
     });
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
       now: ts,
