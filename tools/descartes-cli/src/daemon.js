@@ -881,6 +881,20 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
     factStoreCompleteness = selectFactStoreCompleteness(factHistoryReadResult?.completeness);
     historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
+  } else {
+    // BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf): when NEITHER tier is
+    // enabled, we cannot vouch for fact-history without a fact read we must not do when disabled
+    // (the "no I/O when disabled" invariant) -- but leaving `historyTrust` simply `undefined` is
+    // NOT the same as "nothing to protect": computeCoveredRuleIds's `historyTrust?.trust ===
+    // false` check treats `undefined` as trustworthy-by-omission, so a persisted active
+    // history-dependent alert whose detector genuinely (and correctly) returns [] this tick
+    // because its own gate is off would get flipped to "recovered" -- a fabricated all-clear with
+    // NO fact read at all. Explicitly conservative UNTRUSTED instead, so HISTORY_DEPENDENT_ALERT_
+    // RULE_IDS families freeze (never fabricate) rather than silently recover; this self-heals the
+    // moment either tier is re-enabled and a real read resumes. `factStoreCompleteness` stays
+    // `undefined` -- there is genuinely nothing to display when disabled, this is not itself a
+    // fact-store read result.
+    historyTrust = { trust: false };
   }
 
   // Finding F4, THE FABRICATION TRAP: `statusRecord` is built here, BEFORE attempting the disk

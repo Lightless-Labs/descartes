@@ -2730,12 +2730,21 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
   await appendFactPoints(withHistoryPaths, correlationFixtureFactPoints(), { now: hour(30) });
   // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
   // { enabled: false }, exactly like the baseline above — computeCorrelationCandidates must
-  // short-circuit to [] before ever calling readFactPoints/readAlertRecords. Watch-by-default
-  // slice 1: correlation itself is unmoved (still learned-gated), but the shared fact-history
-  // trust read (§3.2) is now watch-gated and defaults enabled:true on ENOENT -- explicitly
-  // disabled here too so it doesn't call the readFactPoints spy below either.
+  // short-circuit to [] before ever calling readFactPoints/readAlertRecords (correlation's OWN
+  // internal hook). Watch-by-default slice 1: correlation itself is unmoved (still learned-gated),
+  // but the shared fact-history trust read (§3.2) is now watch-gated too -- explicitly disabled
+  // here so it doesn't call the readFactPoints spy below either.
+  //
+  // BLOCKER-2 fix (daybreak-blue re-gate): with BOTH watch and learned off, historyTrust is now
+  // explicitly { trust: false } (conservative untrusted, never fabricate a recovery -- see
+  // daemon.js's historyTrust else-branch), so computeCoveredRuleIds no longer early-returns here:
+  // it must now READ persisted alert records to build the freeze set that protects any active
+  // history-dependent alert from a fabricated recovery. That IS a real readAlertRecords call --
+  // from daemon.js's own protective logic, not from correlation's internal hook (which never runs;
+  // computeCorrelationCandidates still short-circuits before touching it). The fact store stays
+  // fully untouched either way -- readFactPoints is what must never be called while disabled, not
+  // readAlertRecords.
   let readFactsCalled = false;
-  let readAlertsCalled = false;
   const withHistory = await runDaemonIteration(withHistoryPaths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
@@ -2746,17 +2755,12 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
       readFactsCalled = true;
       return readFactPoints(...args);
     },
-    readAlertRecords: async (...args) => {
-      readAlertsCalled = true;
-      return readAlertRecords(...args);
-    },
   });
 
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints must never be called while the learned.json/watch.json kill switches are off");
-  assert.equal(readAlertsCalled, false, "readAlertRecords (the correlation module's own hook) must never be called while the learned.json kill switch is off");
+  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store) must never be called while the learned.json/watch.json kill switches are off");
 
   const persisted = await readAlertRecords(withHistoryPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === CORRELATION_RULE_ID), false);
@@ -3701,31 +3705,41 @@ test("Slice 7.2 wiring: the containment opt-in OFF ⇒ zero recommendations, eve
   assert.equal(persisted.some((a) => a.rule_id === "containment.recommend.block"), false);
 });
 
-test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the containment opt-in ON and a trigger present, and no I/O is attempted for it", async () => {
+test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the containment opt-in ON and a trigger present, and no fact-store I/O is attempted for it", async () => {
   const paths = await tempPaths();
   await writeContainmentRecommendConfig(paths, { enabled: true });
   // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
   // { enabled: false } -- computeContainmentRecommendationCandidates must short-circuit to []
-  // before ever calling readAlertRecords, exactly like every sibling extraCandidates source.
-  // Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates (the underlying trigger this
-  // test seeds) has itself MOVED to watch.json, which defaults enabled:true on ENOENT -- so it
-  // must be explicitly disabled here too, or peer.count_spike would now genuinely fire regardless
-  // of learned.json's state, defeating this test's "nothing fires" premise.
+  // before ever calling readAlertRecords (containment's OWN hook), exactly like every sibling
+  // extraCandidates source. Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates (the
+  // underlying trigger this test seeds) has itself MOVED to watch.json, which defaults
+  // enabled:true on ENOENT -- so it must be explicitly disabled here too, or peer.count_spike
+  // would now genuinely fire regardless of learned.json's state, defeating this test's "nothing
+  // fires" premise.
+  //
+  // BLOCKER-2 fix (daybreak-blue re-gate): with BOTH watch and learned off, historyTrust is now
+  // explicitly { trust: false } (see daemon.js's historyTrust else-branch), so
+  // computeCoveredRuleIds no longer early-returns -- it now genuinely READS persisted alert
+  // records (at both the main and containment evaluateAndPersistAlerts call sites) to build the
+  // freeze set that protects any active history-dependent alert from a fabricated recovery. That
+  // real readAlertRecords call comes from daemon.js's own protective logic, not from
+  // containment-recommend's internal hook (which never runs; computeContainmentRecommendationCandidates
+  // still short-circuits before touching it). The fact store stays fully untouched either way.
   await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
 
-  let readAlertsCalled = false;
+  let readFactsCalled = false;
   const result = await runDaemonIteration(paths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: hour(30),
     now: hour(30),
     loadWatchConfig: async () => ({ enabled: false }),
-    readAlertRecords: async (...args) => { readAlertsCalled = true; return readAlertRecords(...args); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
   });
 
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false);
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "watch.json OFF also gates the underlying peer-baseline detector itself (moved off learned.json, §12.1)");
-  assert.equal(readAlertsCalled, false, "readAlertRecords (containment-recommend's own hook, passed through daemon options) must never be called while learned.json is OFF");
+  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store) must never be called while both learned.json and watch.json are OFF");
 });
 
 test("Slice 7.2 wiring: no trigger present ⇒ zero recommendations (no storm on the first tick), even with both gates ON", async () => {
@@ -4616,6 +4630,57 @@ test("watch-by-default BLOCKER regression: a genuinely degraded fact-history mus
   // The shared fact-history trust read must have actually run (protected by learned:true via the
   // OR), reflecting the genuinely-degraded read on the status record.
   assert.equal(result.status.fact_store_completeness?.status, "degraded");
+});
+
+// Watch-by-default slice 1, BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf):
+// the THIRD flag combination -- BOTH watch:false AND learned:false. The OR gate
+// (`watchConfigForHistory.enabled || learnedConfigForHistory.enabled`) is false here, so the
+// shared fact-history read is correctly SKIPPED (no I/O when fully disabled, by design) --
+// but that left `historyTrust` simply `undefined`, and computeCoveredRuleIds's
+// `historyUntrusted = historyTrust?.trust === false` evaluates `undefined === false` -> `false`.
+// With no detector throwing and containment inert (learned off), computeCoveredRuleIds's early
+// return fires and hands back `undefined` (fully UNRESTRICTED recovery) -- so a persisted active
+// history-dependent alert whose detector genuinely (and correctly) returns [] this tick because
+// its own gate is off gets flipped to "recovered": a fabricated all-clear with NO fact read at
+// all, the sharpest form of this invariant violation. This is orthogonal to the mixed-population
+// fix above (both flags off here, not one) and was NOT caught by that test.
+test("watch-by-default BLOCKER-2 regression: a persisted history-dependent alert must NOT be fabricated-recovered when BOTH watch AND learned are OFF (no fact read happens at all -- historyTrust must default to UNTRUSTED, not merely undefined)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: false });
+  const now = S_LIVE_1_TICK_TS;
+
+  // Pre-existing active alert: session.count_drop, one of the six watch-tier history-dependent
+  // families. No fact-store setup at all -- the whole point is that this must freeze WITHOUT
+  // ever reading facts (both tiers disabled), not because of a degraded read.
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  let readFactsCalled = false;
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+    // Genuinely returns [] -- exactly what the real watch-gated short-circuit would produce with
+    // watch:false, before ever reaching its own I/O.
+    computeSessionBaselineCandidates: async () => [],
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.ok(sessionAlert, "the alert must still be PRESENT in the persisted set, not silently dropped");
+  assert.equal(sessionAlert.status, "active", "must NOT be fabricated-recovered merely because BOTH kill switches are off -- undefined historyTrust must be treated as UNTRUSTED, not as trustworthy-by-omission");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
+
+  // The no-I/O-when-disabled invariant must still hold: this freeze must be achieved WITHOUT
+  // reading facts, not by reading them and finding them untrustworthy.
+  assert.equal(readFactsCalled, false, "readFactPoints must never be called while BOTH watch.json and learned.json are disabled");
+  assert.equal(result.status.fact_store_completeness, undefined, "nothing to display when both tiers are disabled and no read was attempted");
 });
 
 test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the containment phase re-merges main's candidates and independently computes its own isCovered, so a fix scoped to only the main call would leave this red", async () => {
