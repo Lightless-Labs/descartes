@@ -1,8 +1,14 @@
 # Implement watch-by-default slice 1
 
 **Created:** 2026-09-14
-**Status:** ready to build — plan is decision-complete
+**Status:** steps 1–3 BUILT + daybreak-confirmed (2026-09-20); default-on flip HELD (operator: fix-before-flip). Steps 4–8 pending; flip blocked on a new prerequisite slice.
 **Plan:** `docs/plans/2026-09-10-watch-by-default-slice-1.md` (the authoritative spec)
+
+## Progress (2026-09-20)
+- **Steps 1–3 DONE** (gate split: `watch.json` store, daemon seam, six detector gate-moves) — committed local/unpushed, suite 1971/0/34.
+- **Three never-fabricate blockers found by adversarial gating (Fable + daybreak R1/R2) and fixed** (`1e9ddaf` OR-gate, `cc21f35`+`38a225b` both-off+LOW, `74ecf57` tier-ownership). daybreak R3 confirmed the gate-split sound.
+- **daybreak R3 surfaced a PRE-EXISTING architectural gap** (detector's own store-loss → silent `[]` → fabricated recovery) that the default-on flip widens to every install. **Operator decision: FIX BEFORE FLIPPING.**
+- **NEW PREREQUISITE SLICE** (blocks the flip): detector-reported recovery coverage — see its dedicated plan/todo (being drafted). After it lands + daybreak-gates, resume steps 4–8, then operator-confirmed push.
 **Supersedes direction:** the protection-contract plans (`docs/plans/2026-09-09-protection-contract-slice-1*.md`, marked SUPERSEDED)
 **Founds:** `todos/2026-09-09-path-b-self-learning-authorship-spike.md` (the deeper authorship spike rides on this)
 
