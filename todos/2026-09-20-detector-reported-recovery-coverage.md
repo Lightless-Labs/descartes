@@ -1,8 +1,18 @@
 # Detector-reported recovery coverage (prerequisite for the watch-by-default flip)
 
 **Created:** 2026-09-20
-**Status:** PLAN drafted; awaiting operator direction + adversarial review before build.
-**Plan:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md`
+**Status:** PLAN REVISED post-triple-review (2026-09-23). Design confirmed right by all three (Fable/daybreak/Astra); mechanics rewritten in plan §7. Awaiting operator confirm on two flagged choices (C1 per-fingerprint timing, C2 canary rule split), then build.
+**Plan:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7 supersedes §1–§6)
+
+## Review outcome (2026-09-23) — scope grew
+All three reviewers: NEEDS-REVISION, "design right, mechanics need rewriting." Synthesized into plan §7:
+- **Universal coverage** (daybreak BLOCKER): ALL detector-owned security rules, not just history-dependent — `canary.tripped`/`credential.access`/provenance also silently []-recover.
+- **Per-detector readiness predicate** (all 3): cold-start + completeness-count + census-freshness + confidence, NOT cold-start alone.
+- **Canary rule-split** (C2) and **per-fingerprint coverage** (C1, credential-first) — rule-level clears all fingerprints.
+- **Correlation predicate** fix (expiry=clear vs evidence-loss=not-clear vs overflow/warm-up=unevaluated).
+- **Ownership registry** (owner-scoped coverage, fail-closed) — subsumes the tier sets.
+- **Q1/Q2 redundancy: KEEP BOTH as intersection** (daybreak+Astra 2-of-3; Fable dissented retire-tier) — coverage ∩ tier-enabled ∩ global-trust; revisit retiring tier later.
+- Land atomically (daemon-first internally); both persistence passes; config snapshot; churn≠statistical-warmup.
 **Blocks:** the watch-by-default default-on flip (`docs/plans/2026-09-10-watch-by-default-slice-1.md`; `todos/2026-09-14-watch-by-default-implementation.md`) — operator chose fix-before-flip (2026-09-20).
 
 ## Why
