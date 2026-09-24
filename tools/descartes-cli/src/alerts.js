@@ -4,7 +4,7 @@ import {
   readAlertIntelligenceConfig,
   writeAlertIntelligenceConfig,
 } from "./alert-intelligence.js";
-import { acknowledgeAlert, evaluateAlerts, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
+import { acknowledgeAlert, evaluateAlerts, fixedAlertIds, readAlertRecords } from "./alert-store.js";
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
@@ -304,11 +304,13 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
   const printList = async () => {
     // Read-only view: list/watch must never mutate persisted alert state (no false recovery of
     // canary/credential/session/... detector alerts, no phantom cooldown consumption with no
-    // notification ever delivered). Uses evaluateAlerts (never writes) scoped to
-    // FIXED_ALERT_RULE_IDS so this call can only assert recovery for the built-in threshold rules
-    // it actually evaluates -- persisted mutation (recovery + cooldown/last_notified) remains
-    // exclusively the daemon's job via evaluateAndPersistAlerts with the full extraCandidates set.
-    const result = await evaluateAlerts(descartesPaths, { coveredRuleIds: FIXED_ALERT_RULE_IDS });
+    // notification ever delivered). Uses evaluateAlerts (never writes) scoped to fixedAlertIds()
+    // -- the identity-keyed set (§8.A) of the built-in threshold rules' alert IDs -- so this call
+    // can only assert recovery for the built-in rules it actually evaluates; every detector alert's
+    // identity is absent from that set and is therefore never touched here. Persisted mutation
+    // (recovery + cooldown/last_notified) remains exclusively the daemon's job via
+    // evaluateAndPersistAlerts with the full extraCandidates set.
+    const result = await evaluateAlerts(descartesPaths, { coveredAlertIds: fixedAlertIds() });
     if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, options), notification_due_ids: result.notification_due_ids }, null, 2));
     else output(renderAlertList(result.alerts, options));
   };

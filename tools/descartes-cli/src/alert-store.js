@@ -55,7 +55,7 @@ function pushCandidate(candidates, candidate) {
 }
 
 // The complete, static set of rule_ids evaluateAlertRules() can ever produce. Used to scope
-// applyAlertCandidates' recovery eligibility (see coveredRuleIds below) for callers — like the
+// applyAlertCandidates' recovery eligibility (see coveredAlertIds below) for callers — like the
 // CLI's read-only alerts list/watch view — that only ever compute THIS subset of candidates and
 // must never be treated as authoritative over a detector family (canary.*, credential.access,
 // session.*, peer.*, service.*, provenance.*, correlation.*, scheduled_job.*, service_appearance.*,
@@ -71,6 +71,16 @@ export const FIXED_ALERT_RULE_IDS = new Set([
   "system.load.sustained_high",
   "disk.space.high_used_fraction",
 ]);
+
+// Detector-reported recovery coverage (§8.A): coverage is now keyed on alert IDENTITY
+// (alertId(rule_id, fingerprint)), not rule_id, so a caller can authorize recovery per persisted
+// alert rather than per family. Every fixed rule pushes its candidate with the default "global"
+// fingerprint (pushCandidate above), so its identity is alertId(ruleId) — this helper is the
+// identity-keyed analog of "the fixed rules I have full visibility into", handed to
+// coveredAlertIds by the CLI read-only path and folded into the daemon's per-tick covered set.
+export function fixedAlertIds() {
+  return new Set([...FIXED_ALERT_RULE_IDS].map((ruleId) => alertId(ruleId)));
+}
 
 export function evaluateAlertRules(historySummary, daemonStatus, options = {}) {
   const now = new Date(options.now ?? historySummary?.until ?? Date.now());
@@ -264,12 +274,15 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   const byId = new Map(existingAlerts.map((alert) => [alert.id, normalizeAlertRecord(alert)]));
   const activeCandidateIds = new Set(candidates.map((candidate) => candidate.id));
   const notificationDueIds = [];
-  // undefined (the default, used by every existing daemon.js call site — unchanged) means
-  // "unrestricted", i.e. today's exact behavior: any persisted id absent from `candidates` this
-  // call is eligible for recovery. A caller that only evaluates a PARTIAL candidate universe (the
-  // CLI's read-only view, restricted to FIXED_ALERT_RULE_IDS) must pass an explicit Set so it can
-  // only recover rule_ids it actually has full visibility into this call.
-  const coveredRuleIds = options.coveredRuleIds;
+  // Detector-reported recovery coverage (§8.A): the covered set is keyed on alert IDENTITY
+  // (alert.id = alertId(rule_id, fingerprint)), not rule_id, so recovery is authorized per persisted
+  // alert rather than per family. undefined means "unrestricted", i.e. today's exact behavior: any
+  // persisted id absent from `candidates` this call is eligible for recovery — kept for callers that
+  // evaluate the full candidate universe and pass nothing. A caller that only evaluates a PARTIAL
+  // universe (the CLI's read-only view, restricted to the fixed rules) or that enforces
+  // detector-reported coverage (the daemon) passes an explicit Set of alert IDs so it can only
+  // recover the specific alert identities it actually has full visibility into this call.
+  const coveredAlertIds = options.coveredAlertIds;
 
   for (const candidate of candidates) {
     const current = byId.get(candidate.id);
@@ -299,7 +312,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   }
 
   for (const [id, alert] of byId) {
-    const isCovered = !coveredRuleIds || coveredRuleIds.has(alert.rule_id);
+    const isCovered = !coveredAlertIds || coveredAlertIds.has(alert.id);
     if (isCovered && !activeCandidateIds.has(id) && ["active", "acknowledged"].includes(alert.status)) {
       byId.set(id, normalizeAlertRecord({
         ...alert,
@@ -318,9 +331,9 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
 // Non-persisting evaluation: computes candidates and merges them against the existing persisted
 // alerts in memory, but never writes to disk. Used by evaluateAndPersistAlerts below (the daemon's
 // authoritative write path) and directly by read-only callers (the CLI's alerts list/watch view)
-// that must never mutate persisted state — see options.coveredRuleIds, threaded through to
-// applyAlertCandidates to scope recovery eligibility for a caller that only evaluates a partial
-// candidate universe (e.g. FIXED_ALERT_RULE_IDS).
+// that must never mutate persisted state — see options.coveredAlertIds, threaded through to
+// applyAlertCandidates to scope recovery eligibility (by alert identity) for a caller that only
+// evaluates a partial candidate universe (e.g. fixedAlertIds()).
 export async function evaluateAlerts(descartesPaths, options = {}) {
   const now = options.now ?? new Date().toISOString();
   const [historySummary, daemonStatus, existing] = await Promise.all([
@@ -340,7 +353,7 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   const mergedCandidates = [...candidates, ...extraCandidates].map((candidate) =>
     candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
   );
-  const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredRuleIds: options.coveredRuleIds });
+  const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
   return { alerts: applied.alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
 }
 

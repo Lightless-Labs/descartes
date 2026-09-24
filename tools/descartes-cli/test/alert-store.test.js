@@ -269,7 +269,7 @@ test("a fixed-rule alert and an extraCandidates alert do not spuriously recover 
   assert.equal(fixedSymmetric.status, "recovered");
 });
 
-test("applyAlertCandidates scoped by coveredRuleIds only recovers rule_ids it has full visibility into", () => {
+test("applyAlertCandidates scoped by coveredAlertIds only recovers alert identities it has full visibility into", () => {
   const existing = [
     {
       id: "alert_disk",
@@ -306,16 +306,18 @@ test("applyAlertCandidates scoped by coveredRuleIds only recovers rule_ids it ha
   ];
 
   // No candidates supplied this round (as if only the fixed rules were re-evaluated and both
-  // fixed-rule and detector-only alerts came up empty this call), but scoped to FIXED_ALERT_RULE_IDS.
+  // fixed-rule and detector-only alerts came up empty this call), but scoped by alert IDENTITY
+  // (§8.A) to only the fixed-rule alert's id — the covered set is keyed on alert.id now, not
+  // rule_id, so the detector alert's identity being absent freezes it.
   const result = applyAlertCandidates(existing, [], {
     now: "2026-05-28T00:05:00.000Z",
-    coveredRuleIds: FIXED_ALERT_RULE_IDS,
+    coveredAlertIds: new Set(["alert_disk"]),
   });
 
   const diskAfter = result.alerts.find((alert) => alert.id === "alert_disk");
   const canaryAfter = result.alerts.find((alert) => alert.id === "alert_canary");
-  assert.equal(diskAfter.status, "recovered", "fixed-rule alert absent from covered candidates must recover");
-  assert.equal(canaryAfter.status, "active", "non-covered rule_id must never be touched by a scoped recovery pass");
+  assert.equal(diskAfter.status, "recovered", "fixed-rule alert identity present in the covered set must recover");
+  assert.equal(canaryAfter.status, "active", "an alert identity absent from the covered set must never be touched by a scoped recovery pass");
 });
 
 test("readAlertRecords quarantines a single malformed persisted record instead of aborting the whole read", async () => {
