@@ -586,8 +586,13 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
 //     from a coverage-subject label warns (a not-yet-converted detector, flagged for the follow-up
 //     slice); a bare array from a non-coverage-subject label (active-constraint) is that producer's
 //     PERMANENT contract and does NOT warn;
-//   - any OTHER shape (object without both array fields, null, a non-array) -> treated as the
-//     fallback (no candidates) + NO coverage + a warn (fail-safe freeze on a malformed producer).
+//   - a PARTIAL object (a valid `candidates` array but a missing/non-array `evaluatedAlertKeys`) ->
+//     the candidates array is SURFACED regardless (§7.4: coverage never suppresses a PRESENT
+//     positive candidate) while NO coverage is reported (its coverage-subject families freeze) + a
+//     warn (partial shape -- a producer whose coverage field is malformed but whose signal is real);
+//   - any OTHER shape (candidates itself absent/not-an-array -- a bare non-array object, null, ...)
+//     -> treated as the fallback (no candidates) + NO coverage + a warn (fail-safe on a producer
+//     that surfaced nothing).
 // A throw is unchanged: warn, record in failedLabels, return fallback (no coverage reported).
 async function safeCandidates(label, produce, fallback, failedLabels, evaluatedByLabel) {
   let produced;
@@ -608,12 +613,23 @@ async function safeCandidates(label, produce, fallback, failedLabels, evaluatedB
     }
     return produced;
   }
-  if (produced && typeof produced === "object" && Array.isArray(produced.candidates) && Array.isArray(produced.evaluatedAlertKeys)) {
-    const reported = evaluatedByLabel.get(label) ?? new Set();
-    for (const key of produced.evaluatedAlertKeys) reported.add(String(key));
-    evaluatedByLabel.set(label, reported);
+  // §7.4: coverage NEVER suppresses a PRESENT positive candidate. If `produced` is an object
+  // carrying a valid `candidates` array, SURFACE that array regardless of the coverage field, and
+  // collect coverage ONLY when `evaluatedAlertKeys` is ALSO a valid array. A partial shape
+  // (candidates present but evaluatedAlertKeys missing/non-array) still surfaces the candidates
+  // (never dropped) while reporting NO coverage (fail-safe freeze of that family's recovery) + warns.
+  if (produced && typeof produced === "object" && Array.isArray(produced.candidates)) {
+    if (Array.isArray(produced.evaluatedAlertKeys)) {
+      const reported = evaluatedByLabel.get(label) ?? new Set();
+      for (const key of produced.evaluatedAlertKeys) reported.add(String(key));
+      evaluatedByLabel.set(label, reported);
+    } else {
+      console.warn(`[daemon] detector '${label}' returned candidates with a missing/invalid evaluatedAlertKeys (partial shape); surfacing its candidates but reporting no coverage this tick (fail-safe freeze)`);
+    }
     return produced.candidates;
   }
+  // Only reached when there is genuinely nothing to surface (candidates itself absent/not-an-array,
+  // null, a bare non-array object): treat as the fallback (no candidates) + NO coverage + warn.
   console.warn(`[daemon] detector '${label}' returned a malformed result shape (expected an array or { candidates, evaluatedAlertKeys }); treating as no candidates + no coverage (fail-safe)`);
   return fallback;
 }

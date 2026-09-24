@@ -4602,6 +4602,113 @@ test("§8 intersection (§7.7): a correctly-reported identity still FREEZES when
   assert.equal(sessionAlert.status, "active", "final eligibility is the INTERSECTION: a report cannot override the global history veto");
 });
 
+// Detector-reported recovery coverage (§8.B / §7.4) — safeCandidates shape handling: a partial
+// producer result (a valid `candidates` array but a missing/non-array `evaluatedAlertKeys`) must
+// SURFACE its present positive candidates (coverage never suppresses a PRESENT positive candidate,
+// §7.4) while collecting NO coverage (fail-safe freeze on the malformed report). The behavior these
+// two tests pin: a partial shape drops NOTHING and freezes the family's OTHER alerts.
+// ---------------------------------------------------------------------------------------------
+
+test("§8 partial shape (§7.4): a producer returning { candidates:[<present positive>] } with NO evaluatedAlertKeys SURFACES the candidate (never dropped) while its family's OTHER persisted alerts stay frozen (no coverage)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  // Intact history so the §7.7 history veto is NOT the reason for the freeze; watch defaults ON so
+  // the tier veto is not either -- the ONLY possible cause of the freeze below is "partial shape
+  // collected no coverage".
+  await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  // A pre-persisted active session alert under a DIFFERENT fingerprint than the surfaced candidate --
+  // this is the family's "OTHER" alert that must stay frozen (its identity is never reported).
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "frozen-entity", status: "active", severity: "critical",
+    title: "Session count deviation (frozen)", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  // A real positive candidate. Its `id` is set explicitly because applyAlertCandidates builds its
+  // active-candidate set from candidate.id BEFORE normalization (alert-store.js), so an omitted id
+  // would not match on the recovery pass.
+  const surfacedCandidate = {
+    id: alertId(SESSION_COUNT_DROP_RULE_ID, "surfaced-entity"),
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "surfaced-entity", severity: "critical",
+    title: "Session count deviation (surfaced)", summary: "test fixture", diagnostics: {},
+  };
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      // Partial shape: valid candidates array, NO evaluatedAlertKeys.
+      computeSessionBaselineCandidates: async () => ({ candidates: [surfacedCandidate] }),
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const surfacedAlert = result.alerts.alerts.find((a) => a.id === alertId(SESSION_COUNT_DROP_RULE_ID, "surfaced-entity"));
+  assert.ok(surfacedAlert, "a present positive candidate on a partial-shape return must be SURFACED, never dropped (§7.4)");
+  assert.equal(surfacedAlert.status, "active", "the surfaced positive candidate is active regardless of coverage");
+
+  const frozenAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID && a.fingerprint === "frozen-entity");
+  assert.equal(frozenAlert.status, "active", "the family's OTHER persisted alert stays frozen -- a partial shape collects NO coverage");
+
+  assert.ok(
+    warnings.some((w) => w.includes("'session'") && w.includes("partial shape")),
+    "a partial shape (candidates present, evaluatedAlertKeys missing) must warn for the 'session' label",
+  );
+});
+
+test("§8 partial shape: a producer returning { candidates:[], evaluatedAlertKeys:<non-array> } surfaces NO candidates and collects NO coverage (family freezes) + warns partial-shape", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      // A non-array evaluatedAlertKeys field: the candidates array is empty and valid, so nothing is
+      // surfaced, but the invalid coverage field must collect NO coverage (fail-safe freeze).
+      computeSessionBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: "global" }),
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const sessionAlerts = result.alerts.alerts.filter((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionAlerts.length, 1, "no session candidate is surfaced from an empty candidates array");
+  assert.equal(sessionAlerts[0].status, "active", "a non-array evaluatedAlertKeys collects NO coverage -> the family freezes");
+
+  assert.ok(
+    warnings.some((w) => w.includes("'session'") && w.includes("partial shape")),
+    "a non-array evaluatedAlertKeys is a partial shape and must warn for the 'session' label",
+  );
+});
+
 // Watch-by-default slice 1 (docs/plans/2026-09-10-watch-by-default-slice-1.md §12.4): a REAL
 // red->green regression proving the plan's §3.2 finding. The default population after this slice
 // is watch:true (structural collection + the six novelty detectors run), author/learned:false
