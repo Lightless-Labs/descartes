@@ -4792,8 +4792,13 @@ test("§8.D config snapshot (BLOCKER-2 b): a REAL watch-gated AND a REAL learned
   const watchLoader = async () => { watchLoads += 1; return Object.freeze({ enabled: watchLoads === 1 }); };
   const learnedLoader = async () => { learnedLoads += 1; return Object.freeze({ enabled: learnedLoads === 1 }); };
 
-  // Stub the OTHER ten producers (session + provenance-warning stay LIVE); noCoverage ignores the
-  // loader seams, so it adds no loader calls. Containment uses the 4-arg form -> bare [].
+  // Stub the OTHER ten fast-tick producers; noCoverage ignores the loader seams, so it adds no
+  // loader calls. session (watch) + provenance-warning (learned) stay LIVE, AND the second-pass
+  // containment-recommendation producer is left LIVE too (it reads options.loadLearnedConfig at
+  // containment-recommend.js:331 before its own containment-config check), so this test exercises the
+  // containment loader seam as well: without the fix it re-reads learned.json off disk and trips the
+  // flip-loader (learnedLoads -> 2). Containment's own config is disabled by default (ENOENT), so it
+  // short-circuits to [] right after that learned read -- no extra I/O, no throw.
   const noCoverage = async () => ({ candidates: [], evaluatedAlertKeys: [] });
   const result = await runDaemonIteration(paths, {
     profile: slice6Profile(),
@@ -4802,7 +4807,8 @@ test("§8.D config snapshot (BLOCKER-2 b): a REAL watch-gated AND a REAL learned
     now,
     loadWatchConfig: watchLoader,
     loadLearnedConfig: learnedLoader,
-    // session (watch) + provenance-warning (learned) are DELIBERATELY left live.
+    // session (watch) + provenance-warning (learned) + containment-recommendation (learned) are
+    // DELIBERATELY left live.
     computeActiveConstraintCandidates: noCoverage,
     computeProvenanceIdentityCandidates: noCoverage,
     computeCorrelationCandidates: noCoverage,
@@ -4813,7 +4819,6 @@ test("§8.D config snapshot (BLOCKER-2 b): a REAL watch-gated AND a REAL learned
     computeScheduledJobBaselineCandidates: noCoverage,
     computeServiceAppearanceCandidates: noCoverage,
     computeCredentialAccessCandidates: noCoverage,
-    computeContainmentRecommendationCandidates: async () => [],
     adjudicateAlerts: false,
     deliverSessionAlerts: false,
     deliverMetricAlertFallback: false,
@@ -4821,7 +4826,7 @@ test("§8.D config snapshot (BLOCKER-2 b): a REAL watch-gated AND a REAL learned
 
   assert.ok(result, "the tick completes");
   assert.equal(watchLoads, 1, "the REAL watch-gated producer (session) consumed the frozen snapshot through the loader seam -- it did NOT re-read watch.json (a second read would flip to disabled and desync)");
-  assert.equal(learnedLoads, 1, "the REAL learned-gated producer (provenance-warning) consumed the frozen snapshot through the loader seam -- it did NOT re-read learned.json (a second read would flip to disabled and desync)");
+  assert.equal(learnedLoads, 1, "the REAL learned-gated producers (provenance-warning AND second-pass containment-recommendation) consumed the frozen snapshot through the loader seam -- neither re-read learned.json (a second read would flip to disabled and desync)");
 });
 
 // BLOCKER-2 (a) — the per-tick config snapshot must be DEEPLY immutable: a producer handed the

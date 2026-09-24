@@ -899,7 +899,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // configSnapshot.learned.enabled (or watch's) to flip the daemon's OWN later tier check -- the old
   // outer-only Object.freeze left the nested objects mutable and shared by reference with
   // learnedConfigForHistory/watchConfigForHistory below. (b) The producer loader seam is wired to
-  // this snapshot at the detectorOptions site (search "loadWatchConfig: async"): so an unconverted
+  // this snapshot (via the `snapshotLoaders` const below) at BOTH the detectorOptions site (the
+  // twelve fast-tick detectors) AND the second-pass containment-recommendation call, so an unconverted
   // producer doing `options.loadWatchConfig ?? loadWatchConfig` consumes the single frozen snapshot
   // rather than re-reading disk (which could observe a mid-tick flip). Both configs are loaded on
   // every tick already (the fact-history read below is unconditional), so this consolidates redundant
@@ -911,6 +912,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     watch: deepFreeze(structuredClone(await loadWatchForTick(descartesPaths))),
     learned: deepFreeze(structuredClone(await loadLearnedForTick(descartesPaths))),
   });
+  // BLOCKER-2 (b): the loader seam wired to the frozen snapshot, spread into EVERY producer call site
+  // (the twelve fast-tick detectors via detectorOptions AND the second-pass containment-recommendation
+  // producer below) so no producer re-reads watch.json/learned.json off disk this tick -- a second
+  // read could observe a mid-tick enablement flip and desync the producer's own gate from the daemon's
+  // tier veto. Each loader returns the single frozen value the snapshot captured above. Shared as one
+  // const so the two call sites can never drift apart.
+  const snapshotLoaders = {
+    loadWatchConfig: async () => configSnapshot.watch,
+    loadLearnedConfig: async () => configSnapshot.learned,
+  };
 
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
@@ -1268,23 +1279,20 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     const computeServiceAppearance = options.computeServiceAppearanceCandidates ?? computeServiceAppearanceCandidates;
     const computeCredentialAccess = options.computeCredentialAccessCandidates ?? computeCredentialAccessCandidates;
     // §8.D / BLOCKER-2 (b): the immutable per-tick config snapshot is threaded into every producer's
-    // options, AND the loadWatchConfig/loadLearnedConfig loader seams are OVERRIDDEN to resolve to the
-    // frozen snapshot values. Every producer reads its tier gate through `options.loadWatchConfig ??
-    // loadWatchConfig` (session-baseline.js:625) or `options.loadLearnedConfig ?? loadLearnedConfig`
-    // (canary/credential/provenance), so overriding them here makes even an UNCONVERTED producer
-    // consume the single frozen snapshot this tick instead of re-reading watch.json/learned.json off
-    // disk -- a second disk read could observe a mid-tick enablement flip and desync the producer's
-    // own gate from the daemon's tier veto. These override any loader the test/caller injected
-    // (options.load*Config), which is correct: that injected loader was already consumed ONCE, above,
-    // to BUILD the snapshot; the producers must see that same first value, not a fresh read. (This is
-    // the seam the per-producer conversion slice will build coverage reporting on; wiring it to the
-    // snapshot now is the BLOCKER-2 fix, not the conversion.)
-    const detectorOptions = {
-      ...options,
-      configSnapshot,
-      loadWatchConfig: async () => configSnapshot.watch,
-      loadLearnedConfig: async () => configSnapshot.learned,
-    };
+    // options, AND the loadWatchConfig/loadLearnedConfig loader seams are OVERRIDDEN (via
+    // snapshotLoaders, above) to resolve to the frozen snapshot values. Every producer reads its tier
+    // gate through `options.loadWatchConfig ?? loadWatchConfig` (session-baseline.js:625) or
+    // `options.loadLearnedConfig ?? loadLearnedConfig` (canary/credential/provenance), so overriding
+    // them here makes even an UNCONVERTED producer consume the single frozen snapshot this tick
+    // instead of re-reading watch.json/learned.json off disk -- a second disk read could observe a
+    // mid-tick enablement flip and desync the producer's own gate from the daemon's tier veto. These
+    // override any loader the test/caller injected (options.load*Config), which is correct: that
+    // injected loader was already consumed ONCE, above, to BUILD the snapshot; the producers must see
+    // that same first value, not a fresh read. The SAME snapshotLoaders are spread into the
+    // second-pass containment-recommendation producer below. (This is the seam the per-producer
+    // conversion slice will build coverage reporting on; wiring it to the snapshot now is the
+    // BLOCKER-2 fix, not the conversion.)
+    const detectorOptions = { ...options, configSnapshot, ...snapshotLoaders };
     // Cross-cutting SURVIVABILITY fix: each entry is now individually fail-soft via
     // safeCandidates() -- a throw from any one detector degrades to [] (+ a warning) for that
     // detector THIS tick only, instead of aborting the whole array build and silently dropping
@@ -1413,8 +1421,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // second, persistence pass -- the main call above already ran without knowing whether
     // containment would fail).
     const computeContainmentRecommendation = options.computeContainmentRecommendationCandidates ?? computeContainmentRecommendationCandidates;
+    // BLOCKER-2 (b): the second-pass containment-recommendation producer reads its own tier gate via
+    // `options.loadLearnedConfig ?? loadLearnedConfig` (containment-recommend.js:331), so it too must
+    // consume the frozen per-tick snapshot rather than re-reading learned.json off disk -- spread the
+    // SAME snapshotLoaders the twelve fast-tick detectors get, so this pass cannot desync from the
+    // snapshot the daemon's tier veto used.
     const containmentCandidates = await safeCandidates("containment-recommendation", () => computeContainmentRecommendation(descartesPaths, {
       ...options,
+      ...snapshotLoaders,
       evaluation: mainAlerts,
     }), [], failedDetectorLabels);
     // BLOCKER 1 re-gate, phase-appropriate coverage: computed SEPARATELY from the main call's
