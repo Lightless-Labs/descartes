@@ -4968,6 +4968,52 @@ test("watch-by-default BLOCKER-3 regression (author-owned): correlation/canary.t
   assert.equal(persisted.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID)?.status, "active");
 });
 
+// §7.7 TIER-VETO re-arm: the BLOCKER-3 tests above inject a BARE [] (which freezes via the §8
+// coverage-default regardless), so they no longer exercise the tier-ownership veto itself. This
+// test drives the case the retirement gate must protect: coverage WOULD authorize recovery (the
+// OWNING producer REPORTS the alert's exact identity in evaluatedAlertKeys), yet the AUTHOR-tier
+// veto must STILL freeze it because learned is off. It fails (the alert fabricated-recovers) if the
+// AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS tier-exclusion line is removed from alwaysExcludedRuleIds
+// (both the main and containment call sites) -- i.e. it re-arms the §7.7 intersection's tier leg,
+// which §7.7 keeps until coverage is proven, so the tier leg cannot be silently retired unnoticed.
+test("§7.7 tier-veto (author-owned): correlation stays frozen under watch:true/learned:false with INTACT history EVEN WHEN its owning producer REPORTS its identity evaluated -- the AUTHOR-tier veto is the sole freeze (coverage would otherwise recover it)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // Fully intact, trustworthy fact-history: the §7.7 history veto is NOT the cause of the freeze.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [{
+    rule_id: CORRELATION_RULE_ID, fingerprint: "global", status: "active", severity: "warning",
+    title: "Correlated login/kill proximity", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // The OWNER (correlation) explicitly REPORTS the persisted alert's identity as genuinely
+    // evaluated this tick -- so coverage alone WOULD authorize recovery. The ONLY thing that must
+    // still freeze it is the AUTHOR-tier veto (learned is off): its detector never actually ran.
+    computeCorrelationCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(CORRELATION_RULE_ID, "global")] }),
+  });
+
+  const correlationAlert = result.alerts.alerts.find((a) => a.rule_id === CORRELATION_RULE_ID);
+  assert.ok(correlationAlert, "the correlation alert must still be PRESENT, not silently dropped");
+  assert.equal(correlationAlert.status, "active", "the AUTHOR-tier veto must freeze correlation while learned is off, even though its owning producer reported its identity evaluated (coverage would otherwise recover it)");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === CORRELATION_RULE_ID)?.status, "active", "must stay active ON DISK (the tier veto, not coverage, is the sole freeze)");
+});
+
 test("watch-by-default BLOCKER-3 regression (watch-owned): session.count_drop must NOT be fabricated-recovered under watch:false/learned:true even with fully INTACT fact-history", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
