@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   acknowledgeAlert,
+  alertId,
   applyAlertCandidates,
   evaluateAlertRules,
   evaluateAlerts,
@@ -318,6 +319,40 @@ test("applyAlertCandidates scoped by coveredAlertIds only recovers alert identit
   const canaryAfter = result.alerts.find((alert) => alert.id === "alert_canary");
   assert.equal(diskAfter.status, "recovered", "fixed-rule alert identity present in the covered set must recover");
   assert.equal(canaryAfter.status, "active", "an alert identity absent from the covered set must never be touched by a scoped recovery pass");
+});
+
+test("applyAlertCandidates coveredAlertIds discriminates by FINGERPRINT: two alerts under the SAME rule_id recover independently (per-fingerprint headline, §8 C1)", () => {
+  const ruleId = "session.count_drop";
+  const idA = alertId(ruleId, "entity-A");
+  const idB = alertId(ruleId, "entity-B");
+  const existing = [
+    {
+      id: idA, rule_id: ruleId, fingerprint: "entity-A", status: "active", severity: "critical",
+      title: "Session count deviation (A)", summary: "A", evidence_refs: ["history-summary"],
+      first_seen: "2026-05-28T00:00:00.000Z", last_seen: "2026-05-28T00:00:00.000Z",
+      last_notified: null, cooldown_until: null, acknowledged_at: null, diagnostics: {},
+    },
+    {
+      id: idB, rule_id: ruleId, fingerprint: "entity-B", status: "active", severity: "critical",
+      title: "Session count deviation (B)", summary: "B", evidence_refs: ["history-summary"],
+      first_seen: "2026-05-28T00:00:00.000Z", last_seen: "2026-05-28T00:00:00.000Z",
+      last_notified: null, cooldown_until: null, acknowledged_at: null, diagnostics: {},
+    },
+  ];
+
+  // No candidates this round; coverage authorizes ONLY fingerprint A's identity. Because coverage is
+  // keyed on alert IDENTITY (rule_id + fingerprint), A must recover while B -- SAME rule_id, absent
+  // from the covered set -- stays frozen. Rule-id-level coverage would recover BOTH; this pins that
+  // per-fingerprint discrimination, which today's suite only exercises across DIFFERENT rule_ids.
+  const result = applyAlertCandidates(existing, [], {
+    now: "2026-05-28T00:05:00.000Z",
+    coveredAlertIds: new Set([idA]),
+  });
+
+  const afterA = result.alerts.find((alert) => alert.id === idA);
+  const afterB = result.alerts.find((alert) => alert.id === idB);
+  assert.equal(afterA.status, "recovered", "the covered fingerprint (A) recovers");
+  assert.equal(afterB.status, "active", "the uncovered fingerprint (B) under the SAME rule_id stays frozen -- coverage discriminates per fingerprint, not per rule_id");
 });
 
 test("readAlertRecords quarantines a single malformed persisted record instead of aborting the whole read", async () => {
