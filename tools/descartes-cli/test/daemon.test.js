@@ -4720,9 +4720,10 @@ test("§8 partial shape: a producer returning { candidates:[], evaluatedAlertKey
 // value. This pins the single-load property: the injected loaders FLIP their `enabled` on each
 // successive call, so if any consumer re-read config mid-tick instead of sharing the snapshot it
 // would observe a DIFFERENT value than the first read (a desync). Asserting each loader was invoked
-// EXACTLY once proves there is no second read to desync against. The twelve fast-tick producers are
-// stubbed because they still load their OWN config this slice (that wiring lands next slice), so
-// leaving them live would add their own loader calls and mask the daemon's own single load.
+// EXACTLY once proves there is no second read to desync against. Here the twelve fast-tick producers
+// are stubbed so the ONLY config-seam consumer is the daemon's own snapshot load -- this is the
+// baseline single-load pin. Its STRONGER companion below keeps two REAL producers live to prove they
+// consume the snapshot via the loader seam (BLOCKER-2 (b)) rather than re-reading disk.
 test("§8.D config snapshot: watch.json and learned.json are each loaded EXACTLY once per tick (immutable snapshot; a mid-tick flip cannot desync the daemon's consumers)", async () => {
   const paths = await tempPaths();
   const now = S_LIVE_1_TICK_TS;
@@ -4767,6 +4768,116 @@ test("§8.D config snapshot: watch.json and learned.json are each loaded EXACTLY
   assert.ok(result, "the tick completes");
   assert.equal(watchLoads, 1, "watch.json is loaded exactly once per tick (the immutable per-tick snapshot); every daemon consumer shares it, so a mid-tick flip cannot desync them");
   assert.equal(learnedLoads, 1, "learned.json is loaded exactly once per tick (the immutable per-tick snapshot)");
+});
+
+// BLOCKER-2 (b) — the per-tick config snapshot must be what the PRODUCERS consume, not just the
+// daemon. The stronger single-load pin: keep two REAL producers LIVE, one per tier -- `session`
+// (watch-gated, session-baseline.js:625 `options.loadWatchConfig ?? loadWatchConfig`) and
+// `provenance-warning` (learned-gated, provenance-warnings.js:325 `options.loadLearnedConfig ??
+// loadLearnedConfig`, returns [] cleanly on an empty fact store) -- and give the daemon
+// flip-on-second-load loaders. If detectorOptions did NOT override loadWatchConfig/loadLearnedConfig
+// to the frozen snapshot values, each live producer would call the injected loader a SECOND time
+// (re-reading disk) and observe the FLIPPED value -- a mid-tick desync. Asserting each loader was
+// invoked EXACTLY once (only the daemon's own snapshot build) proves the producers consumed the
+// single frozen snapshot through the seam. Goes RED (counts hit 2) if the loader-seam override is
+// reverted. This is the stronger form the all-stubbed test above cannot exercise.
+test("§8.D config snapshot (BLOCKER-2 b): a REAL watch-gated AND a REAL learned-gated producer each consume the single frozen snapshot via the loader seam (no second disk read; a mid-tick flip cannot desync them)", async () => {
+  const paths = await tempPaths();
+  const now = S_LIVE_1_TICK_TS;
+
+  let watchLoads = 0;
+  let learnedLoads = 0;
+  // First call: enabled (so BOTH live producers proceed PAST their gate to their loader read); any
+  // SECOND call flips to disabled. Only a producer re-reading disk (instead of the snapshot) trips it.
+  const watchLoader = async () => { watchLoads += 1; return Object.freeze({ enabled: watchLoads === 1 }); };
+  const learnedLoader = async () => { learnedLoads += 1; return Object.freeze({ enabled: learnedLoads === 1 }); };
+
+  // Stub the OTHER ten producers (session + provenance-warning stay LIVE); noCoverage ignores the
+  // loader seams, so it adds no loader calls. Containment uses the 4-arg form -> bare [].
+  const noCoverage = async () => ({ candidates: [], evaluatedAlertKeys: [] });
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    loadWatchConfig: watchLoader,
+    loadLearnedConfig: learnedLoader,
+    // session (watch) + provenance-warning (learned) are DELIBERATELY left live.
+    computeActiveConstraintCandidates: noCoverage,
+    computeProvenanceIdentityCandidates: noCoverage,
+    computeCorrelationCandidates: noCoverage,
+    computePeerBaselineCandidates: noCoverage,
+    computeServiceBaselineCandidates: noCoverage,
+    computeCanaryBaselineCandidates: noCoverage,
+    computeProcessLineageBaselineCandidates: noCoverage,
+    computeScheduledJobBaselineCandidates: noCoverage,
+    computeServiceAppearanceCandidates: noCoverage,
+    computeCredentialAccessCandidates: noCoverage,
+    computeContainmentRecommendationCandidates: async () => [],
+    adjudicateAlerts: false,
+    deliverSessionAlerts: false,
+    deliverMetricAlertFallback: false,
+  });
+
+  assert.ok(result, "the tick completes");
+  assert.equal(watchLoads, 1, "the REAL watch-gated producer (session) consumed the frozen snapshot through the loader seam -- it did NOT re-read watch.json (a second read would flip to disabled and desync)");
+  assert.equal(learnedLoads, 1, "the REAL learned-gated producer (provenance-warning) consumed the frozen snapshot through the loader seam -- it did NOT re-read learned.json (a second read would flip to disabled and desync)");
+});
+
+// BLOCKER-2 (a) — the per-tick config snapshot must be DEEPLY immutable: a producer handed the
+// snapshot must not be able to mutate the nested `watch`/`learned` config the daemon's OWN later tier
+// check reads. Repro (daybreak): a producer sets configSnapshot.learned.enabled=true; because the
+// old snapshot Object.freeze'd only the OUTER object, the nested `learned` stayed mutable and shared
+// by reference with the daemon's learnedConfigForHistory -> the AUTHOR-tier veto then reads
+// enabled:true -> a fabricated recovery. Here canary.tripped (AUTHOR-tier, positive-evidence) is
+// persisted under watch:true/learned:false with intact history; its owner reports the identity
+// evaluated (coverage WOULD recover it), and the producer ALSO attempts the mutation (swallowing the
+// frozen-object throw so the coverage report still lands -- otherwise the failed-label veto would
+// mask whether deep-freeze did anything). With a deeply-frozen snapshot the mutation is a no-op, the
+// tier check still reads learned:false, and the AUTHOR-tier veto freezes canary.tripped. Goes RED
+// (fabricated-recovers) if the snapshot reverts to the shallow outer-only Object.freeze.
+test("§8.D config snapshot (BLOCKER-2 a): a producer that mutates configSnapshot.learned.enabled=true has NO effect on the daemon's tier decision (deeply-frozen snapshot; alert stays frozen)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // Intact history so the §7.7 history veto is NOT the cause of the freeze (canary.tripped is not
+  // history-dependent anyway) -- the AUTHOR-tier veto reading the IMMUTABLE learned:false is.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [{
+    rule_id: CANARY_TRIPPED_RULE_ID, fingerprint: "canary-1", status: "active", severity: "critical",
+    title: "Canary tripped", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  let mutationThrew = false;
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // Attempt to flip the AUTHOR tier ON by mutating the shared snapshot, then report the identity
+    // evaluated. Swallow the frozen-object TypeError so this stays a coverage-reporting producer (a
+    // throw would land it in failedLabels and freeze via THAT veto, masking the deep-freeze).
+    computeCanaryBaselineCandidates: async (_paths, options) => {
+      try { options.configSnapshot.learned.enabled = true; } catch { mutationThrew = true; }
+      return { candidates: [], evaluatedAlertKeys: [alertId(CANARY_TRIPPED_RULE_ID, "canary-1")] };
+    },
+  });
+
+  assert.equal(mutationThrew, true, "mutating the deeply-frozen nested learned config must throw (proving it is frozen, not merely a silent no-op)");
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID);
+  assert.ok(canaryAlert, "the canary.tripped alert must still be PRESENT, not silently dropped");
+  assert.equal(canaryAlert.status, "active", "the producer's mutation of configSnapshot.learned.enabled must have NO effect on the AUTHOR-tier veto: it reads the immutable learned:false and freezes canary.tripped");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID)?.status, "active", "canary.tripped must stay active ON DISK (a mid-tick producer mutation cannot desync the daemon's tier decision)");
 });
 
 // Watch-by-default slice 1 (docs/plans/2026-09-10-watch-by-default-slice-1.md §12.4): a REAL

@@ -860,6 +860,19 @@ function combineErrors(...messages) {
   return present.length > 0 ? present.join("; ") : undefined;
 }
 
+// Detector-reported recovery coverage (§8.D / BLOCKER-2): recursively freeze a value in place so a
+// nested object cannot be mutated. Used on the per-tick config snapshot's `watch`/`learned` (after a
+// structuredClone that severs any shared reference) so neither a producer handed the snapshot nor the
+// daemon's own later tier check can mutate it mid-tick. Plain config objects only (booleans/strings/
+// numbers), so a shallow recursion over own object/array properties is sufficient and terminates.
+function deepFreeze(value) {
+  if (value !== null && typeof value === "object") {
+    for (const key of Object.keys(value)) deepFreeze(value[key]);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
@@ -873,21 +886,30 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
 
   // Detector-reported recovery coverage (§8.D): an immutable per-tick config snapshot. watch.json
   // and learned.json are loaded ONCE here (via the same options.load*Config ?? load*Config DI seams
-  // every call site already used) and frozen, so the daemon's own tier gates (the structural block,
-  // the shadow-soak block, the fact-history-trust read below) and — next slice — the producers all
-  // read the SAME view of "which tier is on" within a tick. This closes the mid-tick enablement-flip
-  // desync (daybreak R3's second note / §3 Config snapshot): a flip landing between two loads within
-  // one tick could otherwise make the daemon's ownership view disagree with a detector's own gate.
-  // Producer wiring (passing configSnapshot INTO the producers so they stop loading their own) lands
-  // in the per-producer conversion slice; this establishes the seam. Both configs are loaded on every
-  // tick already (the fact-history read below is unconditional), so this consolidates redundant loads
-  // rather than adding any; the "no fact I/O when disabled" invariant (guarded separately below) is
-  // untouched — these are cheap config reads, not fact-store reads.
+  // every call site already used) and DEEPLY frozen, so the daemon's own tier gates (the structural
+  // block, the shadow-soak block, the fact-history-trust read below, the tier veto) AND the producers
+  // all read the SAME immutable view of "which tier is on" within a tick. This closes the mid-tick
+  // enablement-flip desync (daybreak R3's second note / §3 Config snapshot): a flip landing between
+  // two loads within one tick could otherwise make the daemon's ownership view disagree with a
+  // detector's own gate.
+  //
+  // BLOCKER-2 (daybreak-blue re-gate, this slice): the snapshot must be DEEPLY immutable and be what
+  // the PRODUCERS consume. (a) Each nested config is structuredClone'd (severing any reference the
+  // loader might share elsewhere) then deepFreeze'd, so a producer handed the snapshot CANNOT mutate
+  // configSnapshot.learned.enabled (or watch's) to flip the daemon's OWN later tier check -- the old
+  // outer-only Object.freeze left the nested objects mutable and shared by reference with
+  // learnedConfigForHistory/watchConfigForHistory below. (b) The producer loader seam is wired to
+  // this snapshot at the detectorOptions site (search "loadWatchConfig: async"): so an unconverted
+  // producer doing `options.loadWatchConfig ?? loadWatchConfig` consumes the single frozen snapshot
+  // rather than re-reading disk (which could observe a mid-tick flip). Both configs are loaded on
+  // every tick already (the fact-history read below is unconditional), so this consolidates redundant
+  // loads rather than adding any; the "no fact I/O when disabled" invariant (guarded separately
+  // below) is untouched — these are cheap config reads, not fact-store reads.
   const loadWatchForTick = options.loadWatchConfig ?? loadWatchConfig;
   const loadLearnedForTick = options.loadLearnedConfig ?? loadLearnedConfig;
   const configSnapshot = Object.freeze({
-    watch: await loadWatchForTick(descartesPaths),
-    learned: await loadLearnedForTick(descartesPaths),
+    watch: deepFreeze(structuredClone(await loadWatchForTick(descartesPaths))),
+    learned: deepFreeze(structuredClone(await loadLearnedForTick(descartesPaths))),
   });
 
   const evidence = await collectDaemonEvidence(profile, options.collectors);
@@ -1245,10 +1267,24 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     const computeScheduledJobBaseline = options.computeScheduledJobBaselineCandidates ?? computeScheduledJobBaselineCandidates;
     const computeServiceAppearance = options.computeServiceAppearanceCandidates ?? computeServiceAppearanceCandidates;
     const computeCredentialAccess = options.computeCredentialAccessCandidates ?? computeCredentialAccessCandidates;
-    // §8.D: the immutable per-tick config snapshot is threaded into every producer's options as the
-    // seam for the next slice (producers will read configSnapshot.watch/.learned instead of loading
-    // their own). No producer consumes it yet, so this is behavior-neutral this slice.
-    const detectorOptions = { ...options, configSnapshot };
+    // §8.D / BLOCKER-2 (b): the immutable per-tick config snapshot is threaded into every producer's
+    // options, AND the loadWatchConfig/loadLearnedConfig loader seams are OVERRIDDEN to resolve to the
+    // frozen snapshot values. Every producer reads its tier gate through `options.loadWatchConfig ??
+    // loadWatchConfig` (session-baseline.js:625) or `options.loadLearnedConfig ?? loadLearnedConfig`
+    // (canary/credential/provenance), so overriding them here makes even an UNCONVERTED producer
+    // consume the single frozen snapshot this tick instead of re-reading watch.json/learned.json off
+    // disk -- a second disk read could observe a mid-tick enablement flip and desync the producer's
+    // own gate from the daemon's tier veto. These override any loader the test/caller injected
+    // (options.load*Config), which is correct: that injected loader was already consumed ONCE, above,
+    // to BUILD the snapshot; the producers must see that same first value, not a fresh read. (This is
+    // the seam the per-producer conversion slice will build coverage reporting on; wiring it to the
+    // snapshot now is the BLOCKER-2 fix, not the conversion.)
+    const detectorOptions = {
+      ...options,
+      configSnapshot,
+      loadWatchConfig: async () => configSnapshot.watch,
+      loadLearnedConfig: async () => configSnapshot.learned,
+    };
     // Cross-cutting SURVIVABILITY fix: each entry is now individually fail-soft via
     // safeCandidates() -- a throw from any one detector degrades to [] (+ a warning) for that
     // detector THIS tick only, instead of aborting the whole array build and silently dropping
