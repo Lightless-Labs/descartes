@@ -93,10 +93,11 @@ export const ACTIVE_FRESHNESS_MULTIPLE = 3;
 // deliberately NOT enumerated here -- active-constraint evaluation does not gate on
 // factHistoryTrustworthy at all (computeActiveConstraintCandidates's own doc comment: "no
 // completeness gate needed... already follows 'no fact, no claim'"), so it must stay eligible
-// for recovery regardless of this tick's fact-history trust. coveredRuleIds below is built as a
-// COMPLEMENT (FIXED_ALERT_RULE_IDS ∪ currently-persisted rule_ids, minus this set) rather than a
-// hardcoded allowlist, precisely so a dynamic non-history-gated rule_id like this is never
-// wrongly excluded from recovery eligibility.
+// for recovery regardless of this tick's fact-history trust. Under detector-reported coverage
+// (§8) the covered set (computeCoveredAlerts below) is identity-keyed, and constraint.violation.*
+// is a dynamic, NON-coverage-subject family (it has no owner in SECURITY_RULE_OWNERSHIP): it keeps
+// its existing recovery semantics (subject only to the §7.7 vetoes), precisely so a dynamic
+// non-history-gated rule_id like this is never wrongly frozen.
 export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
   SERVICE_DISAPPEARED_RULE_ID,
   SERVICE_APPEARED_RULE_ID,
@@ -116,8 +117,10 @@ export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
 // disabled this tick. Two real reproductions, BOTH with INTACT (trustworthy) history:
 //   - watch:true, learned:false (the DEFAULT population): correlation/canary.tampered's detectors
 //     are learned-gated and short-circuit; the watch-enabled history read is trustworthy, so
-//     computeCoveredRuleIds's early return fires (unrestricted) and their absent candidates get
-//     fabricated-"recovered", even though those detectors never actually evaluated this tick.
+//     (pre-§8, when computeCoveredRuleIds early-returned undefined = unrestricted) their absent
+//     candidates got fabricated-"recovered", even though those detectors never actually evaluated
+//     this tick. (Post-§8 detector-reported coverage also freezes these by default; this
+//     tier-ownership veto is now the §7.7 defense-in-depth layer, not the sole protection.)
 //   - watch:false, learned:true: the six watch-gated detectors short-circuit; learned-on makes the
 //     shared read trustworthy and (via containment) defeats the early return, but the resulting
 //     exclusion set only ever covered containment.recommend.* -- none of the six watch-owned
@@ -563,10 +566,10 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
 // BLOCKER 1 re-gate (daybreak-blue CONFIRMED BLOCKER, fabricated alert recovery on detector
 // FAILURE): degrading a throw to `fallback` (above) is correct for THIS tick's candidate build,
 // but it also made a genuine exception indistinguishable from a genuine "nothing to report" clear
-// downstream, at the coveredRuleIds/recovery boundary -- an exception is not evidence of absence.
+// downstream, at the coveredAlertIds/recovery boundary -- an exception is not evidence of absence.
 // The optional `failedLabels` Set (passed by every call site whose family must be withheld from
 // recovery on its own failure, never defaulted) records `label` here, at the exact moment the
-// exception is caught, so the caller can exclude that family's rule_ids from coveredRuleIds
+// exception is caught, so the caller can exclude that family's rule_ids from coveredAlertIds
 // afterwards. A caller that omits `failedLabels` (none currently do, but the parameter stays
 // optional rather than required) simply does not participate in that exclusion.
 //
@@ -617,7 +620,7 @@ async function safeCandidates(label, produce, fallback, failedLabels, evaluatedB
 
 // BLOCKER 1 re-gate: the rule_ids each fast-tick detector (keyed by the exact `label` string
 // passed to its own safeCandidates call site below) can ever emit -- consulted ONLY to compute
-// which rule_ids must be excluded from coveredRuleIds when that detector's label appears in
+// which rule_ids must be excluded from coveredAlertIds when that detector's label appears in
 // `failedLabels` (i.e. it genuinely threw this tick), never to make any other decision. Two
 // detectors are deliberately ABSENT here because their rule_id sets are not fixed/static; each is
 // handled by ruleIdsForFailedLabel below instead:
@@ -998,7 +1001,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
 
   // Fix 2/Fix 3 (trusted-state step-1 revision, "R1 made signable"): ONE shared fact-history
   // read this tick, sourced identically for (a) the statusRecord's fact_store_completeness line
-  // below and (b) scoping coveredRuleIds away from HISTORY_DEPENDENT_ALERT_RULE_IDS at BOTH
+  // below and (b) scoping coveredAlertIds away from HISTORY_DEPENDENT_ALERT_RULE_IDS at BOTH
   // evaluateAndPersistAlerts call sites below whenever this tick's fact-history is untrustworthy
   // (no fabricated recovery -- alert-store.js's applyAlertCandidates would otherwise mark a
   // suppressed history-dependent family's persisted alert "recovered" just because its absent
@@ -1028,8 +1031,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // a structural-due one, so it must not depend on that block having run this tick.
   //
   // BLOCKER 1 re-gate: only `historyTrust` itself (the TRUST DECISION) is computed here, at the
-  // same point as before -- the actual coveredRuleIds Set is now built LATER, via
-  // computeCoveredRuleIds, after the twelve fast-tick detectors below have run and
+  // same point as before -- the actual coveredAlertIds Set is now built LATER, via
+  // computeCoveredAlerts, after the twelve fast-tick detectors below have run and
   // `failedDetectorLabels` is known. A detector's genuine exception is exactly as disqualifying
   // for recovery as untrustworthy history, and that can only be known once the detectors have
   // actually been attempted this tick.
@@ -1055,7 +1058,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf): when NEITHER tier is
     // enabled, we cannot vouch for fact-history without a fact read we must not do when disabled
     // (the "no I/O when disabled" invariant) -- but leaving `historyTrust` simply `undefined` is
-    // NOT the same as "nothing to protect": computeCoveredRuleIds's `historyTrust?.trust ===
+    // NOT the same as "nothing to protect": computeCoveredAlerts's `historyTrust?.trust ===
     // false` check treats `undefined` as trustworthy-by-omission, so a persisted active
     // history-dependent alert whose detector genuinely (and correctly) returns [] this tick
     // because its own gate is off would get flipped to "recovered" -- a fabricated all-clear with
@@ -1066,7 +1069,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // fact-store read result. BLOCKER-3 (daybreak-blue round 2) ADDITIONALLY covers this same
     // both-off case via tier-ownership exclusion (WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS ∪
     // AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS, both non-empty when both tiers are off) at both
-    // computeCoveredRuleIds call sites below -- this `{trust:false}` branch is now defense-in-depth
+    // computeCoveredAlerts call sites below -- this `{trust:false}` branch is now defense-in-depth
     // for the both-off case specifically, not the only thing protecting it; it remains load-bearing
     // on its own for a genuinely-degraded read when at least one tier IS enabled.
     historyTrust = { trust: false };
@@ -1156,8 +1159,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // BLOCKER 1 re-gate: every safeCandidates call below that produces alert candidates (the twelve
   // fast-tick detectors AND, further down, the containment-recommendation phase) shares this ONE
   // Set, so a label recorded here reflects a genuine exception this tick regardless of which call
-  // site caught it. Read at two different points in time deliberately (see coveredRuleIds and
-  // containmentCoveredRuleIds below) -- the main call's coveredRuleIds is computed once the twelve
+  // site caught it. Read at two different points in time deliberately (see coveredAlertIds and
+  // containmentCoveredAlertIds below) -- the main call's coveredAlertIds is computed once the twelve
   // detectors have run but strictly BEFORE containment-recommendation is even attempted, which is
   // exactly the phase-appropriate boundary: containment's own failure cannot retroactively affect
   // a persistence pass that already happened.
@@ -1189,7 +1192,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // every OTHER detector's candidates for the tick. Order/arguments unchanged from before.
     // BLOCKER 1 re-gate: `failedDetectorLabels` is now threaded as safeCandidates' 4th argument at
     // every one of these twelve call sites, so a genuine exception here is ALSO recorded (not just
-    // degraded to `[]`) for the coveredRuleIds computation below.
+    // degraded to `[]`) for the coveredAlertIds computation below.
     mainExtraCandidates = [
           ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
           ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
@@ -1239,10 +1242,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // watch-disabled isn't the common case today, but an operator running `baseline disable` (or
     // a fresh ENOENT-disabled watch.json) reaches it exactly the same way learned-disabled did
     // before this slice (regression-tested: daemon.test.js's "BLOCKER 1 re-gate" test drives BOTH
-    // flags disabled). So the call stays unconditional; computeCoveredRuleIds internally
-    // early-returns undefined with ZERO I/O when nothing warrants a restriction (historyTrust is
-    // undefined when BOTH watch and learned are disabled -> historyUntrusted false -> no fact
-    // read).
+    // flags disabled). So the call stays unconditional. Post-§8, computeCoveredAlerts no longer
+    // has an early-return/unrestricted path (it always returns an identity-keyed Set, freezing
+    // every coverage-subject family that wasn't reported evaluated); it performs one cheap local
+    // alert-record read per pass. The fact-store's own "no I/O when disabled" invariant is
+    // untouched (historyTrust is {trust:false} when BOTH watch and learned are disabled -> no fact
+    // read; see that branch below).
     // The containment exclusion (first spread below) stays scoped to the AUTHOR flag (plan
     // §3.2/§12.3 fact 2: containment stays opt-in, unmoved by this slice) -- reuses
     // learnedConfigForHistory (loaded once, above, for the fact-history-read OR) rather than
@@ -1311,7 +1316,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       evaluation: mainAlerts,
     }), [], failedDetectorLabels);
     // BLOCKER 1 re-gate, phase-appropriate coverage: computed SEPARATELY from the main call's
-    // coveredRuleIds -- this is the ONE call site where containment.recommend.* is ever
+    // coveredAlertIds -- this is the ONE call site where containment.recommend.* is ever
     // legitimately evaluated, so (unlike the main call above) it does NOT add
     // containmentRecommendationRuleIds() to alwaysExcludedRuleIds: containment.recommend.* stays
     // eligible for recovery whenever containment-recommendation genuinely ran this tick (whether
@@ -1324,7 +1329,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // family, matching every other detector's protection.
     // BLOCKER-3 re-gate (daybreak-blue round 2): the SAME tier-ownership exclusion as the main
     // call above IS added here though -- this second persistence pass re-derives its own
-    // coveredRuleIds independently (BLOCKER 1's phase-appropriate-coverage requirement), so a
+    // coveredAlertIds independently (BLOCKER 1's phase-appropriate-coverage requirement), so a
     // tier-disabled family must be protected at THIS call site too, not just the main one, or a
     // fix scoped to only the main call would leave this pass fabricating the exact same recovery
     // (mirrors Fix 3's own "BOTH evaluateAndPersistAlerts call sites are patched" precedent).
