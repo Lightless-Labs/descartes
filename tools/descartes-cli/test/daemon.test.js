@@ -4540,6 +4540,11 @@ test("§8 owner-scope: a producer reporting ANOTHER family's alert identity must
   // Intact history so the §7.7 history veto is NOT the reason for any freeze here.
   await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
   await appendFactPoints(paths, [], { now });
+  // Pin the intactness explicitly: without this, a silently-degraded read could freeze the alert via
+  // the §7.7 history veto, masking whether owner-scope rejection is really the cause. Asserting
+  // intact makes owner-scope the ONLY possible reason the session alert stays frozen below.
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
     rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
