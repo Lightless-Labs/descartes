@@ -4714,6 +4714,61 @@ test("§8 partial shape: a producer returning { candidates:[], evaluatedAlertKey
   );
 });
 
+// Detector-reported recovery coverage (§8.D) — per-tick config snapshot desync pin: watch.json and
+// learned.json are loaded ONCE per tick into an immutable snapshot, and every daemon-side consumer
+// (structural gate, shadow-soak gate, fact-history-trust read, tier veto) reads that one frozen
+// value. This pins the single-load property: the injected loaders FLIP their `enabled` on each
+// successive call, so if any consumer re-read config mid-tick instead of sharing the snapshot it
+// would observe a DIFFERENT value than the first read (a desync). Asserting each loader was invoked
+// EXACTLY once proves there is no second read to desync against. The twelve fast-tick producers are
+// stubbed because they still load their OWN config this slice (that wiring lands next slice), so
+// leaving them live would add their own loader calls and mask the daemon's own single load.
+test("§8.D config snapshot: watch.json and learned.json are each loaded EXACTLY once per tick (immutable snapshot; a mid-tick flip cannot desync the daemon's consumers)", async () => {
+  const paths = await tempPaths();
+  const now = S_LIVE_1_TICK_TS;
+
+  let watchLoads = 0;
+  let learnedLoads = 0;
+  // Flip on each successive call: only the FIRST read's value is ever captured by the snapshot; a
+  // second read (which must not happen within one tick) would see the opposite value.
+  const watchLoader = async () => { watchLoads += 1; return Object.freeze({ enabled: watchLoads === 1 }); };
+  const learnedLoader = async () => { learnedLoads += 1; return Object.freeze({ enabled: learnedLoads === 1 }); };
+
+  // Stub every fast-tick producer so the ONLY consumer of the config seams this tick is the daemon's
+  // own per-tick snapshot load. Containment uses the 4-arg safeCandidates form and is spread as an
+  // array, so it must return a bare [] (an object would break the spread).
+  const noCoverage = async () => ({ candidates: [], evaluatedAlertKeys: [] });
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    loadWatchConfig: watchLoader,
+    loadLearnedConfig: learnedLoader,
+    computeActiveConstraintCandidates: noCoverage,
+    computeProvenanceWarningCandidates: noCoverage,
+    computeProvenanceIdentityCandidates: noCoverage,
+    computeSessionBaselineCandidates: noCoverage,
+    computeCorrelationCandidates: noCoverage,
+    computePeerBaselineCandidates: noCoverage,
+    computeServiceBaselineCandidates: noCoverage,
+    computeCanaryBaselineCandidates: noCoverage,
+    computeProcessLineageBaselineCandidates: noCoverage,
+    computeScheduledJobBaselineCandidates: noCoverage,
+    computeServiceAppearanceCandidates: noCoverage,
+    computeCredentialAccessCandidates: noCoverage,
+    computeContainmentRecommendationCandidates: async () => [],
+    // Quiet the post-alert delivery/adjudication phase so it cannot add its own config reads.
+    adjudicateAlerts: false,
+    deliverSessionAlerts: false,
+    deliverMetricAlertFallback: false,
+  });
+
+  assert.ok(result, "the tick completes");
+  assert.equal(watchLoads, 1, "watch.json is loaded exactly once per tick (the immutable per-tick snapshot); every daemon consumer shares it, so a mid-tick flip cannot desync them");
+  assert.equal(learnedLoads, 1, "learned.json is loaded exactly once per tick (the immutable per-tick snapshot)");
+});
+
 // Watch-by-default slice 1 (docs/plans/2026-09-10-watch-by-default-slice-1.md §12.4): a REAL
 // red->green regression proving the plan's §3.2 finding. The default population after this slice
 // is watch:true (structural collection + the six novelty detectors run), author/learned:false
