@@ -5,7 +5,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { evaluateAndPersistAlerts, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
+import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
@@ -569,15 +569,50 @@ async function safeAdjudicateAlertNotifications(adjudicate, descartesPaths, aler
 // exception is caught, so the caller can exclude that family's rule_ids from coveredRuleIds
 // afterwards. A caller that omits `failedLabels` (none currently do, but the parameter stays
 // optional rather than required) simply does not participate in that exclusion.
-async function safeCandidates(label, produce, fallback, failedLabels) {
+//
+// Detector-reported recovery coverage (§8.B): the optional 5th arg `evaluatedByLabel` (a
+// Map<label, Set<alertId>>, passed only by the twelve fast-tick detector call sites that
+// participate in coverage -- NOT by the structural-checkpoint / containment / delivery sites,
+// which keep the 4-arg form and are unaffected) turns on shape-validation + coverage collection:
+//   - a converted producer returns `{ candidates: [...], evaluatedAlertKeys: [...] }` -> the
+//     candidates array is returned (spread as before) and its evaluatedAlertKeys are unioned into
+//     this label's reported set (owner-scoped: only ever consulted for persisted alerts whose
+//     rule_id this label owns, so a foreign key can never authorize another family's recovery);
+//   - a BARE array (an unconverted producer's old shape) -> returned as-is, NO coverage reported
+//     (its coverage-subject families therefore freeze -- fail-safe, never fabricate). A bare array
+//     from a coverage-subject label warns (a not-yet-converted detector, flagged for the follow-up
+//     slice); a bare array from a non-coverage-subject label (active-constraint) is that producer's
+//     PERMANENT contract and does NOT warn;
+//   - any OTHER shape (object without both array fields, null, a non-array) -> treated as the
+//     fallback (no candidates) + NO coverage + a warn (fail-safe freeze on a malformed producer).
+// A throw is unchanged: warn, record in failedLabels, return fallback (no coverage reported).
+async function safeCandidates(label, produce, fallback, failedLabels, evaluatedByLabel) {
+  let produced;
   try {
-    return await produce();
+    produced = await produce();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[daemon] detector '${label}' failed this tick, degrading to no candidates: ${message}`);
     failedLabels?.add(label);
     return fallback;
   }
+  // Call sites not participating in coverage keep today's exact behavior (return the produced value
+  // verbatim), so the structural-checkpoint / containment / delivery sites are untouched.
+  if (!evaluatedByLabel) return produced;
+  if (Array.isArray(produced)) {
+    if (isCoverageSubjectLabel(label)) {
+      console.warn(`[daemon] detector '${label}' returned a bare candidate array (no coverage report); freezing its family's recovery this tick (fail-safe, pending producer conversion)`);
+    }
+    return produced;
+  }
+  if (produced && typeof produced === "object" && Array.isArray(produced.candidates) && Array.isArray(produced.evaluatedAlertKeys)) {
+    const reported = evaluatedByLabel.get(label) ?? new Set();
+    for (const key of produced.evaluatedAlertKeys) reported.add(String(key));
+    evaluatedByLabel.set(label, reported);
+    return produced.candidates;
+  }
+  console.warn(`[daemon] detector '${label}' returned a malformed result shape (expected an array or { candidates, evaluatedAlertKeys }); treating as no candidates + no coverage (fail-safe)`);
+  return fallback;
 }
 
 // BLOCKER 1 re-gate: the rule_ids each fast-tick detector (keyed by the exact `label` string
@@ -608,7 +643,60 @@ const DETECTOR_FAILURE_RULE_IDS = {
 
 const CONSTRAINT_VIOLATION_RULE_ID_PREFIX = "constraint.violation.";
 
-// Returns the rule_ids a single failed detector label must have excluded from coveredRuleIds.
+// Detector-reported recovery coverage (§8.B) — the canonical ownership registry. Derived from
+// DETECTOR_FAILURE_RULE_IDS above (the SAME "ground truth" map, extended per §7.6, never
+// hand-duplicated), keyed by security rule_id, each row carrying the owning producer LABEL and the
+// owning TIER (§8.B's "owning-tier column"). It answers ONE question for the covered-set
+// construction: which producer owns a given security rule_id. A persisted alert whose rule_id is
+// owned here is "coverage-subject" -- it recovers this tick ONLY if its OWNING producer reported
+// its exact identity in evaluatedAlertKeys (owner-scoped: another producer's report can never
+// authorize it, because the lookup only ever consults the owning label's reported set). A rule_id
+// with NO owner here is deliberately NOT coverage-subject: the two dynamic families
+// (constraint.violation.* and containment.recommend.*) are intentionally absent from
+// DETECTOR_FAILURE_RULE_IDS (see its own doc comment) and keep their existing recovery semantics
+// (they carry their own non-fabrication handling -- active-constraint's "no fact, no claim" and
+// containment's documented fail-closed transition -- and are deferred from conversion this slice,
+// plan §8). Any OTHER unknown rule_id fails closed (frozen) in computeCoveredAlerts. Duplicate
+// ownership is a build-time bug and throws here at module init (fail closed on the ambiguity rather
+// than silently letting either label authorize the rule).
+//
+// The `tier` column is sourced from the SAME partition sets (WATCH_OWNED /
+// AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS) the §7.7 alwaysExcludedRuleIds tier veto already uses; it
+// is carried here for registry completeness and the next slice's wiring, but is deliberately NOT
+// consulted for any NEW veto this slice -- the existing alwaysExcludedRuleIds tier-ownership
+// exclusion remains the load-bearing tier check. `undefined` tier for rules in neither partition
+// set (canary.tripped, credential.access, provenance families).
+const SECURITY_RULE_OWNERSHIP = (() => {
+  const registry = new Map();
+  for (const [label, ruleIds] of Object.entries(DETECTOR_FAILURE_RULE_IDS)) {
+    for (const ruleId of ruleIds) {
+      if (registry.has(ruleId)) {
+        throw new Error(`ownership registry: rule_id '${ruleId}' is owned by both '${registry.get(ruleId).label}' and '${label}' (duplicate ownership)`);
+      }
+      const tier = WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS.has(ruleId) ? "watch"
+        : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS.has(ruleId) ? "author"
+        : undefined;
+      registry.set(ruleId, { label, tier });
+    }
+  }
+  return registry;
+})();
+
+// The closed set of dynamic containment.recommend.<verb> rule_ids (from the same source of truth
+// used by ruleIdsForFailedLabel), pre-computed once: these are NOT coverage-subject (no owner in
+// SECURITY_RULE_OWNERSHIP) and keep their existing recovery semantics in computeCoveredAlerts.
+const CONTAINMENT_RECOMMEND_RULE_IDS = new Set(containmentRecommendationRuleIds());
+
+// True iff a safeCandidates `label` is a coverage-subject detector (present in the ownership
+// registry's ground-truth map). A bare-array return from such a label is a not-yet-converted
+// producer whose family therefore freezes (fail-safe) and warrants a warn; a bare array from a
+// non-registry label (active-constraint / containment-recommendation) is that producer's PERMANENT
+// contract, not an un-adopted shape, and must not warn.
+function isCoverageSubjectLabel(label) {
+  return Object.hasOwn(DETECTOR_FAILURE_RULE_IDS, label);
+}
+
+// Returns the rule_ids a single failed detector label must have excluded from coveredAlertIds.
 // `persistedRuleIds` (this tick's currently-persisted alert rule_ids) is needed only for
 // "active-constraint"'s dynamic prefix match -- every other label resolves from the static table
 // above and ignores it.
@@ -622,21 +710,40 @@ function ruleIdsForFailedLabel(label, persistedRuleIds) {
   return DETECTOR_FAILURE_RULE_IDS[label] ?? [];
 }
 
-// BLOCKER 1 re-gate: builds the SAME coveredRuleIds shape Fix 3 already computed (a complement of
-// FIXED_ALERT_RULE_IDS ∪ this tick's persisted rule_ids, minus an exclusion set), now folding in
-// THREE restriction sources -- history-untrusted (existing, HISTORY_DEPENDENT_ALERT_RULE_IDS,
-// applied only when `!historyTrust.trust`), any genuinely-failed detector this tick (new, applied
-// UNCONDITIONALLY, regardless of history trust), and an optional caller-supplied
-// `alwaysExcludedRuleIds` (new, applied UNCONDITIONALLY, independent of trust or failure -- see
-// its call-site doc comment below for why the MAIN call needs this and the containment call does
-// not) -- so recovery is authorized only for families that were both (a) evaluated against
-// trustworthy history and (b) actually ran without throwing, at the ONE call site that ever
-// legitimately evaluates them. Returns `undefined` (fully unrestricted, byte-identical to the
-// pre-fix default) only when NONE of the three restrictions apply -- the branch that must stay a
-// true no-op for the "zero I/O when nothing is wrong" tick.
-async function computeCoveredRuleIds(descartesPaths, options, { historyTrust, failedLabels, alwaysExcludedRuleIds = [] }) {
+// Detector-reported recovery coverage (§8.A) — the covered set is now keyed on alert IDENTITY
+// (alertId(rule_id, fingerprint)), not rule_id, and recovery is authorized POSITIVELY (freeze by
+// default) for every coverage-subject detector family, folding in FOUR restriction sources:
+//
+//   1. Coverage (NEW, the root fix): a persisted alert whose rule_id is owned in
+//      SECURITY_RULE_OWNERSHIP recovers ONLY if its OWNING producer reported its exact identity in
+//      evaluatedAlertKeys this tick. An unreported (or bare-array / thrown / not-yet-converted)
+//      producer reports nothing -> its family freezes. Owner-scoped by construction: each persisted
+//      alert consults ONLY its owning label's reported set, so a foreign producer's report can never
+//      authorize another family. This is the "empty ⇒ genuine clear" fabrication closed at its root.
+//   2. History-untrusted (existing, §7.7): HISTORY_DEPENDENT_ALERT_RULE_IDS freeze when
+//      `!historyTrust.trust` — an independent daemon-side veto that still fires even if a detector's
+//      coverage-reporting were buggy (kept per §7.7 as the intersection, not removed).
+//   3. Failed-detector (existing, §7.7): a genuinely-thrown detector's rule_ids freeze
+//      unconditionally (ruleIdsForFailedLabel over failedLabels).
+//   4. alwaysExcludedRuleIds (existing, §7.7): the caller-supplied tier-ownership + containment
+//      exclusions, applied unconditionally.
+//
+// Final eligibility is the INTERSECTION (§7.7): a family recovers only if reported-covered AND not
+// history-vetoed AND not failed AND not always-excluded. FIXED_ALERT_RULE_IDS are EXEMPT from the
+// coverage requirement (they always evaluate from current metrics) — their identities are seeded
+// into the covered set and only the §7.7 vetoes (which never name a fixed rule) can drop them. The
+// two dynamic families NOT in the ownership registry (constraint.violation.* and
+// containment.recommend.*) are NOT coverage-subject and keep their existing recovery semantics
+// (subject only to the §7.7 vetoes) — they carry their own non-fabrication handling and are deferred
+// from conversion this slice (plan §8). Any OTHER unowned rule_id fails closed (frozen).
+//
+// Always returns a Set of alert IDs (never `undefined`): freeze-by-default requires the full covered
+// set every tick, and the persisted-alert read this needs is the same cheap local alert-record read
+// the pre-fix code already did whenever any restriction applied. Only called when
+// options.evaluateAlerts !== false, so the "no I/O when disabled" invariant (no detector/alert I/O
+// on a disabled tick) is preserved by the caller, unchanged.
+async function computeCoveredAlerts(descartesPaths, options, { historyTrust, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel }) {
   const historyUntrusted = historyTrust?.trust === false;
-  if (!historyUntrusted && failedLabels.size === 0 && alwaysExcludedRuleIds.length === 0) return undefined;
 
   const readAlerts = options.readAlertRecords ?? readAlertRecords;
   let persistedAlerts = [];
@@ -647,21 +754,35 @@ async function computeCoveredRuleIds(descartesPaths, options, { historyTrust, fa
   }
   const persistedRuleIds = persistedAlerts.map((alert) => alert.rule_id);
 
-  const excludedRuleIds = new Set([
+  // §7.7 rule-id-level vetoes (history-untrusted ∪ failed-detector ∪ always-excluded): a rule_id in
+  // this set freezes regardless of any coverage report.
+  const vetoedRuleIds = new Set([
     ...(historyUntrusted ? HISTORY_DEPENDENT_ALERT_RULE_IDS : []),
     ...alwaysExcludedRuleIds,
   ]);
   for (const label of failedLabels) {
-    for (const ruleId of ruleIdsForFailedLabel(label, persistedRuleIds)) excludedRuleIds.add(ruleId);
+    for (const ruleId of ruleIdsForFailedLabel(label, persistedRuleIds)) vetoedRuleIds.add(ruleId);
   }
 
-  // Complement, not a hardcoded allowlist (see HISTORY_DEPENDENT_ALERT_RULE_IDS's own doc
-  // comment): FIXED_ALERT_RULE_IDS ∪ every rule_id currently persisted, minus the excluded set --
-  // so a dynamic non-excluded rule_id stays eligible for recovery, while every excluded family
-  // freezes in place (no recovery, no fabricated clear) until it is genuinely re-evaluated.
-  return new Set(
-    [...FIXED_ALERT_RULE_IDS, ...persistedRuleIds].filter((ruleId) => !excludedRuleIds.has(ruleId)),
-  );
+  // Seed with the fixed rules' identities (always covered, subject only to the §7.7 vetoes below,
+  // which never name a fixed rule), then decide each persisted alert by identity.
+  const covered = fixedAlertIds();
+  for (const alert of persistedAlerts) {
+    if (vetoedRuleIds.has(alert.rule_id)) continue; // §7.7 veto -> frozen
+    if (FIXED_ALERT_RULE_IDS.has(alert.rule_id)) { covered.add(alert.id); continue; } // exempt
+    const owner = SECURITY_RULE_OWNERSHIP.get(alert.rule_id);
+    if (owner) {
+      // Coverage-subject: recover ONLY if its owning producer reported this exact identity.
+      if (evaluatedByLabel?.get(owner.label)?.has(alert.id)) covered.add(alert.id);
+      continue; // else frozen (never fabricate)
+    }
+    if (alert.rule_id.startsWith(CONSTRAINT_VIOLATION_RULE_ID_PREFIX) || CONTAINMENT_RECOMMEND_RULE_IDS.has(alert.rule_id)) {
+      covered.add(alert.id); // dynamic, non-coverage-subject family: existing semantics (already past the §7.7 vetoes)
+      continue;
+    }
+    // Unknown/unowned rule_id: fail closed (frozen) — a future producer must register its rule.
+  }
+  return covered;
 }
 
 // Finding F4-B1/F4-B2: joins zero or more possibly-undefined error messages into one honestly-
@@ -1005,7 +1126,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // mainExtraCandidates; that block only runs when mainAlerts is truthy, i.e. when the branch ran.
   let mainExtraCandidates;
   let mainAlerts;
-  let coveredRuleIds;
+  let coveredAlertIds;
+  // Detector-reported recovery coverage (§8.B): the per-tick, owner-scoped map of the alert
+  // identities each producer LABEL reported it genuinely evaluated this tick (Map<label,
+  // Set<alertId>>). Populated by safeCandidates at the twelve detector call sites below and consumed
+  // by computeCoveredAlerts to authorize recovery per identity. Shared across BOTH persistence
+  // passes (the containment pass re-persists the same detector alerts, so their coverage must carry
+  // over). In this slice NO producer is converted, so it stays empty and every coverage-subject
+  // family freezes — the intended, safe intermediate state until the per-producer conversion slice.
+  const evaluatedByLabel = new Map();
   // BLOCKER 1 re-gate: every safeCandidates call below that produces alert candidates (the twelve
   // fast-tick detectors AND, further down, the containment-recommendation phase) shares this ONE
   // Set, so a label recorded here reflects a genuine exception this tick regardless of which call
@@ -1040,18 +1169,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // every one of these twelve call sites, so a genuine exception here is ALSO recorded (not just
     // degraded to `[]`) for the coveredRuleIds computation below.
     mainExtraCandidates = [
-          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
-          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, options), [], failedDetectorLabels),
-          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, options), [], failedDetectorLabels),
-          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, options), [], failedDetectorLabels),
-          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, options), [], failedDetectorLabels),
-          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, options), [], failedDetectorLabels),
-          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
-          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
-          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
-          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
-          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels),
-          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, options), [], failedDetectorLabels),
+          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
         ];
     // BLOCKER 1 re-gate: computed HERE, after the twelve detectors above have actually run (so
     // failedDetectorLabels reflects this tick's real outcome) and BEFORE the main persistence
@@ -1115,9 +1244,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // disabled" invariant is untouched by this (cc21f35's else-branch still holds: no fact read
     // happens when both tiers are off). A genuine detector failure still forces its family's
     // exclusion via failedLabels on top of all three sources, on either call site.
-    coveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
+    coveredAlertIds = await computeCoveredAlerts(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
+      evaluatedByLabel,
       alwaysExcludedRuleIds: [
         ...(learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : []),
         ...(watchConfigForHistory.enabled ? [] : WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS),
@@ -1133,13 +1263,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
         extraCandidates: mainExtraCandidates,
-        // Fix 3 / BLOCKER 1 re-gate: the history-untrusted and failed-main-detector restrictions
-        // are applied identically at both this call and the containment call below (shared base);
-        // this call ADDITIONALLY, always, withholds containment.recommend.* itself (see this
-        // coveredRuleIds computation's own doc comment above) since containment is the only phase
-        // that ever legitimately evaluates it. `undefined` (unrestricted, today's exact default
-        // behavior) only when none of that applies; a computed complement Set otherwise.
-        coveredRuleIds,
+        // Detector-reported recovery coverage (§8.A): identity-keyed covered set. Freeze-by-default
+        // for every coverage-subject family (recover only what a producer reported evaluated this
+        // tick), intersected with the §7.7 vetoes (history-untrusted, failed-detector, and this
+        // call's ADDITIONAL always-excluded containment.recommend.* — withheld here because
+        // containment is the only phase that legitimately evaluates it) and tier-ownership.
+        coveredAlertIds,
       });
   }
   let alerts = mainAlerts;
@@ -1181,9 +1310,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // (shared base, applied identically at both sites); `undefined` (fully unrestricted, no extra
     // I/O) only when both tiers are enabled AND containment succeeds AND nothing else this tick
     // warrants a restriction.
-    const containmentCoveredRuleIds = await computeCoveredRuleIds(descartesPaths, options, {
+    const containmentCoveredAlertIds = await computeCoveredAlerts(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
+      evaluatedByLabel,
       alwaysExcludedRuleIds: [
         ...(watchConfigForHistory.enabled ? [] : WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS),
         ...(learnedConfigForHistory.enabled ? [] : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS),
@@ -1195,13 +1325,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historySummary: mainAlerts.history_summary,
       windowMs: options.alertWindowMs,
       extraCandidates: [...mainAlerts.candidates, ...mainExtraCandidates, ...containmentCandidates],
-      // Fix 3 / BLOCKER 1 re-gate: the SAME shared-base restriction as the main call above, plus
-      // (only when containment-recommendation itself just failed) the phase-appropriate
-      // containment.recommend.* exclusion -- this unconditional second phase independently
-      // reproduces the identical fabricated-recovery bug if left unpatched (verified: it computes
-      // its own isCovered from its own coveredRuleIds; patching only the main call is
-      // insufficient).
-      coveredRuleIds: containmentCoveredRuleIds,
+      // Detector-reported recovery coverage (§8.A), containment pass: same identity-keyed
+      // freeze-by-default covered set as the main call, sharing the SAME evaluatedByLabel report (so
+      // the detector families re-persisted here keep their coverage), but WITHOUT the main call's
+      // always-excluded containment.recommend.* — this is the one phase that legitimately evaluates
+      // it, so it recovers whenever containment genuinely ran (unless containment-recommendation
+      // itself threw, in which case failedLabels excludes its rule_ids just like any other
+      // detector). §7.7 vetoes (history-untrusted, failed-detector, tier-ownership) apply identically.
+      coveredAlertIds: containmentCoveredAlertIds,
     });
     alerts = {
       ...containmentAlerts,

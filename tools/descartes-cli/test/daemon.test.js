@@ -33,7 +33,7 @@ import { writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
+import { alertId, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-baseline.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
@@ -2167,8 +2167,14 @@ test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a pro
   const constraintThird = third.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
   const provenanceThird = third.alerts.alerts.find((alert) => alert.rule_id === PUBLIC_BIND_RULE_ID);
   assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by either learned source clearing");
+  // constraint.violation.* is a dynamic, NON-coverage-subject family (not in the §8.B ownership
+  // registry) — it keeps its existing recovery semantics and still genuinely recovers here.
   assert.equal(constraintThird.status, "recovered");
-  assert.equal(provenanceThird.status, "recovered");
+  // Detector-reported recovery coverage (§8): provenance-warning is a coverage-subject family but is
+  // NOT converted in this slice, so its real producer returns a bare array (no coverage report) and
+  // its alert FREEZES (fail-safe, never fabricate) instead of recovering. This flips back to
+  // "recovered" once provenance-warning adopts evaluatedAlertKeys in its own §8 follow-up slice.
+  assert.equal(provenanceThird.status, "active", "an unconverted coverage-subject producer freezes its family's recovery (fail-safe); was 'recovered' before §8");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -4451,7 +4457,7 @@ test("Fix 3: a genuinely degraded fact-history freezes a suppressed history-depe
   assert.equal(result.status.fact_store_completeness?.status, "degraded");
 });
 
-test("Fix 3 control: the SAME suppressed-detector shape genuinely recovers its alert once fact-history is trustworthy (proves the freeze is trust-scoped, not unconditional)", async () => {
+test("Fix 3 control (detector-reported coverage §8): a detector that REPORTS it genuinely evaluated an alert's identity (and history is trustworthy) recovers it — the explicit-report path replacing the old bare-[] inference", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
@@ -4475,19 +4481,125 @@ test("Fix 3 control: the SAME suppressed-detector shape genuinely recovers its a
     },
   ]);
 
+  // Detector-reported recovery coverage (§8): a bare [] no longer recovers (freeze-by-default). To
+  // signal a GENUINE clear, each owning producer must report the exact alert IDENTITY it evaluated
+  // this tick in evaluatedAlertKeys. The session producer owns SESSION_COUNT_DROP; the canary
+  // producer owns CANARY_TAMPERED — each reports the persisted alert's own id.
   const result = await runDaemonIteration(paths, {
     profile: slice6Profile(),
     collectors: fastCollectorFakes(),
     ts: now,
     now,
-    computeSessionBaselineCandidates: async () => [],
-    computeCanaryBaselineCandidates: async () => [],
+    computeSessionBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] }),
+    computeCanaryBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(CANARY_TAMPERED_RULE_ID, "canary_vanished")] }),
   });
 
   const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
   const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TAMPERED_RULE_ID);
-  assert.equal(sessionAlert.status, "recovered", "with TRUSTWORTHY history, an absent candidate must still genuinely recover its alert (unchanged, pre-existing behavior)");
+  assert.equal(sessionAlert.status, "recovered", "a genuinely-evaluated (reported) identity with trustworthy history must recover");
   assert.equal(canaryAlert.status, "recovered");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (§8) — CORE acceptance: freeze-by-default, FIXED exempt,
+// owner-scoped acceptance, and the §7.7 intersection (a report cannot override a global veto).
+// ---------------------------------------------------------------------------------------------
+
+test("§8 FIXED exemption: a fixed-rule alert (system.memory.sustained_high) recovers normally even though EVERY detector producer returns a bare array (no coverage report)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // Pre-persist an active fixed-rule alert. fastCollectorFakes() reports low, non-alerting memory,
+  // so the fixed memory rule produces NO candidate this tick -> the persisted alert is absent from
+  // candidates. Fixed rules are EXEMPT from the coverage requirement (they always evaluate from
+  // current metrics), so it must still recover even with every detector frozen by the fail-safe.
+  await writeAlertRecords(paths, [{
+    rule_id: "system.memory.sustained_high", fingerprint: "global", status: "active", severity: "critical",
+    title: "Sustained high memory pressure", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const memoryAlert = result.alerts.alerts.find((a) => a.rule_id === "system.memory.sustained_high");
+  assert.equal(memoryAlert.status, "recovered", "a fixed-rule alert must recover regardless of detector coverage (it is exempt)");
+});
+
+test("§8 owner-scope: a producer reporting ANOTHER family's alert identity must NOT recover it (cross-source authorization is rejected)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  // Intact history so the §7.7 history veto is NOT the reason for any freeze here.
+  await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
+  await appendFactPoints(paths, [], { now });
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      // session (the OWNER of SESSION_COUNT_DROP) reports nothing (bare array) -> its family freezes.
+      computeSessionBaselineCandidates: async () => [],
+      // peer (a FOREIGN producer) reports session's identity. Owner-scope must ignore it: the covered
+      // set only ever consults the OWNING label's reported set for each persisted alert.
+      computePeerBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] }),
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionAlert.status, "active", "a foreign producer's report must never authorize another family's recovery");
+});
+
+test("§8 intersection (§7.7): a correctly-reported identity still FREEZES when this tick's fact-history is untrustworthy (coverage ∩ global-trust)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  // A genuinely DEGRADED windowed read (in-window corrupt line) -> historyUntrusted true.
+  const storePaths = resolveFactStorePaths(paths);
+  await fs.mkdir(storePaths.dir, { recursive: true });
+  await fs.writeFile(storePaths.factsFile, "not-json\n");
+  await appendFactPoints(paths, [], { now });
+  await appendFactPoints(paths, [], { now });
+  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(degradedRead.completeness.status, "degraded");
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // The OWNER reports the identity as genuinely evaluated -- but SESSION_COUNT_DROP is
+    // history-dependent, and the §7.7 history veto must still freeze it while history is untrusted.
+    computeSessionBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] }),
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionAlert.status, "active", "final eligibility is the INTERSECTION: a report cannot override the global history veto");
 });
 
 // Watch-by-default slice 1 (docs/plans/2026-09-10-watch-by-default-slice-1.md §12.4): a REAL
@@ -4982,8 +5094,10 @@ test("BLOCKER 1 control: a DIFFERENT family that genuinely ran and returned [] t
     computeSessionBaselineCandidates: async () => {
       throw new Error("simulated computeSessionBaselineCandidates failure");
     },
-    // Genuinely evaluated, genuinely absent -- a real clear, not a swallowed exception.
-    computeCorrelationCandidates: async () => [],
+    // Genuinely evaluated, genuinely absent -- a real clear. Under detector-reported coverage (§8) a
+    // genuine clear is signalled by REPORTING the evaluated identity (evaluatedAlertKeys), not by a
+    // bare []; correlation owns CORRELATION_RULE_ID and reports the persisted alert's own id.
+    computeCorrelationCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(CORRELATION_RULE_ID, "global")] }),
   });
 
   const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
@@ -4992,7 +5106,7 @@ test("BLOCKER 1 control: a DIFFERENT family that genuinely ran and returned [] t
   assert.equal(
     correlationAlert.status,
     "recovered",
-    "a family that genuinely ran and returned [] must still recover -- excluding a failed sibling's rule_ids must not over-restrict an unrelated, successfully-evaluated family",
+    "a family that genuinely ran and REPORTED its evaluated identity must still recover -- excluding a failed sibling's rule_ids must not over-restrict an unrelated, successfully-evaluated family",
   );
 });
 
