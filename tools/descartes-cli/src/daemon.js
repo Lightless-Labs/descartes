@@ -804,6 +804,26 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // live-active and shadow-soak constraint evals so they apply the identical staleness bound.
   const structuralIntervalMs = profile.structural?.interval_ms ?? DEFAULT_STRUCTURAL_INTERVAL_MS;
   const activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE * structuralIntervalMs;
+
+  // Detector-reported recovery coverage (§8.D): an immutable per-tick config snapshot. watch.json
+  // and learned.json are loaded ONCE here (via the same options.load*Config ?? load*Config DI seams
+  // every call site already used) and frozen, so the daemon's own tier gates (the structural block,
+  // the shadow-soak block, the fact-history-trust read below) and — next slice — the producers all
+  // read the SAME view of "which tier is on" within a tick. This closes the mid-tick enablement-flip
+  // desync (daybreak R3's second note / §3 Config snapshot): a flip landing between two loads within
+  // one tick could otherwise make the daemon's ownership view disagree with a detector's own gate.
+  // Producer wiring (passing configSnapshot INTO the producers so they stop loading their own) lands
+  // in the per-producer conversion slice; this establishes the seam. Both configs are loaded on every
+  // tick already (the fact-history read below is unconditional), so this consolidates redundant loads
+  // rather than adding any; the "no fact I/O when disabled" invariant (guarded separately below) is
+  // untouched — these are cheap config reads, not fact-store reads.
+  const loadWatchForTick = options.loadWatchConfig ?? loadWatchConfig;
+  const loadLearnedForTick = options.loadLearnedConfig ?? loadLearnedConfig;
+  const configSnapshot = Object.freeze({
+    watch: await loadWatchForTick(descartesPaths),
+    learned: await loadLearnedForTick(descartesPaths),
+  });
+
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
   // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
@@ -846,8 +866,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let shadowEvaluation;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
-    const loadWatch = options.loadWatchConfig ?? loadWatchConfig;
-    const watchConfig = await loadWatch(descartesPaths);
+    const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
     if (watchConfig.enabled) {
       const readCheckpoint = options.readStructuralCheckpoint ?? readStructuralCheckpoint;
       const checkpoint = await readCheckpoint(descartesPaths);
@@ -958,8 +977,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // promoteDraftsToShadow first runs). Writes only to shadow-violations.jsonl — never
           // constraints.json, never alerts.json/notifications (evaluateAndLogShadowConstraints
           // never imports alert-store.js).
-          const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
-          const learnedConfig = await loadConfig(descartesPaths);
+          const learnedConfig = configSnapshot.learned; // §8.D: per-tick snapshot (loaded once above)
           if (learnedConfig.enabled) {
             const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
             shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
@@ -1015,10 +1033,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // `failedDetectorLabels` is known. A detector's genuine exception is exactly as disqualifying
   // for recovery as untrustworthy history, and that can only be known once the detectors have
   // actually been attempted this tick.
-  const loadWatchConfigForHistory = options.loadWatchConfig ?? loadWatchConfig;
-  const watchConfigForHistory = await loadWatchConfigForHistory(descartesPaths);
-  const loadLearnedConfigForHistory = options.loadLearnedConfig ?? loadLearnedConfig;
-  const learnedConfigForHistory = await loadLearnedConfigForHistory(descartesPaths);
+  // §8.D: the per-tick config snapshot (loaded once at tick start), NOT a fresh read here — the
+  // daemon's tier view can no longer drift between the structural block above and this trust read.
+  const watchConfigForHistory = configSnapshot.watch;
+  const learnedConfigForHistory = configSnapshot.learned;
   let factStoreCompleteness;
   let historyTrust;
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
@@ -1161,6 +1179,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     const computeScheduledJobBaseline = options.computeScheduledJobBaselineCandidates ?? computeScheduledJobBaselineCandidates;
     const computeServiceAppearance = options.computeServiceAppearanceCandidates ?? computeServiceAppearanceCandidates;
     const computeCredentialAccess = options.computeCredentialAccessCandidates ?? computeCredentialAccessCandidates;
+    // §8.D: the immutable per-tick config snapshot is threaded into every producer's options as the
+    // seam for the next slice (producers will read configSnapshot.watch/.learned instead of loading
+    // their own). No producer consumes it yet, so this is behavior-neutral this slice.
+    const detectorOptions = { ...options, configSnapshot };
     // Cross-cutting SURVIVABILITY fix: each entry is now individually fail-soft via
     // safeCandidates() -- a throw from any one detector degrades to [] (+ a warning) for that
     // detector THIS tick only, instead of aborting the whole array build and silently dropping
@@ -1169,18 +1191,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // every one of these twelve call sites, so a genuine exception here is ALSO recorded (not just
     // degraded to `[]`) for the coveredRuleIds computation below.
     mainExtraCandidates = [
-          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...options, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, options), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
         ];
     // BLOCKER 1 re-gate: computed HERE, after the twelve detectors above have actually run (so
     // failedDetectorLabels reflects this tick's real outcome) and BEFORE the main persistence
