@@ -5033,9 +5033,12 @@ test("watch-by-default BLOCKER-3 regression (author-owned): correlation/canary.t
 // test drives the case the retirement gate must protect: coverage WOULD authorize recovery (the
 // OWNING producer REPORTS the alert's exact identity in evaluatedAlertKeys), yet the AUTHOR-tier
 // veto must STILL freeze it because learned is off. It fails (the alert fabricated-recovers) if the
-// AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS tier-exclusion line is removed from alwaysExcludedRuleIds
-// (both the main and containment call sites) -- i.e. it re-arms the §7.7 intersection's tier leg,
-// which §7.7 keeps until coverage is proven, so the tier leg cannot be silently retired unnoticed.
+// registry-derived tier veto (tierVetoedRuleIds() over SECURITY_RULE_OWNERSHIP, applied via
+// alwaysExcludedRuleIds at both the main and containment call sites) stops freezing AUTHOR-owned
+// rules when learned is off -- e.g. if it were reverted to the old history-dependent-only spreads.
+// It re-arms the §7.7 intersection's tier leg, which §7.7 keeps until coverage is proven, so the
+// tier leg cannot be silently retired unnoticed. See the two POSITIVE-EVIDENCE companions below
+// (canary.tripped / credential.access) for the BLOCKER-1 gap the old spreads left open.
 test("§7.7 tier-veto (author-owned): correlation stays frozen under watch:true/learned:false with INTACT history EVEN WHEN its owning producer REPORTS its identity evaluated -- the AUTHOR-tier veto is the sole freeze (coverage would otherwise recover it)", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: false });
@@ -5072,6 +5075,97 @@ test("§7.7 tier-veto (author-owned): correlation stays frozen under watch:true/
 
   const persisted = await readAlertRecords(paths);
   assert.equal(persisted.find((a) => a.rule_id === CORRELATION_RULE_ID)?.status, "active", "must stay active ON DISK (the tier veto, not coverage, is the sole freeze)");
+});
+
+// BLOCKER-1 (daybreak-blue re-gate, this slice): the §7.7 tier veto must cover EVERY registry-owned
+// rule, INCLUDING the POSITIVE-EVIDENCE AUTHOR rules that are deliberately NOT history-dependent
+// (canary.tripped, credential.access) and were absent from the old
+// WATCH_OWNED/AUTHOR_OWNED_HISTORY_DEPENDENT sets the veto used to be derived from. Once the
+// positive-evidence producers convert (next slice), an owner reporting an identity evaluated while
+// its AUTHOR tier is OFF would fabricate a recovery -- learned:false means its detector never
+// actually ran (canary-baseline.js:483 / credential-access-baseline.js:285 short-circuit before any
+// I/O), so its silence is not a genuine clear. The registry-derived tier veto (every owned rule
+// tier-vetoed when its owning tier is disabled) must freeze it. These two go RED if the
+// registry-derived veto is reverted to the history-dependent-only sets (which never named
+// canary.tripped / credential.access): coverage alone would then recover them.
+test("§7.7 tier-veto (author-owned POSITIVE evidence): canary.tripped stays frozen under watch:true/learned:false with INTACT history EVEN WHEN its owning producer REPORTS its identity evaluated -- the AUTHOR-tier veto is the sole freeze", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // Fully intact, trustworthy fact-history: the §7.7 history veto is NOT the cause of the freeze
+  // (and canary.tripped is not history-dependent anyway, so it never could be) -- isolating the
+  // AUTHOR-tier veto as the sole freeze.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [{
+    rule_id: CANARY_TRIPPED_RULE_ID, fingerprint: "canary-1", status: "active", severity: "critical",
+    title: "Canary tripped", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // The OWNER (canary) explicitly REPORTS the persisted alert's identity as genuinely evaluated
+    // this tick -- so coverage alone WOULD authorize recovery. The ONLY thing that must still freeze
+    // it is the AUTHOR-tier veto (learned is off): canary-baseline is learned-gated, so its detector
+    // never actually ran this tick.
+    computeCanaryBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(CANARY_TRIPPED_RULE_ID, "canary-1")] }),
+  });
+
+  const canaryAlert = result.alerts.alerts.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID);
+  assert.ok(canaryAlert, "the canary.tripped alert must still be PRESENT, not silently dropped");
+  assert.equal(canaryAlert.status, "active", "the AUTHOR-tier veto must freeze canary.tripped while learned is off, even though its owning producer reported its identity evaluated (coverage would otherwise recover it)");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === CANARY_TRIPPED_RULE_ID)?.status, "active", "canary.tripped must stay active ON DISK (the registry-derived tier veto, not coverage, is the sole freeze)");
+});
+
+test("§7.7 tier-veto (author-owned POSITIVE evidence): credential.access stays frozen under watch:true/learned:false with INTACT history EVEN WHEN its owning producer REPORTS its identity evaluated -- the AUTHOR-tier veto is the sole freeze", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeWatchConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+
+  // Fully intact, trustworthy fact-history: the §7.7 history veto is NOT the cause of the freeze
+  // (credential.access is not history-dependent) -- the AUTHOR-tier veto is the sole freeze.
+  await appendFactPoints(paths, [
+    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
+  ], { now });
+  await appendFactPoints(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(intactRead.completeness.status, "intact");
+
+  await writeAlertRecords(paths, [{
+    rule_id: CREDENTIAL_ACCESS_RULE_ID, fingerprint: "path-1", status: "active", severity: "critical",
+    title: "Credential access", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    // The OWNER (credential-access) REPORTS the persisted alert's identity as genuinely evaluated;
+    // coverage alone WOULD authorize recovery. The AUTHOR-tier veto (learned off) must still freeze
+    // it -- credential-access-baseline is learned-gated, so its detector never ran this tick.
+    computeCredentialAccessCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(CREDENTIAL_ACCESS_RULE_ID, "path-1")] }),
+  });
+
+  const credentialAlert = result.alerts.alerts.find((a) => a.rule_id === CREDENTIAL_ACCESS_RULE_ID);
+  assert.ok(credentialAlert, "the credential.access alert must still be PRESENT, not silently dropped");
+  assert.equal(credentialAlert.status, "active", "the AUTHOR-tier veto must freeze credential.access while learned is off, even though its owning producer reported its identity evaluated (coverage would otherwise recover it)");
+
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.find((a) => a.rule_id === CREDENTIAL_ACCESS_RULE_ID)?.status, "active", "credential.access must stay active ON DISK (the registry-derived tier veto, not coverage, is the sole freeze)");
 });
 
 test("watch-by-default BLOCKER-3 regression (watch-owned): session.count_drop must NOT be fabricated-recovered under watch:false/learned:true even with fully INTACT fact-history", async () => {

@@ -129,6 +129,18 @@ export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
 // rule_id, and ALWAYS exclude a tier's families from recovery whenever that tier is disabled --
 // independent of global history trust. A family is recovery-eligible only if its owning tier's
 // detector genuinely ran this tick (never fabricate: silence from a disabled tier is not a clear).
+//
+// BLOCKER-1 (daybreak-blue re-gate, this slice) — the tier veto is now derived DIRECTLY from the
+// COMPLETE SECURITY_RULE_OWNERSHIP registry (via tierVetoedRuleIds() at both persistence passes),
+// NOT from these two history-dependent-only sets. These two sets remain the SOURCE OF TRUTH for the
+// registry's `tier` column (WATCH_OWNED here -> "watch", everything else -> "author"), but the veto
+// itself now spans EVERY registry-owned rule, including the positive-evidence AUTHOR rules
+// (canary.tripped, credential.access) and provenance families these sets never named. See
+// tierVetoedRuleIds()'s own doc comment for how it subsumes these sets. WATCH_OWNED_ is still the
+// canonical membership test a future watch-gated rule must be added to (or it defaults to AUTHOR and
+// over-freezes when learned is off). AUTHOR_OWNED_ is retained (still exported; daemon.test.js pins
+// it) as the documented history-dependent AUTHOR pair, though the registry no longer consults it
+// directly (its members resolve to "author" via the not-watch default).
 export const WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS = new Set([
   SERVICE_DISAPPEARED_RULE_ID,
   SERVICE_APPEARED_RULE_ID,
@@ -679,12 +691,23 @@ const CONSTRAINT_VIOLATION_RULE_ID_PREFIX = "constraint.violation.";
 // ownership is a build-time bug and throws here at module init (fail closed on the ambiguity rather
 // than silently letting either label authorize the rule).
 //
-// The `tier` column is sourced from the SAME partition sets (WATCH_OWNED /
-// AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS) the §7.7 alwaysExcludedRuleIds tier veto already uses; it
-// is carried here for registry completeness and the next slice's wiring, but is deliberately NOT
-// consulted for any NEW veto this slice -- the existing alwaysExcludedRuleIds tier-ownership
-// exclusion remains the load-bearing tier check. `undefined` tier for rules in neither partition
-// set (canary.tripped, credential.access, provenance families).
+// The `tier` column assigns EVERY owned rule an EXPLICIT owning tier (BLOCKER-1, daybreak-blue
+// re-gate this slice -- no `undefined` tier any more): WATCH for the eight watch-tier
+// structural/novelty detectors (WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS --
+// service.disappeared/appeared, session.count_drop/churn, peer.count_spike/drop,
+// scheduled_job.appeared, process.lineage.novel_edge), AUTHOR for EVERYTHING ELSE (correlation and
+// canary.tampered as before, PLUS the positive-evidence rules canary.tripped and credential.access
+// and the provenance families that used to be `undefined`). AUTHOR is correct for all of them
+// because every non-watch-owned producer here is learned-gated -- canary-baseline.js:483,
+// credential-access-baseline.js:285, provenance-warnings.js:327, provenance-identity.js:193 all
+// short-circuit on `!learnedConfig.enabled` BEFORE evaluating -- so their silence while learned is
+// off is never a genuine clear. This complete tier column is the SOLE source tierVetoedRuleIds()
+// derives the §7.7 tier veto from at BOTH persistence passes (it SUBSUMES the old
+// history-dependent-only WATCH_OWNED/AUTHOR_OWNED spreads, which never named the positive-evidence
+// rules -- the BLOCKER-1 gap). A FUTURE watch-gated rule MUST be added to
+// WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS, or it defaults to AUTHOR here and over-freezes when learned
+// is off (the SAFE direction -- an over-freeze is never a fabrication -- but still wrong, so it must
+// be classified explicitly rather than left to the default).
 const SECURITY_RULE_OWNERSHIP = (() => {
   const registry = new Map();
   for (const [label, ruleIds] of Object.entries(DETECTOR_FAILURE_RULE_IDS)) {
@@ -692,14 +715,38 @@ const SECURITY_RULE_OWNERSHIP = (() => {
       if (registry.has(ruleId)) {
         throw new Error(`ownership registry: rule_id '${ruleId}' is owned by both '${registry.get(ruleId).label}' and '${label}' (duplicate ownership)`);
       }
-      const tier = WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS.has(ruleId) ? "watch"
-        : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS.has(ruleId) ? "author"
-        : undefined;
+      const tier = WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS.has(ruleId) ? "watch" : "author";
       registry.set(ruleId, { label, tier });
     }
   }
   return registry;
 })();
+
+// §7.7 tier veto, derived DIRECTLY from the complete ownership registry (BLOCKER-1 fix, daybreak
+// re-gate): a registry-owned security rule is tier-vetoed (frozen, never recoverable this tick)
+// whenever its OWNING tier is disabled -- WATCH-owned while !watch.enabled, or AUTHOR-owned while
+// !learned.enabled. Silence from a disabled tier is not a genuine clear (its detector short-circuits
+// before evaluating), regardless of how trustworthy the OTHER tier's fact-history happens to be.
+// This SUBSUMES the old history-dependent-only spreads (WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS ∪
+// AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS): the eight history-dependent WATCH families and the two
+// history-dependent AUTHOR families are in the registry with the same tiers, so they stay vetoed
+// exactly as before -- while ALSO covering the positive-evidence AUTHOR rules (canary.tripped,
+// credential.access) and the provenance families the old sets never named. Absent this, once those
+// producers convert (next slice) an owner reporting an identity evaluated while its tier was off
+// would fabricate a recovery (daybreak's repro: watch:true/learned:false + persisted canary.tripped
+// + canary reports the identity evaluated -> covered -> recovered with no observation). Applied
+// unconditionally at BOTH persistence passes via alwaysExcludedRuleIds. Fails CLOSED (freezes) on any
+// tier value that is neither "watch" nor "author" -- unreachable today (the registry assigns exactly
+// one of the two) but matching the registry's own throw-on-duplicate fail-closed posture.
+function tierVetoedRuleIds({ watchEnabled, learnedEnabled }) {
+  const vetoed = [];
+  for (const [ruleId, { tier }] of SECURITY_RULE_OWNERSHIP) {
+    if (tier === "watch") { if (!watchEnabled) vetoed.push(ruleId); }
+    else if (tier === "author") { if (!learnedEnabled) vetoed.push(ruleId); }
+    else vetoed.push(ruleId); // fail closed: an unclassified owned rule stays frozen until classified
+  }
+  return vetoed;
+}
 
 // The closed set of dynamic containment.recommend.<verb> rule_ids (from the same source of truth
 // used by ruleIdsForFailedLabel), pre-computed once: these are NOT coverage-subject (no owner in
@@ -1271,12 +1318,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // inert when learned is off (Slice 7.2 -> zero recommendations, and a stale recommendation
     // SHOULD then recover), so there is nothing to withhold.
     //
-    // BLOCKER-3 re-gate (daybreak-blue round 2, the root of the class): the second and third
-    // spreads below add tier-ownership exclusion, independent of global historyTrust --
-    // WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS whenever watch is off, AUTHOR_OWNED_HISTORY_
-    // DEPENDENT_RULE_IDS whenever learned is off (see their own doc comment above
-    // HISTORY_DEPENDENT_ALERT_RULE_IDS for the full reproduction). This is NOT redundant with
-    // history-untrusted exclusion: a tier can be disabled while the OTHER tier's history read is
+    // BLOCKER-3 re-gate (daybreak-blue round 2, the root of the class) + BLOCKER-1 (this slice): the
+    // second spread below is the tier-ownership exclusion, independent of global historyTrust. It is
+    // now derived DIRECTLY from the COMPLETE SECURITY_RULE_OWNERSHIP registry via tierVetoedRuleIds()
+    // -- every WATCH-owned rule whenever watch is off, every AUTHOR-owned rule whenever learned is off
+    // -- rather than from the old history-dependent-only WATCH_OWNED/AUTHOR_OWNED spreads it used to
+    // build inline. This closes BLOCKER-1: the old spreads never named the positive-evidence AUTHOR
+    // rules (canary.tripped, credential.access) or the provenance families, so once those producers
+    // convert an owner reporting an identity evaluated while its tier was off would have fabricated a
+    // recovery (see tierVetoedRuleIds()'s doc comment for the reproduction). This is NOT redundant
+    // with history-untrusted exclusion: a tier can be disabled while the OTHER tier's history read is
     // perfectly trustworthy (e.g. the DEFAULT watch:true/learned:false population), in which case
     // historyUntrusted is false but the disabled tier's own detectors still never ran this tick --
     // silence from a disabled tier is not a genuine clear, regardless of how trustworthy the
@@ -1286,15 +1337,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // one cheap local alert-record read, not a fact-store read; the fact store's own "no I/O when
     // disabled" invariant is untouched by this (cc21f35's else-branch still holds: no fact read
     // happens when both tiers are off). A genuine detector failure still forces its family's
-    // exclusion via failedLabels on top of all three sources, on either call site.
+    // exclusion via failedLabels on top of all sources, on either call site.
     coveredAlertIds = await computeCoveredAlerts(descartesPaths, options, {
       historyTrust,
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
       alwaysExcludedRuleIds: [
         ...(learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : []),
-        ...(watchConfigForHistory.enabled ? [] : WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS),
-        ...(learnedConfigForHistory.enabled ? [] : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS),
+        ...tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
       ],
     });
     mainAlerts = await evaluateAndPersistAlerts(descartesPaths, {
@@ -1343,12 +1393,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // above) and ruleIdsForFailedLabel excludes its closed rule_id set exactly like any other
     // failed detector -- so a genuine exception still cannot fabricate a recovery of its own
     // family, matching every other detector's protection.
-    // BLOCKER-3 re-gate (daybreak-blue round 2): the SAME tier-ownership exclusion as the main
-    // call above IS added here though -- this second persistence pass re-derives its own
-    // coveredAlertIds independently (BLOCKER 1's phase-appropriate-coverage requirement), so a
-    // tier-disabled family must be protected at THIS call site too, not just the main one, or a
-    // fix scoped to only the main call would leave this pass fabricating the exact same recovery
-    // (mirrors Fix 3's own "BOTH evaluateAndPersistAlerts call sites are patched" precedent).
+    // BLOCKER-3 re-gate (daybreak-blue round 2) + BLOCKER-1 (this slice): the SAME registry-derived
+    // tier-ownership exclusion as the main call above IS added here though (tierVetoedRuleIds() over
+    // the complete SECURITY_RULE_OWNERSHIP registry) -- this second persistence pass re-derives its
+    // own coveredAlertIds independently (BLOCKER 1's phase-appropriate-coverage requirement), so a
+    // tier-disabled family (including the positive-evidence AUTHOR rules the old sets missed) must be
+    // protected at THIS call site too, not just the main one, or a fix scoped to only the main call
+    // would leave this pass fabricating the exact same recovery (mirrors Fix 3's own "BOTH
+    // evaluateAndPersistAlerts call sites are patched" precedent).
     // Same history-untrusted and failed-main-detector restrictions as the main call otherwise
     // (shared base, applied identically at both sites); `undefined` (fully unrestricted, no extra
     // I/O) only when both tiers are enabled AND containment succeeds AND nothing else this tick
@@ -1357,10 +1409,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historyTrust,
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
-      alwaysExcludedRuleIds: [
-        ...(watchConfigForHistory.enabled ? [] : WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS),
-        ...(learnedConfigForHistory.enabled ? [] : AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS),
-      ],
+      alwaysExcludedRuleIds: tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
     });
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
       now: ts,
