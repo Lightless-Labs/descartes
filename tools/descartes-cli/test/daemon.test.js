@@ -50,7 +50,7 @@ import {
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   buildScheduledJobEntityKey,
 } from "../src/fact-translators.js";
-import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
+import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readContainmentRecommendConfig, writeContainmentRecommendConfig } from "../src/containment-recommend.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
@@ -1340,6 +1340,20 @@ function runIsolatedDaemonTick(paths, ts = S_LIVE_1_TICK_TS) {
   return runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts, now: ts });
 }
 
+function persistedActiveConstraintViolation(now = S_LIVE_1_TICK_TS) {
+  return {
+    rule_id: "constraint.violation.service-presence",
+    fingerprint: activeConstraintFixture().id,
+    status: "active",
+    severity: "warning",
+    title: "Constraint violated",
+    summary: "test fixture",
+    first_seen: now,
+    last_seen: now,
+    diagnostics: {},
+  };
+}
+
 test("S-live-1: byte-identical real alerts when the learned kill switch is off, even with a violated active constraint and a matching current fact present", async () => {
   const baselinePaths = await tempPaths();
   const baseline = await runIsolatedDaemonTick(baselinePaths);
@@ -1402,6 +1416,43 @@ test("S-live-1: an active constraint whose target has no current fact does not f
   const result = await runIsolatedDaemonTick(paths);
   assert.equal(result.alerts.alerts.some((alert) => alert.rule_id === "constraint.violation.service-presence"), false);
   await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+});
+
+test("BLOCKER-1: a persisted constraint.violation alert stays active when learned monitoring is off and the active-constraint producer returns []", async () => {
+  const paths = await tempPaths();
+  const now = S_LIVE_1_TICK_TS;
+  await writeLearnedConfig(paths, { enabled: false });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await writeAlertRecords(paths, [persistedActiveConstraintViolation(now)]);
+
+  const result = await runIsolatedDaemonTick(paths, now);
+  const inMemory = result.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+  const persisted = await readAlertRecords(paths);
+  const onDisk = persisted.find((alert) => alert.rule_id === "constraint.violation.service-presence");
+
+  assert.equal(inMemory?.status, "active", "learned-off active-constraint silence is unevaluated and must freeze, not recover");
+  assert.equal(onDisk?.status, "active", "the frozen constraint.violation alert must stay active on disk");
+});
+
+test("BLOCKER-1: a persisted constraint.violation alert stays active when learned monitoring is on but its required fact is missing", async () => {
+  const paths = await tempPaths();
+  const now = S_LIVE_1_TICK_TS;
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeConstraints(paths, [activeConstraintFixture()]);
+  await writeAlertRecords(paths, [persistedActiveConstraintViolation(now)]);
+
+  const result = await runIsolatedDaemonTick(paths, now);
+  assert.equal(
+    result.alerts.candidates.some((candidate) => candidate.rule_id === "constraint.violation.service-presence"),
+    false,
+    "a missing required fact yields no active-constraint candidate",
+  );
+  const persisted = await readAlertRecords(paths);
+  assert.equal(
+    persisted.find((alert) => alert.rule_id === "constraint.violation.service-presence")?.status,
+    "active",
+    "no candidate without an evaluated fact is not evidence of recovery; the alert must stay active on disk",
+  );
 });
 
 // --- Slice B (Codex-hardening): eval-side freshness bound (stale fact ≠ live claim) ---
@@ -1513,9 +1564,14 @@ test("S-live-1: a fixed-rule alert and an active-constraint alert coexist across
   assert.ok(constraintSecond, "expected the constraint alert to remain active");
   assert.equal(constraintSecond.status, "active");
 
-  // Third iteration: the fact now satisfies the constraint (service recovered) — the constraint
-  // alert must recover, while the still-sustained-high-memory fixed alert must NOT be
-  // spuriously recovered by the constraint source disappearing from extraCandidates.
+  // Third iteration: the fact now satisfies the constraint (service recovered). Post
+  // detector-recovery-coverage core, constraint.violation.* is safe-frozen (removed from the
+  // auto-covered dynamic branch) until the active-constraint producer reports per-identity
+  // coverage — so this GENUINE clear stays frozen in the interim rather than fabricate-recover
+  // in the learned-off / fact-missing cases that shared the same auto-cover. Recovery of a real
+  // clear returns when active-constraint is converted to report coverage. Meanwhile the
+  // still-sustained-high-memory fixed alert must ALSO NOT be spuriously recovered by the
+  // constraint source disappearing from extraCandidates.
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } },
   ], { now: "2026-05-24T00:02:00.000Z" });
@@ -1524,7 +1580,7 @@ test("S-live-1: a fixed-rule alert and an active-constraint alert coexist across
   const fixedThird = third.alerts.alerts.find((alert) => alert.rule_id === "system.memory.sustained_high");
   const constraintThird = third.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
   assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by the constraint source clearing");
-  assert.equal(constraintThird.status, "recovered");
+  assert.equal(constraintThird.status, "active", "constraint.violation.* is safe-frozen post-core (no longer auto-covered) until active-constraint reports coverage; a genuine clear stays frozen in the interim rather than share the fabricated-recovery of the learned-off/fact-missing cases");
 });
 
 // --- Slice S4, additive: provenance-warning candidates wired into the real
@@ -2167,9 +2223,10 @@ test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a pro
   const constraintThird = third.alerts.alerts.find((alert) => alert.rule_id === "constraint.violation.service-presence");
   const provenanceThird = third.alerts.alerts.find((alert) => alert.rule_id === PUBLIC_BIND_RULE_ID);
   assert.equal(fixedThird.status, "active", "the fixed-rule alert must not be spuriously recovered by either learned source clearing");
-  // constraint.violation.* is a dynamic, NON-coverage-subject family (not in the §8.B ownership
-  // registry) — it keeps its existing recovery semantics and still genuinely recovers here.
-  assert.equal(constraintThird.status, "recovered");
+  // Active-constraint is an explicitly deferred §8 producer. Its bare [] result is unevaluated
+  // coverage, so constraint.violation.* is safe-frozen until that producer reports per-identity
+  // coverage; a clear result must not be inferred from the absent candidate.
+  assert.equal(constraintThird.status, "active");
   // Detector-reported recovery coverage (§8): provenance-warning is a coverage-subject family but is
   // NOT converted in this slice, so its real producer returns a bare array (no coverage report) and
   // its alert FREEZES (fail-safe, never fabricate) instead of recovering. This flips back to
@@ -4827,6 +4884,55 @@ test("§8.D config snapshot (BLOCKER-2 b): a REAL watch-gated AND a REAL learned
   assert.ok(result, "the tick completes");
   assert.equal(watchLoads, 1, "the REAL watch-gated producer (session) consumed the frozen snapshot through the loader seam -- it did NOT re-read watch.json (a second read would flip to disabled and desync)");
   assert.equal(learnedLoads, 1, "the REAL learned-gated producers (provenance-warning AND second-pass containment-recommendation) consumed the frozen snapshot through the loader seam -- neither re-read learned.json (a second read would flip to disabled and desync)");
+});
+
+test("§8.D BLOCKER-2: a producer that reassigns its loader cannot alter a later producer's per-call options", async () => {
+  const paths = await tempPaths();
+  const now = S_LIVE_1_TICK_TS;
+  let mutatingOptions;
+  let laterOptions;
+  let laterObservedWatchEnabled;
+  const noCoverage = async () => ({ candidates: [], evaluatedAlertKeys: [] });
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    loadWatchConfig: async () => ({ enabled: true }),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    // provenance-warning is the first producer that currently receives the shared base object.
+    // Reassigning this object's loader must not change the loader later handed to session.
+    computeProvenanceWarningCandidates: async (_paths, options) => {
+      mutatingOptions = options;
+      options.loadWatchConfig = async () => ({ enabled: false });
+      return { candidates: [], evaluatedAlertKeys: [] };
+    },
+    computeActiveConstraintCandidates: noCoverage,
+    computeProvenanceIdentityCandidates: noCoverage,
+    computeCorrelationCandidates: noCoverage,
+    computePeerBaselineCandidates: noCoverage,
+    computeServiceBaselineCandidates: noCoverage,
+    computeCanaryBaselineCandidates: noCoverage,
+    computeProcessLineageBaselineCandidates: noCoverage,
+    computeScheduledJobBaselineCandidates: noCoverage,
+    computeServiceAppearanceCandidates: noCoverage,
+    computeCredentialAccessCandidates: noCoverage,
+    // Delegate to the real session producer after observing the loader it received.
+    computeSessionBaselineCandidates: async (producerPaths, options) => {
+      laterOptions = options;
+      laterObservedWatchEnabled = (await options.loadWatchConfig(producerPaths)).enabled;
+      return computeSessionBaselineCandidates(producerPaths, options);
+    },
+    computeContainmentRecommendationCandidates: async () => [],
+    adjudicateAlerts: false,
+    deliverSessionAlerts: false,
+    deliverMetricAlertFallback: false,
+  });
+
+  assert.ok(result, "the tick completes despite the producer mutation");
+  assert.notEqual(mutatingOptions, laterOptions, "each producer must receive a distinct mutable options object");
+  assert.equal(laterObservedWatchEnabled, true, "the later real producer must still observe the original frozen-snapshot loader value");
 });
 
 // BLOCKER-2 (a) — the per-tick config snapshot must be DEEPLY immutable: a producer handed the

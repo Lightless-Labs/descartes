@@ -682,12 +682,11 @@ const CONSTRAINT_VIOLATION_RULE_ID_PREFIX = "constraint.violation.";
 // owned here is "coverage-subject" -- it recovers this tick ONLY if its OWNING producer reported
 // its exact identity in evaluatedAlertKeys (owner-scoped: another producer's report can never
 // authorize it, because the lookup only ever consults the owning label's reported set). A rule_id
-// with NO owner here is deliberately NOT coverage-subject: the two dynamic families
-// (constraint.violation.* and containment.recommend.*) are intentionally absent from
-// DETECTOR_FAILURE_RULE_IDS (see its own doc comment) and keep their existing recovery semantics
-// (they carry their own non-fabrication handling -- active-constraint's "no fact, no claim" and
-// containment's documented fail-closed transition -- and are deferred from conversion this slice,
-// plan §8). Any OTHER unknown rule_id fails closed (frozen) in computeCoveredAlerts. Duplicate
+// with NO owner here is deliberately NOT coverage-subject: containment.recommend.* is intentionally
+// absent from DETECTOR_FAILURE_RULE_IDS (see its own doc comment) and keeps its deliberate existing
+// recovery semantics. constraint.violation.* is also dynamic and absent from the registry, but its
+// deferred active-constraint producer has no per-identity coverage report, so it is safe-frozen by
+// computeCoveredAlerts below. Any OTHER unknown rule_id fails closed (frozen). Duplicate
 // ownership is a build-time bug and throws here at module init (fail closed on the ambiguity rather
 // than silently letting either label authorize the rule).
 //
@@ -798,10 +797,10 @@ function ruleIdsForFailedLabel(label, persistedRuleIds) {
 // history-vetoed AND not failed AND not always-excluded. FIXED_ALERT_RULE_IDS are EXEMPT from the
 // coverage requirement (they always evaluate from current metrics) — their identities are seeded
 // into the covered set and only the §7.7 vetoes (which never name a fixed rule) can drop them. The
-// two dynamic families NOT in the ownership registry (constraint.violation.* and
-// containment.recommend.*) are NOT coverage-subject and keep their existing recovery semantics
-// (subject only to the §7.7 vetoes) — they carry their own non-fabrication handling and are deferred
-// from conversion this slice (plan §8). Any OTHER unowned rule_id fails closed (frozen).
+// containment.recommend.* is NOT coverage-subject and keeps its deliberate existing recovery
+// semantics (subject only to the §7.7 vetoes). constraint.violation.* is deferred under §8 and
+// therefore remains frozen because the active-constraint producer reports no per-identity coverage.
+// Any OTHER unowned rule_id fails closed (frozen).
 //
 // Always returns a Set of alert IDs (never `undefined`): freeze-by-default requires the full covered
 // set every tick, and the persisted-alert read this needs is the same cheap local alert-record read
@@ -842,8 +841,8 @@ async function computeCoveredAlerts(descartesPaths, options, { historyTrust, fai
       if (evaluatedByLabel?.get(owner.label)?.has(alert.id)) covered.add(alert.id);
       continue; // else frozen (never fabricate)
     }
-    if (alert.rule_id.startsWith(CONSTRAINT_VIOLATION_RULE_ID_PREFIX) || CONTAINMENT_RECOMMEND_RULE_IDS.has(alert.rule_id)) {
-      covered.add(alert.id); // dynamic, non-coverage-subject family: existing semantics (already past the §7.7 vetoes)
+    if (CONTAINMENT_RECOMMEND_RULE_IDS.has(alert.rule_id)) {
+      covered.add(alert.id); // containment's deliberate non-coverage-subject semantics (past vetoes)
       continue;
     }
     // Unknown/unowned rule_id: fail closed (frozen) — a future producer must register its rule.
@@ -1289,10 +1288,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // override any loader the test/caller injected (options.load*Config), which is correct: that
     // injected loader was already consumed ONCE, above, to BUILD the snapshot; the producers must see
     // that same first value, not a fresh read. The SAME snapshotLoaders are spread into the
-    // second-pass containment-recommendation producer below. (This is the seam the per-producer
+    // second-pass containment-recommendation producer below. Each fast-tick producer receives
+    // a fresh shallow copy of this base object below, so a producer can neither reassign a loader
+    // nor mutate another producer's top-level options. (This is the seam the per-producer
     // conversion slice will build coverage reporting on; wiring it to the snapshot now is the
     // BLOCKER-2 fix, not the conversion.)
     const detectorOptions = { ...options, configSnapshot, ...snapshotLoaders };
+    const detectorOptionsFor = (extra = {}) => ({ ...detectorOptions, ...extra });
     // Cross-cutting SURVIVABILITY fix: each entry is now individually fail-soft via
     // safeCandidates() -- a throw from any one detector degrades to [] (+ a warning) for that
     // detector THIS tick only, instead of aborting the whole array build and silently dropping
@@ -1301,18 +1303,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // every one of these twelve call sites, so a genuine exception here is ALSO recorded (not just
     // degraded to `[]`) for the coveredAlertIds computation below.
     mainExtraCandidates = [
-          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, { ...detectorOptions, activeFreshnessMs }), [], failedDetectorLabels, evaluatedByLabel),
-          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, detectorOptions), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("active-constraint", () => computeActiveConstraint(descartesPaths, detectorOptionsFor({ activeFreshnessMs })), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("provenance-warning", () => computeProvenanceWarning(descartesPaths, detectorOptionsFor()), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("provenance-identity", () => computeProvenanceIdentity(descartesPaths, detectorOptionsFor()), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("session", () => computeSessionBaseline(descartesPaths, detectorOptionsFor()), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("correlation", () => computeCorrelation(descartesPaths, detectorOptionsFor()), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("peer", () => computePeerBaseline(descartesPaths, detectorOptionsFor()), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("service", () => computeServiceBaseline(descartesPaths, detectorOptionsFor({ activeFreshnessMs })), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("canary", () => computeCanaryBaseline(descartesPaths, detectorOptionsFor({ activeFreshnessMs })), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("process-lineage", () => computeProcessLineageBaseline(descartesPaths, detectorOptionsFor({ activeFreshnessMs })), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("scheduled-job", () => computeScheduledJobBaseline(descartesPaths, detectorOptionsFor({ activeFreshnessMs })), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("service-appearance", () => computeServiceAppearance(descartesPaths, detectorOptionsFor({ activeFreshnessMs })), [], failedDetectorLabels, evaluatedByLabel),
+          ...await safeCandidates("credential-access", () => computeCredentialAccess(descartesPaths, detectorOptionsFor()), [], failedDetectorLabels, evaluatedByLabel),
         ];
     // BLOCKER 1 re-gate: computed HERE, after the twelve detectors above have actually run (so
     // failedDetectorLabels reflects this tick's real outcome) and BEFORE the main persistence
