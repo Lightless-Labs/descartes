@@ -329,12 +329,13 @@ export function buildCorrelationCandidate(anchor, bestPeer, poolSize) {
  * Detector-reported recovery coverage (§8.B/§8.C): returns `{ candidates, evaluatedAlertKeys }`.
  * `candidates` is exactly what this producer emitted before. `evaluatedAlertKeys` is the set of
  * `alertId(CORRELATION_RULE_ID, fingerprint)` for every persisted correlation identity this
- * stateless detector GENUINELY evaluated this tick -- expired/orphaned anchors (designed
- * end-of-life, always clear) plus, when the peer stream is trusted+ready, the per-anchor-prefix
- * identities under each live anchor (documented exception to exact per-identity matching, §8.C).
- * Unevaluated cases (gate-off, non-finite clock, untrusted history, overflow, insufficient peer
- * history) report NO coverage for the affected identities so the daemon freezes rather than
- * fabricates a recovery.
+ * stateless detector GENUINELY evaluated this tick. Each identity must first resolve through its
+ * complete diagnostics to exactly one kill-side source row; only then can that one source be
+ * classified as expired or live. Expired sources are clear by end-of-life. Live sources require
+ * the trusted+ready peer-stream evaluation below. Unevaluated cases (including legacy alerts
+ * without anchor_fingerprint, prefix mismatches, missing/ambiguous/malformed/future sources,
+ * gate-off, non-finite clock, untrusted history, overflow, and insufficient peer history) report
+ * NO coverage so the daemon freezes rather than fabricates a recovery.
  */
 export async function computeCorrelationCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
@@ -378,40 +379,56 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   );
 
   const anchors = findKillSideAnchors(alertRecords, { now, lookbackMs });
-  const liveAnchorPrefixes = anchors.map((anchor) => `${anchor.fingerprint}__`);
-  const underLiveAnchor = (fingerprint) => liveAnchorPrefixes.some((prefix) => fingerprint.startsWith(prefix));
-
   const evaluatedAlertKeys = [];
-  // EXPIRY branch (§7.5 + §8.C): a persisted correlation alert may be clear solely because its
-  // exact source anchor is provably past the lookback. A missing, quarantined, malformed, or
-  // future-dated source anchor is evidence loss, not expiry, so it must remain unevaluated.
-  const expiredSourceAnchor = (correlationAlert) => {
+  // Resolve every persisted correlation identity to one exact source row before either coverage
+  // branch runs. A correlation fingerprint is only a consistency check against the diagnostic
+  // source fingerprint; it is never allowed to discover the source by prefix alone.
+  const resolveSourceAnchor = (correlationAlert) => {
     const diagnostics = correlationAlert?.diagnostics;
     const diagnosticRuleId = typeof diagnostics?.kill_rule_id === "string" ? diagnostics.kill_rule_id : undefined;
     const diagnosticFingerprint = typeof diagnostics?.anchor_fingerprint === "string" ? diagnostics.anchor_fingerprint : undefined;
-    const hasDiagnosticIdentity = diagnosticRuleId !== undefined && diagnosticFingerprint !== undefined;
+    if (
+      diagnosticRuleId === undefined ||
+      diagnosticFingerprint === undefined ||
+      diagnosticRuleId.length === 0 ||
+      diagnosticFingerprint.length === 0 ||
+      !KILL_SIDE_RULE_IDS.has(diagnosticRuleId) ||
+      !correlationAlert.fingerprint.startsWith(`${diagnosticFingerprint}__`)
+    ) {
+      return undefined;
+    }
 
     const matchingAnchors = (alertRecords ?? []).filter((anchor) => {
       if (!KILL_SIDE_RULE_IDS.has(anchor?.rule_id)) return false;
-      const anchorFingerprint = typeof anchor.fingerprint === "string" ? anchor.fingerprint : "global";
-      if (hasDiagnosticIdentity) {
-        return anchor.rule_id === diagnosticRuleId && anchorFingerprint === diagnosticFingerprint;
-      }
-      return typeof correlationAlert.fingerprint === "string" && correlationAlert.fingerprint.startsWith(`${anchorFingerprint}__`);
+      if (anchor.rule_id !== diagnosticRuleId) return false;
+      const anchorFingerprint = typeof anchor.fingerprint === "string"
+        ? anchor.fingerprint
+        : anchor.fingerprint === undefined || anchor.fingerprint === null
+          ? "global"
+          : undefined;
+      return anchorFingerprint === diagnosticFingerprint;
     });
 
-    // Prefix-only legacy records are safe only when the source identity is unambiguous. The
-    // diagnostic identity on newly emitted candidates avoids this ambiguity when rule fingerprints
-    // overlap across kill-side families.
-    if (matchingAnchors.length !== 1) return false;
-    const firstSeenMs = tsMs(matchingAnchors[0].first_seen);
-    if (firstSeenMs === undefined) return false;
+    if (matchingAnchors.length !== 1) return undefined;
+    const sourceAnchor = matchingAnchors[0];
+    const firstSeenMs = tsMs(sourceAnchor.first_seen);
+    if (firstSeenMs === undefined) return { status: "invalid", anchor: sourceAnchor };
     const ageMs = nowMs - firstSeenMs;
-    return ageMs >= 0 && ageMs > lookbackMs;
+    if (ageMs < 0) return { status: "future", anchor: sourceAnchor };
+    if (ageMs > lookbackMs) return { status: "expired", anchor: sourceAnchor };
+    return { status: "live", anchor: sourceAnchor };
   };
 
-  for (const alert of persistedCorrelationAlerts) {
-    if (!underLiveAnchor(alert.fingerprint) && expiredSourceAnchor(alert)) {
+  const resolvedCorrelationAlerts = persistedCorrelationAlerts.map((alert) => ({
+    alert,
+    source: resolveSourceAnchor(alert),
+  }));
+
+  // EXPIRY branch (§7.5 + §8.C): only a uniquely resolved source anchor that is provably past the
+  // lookback is clear solely by end-of-life. Missing, partial, mismatched, ambiguous, malformed,
+  // and future-dated sources remain unevaluated.
+  for (const { alert, source } of resolvedCorrelationAlerts) {
+    if (source?.status === "expired") {
       evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
     }
   }
@@ -447,13 +464,11 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
 
   const candidates = [];
   if (liveAnchorsEvaluated) {
-    // Per-anchor-prefix coverage (deliberate documented exception to exact per-identity matching,
-    // §8.C): the fingerprint bakes in the WINNING peer, so exact identity matching cannot fit the
-    // ready-anchor branch. Instead report every persisted correlation alert id whose fingerprint
-    // startsWith(anchor.fingerprint + "__") for the live anchors we just evaluated -- whether it
-    // re-fired this tick or is a genuine clear.
-    for (const alert of persistedCorrelationAlerts) {
-      if (underLiveAnchor(alert.fingerprint)) evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
+    // The fingerprint bakes in the WINNING peer, so exact correlation identity matching cannot fit
+    // the ready-anchor branch. The source was nevertheless resolved exactly above; coverage here
+    // is limited to persisted identities whose single resolved source is live.
+    for (const { alert, source } of resolvedCorrelationAlerts) {
+      if (source?.status === "live") evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
     }
     for (const anchor of anchors) {
       const qualifying = findQualifyingPeerObservations(peerPoints, anchor, {

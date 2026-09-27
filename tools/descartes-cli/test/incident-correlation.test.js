@@ -134,6 +134,10 @@ function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active", d
   };
 }
 
+function sourceDiagnostics(ruleId, fingerprint) {
+  return { kill_rule_id: ruleId, anchor_fingerprint: fingerprint };
+}
+
 async function seed(paths, { alerts = [], factPoints = [], now, learnedEnabled = true } = {}) {
   if (learnedEnabled) await writeLearnedConfig(paths, { enabled: true });
   if (alerts.length > 0) await writeAlertRecords(paths, alerts);
@@ -763,7 +767,10 @@ test("Recovery coverage (i) GENUINE clear: a persisted correlation alert whose k
   await seed(paths, {
     alerts: [
       killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs), // live anchor -> "global__" prefix
-      correlationAlertRecord(corrFingerprint, { firstSeenTs: anchorTs }), // persisted from a prior tick
+      correlationAlertRecord(corrFingerprint, {
+        firstSeenTs: anchorTs,
+        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, "global"),
+      }), // persisted from a prior tick
     ],
     // A mature/ready peer stream (past the stream-wide cold-start gate) but with NO odd-hour novel
     // peer coincident with the anchor this tick: findQualifyingPeerObservations returns [] as a
@@ -817,7 +824,10 @@ test("Recovery coverage — future-dated source anchor freezes a persisted corre
     alerts: [
       killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs),
       killSideAlertRecord(SESSION_CHURN_RULE_ID, futureAnchorTs, { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
-      correlationAlertRecord(liveCorr, { firstSeenTs: liveAnchorTs }),
+      correlationAlertRecord(liveCorr, {
+        firstSeenTs: liveAnchorTs,
+        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, "global"),
+      }),
       correlationAlertRecord(futureCorr, {
         firstSeenTs: liveAnchorTs,
         diagnostics: { kill_rule_id: SESSION_CHURN_RULE_ID, anchor_fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" },
@@ -900,6 +910,80 @@ test("Recovery coverage — missing or quarantined source anchor freezes a persi
   }
 });
 
+test("Recovery coverage — diagnostic source B cannot recover correlation fingerprint A from an expired B anchor", async () => {
+  const paths = await tempPaths();
+  const expiredAnchorTs = dayTs(0, 2);
+  const now = dayTs(2, 13);
+  const corrFingerprint = "anchor.a__peer.wireguard.9999999999999999";
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_CHURN_RULE_ID, expiredAnchorTs, { fingerprint: "anchor.b" }),
+      correlationAlertRecord(corrFingerprint, {
+        firstSeenTs: expiredAnchorTs,
+        diagnostics: sourceDiagnostics(SESSION_CHURN_RULE_ID, "anchor.b"),
+      }),
+    ],
+    now,
+  });
+
+  const result = await computeCorrelationCandidates(paths, {
+    now,
+    readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
+  });
+  assert.ok(!result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)));
+  const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
+    now,
+    coveredAlertIds: new Set(result.evaluatedAlertKeys),
+  });
+  assert.equal(applied.alerts.find((alert) => alert.fingerprint === corrFingerprint)?.status, "active");
+});
+
+test("Recovery coverage — duplicate exact source anchors are ambiguous even when one is live and one is future-dated", async () => {
+  const paths = await tempPaths();
+  const now = dayTs(2, 13);
+  const liveAnchorTs = dayTs(2, 2);
+  const futureAnchorTs = dayTs(2, 14);
+  const anchorFingerprint = "anchor.a";
+  const corrFingerprint = `${anchorFingerprint}__peer.wireguard.9999999999999999`;
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs, { fingerprint: anchorFingerprint }),
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, futureAnchorTs, { fingerprint: anchorFingerprint }),
+      correlationAlertRecord(corrFingerprint, {
+        firstSeenTs: liveAnchorTs,
+        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, anchorFingerprint),
+      }),
+    ],
+    factPoints: [...regularPeerPoints("peer.ssh.1111111111111111", -1, 2)],
+    now,
+  });
+
+  const result = await computeCorrelationCandidates(paths, { now });
+  assert.ok(!result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)));
+});
+
+test("Recovery coverage — a different live kill-side rule with the same fingerprint cannot cover an exact missing source", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(2, 2);
+  const now = dayTs(2, 13);
+  const anchorFingerprint = "anchor.a";
+  const corrFingerprint = `${anchorFingerprint}__peer.wireguard.9999999999999999`;
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_CHURN_RULE_ID, anchorTs, { fingerprint: anchorFingerprint }),
+      correlationAlertRecord(corrFingerprint, {
+        firstSeenTs: anchorTs,
+        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, anchorFingerprint),
+      }),
+    ],
+    factPoints: [...regularPeerPoints("peer.ssh.1111111111111111", -1, 2)],
+    now,
+  });
+
+  const result = await computeCorrelationCandidates(paths, { now });
+  assert.ok(!result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)));
+});
+
 test("Recovery coverage — expiry: a persisted correlation alert whose PRESENT source anchor is older than the 24h lookback is reported evaluated-clear even while OTHER anchors remain live, independent of peer-stream trust/readiness", async () => {
   const paths = await tempPaths();
   const liveAnchorTs = dayTs(2, 2); // still within the 24h lookback of `now`
@@ -911,7 +995,10 @@ test("Recovery coverage — expiry: a persisted correlation alert whose PRESENT 
     alerts: [
       killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs), // live "global__" anchor
       killSideAlertRecord(SESSION_CHURN_RULE_ID, expiredAnchorTs, { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
-      correlationAlertRecord(liveCorr, { firstSeenTs: liveAnchorTs }),
+      correlationAlertRecord(liveCorr, {
+        firstSeenTs: liveAnchorTs,
+        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, "global"),
+      }),
       correlationAlertRecord(orphanCorr, {
         firstSeenTs: expiredAnchorTs,
         diagnostics: { kill_rule_id: SESSION_CHURN_RULE_ID, anchor_fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" },
