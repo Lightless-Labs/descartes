@@ -28,6 +28,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { alertId } from "./alert-store.js";
 import { loadWatchConfig } from "./watch-store.js";
+import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
@@ -766,7 +767,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     // (Re-)arm the lockout. Any in-progress re-accumulation is discarded — it cannot be trusted to
     // have been continuous once corruption/loss is observed again.
     nextColdStartPending = true;
-    nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
+    nextColdStartReason = coldStartEntryReason({ storeLossThisTick, persistedReason: persistedState.cold_start_reason, currentGroups });
     nextColdStartSinceTs = nowIso;
   } else if (persistedState.cold_start_pending && historyTrust.trust) {
     // Re-accumulating: count complete ticks genuinely observed strictly after the lockout began.

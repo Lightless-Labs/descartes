@@ -592,7 +592,7 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
 
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
-  assert.equal(state.cold_start_reason, "missing_store");
+  assert.equal(state.cold_start_reason, "history_lost");
 });
 
 // FABRICATION + FAIL-SAFE fix (deception/anomaly-detector review -- schema-invalid-store trust

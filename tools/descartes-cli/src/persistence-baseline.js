@@ -20,6 +20,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { alertId } from "./alert-store.js";
 import { loadWatchConfig } from "./watch-store.js";
+import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
@@ -381,7 +382,7 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
 
   if (enteringColdStart) {
     nextColdStartPending = true;
-    nextColdStartReason = storeLossThisTick ? persistedState.cold_start_reason : "corrupt_facts";
+    nextColdStartReason = coldStartEntryReason({ storeLossThisTick, persistedReason: persistedState.cold_start_reason, currentGroups });
     nextColdStartSinceTs = nowIso;
   } else if (persistedState.cold_start_pending && historyTrust.trust) {
     const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
