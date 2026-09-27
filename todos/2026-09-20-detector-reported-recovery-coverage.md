@@ -4,6 +4,13 @@
 **Status:** PLAN REVISED post-triple-review (2026-09-23). Design confirmed right by all three (Fable/daybreak/Astra); mechanics rewritten in plan §7. Awaiting operator confirm on two flagged choices (C1 per-fingerprint timing, C2 canary rule split), then build.
 **Plan:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7 supersedes §1–§6)
 
+## Build outcome (2026-09-27) — slice functionally COMPLETE + green; daybreak corr re-gate OWED (codex quota)
+- **Core** (identity-keyed coverage, registry tier veto, deep-frozen snapshot): daybreak-blue **READY** (3 rounds, 4 blockers fixed). Commits `e9a5f04`→`97822db`.
+- **Producers** converted (8, Workflow B) to report `evaluatedAlertKeys` — commit `c059289`. daybreak whole-slice gate: **adjudicated the census-union coverage SAFE** (service.disappeared/appeared/scheduled_job/lineage are edge-triggered transition notices — union coverage clears the transition, never claims return); all other findings safe (over-freeze / correct). One BLOCKER: correlation orphan-branch (no-live-prefix ≠ expiry).
+- **Correlation blocker FIXED** — commit `7f812b8`: expiry-recovery only when the exact source anchor is present + unambiguous + valid non-future ts + `age > lookback`; missing/future/quarantined/ambiguous FREEZE. Matches daybreak's spec exactly (self-verified); red→green tests; full suite green (~2009/0/34).
+- **OWED before push:** daybreak re-gate of `7f812b8` (codex quota re-exhausted 2026-09-27 — confirmation of daybreak's own prescribed fix, high-confidence but not yet re-gated). Then: watch-by-default flip steps 4–8 (first-cold-start reason, `baseline status/inspect/enable/disable` CLI, README "off by default" rewrite, HANDOFF) → operator-confirmed push.
+- **Parallel-session note:** `docs/HANDOFF.md` + two `docs/research/2026-09-26-*.md` are another session's uncommitted side-research (antivirus/EDR + sandbox/microVM) — left untouched; HANDOFF update for THIS milestone deferred to avoid clobbering their edits.
+
 ## Review outcome (2026-09-23) — scope grew
 All three reviewers: NEEDS-REVISION, "design right, mechanics need rewriting." Synthesized into plan §7:
 - **Universal coverage** (daybreak BLOCKER): ALL detector-owned security rules, not just history-dependent — `canary.tripped`/`credential.access`/provenance also silently []-recover.
