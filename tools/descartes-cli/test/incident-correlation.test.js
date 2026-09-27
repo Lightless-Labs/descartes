@@ -17,7 +17,6 @@ import {
   CORRELATION_RULE_ID,
   DEFAULT_CORRELATION_LOOKBACK_MS,
   DEFAULT_CORRELATION_WINDOW_MS,
-  assessPeerStreamReadiness,
   buildCorrelationCandidate,
   computeCorrelationCandidates,
   findKillSideAnchors,
@@ -114,10 +113,8 @@ function killSideAlertRecord(ruleId, firstSeenTs, { severity = "critical", finge
   };
 }
 
-// A persisted correlation.login_kill_proximity alert row (as if emitted on a prior tick), for the
-// detector-reported recovery-coverage tests. Its fingerprint is `${anchorFingerprint}__${peerKey}`
-// exactly as buildCorrelationCandidate constructs it, so the per-anchor-prefix coverage logic keys
-// on it correctly.
+// A persisted correlation.login_kill_proximity alert row (as if emitted on a prior tick). Its
+// fingerprint is `${anchorFingerprint}__${peerKey}` exactly as buildCorrelationCandidate constructs it.
 function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active", diagnostics = {} } = {}) {
   return {
     id: alertId(CORRELATION_RULE_ID, fingerprint),
@@ -132,10 +129,6 @@ function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active", d
     last_seen: firstSeenTs,
     diagnostics,
   };
-}
-
-function sourceDiagnostics(ruleId, fingerprint) {
-  return { kill_rule_id: ruleId, anchor_fingerprint: fingerprint };
 }
 
 async function seed(paths, { alerts = [], factPoints = [], now, learnedEnabled = true } = {}) {
@@ -753,184 +746,32 @@ test("CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS/_DAYS/NOVELTY_MAX_PRIOR_TICKS are
 });
 
 // ---------------------------------------------------------------------------------------------
-// Detector-reported recovery coverage (§8.B/§8.C, correlation recipe): computeCorrelationCandidates
-// now returns { candidates, evaluatedAlertKeys }. evaluatedAlertKeys = the persisted correlation
-// alert identities this detector GENUINELY evaluated this tick (whether it re-fired or found clear),
-// so the daemon recovers a genuinely-cleared correlation alert and FREEZES an unevaluated one.
+// Correlation recovery-coverage deferral: candidates still detect normally, but every persisted
+// correlation alert freezes because this producer reports no recovery coverage.
 // ---------------------------------------------------------------------------------------------
 
-test("Recovery coverage (i) GENUINE clear: a persisted correlation alert whose kill-side anchor is still live but whose peer no longer qualifies this tick (ready peer stream, no qualifying observation = a genuine non-match) is reported in evaluatedAlertKeys so it can recover", async () => {
+test("Recovery coverage DEFERRED: a genuinely-cleared correlation alert reports no coverage and freezes", async () => {
   const paths = await tempPaths();
   const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 13); // 11h after the anchor -> anchor still within the 24h lookback (live)
+  const now = dayTs(0, 13); // anchor remains within the 24h lookback
   const corrFingerprint = "global__peer.wireguard.9999999999999999";
   await seed(paths, {
     alerts: [
-      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs), // live anchor -> "global__" prefix
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs),
       correlationAlertRecord(corrFingerprint, {
         firstSeenTs: anchorTs,
-        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, "global"),
-      }), // persisted from a prior tick
+        diagnostics: { kill_rule_id: SESSION_COUNT_DROP_RULE_ID, anchor_fingerprint: "global" },
+      }),
     ],
-    // A mature/ready peer stream (past the stream-wide cold-start gate) but with NO odd-hour novel
-    // peer coincident with the anchor this tick: findQualifyingPeerObservations returns [] as a
-    // GENUINE non-match (the detector DID evaluate the join and found it clear), not as an
-    // unevaluated overflow/cold-start skip.
+    // A mature stream with no odd-hour novel peer: the join genuinely finds no match.
     factPoints: [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0)],
     now,
   });
 
-  const { candidates, evaluatedAlertKeys } = await computeCorrelationCandidates(paths, { now });
-  assert.deepEqual(candidates, [], "no peer qualifies this tick, so no candidate is emitted");
-  assert.ok(
-    evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)),
-    "a genuinely evaluated (ready stream, live anchor) correlation identity must be reported so the daemon can recover it",
-  );
-});
+  const result = await computeCorrelationCandidates(paths, { now });
+  assert.deepEqual(result.candidates, [], "no peer qualifies this tick, so no candidate is emitted");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a genuine clear still has no recovery coverage while correlation coverage is deferred");
 
-test("Recovery coverage (ii) UNEVALUATED: when the peer stream is unevaluable this tick (overflow-degraded window = fail-closed) the persisted correlation alert under a still-live anchor is NOT reported, so the daemon freezes it rather than fabricating a recovery", async () => {
-  const paths = await tempPaths();
-  const anchorTs = dayTs(0, 2);
-  const now = dayTs(0, 13); // anchor still live
-  const corrFingerprint = "global__peer.wireguard.9999999999999999";
-  await seed(paths, {
-    alerts: [
-      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs), // still-live anchor -> not orphaned
-      correlationAlertRecord(corrFingerprint, { firstSeenTs: anchorTs }),
-    ],
-    factPoints: [
-      ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
-      overflowPoint(dayTs(-1, 0)), // one overflow tick degrades the whole window -> UNEVALUATED
-    ],
-    now,
-  });
-
-  const { candidates, evaluatedAlertKeys } = await computeCorrelationCandidates(paths, { now });
-  assert.deepEqual(candidates, []);
-  assert.ok(
-    !evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)),
-    "an unevaluated (overflow fail-closed) peer stream must NOT report its live-anchor correlation identity as clear",
-  );
-});
-
-test("Recovery coverage — future-dated source anchor freezes a persisted correlation alert after clock rollback", async () => {
-  const paths = await tempPaths();
-  const liveAnchorTs = dayTs(2, 2);
-  const futureAnchorTs = dayTs(2, 14);
-  const now = dayTs(2, 13);
-  const liveCorr = "global__peer.wireguard.1111111111111111";
-  const futureCorr = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999";
-  await seed(paths, {
-    alerts: [
-      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs),
-      killSideAlertRecord(SESSION_CHURN_RULE_ID, futureAnchorTs, { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
-      correlationAlertRecord(liveCorr, {
-        firstSeenTs: liveAnchorTs,
-        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, "global"),
-      }),
-      correlationAlertRecord(futureCorr, {
-        firstSeenTs: liveAnchorTs,
-        diagnostics: { kill_rule_id: SESSION_CHURN_RULE_ID, anchor_fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" },
-      }),
-    ],
-    now,
-  });
-
-  const result = await computeCorrelationCandidates(paths, {
-    now,
-    readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
-  });
-  assert.ok(
-    !result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, futureCorr)),
-    "a future-dated source anchor is not evaluated and must not authorize correlation recovery",
-  );
-
-  const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
-    now,
-    coveredAlertIds: new Set(result.evaluatedAlertKeys),
-  });
-  assert.equal(applied.alerts.find((alert) => alert.fingerprint === futureCorr)?.status, "active");
-});
-
-test("Recovery coverage — missing or quarantined source anchor freezes a persisted correlation alert", async () => {
-  const cases = [
-    {
-      label: "missing",
-      prepare: async (paths, liveAnchorTs, now) => {
-        await seed(paths, {
-          alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs)],
-          now,
-        });
-      },
-    },
-    {
-      label: "quarantined",
-      prepare: async (paths, liveAnchorTs, now) => {
-        const alertsDir = path.join(paths.stateDir, "alerts");
-        const alertsFile = path.join(alertsDir, "alerts.json");
-        await fs.mkdir(alertsDir, { recursive: true, mode: 0o700 });
-        await fs.writeFile(alertsFile, JSON.stringify({
-          version: 1,
-          alerts: [
-            killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs),
-            killSideAlertRecord(SESSION_CHURN_RULE_ID, "not-a-date", { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
-          ],
-        }));
-      },
-    },
-  ];
-
-  for (const { label, prepare } of cases) {
-    const paths = await tempPaths();
-    const liveAnchorTs = dayTs(2, 2);
-    const now = dayTs(2, 13);
-    const missingCorr = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999";
-    await writeLearnedConfig(paths, { enabled: true });
-    await prepare(paths, liveAnchorTs, now);
-    const existingAlerts = await readAlertRecords(paths);
-    await writeAlertRecords(paths, [
-      ...existingAlerts,
-      correlationAlertRecord(missingCorr, { firstSeenTs: liveAnchorTs }),
-    ]);
-
-    const result = await computeCorrelationCandidates(paths, {
-      now,
-      readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
-    });
-    assert.ok(
-      !result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, missingCorr)),
-      `${label} source anchor must not authorize correlation recovery`,
-    );
-
-    const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
-      now,
-      coveredAlertIds: new Set(result.evaluatedAlertKeys),
-    });
-    assert.equal(applied.alerts.find((alert) => alert.fingerprint === missingCorr)?.status, "active", label);
-  }
-});
-
-test("Recovery coverage — diagnostic source B cannot recover correlation fingerprint A from an expired B anchor", async () => {
-  const paths = await tempPaths();
-  const expiredAnchorTs = dayTs(0, 2);
-  const now = dayTs(2, 13);
-  const corrFingerprint = "anchor.a__peer.wireguard.9999999999999999";
-  await seed(paths, {
-    alerts: [
-      killSideAlertRecord(SESSION_CHURN_RULE_ID, expiredAnchorTs, { fingerprint: "anchor.b" }),
-      correlationAlertRecord(corrFingerprint, {
-        firstSeenTs: expiredAnchorTs,
-        diagnostics: sourceDiagnostics(SESSION_CHURN_RULE_ID, "anchor.b"),
-      }),
-    ],
-    now,
-  });
-
-  const result = await computeCorrelationCandidates(paths, {
-    now,
-    readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
-  });
-  assert.ok(!result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)));
   const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
     now,
     coveredAlertIds: new Set(result.evaluatedAlertKeys),
@@ -938,130 +779,29 @@ test("Recovery coverage — diagnostic source B cannot recover correlation finge
   assert.equal(applied.alerts.find((alert) => alert.fingerprint === corrFingerprint)?.status, "active");
 });
 
-test("Recovery coverage — duplicate exact source anchors are ambiguous even when one is live and one is future-dated", async () => {
+test("Recovery coverage DEFERRED: a previously fabricating expiry scenario reports no coverage and freezes", async () => {
   const paths = await tempPaths();
+  const expiredAnchorTs = dayTs(0, 2);
   const now = dayTs(2, 13);
-  const liveAnchorTs = dayTs(2, 2);
-  const futureAnchorTs = dayTs(2, 14);
-  const anchorFingerprint = "anchor.a";
-  const corrFingerprint = `${anchorFingerprint}__peer.wireguard.9999999999999999`;
+  const corrFingerprint = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999";
   await seed(paths, {
     alerts: [
-      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs, { fingerprint: anchorFingerprint }),
-      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, futureAnchorTs, { fingerprint: anchorFingerprint }),
-      correlationAlertRecord(corrFingerprint, {
-        firstSeenTs: liveAnchorTs,
-        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, anchorFingerprint),
-      }),
-    ],
-    factPoints: [...regularPeerPoints("peer.ssh.1111111111111111", -1, 2)],
-    now,
-  });
-
-  const result = await computeCorrelationCandidates(paths, { now });
-  assert.ok(!result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)));
-});
-
-test("Recovery coverage — a different live kill-side rule with the same fingerprint cannot cover an exact missing source", async () => {
-  const paths = await tempPaths();
-  const anchorTs = dayTs(2, 2);
-  const now = dayTs(2, 13);
-  const anchorFingerprint = "anchor.a";
-  const corrFingerprint = `${anchorFingerprint}__peer.wireguard.9999999999999999`;
-  await seed(paths, {
-    alerts: [
-      killSideAlertRecord(SESSION_CHURN_RULE_ID, anchorTs, { fingerprint: anchorFingerprint }),
-      correlationAlertRecord(corrFingerprint, {
-        firstSeenTs: anchorTs,
-        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, anchorFingerprint),
-      }),
-    ],
-    factPoints: [...regularPeerPoints("peer.ssh.1111111111111111", -1, 2)],
-    now,
-  });
-
-  const result = await computeCorrelationCandidates(paths, { now });
-  assert.ok(!result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)));
-});
-
-test("Recovery coverage — expiry: a persisted correlation alert whose PRESENT source anchor is older than the 24h lookback is reported evaluated-clear even while OTHER anchors remain live, independent of peer-stream trust/readiness", async () => {
-  const paths = await tempPaths();
-  const liveAnchorTs = dayTs(2, 2); // still within the 24h lookback of `now`
-  const expiredAnchorTs = dayTs(0, 2); // > 24h before `now` -> no longer an anchor
-  const now = dayTs(2, 13);
-  const liveCorr = "global__peer.wireguard.1111111111111111"; // under the still-live count_drop anchor
-  const orphanCorr = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999"; // anchor aged out
-  await seed(paths, {
-    alerts: [
-      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs), // live "global__" anchor
       killSideAlertRecord(SESSION_CHURN_RULE_ID, expiredAnchorTs, { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
-      correlationAlertRecord(liveCorr, {
-        firstSeenTs: liveAnchorTs,
-        diagnostics: sourceDiagnostics(SESSION_COUNT_DROP_RULE_ID, "global"),
-      }),
-      correlationAlertRecord(orphanCorr, {
+      correlationAlertRecord(corrFingerprint, {
         firstSeenTs: expiredAnchorTs,
         diagnostics: { kill_rule_id: SESSION_CHURN_RULE_ID, anchor_fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" },
       }),
     ],
-    // A degraded/empty peer read: even with the peer stream UNEVALUATED, the orphan must still be
-    // reported clear (its clearance is anchor-expiry, not a peer join), while the live-anchor
-    // identity is frozen because its stream is unevaluable.
     now,
   });
 
-  const { evaluatedAlertKeys } = await computeCorrelationCandidates(paths, {
+  const result = await computeCorrelationCandidates(paths, { now });
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "an expired source has no recovery coverage while correlation coverage is deferred");
+
+  const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
     now,
-    readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
+    coveredAlertIds: new Set(result.evaluatedAlertKeys),
   });
-  assert.ok(
-    evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, orphanCorr)),
-    "an expired/orphaned correlation alert must be reported evaluated-clear regardless of peer-stream trust",
-  );
-  assert.ok(
-    !evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, liveCorr)),
-    "a still-live anchor's correlation identity must be frozen when the peer stream is unevaluable (untrusted here)",
-  );
-});
-
-test("Recovery coverage — non-finite `now` freezes all (does NOT masquerade as anchors===0 expiry-clear): the anchor scan cannot run, so nothing is reported evaluated", async () => {
-  const paths = await tempPaths();
-  await writeLearnedConfig(paths, { enabled: true });
-  await writeAlertRecords(paths, [
-    killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, dayTs(0, 2)),
-    correlationAlertRecord("global__peer.wireguard.9999999999999999", { firstSeenTs: dayTs(0, 2) }),
-  ]);
-  const result = await computeCorrelationCandidates(paths, { now: "not-a-date" });
-  assert.deepEqual(
-    result,
-    { candidates: [], evaluatedAlertKeys: [] },
-    "a non-finite clock is UNEVALUATED (freeze), never an empty-anchor expiry-clear that would recover every persisted correlation alert",
-  );
-});
-
-test("assessPeerStreamReadiness agrees with findQualifyingPeerObservations' own overflow + stream-history gate (the reason string is load-bearing, not decorative)", () => {
-  const anchor = { first_seen_ms: Date.parse(dayTs(0, 2)) };
-  const opts = { minPeerHistoryTickGroups: CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS, minPeerHistoryDays: CORRELATION_MIN_PEER_HISTORY_DAYS };
-
-  // Overflow anywhere -> not ready (reason overflow) AND the helper yields no qualifying observation.
-  const overflowPoints = [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0), peerPoint(dayTs(0, 2), "peer.wireguard.9999999999999999"), overflowPoint(dayTs(-1, 0))];
-  assert.deepEqual(assessPeerStreamReadiness(overflowPoints, opts), { ready: false, reason: "overflow" });
-  assert.deepEqual(findQualifyingPeerObservations(overflowPoints, anchor, opts), []);
-
-  // Too-young stream -> not ready (reason insufficient_history) AND no qualifying observation.
-  const youngPoints = [peerPoint(dayTs(0, 2), "peer.wireguard.9999999999999999")];
-  assert.equal(assessPeerStreamReadiness(youngPoints, opts).ready, false);
-  assert.equal(assessPeerStreamReadiness(youngPoints, opts).reason, "insufficient_history");
-  assert.deepEqual(findQualifyingPeerObservations(youngPoints, anchor, opts), []);
-
-  // Mature stream with an in-window odd-hour novel peer -> ready AND the helper DOES find it (proves
-  // "ready + empty" would be a genuine clear, not an unevaluated skip).
-  const readyMatch = [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0), peerPoint(dayTs(0, 2), "peer.wireguard.9999999999999999", { hourBucket: "02" })];
-  assert.deepEqual(assessPeerStreamReadiness(readyMatch, opts), { ready: true, reason: "ready" });
-  assert.equal(findQualifyingPeerObservations(readyMatch, anchor, opts).length, 1);
-
-  // Mature stream but NO qualifying peer (all non-odd-hour) -> ready yet empty = genuine non-match.
-  const readyNoMatch = [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0)];
-  assert.equal(assessPeerStreamReadiness(readyNoMatch, opts).ready, true);
-  assert.deepEqual(findQualifyingPeerObservations(readyNoMatch, anchor, opts), []);
+  assert.equal(applied.alerts.find((alert) => alert.fingerprint === corrFingerprint)?.status, "active");
 });
