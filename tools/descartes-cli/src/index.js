@@ -44,6 +44,9 @@ Usage:
   descartes alerts list [--json] [--all]
   descartes alerts watch [--json] [--interval <duration>] [--once] [--all]
   descartes alerts ack <alert-id> [--json]
+  descartes baseline status [--json]
+  descartes baseline inspect [--domain <name>] [--json]
+  descartes baseline enable|disable [--json]
   descartes alerts intelligence status|enable|disable [--json]
   descartes alerts notifications status|setup|test|disable [--json] [--channel cli|desktop|macos|native|linux|syslog]
   descartes containment recommend status|enable|disable [--json]
@@ -129,6 +132,11 @@ async function main(argv) {
   if (command === "alerts") {
     const { runAlerts } = await import("./alerts.js");
     await runAlerts(paths, args);
+    return;
+  }
+  if (command === "baseline") {
+    const { runBaseline } = await import("./baseline.js");
+    await runBaseline(paths, args);
     return;
   }
   if (command === "learned") {
