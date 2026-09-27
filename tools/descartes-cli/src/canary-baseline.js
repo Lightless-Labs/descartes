@@ -270,18 +270,30 @@ function canaryIdentityFingerprint(canaryPath, sentinelPath) {
   return createHash("sha256").update(preimage).digest("hex").slice(0, 16);
 }
 
-export function detectCanaryTrips(groups = [], options = {}) {
+// Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+// §7.2 recommended shape): the trip detection and the "which canaries did I genuinely EVALUATE
+// this tick" report share ONE walk over the exact same complete-group/freshness/identity/
+// established-count gates, so the fabrication-safety-critical prerequisites live in a single place
+// and can never drift between the candidate output and the coverage report. `detectCanaryTrips`
+// (the exported helper, unchanged return shape for its direct callers/tests) is a thin wrapper.
+// `evaluatedCanaryIds` = the canary_ids that reached the trip comparison (present in BOTH compared
+// complete ticks, identity-stable, past minEstablishedCount) -- whether they tripped OR were
+// found clean; NOT canaries skipped as absent-this-tick, identity-unverifiable, or not-yet-
+// established, and empty entirely when the two-complete-group or freshness gate fails.
+function walkCanaryTrips(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_CANARY_FRESHNESS_FALLBACK_MS,
     minEstablishedCount = DEFAULT_CANARY_ESTABLISHED_MIN_CENSUS_COUNT,
   } = options;
+  const trips = [];
+  const evaluatedCanaryIds = new Set();
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < 2) return [];
+  if (completeGroups.length < 2) return { trips, evaluatedCanaryIds };
   const latest = completeGroups[completeGroups.length - 1];
   const previous = completeGroups[completeGroups.length - 2];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return [];
+  if (!(nowMs - latestMs <= freshnessMs)) return { trips, evaluatedCanaryIds };
 
   // Keyed by (canary_id, identity_fingerprint) -- see the FIX-A header comment above
   // canarySightingKey -- so a fresh identity under a reused/edited canary_id never inherits the
@@ -294,7 +306,6 @@ export function detectCanaryTrips(groups = [], options = {}) {
     }
   }
 
-  const trips = [];
   for (const [canaryId, previousSnapshot] of previous.canaries) {
     const latestSnapshot = latest.canaries.get(canaryId);
     if (!latestSnapshot) continue;
@@ -309,6 +320,9 @@ export function detectCanaryTrips(groups = [], options = {}) {
     if (!identityStable) continue;
     const sightingKey = canarySightingKey(canaryId, latestSnapshot);
     if ((sightingCounts.get(sightingKey) ?? 0) < minEstablishedCount) continue;
+    // Past every "can I evaluate this canary's trip condition" gate: the detector genuinely
+    // evaluated it this tick (whether or not a watched field moved), so it is coverage-reportable.
+    evaluatedCanaryIds.add(canaryId);
     const watches = watchList(latestSnapshot.watch);
     // Extracted (Slice D, credential-access plan): the per-watch trip-reason diff itself now
     // lives in stat-diff.js's computeStatDiffTripReason, shared with credential-access-
@@ -328,7 +342,11 @@ export function detectCanaryTrips(groups = [], options = {}) {
       });
     }
   }
-  return trips;
+  return { trips, evaluatedCanaryIds };
+}
+
+export function detectCanaryTrips(groups = [], options = {}) {
+  return walkCanaryTrips(groups, options).trips;
 }
 
 // CANARY VANISHED: a canary STILL LISTED in the current, successfully-read manifest whose file
@@ -361,19 +379,32 @@ export function detectCanaryTrips(groups = [], options = {}) {
 // established canary whose identity never changed (identity_fingerprint stable across every
 // complete tick, as it always is when path/sentinel_path are untouched) is completely unaffected
 // and still raises canary_vanished exactly as before.
-export function detectCanaryVanished(groups = [], currentCanaryIds = new Set(), options = {}) {
+// Detector-reported recovery coverage (§7.2 shared-walk shape, mirroring walkCanaryTrips above):
+// the vanished detection and its "which canaries did I genuinely evaluate for absence this tick"
+// report share ONE walk. `evaluatedCanaryIds` = the canary_ids that passed every "can I evaluate
+// absence for this canary" gate (identity-verifiable on the last-observed snapshot, current
+// manifest still resolves the same identity, established under that identity, still monitored) --
+// reported whether the canary VANISHED (absent from the latest complete tick -> a candidate) OR
+// was found PRESENT (a clear, so a stale canary_vanished alert can recover). The absence check is
+// therefore evaluated LAST (rather than the exported helper's original short-circuit-first order)
+// so present-but-established canaries are still counted as evaluated; `vanished` is byte-identical
+// to before because a present canary is still never pushed. Empty entirely when the two-complete-
+// group or freshness gate fails.
+function walkCanaryVanished(groups = [], currentCanaryIds = new Set(), options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_CANARY_FRESHNESS_FALLBACK_MS,
     minEstablishedCount = DEFAULT_CANARY_ESTABLISHED_MIN_CENSUS_COUNT,
     currentCanaryIdentityFingerprints = new Map(),
   } = options;
+  const vanished = [];
+  const evaluatedCanaryIds = new Set();
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < 2) return [];
+  if (completeGroups.length < 2) return { vanished, evaluatedCanaryIds };
   const latest = completeGroups[completeGroups.length - 1];
   const previous = completeGroups[completeGroups.length - 2];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return [];
+  if (!(nowMs - latestMs <= freshnessMs)) return { vanished, evaluatedCanaryIds };
 
   // Keyed by (canary_id, identity_fingerprint) -- see the FIX-A parity header comment above -- so
   // a fresh identity under a reused/edited canary_id never inherits the OLD identity's established
@@ -386,9 +417,7 @@ export function detectCanaryVanished(groups = [], currentCanaryIds = new Set(), 
     }
   }
 
-  const vanished = [];
   for (const [canaryId, previousSnapshot] of previous.canaries) {
-    if (latest.canaries.has(canaryId)) continue;
     // FIX-A parity: a missing identity_fingerprint on the last-observed snapshot means identity
     // cannot be verified -- fail CLOSED (skip) rather than risking a fabricated finding, same
     // posture detectCanaryTrips takes on a missing/mismatched fingerprint.
@@ -400,6 +429,10 @@ export function detectCanaryVanished(groups = [], currentCanaryIds = new Set(), 
     const sightingKey = canarySightingKey(canaryId, previousSnapshot);
     if ((sightingCounts.get(sightingKey) ?? 0) < minEstablishedCount) continue;
     if (!currentCanaryIds.has(canaryId)) continue;
+    // Past every "can I evaluate absence for this canary" gate: genuinely evaluated this tick,
+    // whether it turns out present (clear) or absent (vanished) below.
+    evaluatedCanaryIds.add(canaryId);
+    if (latest.canaries.has(canaryId)) continue;
     vanished.push({
       canary_id: canaryId,
       kind: previousSnapshot.kind,
@@ -408,7 +441,11 @@ export function detectCanaryVanished(groups = [], currentCanaryIds = new Set(), 
       complete_census_seen_count: sightingCounts.get(sightingKey),
     });
   }
-  return vanished;
+  return { vanished, evaluatedCanaryIds };
+}
+
+export function detectCanaryVanished(groups = [], currentCanaryIds = new Set(), options = {}) {
+  return walkCanaryVanished(groups, currentCanaryIds, options).vanished;
 }
 
 function hashCanaryId(canaryId) {
@@ -482,7 +519,12 @@ export function buildCanaryTamperedCandidates(entries = []) {
 export async function computeCanaryBaselineCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
   const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return [];
+  // Detector-reported recovery coverage (§8.C canary recipe): a tier-off (learned-disabled) tick
+  // short-circuits BEFORE evaluating anything, so it reports NO coverage -- every canary.* identity
+  // it owns is frozen (not fabricated-recovered) this tick, exactly as intended for a disabled
+  // detector. canary.tripped is positive evidence and NOT cold-start-gated, but it IS gated by
+  // this tier switch, so this early empty-coverage return is load-bearing.
+  if (!learnedConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_CANARY_MIN_HISTORY_TICK_COUNT;
@@ -640,7 +682,7 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
     }
   }
 
-  const rawTrips = detectCanaryTrips(currentGroups, { nowMs, freshnessMs, minEstablishedCount });
+  const { trips: rawTrips, evaluatedCanaryIds: evaluatedTripCanaryIds } = walkCanaryTrips(currentGroups, { nowMs, freshnessMs, minEstablishedCount });
 
   // Manifest-gated (HIGH fix, canary collector review): candidates may ONLY be produced for
   // canary_ids present in the CURRENT manifest. Without this gate, stale fact-history for a
@@ -754,14 +796,15 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   // tick that would have shown it present). Compute it regardless of lockout state, then suppress
   // only the absence claim while pending; unlike canary.tripped, this claim is fabricable from
   // incomplete history.
-  const rawVanished = manifestReadOk
-    ? detectCanaryVanished(currentGroups, currentCanaryIds, {
+  const vanishedWalk = manifestReadOk
+    ? walkCanaryVanished(currentGroups, currentCanaryIds, {
       nowMs,
       freshnessMs,
       minEstablishedCount,
       currentCanaryIdentityFingerprints,
     })
-    : [];
+    : { vanished: [], evaluatedCanaryIds: new Set() };
+  const rawVanished = vanishedWalk.vanished;
   const outputVanished = coldStartPendingThisTick ? [] : rawVanished;
   for (const entry of outputVanished) {
     tamperEntries.push({ reason: "canary_vanished", canary_id: entry.canary_id, kind: entry.kind, last_seen_ts: entry.last_seen_ts });
@@ -785,10 +828,17 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   const newGroups = currentGroups.filter((group) => new Date(group.ts).getTime() > lastFoldedMs);
 
   let baselineStoreWriteFailed = false;
+  // Recovery-coverage bookkeeping (see the evaluatedAlertKeys assembly below): true iff we
+  // actually entered the fold-write branch this tick. A successful LOAD alone does NOT prove the
+  // store is WRITABLE (an EROFS store reads fine but fails writes), so baseline_store_error
+  // coverage must not be reported off a bare successful load -- only when a write was genuinely
+  // attempted (health confirmed or a write failure surfaced), never on a no-op tick.
+  let baselineStoreWriteAttempted = false;
   const coldStartStateChanged = nextColdStartPending !== persistedState.cold_start_pending
     || nextColdStartReason !== persistedState.cold_start_reason
     || nextColdStartSinceTs !== persistedState.cold_start_since_ts;
   if ((newGroups.length > 0 || coldStartStateChanged || lastFoldedWasFuture) && !baselineStoreLoadFailed) {
+    baselineStoreWriteAttempted = true;
     const newGroupTs = new Set(newGroups.map((group) => group.ts));
     const partialCount = newGroups.filter((group) => group.censusState === "partial").length;
     const tripCount = outputTrips.filter((entry) => newGroupTs.has(entry.tripped_at_ts)).length;
@@ -823,5 +873,69 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   // canary.tripped is positive two-snapshot evidence, so it is emitted even while the completeness
   // lockout is pending. canary_vanished remains gated through outputVanished above because absence
   // can be fabricated by incomplete history.
-  return [...buildCanaryTrippedCandidates(outputTrips), ...buildCanaryTamperedCandidates(tamperEntries)];
+  const candidates = [...buildCanaryTrippedCandidates(outputTrips), ...buildCanaryTamperedCandidates(tamperEntries)];
+
+  // Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+  // §8.B/§8.C): the set of alert IDENTITIES (alertId(rule_id, fingerprint)) this producer genuinely
+  // EVALUATED this tick -- every identity it had complete/fresh/established data for, whether it
+  // produced a candidate OR found it clear. The daemon recovers a persisted alert only if its
+  // identity is reported here, and freezes any owned identity it is NOT (never fabricating a
+  // recovery). Per-fingerprint (§7.3/§7.4 C1/C2): each canary_id and each tamper reason carries an
+  // independent identity, so a repaired manifest can recover while a still-cold-start canary_vanished
+  // stays frozen, with no rule split. §7.4 note: a PRESENT candidate is activated regardless of
+  // coverage (alert-store.js activates before the recovery loop) -- coverage only governs recovery
+  // of an ABSENT one, so reporting present-candidate identities here is harmless.
+  const evaluatedAlertKeys = new Set();
+
+  // canary.tripped (per-canary, hashCanaryId): each canary detectCanaryTrips actually walked
+  // (present in both compared complete ticks, identity-stable, past minEstablishedCount) is an
+  // evaluated identity -- trip or clear. NOT cold-start-gated (positive evidence); the tier-off
+  // gate is handled by the early return above. Mirror outputTrips' empty/garbage-id guard
+  // (sanitizeEntityKey) so we only key identities that could correspond to a real persisted alert.
+  for (const canaryId of evaluatedTripCanaryIds) {
+    if (!sanitizeEntityKey(canaryId)) continue;
+    evaluatedAlertKeys.add(alertId(CANARY_TRIPPED_RULE_ID, hashCanaryId(canaryId)));
+  }
+
+  // canary.tampered / manifest_unreadable (singleton): loadManifest ALWAYS runs past the tier gate,
+  // so this identity is genuinely evaluated every tick -- a now-readable manifest is an evaluated
+  // clear, letting a persisted manifest_unreadable alert recover.
+  evaluatedAlertKeys.add(alertId(CANARY_TAMPERED_RULE_ID, hashCanaryTamperKey("manifest_unreadable")));
+
+  // canary.tampered / baseline_store_error (singleton): DELIBERATELY NOT reported unconditionally
+  // (a documented deviation from §8.C's literal "whenever the fn ran past the tier gate"). The load
+  // is always attempted, but a successful load does not prove the store is WRITABLE; reporting this
+  // evaluated off a bare load would fabricate a recovery while an EROFS disk still fails writes.
+  // Report it only with real this-tick I/O evidence: a write was attempted (health confirmed, or a
+  // write failure surfaced as the present candidate) OR the failure condition is already present
+  // (which yields a candidate anyway, §7.4). A steady no-write tick reports nothing -> frozen (safe).
+  const baselineStoreErrorPresent = baselineStoreLoadFailed || baselineStoreCorrupt || baselineStoreWriteFailed;
+  if (baselineStoreWriteAttempted || baselineStoreErrorPresent) {
+    evaluatedAlertKeys.add(alertId(CANARY_TAMPERED_RULE_ID, hashCanaryTamperKey("baseline_store_error")));
+  }
+
+  // canary.tampered / invalid_entries (per (reason, canary_id)): the reason is baked into the
+  // fingerprint, so a now-valid entry's PRIOR reason cannot be reconstructed from the current clean
+  // manifest -- a cleared invalid entry therefore FREEZES rather than recovers (safe; documented
+  // deviation). Only entries present THIS tick are reported evaluated; they are active candidates
+  // anyway (§7.4), so this keeps the report honest without fabricating any recovery. Fingerprint
+  // key mirrors buildCanaryTamperedCandidates exactly (`${reason}:${canary_id}` when an id is set).
+  for (const entry of invalidManifestEntries) {
+    const tamperKey = entry.id ? `${entry.reason}:${entry.id}` : entry.reason;
+    evaluatedAlertKeys.add(alertId(CANARY_TAMPERED_RULE_ID, hashCanaryTamperKey(tamperKey)));
+  }
+
+  // canary.tampered / canary_vanished (per-canary): a history-gated ABSENCE claim, fabricable from
+  // incomplete history. Report an identity evaluated only when absence could be genuinely evaluated
+  // this tick: not cold-start-pending, manifest read OK, and (inside walkCanaryVanished) >=2 complete
+  // groups + fresh census + this canary established under a verified, still-monitored identity.
+  // Present-established canaries are reported too (found clear -> a stale canary_vanished alert can
+  // recover, one tick after the canary reappears in the `previous` complete group).
+  if (!coldStartPendingThisTick && manifestReadOk) {
+    for (const canaryId of vanishedWalk.evaluatedCanaryIds) {
+      evaluatedAlertKeys.add(alertId(CANARY_TAMPERED_RULE_ID, hashCanaryTamperKey(`canary_vanished:${canaryId}`)));
+    }
+  }
+
+  return { candidates, evaluatedAlertKeys: [...evaluatedAlertKeys] };
 }

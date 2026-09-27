@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { writeWatchConfig } from "../src/watch-store.js";
+import { alertId } from "../src/alert-store.js";
 import { isFixedLengthHexHash, isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
@@ -318,7 +319,7 @@ test("EXACT-ZERO fixture (must-fix 1): a complete tick-group with ZERO non-marke
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
   ticks.push(completeTick(tickTs(30), 0)); // exact zero, not merely near-zero
-  const candidates = await seedAndCompute(paths, flatten(ticks));
+  const { candidates } = await seedAndCompute(paths, flatten(ticks));
   const dropCandidates = candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.equal(dropCandidates.length, 1);
   const [candidate] = dropCandidates;
@@ -333,7 +334,7 @@ test("near-zero mass-drop fixture: a complete tick-group dropping to 1 (not exac
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
   ticks.push(completeTick(tickTs(30), 1));
-  const candidates = await seedAndCompute(paths, flatten(ticks));
+  const { candidates } = await seedAndCompute(paths, flatten(ticks));
   const dropCandidates = candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.equal(dropCandidates.length, 1);
   assert.equal(dropCandidates[0].diagnostics.observed_count, 1);
@@ -344,7 +345,7 @@ test("a moderate drop crosses DEVIATION_SIGMA but not CRITICAL_SIGMA -> severity
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(completeTick(tickTs(i), 20));
   ticks.push(completeTick(tickTs(30), 18)); // z = (18-20)/0.5 = -4: <= -3 (fires) but > -5 (not critical)
-  const candidates = await seedAndCompute(paths, flatten(ticks));
+  const { candidates } = await seedAndCompute(paths, flatten(ticks));
   const dropCandidates = candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.equal(dropCandidates.length, 1);
   assert.equal(dropCandidates[0].severity, "warning");
@@ -373,7 +374,7 @@ test("PARTIAL-CENSUS skip test (must-fix 2): a tick-group carrying a 'partial' m
   ticks.push(partialTick(tickTs(20), 2)); // tmux-ok/screen-errored: an undercounted, partial tick
   for (let i = 21; i < 31; i += 1) ticks.push(completeTick(tickTs(i), 20));
 
-  const candidates = await seedAndCompute(paths, flatten(ticks));
+  const { candidates } = await seedAndCompute(paths, flatten(ticks));
   assert.equal(candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 0, "the partial tick's undercount must never derive a candidate");
 
   const { state } = await loadSessionBaselineStore(paths);
@@ -391,7 +392,7 @@ test("GARBLED-CENSUS skip test (adversarial-review regression, mirrors service-b
   // it would manufacture a false session.count_drop from an empty/garbled census.
   ticks.push([sessionPoint(tickTs(30), "e-0"), censusMarkerPoint(tickTs(30), "truncated-oops")]);
 
-  const candidates = await seedAndCompute(paths, flatten(ticks));
+  const { candidates } = await seedAndCompute(paths, flatten(ticks));
   assert.equal(
     candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length,
     0,
@@ -436,7 +437,7 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 session/day o
     }
     const now = tickTs(hour - 1);
     await appendFactPoints(paths, dayPoints, { now });
-    const candidates = await computeSessionBaselineCandidates(paths, { now });
+    const { candidates } = await computeSessionBaselineCandidates(paths, { now });
     const dropCandidates = candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
     assert.equal(dropCandidates.length, 0, `unexpected session.count_drop candidate on day ${day} (count=${count}): ${JSON.stringify(dropCandidates)}`);
   }
@@ -463,7 +464,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M<N eventua
   for (let i = 0; i < MAX_ADDITIONAL_TICKS; i += 1) {
     const ts = tickTs(hour);
     await appendFactPoints(paths, completeTick(ts, M), { now: ts });
-    const candidates = await computeSessionBaselineCandidates(paths, { now: ts });
+    const { candidates } = await computeSessionBaselineCandidates(paths, { now: ts });
     const fired = candidates.some((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
     if (i === 0) firedImmediatelyAfterShift = fired;
     if (!fired && recoveredAtHour === undefined) recoveredAtHour = hour;
@@ -477,7 +478,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M<N eventua
   for (let i = 0; i < 3; i += 1) {
     const ts = tickTs(hour);
     await appendFactPoints(paths, completeTick(ts, M), { now: ts });
-    const candidates = await computeSessionBaselineCandidates(paths, { now: ts });
+    const { candidates } = await computeSessionBaselineCandidates(paths, { now: ts });
     assert.equal(candidates.some((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID), false, `expected sustained recovery, but session.count_drop re-fired at hour ${hour}`);
     hour += 1;
   }
@@ -501,8 +502,8 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   await appendFactPoints(paths, points, { now });
   await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
-  const first = await computeSessionBaselineCandidates(paths, { now });
-  const second = await computeSessionBaselineCandidates(paths, { now }); // no new fact-history written in between
+  const { candidates: first } = await computeSessionBaselineCandidates(paths, { now });
+  const { candidates: second } = await computeSessionBaselineCandidates(paths, { now }); // no new fact-history written in between
   const firstDrop = first.find((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
   const secondDrop = second.find((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.ok(firstDrop && secondDrop);
@@ -641,14 +642,14 @@ test("session.churn ignores a future complete group while still detecting a real
     readFactPoints: async () => intactReadResult(points),
   };
 
-  const beforeNow = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  const { candidates: beforeNow } = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal(beforeNow.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID).length, 0);
 
   points = [
     ...points,
     sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"), censusMarkerPoint(tickTs(0), "complete"),
   ];
-  const atNow = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
+  const { candidates: atNow } = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
   const churn = atNow.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID);
   assert.equal(churn.length, 1, "a real current-tick fingerprint change still fires");
   assert.equal(churn[0].diagnostics.prior_fingerprint, "1111111111111111");
@@ -809,7 +810,7 @@ test("session.churn, driven end-to-end through computeSessionBaselineCandidates"
     sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
     censusMarkerPoint(tickTs(1), "complete"),
   ];
-  const candidates = await seedAndCompute(paths, points);
+  const { candidates } = await seedAndCompute(paths, points);
   const churnCandidates = candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID);
   assert.equal(churnCandidates.length, 1);
   assert.equal(churnCandidates[0].diagnostics.entity_key, "session.tmux.aaaaaaaaaaaaaaaa");
@@ -827,7 +828,7 @@ test("GARBLED-MARKER end-to-end (adversarial-review regression, mirrors service-
     sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
     censusMarkerPoint(tickTs(1), "truncated-oops"),
   ];
-  const candidates = await seedAndCompute(paths, points);
+  const { candidates } = await seedAndCompute(paths, points);
   assert.equal(candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a garbled census must never manufacture a fabricated session.churn");
   assert.equal(candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 0, "a garbled census must never manufacture a fabricated session.count_drop");
 });
@@ -843,7 +844,7 @@ test("GARBLED-MARKER on an OLDER (non-latest) tick, end-to-end (adversarial-revi
     sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
     censusMarkerPoint(tickTs(1), "complete"),
   ];
-  const candidates = await seedAndCompute(paths, points);
+  const { candidates } = await seedAndCompute(paths, points);
   assert.equal(candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a garbled census on an older tick must never manufacture a fabricated session.churn using its point as the prior_fingerprint anchor");
 });
 
@@ -870,7 +871,8 @@ test("computeSessionBaselineCandidates: degraded truncated history suppresses a 
     readFactPoints: async () => degradedReadResult(points, tickTs(30)),
   });
 
-  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a session.count_drop claim");
+  assert.deepEqual(result.candidates, [], "untrustworthy retained history must not authorize a session.count_drop claim");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a whole-fn cold-start freeze reports zero coverage -- every owned session identity freezes, never recovers");
   const { state } = await loadSessionBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
 });
@@ -916,13 +918,14 @@ test("computeSessionBaselineCandidates: rollback repairs a future anchor and wat
     completeTick(tickTs(11), 2),
   ]);
   const recoveredTick = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(6) });
-  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  assert.deepEqual(recoveredTick.candidates, [], "the tick that re-establishes trust remains suppressed");
+  assert.deepEqual(recoveredTick.evaluatedAlertKeys, [], "the re-establishing tick is still cold-start-frozen -- zero coverage reported");
   const state = (await loadSessionBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, false);
   assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
 
   points = [...points, ...completeTick(tickTs(7), 0)];
-  const resumed = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(7) });
+  const { candidates: resumed } = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(7) });
   assert.equal(resumed.some((candidate) => candidate.rule_id === SESSION_COUNT_DROP_RULE_ID), true, "session novelty resumes after rollback recovery has been persisted");
 });
 
@@ -942,7 +945,8 @@ test("computeSessionBaselineCandidates (security-sweep F4): an established store
     readFactPoints: async () => intactReadResult(points),
   });
 
-  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.candidates, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a cold-start-frozen tick reports zero coverage -- no fabricated recovery from the shortened window");
   const { state } = await loadSessionBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
@@ -962,7 +966,7 @@ test("computeSessionBaselineCandidates: intact history control still fires a rea
     readFactPoints: async () => intactReadResult(points),
   });
 
-  const dropCandidates = result.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const dropCandidates = result.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.equal(dropCandidates.length, 1, "an intact store must not be falsely suppressed");
 });
 
@@ -979,19 +983,20 @@ test("computeSessionBaselineCandidates: one transient fact-history loss recovers
   // Loss tick: e1's fingerprint would change here (fp1 -> fp2) -- would churn if trusted.
   points = [...points, sessionPoint(tickTs(1), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(1), "complete")];
   const lossTick = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(1) });
-  assert.deepEqual(lossTick, []);
+  assert.deepEqual(lossTick.candidates, []);
+  assert.deepEqual(lossTick.evaluatedAlertKeys, [], "the loss tick is cold-start-frozen -- zero coverage, so a persisted churn alert freezes rather than recovering");
 
   readResult = intactReadResult([]);
   points = [...points, sessionPoint(tickTs(2), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(2), "complete")]; // 1st re-accum tick
-  assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(2) }), []);
+  assert.deepEqual((await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(2) })).candidates, []);
 
   points = [...points, sessionPoint(tickTs(3), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(3), "complete")]; // 2nd re-accum tick
-  assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
   assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, false);
 
   // A genuinely new fingerprint change after re-establishment must fire normally.
   points = [...points, sessionPoint(tickTs(4), "session.tmux.aaaaaaaaaaaaaaaa", "fp3"), censusMarkerPoint(tickTs(4), "complete")];
-  const resumed = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) });
+  const { candidates: resumed } = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) });
   const churnCandidates = resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID);
   assert.equal(churnCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
 });
@@ -1009,15 +1014,17 @@ test("computeSessionBaselineCandidates: a clean tick cannot self-heal and fire s
   let readResult = degradedReadResult(points, tickTs(3));
   const options = { minHistoryTickCount: 1, readFactPoints: async () => ({ ...readResult, points }) };
 
-  assert.deepEqual(await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
 
   points = [...points, sessionPoint(tickTs(4), "session.tmux.aaaaaaaaaaaaaaaa", "fp2"), censusMarkerPoint(tickTs(4), "complete")];
   readResult = intactReadResult([]);
+  const firstCleanTick = await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) });
   assert.deepEqual(
-    await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    firstCleanTick.candidates,
     [],
     "the first clean tick after loss may re-establish state but must not emit novelty in the same tick",
   );
+  assert.deepEqual(firstCleanTick.evaluatedAlertKeys, [], "the first clean tick after loss is still cold-start-frozen -- zero coverage, no same-breath recovery");
   assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, false);
 });
 
@@ -1050,7 +1057,8 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
   // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
   // must not be trusted just because it parses. A bounded, one-time cold-start is required.
   const firstRead = await computeSessionBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount });
-  assert.deepEqual(firstRead, []);
+  assert.deepEqual(firstRead.candidates, []);
+  assert.deepEqual(firstRead.evaluatedAlertKeys, [], "the one-time migration cold-start reports zero coverage -- an established-looking store must not authorize a recovery on its first read");
   const afterFirst = (await loadSessionBaselineStore(paths)).state;
   assert.equal(afterFirst.cold_start_pending, true);
   assert.equal(
@@ -1077,7 +1085,7 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
   // And session.* novelty genuinely resumes afterward.
   const ts = tickTs(hour);
   await appendFactPoints(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp-changed"), censusMarkerPoint(ts, "complete")], { now: ts });
-  const resumed = await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
+  const { candidates: resumed } = await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
   assert.equal(resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 1);
 });
 
@@ -1113,7 +1121,8 @@ test("computeSessionBaselineCandidates (security-sweep F1): a forged {cold_start
     now: tickTs(30),
     readFactPoints: async () => intactReadResult(points),
   });
-  assert.deepEqual(forged.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a session.count_drop claim");
+  assert.deepEqual(forged.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a session.count_drop claim");
+  assert.deepEqual(forged.evaluatedAlertKeys, [], "a forged/invalid-schema store cold-starts -- zero coverage, so no fabricated recovery either");
   assert.equal((await loadSessionBaselineStore(paths)).state.cold_start_pending, true);
 
   // Control: an otherwise-identical, GENUINELY established store (real watermark) still fires.
@@ -1122,7 +1131,7 @@ test("computeSessionBaselineCandidates (security-sweep F1): a forged {cold_start
     now: tickTs(30),
     readFactPoints: async () => intactReadResult(points),
   });
-  assert.equal(genuine.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
+  assert.equal(genuine.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1193,7 +1202,7 @@ test("loadSessionBaselineStore: corrupt JSON resets to a fresh baseline with cor
   // computeSessionBaselineCandidates must tolerate the corrupt store and keep working (honest
   // cold-start re-warm-up, not a crashed tick).
   const points = flatten([completeTick(tickTs(0), 5)]);
-  const candidates = await seedAndCompute(paths, points);
+  const { candidates } = await seedAndCompute(paths, points);
   assert.deepEqual(candidates, []);
 });
 
@@ -1215,7 +1224,8 @@ test("computeSessionBaselineCandidates short-circuits to [] before any I/O when 
     readFactPoints: async () => { ioAttempted = true; throw new Error("readFactPoints must not be called while watch.json is disabled"); },
     loadSessionBaselineStore: async () => { ioAttempted = true; throw new Error("loadSessionBaselineStore must not be called while watch.json is disabled"); },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a watch-disabled short-circuit reports zero coverage -- a disabled detector never authorizes a recovery");
   assert.equal(ioAttempted, false);
 });
 
@@ -1225,7 +1235,8 @@ test("computeSessionBaselineCandidates calls the real (default) loadWatchConfig 
   const result = await computeSessionBaselineCandidates(paths, {
     readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args); },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a day-1 cold-start (fresh state dir) reaches I/O but reports zero coverage -- nothing evaluated yet");
   assert.equal(readCalled, true, "watch.json's real ENOENT default is enabled:true (watch-by-default slice 1) -- unlike the pre-split default, I/O IS attempted even with nothing injected");
 });
 
@@ -1235,4 +1246,76 @@ test("computeSessionBaselineCandidates calls the real (default) loadWatchConfig 
 
 test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS is exactly [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID]", () => {
   assert.deepEqual(DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS, [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage
+// (docs/plans/2026-09-20-detector-reported-recovery-coverage.md §8.B/§8.C).
+// computeSessionBaselineCandidates now returns { candidates, evaluatedAlertKeys }.
+// evaluatedAlertKeys is the set of alertId(rule_id, fingerprint) identities this detector
+// GENUINELY evaluated this tick (complete/fresh/established data for it, whether it produced a
+// candidate OR found it clear) EXCLUDING anything skipped as cold-start / warm-up / stale /
+// ambiguous / gated-off. The daemon recovers a genuinely-cleared identity that IS reported and
+// freezes any owned identity NOT reported (never fabricates a recovery).
+// ---------------------------------------------------------------------------------------------
+
+test("recovery coverage (i) — GENUINE clear reports the identity so a persisted alert can recover: a churned-then-stable entity and an established-but-normal count_drop are both surfaced in evaluatedAlertKeys", async () => {
+  // (a) churn: an entity that churned (fp1 -> fp2) then STABILIZED (fp2 -> fp2 on the latest
+  // complete tick) is no longer anomalous, yet was FRESHLY evaluated this tick (>=2 obs, fresh,
+  // conforming, both fingerprints known, unambiguous) -> its identity is reported so a stale
+  // session.churn alert can recover.
+  const churnPaths = await tempPaths();
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const churnPoints = [
+    sessionPoint(tickTs(0), entityKey, "1111111111111111"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), entityKey, "2222222222222222"), censusMarkerPoint(tickTs(1), "complete"),
+    sessionPoint(tickTs(2), entityKey, "2222222222222222"), censusMarkerPoint(tickTs(2), "complete"),
+  ];
+  const churnResult = await seedAndCompute(churnPaths, churnPoints);
+  assert.equal(churnResult.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a now-stable fingerprint must not fire churn");
+  assert.equal(
+    churnResult.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)),
+    true,
+    "a freshly-evaluated, no-longer-anomalous entity must be reported so its persisted alert can recover",
+  );
+
+  // (b) count_drop: an established baseline whose latest complete tick sits ON its mean fires no
+  // candidate, but the singleton "global" identity WAS evaluated (an established statistical
+  // verdict was genuinely reached) -> reported so a persisted count_drop can recover.
+  const dropPaths = await tempPaths();
+  const dropTicks = [];
+  for (let i = 0; i < 31; i += 1) dropTicks.push(completeTick(tickTs(i), 20));
+  const dropResult = await seedAndCompute(dropPaths, flatten(dropTicks));
+  assert.equal(dropResult.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 0, "an on-mean tick must not fire count_drop");
+  assert.equal(
+    dropResult.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")),
+    true,
+    "an established (non-warm-up) count_drop verdict must report the global identity so a persisted alert can recover",
+  );
+});
+
+test("recovery coverage (ii) — UNEVALUATED identities are NOT reported (so a persisted alert freezes, never falsely recovers): a stale churn entity and a warm-up (provisional) count_drop are both absent from evaluatedAlertKeys", async () => {
+  const paths = await tempPaths();
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [
+    sessionPoint(tickTs(0), entityKey, "1111111111111111"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(1), entityKey, "2222222222222222"), censusMarkerPoint(tickTs(1), "complete"),
+    censusMarkerPoint(tickTs(2), "complete"), // entity absent from here on
+    censusMarkerPoint(tickTs(3), "complete"), // latest complete tick: entity's newest obs is NOT here -> STALE
+  ];
+  const result = await seedAndCompute(paths, points);
+  assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a stale pair must not fire (must-fix 4 recency bound)");
+  assert.equal(
+    result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)),
+    false,
+    "a stale entity (newest observation not in the latest complete tick) was not genuinely evaluated -- reporting it would falsely recover a persisted alert",
+  );
+  // The same fixture holds only 4 complete tick-groups -> confidence_state provisional (warm-up),
+  // so no established count_drop verdict was reached: its "global" identity must NOT be reported
+  // either (a warm-up detector freezes, never recovers).
+  assert.equal(
+    result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")),
+    false,
+    "a provisional (warm-up) count_drop must not report the global identity",
+  );
 });

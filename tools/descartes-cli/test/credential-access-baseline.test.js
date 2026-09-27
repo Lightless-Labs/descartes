@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { alertId } from "../src/alert-store.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { computeStatDiffTripReason } from "../src/stat-diff.js";
 import { resolveDefaultCredentialPaths } from "../src/tools/credential-access.js";
@@ -222,7 +223,7 @@ test("computeCredentialAccessCandidates: cold-start (no prior store) seeds silen
   const result = await computeCredentialAccessCandidates(paths, {
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry()] } }),
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
   const loaded = await loadCredentialAccessBaselineStore(paths);
   assert.deepEqual(loaded.entries[PATH_HASH_A], { atime: 1000, mtime: 2000, ino: 42 });
 });
@@ -235,15 +236,15 @@ test("computeCredentialAccessCandidates: a real mtime change on the SECOND obser
   const result = await computeCredentialAccessCandidates(paths, {
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 5000 })] } }),
   });
-  assert.equal(result.length, 1);
-  assert.equal(result[0].rule_id, CREDENTIAL_ACCESS_RULE_ID);
-  assert.equal(result[0].diagnostics.trip_reason, "mtime_changed");
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].rule_id, CREDENTIAL_ACCESS_RULE_ID);
+  assert.equal(result.candidates[0].diagnostics.trip_reason, "mtime_changed");
 
   // The store advanced unconditionally -- a second identical tick does not re-fire.
   const second = await computeCredentialAccessCandidates(paths, {
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 5000 })] } }),
   });
-  assert.deepEqual(second, []);
+  assert.deepEqual(second.candidates, []);
 });
 
 test("computeCredentialAccessCandidates: NOT completeness-gated -- fires immediately on the observation right after a corrupt/invalid store re-seeds, given two REAL consecutive ticks (unlike the novelty detectors, there is no multi-tick cold-start lockout here)", async () => {
@@ -257,7 +258,7 @@ test("computeCredentialAccessCandidates: NOT completeness-gated -- fires immedia
   const first = await computeCredentialAccessCandidates(paths, {
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 2000 })] } }),
   });
-  assert.deepEqual(first, []);
+  assert.deepEqual(first.candidates, []);
 
   // Tick 2: a genuine mtime change against the tick-1 seed fires immediately -- no multi-tick
   // re-accumulation window required, because this is positive two-snapshot evidence, not an
@@ -265,8 +266,8 @@ test("computeCredentialAccessCandidates: NOT completeness-gated -- fires immedia
   const second = await computeCredentialAccessCandidates(paths, {
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
   });
-  assert.equal(second.length, 1);
-  assert.equal(second[0].diagnostics.trip_reason, "mtime_changed");
+  assert.equal(second.candidates.length, 1);
+  assert.equal(second.candidates[0].diagnostics.trip_reason, "mtime_changed");
 });
 
 test("kill-switch: learned.json disabled -> [], zero I/O", async () => {
@@ -306,9 +307,9 @@ test("[BLOCKER fix] a throwing writeCredentialAccessBaselineStore does NOT disca
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
     writeCredentialAccessBaselineStore: async () => { const error = new Error("read-only filesystem"); error.code = "EROFS"; throw error; },
   });
-  assert.equal(result.length, 1, "the positive finding, already computed before the write throws, must survive");
-  assert.equal(result[0].rule_id, CREDENTIAL_ACCESS_RULE_ID);
-  assert.equal(result[0].diagnostics.trip_reason, "mtime_changed");
+  assert.equal(result.candidates.length, 1, "the positive finding, already computed before the write throws, must survive");
+  assert.equal(result.candidates[0].rule_id, CREDENTIAL_ACCESS_RULE_ID);
+  assert.equal(result.candidates[0].diagnostics.trip_reason, "mtime_changed");
 });
 
 test("[BLOCKER fix] end-to-end with the real loadCredentialAccessBaselineStore: an unreadable store on disk (EISDIR) does not abort the tick", async () => {
@@ -356,7 +357,7 @@ test("[HIGH fix] a collector that resolves well within its deadline is unaffecte
     credentialCollectionBreaker: createCredentialCollectionBreaker(),
     collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 9000 })] } }),
   });
-  assert.deepEqual(result, [], "cold-start seed against an empty store -- no baseline to diff against yet");
+  assert.deepEqual(result.candidates, [], "cold-start seed against an empty store -- no baseline to diff against yet");
 });
 
 test("[HIGH fix] in-memory circuit breaker: after a collection timeout, the next K ticks skip collection entirely (no new hung call, no new libuv thread leaked), then collection resumes", async () => {
@@ -391,7 +392,7 @@ test("[HIGH fix] in-memory circuit breaker: after a collection timeout, the next
     collectCredentialAccessEvidence: async () => { collectCalls += 1; return { status: "ok", result: { entries: [okEntry()] } }; },
   });
   assert.equal(collectCalls, 2);
-  assert.deepEqual(fourth, []);
+  assert.deepEqual(fourth.candidates, []);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -411,6 +412,73 @@ test("[O6] churn-rate ceiling: no v1-shipped path is drawn from the excluded hig
 // ---------------------------------------------------------------------------------------------
 // P9 fail-closed namespace pin
 // ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (plan 2026-09-20 §8.B/§8.C): computeCredentialAccessCandidates
+// returns { candidates, evaluatedAlertKeys }. evaluatedAlertKeys = alertId(rule_id, fingerprint) for
+// every watched path GENUINELY evaluated this tick (status "ok" AND a prior baseline existed, whether
+// it tripped OR was found clear) — EXCLUDING cold-start seeds (no prior baseline) and skipped
+// (absent/unreadable) paths. Per-fingerprint (C1): one unreadable path must not freeze the others.
+// ---------------------------------------------------------------------------------------------
+
+test("[coverage] a GENUINE clear reports the evaluated identity so it can recover: a tripped path (evaluated) reports its identity, and on the next tick with the SAME (now-baselined) stat it produces no candidate yet STILL reports the identity as evaluated-and-clear", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeCredentialAccessBaselineStore(paths, { entries: { [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 } } });
+  const evaluatedId = alertId(CREDENTIAL_ACCESS_RULE_ID, expectedHash(PATH_HASH_A));
+
+  // Tick 1: a real mtime change against the established baseline — evaluated AND tripped.
+  const first = await computeCredentialAccessCandidates(paths, {
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 5000 })] } }),
+  });
+  assert.equal(first.candidates.length, 1, "the mtime change fires a candidate");
+  assert.ok(first.evaluatedAlertKeys.includes(evaluatedId), "the tripped path was genuinely evaluated -> reported");
+
+  // Tick 2: the SAME stat (baseline advanced to mtime 5000) — no candidate, but the path was still
+  // genuinely diffed and found clear, so its identity MUST be reported so the daemon can recover a
+  // persisted alert (never fabricates a recovery from a bare [], recovers a reported genuine clear).
+  const second = await computeCredentialAccessCandidates(paths, {
+    collectCredentialAccessEvidence: async () => ({ status: "ok", result: { entries: [okEntry({ mtime: 5000 })] } }),
+  });
+  assert.deepEqual(second.candidates, [], "no change -> no candidate (evaluated-and-clear)");
+  assert.ok(second.evaluatedAlertKeys.includes(evaluatedId), "an evaluated-and-clear path IS reported so it can recover");
+});
+
+test("[coverage] an UNEVALUATED path is NOT reported (would freeze a persisted alert): a skipped absent path and a first-sight cold-start seed are excluded, while only the genuinely-diffed unchanged path is reported — per-fingerprint (C1): one unevaluable path must not freeze the others", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  // A and B both have established baselines; C is first-sight (no baseline this tick).
+  await writeCredentialAccessBaselineStore(paths, {
+    entries: {
+      [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 },
+      [PATH_HASH_B]: { atime: 1000, mtime: 3000, ino: 43 },
+    },
+  });
+  const PATH_HASH_C = "abcabcabcabcabcd";
+
+  const result = await computeCredentialAccessCandidates(paths, {
+    collectCredentialAccessEvidence: async () => ({
+      status: "ok",
+      result: {
+        entries: [
+          // A: unevaluable this tick (absent) -> skipped, NOT evaluated -> its persisted alert freezes.
+          { category: "ssh_private_key", path_hash: PATH_HASH_A, watch: ["mtime", "ino"], status: "absent" },
+          // B: present with a prior baseline, unchanged -> genuinely diffed and clear -> reported.
+          okEntry({ pathHash: PATH_HASH_B, mtime: 3000, ino: 43 }),
+          // C: first sight, no prior baseline -> cold-start seed, NOT evaluated -> excluded.
+          okEntry({ pathHash: PATH_HASH_C, mtime: 7000, ino: 44 }),
+        ],
+      },
+    }),
+  });
+
+  assert.deepEqual(result.candidates, [], "nothing tripped this tick");
+  assert.deepEqual(
+    result.evaluatedAlertKeys,
+    [alertId(CREDENTIAL_ACCESS_RULE_ID, expectedHash(PATH_HASH_B))],
+    "ONLY the genuinely-diffed unchanged path B is reported; the absent A (skipped) and first-sight C (cold-start) are excluded",
+  );
+});
 
 test("[P9] CREDENTIAL_ACCESS_RULE_ID classifies to unknown_namespace -- structurally LLM-ineligible (full deterministic-delivery pin lives in test/alert-intelligence.test.js)", async () => {
   const { classifyAlertNamespace } = await import("../src/alert-intelligence.js");

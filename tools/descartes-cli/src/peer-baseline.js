@@ -689,7 +689,10 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_D
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Matches computeSessionBaselineCandidates' exact signature/short-circuit shape: gated by the
+ * Returns { candidates, evaluatedAlertKeys } (detector-reported recovery coverage, plan
+ * 2026-09-20 §8.B) -- NOT a bare array; every exit point below returns that object shape. (Sibling
+ * producers such as computeSessionBaselineCandidates still return a bare array until their own
+ * conversion slice lands; this contract is per-producer.) Gated by the
  * same loadWatchConfig(...).enabled short-circuit-to-[] BEFORE any I/O (watch-by-default slice 1,
  * plan §3.4/§12.1 -- moved off constraint-store.js's loadLearnedConfig; peer/session joined WATCH
  * per plan §11 #1). Called on every daemon tick, not just on a structural-due tick — an
@@ -705,7 +708,11 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_D
 export async function computePeerBaselineCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfig = await loadConfig(descartesPaths);
-  if (!watchConfig.enabled) return [];
+  // Detector-reported recovery coverage (plan 2026-09-20, §8.B): every exit point returns the
+  // { candidates, evaluatedAlertKeys } object shape now, never a bare array -- a bare array makes
+  // daemon.js's safeCandidates warn (fail-safe freeze) every tick, which would fire on every tick
+  // in a watch-disabled deployment. A watch-off tick evaluated nothing, so coverage is empty.
+  if (!watchConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const minSampleCount = options.minSampleCount ?? DEFAULT_PEER_MIN_SAMPLE_COUNT;
   const stddevFloor = options.stddevFloor ?? DEFAULT_PEER_STDDEV_FLOOR;
@@ -867,7 +874,11 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
     await writeStore(descartesPaths, nextState);
   }
 
-  if (coldStartPendingThisTick) return [];
+  // Whole-fn cold-start gate (plan §8.C, peer recipe): while the persistent lockout is pending (or
+  // (re)armed this tick, or history is untrusted), this detector evaluated NOTHING it can vouch
+  // for -- report empty coverage so any persisted peer.count_spike/peer.count_drop alert FREEZES
+  // (never fabricate a recovery), exactly as it already emits zero candidates.
+  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
 
   // Re-emission every tick (load-bearing, mirrors session-baseline.js's own Decision 3): built
   // fresh from `windowed`/`windowedDrop` on EVERY call — including ticks where nothing new was
@@ -899,5 +910,27 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
         && groupMs < scoredDropMs;
     }).length >= minHistoryTickCount);
   if (dropCandidate && dropRecoveryReady) candidates.push(dropCandidate);
-  return candidates;
+
+  // Detector-reported recovery coverage (plan §8.B/§8.C, peer recipe). evaluatedAlertKeys = the
+  // alert identities this detector GENUINELY evaluated this tick -- every family it had
+  // complete/fresh/established data for, whether it produced a candidate above OR found it clear
+  // -- EXCLUDING anything it could not evaluate (cold-start already returned above; per-direction
+  // warm-up / drop-readiness gated off here). The daemon freezes any owned identity NOT reported
+  // (never fabricates a recovery) and recovers a genuinely-cleared one that IS reported. Both
+  // directions are singletons keyed on fingerprint "global".
+  //   - spike: evaluated iff its windowed baseline is "established" (Welford warm-up satisfied for
+  //     the current regime). Reported regardless of whether the spike candidate fired.
+  //   - drop: evaluated iff its OWN windowed baseline is "established" AND dropRecoveryReady --
+  //     the extra term is load-bearing: an established windowedDrop can still be un-evaluable when
+  //     too few marker-complete ticks have re-accumulated since the cold-start anchor (a
+  //     count_drop-only warm-up the spike direction does not share), so gating drop on
+  //     windowedDrop.confidence_state alone would fabricate a recovery.
+  const evaluatedAlertKeys = [];
+  if (windowed.confidence_state === "established") {
+    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, "global"));
+  }
+  if (windowedDrop.confidence_state === "established" && dropRecoveryReady) {
+    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, "global"));
+  }
+  return { candidates, evaluatedAlertKeys };
 }

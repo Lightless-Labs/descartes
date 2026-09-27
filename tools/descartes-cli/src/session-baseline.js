@@ -463,11 +463,32 @@ const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16
  * record is compared only against the most recent STRICTLY-EARLIER tick's record (`older.ts <
  * newer.ts`); the must-fix-4 K=1 recency bound is unchanged.
  */
-export function detectSessionChurn(points = []) {
+/**
+ * Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+ * §8.C, session recipe): the single evaluation pass behind BOTH detectSessionChurn (which surfaces
+ * only the churn candidates, unchanged) AND computeSessionBaselineCandidates' churn coverage
+ * report. Returns `{ churnEntries, evaluatedEntityKeys }`:
+ *   - `churnEntries` is byte-for-byte what detectSessionChurn always returned — an entity is a
+ *     churn entry iff its fingerprint changed AND it passed every ambiguity/chronology/recency/
+ *     shape safeguard (the checks below are all `continue`s in one conjunction, so re-ordering the
+ *     fingerprint-equality test relative to the recency/shape gates cannot change this set).
+ *   - `evaluatedEntityKeys` is the set of entity_keys this detector GENUINELY evaluated this tick —
+ *     reached a definitive fresh verdict for, churned OR clear. session.churn is NOT statistical:
+ *     an entity is "evaluated" iff it had >=2 observations across DISTINCT ticks, was unambiguous
+ *     on both the newest and the chosen-earlier tick, had both created_at_fingerprints defined and
+ *     neither "unknown", is RECENCY-FRESH (its newest observation is in the latest complete
+ *     tick-group), and carries a CONFORMING (in-contract) hashed entity_key. Entities skipped as
+ *     <2-obs / same-tick-ambiguous / missing-or-unknown-fingerprint (per §8.C's named skip
+ *     reasons), and additionally as STALE or OUT-OF-CONTRACT (per the recovery-coverage contract's
+ *     "excluding entities it skipped as ... stale / unevaluable"), are NOT reported — so the daemon
+ *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
+ */
+function evaluateSessionChurn(points = []) {
   const groups = groupSessionFactsByTick(points);
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length === 0) return [];
+  if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [] };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
+  const latestCompleteMs = new Date(latestCompleteTs).getTime();
 
   const byEntity = new Map();
   for (const group of groups) {
@@ -487,8 +508,9 @@ export function detectSessionChurn(points = []) {
   }
 
   const churnEntries = [];
+  const evaluatedEntityKeys = [];
   for (const [entityKey, observations] of byEntity) {
-    if (observations.length < 2) continue;
+    if (observations.length < 2) continue; // <2 observations -- unevaluable, never reported for recovery
     observations.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
     const newer = observations[observations.length - 1];
     // F5 residual fix (2026-09-04 daybreak re-gate, round 3): "within one tick" means "within one
@@ -534,21 +556,46 @@ export function detectSessionChurn(points = []) {
       continue; // ambiguous same-tick evidence on the earlier side -- no claim
     }
 
-    if (!newer.fingerprint || !older.fingerprint) continue;
-    if (newer.fingerprint === "unknown" || older.fingerprint === "unknown") continue;
-    if (newer.fingerprint === older.fingerprint) continue;
-    // must-fix 4 recency bound (K=1). Compared by PARSED INSTANT, not raw string: the newest
-    // record selected above may be a same-instant record written in a different ISO form than the
-    // census group's ts (e.g. "...:00Z" vs "...:00.000Z"), and a raw-string `!==` would then
-    // FALSE-NEGATIVE-suppress a genuine A->B change. Instant comparison keeps this consistent with
-    // the same-instant discipline used for the ambiguity grouping and the strictly-earlier search
-    // above (daybreak-blue F5 re-gate). Cannot fabricate: it only admits a change that already
-    // passed every ambiguity/chronology safeguard.
-    if (new Date(newer.ts).getTime() !== new Date(latestCompleteTs).getTime()) continue;
-    if (!SESSION_CHURN_ENTITY_KEY_PATTERN.test(entityKey)) continue; // F7: nonconforming entity_key shape, never republished
-    churnEntries.push({ entity_key: entityKey, prior_fingerprint: older.fingerprint, current_fingerprint: newer.fingerprint });
+    if (!newer.fingerprint || !older.fingerprint) continue; // missing fingerprint -- unevaluable
+    if (newer.fingerprint === "unknown" || older.fingerprint === "unknown") continue; // unknown fingerprint (screen-session case) -- unevaluable
+    // Recovery coverage (§8.C): the must-fix-4 K=1 recency bound AND the F7 conforming-shape
+    // backstop below decide whether this entity was GENUINELY EVALUATED this tick -- reached a
+    // definitive FRESH verdict, churned OR clear -- independent of whether its fingerprint actually
+    // changed. They are hoisted AHEAD of the fingerprint-equality test (which now only selects
+    // churned-vs-clear, not evaluated-vs-skipped) so that a STALE pair (newest observation not in
+    // the latest complete tick) or an OUT-OF-CONTRACT (nonconforming) entity_key is treated as
+    // unevaluable: never added to evaluatedEntityKeys, so the daemon freezes any persisted churn
+    // alert for it rather than fabricating a recovery. This re-order cannot change `churnEntries`:
+    // an entry is still pushed only when the fingerprint changed AND all of these gates pass -- a
+    // conjunction of `continue`s, order-independent for that outcome.
+    //
+    // Recency bound compared by PARSED INSTANT, not raw string: the newest record selected above
+    // may be a same-instant record written in a different ISO form than the census group's ts (e.g.
+    // "...:00Z" vs "...:00.000Z"), and a raw-string `!==` would then FALSE-NEGATIVE-suppress a
+    // genuine A->B change. Instant comparison keeps this consistent with the same-instant discipline
+    // used for the ambiguity grouping and the strictly-earlier search above (daybreak-blue F5
+    // re-gate).
+    if (newerMs !== latestCompleteMs) continue; // must-fix 4 recency bound (K=1) -- STALE pair, unevaluable
+    if (!SESSION_CHURN_ENTITY_KEY_PATTERN.test(entityKey)) continue; // F7: nonconforming entity_key shape -- unevaluable, never republished
+
+    // Fresh + conforming + unambiguous + both fingerprints known: a definitive verdict either way,
+    // so this identity WAS genuinely evaluated (whether it churned or is clear) and is reported.
+    evaluatedEntityKeys.push(entityKey);
+    if (newer.fingerprint !== older.fingerprint) {
+      churnEntries.push({ entity_key: entityKey, prior_fingerprint: older.fingerprint, current_fingerprint: newer.fingerprint });
+    }
   }
-  return churnEntries;
+  return { churnEntries, evaluatedEntityKeys };
+}
+
+/**
+ * Must-fix 4 (recency bound, hard requirement) — the churn candidate list, unchanged in shape and
+ * content from before the recovery-coverage conversion (a thin wrapper over evaluateSessionChurn,
+ * which now ALSO computes which entity_keys were genuinely evaluated; see its doc comment). Every
+ * existing caller and test that reads a bare churn-entry array keeps working through this wrapper.
+ */
+export function detectSessionChurn(points = []) {
+  return evaluateSessionChurn(points).churnEntries;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -624,7 +671,12 @@ export function buildChurnCandidates(churnEntries = []) {
 export async function computeSessionBaselineCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfig = await loadConfig(descartesPaths);
-  if (!watchConfig.enabled) return [];
+  // Detector-reported recovery coverage (§8.B): this producer now returns
+  // `{ candidates, evaluatedAlertKeys }` on EVERY path. A watch-disabled short-circuit reports NO
+  // evaluated identities (empty coverage) -- correct: a disabled detector must never authorize a
+  // recovery. (The object shape also avoids safeCandidates' bare-array fail-safe warn firing every
+  // tick the tier is legitimately off.)
+  if (!watchConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const minSampleCount = options.minSampleCount ?? DEFAULT_MIN_SAMPLE_COUNT;
   const stddevFloor = options.stddevFloor ?? DEFAULT_STDDEV_FLOOR;
@@ -772,9 +824,13 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     await writeStore(descartesPaths, nextState);
   }
 
-  if (coldStartPendingThisTick) return [];
+  // Detector-reported recovery coverage (§8.C, session recipe): the whole-fn coldStartPendingThisTick
+  // gate freezes BOTH rules -- nothing was evaluated this tick, so report an empty coverage set (the
+  // daemon then freezes every owned session identity, never fabricating a recovery).
+  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
 
   const candidates = [];
+  const evaluatedAlertKeys = [];
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
   // — including ticks where nothing new was folded — so applyAlertCandidates never spuriously
   // "recovers" an active session.count_drop just because this source skipped a redundant write.
@@ -783,8 +839,28 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     { deviationSigma, criticalSigma },
   );
   if (dropCandidate) candidates.push(dropCandidate);
+  // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
+  // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
+  // against the latest complete tick -- exactly the preconditions buildCountDropCandidate itself
+  // requires before it can fire OR find-clear. A provisional (warm-up) window reaches no verdict, so
+  // "global" is NOT reported and any persisted count_drop freezes rather than falsely recovering.
+  const dropObservation = windowed.last_observation;
+  const dropEvaluated = windowed.confidence_state === "established"
+    && Boolean(dropObservation)
+    && Number.isFinite(dropObservation.z_score)
+    && Number.isFinite(dropObservation.mean_before);
+  if (dropEvaluated) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
+
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
   const currentPoints = points.filter((point) => currentGroupTimestamps.has(point.ts));
-  candidates.push(...buildChurnCandidates(detectSessionChurn(currentPoints)));
-  return candidates;
+  // churn coverage (§8.C): one evaluation pass yields both the candidates and the set of entity_keys
+  // genuinely evaluated (fresh/unambiguous/known-fingerprint/conforming) this tick -- see
+  // evaluateSessionChurn. Each evaluated key (whether it churned or was clear) is reported so the
+  // daemon can recover a now-stable session's persisted churn alert; skipped/stale/ambiguous entities
+  // are absent, so their alerts freeze.
+  const { churnEntries, evaluatedEntityKeys } = evaluateSessionChurn(currentPoints);
+  candidates.push(...buildChurnCandidates(churnEntries));
+  for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+
+  return { candidates, evaluatedAlertKeys };
 }

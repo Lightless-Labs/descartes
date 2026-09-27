@@ -252,19 +252,33 @@ export function groupProcessLineageFactsByTick(points = []) {
   return [...byTs.values()].sort((left, right) => new Date(left.ts).getTime() - new Date(right.ts).getTime());
 }
 
-export function detectNovelProcessLineageEdges(groups = [], options = {}) {
+// Shared readiness gate (Y-refactor, plan §8.C -- "a sibling predicate over data already
+// computed"): the EXACT complete-history-count + latest-census-freshness prerequisites the detector
+// applies, factored out of detectNovelProcessLineageEdges so the coverage sibling
+// (computeEvaluatedProcessLineageEdgeKeys) reuses the same computation and cannot drift from the
+// detector's own gates. Returns the complete groups when the window is genuinely evaluable, or
+// undefined when it is not (too little complete history, or a stale latest complete census) --
+// exactly the two cases where detection itself returns []. No detection-logic change: this is the
+// same filter/length/freshness test that was inline before.
+function readyLineageCompleteGroups(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_LINEAGE_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minHistoryTickCount + 1) return [];
-
+  if (completeGroups.length < minHistoryTickCount + 1) return undefined;
   const latest = completeGroups[completeGroups.length - 1];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return [];
+  if (!(nowMs - latestMs <= freshnessMs)) return undefined;
+  return completeGroups;
+}
 
+export function detectNovelProcessLineageEdges(groups = [], options = {}) {
+  const completeGroups = readyLineageCompleteGroups(groups, options);
+  if (!completeGroups) return [];
+
+  const latest = completeGroups[completeGroups.length - 1];
   const historical = new Set();
   for (const group of completeGroups.slice(0, -1)) {
     for (const entityKey of group.entityKeys) historical.add(entityKey);
@@ -276,6 +290,29 @@ export function detectNovelProcessLineageEdges(groups = [], options = {}) {
     novel.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return novel;
+}
+
+// Detector-reported recovery coverage (plan §8.B/§8.C): the alert identities this detector GENUINELY
+// evaluated this tick. Recipe (§8.C, "service ×2 / scheduled-job / process-lineage"): hash-forward
+// every entity_key the detector holds census knowledge of this tick -- the historical union it
+// already computes PLUS the latest census, i.e. every entity_key across every complete group -- with
+// the SAME domain-separated hash the candidate builder uses, so an identity here is byte-identical to
+// the candidate .id it would fire. This deliberately includes the edges it emitted a candidate for
+// (novel this tick) AND the edges it found clear (already established) -- §8.B's "whether it emitted
+// a candidate or found it clear". Returns [] whenever the window is unevaluable (the identical
+// readiness gate the detector uses); the caller ALSO zeroes it whenever coldStartPendingThisTick,
+// mirroring exactly how it zeroes `novel`, so a persisted alert freezes rather than recovering off an
+// untrustworthy window.
+export function computeEvaluatedProcessLineageEdgeKeys(groups = [], options = {}) {
+  const completeGroups = readyLineageCompleteGroups(groups, options);
+  if (!completeGroups) return [];
+  const evaluated = new Set();
+  for (const group of completeGroups) {
+    for (const entityKey of group.entityKeys) {
+      evaluated.add(alertId(PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, hashLineageEdgeEntityKey(entityKey)));
+    }
+  }
+  return [...evaluated];
 }
 
 function hashLineageEdgeEntityKey(entityKey) {
@@ -311,7 +348,12 @@ export function buildNovelEdgeCandidates(entries = []) {
 export async function computeProcessLineageBaselineCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfig = await loadConfig(descartesPaths);
-  if (!watchConfig.enabled) return [];
+  // Detector-reported recovery coverage (§8.B): return the { candidates, evaluatedAlertKeys } shape
+  // on every path. Watch disabled ⇒ nothing was evaluated this tick ⇒ empty coverage, so every
+  // owned identity freezes (the daemon's registry-derived tier veto also freezes the watch tier
+  // when it is off; reporting empty coverage keeps this producer honest and avoids the bare-array
+  // "not-yet-converted" warn safeCandidates would otherwise log every disabled tick).
+  if (!watchConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const readFacts = options.readFactPoints ?? readFactPoints;
@@ -416,6 +458,12 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
   }
 
   const novel = coldStartPendingThisTick ? [] : detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
+  // §8.B/§8.C coverage: reported from the SAME state the detector already computed (currentGroups +
+  // the readiness predicate), zeroed under coldStartPendingThisTick exactly as `novel` is -- never a
+  // change to detection logic, cold-start lockout, or completeness gates.
+  const evaluatedAlertKeys = coldStartPendingThisTick
+    ? []
+    : computeEvaluatedProcessLineageEdgeKeys(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
   // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
@@ -443,5 +491,5 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     await writeStore(descartesPaths, nextState);
   }
 
-  return buildNovelEdgeCandidates(novel);
+  return { candidates: buildNovelEdgeCandidates(novel), evaluatedAlertKeys };
 }

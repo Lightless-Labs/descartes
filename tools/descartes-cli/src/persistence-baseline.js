@@ -255,6 +255,38 @@ function hashScheduledJobEntityKey(entityKey) {
     .slice(0, 16);
 }
 
+// Detector-reported recovery coverage (§8.C recipe — "service ×2 / scheduled-job / process-lineage"):
+// the set of scheduled-job entity_keys this detector GENUINELY evaluated for novelty this tick. It
+// reuses detectScheduledJobAppearances' EXACT prerequisite gates (same complete-group filter, same
+// >= minHistoryTickCount+1 arming, same freshness bound on the latest complete census) so readiness
+// stays honest — a sibling predicate over data already computed, NOT a change to detection logic.
+// When those gates pass, the detector holds complete/fresh census knowledge of every entity across
+// the trusted window's complete groups; each such entity's novelty status was evaluated this tick
+// (either it produced a candidate — latest \ historical — or was found clear — present in prior
+// complete history). The union (historical ∪ latest) is the "every entity_key the detector holds
+// census knowledge of this tick" the recipe names; latest-only entities MUST be included because a
+// candidate's own identity is required in the evaluated set (§8.B). Returns [] if any gate fails
+// (the coldStartPendingThisTick short-circuit is applied by the caller, above and beyond this).
+function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
+  const {
+    nowMs = Date.now(),
+    freshnessMs = DEFAULT_SCHEDULED_JOB_FRESHNESS_FALLBACK_MS,
+    minHistoryTickCount = DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
+  } = options;
+  const completeGroups = groups.filter((group) => group.censusState === "complete");
+  if (completeGroups.length < minHistoryTickCount + 1) return [];
+
+  const latest = completeGroups[completeGroups.length - 1];
+  const latestMs = new Date(latest.ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return [];
+
+  const evaluated = new Set();
+  for (const group of completeGroups) {
+    for (const entityKey of group.entityKeys) evaluated.add(entityKey);
+  }
+  return [...evaluated];
+}
+
 // [O1] Hash-only diagnostics by default (unsigned): mirrors buildNovelEdgeCandidates' own
 // hash-only shape, NOT service.disappeared's scoped 2026-07-24 cleartext-name exception. A future
 // operator sign-off can flip this to carry a sanitized job_kind/job_source/job_name, exactly as
@@ -294,7 +326,10 @@ export function buildScheduledJobAppearedCandidates(entries = []) {
 export async function computeScheduledJobBaselineCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfig = await loadConfig(descartesPaths);
-  if (!watchConfig.enabled) return [];
+  // Gate/kill-switch off: the detector evaluated nothing this tick. Return the object shape (empty
+  // candidates + empty coverage) rather than a bare [] so safeCandidates does not treat a normal
+  // gated-off tick as a malformed producer result (§8.B fail-safe freeze — the family is frozen).
+  if (!watchConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT;
@@ -359,7 +394,18 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
     }
   }
 
-  const appearances = coldStartPendingThisTick ? [] : detectScheduledJobAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
+  const detectionOptions = { nowMs, freshnessMs, minHistoryTickCount };
+  const appearances = coldStartPendingThisTick ? [] : detectScheduledJobAppearances(currentGroups, detectionOptions);
+
+  // Detector-reported recovery coverage (§8.B/§8.C): the alert identities this detector genuinely
+  // evaluated this tick. Gated by the SAME coldStartPendingThisTick short-circuit that zeroes
+  // `appearances`, then by detectScheduledJobAppearances' own readiness gates (via the sibling
+  // predicate). Empty when the detector could not evaluate — the daemon then freezes any persisted
+  // scheduled_job.appeared alert instead of fabricating a recovery.
+  const evaluatedAlertKeys = (coldStartPendingThisTick
+    ? []
+    : scheduledJobEvaluatedEntityKeys(currentGroups, detectionOptions))
+    .map((entityKey) => alertId(SCHEDULED_JOB_APPEARED_RULE_ID, hashScheduledJobEntityKey(entityKey)));
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
   // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
@@ -387,5 +433,5 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
     await writeStore(descartesPaths, nextState);
   }
 
-  return buildScheduledJobAppearedCandidates(appearances);
+  return { candidates: buildScheduledJobAppearedCandidates(appearances), evaluatedAlertKeys };
 }

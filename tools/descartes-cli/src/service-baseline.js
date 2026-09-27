@@ -438,6 +438,42 @@ export function buildDisappearedCandidates(entries = []) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+// §8.B/§8.C). A sibling predicate over the SAME complete-group/latest/freshness computation
+// detectServiceDisappearances/detectServiceAppearances already perform — NO detection-logic change,
+// just the surfacing of an already-computed evaluation-readiness status. When this tick was
+// genuinely evaluable (not cold-start-pending AND the detect* freshness + >=complete-count gates
+// passed), every entity_key the detector holds census knowledge of this tick — the union across
+// EVERY complete tick-group in the window (its historical-union, latest included) — is hash-forwarded
+// with the SAME domain-separated hash the candidate builder uses into an alert identity
+// (alertId(rule_id, fingerprint)) the daemon may recover. An entity that has aged out of the fact
+// window entirely is absent from the union → unreported → frozen (a safe availability cost, never a
+// fabricated recovery). When the tick was NOT evaluable (cold-start / too few complete groups /
+// stale latest census), NOTHING is reported, so every owned identity freezes rather than clearing
+// itself from silence.
+function computeCensusEvaluatedAlertKeys(currentGroups, {
+  coldStartPendingThisTick,
+  nowMs,
+  freshnessMs,
+  minCompleteGroups,
+  ruleId,
+  hashEntityKey,
+}) {
+  if (coldStartPendingThisTick) return [];
+  // Same filter detect* uses ("the" notion of a complete tick for this detector).
+  const completeGroups = currentGroups.filter((group) => group.censusState === "complete");
+  if (completeGroups.length < minCompleteGroups) return []; // detect*'s >=complete-count gate
+  const latest = completeGroups[completeGroups.length - 1];
+  const latestMs = new Date(latest.ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return []; // detect*'s freshness gate
+  const union = new Set();
+  for (const group of completeGroups) {
+    for (const entityKey of group.entityKeys) union.add(entityKey);
+  }
+  return [...union].map((entityKey) => alertId(ruleId, hashEntityKey(entityKey)));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Fast-tick side — the daemon.js extraCandidates entry.
 // ---------------------------------------------------------------------------------------------
 
@@ -466,7 +502,9 @@ export function buildDisappearedCandidates(entries = []) {
 export async function computeServiceBaselineCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfig = await loadConfig(descartesPaths);
-  if (!watchConfig.enabled) return []; // default-ON WATCH kill switch, checked before ANY I/O
+  // default-ON WATCH kill switch, checked before ANY I/O. Gate-off evaluates nothing this tick, so
+  // it reports empty coverage (its families freeze under the daemon's fail-safe default / tier veto).
+  if (!watchConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS; // reused from welford-stats.js — generic read-window bound, not a Welford use
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT;
@@ -629,12 +667,24 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
     await writeStore(descartesPaths, nextState);
   }
 
-  if (coldStartPendingThisTick) return [];
+  // Recovery-coverage report (§8.B/§8.C): the alert identities this detector GENUINELY evaluated
+  // this tick — empty when coldStartPendingThisTick (computeCensusEvaluatedAlertKeys short-circuits
+  // on it), matching the frozen `[]` candidates below.
+  const evaluatedAlertKeys = computeCensusEvaluatedAlertKeys(currentGroups, {
+    coldStartPendingThisTick,
+    nowMs,
+    freshnessMs,
+    minCompleteGroups: 2, // detectServiceDisappearances' own `completeGroups.length < 2 -> []` gate
+    ruleId: SERVICE_DISAPPEARED_RULE_ID,
+    hashEntityKey: hashServiceEntityKey,
+  });
+
+  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys };
 
   // Re-emission every tick (load-bearing, mirrors session/peer's own "re-emission every tick"
   // behavior): built fresh from `disappearances` on EVERY call — never dependent on whether a store
   // write happened that tick.
-  return buildDisappearedCandidates(disappearances);
+  return { candidates: buildDisappearedCandidates(disappearances), evaluatedAlertKeys };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -848,7 +898,8 @@ export function buildAppearedCandidates(entries = []) {
 export async function computeServiceAppearanceCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadWatchConfig ?? loadWatchConfig;
   const watchConfig = await loadConfig(descartesPaths);
-  if (!watchConfig.enabled) return [];
+  // Gate-off evaluates nothing this tick -> empty coverage (families freeze under the tier veto).
+  if (!watchConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   // Persistent-lockout re-accumulation gate (distinct from detectServiceAppearances' own
@@ -952,7 +1003,21 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
     await writeStore(descartesPaths, nextState);
   }
 
-  if (coldStartPendingThisTick) return [];
+  // Recovery-coverage report (§8.B/§8.C): the appearance identities this detector GENUINELY
+  // evaluated this tick. The completeness gate here is establishedMinCensusCount + 1 — the exact
+  // threshold detectServiceAppearances applies (`completeGroups.length < minHistoryTickCount + 1`,
+  // where it is called with minHistoryTickCount: establishedMinCensusCount) — NOT the lockout
+  // re-accumulation `minHistoryTickCount`, which is a different knob with a colliding name.
+  const evaluatedAlertKeys = computeCensusEvaluatedAlertKeys(currentGroups, {
+    coldStartPendingThisTick,
+    nowMs,
+    freshnessMs,
+    minCompleteGroups: establishedMinCensusCount + 1,
+    ruleId: SERVICE_APPEARED_RULE_ID,
+    hashEntityKey: hashServiceAppearedEntityKey,
+  });
 
-  return buildAppearedCandidates(appearances);
+  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys };
+
+  return { candidates: buildAppearedCandidates(appearances), evaluatedAlertKeys };
 }

@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { alertId } from "../src/alert-store.js";
 import { appendFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
@@ -262,7 +263,8 @@ test("computeScheduledJobBaselineCandidates checks watch.json before any fact/st
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadPersistenceBaselineStore: async () => { loadCalls += 1; return { state: normalizePersistenceBaselineState() }; },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a gated-off tick evaluated nothing — report no coverage so persisted alerts freeze");
   assert.equal(readCalls, 0);
   assert.equal(loadCalls, 0);
 });
@@ -279,10 +281,14 @@ test("computeScheduledJobBaselineCandidates folds counters once and emits an app
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await settleFactStore(paths, tickTs(2));
   const first = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(first.length, 1);
-  assert.equal(first[0].diagnostics.entity_key_hash, expectedHash(KEY_CRON));
+  assert.equal(first.candidates.length, 1);
+  assert.equal(first.candidates[0].diagnostics.entity_key_hash, expectedHash(KEY_CRON));
+  // The candidate's own identity must be reported as evaluated (§8.B: a candidate is an evaluated
+  // entity), and via the SAME domain-separated hash the candidate builder uses.
+  assert.ok(first.evaluatedAlertKeys.includes(first.candidates[0].id));
+  assert.equal(first.candidates[0].id, alertId(SCHEDULED_JOB_APPEARED_RULE_ID, expectedHash(KEY_CRON)));
   const second = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(second.length, 1, "candidate re-emits from the same fact window");
+  assert.equal(second.candidates.length, 1, "candidate re-emits from the same fact window");
   const state = (await loadPersistenceBaselineStore(paths)).state;
   assert.equal(state.appeared_event_count, 1);
   assert.equal(state.skipped_partial_tick_count, 0);
@@ -314,13 +320,14 @@ test("computeScheduledJobBaselineCandidates fails closed end-to-end when facts.j
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await settleFactStore(paths, tickTs(2));
   const clean = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(clean.length, 1, "sanity control: this history really would fire absent the corrupt gate");
+  assert.equal(clean.candidates.length, 1, "sanity control: this history really would fire absent the corrupt gate");
 
   const { factsFile } = resolveFactStorePaths(paths);
   await fs.appendFile(factsFile, "{this is not valid json\n");
 
   const result = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a cold-start / fail-closed tick evaluated nothing — report no coverage so persisted alerts freeze");
 });
 
 test("computeScheduledJobBaselineCandidates fails closed end-to-end when the persisted baseline-store file is corrupt", async () => {
@@ -334,7 +341,8 @@ test("computeScheduledJobBaselineCandidates fails closed end-to-end when the per
   await fs.writeFile(storeFile, "{this is not valid json", { mode: 0o600 });
 
   const result = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a cold-start / fail-closed tick evaluated nothing — report no coverage so persisted alerts freeze");
 });
 
 test("computeScheduledJobBaselineCandidates: corrupt fact-history and genuine cold-start both fail closed to zero claims (fixture-driven)", async () => {
@@ -350,7 +358,8 @@ test("computeScheduledJobBaselineCandidates: corrupt fact-history and genuine co
     loadPersistenceBaselineStore: async () => ({ state: normalizePersistenceBaselineState(), corrupt: false }),
     writePersistenceBaselineStore: async () => {},
   });
-  assert.deepEqual(corrupt, []);
+  assert.deepEqual(corrupt.candidates, []);
+  assert.deepEqual(corrupt.evaluatedAlertKeys, [], "corrupt fact-history is cold-start — no coverage reported");
 
   const coldStart = await computeScheduledJobBaselineCandidates(paths, {
     now: tickTs(2),
@@ -360,7 +369,8 @@ test("computeScheduledJobBaselineCandidates: corrupt fact-history and genuine co
     loadPersistenceBaselineStore: async () => ({ state: normalizePersistenceBaselineState(), corrupt: false }),
     writePersistenceBaselineStore: async () => {},
   });
-  assert.deepEqual(coldStart, []);
+  assert.deepEqual(coldStart.candidates, []);
+  assert.deepEqual(coldStart.evaluatedAlertKeys, [], "genuine cold-start (too little complete history) — no coverage reported");
 });
 
 test("computeScheduledJobBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated appearance from the shortened post-rollback window", async () => {
@@ -383,7 +393,8 @@ test("computeScheduledJobBaselineCandidates (security-sweep F4): an established 
     readFactPoints: async () => intactReadResult(points),
   });
 
-  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.candidates, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a cold-started (rolled-back watermark) tick evaluated nothing — no coverage reported");
   const { state } = await loadPersistenceBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
@@ -407,7 +418,8 @@ test("computeScheduledJobBaselineCandidates: degraded/untrustworthy retained his
     readFactPoints: async () => degradedReadResult(truncatedPoints, tickTs(3)),
   });
 
-  assert.deepEqual(result, [], "untrustworthy retained history must not authorize an appearance claim");
+  assert.deepEqual(result.candidates, [], "untrustworthy retained history must not authorize an appearance claim");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "untrustworthy history is cold-start — no coverage reported");
   const state = (await loadPersistenceBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
 });
@@ -420,18 +432,19 @@ test("computeScheduledJobBaselineCandidates: a corrupt baseline store forces a P
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, flatten([completeTick(tickTs(0)), completeTick(tickTs(1))]), { now: tickTs(1) });
   const control = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(1), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(control, [], "not enough complete history yet -- unrelated to the corruption below");
+  assert.deepEqual(control.candidates, [], "not enough complete history yet -- unrelated to the corruption below");
 
   const { storeFile } = resolvePersistenceBaselineStorePaths(paths);
   await fs.writeFile(storeFile, "{this is not valid json", { mode: 0o600 });
 
   await appendFactPoints(paths, completeTick(tickTs(2), [KEY_TIMER, KEY_CRON]), { now: tickTs(2) });
   const corruptTick = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(corruptTick, [], "corrupt store this tick fails closed");
+  assert.deepEqual(corruptTick.candidates, [], "corrupt store this tick fails closed");
+  assert.deepEqual(corruptTick.evaluatedAlertKeys, [], "corrupt store is cold-start — no coverage reported");
 
   await appendFactPoints(paths, completeTick(tickTs(3), [KEY_TIMER, KEY_CRON]), { now: tickTs(3) });
   const nextTick = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(3), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(nextTick, [], "still zero right after self-heal -- not re-established yet, not 0-then-1");
+  assert.deepEqual(nextTick.candidates, [], "still zero right after self-heal -- not re-established yet, not 0-then-1");
 
   const midState = (await loadPersistenceBaselineStore(paths)).state;
   assert.equal(midState.cold_start_pending, true, "only 1 of 2 required fresh ticks has accumulated since the reset");
@@ -439,14 +452,14 @@ test("computeScheduledJobBaselineCandidates: a corrupt baseline store forces a P
 
   await appendFactPoints(paths, completeTick(tickTs(4), [KEY_TIMER, KEY_CRON]), { now: tickTs(4) });
   const reestablishingTick = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(reestablishingTick, [], "cannot alert in the same breath it regains trust");
+  assert.deepEqual(reestablishingTick.candidates, [], "cannot alert in the same breath it regains trust");
   const reestablishedState = (await loadPersistenceBaselineStore(paths)).state;
   assert.equal(reestablishedState.cold_start_pending, false);
 
   // Positive control: with trust genuinely restored, a real appearance now fires.
   await appendFactPoints(paths, completeTick(tickTs(5), [KEY_TIMER, KEY_CRON, "scheduled_job.9:new-entry.5:cron_d.16:0123456789abcdef"]), { now: tickTs(5) });
   const resumed = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(5), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(resumed.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+  assert.equal(resumed.candidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
 });
 
 test("computeScheduledJobBaselineCandidates with watch.json disabled makes ZERO calls into readFactPoints/loadPersistenceBaselineStore", async () => {
@@ -458,9 +471,105 @@ test("computeScheduledJobBaselineCandidates with watch.json disabled makes ZERO 
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadPersistenceBaselineStore: async () => { loadCalls += 1; return { state: normalizePersistenceBaselineState() }; },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a gated-off tick evaluated nothing — report no coverage so persisted alerts freeze");
   assert.equal(readCalls, 0);
   assert.equal(loadCalls, 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (§8.B/§8.C): evaluatedAlertKeys — the alert identities the
+// detector GENUINELY evaluated this tick (complete+fresh+established data), whether it emitted a
+// candidate or found the entity clear; EXCLUDING anything skipped as cold-start/stale/gated-off.
+// ---------------------------------------------------------------------------------------------
+
+test("computeScheduledJobBaselineCandidates (§8.C GENUINE CLEAR): an entity re-observed in a complete/fresh census is no longer novel — no candidate, but reported in evaluatedAlertKeys so a persisted appeared-alert can recover", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  // KEY_CRON was novel at tick 2; by tick 3 it is present again in a complete/fresh census, so it
+  // is now established (in the historical union) — genuinely evaluated and found clear. KEY_OLD is
+  // present in ticks 0-2 but has left by tick 3 (historical-only) — it pins the UNION reading of
+  // the evaluated set (all complete groups, not just the latest census).
+  const KEY_OLD = buildScheduledJobEntityKey("systemd_timer", "systemd_timers", "old.timer");
+  const points = flatten([
+    completeTick(tickTs(0), [KEY_TIMER, KEY_OLD]),
+    completeTick(tickTs(1), [KEY_TIMER, KEY_OLD]),
+    completeTick(tickTs(2), [KEY_TIMER, KEY_CRON, KEY_OLD]),
+    completeTick(tickTs(3), [KEY_TIMER, KEY_CRON]),
+  ]);
+  await appendFactPoints(paths, points, { now: tickTs(3) });
+  await settleFactStore(paths, tickTs(3));
+  const result = await computeScheduledJobBaselineCandidates(paths, { now: tickTs(3), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
+
+  // No fresh novelty this tick (KEY_CRON is now in prior complete history).
+  assert.deepEqual(result.candidates, []);
+  // ...but the detector held complete/fresh/established census knowledge of it, so it reports the
+  // identity as GENUINELY evaluated → the daemon may recover a persisted scheduled_job.appeared.
+  assert.ok(Array.isArray(result.evaluatedAlertKeys), "converted producer must return an evaluatedAlertKeys array");
+  assert.ok(
+    result.evaluatedAlertKeys.includes(alertId(SCHEDULED_JOB_APPEARED_RULE_ID, expectedHash(KEY_CRON))),
+    "a genuinely re-evaluated, now-cleared identity must be reported so it can recover",
+  );
+  assert.ok(
+    result.evaluatedAlertKeys.includes(alertId(SCHEDULED_JOB_APPEARED_RULE_ID, expectedHash(KEY_TIMER))),
+    "every entity the detector holds complete/fresh census knowledge of this tick is evaluated",
+  );
+  // UNION reading (deviation, pinned for daybreak re-gate): a historical-only entity (present in the
+  // trusted complete window but gone from the latest census) IS reported evaluated. Pre-conversion
+  // the daemon recovered this case on trustworthy history; union preserves that. Latest-only would
+  // newly freeze it — over-freeze, not fabrication-prevention (the tick-3 census is complete/fresh
+  // and positively shows it absent).
+  assert.ok(
+    result.evaluatedAlertKeys.includes(alertId(SCHEDULED_JOB_APPEARED_RULE_ID, expectedHash(KEY_OLD))),
+    "a historical-only entity (in the trusted window, absent from latest) is evaluated under the union reading",
+  );
+});
+
+test("computeScheduledJobBaselineCandidates (§8.C UNEVALUATED): cold-start (corrupt store) and stale-census ticks report NO coverage — a persisted appeared-alert freezes, never fabricated-recovers", async () => {
+  // (a) cold-start via a corrupt persisted store: the whole family is unevaluable this tick.
+  const coldPaths = await tempPaths();
+  await writeWatchConfig(coldPaths, { enabled: true });
+  await appendFactPoints(coldPaths, flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [KEY_TIMER, KEY_CRON]),
+    completeTick(tickTs(3), [KEY_TIMER, KEY_CRON]),
+  ]), { now: tickTs(3) });
+  const { dir, storeFile } = resolvePersistenceBaselineStorePaths(coldPaths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(storeFile, "{not valid json", { mode: 0o600 });
+  const cold = await computeScheduledJobBaselineCandidates(coldPaths, { now: tickTs(3), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
+  assert.deepEqual(cold.candidates, []);
+  assert.ok(Array.isArray(cold.evaluatedAlertKeys), "converted producer must return an evaluatedAlertKeys array");
+  assert.deepEqual(cold.evaluatedAlertKeys, [], "a cold-start tick evaluated nothing — report no coverage so persisted alerts freeze");
+
+  // (b) established store, intact/trusted history, but the freshest complete census is STALE
+  // (older than activeFreshnessMs). cold_start_pending stays false — factHistoryTrustworthy does
+  // NOT test census freshness — yet the detector could not evaluate, so it must report nothing.
+  const stalePaths = await tempPaths();
+  await writeWatchConfig(stalePaths, { enabled: true });
+  await writePersistenceBaselineStore(stalePaths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  await appendFactPoints(stalePaths, flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [KEY_TIMER, KEY_CRON]),
+    completeTick(tickTs(3), [KEY_TIMER, KEY_CRON]),
+  ]), { now: tickTs(3) });
+  await settleFactStore(stalePaths, tickTs(3));
+  // now is 2h past the freshest complete census; freshness window is 1h → stale.
+  const stale = await computeScheduledJobBaselineCandidates(stalePaths, {
+    now: new Date(Date.parse(tickTs(3)) + 2 * HOUR_MS).toISOString(),
+    minHistoryTickCount: 2,
+    activeFreshnessMs: HOUR_MS,
+  });
+  assert.deepEqual(stale.candidates, []);
+  assert.ok(Array.isArray(stale.evaluatedAlertKeys), "converted producer must return an evaluatedAlertKeys array");
+  assert.deepEqual(stale.evaluatedAlertKeys, [], "a stale-census tick evaluated nothing fresh — report no coverage so persisted alerts freeze");
+  // Discriminator: this sub-case must exercise the FRESHNESS gate, not cold-start (which (a) already
+  // covers). factHistoryTrustworthy does not test census freshness, so the store stays established.
+  const staleState = (await loadPersistenceBaselineStore(stalePaths)).state;
+  assert.equal(staleState.cold_start_pending, false, "staleness alone — NOT cold-start — withheld coverage (this proves the freshness gate is what fired)");
 });
 
 // P9 fail-closed namespace pins (classifyAlertNamespace / deterministic-delivery allowlist /

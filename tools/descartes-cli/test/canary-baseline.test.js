@@ -14,6 +14,7 @@ import {
   resolveCanaryBaselineStorePaths,
   writeCanaryBaselineStore,
 } from "../src/canary-baseline.js";
+import { alertId } from "../src/alert-store.js";
 import { MAX_CANARIES } from "../src/tools/canary.js";
 
 const ts = (day) => `2026-08-${String(day).padStart(2, "0")}T00:00:00.000Z`;
@@ -25,6 +26,19 @@ function identityFingerprint(canaryPath, sentinelPath) {
     .update([CANARY_IDENTITY_FINGERPRINT_DOMAIN, canaryPath, sentinelPath ?? ""].join(CANARY_IDENTITY_FINGERPRINT_SEPARATOR))
     .digest("hex")
     .slice(0, 16);
+}
+
+// Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+// §8): re-derive the exact alert identities computeCanaryBaselineCandidates reports in
+// `evaluatedAlertKeys`, byte-for-byte matching canary-baseline.js's own hashCanaryId /
+// hashCanaryTamperKey + alertId keying, so the coverage tests below assert against the real ids.
+function trippedKey(canaryId) {
+  const fingerprint = createHash("sha256").update(`canary.tripped:${canaryId}`).digest("hex").slice(0, 16);
+  return alertId("canary.tripped", fingerprint);
+}
+function tamperedKey(key) {
+  const fingerprint = createHash("sha256").update(`canary.tampered:${key}`).digest("hex").slice(0, 16);
+  return alertId("canary.tampered", fingerprint);
 }
 
 const CURRENT_CANARY_PATH = "/fixture/credential";
@@ -324,7 +338,9 @@ test("disabled learned config short-circuits before fact or store I/O", async ()
     readFactPoints: async () => { reads += 1; return { points: [] }; },
     loadCanaryBaselineStore: async () => { stores += 1; return { state: {} }; },
   });
-  assert.deepEqual(result, []);
+  // Recovery coverage (§8.C): a tier-off tick short-circuits before evaluating anything, so it
+  // reports NO coverage (empty evaluatedAlertKeys) -- every owned canary.* identity freezes.
+  assert.deepEqual(result, { candidates: [], evaluatedAlertKeys: [] });
   assert.equal(reads, 0);
   assert.equal(stores, 0);
 });
@@ -349,8 +365,8 @@ test("compute folds counters once and rebuilds candidates on repeated calls", as
     loadCanaryManifest: async () => ({ canaries: [{ id: "credential" }] }),
   };
   try {
-    const first = await computeCanaryBaselineCandidates(paths, options);
-    const second = await computeCanaryBaselineCandidates(paths, options);
+    const { candidates: first } = await computeCanaryBaselineCandidates(paths, options);
+    const { candidates: second } = await computeCanaryBaselineCandidates(paths, options);
     assert.equal(first.length, 1);
     assert.equal(second.length, 1);
     assert.equal(writes, 1);
@@ -377,7 +393,7 @@ test("A1: a canary clean-deleted from the current manifest still fires its genui
   // exercising the manifest gate itself, not the (separately-covered) cold-start lockout.
   const state = establishedCanaryState();
   try {
-    const stillPresent = await computeCanaryBaselineCandidates(paths, {
+    const { candidates: stillPresent } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 3,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -391,7 +407,7 @@ test("A1: a canary clean-deleted from the current manifest still fires its genui
     // Same genuine trip-shaped facts, but the manifest no longer lists "credential" —
     // simulating canaries.json having the entry cleanly removed (`{canaries:[]}`, read_ok:true,
     // no invalid_entries -- a legitimate decommission, not a corrupt/unreadable manifest).
-    const decommissioned = await computeCanaryBaselineCandidates(paths, {
+    const { candidates: decommissioned } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 3,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -421,7 +437,7 @@ test("P1 fix: a corrupt/unreadable manifest (read_ok:false) does NOT suppress ca
     // FAILURE (canary-manifest.js's P1 fix): canaries:[] with read_ok:false, NOT the
     // authoritative-empty-manifest shape ({ canaries: [] } alone / read_ok:true) a legitimate
     // decommission produces.
-    const stillFires = await computeCanaryBaselineCandidates(paths, {
+    const { candidates: stillFires } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 3,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -455,7 +471,7 @@ test("P1 fix, end-to-end with the real loadCanaryManifest: a corrupted canaries.
     // An attacker (or disk corruption) truncates/mangles canaries.json -- no fs mocking, the real
     // loadCanaryManifest reads this actual file and must report read_ok:false for it.
     await fs.writeFile(path.join(configRoot, "canaries.json"), "{not json");
-    const candidates = await computeCanaryBaselineCandidates(paths, {
+    const { candidates } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 3,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -489,7 +505,7 @@ test("canary vanished: a canary still listed in the manifest that disappears fro
     // ordinary evidence, not a this-tick read failure), so the tick is still "complete".
     census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -528,7 +544,7 @@ test("[round-2 fix] a canary isolated past the MAX_CANARIES cap raises canary.ta
     // force the census to "partial".
     census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -561,7 +577,7 @@ test("[round-2 fix] entity_key_collision/empty_entity_key entries raise their ow
     // be on atime for detectCanaryTrips to fire.
     presence(3, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY, atime: "200" }), census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -607,7 +623,7 @@ test("[round-3 fix] an established canary's genuine trip survives a colliding at
     // manifest entirely.
     presence(3, "prod_key", { atime: "200" }), census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -645,7 +661,7 @@ test("[round-3 fix] an established canary's genuine trip survives being flooded 
     presence(2, "prod_key"), census(2),
     presence(3, "prod_key", { atime: "200" }), census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -694,7 +710,7 @@ test("[round-3 fix] end-to-end with the real loadCanaryManifest: a colliding att
         { id: "prod/key", kind: "credential-file", path: "/fixture/prod-key-attacker", watch: ["atime"] },
       ],
     }));
-    const candidates = await computeCanaryBaselineCandidates(paths, {
+    const { candidates } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 2,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -734,7 +750,7 @@ test("[round-3 fix] end-to-end with the real loadCanaryManifest: manifest-order 
       schema_version: 1,
       canaries: [...junk, { id: "prod_key", kind: "credential-file", path: "/fixture/prod-key", watch: ["atime"] }],
     }));
-    const candidates = await computeCanaryBaselineCandidates(paths, {
+    const { candidates } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 2,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -791,7 +807,7 @@ test("[round-4 fix] end-to-end with the real loadCanaryManifest: an established 
       schema_version: 1,
       canaries: [{ id: "prod_key", kind: "credential-file", watch: ["atime"] }],
     }));
-    const candidates = await computeCanaryBaselineCandidates(paths, {
+    const { candidates } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 2,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -836,7 +852,7 @@ test("[round-4 fix] negative control: an entry with no usable declared id stays 
       schema_version: 1,
       canaries: [{ id: "////", kind: "credential-file", watch: ["atime"] }], // no `path`
     }));
-    const candidates = await computeCanaryBaselineCandidates(paths, {
+    const { candidates } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 2,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -857,7 +873,7 @@ test("legit decommission: a canary removed from the manifest AND gone produces N
     presence(2, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
     census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -876,7 +892,7 @@ test("a canary that never reached the established sighting-count threshold does 
     presence(1, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
     census(2),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(2),
     establishedMinCensusCount: 3,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -912,7 +928,7 @@ test("FIX-A parity (i): an id-reuse / path-edit whose NEW identity never reached
     // identity that was never actually established.
     census(4),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(4),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -932,7 +948,7 @@ test("FIX-A parity (ii): a genuinely-established, UNCHANGED-identity canary that
     // Day 4: the SAME identity that was genuinely established over days 1-3 is now genuinely gone.
     census(4),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(4),
     establishedMinCensusCount: 3,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -956,7 +972,7 @@ test("FIX-A parity (iii): id reuse for an already-absent new path with zero obse
     // The manifest now points at a different path, but that new identity was never observed.
     census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -971,7 +987,7 @@ test("FIX-A parity (iii): id reuse for an already-absent new path with zero obse
 // MANIFEST TAMPER ---------------------------------------------------------------------------
 
 test("manifest tamper: a successfully-read, genuinely empty manifest (legit decommission/never-configured) raises NO tamper alert", async () => {
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(1),
     loadLearnedConfig: async () => ({ enabled: true }),
     readFactPoints: async () => ({ points: [] }),
@@ -983,7 +999,7 @@ test("manifest tamper: a successfully-read, genuinely empty manifest (legit deco
 });
 
 test("manifest tamper: a schema-invalid manifest (read_ok:false) raises canary.tampered(manifest_unreadable)", async () => {
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(1),
     loadLearnedConfig: async () => ({ enabled: true }),
     readFactPoints: async () => ({ points: [] }),
@@ -1004,7 +1020,7 @@ test("baseline-store failure: a throwing loadCanaryBaselineStore never aborts th
     presence(1), census(1), presence(2), census(2), presence(3, "credential", { atime: "101" }), census(3),
   ];
   let writeCalled = false;
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 3,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -1029,7 +1045,7 @@ test("baseline-store failure: a throwing writeCanaryBaselineStore never aborts t
   const points = [
     presence(1), census(1), presence(2), census(2), presence(3, "credential", { atime: "101" }), census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 3,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -1050,7 +1066,7 @@ test("baseline-store failure: a corrupt-but-non-throwing store load (existing de
   const points = [
     presence(1), census(1), presence(2), census(2), presence(3, "credential", { atime: "101" }), census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 3,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -1069,7 +1085,7 @@ test("baseline-store deletion does not raise a false tamper and does not disable
   const points = [
     presence(1), census(1), presence(2), census(2), presence(3, "credential", { atime: "101" }), census(3),
   ];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(3),
     establishedMinCensusCount: 3,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -1085,7 +1101,7 @@ test("baseline-store deletion does not raise a false tamper and does not disable
 test("legit first run: configured canaries with a genuinely absent baseline store and no facts produce no alert", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-canary-baseline-"));
   try {
-    const candidates = await computeCanaryBaselineCandidates({ stateDir: root }, {
+    const { candidates } = await computeCanaryBaselineCandidates({ stateDir: root }, {
       now: ts(1),
       loadLearnedConfig: async () => ({ enabled: true }),
       readFactPoints: async () => intactReadResult([]),
@@ -1099,7 +1115,7 @@ test("legit first run: configured canaries with a genuinely absent baseline stor
 
 test("legit decommission with retained facts: an absent baseline store and removed canary produce no alert", async () => {
   const points = [presence(1), census(1), presence(2), census(2)];
-  const candidates = await computeCanaryBaselineCandidates({}, {
+  const { candidates } = await computeCanaryBaselineCandidates({}, {
     now: ts(2),
     establishedMinCensusCount: 2,
     loadLearnedConfig: async () => ({ enabled: true }),
@@ -1126,7 +1142,7 @@ test("baseline-store failure, end-to-end with the real loadCanaryBaselineStore: 
     // Directory trick (mirrors canary-manifest.test.js's own pattern): making the store path
     // itself a directory forces a real, non-ENOENT fs.readFile failure regardless of uid.
     await fs.mkdir(storeFile, { recursive: true });
-    const candidates = await computeCanaryBaselineCandidates(paths, {
+    const { candidates } = await computeCanaryBaselineCandidates(paths, {
       now: ts(3),
       establishedMinCensusCount: 3,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -1203,7 +1219,7 @@ test("computeCanaryBaselineCandidates: degraded truncated history does not suppr
       presence(2, "credential", { mtime: "999", watch: "mtime" }), census(2), // would trip if trusted
     ];
 
-    const result = await computeCanaryBaselineCandidates(paths, {
+    const { candidates: result } = await computeCanaryBaselineCandidates(paths, {
       now: ts(2),
       establishedMinCensusCount: 2,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -1230,7 +1246,7 @@ test("computeCanaryBaselineCandidates: intact history control still fires a real
       presence(2, "credential", { mtime: "999", watch: "mtime" }), census(2),
     ];
 
-    const result = await computeCanaryBaselineCandidates(paths, {
+    const { candidates: result } = await computeCanaryBaselineCandidates(paths, {
       now: ts(2),
       establishedMinCensusCount: 2,
       loadLearnedConfig: async () => ({ enabled: true }),
@@ -1265,20 +1281,20 @@ test("computeCanaryBaselineCandidates: one transient fact-history loss recovers 
 
     // Loss tick: credential's mtime would change here (100 -> 999) -- would trip if trusted.
     points = [...points, presence(2, "credential", { mtime: "999", watch: "mtime" }), census(2)];
-    const lossTick = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(2) });
+    const { candidates: lossTick } = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(2) });
     assert.equal(lossTick.filter((candidate) => candidate.rule_id === "canary.tripped").length, 1);
 
     readResult = intactReadResult([]);
     points = [...points, presence(3, "credential", { mtime: "999", watch: "mtime" }), census(3)]; // 1st re-accum tick
-    assert.deepEqual(await computeCanaryBaselineCandidates(paths, { ...options, now: ts(3) }), []);
+    assert.deepEqual((await computeCanaryBaselineCandidates(paths, { ...options, now: ts(3) })).candidates, []);
 
     points = [...points, presence(4, "credential", { mtime: "999", watch: "mtime" }), census(4)]; // 2nd re-accum tick
-    assert.deepEqual(await computeCanaryBaselineCandidates(paths, { ...options, now: ts(4) }), []);
+    assert.deepEqual((await computeCanaryBaselineCandidates(paths, { ...options, now: ts(4) })).candidates, []);
     assert.equal((await loadCanaryBaselineStore(paths)).state.cold_start_pending, false);
 
     // A genuinely new mtime change after re-establishment must trip normally.
     points = [...points, presence(5, "credential", { mtime: "12345", watch: "mtime" }), census(5)];
-    const resumed = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(5) });
+    const { candidates: resumed } = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(5) });
     const trips = resumed.filter((candidate) => candidate.rule_id === "canary.tripped");
     assert.equal(trips.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
   } finally {
@@ -1306,14 +1322,14 @@ test("computeCanaryBaselineCandidates: positive trips remain observable while lo
       loadCanaryManifest: async () => ({ canaries: [{ id: "credential" }], read_ok: true }),
     };
 
-    const lossTick = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(3) });
+    const { candidates: lossTick } = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(3) });
     assert.equal(lossTick.filter((candidate) => candidate.rule_id === "canary.tripped").length, 1);
 
     // Day 4: a GENUINE new mtime change (999 -> 1234) lands on the very tick that qualifies as the
     // first re-accumulation tick. Positive trip evidence is emitted even while that state changes.
     points = [...points, presence(4, "credential", { mtime: "1234", watch: "mtime" }), census(4)];
     readResult = intactReadResult([]);
-    const recovered = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(4) });
+    const { candidates: recovered } = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(4) });
     assert.equal(recovered.filter((candidate) => candidate.rule_id === "canary.tripped").length, 1);
     assert.equal((await loadCanaryBaselineStore(paths)).state.cold_start_pending, false);
   } finally {
@@ -1345,7 +1361,7 @@ test("migration: a pre-Slice-7 store with no cold_start_* fields at all cold-sta
     // First read post-migration: even against a fully intact, loss-free fact-history, the missing
     // cold_start_* fields default to pending (fail-closed) -- an established-looking store must not
     // be trusted just because it parses. A bounded, one-time cold-start is required.
-    const firstRead = await computeCanaryBaselineCandidates(paths, { ...baseOptions, now: ts(1), readFactPoints: async () => intactReadResult(points) });
+    const { candidates: firstRead } = await computeCanaryBaselineCandidates(paths, { ...baseOptions, now: ts(1), readFactPoints: async () => intactReadResult(points) });
     assert.deepEqual(firstRead, []);
     const afterFirst = (await loadCanaryBaselineStore(paths)).state;
     assert.equal(afterFirst.cold_start_pending, true);
@@ -1370,7 +1386,7 @@ test("migration: a pre-Slice-7 store with no cold_start_* fields at all cold-sta
     // And canary.tripped genuinely resumes afterward.
     const resumeDay = 2 + minHistoryTickCount;
     points = [...points, presence(resumeDay, "credential", { mtime: "999", watch: "mtime" }), census(resumeDay)];
-    const resumed = await computeCanaryBaselineCandidates(paths, { ...baseOptions, now: ts(resumeDay), readFactPoints: async () => intactReadResult(points) });
+    const { candidates: resumed } = await computeCanaryBaselineCandidates(paths, { ...baseOptions, now: ts(resumeDay), readFactPoints: async () => intactReadResult(points) });
     assert.equal(resumed.filter((candidate) => candidate.rule_id === "canary.tripped").length, 1);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
@@ -1410,14 +1426,14 @@ test("computeCanaryBaselineCandidates: rollback repairs a future anchor, a futur
     for (let day = 1; day <= 7; day += 1) points.push(presence(day, "credential", { mtime: "100", watch: "mtime" }), census(day));
     points.push(presence(21, "credential", { mtime: "100", watch: "mtime" }), census(21));
 
-    const recoveredTick = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(7) });
+    const { candidates: recoveredTick } = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(7) });
     assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
     const state = (await loadCanaryBaselineStore(paths)).state;
     assert.equal(state.cold_start_pending, false);
     assert.equal(state.last_folded_ts, ts(7), "future facts must not advance the folded watermark");
 
     points = [...points, presence(8, "credential", { mtime: "999", watch: "mtime" }), census(8)];
-    const resumed = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(8) });
+    const { candidates: resumed } = await computeCanaryBaselineCandidates(paths, { ...options, now: ts(8) });
     assert.equal(
       resumed.some((candidate) => candidate.rule_id === "canary.tripped"),
       true,
@@ -1426,4 +1442,89 @@ test("computeCanaryBaselineCandidates: rollback repairs a future anchor, a futur
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+// §8.B/§8.C): computeCanaryBaselineCandidates now returns { candidates, evaluatedAlertKeys }.
+// evaluatedAlertKeys is the set of alertId(rule_id, fingerprint) the detector GENUINELY EVALUATED
+// this tick -- every identity it had complete/fresh/established data for, whether it produced a
+// candidate OR found it clear -- EXCLUDING identities it skipped as cold-start/stale/gated-off.
+// The daemon recovers a persisted alert ONLY if its identity is reported here, and freezes any it
+// is not (never fabricating a recovery). These two tests pin the load-bearing distinction between
+// "returned no candidate because the entity is genuinely CLEAR" (report -> recoverable) and
+// "returned no candidate because the entity was UNEVALUATED" (omit -> frozen).
+// ---------------------------------------------------------------------------------------------
+
+test("coverage (genuine clear): an established canary evaluated with no anomaly reports its tripped, vanished, and manifest identities so a persisted alert can recover", async () => {
+  // credential is established (>= 2 complete sightings), identity-stable, present in both complete
+  // ticks, watch=atime -- but atime never moves, so there is NO trip and NO vanish. It is a
+  // GENUINE clear on every family the detector owns for it: the detector walked it and found it
+  // clean. Its identities must therefore appear in evaluatedAlertKeys.
+  const points = [
+    presence(1, "credential", { atime: "100", watch: "atime", identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
+    presence(2, "credential", { atime: "100", watch: "atime", identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
+  ];
+  const result = await computeCanaryBaselineCandidates({}, {
+    now: ts(2),
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    loadCanaryManifest: async () => ({ canaries: [manifestCanary()], read_ok: true }),
+  });
+  assert.ok(Array.isArray(result.evaluatedAlertKeys), "the converted producer must return evaluatedAlertKeys as an array");
+  assert.deepEqual(result.candidates, [], "a genuine clear produces no candidate at all");
+  assert.ok(
+    result.evaluatedAlertKeys.includes(trippedKey("credential")),
+    "a walked-but-clear canary must report its canary.tripped identity so a persisted trip alert can recover",
+  );
+  assert.ok(
+    result.evaluatedAlertKeys.includes(tamperedKey("canary_vanished:credential")),
+    "a present, established, manifest-tracked canary is an evaluated-clear on canary_vanished and must report that identity",
+  );
+  assert.ok(
+    result.evaluatedAlertKeys.includes(tamperedKey("manifest_unreadable")),
+    "a readable manifest is an evaluated-clear on the manifest_unreadable singleton and must report it",
+  );
+});
+
+test("coverage (unevaluated: stale census): a stale census reports NEITHER the tripped NOR the vanished identity, so a persisted alert freezes instead of fabricated-recovering", async () => {
+  // Same established, non-anomalous canary as the genuine-clear test above -- but the latest
+  // complete census is far older than the freshness window. detectCanaryTrips / detectCanaryVanished
+  // both short-circuit on staleness and evaluate NOTHING, so returning "no candidate" here is
+  // "could not evaluate", not "clear". Its per-canary identities must be ABSENT from
+  // evaluatedAlertKeys (a persisted alert must freeze, never fabricated-recover).
+  const points = [
+    presence(1, "credential", { atime: "100", watch: "atime", identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
+    presence(2, "credential", { atime: "100", watch: "atime", identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
+  ];
+  const result = await computeCanaryBaselineCandidates({}, {
+    now: new Date(Date.parse(ts(2)) + 60_000).toISOString(),
+    activeFreshnessMs: 1,
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    loadCanaryManifest: async () => ({ canaries: [manifestCanary()], read_ok: true }),
+  });
+  assert.ok(Array.isArray(result.evaluatedAlertKeys), "the converted producer must return evaluatedAlertKeys as an array");
+  assert.ok(
+    !result.evaluatedAlertKeys.includes(trippedKey("credential")),
+    "a stale census evaluated the tripped condition for NO canary -- its identity must be frozen, not reported clear",
+  );
+  assert.ok(
+    !result.evaluatedAlertKeys.includes(tamperedKey("canary_vanished:credential")),
+    "a stale census evaluated the vanished condition for NO canary -- its identity must be frozen, not reported clear",
+  );
+  // Stands alone (not just as the negative of the genuine-clear test): the fn DID run past the
+  // tier gate, so the unconditional manifest_unreadable singleton IS reported -- proving the
+  // tripped/vanished omission above is the TARGETED effect of the stale-census gate, not a blanket
+  // empty coverage from some unrelated failure.
+  assert.ok(
+    result.evaluatedAlertKeys.includes(tamperedKey("manifest_unreadable")),
+    "past the tier gate, the unconditional manifest_unreadable singleton must still be reported -- the freeze is targeted, not blanket",
+  );
 });

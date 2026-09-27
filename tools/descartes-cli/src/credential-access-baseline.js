@@ -159,11 +159,21 @@ export async function writeCredentialAccessBaselineStore(descartesPaths, state) 
  * `status: "absent"`/`"unreadable"` entries are skipped entirely: no comparison, no baseline
  * update (degrade-not-fabricate — an unobservable path carries no new information in either
  * direction, so its last-known-good baseline is left untouched rather than reset or guessed at).
+ *
+ * Detector-reported recovery coverage (plan 2026-09-20 §8.B/§8.C — credential recipe): also returns
+ * `evaluatedPathHashes`, the `path_hash`es this detector GENUINELY evaluated this tick — exactly the
+ * `if (previous)` branch: `status === "ok"` AND a prior baseline existed, WHETHER OR NOT a trip
+ * fired. Those are the paths a two-snapshot diff actually compared (produced a candidate OR found
+ * clear). First-sight seeds (no prior baseline — the per-path cold-start analogue) and skipped
+ * `absent`/`unreadable`/invalid entries are NOT evaluated and are omitted, so the daemon freezes any
+ * persisted alert for them rather than fabricating a recovery. Per-fingerprint (C1): one unevaluable
+ * path never freezes the others.
  */
 export function detectCredentialAccess(previousEntries = {}, latestSnapshot = [], options = {}) {
   const safePrevious = previousEntries && typeof previousEntries === "object" && !Array.isArray(previousEntries) ? previousEntries : {};
   const nextEntries = { ...safePrevious };
   const findings = [];
+  const evaluatedPathHashes = [];
   for (const entry of latestSnapshot ?? []) {
     if (!isValidCredentialSnapshotEntry(entry)) continue;
     if (entry.status !== "ok") continue;
@@ -171,6 +181,9 @@ export function detectCredentialAccess(previousEntries = {}, latestSnapshot = []
     const latest = { atime: entry.atime, mtime: entry.mtime, ino: entry.ino };
     const previous = safePrevious[pathHash];
     if (previous) {
+      // A prior baseline existed -> this path was genuinely diffed this tick (evaluated), whether or
+      // not it tripped. Report it for recovery coverage.
+      evaluatedPathHashes.push(pathHash);
       const tripReason = computeStatDiffTripReason(previous, latest, Array.isArray(entry.watch) ? entry.watch : []);
       if (tripReason) {
         findings.push({ category: entry.category, path_hash: pathHash, trip_reason: tripReason });
@@ -178,7 +191,7 @@ export function detectCredentialAccess(previousEntries = {}, latestSnapshot = []
     }
     nextEntries[pathHash] = latest;
   }
-  return { findings, nextEntries };
+  return { findings, nextEntries, evaluatedPathHashes };
 }
 
 function hashCredentialAccessKey(pathHash) {
@@ -278,6 +291,16 @@ const defaultCredentialCollectionBreaker = createCredentialCollectionBreaker();
  * structural evidence only ever reaches fact-history via a translator this module deliberately
  * does not have). Stated cadence: per-fast-tick `lstat` over the fixed v1 path list (~8 syscalls)
  * — cheap and acceptable at the fast-tick rate.
+ *
+ * Detector-reported recovery coverage (plan 2026-09-20 §8.B/§8.C): the NORMAL path returns
+ * `{ candidates, evaluatedAlertKeys }`, where `evaluatedAlertKeys` is `alertId(rule_id, fingerprint)`
+ * for every watched path genuinely diffed this tick (see `detectCredentialAccess`'s
+ * `evaluatedPathHashes`). The four whole-fn short-circuits — gate/kill-switch off, circuit-breaker
+ * open, collection timeout, and store-LOAD failure — degrade ALL paths at once and return a BARE
+ * `[]` (§8.C credential recipe: "map to the bare-array fail-safe"), so the daemon reports no coverage
+ * and freezes every persisted credential.access alert this tick (never fabricates a recovery). A
+ * store-WRITE failure is NOT a short-circuit: the diff already happened, so coverage is still
+ * reported and the already-computed finding still fires.
  */
 export async function computeCredentialAccessCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
@@ -319,7 +342,7 @@ export async function computeCredentialAccessCandidates(descartesPaths, options 
     return [];
   }
 
-  const { findings, nextEntries } = detectCredentialAccess(previousEntries, latestSnapshot, options);
+  const { findings, nextEntries, evaluatedPathHashes } = detectCredentialAccess(previousEntries, latestSnapshot, options);
 
   // The positive finding above is already computed -- a store-write failure must not discard it.
   const writeStore = options.writeCredentialAccessBaselineStore ?? writeCredentialAccessBaselineStore;
@@ -330,7 +353,12 @@ export async function computeCredentialAccessCandidates(descartesPaths, options 
     // alertId dedup absorbs the re-fire once the store becomes writable again.
   }
 
+  // Detector-reported recovery coverage (§8.B/§8.C): the alert identities genuinely evaluated this
+  // tick — one per watched path that had a prior baseline to diff against (whether it tripped or was
+  // found clear). A store-write failure above does NOT drop coverage: the diff already happened.
+  const evaluatedAlertKeys = evaluatedPathHashes.map((pathHash) => alertId(CREDENTIAL_ACCESS_RULE_ID, hashCredentialAccessKey(pathHash)));
+
   // Positive direct evidence (see the module-header GATE DECISION) — emitted unconditionally,
   // never suppressed by any completeness/cold-start lockout or a failed store I/O step.
-  return buildCredentialAccessCandidates(findings);
+  return { candidates: buildCredentialAccessCandidates(findings), evaluatedAlertKeys };
 }

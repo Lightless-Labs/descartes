@@ -17,6 +17,7 @@ import {
   CORRELATION_RULE_ID,
   DEFAULT_CORRELATION_LOOKBACK_MS,
   DEFAULT_CORRELATION_WINDOW_MS,
+  assessPeerStreamReadiness,
   buildCorrelationCandidate,
   computeCorrelationCandidates,
   findKillSideAnchors,
@@ -113,6 +114,26 @@ function killSideAlertRecord(ruleId, firstSeenTs, { severity = "critical", finge
   };
 }
 
+// A persisted correlation.login_kill_proximity alert row (as if emitted on a prior tick), for the
+// detector-reported recovery-coverage tests. Its fingerprint is `${anchorFingerprint}__${peerKey}`
+// exactly as buildCorrelationCandidate constructs it, so the per-anchor-prefix coverage logic keys
+// on it correctly.
+function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active" } = {}) {
+  return {
+    id: alertId(CORRELATION_RULE_ID, fingerprint),
+    rule_id: CORRELATION_RULE_ID,
+    fingerprint,
+    status,
+    severity: "warning",
+    title: "Correlated peer login near session.count_drop",
+    summary: "test fixture persisted correlation alert",
+    evidence_refs: ["session-baseline", "peer-presence"],
+    first_seen: firstSeenTs,
+    last_seen: firstSeenTs,
+    diagnostics: {},
+  };
+}
+
 async function seed(paths, { alerts = [], factPoints = [], now, learnedEnabled = true } = {}) {
   if (learnedEnabled) await writeLearnedConfig(paths, { enabled: true });
   if (alerts.length > 0) await writeAlertRecords(paths, alerts);
@@ -188,7 +209,7 @@ test("Slice 6: gated by learned.json BEFORE any I/O — disabled/default config 
       return { points: [], corrupt_count: 0 };
     },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result, { candidates: [], evaluatedAlertKeys: [] });
   assert.equal(readAlertsCalled, false, "readAlertRecords must never be called while learned.json is disabled");
   assert.equal(readFactsCalled, false, "readFactPoints must never be called while learned.json is disabled");
 });
@@ -197,7 +218,7 @@ test("Slice 6 day-1 no-storm: empty alert-history and empty fact-history -> [], 
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const result = await computeCorrelationCandidates(paths, { now: dayTs(0) });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result, { candidates: [], evaluatedAlertKeys: [] });
 });
 
 test("Slice 6 positive fixture (motivating incident shape): odd-hour, low-prior-tick peer within window of a session.count_drop anchor fires exactly one correlation candidate, with severity capped at warning even for a CRITICAL anchor", async () => {
@@ -222,7 +243,7 @@ test("Slice 6 positive fixture (motivating incident shape): odd-hour, low-prior-
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.equal(candidates.length, 1);
   const candidate = candidates[0];
   assert.equal(candidate.rule_id, CORRELATION_RULE_ID);
@@ -267,7 +288,7 @@ test("Slice 8: degraded, unknown, or this-tick-corrupt fact-history suppresses a
       peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
     ];
 
-    const candidates = await computeCorrelationCandidates(paths, {
+    const { candidates } = await computeCorrelationCandidates(paths, {
       now,
       readFactPoints: async () => ({ ...readResultTemplate, points }),
     });
@@ -287,7 +308,7 @@ test("Slice 8: an intact fact-history control still fires the qualifying correla
     peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
   ];
 
-  const candidates = await computeCorrelationCandidates(paths, {
+  const { candidates } = await computeCorrelationCandidates(paths, {
     now,
     readFactPoints: async () => completeFactReadResult(points),
   });
@@ -307,7 +328,7 @@ test("Slice 8: a future completeness loss timestamp is outside nowMs and does no
     peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
   ];
 
-  const candidates = await computeCorrelationCandidates(paths, {
+  const { candidates } = await computeCorrelationCandidates(paths, {
     now,
     readFactPoints: async () => completeFactReadResult(points, {
       last_corrupt_ts: dayTs(0, 4),
@@ -325,7 +346,7 @@ test("Slice 8: intact history does not defeat the existing cold-start gate", asy
   });
   const points = [peerPoint(anchorTs, "peer.wireguard.9999999999999999")];
 
-  const candidates = await computeCorrelationCandidates(paths, {
+  const { candidates } = await computeCorrelationCandidates(paths, {
     now,
     readFactPoints: async () => completeFactReadResult(points),
   });
@@ -347,7 +368,7 @@ test("Slice 6 positive fixture, warning-anchor variant: severity stays capped at
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].severity, "warning");
   assert.equal(candidates[0].diagnostics.anchor_severity, "warning");
@@ -368,7 +389,7 @@ test("Slice 6: a session.churn anchor also correlates, with its own entity-hash 
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].diagnostics.kill_rule_id, SESSION_CHURN_RULE_ID);
   assert.equal(candidates[0].diagnostics.anchor_fingerprint, "session.tmux.aaaaaaaaaaaaaaaa");
@@ -388,7 +409,7 @@ test("Slice 6 distant-in-time non-fire: a peer observation outside DEFAULT_CORRE
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, []);
 });
 
@@ -405,7 +426,7 @@ test("Slice 6 not-odd-hour non-fire: an in-window, low-novelty peer whose login_
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, []);
 });
 
@@ -422,7 +443,7 @@ test("Slice 6 must-fix 6: login_hour_bucket === 'unknown' never qualifies as odd
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, []);
   assert.equal(CORRELATION_ODD_HOURS.has("unknown"), false);
 });
@@ -439,7 +460,7 @@ test("Slice 6 not-novel non-fire: a peer with many prior ticks (> CORRELATION_NO
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, []);
 });
 
@@ -456,7 +477,7 @@ test("Slice 6 must-fix 4 week-1 cold-start no-fire: an otherwise-fully-qualifyin
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, [], "a young peer.presence stream must gate out every peer, not just the flagged one");
 });
 
@@ -474,7 +495,7 @@ test("Slice 6 must-fix 5 overflow-degraded-window no-fire: an otherwise-fully-qu
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, []);
 });
 
@@ -499,7 +520,7 @@ test("Slice 4c regression (must-fix 4): marker-only (zero-peer) census ticks spa
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(
     candidates,
     [],
@@ -526,7 +547,7 @@ test("Slice 4c regression positive control: a real, established (post-cold-start
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].diagnostics.peer_entity_key, "peer.wireguard.9999999999999999");
 });
@@ -547,7 +568,7 @@ test("Slice 6 ranking/pool-size fixture: two qualifying peers for the same ancho
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].diagnostics.peer_entity_key, "peer.wireguard.bbbbbbbbbbbbbbbb", "the closest-in-time qualifying peer must win");
   assert.equal(candidates[0].diagnostics.candidate_pool_size, 2);
@@ -586,7 +607,7 @@ test("Slice 6 lookback-bound / old-history no-storm: several weeks of old, other
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.deepEqual(candidates, [], "anchors weeks outside the lookback bound must not fire on the very first call");
 });
 
@@ -605,7 +626,7 @@ test("Slice 6 recovery: a candidate that fired on tick N is absent on tick N+1 o
     now: nowTick1,
   });
 
-  const tick1Candidates = await computeCorrelationCandidates(paths, { now: nowTick1 });
+  const { candidates: tick1Candidates } = await computeCorrelationCandidates(paths, { now: nowTick1 });
   assert.equal(tick1Candidates.length, 1);
 
   const existingAlerts = await readAlertRecords(paths);
@@ -618,7 +639,7 @@ test("Slice 6 recovery: a candidate that fired on tick N is absent on tick N+1 o
 
   // Tick N+1: far enough past the anchor's first_seen that the 24h lookback has expired.
   const nowTick2 = dayTs(2, 0);
-  const tick2Candidates = await computeCorrelationCandidates(paths, { now: nowTick2 });
+  const { candidates: tick2Candidates } = await computeCorrelationCandidates(paths, { now: nowTick2 });
   assert.deepEqual(tick2Candidates, [], "the anchor has aged out of the lookback bound; the join must not re-derive the candidate");
 
   const existingAlerts2 = await readAlertRecords(paths);
@@ -649,7 +670,7 @@ test("Slice 6 must-fix 2 (schema-pinned, strengthened per adversarial review): E
     now,
   });
 
-  const candidates = await computeCorrelationCandidates(paths, { now });
+  const { candidates } = await computeCorrelationCandidates(paths, { now });
   assert.equal(candidates.length, 1);
   const { title, summary, diagnostics } = candidates[0];
 
@@ -725,4 +746,140 @@ test("CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS/_DAYS/NOVELTY_MAX_PRIOR_TICKS are
   assert.ok(Number.isFinite(CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS) && CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS > 0);
   assert.ok(Number.isFinite(CORRELATION_MIN_PEER_HISTORY_DAYS) && CORRELATION_MIN_PEER_HISTORY_DAYS > 0);
   assert.ok(Number.isFinite(CORRELATION_NOVELTY_MAX_PRIOR_TICKS) && CORRELATION_NOVELTY_MAX_PRIOR_TICKS >= 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (§8.B/§8.C, correlation recipe): computeCorrelationCandidates
+// now returns { candidates, evaluatedAlertKeys }. evaluatedAlertKeys = the persisted correlation
+// alert identities this detector GENUINELY evaluated this tick (whether it re-fired or found clear),
+// so the daemon recovers a genuinely-cleared correlation alert and FREEZES an unevaluated one.
+// ---------------------------------------------------------------------------------------------
+
+test("Recovery coverage (i) GENUINE clear: a persisted correlation alert whose kill-side anchor is still live but whose peer no longer qualifies this tick (ready peer stream, no qualifying observation = a genuine non-match) is reported in evaluatedAlertKeys so it can recover", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 13); // 11h after the anchor -> anchor still within the 24h lookback (live)
+  const corrFingerprint = "global__peer.wireguard.9999999999999999";
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs), // live anchor -> "global__" prefix
+      correlationAlertRecord(corrFingerprint, { firstSeenTs: anchorTs }), // persisted from a prior tick
+    ],
+    // A mature/ready peer stream (past the stream-wide cold-start gate) but with NO odd-hour novel
+    // peer coincident with the anchor this tick: findQualifyingPeerObservations returns [] as a
+    // GENUINE non-match (the detector DID evaluate the join and found it clear), not as an
+    // unevaluated overflow/cold-start skip.
+    factPoints: [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0)],
+    now,
+  });
+
+  const { candidates, evaluatedAlertKeys } = await computeCorrelationCandidates(paths, { now });
+  assert.deepEqual(candidates, [], "no peer qualifies this tick, so no candidate is emitted");
+  assert.ok(
+    evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)),
+    "a genuinely evaluated (ready stream, live anchor) correlation identity must be reported so the daemon can recover it",
+  );
+});
+
+test("Recovery coverage (ii) UNEVALUATED: when the peer stream is unevaluable this tick (overflow-degraded window = fail-closed) the persisted correlation alert under a still-live anchor is NOT reported, so the daemon freezes it rather than fabricating a recovery", async () => {
+  const paths = await tempPaths();
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 13); // anchor still live
+  const corrFingerprint = "global__peer.wireguard.9999999999999999";
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs), // still-live anchor -> not orphaned
+      correlationAlertRecord(corrFingerprint, { firstSeenTs: anchorTs }),
+    ],
+    factPoints: [
+      ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+      overflowPoint(dayTs(-1, 0)), // one overflow tick degrades the whole window -> UNEVALUATED
+    ],
+    now,
+  });
+
+  const { candidates, evaluatedAlertKeys } = await computeCorrelationCandidates(paths, { now });
+  assert.deepEqual(candidates, []);
+  assert.ok(
+    !evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, corrFingerprint)),
+    "an unevaluated (overflow fail-closed) peer stream must NOT report its live-anchor correlation identity as clear",
+  );
+});
+
+test("Recovery coverage — expiry/orphan (generalized anchors===0): a persisted correlation alert whose kill-side anchor has aged past the 24h lookback is reported evaluated-clear even while OTHER anchors remain live, independent of peer-stream trust/readiness (the designed end-of-life; requiring the anchor to persist would make it immortal)", async () => {
+  const paths = await tempPaths();
+  const liveAnchorTs = dayTs(2, 2); // still within the 24h lookback of `now`
+  const expiredAnchorTs = dayTs(0, 2); // > 24h before `now` -> no longer an anchor
+  const now = dayTs(2, 13);
+  const liveCorr = "global__peer.wireguard.1111111111111111"; // under the still-live count_drop anchor
+  const orphanCorr = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999"; // anchor aged out
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs), // live "global__" anchor
+      // The churn anchor whose first_seen has aged out is intentionally NOT persisted anymore (or is
+      // simply outside lookback); either way findKillSideAnchors won't surface it, so orphanCorr has
+      // no live prefix.
+      correlationAlertRecord(liveCorr, { firstSeenTs: liveAnchorTs }),
+      correlationAlertRecord(orphanCorr, { firstSeenTs: expiredAnchorTs }),
+    ],
+    // A degraded/empty peer read: even with the peer stream UNEVALUATED, the orphan must still be
+    // reported clear (its clearance is anchor-expiry, not a peer join), while the live-anchor
+    // identity is frozen because its stream is unevaluable.
+    now,
+  });
+
+  const { evaluatedAlertKeys } = await computeCorrelationCandidates(paths, {
+    now,
+    readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
+  });
+  assert.ok(
+    evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, orphanCorr)),
+    "an expired/orphaned correlation alert must be reported evaluated-clear regardless of peer-stream trust",
+  );
+  assert.ok(
+    !evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, liveCorr)),
+    "a still-live anchor's correlation identity must be frozen when the peer stream is unevaluable (untrusted here)",
+  );
+});
+
+test("Recovery coverage — non-finite `now` freezes all (does NOT masquerade as anchors===0 expiry-clear): the anchor scan cannot run, so nothing is reported evaluated", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeAlertRecords(paths, [
+    killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, dayTs(0, 2)),
+    correlationAlertRecord("global__peer.wireguard.9999999999999999", { firstSeenTs: dayTs(0, 2) }),
+  ]);
+  const result = await computeCorrelationCandidates(paths, { now: "not-a-date" });
+  assert.deepEqual(
+    result,
+    { candidates: [], evaluatedAlertKeys: [] },
+    "a non-finite clock is UNEVALUATED (freeze), never an empty-anchor expiry-clear that would recover every persisted correlation alert",
+  );
+});
+
+test("assessPeerStreamReadiness agrees with findQualifyingPeerObservations' own overflow + stream-history gate (the reason string is load-bearing, not decorative)", () => {
+  const anchor = { first_seen_ms: Date.parse(dayTs(0, 2)) };
+  const opts = { minPeerHistoryTickGroups: CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS, minPeerHistoryDays: CORRELATION_MIN_PEER_HISTORY_DAYS };
+
+  // Overflow anywhere -> not ready (reason overflow) AND the helper yields no qualifying observation.
+  const overflowPoints = [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0), peerPoint(dayTs(0, 2), "peer.wireguard.9999999999999999"), overflowPoint(dayTs(-1, 0))];
+  assert.deepEqual(assessPeerStreamReadiness(overflowPoints, opts), { ready: false, reason: "overflow" });
+  assert.deepEqual(findQualifyingPeerObservations(overflowPoints, anchor, opts), []);
+
+  // Too-young stream -> not ready (reason insufficient_history) AND no qualifying observation.
+  const youngPoints = [peerPoint(dayTs(0, 2), "peer.wireguard.9999999999999999")];
+  assert.equal(assessPeerStreamReadiness(youngPoints, opts).ready, false);
+  assert.equal(assessPeerStreamReadiness(youngPoints, opts).reason, "insufficient_history");
+  assert.deepEqual(findQualifyingPeerObservations(youngPoints, anchor, opts), []);
+
+  // Mature stream with an in-window odd-hour novel peer -> ready AND the helper DOES find it (proves
+  // "ready + empty" would be a genuine clear, not an unevaluated skip).
+  const readyMatch = [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0), peerPoint(dayTs(0, 2), "peer.wireguard.9999999999999999", { hourBucket: "02" })];
+  assert.deepEqual(assessPeerStreamReadiness(readyMatch, opts), { ready: true, reason: "ready" });
+  assert.equal(findQualifyingPeerObservations(readyMatch, anchor, opts).length, 1);
+
+  // Mature stream but NO qualifying peer (all non-odd-hour) -> ready yet empty = genuine non-match.
+  const readyNoMatch = [...regularPeerPoints("peer.ssh.1111111111111111", -3, 0)];
+  assert.equal(assessPeerStreamReadiness(readyNoMatch, opts).ready, true);
+  assert.deepEqual(findQualifyingPeerObservations(readyNoMatch, anchor, opts), []);
 });

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { writeWatchConfig } from "../src/watch-store.js";
+import { alertId } from "../src/alert-store.js";
 import { isFixedLengthHexHash, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
 import { factPointsFromServiceEvidence, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
@@ -456,7 +457,7 @@ test("computeServiceBaselineCandidates: watch.json disabled -> [], zero I/O (rea
     readFactPoints: async () => { readCalled = true; return { points: [] }; },
     loadServiceBaselineStore: async () => { loadStoreCalled = true; return { state: {} }; },
   });
-  assert.deepEqual(candidates, []);
+  assert.deepEqual(candidates, { candidates: [], evaluatedAlertKeys: [] });
   assert.equal(readCalled, false);
   assert.equal(loadStoreCalled, false);
 });
@@ -606,17 +607,17 @@ test("re-emission every call: candidate list is rebuilt fresh from the current w
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
   const first = await computeServiceBaselineCandidates(paths, commonOptions);
   const second = await computeServiceBaselineCandidates(paths, commonOptions); // no new fact-history in between
-  assert.equal(first.length, 1);
-  assert.equal(second.length, 1);
+  assert.equal(first.candidates.length, 1);
+  assert.equal(second.candidates.length, 1);
   assert.deepEqual(first, second);
 });
 
 test("computeServiceBaselineCandidates end-to-end: an established service disappearing in a fresh complete census fires exactly one service.disappeared candidate naming the sanitized service in diagnostics.service_name (2026-07-24), with fingerprint/id still hash-derived", async () => {
   const paths = await tempPaths();
   const ticks = [...establishedTicks(["svc-a", "svc-b"], 5), completeTick(tickTs(5), ["svc-b"])]; // svc-a disappears
-  const candidates = await seedAndCompute(paths, flatten(ticks), { freshnessMs: HOUR_MS, establishedMinCensusCount: 3 });
-  assert.equal(candidates.length, 1);
-  const [candidate] = candidates;
+  const result = await seedAndCompute(paths, flatten(ticks), { freshnessMs: HOUR_MS, establishedMinCensusCount: 3 });
+  assert.equal(result.candidates.length, 1);
+  const [candidate] = result.candidates;
   assert.equal(candidate.rule_id, SERVICE_DISAPPEARED_RULE_ID);
   assert.equal(candidate.severity, "warning");
   assert.equal(candidate.diagnostics.entity_key_hash, expectedHash("svc-a"));
@@ -677,7 +678,7 @@ test("computeServiceBaselineCandidates: degraded truncated history suppresses a 
     readFactPoints: async () => degradedReadResult(points, tickTs(30)),
   });
 
-  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a service.disappeared claim");
+  assert.deepEqual(result.candidates, [], "untrustworthy retained history must not authorize a service.disappeared claim");
   const { state } = await loadServiceBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
 });
@@ -702,7 +703,7 @@ test("computeServiceBaselineCandidates (security-sweep F4): an established store
     readFactPoints: async () => intactReadResult(points),
   });
 
-  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.candidates, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
   const { state } = await loadServiceBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_since_ts, tickTs(3), "a real anchor must be synthesized at the injected now");
@@ -750,14 +751,14 @@ test("computeServiceBaselineCandidates: rollback repairs a future anchor and wat
     completeTick(tickTs(11), ["svc-a"]),
   ]);
   const recoveredTick = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(6) });
-  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  assert.deepEqual(recoveredTick.candidates, [], "the tick that re-establishes trust remains suppressed");
   const state = (await loadServiceBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, false);
   assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
 
   points = [...points, ...completeTick(tickTs(7), [])];
   const resumed = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(7) });
-  assert.equal(resumed.some((candidate) => candidate.rule_id === SERVICE_DISAPPEARED_RULE_ID), true, "service novelty resumes after rollback recovery has been persisted");
+  assert.equal(resumed.candidates.some((candidate) => candidate.rule_id === SERVICE_DISAPPEARED_RULE_ID), true, "service novelty resumes after rollback recovery has been persisted");
 });
 
 test("computeServiceBaselineCandidates: intact history control still fires a real service.disappeared (sanity check proving the degraded case above really would have fabricated an alert absent the gate)", async () => {
@@ -772,7 +773,7 @@ test("computeServiceBaselineCandidates: intact history control still fires a rea
     readFactPoints: async () => intactReadResult(points),
   });
 
-  const disappearedCandidates = result.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID);
+  const disappearedCandidates = result.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID);
   assert.equal(disappearedCandidates.length, 1, "an intact store must not be falsely suppressed");
 });
 
@@ -789,26 +790,26 @@ test("computeServiceBaselineCandidates: one transient fact-history loss recovers
   // Loss tick: svc-a would disappear here -- would fire if trusted.
   points = [...points, ...completeTick(tickTs(3), [])];
   const lossTick = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(3) });
-  assert.deepEqual(lossTick, []);
+  assert.deepEqual(lossTick.candidates, []);
 
   readResult = intactReadResult([]);
   points = [...points, ...completeTick(tickTs(4), [])]; // 1st re-accum tick (still absent)
-  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(4) }), []);
+  assert.deepEqual((await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(4) })).candidates, []);
 
   points = [...points, ...completeTick(tickTs(5), [])]; // 2nd re-accum tick (still absent)
-  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(5) }), []);
+  assert.deepEqual((await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(5) })).candidates, []);
   assert.equal((await loadServiceBaselineStore(paths)).state.cold_start_pending, false);
 
   // A genuinely new disappearance after re-establishment must fire normally: svc-a reappears
   // (tick 6), is present again (tick 7, keeping its already-established sighting count from ticks
   // 0-2 well above minEstablishedCount), then genuinely vanishes again (tick 8).
   points = [...points, ...completeTick(tickTs(6), ["svc-a"])];
-  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(6) }), []);
+  assert.deepEqual((await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(6) })).candidates, []);
   points = [...points, ...completeTick(tickTs(7), ["svc-a"])];
-  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(7) }), []);
+  assert.deepEqual((await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(7) })).candidates, []);
   points = [...points, ...completeTick(tickTs(8), [])];
   const resumed = await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(8) });
-  const disappearedCandidates = resumed.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID);
+  const disappearedCandidates = resumed.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID);
   assert.equal(disappearedCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
   assert.equal(disappearedCandidates[0].diagnostics.service_name, "svc-a");
 });
@@ -825,7 +826,7 @@ test("computeServiceBaselineCandidates: a clean tick cannot self-heal and fire s
   let readResult = degradedReadResult(points, tickTs(3));
   const options = { minHistoryTickCount: 1, establishedMinCensusCount: 3, freshnessMs: HOUR_MS, readFactPoints: async () => ({ ...readResult, points }) };
 
-  assert.deepEqual(await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
 
   // Tick 4 is BOTH (a) the first genuinely-new clean tick past the tick-3 anchor -- satisfying
   // minHistoryTickCount:1 and flipping cold_start_pending false in the persisted store by the end
@@ -836,7 +837,7 @@ test("computeServiceBaselineCandidates: a clean tick cannot self-heal and fire s
   points = [...points, ...completeTick(tickTs(4), [])];
   readResult = intactReadResult([]);
   assert.deepEqual(
-    await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    (await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(4) })).candidates,
     [],
     "the first clean tick after loss may re-establish state but must not emit novelty in the same tick, even though a real disappearance transition exists on this exact tick",
   );
@@ -868,7 +869,7 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
   // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
   // must not be trusted just because it parses. A bounded, one-time cold-start is required.
   const firstRead = await computeServiceBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
-  assert.deepEqual(firstRead, []);
+  assert.deepEqual(firstRead.candidates, []);
   const afterFirst = (await loadServiceBaselineStore(paths)).state;
   assert.equal(afterFirst.cold_start_pending, true);
   assert.equal(
@@ -896,7 +897,7 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
   const ts = tickTs(hour);
   await appendFactPoints(paths, completeTick(ts, []), { now: ts }); // svc-a genuinely vanishes
   const resumed = await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
-  assert.equal(resumed.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1);
+  assert.equal(resumed.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1);
 });
 
 test("loadServiceBaselineStore (security-sweep F1): a bare {cold_start_pending:false} with no last_folded_ts watermark carries zero establishment provenance and loads as invalid_store_schema (cold-start), while an otherwise-identical store WITH a valid watermark is trusted", async () => {
@@ -929,7 +930,7 @@ test("computeServiceBaselineCandidates (security-sweep F1): a forged {cold_start
     freshnessMs: HOUR_MS,
     readFactPoints: async () => intactReadResult(points),
   });
-  assert.deepEqual(forged.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a service.disappeared claim");
+  assert.deepEqual(forged.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID), [], "a bare cold_start_pending:false claim with no watermark must not authorize a service.disappeared claim");
   assert.equal((await loadServiceBaselineStore(paths)).state.cold_start_pending, true);
 
   // Control: an otherwise-identical, GENUINELY established store (real watermark) still fires.
@@ -939,7 +940,74 @@ test("computeServiceBaselineCandidates (security-sweep F1): a forged {cold_start
     freshnessMs: HOUR_MS,
     readFactPoints: async () => intactReadResult(points),
   });
-  assert.equal(genuine.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
+  assert.equal(genuine.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1, "a genuinely-established store must not be falsely suppressed");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (docs/plans/2026-09-20-detector-reported-recovery-coverage.md
+// §8.B/§8.C) — computeServiceBaselineCandidates now returns { candidates, evaluatedAlertKeys }, the
+// set of alertId(rule_id, fingerprint) identities it GENUINELY evaluated this tick (every entity it
+// held complete+fresh+established census knowledge of, whether it fired a candidate or found the
+// entity clear). The daemon freezes any owned identity NOT reported (never fabricates a recovery)
+// and recovers a genuinely-cleared one that IS reported.
+// ---------------------------------------------------------------------------------------------
+
+test("computeServiceBaselineCandidates recovery coverage (GENUINE clear): a service that disappeared then reappeared is no longer a live candidate, yet its identity IS reported in evaluatedAlertKeys so a persisted service.disappeared alert can recover", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // Ticks 0-2: svc-a established. Tick 3: svc-a disappears. Tick 4: svc-a is back (genuine clear).
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a"]),
+    completeTick(tickTs(3), []),
+    completeTick(tickTs(4), ["svc-a"]),
+  ]);
+  const result = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(4),
+    minHistoryTickCount: 2,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  // svc-a is present again in the fresh latest complete census -> NOT a live disappearance candidate.
+  assert.equal(result.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 0);
+  // ...but the detector genuinely evaluated svc-a this tick (fresh, complete, established census
+  // knowledge), so its identity IS reported -> a persisted service.disappeared alert recovers.
+  assert.ok(
+    result.evaluatedAlertKeys.includes(alertId(SERVICE_DISAPPEARED_RULE_ID, expectedHash("svc-a"))),
+    "a genuinely-evaluated, now-cleared entity must be reported in evaluatedAlertKeys so it can recover",
+  );
+});
+
+test("computeServiceBaselineCandidates recovery coverage (UNEVALUATED — stale latest census): the detector could NOT evaluate this tick (freshness gate, cold_start still false), so evaluatedAlertKeys is empty and a persisted service.disappeared alert freezes", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // svc-a is established across 3 complete groups, the store is intact and NOT cold-start -- but the
+  // freshest complete census is far older than activeFreshnessMs relative to `now`, so detect*'s
+  // freshness gate makes this tick unevaluable. Coverage-from-cold-start-alone would wrongly report.
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a"]),
+  ]);
+  const result = await computeServiceBaselineCandidates(paths, {
+    now: tickTs(1000),
+    minHistoryTickCount: 2,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result.candidates, [], "a stale census must never fire a disappearance");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "an unevaluable (stale) tick must report NO coverage, so a persisted alert freezes rather than fabricating a recovery");
+  // Prove it is the freshness gate, not the cold-start lockout, doing the work here.
+  assert.equal((await loadServiceBaselineStore(paths)).state.cold_start_pending, false);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1120,7 +1188,7 @@ test("computeServiceAppearanceCandidates checks watch.json before any fact/store
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadServiceAppearanceBaselineStore: async () => { loadCalls += 1; return { state: normalizeServiceAppearanceBaselineState() }; },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result, { candidates: [], evaluatedAlertKeys: [] });
   assert.equal(readCalls, 0);
   assert.equal(loadCalls, 0);
 });
@@ -1137,8 +1205,8 @@ test("computeServiceAppearanceCandidates folds counters once and emits an appear
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await appendFactPoints(paths, [], { now: tickTs(2) });
   const first = await computeServiceAppearanceCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(first.length, 1);
-  assert.equal(first[0].diagnostics.entity_key_hash, expectedAppearedHash("svc-new"));
+  assert.equal(first.candidates.length, 1);
+  assert.equal(first.candidates[0].diagnostics.entity_key_hash, expectedAppearedHash("svc-new"));
   const state = (await loadServiceAppearanceBaselineStore(paths)).state;
   assert.equal(state.appeared_event_count, 1);
 });
@@ -1169,8 +1237,8 @@ test("co-existence: a service that disappears then reappears exercises BOTH dete
   // complete pair (tick(3)->tick(4)) where svc-a is present again -- so no disappearance is live
   // at tick(4). The appearance detector, using the FULL historical union, correctly does NOT
   // re-fire for svc-a (it was seen in ticks 0-2, so it is not "never seen before").
-  assert.equal(disappeared.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 0);
-  assert.equal(appeared.filter((c) => c.rule_id === SERVICE_APPEARED_RULE_ID).length, 0);
+  assert.equal(disappeared.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 0);
+  assert.equal(appeared.candidates.filter((c) => c.rule_id === SERVICE_APPEARED_RULE_ID).length, 0);
 
   // Independent fold checkpoints: both stores must have advanced to the SAME latest tick without
   // either fold observably skipping a tick because of the other's write.
@@ -1201,7 +1269,7 @@ test("computeServiceAppearanceCandidates (security-sweep F4): an established sto
     readFactPoints: async () => intactReadResult(points),
   });
 
-  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.candidates, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
   const { state } = await loadServiceAppearanceBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
@@ -1222,7 +1290,7 @@ test("computeServiceAppearanceCandidates fails closed end-to-end when the persis
   await fs.writeFile(storeFile, "{this is not valid json", { mode: 0o600 });
 
   const result = await computeServiceAppearanceCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
 });
 
 test("computeServiceAppearanceCandidates: degraded/untrustworthy retained history suppresses a fabricated established-service appearance alert", async () => {
@@ -1242,9 +1310,66 @@ test("computeServiceAppearanceCandidates: degraded/untrustworthy retained histor
     activeFreshnessMs: HOUR_MS,
     readFactPoints: async () => degradedReadResult(truncatedPoints, tickTs(3)),
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
   const state = (await loadServiceAppearanceBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
+});
+
+test("computeServiceAppearanceCandidates recovery coverage (GENUINE clear): a still-firing appearance and an established, no-longer-novel service are BOTH reported in evaluatedAlertKeys; the emitted candidate's id is one of them", async () => {
+  const paths = await tempPaths();
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a", "svc-new"]), // svc-new is newly appeared; svc-a is old news
+  ]);
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const result = await computeServiceAppearanceCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount: 2,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  // svc-a is in the historical union -> NOT a live appearance candidate (genuine clear), but IS
+  // reported evaluated, so a persisted service.appeared alert for svc-a can recover.
+  assert.equal(result.candidates.filter((c) => c.diagnostics.entity_key_hash === expectedAppearedHash("svc-a")).length, 0);
+  assert.ok(
+    result.evaluatedAlertKeys.includes(alertId(SERVICE_APPEARED_RULE_ID, expectedAppearedHash("svc-a"))),
+    "an established, no-longer-novel service the detector genuinely evaluated must be reported so it can recover",
+  );
+  // svc-new IS a live candidate; §8.C: the SAME domain-separated hash keys both, so the candidate's
+  // own id must appear in the evaluated set (it was evaluated AND fired).
+  const appearedCandidate = result.candidates.find((c) => c.rule_id === SERVICE_APPEARED_RULE_ID);
+  assert.ok(appearedCandidate, "svc-new must fire a service.appeared candidate");
+  assert.ok(
+    result.evaluatedAlertKeys.includes(appearedCandidate.id),
+    "the emitted candidate's id must be one of the evaluated alert keys (same domain-separated hash)",
+  );
+});
+
+test("computeServiceAppearanceCandidates recovery coverage (UNEVALUATED — stale latest census): freshness gate makes the tick unevaluable while cold_start stays false, so evaluatedAlertKeys is empty and a persisted service.appeared alert freezes", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  const points = flatten([
+    completeTick(tickTs(0), ["svc-a"]),
+    completeTick(tickTs(1), ["svc-a"]),
+    completeTick(tickTs(2), ["svc-a", "svc-new"]),
+  ]);
+  const result = await computeServiceAppearanceCandidates(paths, {
+    now: tickTs(1000),
+    minHistoryTickCount: 2,
+    establishedMinCensusCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+
+  assert.deepEqual(result.candidates, [], "a stale census must never fire an appearance");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "an unevaluable (stale) tick must report NO coverage, so a persisted alert freezes rather than fabricating a recovery");
+  assert.equal((await loadServiceAppearanceBaselineStore(paths)).state.cold_start_pending, false);
 });
 
 test("[P9] SERVICE_APPEARED_RULE_ID classifies to unknown_namespace -- structurally LLM-ineligible (full deterministic-delivery pin lives in test/alert-intelligence.test.js)", async () => {

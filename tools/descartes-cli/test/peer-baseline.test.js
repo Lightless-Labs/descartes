@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { alertId } from "../src/alert-store.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
@@ -405,7 +406,7 @@ test(">cap-burst-fires fixture (Fable review MUST-FIX 3, hard requirement): a bu
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   const burstTs = tickTs(30);
   const burstPoints = overflowTick(burstTs, 200); // the collector's own capped observed_active count
-  const candidates = await seedAndCompute(paths, [...ticks, ...burstPoints], { now: burstTs });
+  const { candidates } = await seedAndCompute(paths, [...ticks, ...burstPoints], { now: burstTs });
 
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spike, "expected peer.count_spike to STILL fire on a >cap burst (score-but-never-fold)");
@@ -426,14 +427,14 @@ test("overflow-tick scoring-vs-folding interaction: an overflow tick occurring w
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   ticks.push(...activeTick(tickTs(30), 10)); // z = (10-2)/0.5 = 16 -> already fires
   const beforeTs = tickTs(30);
-  const before = await seedAndCompute(paths, ticks, { now: beforeTs });
+  const { candidates: before } = await seedAndCompute(paths, ticks, { now: beforeTs });
   const spikeBefore = before.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spikeBefore, "expected the sustained shift to fire peer.count_spike before the overflow tick");
   const { state: stateBefore } = await loadPeerBaselineStore(paths);
 
   const overflowTs = tickTs(31);
   await appendFactPoints(paths, overflowTick(overflowTs, 200), { now: overflowTs });
-  const after = await computePeerBaselineCandidates(paths, { now: overflowTs });
+  const { candidates: after } = await computePeerBaselineCandidates(paths, { now: overflowTs });
   const spikeAfter = after.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spikeAfter, "the candidate must keep re-firing, not disappear, across an intervening overflow tick");
   assert.equal(spikeAfter.diagnostics.observed_count, 200, "scored at the overflow tick's own capped count, not the prior real observation's");
@@ -477,7 +478,7 @@ test("synthetic spike fixture: a mass odd-hour peer-login burst fires peer.count
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   ticks.push(...activeTick(tickTs(30), 8)); // z = (8-2)/0.5 = 12 >= DEVIATION_SIGMA
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spike, "expected peer.count_spike to fire on the synthetic burst");
   assert.equal(spike.severity, "warning");
@@ -491,7 +492,7 @@ test("computePeerBaselineCandidates (security-sweep F6): a present-but-invalid m
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2)); // markerless legacy baseline, same shape as the control above
   ticks.push(...activeTickWithMarker(tickTs(30), 8, "v2:future-garbage")); // present-but-invalid marker on the jump tick
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.equal(spike, undefined, "a present-but-invalid marker must fail closed, never pool with (or be scored against) the trusted markerless regime");
 });
@@ -501,7 +502,7 @@ test("MUST-FIX 1 (hard requirement): stored severity is capped at 'warning' UNCO
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   ticks.push(...activeTick(tickTs(30), 100)); // z = (100-2)/0.5 = 196, wildly beyond CRITICAL_SIGMA=5
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spike);
   assert.ok(spike.diagnostics.z_score > DEFAULT_PEER_CRITICAL_SIGMA * 10, "sanity: the z-score is extreme");
@@ -514,7 +515,7 @@ test("observed_historical points are EXCLUDED from the spike count (Decision 1, 
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   const burstTs = tickTs(30);
   const burstPoints = [...activeTick(burstTs, 2), ...historicalTick(burstTs, 50)]; // 50 historical would obviously cross the threshold if wrongly counted
-  const candidates = await seedAndCompute(paths, [...ticks, ...burstPoints], { now: burstTs });
+  const { candidates } = await seedAndCompute(paths, [...ticks, ...burstPoints], { now: burstTs });
   assert.equal(candidates.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 0, "observed_historical volume must never contribute to the spike count");
 });
 
@@ -543,7 +544,7 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 new peer/week
       }
       const now = tickTs(hour - 1);
       await appendFactPoints(paths, dayPoints, { now });
-      const candidates = await computePeerBaselineCandidates(paths, { now });
+      const { candidates } = await computePeerBaselineCandidates(paths, { now });
       const spikes = candidates.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
       assert.equal(spikes.length, 0, `unexpected peer.count_spike on week ${week} day ${day} (count=${count}): ${JSON.stringify(spikes)}`);
     }
@@ -572,7 +573,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M>N (e.g. 3
   for (let i = 0; i < MAX_ADDITIONAL_TICKS; i += 1) {
     const ts = tickTs(hour);
     await appendFactPoints(paths, activeTick(ts, M), { now: ts });
-    const candidates = await computePeerBaselineCandidates(paths, { now: ts });
+    const { candidates } = await computePeerBaselineCandidates(paths, { now: ts });
     const fired = candidates.some((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
     if (i === 0) firedImmediatelyAfterShift = fired;
     if (!fired && recoveredAtHour === undefined) recoveredAtHour = hour;
@@ -585,7 +586,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M>N (e.g. 3
   for (let i = 0; i < 3; i += 1) {
     const ts = tickTs(hour);
     await appendFactPoints(paths, activeTick(ts, M), { now: ts });
-    const candidates = await computePeerBaselineCandidates(paths, { now: ts });
+    const { candidates } = await computePeerBaselineCandidates(paths, { now: ts });
     assert.equal(candidates.some((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, `expected sustained recovery, but peer.count_spike re-fired at hour ${hour}`);
     hour += 1;
   }
@@ -749,7 +750,7 @@ test("synthetic drop fixture: a mass peer-drop-to-near-zero fires peer.count_dro
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 10));
   ticks.push(...activeTickWithMarker(tickTs(30), 1)); // z = (1-10)/0.5 = -18 <= -DEVIATION_SIGMA
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const drop = candidates.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   assert.ok(drop, "expected peer.count_drop to fire on the synthetic mass drop");
   assert.equal(drop.severity, "warning");
@@ -764,7 +765,7 @@ test("Stage 2 adversarial-review regression (hard requirement): a garbled-but-st
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 10, garbledSignature));
   ticks.push(...activeTickWithMarker(tickTs(30), 1, garbledSignature)); // would have been z = (1-10)/0.5 = -18 pre-fix
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const drop = candidates.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.equal(drop, undefined, "a garbled signature must never establish a drop-direction regime baseline");
@@ -779,7 +780,7 @@ test("EXACT-ZERO drop fixture: a genuine zero-peer tick (the census marker's who
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 5));
   ticks.push(censusMarkerPoint(tickTs(30))); // genuinely zero peers this tick, marker still present
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const drop = candidates.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   assert.ok(drop, "expected peer.count_drop to fire on a genuine drop to exact zero");
   assert.equal(drop.diagnostics.observed_count, 0);
@@ -790,7 +791,7 @@ test("MUST-FIX-1-equivalent (hard requirement): stored severity is capped at 'wa
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 100));
   ticks.push(...activeTickWithMarker(tickTs(30), 0)); // z = (0-100)/0.5 = -200, wildly beyond -CRITICAL_SIGMA
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const drop = candidates.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   assert.ok(drop);
   assert.ok(drop.diagnostics.z_score < -DEFAULT_PEER_CRITICAL_SIGMA * 10, "sanity: the z-score is extreme");
@@ -812,7 +813,7 @@ test("chronic-degradation-then-recovery sequence: a signature flip from a degrad
   for (let i = 0; i < 35; i += 1) {
     const ts = tickTs(hour);
     await appendFactPoints(paths, activeTickWithMarker(ts, 5, DEFAULT_SIGNATURE), { now: ts });
-    const candidates = await computePeerBaselineCandidates(paths, { now: ts });
+    const { candidates } = await computePeerBaselineCandidates(paths, { now: ts });
     if (candidates.length > 0) anyFalseFire = true;
     hour += 1;
   }
@@ -820,7 +821,7 @@ test("chronic-degradation-then-recovery sequence: a signature flip from a degrad
 
   const finalTs = tickTs(hour);
   await appendFactPoints(paths, activeTickWithMarker(finalTs, 5, DEFAULT_SIGNATURE), { now: finalTs });
-  const finalCandidates = await computePeerBaselineCandidates(paths, { now: finalTs });
+  const { candidates: finalCandidates } = await computePeerBaselineCandidates(paths, { now: finalTs });
   assert.equal(finalCandidates.length, 0, "the fully-established new regime must recover cleanly, firing neither direction on a steady count");
 });
 
@@ -838,8 +839,8 @@ test("re-emission-every-tick (drop): after a peer.count_drop candidate fires onc
   await appendFactPoints(paths, ticks, { now });
   await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
-  const first = await computePeerBaselineCandidates(paths, { now });
-  const second = await computePeerBaselineCandidates(paths, { now });
+  const { candidates: first } = await computePeerBaselineCandidates(paths, { now });
+  const { candidates: second } = await computePeerBaselineCandidates(paths, { now });
   const firstDrop = first.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   const secondDrop = second.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   assert.ok(firstDrop && secondDrop);
@@ -852,21 +853,21 @@ test("computePeerBaselineCandidates: returns [], [spike-only], or [drop-only] de
   const flatTicks = [];
   for (let i = 0; i < 30; i += 1) flatTicks.push(...activeTickWithMarker(tickTs(i), 5));
   flatTicks.push(...activeTickWithMarker(tickTs(30), 5));
-  const noneCandidates = await seedAndCompute(pathsNone, flatTicks);
+  const { candidates: noneCandidates } = await seedAndCompute(pathsNone, flatTicks);
   assert.deepEqual(noneCandidates.map((c) => c.rule_id), []);
 
   const pathsSpike = await tempPaths();
   const spikeTicks = [];
   for (let i = 0; i < 30; i += 1) spikeTicks.push(...activeTickWithMarker(tickTs(i), 2));
   spikeTicks.push(...activeTickWithMarker(tickTs(30), 8));
-  const spikeCandidates = await seedAndCompute(pathsSpike, spikeTicks);
+  const { candidates: spikeCandidates } = await seedAndCompute(pathsSpike, spikeTicks);
   assert.deepEqual(spikeCandidates.map((c) => c.rule_id), [PEER_COUNT_SPIKE_RULE_ID]);
 
   const pathsDrop = await tempPaths();
   const dropTicks = [];
   for (let i = 0; i < 30; i += 1) dropTicks.push(...activeTickWithMarker(tickTs(i), 10));
   dropTicks.push(...activeTickWithMarker(tickTs(30), 1));
-  const dropCandidates = await seedAndCompute(pathsDrop, dropTicks);
+  const { candidates: dropCandidates } = await seedAndCompute(pathsDrop, dropTicks);
   assert.deepEqual(dropCandidates.map((c) => c.rule_id), [PEER_COUNT_DROP_RULE_ID]);
 });
 
@@ -875,7 +876,7 @@ test("sanitized-diagnostics assertion (drop): every diagnostics field survives s
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 10));
   ticks.push(...activeTickWithMarker(tickTs(30), 1));
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const drop = candidates.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   assert.deepEqual(sanitizeDiagnostics(drop.diagnostics), drop.diagnostics);
   assert(isSafeEnumString(drop.diagnostics.confidence_state));
@@ -890,7 +891,7 @@ test("no raw peer host/IP/pubkey is reachable from peer.count_drop's candidate d
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 10));
   ticks.push(...activeTickWithMarker(tickTs(30), 1, DEFAULT_SIGNATURE, "peer.ssh.definitely-not-a-hash"));
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const drop = candidates.find((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID);
   const serialized = JSON.stringify(drop);
   assert.equal(/definitely-not-a-hash|203\.0\.113|alice/.test(serialized), false);
@@ -914,8 +915,8 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   await appendFactPoints(paths, ticks, { now });
   await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
-  const first = await computePeerBaselineCandidates(paths, { now });
-  const second = await computePeerBaselineCandidates(paths, { now });
+  const { candidates: first } = await computePeerBaselineCandidates(paths, { now });
+  const { candidates: second } = await computePeerBaselineCandidates(paths, { now });
   const firstSpike = first.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   const secondSpike = second.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(firstSpike && secondSpike);
@@ -964,7 +965,7 @@ test("candidate shape matches the existing extraCandidates sources (buildCountDr
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   ticks.push(...activeTick(tickTs(30), 8));
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spike);
   assert.equal(typeof spike.id, "string");
@@ -981,7 +982,7 @@ test("sanitized-diagnostics assertion: every diagnostics field survives sanitize
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   ticks.push(...activeTick(tickTs(30), 8));
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.deepEqual(sanitizeDiagnostics(spike.diagnostics), spike.diagnostics);
   assert(isSafeEnumString(spike.diagnostics.confidence_state));
@@ -996,7 +997,7 @@ test("no raw peer host/IP/pubkey is reachable from this module's candidate diagn
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   ticks.push(...activeTick(tickTs(30), 8, "peer.ssh.definitely-not-a-hash"));
-  const candidates = await seedAndCompute(paths, ticks);
+  const { candidates } = await seedAndCompute(paths, ticks);
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   const serialized = JSON.stringify(spike);
   assert.equal(/definitely-not-a-hash|203\.0\.113|alice/.test(serialized), false);
@@ -1031,7 +1032,8 @@ test("computePeerBaselineCandidates: degraded truncated history suppresses a fab
     readFactPoints: async () => degradedReadResult(points, tickTs(30)),
   });
 
-  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a peer.count_spike claim");
+  assert.deepEqual(result.candidates, [], "untrustworthy retained history must not authorize a peer.count_spike claim");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a cold-start (untrusted-history) tick evaluated nothing -- empty coverage freezes any persisted peer.* alert");
   const { state } = await loadPeerBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
 });
@@ -1076,14 +1078,14 @@ test("computePeerBaselineCandidates: rollback repairs a future anchor and waterm
     ...Array.from({ length: 6 }, (_, index) => activeTickWithMarker(tickTs(index + 1), 2)),
     activeTickWithMarker(tickTs(11), 2),
   ]);
-  const recoveredTick = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(6) });
+  const { candidates: recoveredTick } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(6) });
   assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
   const state = (await loadPeerBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, false);
   assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
 
   points = [...points, ...activeTickWithMarker(tickTs(7), 0)];
-  const resumed = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(7) });
+  const { candidates: resumed } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(7) });
   assert.equal(resumed.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), true, "peer novelty resumes after rollback recovery has been persisted");
 });
 
@@ -1100,7 +1102,7 @@ test("computePeerBaselineCandidates: an established future anchor is repaired fo
     last_folded_ts: tickTs(29),
   });
 
-  const candidates = await computePeerBaselineCandidates(paths, {
+  const { candidates } = await computePeerBaselineCandidates(paths, {
     now: tickTs(30),
     minSampleCount: 2,
     minHistoryTickCount: 2,
@@ -1128,7 +1130,8 @@ test("computePeerBaselineCandidates (security-sweep F4): an established store wi
     readFactPoints: async () => intactReadResult(ticks),
   });
 
-  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.candidates, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a cold-start tick evaluated nothing -- empty coverage freezes any persisted peer.* alert");
   const { state } = await loadPeerBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_since_ts, tickTs(30), "a real anchor must be synthesized at the injected now");
@@ -1148,7 +1151,7 @@ test("computePeerBaselineCandidates: intact history control still fires a real p
     readFactPoints: async () => intactReadResult(points),
   });
 
-  const spikeCandidates = result.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  const spikeCandidates = result.candidates.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.equal(spikeCandidates.length, 1, "an intact store must not be falsely suppressed");
 });
 
@@ -1166,22 +1169,22 @@ test("computePeerBaselineCandidates: one transient fact-history loss recovers af
   // Loss tick: a burst (count 10 vs. an established mean of 2) that would fire peer.count_spike
   // if trusted.
   points = [...points, ...activeTick(tickTs(1), 10)];
-  const lossTick = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(1) });
+  const { candidates: lossTick } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(1) });
   assert.deepEqual(lossTick, []);
   const afterLoss = (await loadPeerBaselineStore(paths)).state;
   assert.equal(afterLoss.cold_start_pending, true);
 
   readResult = intactReadResult([]);
   points = [...points, ...activeTick(tickTs(2), 2)]; // 1st re-accum tick
-  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(2) }), []);
+  assert.deepEqual((await computePeerBaselineCandidates(paths, { ...options, now: tickTs(2) })).candidates, []);
 
   points = [...points, ...activeTick(tickTs(3), 2)]; // 2nd re-accum tick
-  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computePeerBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
   assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false);
 
   // A genuinely new burst after re-establishment must fire normally.
   points = [...points, ...activeTick(tickTs(4), 200)];
-  const resumed = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) });
+  const { candidates: resumed } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) });
   const spikeCandidates = resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.equal(spikeCandidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
 });
@@ -1207,30 +1210,30 @@ test("computePeerBaselineCandidates: count_drop stays suppressed after BASE reco
   // lockout for spike recovery, but they are not eligible evidence for count_drop.
   points.push(...activeTickWithMarker(tickTs(30), 20));
   readResult = degradedReadResult(points, tickTs(30));
-  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(30) }), []);
+  assert.deepEqual((await computePeerBaselineCandidates(paths, { ...options, now: tickTs(30) })).candidates, []);
 
   points.push(...activeTick(tickTs(31), 20));
   readResult = intactReadResult(points);
-  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(31) }), []);
+  assert.deepEqual((await computePeerBaselineCandidates(paths, { ...options, now: tickTs(31) })).candidates, []);
   points.push(...activeTick(tickTs(32), 20));
-  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(32) }), []);
+  assert.deepEqual((await computePeerBaselineCandidates(paths, { ...options, now: tickTs(32) })).candidates, []);
   assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false);
 
   // A marker-complete drop immediately after shared recovery is still suppressed: only one
   // post-anchor drop-eligible group exists, despite the shared lockout having cleared.
   points.push(...activeTickWithMarker(tickTs(33), 0));
-  const firstMarkedDrop = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(33) });
+  const { candidates: firstMarkedDrop } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(33) });
   assert.equal(firstMarkedDrop.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), false);
 
   // The scored tick itself does not count toward recovery: only one marker-complete group
   // (tick 33) precedes this scored tick, so count_drop remains suppressed.
   points.push(...activeTickWithMarker(tickTs(34), 0));
-  const stillRecoveringDrop = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(34) });
+  const { candidates: stillRecoveringDrop } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(34) });
   assert.equal(stillRecoveringDrop.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), false);
 
   // Once two marker-complete groups genuinely precede the scored tick, the real drop is eligible.
   points.push(...activeTickWithMarker(tickTs(35), 0));
-  const recoveredDrop = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(35) });
+  const { candidates: recoveredDrop } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(35) });
   assert.equal(recoveredDrop.some((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID), true);
 });
 
@@ -1248,12 +1251,12 @@ test("computePeerBaselineCandidates: a clean tick cannot self-heal and fire peer
   let readResult = degradedReadResult(points, tickTs(3));
   const options = { minHistoryTickCount: 1, minSampleCount, readFactPoints: async () => ({ ...readResult, points }) };
 
-  assert.deepEqual(await computePeerBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computePeerBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
 
   points = [...points, ...activeTick(tickTs(4), 200)]; // an even larger burst on the very next tick
   readResult = intactReadResult([]);
   assert.deepEqual(
-    await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    (await computePeerBaselineCandidates(paths, { ...options, now: tickTs(4) })).candidates,
     [],
     "the first clean tick after loss may re-establish state but must not emit novelty in the same tick",
   );
@@ -1295,7 +1298,7 @@ test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-sta
   // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
   // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
   // must not be trusted just because it parses. A bounded, one-time cold-start is required.
-  const firstRead = await computePeerBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, minSampleCount });
+  const { candidates: firstRead } = await computePeerBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, minSampleCount });
   assert.deepEqual(firstRead, []);
   const afterFirst = (await loadPeerBaselineStore(paths)).state;
   assert.equal(afterFirst.cold_start_pending, true);
@@ -1323,7 +1326,7 @@ test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-sta
   // And peer.* novelty genuinely resumes afterward.
   const ts = tickTs(hour);
   await appendFactPoints(paths, activeTick(ts, 200), { now: ts });
-  const resumed = await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
+  const { candidates: resumed } = await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
   assert.equal(resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1);
 });
 
@@ -1354,7 +1357,7 @@ test("computePeerBaselineCandidates (security-sweep F1): a forged {cold_start_pe
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
 
-  const forged = await computePeerBaselineCandidates(paths, {
+  const { candidates: forged } = await computePeerBaselineCandidates(paths, {
     now: tickTs(30),
     readFactPoints: async () => intactReadResult(ticks),
   });
@@ -1363,7 +1366,7 @@ test("computePeerBaselineCandidates (security-sweep F1): a forged {cold_start_pe
 
   // Control: an otherwise-identical, GENUINELY established store (real watermark) still fires.
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  const genuine = await computePeerBaselineCandidates(paths, {
+  const { candidates: genuine } = await computePeerBaselineCandidates(paths, {
     now: tickTs(30),
     readFactPoints: async () => intactReadResult(ticks),
   });
@@ -1398,7 +1401,7 @@ test("loadPeerBaselineStore: corrupt JSON resets to a fresh baseline with corrup
   assert.equal(corrupt, true);
   assert.equal(state.confidence_state, "provisional");
 
-  const candidates = await seedAndCompute(paths, activeTick(tickTs(0), 2));
+  const { candidates } = await seedAndCompute(paths, activeTick(tickTs(0), 2));
   assert.deepEqual(candidates, []);
 });
 
@@ -1457,8 +1460,84 @@ test("computePeerBaselineCandidates short-circuits to [] before any I/O when wat
     readFactPoints: async () => { ioAttempted = true; throw new Error("readFactPoints must not be called while watch.json is disabled"); },
     loadPeerBaselineStore: async () => { ioAttempted = true; throw new Error("loadPeerBaselineStore must not be called while watch.json is disabled"); },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "a watch-disabled tick evaluated nothing -- empty coverage, never a fabricated recovery");
   assert.equal(ioAttempted, false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Detector-reported recovery coverage (plan 2026-09-20, §8.B/§8.C, peer recipe): the producer now
+// returns { candidates, evaluatedAlertKeys }. evaluatedAlertKeys reports the alert identities this
+// detector genuinely evaluated this tick (established + fresh + drop-ready), so the daemon can
+// recover a genuinely-cleared alert while freezing (never fabricating a recovery for) any identity
+// the detector could not evaluate.
+// ---------------------------------------------------------------------------------------------
+
+test("computePeerBaselineCandidates coverage: a GENUINE clear (both directions established, steady count, no deviation) reports BOTH the spike and drop identities in evaluatedAlertKeys, so a persisted alert of either kind can recover", async () => {
+  const paths = await tempPaths();
+  const flatTicks = [];
+  for (let i = 0; i < 30; i += 1) flatTicks.push(...activeTickWithMarker(tickTs(i), 5));
+  flatTicks.push(...activeTickWithMarker(tickTs(30), 5)); // steady -- neither spike nor drop fires
+  const { candidates, evaluatedAlertKeys } = await seedAndCompute(paths, flatTicks);
+  assert.deepEqual(
+    [...evaluatedAlertKeys].sort(),
+    [alertId(PEER_COUNT_SPIKE_RULE_ID, "global"), alertId(PEER_COUNT_DROP_RULE_ID, "global")].sort(),
+    "both directions were genuinely evaluated (established, clear) -- both identities must be reported so a persisted alert of either kind can recover",
+  );
+  assert.deepEqual(candidates, [], "a genuine clear produces no candidate");
+});
+
+test("computePeerBaselineCandidates coverage: a tick where spike is established+clear but drop is gated OFF by dropRecoveryReady (marker-complete warm-up) reports the spike identity but NOT the drop identity -- so a persisted peer.count_drop alert FREEZES (never a fabricated recovery)", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  const minHistoryTickCount = 2;
+  const minSampleCount = 2;
+  let points = [];
+  let readResult;
+  const options = { minHistoryTickCount, minSampleCount, readFactPoints: async () => ({ ...readResult, points }) };
+
+  for (let i = 0; i < 30; i += 1) points.push(...activeTickWithMarker(tickTs(i), 20));
+  await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  readResult = intactReadResult(points);
+  await computePeerBaselineCandidates(paths, { ...options, now: tickTs(29) });
+
+  // A fact-history loss anchors the shared cold-start lockout at tick 30.
+  points.push(...activeTickWithMarker(tickTs(30), 20));
+  readResult = degradedReadResult(points, tickTs(30));
+  await computePeerBaselineCandidates(paths, { ...options, now: tickTs(30) });
+
+  // Two markerless BASE-complete ticks clear the shared lockout (spike can recover) but are NOT
+  // eligible drop evidence -- so post-anchor drop history has not re-accumulated.
+  points.push(...activeTick(tickTs(31), 20));
+  readResult = intactReadResult(points);
+  await computePeerBaselineCandidates(paths, { ...options, now: tickTs(31) });
+  points.push(...activeTick(tickTs(32), 20));
+  await computePeerBaselineCandidates(paths, { ...options, now: tickTs(32) });
+
+  // A marker-complete real drop: windowedDrop IS established (32 eligible groups >= 2), but only
+  // this scored tick's own group sits after the anchor with no minHistoryTickCount marker-complete
+  // predecessors, so dropRecoveryReady is false -- drop is un-evaluable this tick.
+  points.push(...activeTickWithMarker(tickTs(33), 0));
+  const { candidates, evaluatedAlertKeys } = await computePeerBaselineCandidates(paths, { ...options, now: tickTs(33) });
+
+  assert.equal(
+    (await loadPeerBaselineStore(paths)).state.drop.confidence_state,
+    "established",
+    "sanity: windowedDrop IS established this tick, so the drop key's absence below is dropRecoveryReady doing its job, not ordinary Welford warm-up",
+  );
+  const spikeKey = alertId(PEER_COUNT_SPIKE_RULE_ID, "global");
+  const dropKey = alertId(PEER_COUNT_DROP_RULE_ID, "global");
+  assert.equal(
+    evaluatedAlertKeys.includes(dropKey),
+    false,
+    "drop is gated off by dropRecoveryReady this tick -- it must NOT be reported, so a persisted peer.count_drop alert freezes rather than fabricating a recovery",
+  );
+  assert.equal(
+    evaluatedAlertKeys.includes(spikeKey),
+    true,
+    "spike IS established and evaluable this tick (a genuine clear) -- its identity must be reported so a persisted peer.count_spike alert can recover",
+  );
+  assert.equal(candidates.some((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID), false, "and the drop candidate itself is correctly still suppressed");
 });
 
 test("computePeerBaselineCandidates calls the real (default) loadWatchConfig when not injected -- watch.json defaults to enabled:true (the inversion of learned.json's old enabled:false), so a fresh state dir now proceeds PAST the gate and reaches real I/O, returning [] only for lack of history (cold-start), not a kill switch", async () => {
@@ -1467,6 +1546,6 @@ test("computePeerBaselineCandidates calls the real (default) loadWatchConfig whe
   const result = await computePeerBaselineCandidates(paths, {
     readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args); },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
   assert.equal(readCalled, true, "watch.json's real ENOENT default is enabled:true (watch-by-default slice 1) -- unlike the pre-split default, I/O IS attempted even with nothing injected");
 });

@@ -198,7 +198,7 @@ test("computeProcessLineageBaselineCandidates checks watch.json before any fact/
     readFactPoints: async () => { readCalls += 1; return { points: [] }; },
     loadProcessLineageBaselineStore: async () => { loadCalls += 1; return { state: normalizeProcessLineageBaselineState() }; },
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result, { candidates: [], evaluatedAlertKeys: [] });
   assert.equal(readCalls, 0);
   assert.equal(loadCalls, 0);
 });
@@ -220,10 +220,10 @@ test("computeProcessLineageBaselineCandidates folds counters once and emits a no
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await settleFactStore(paths, tickTs(2));
   const first = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(first.length, 1);
-  assert.equal(first[0].diagnostics.entity_key_hash, expectedHash(buildLineageEntityKey("shell", "python")));
+  assert.equal(first.candidates.length, 1);
+  assert.equal(first.candidates[0].diagnostics.entity_key_hash, expectedHash(buildLineageEntityKey("shell", "python")));
   const second = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(second.length, 1, "candidate re-emits from the same fact window");
+  assert.equal(second.candidates.length, 1, "candidate re-emits from the same fact window");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.novel_edge_event_count, 1);
   assert.equal(state.skipped_partial_tick_count, 0);
@@ -254,7 +254,7 @@ test("computeProcessLineageBaselineCandidates fails closed end-to-end when facts
   await appendFactPoints(paths, points, { now: tickTs(2) });
   await settleFactStore(paths, tickTs(2));
   const clean = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.equal(clean.length, 1);
+  assert.equal(clean.candidates.length, 1);
 
   // Now corrupt facts.jsonl with a genuinely unparsable line (a partial/torn write, disk
   // corruption, ...). readFactPoints is corrupt-tolerant per-line (drops the bad line, keeps the
@@ -264,7 +264,7 @@ test("computeProcessLineageBaselineCandidates fails closed end-to-end when facts
   await fs.appendFile(factsFile, "{this is not valid json\n");
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
 });
 
 test("computeProcessLineageBaselineCandidates fails closed end-to-end when the persisted baseline-store file is corrupt", async () => {
@@ -282,7 +282,7 @@ test("computeProcessLineageBaselineCandidates fails closed end-to-end when the p
   await fs.writeFile(storeFile, "{this is not valid json", { mode: 0o600 });
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result.candidates, []);
 });
 
 test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine cold-start both fail closed to zero claims (fixture-driven)", async () => {
@@ -303,7 +303,7 @@ test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine 
     loadProcessLineageBaselineStore: async () => ({ state: normalizeProcessLineageBaselineState(), corrupt: false }),
     writeProcessLineageBaselineStore: async () => {},
   });
-  assert.deepEqual(corrupt, []);
+  assert.deepEqual(corrupt.candidates, []);
 
   // Genuine day-1 cold-start (too few complete ticks, no corruption at all) fails closed via the
   // pre-existing minHistoryTickCount gate -- same zero-claims outcome, distinct cause.
@@ -315,7 +315,7 @@ test("computeProcessLineageBaselineCandidates: corrupt fact-history and genuine 
     loadProcessLineageBaselineStore: async () => ({ state: normalizeProcessLineageBaselineState(), corrupt: false }),
     writeProcessLineageBaselineStore: async () => {},
   });
-  assert.deepEqual(coldStart, []);
+  assert.deepEqual(coldStart.candidates, []);
 });
 
 test("computeProcessLineageBaselineCandidates: degraded truncated history suppresses a fabricated established-edge alert", async () => {
@@ -336,7 +336,7 @@ test("computeProcessLineageBaselineCandidates: degraded truncated history suppre
     readFactPoints: async () => degradedReadResult(truncatedPoints, tickTs(3)),
   });
 
-  assert.deepEqual(result, [], "untrustworthy retained history must not authorize a novel-edge claim");
+  assert.deepEqual(result.candidates, [], "untrustworthy retained history must not authorize a novel-edge claim");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
 });
@@ -382,14 +382,14 @@ test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor 
     completeTick(tickTs(11), [["shell", "python"]]),
   ]);
   const recoveredTick = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(6) });
-  assert.deepEqual(recoveredTick, [], "the tick that re-establishes trust remains suppressed");
+  assert.deepEqual(recoveredTick.candidates, [], "the tick that re-establishes trust remains suppressed");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, false);
   assert.equal(state.last_folded_ts, tickTs(6), "future facts must not advance the folded watermark");
 
   points = [...points, ...completeTick(tickTs(7), [["shell", "python"]])];
   const resumed = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(7) });
-  assert.equal(resumed.length, 1, "novelty resumes after rollback recovery has been persisted");
+  assert.equal(resumed.candidates.length, 1, "novelty resumes after rollback recovery has been persisted");
 });
 
 test("computeProcessLineageBaselineCandidates (security-sweep F4): an established store with a future/clock-rolled-back last_folded_ts must cold-start, never fire a fabricated novel edge from the shortened post-rollback window", async () => {
@@ -412,7 +412,7 @@ test("computeProcessLineageBaselineCandidates (security-sweep F4): an establishe
     readFactPoints: async () => intactReadResult(points),
   });
 
-  assert.deepEqual(result, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
+  assert.deepEqual(result.candidates, [], "a future/rolled-back watermark must fail closed to cold-start, not trust a shortened post-rollback window");
   const { state } = await loadProcessLineageBaselineStore(paths);
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_since_ts, tickTs(2), "a real anchor must be synthesized at the injected now");
@@ -435,8 +435,8 @@ test("computeProcessLineageBaselineCandidates: intact history control still dete
     readFactPoints: async () => intactReadResult(points),
   });
 
-  assert.equal(result.length, 1, "an intact store must not be falsely suppressed");
-  assert.equal(result[0].diagnostics.entity_key_hash, expectedHash(buildLineageEntityKey("shell", "python")));
+  assert.equal(result.candidates.length, 1, "an intact store must not be falsely suppressed");
+  assert.equal(result.candidates[0].diagnostics.entity_key_hash, expectedHash(buildLineageEntityKey("shell", "python")));
 });
 
 test("computeProcessLineageBaselineCandidates: one transient fact-history loss recovers after clean ticks", async () => {
@@ -455,19 +455,19 @@ test("computeProcessLineageBaselineCandidates: one transient fact-history loss r
 
   points = [...points, ...completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]])];
   const lossTick = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(2) });
-  assert.deepEqual(lossTick, []);
+  assert.deepEqual(lossTick.candidates, []);
 
   readResult = intactReadResult([]);
   points = [...points, ...completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]])];
-  assert.deepEqual(await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
 
   points = [...points, ...completeTick(tickTs(4), [["shell", "node"], ["shell", "python"]])];
-  assert.deepEqual(await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(4) }), []);
+  assert.deepEqual((await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(4) })).candidates, []);
   assert.equal((await loadProcessLineageBaselineStore(paths)).state.cold_start_pending, false);
 
   points = [...points, ...completeTick(tickTs(5), [["shell", "node"], ["shell", "ruby"]])];
   const resumed = await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(5) });
-  assert.equal(resumed.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
+  assert.equal(resumed.candidates.length, 1, "novelty resumes after genuinely-new clean ticks re-establish trust");
 });
 
 test("computeProcessLineageBaselineCandidates: a clean tick cannot self-heal and fire after fact-history loss", async () => {
@@ -483,11 +483,11 @@ test("computeProcessLineageBaselineCandidates: a clean tick cannot self-heal and
     readFactPoints: async () => ({ ...readResult, points }),
   };
 
-  assert.deepEqual(await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(3) }), []);
+  assert.deepEqual((await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(3) })).candidates, []);
   points = [...points, ...completeTick(tickTs(4), [["shell", "node"], ["shell", "python"]])];
   readResult = intactReadResult([]);
   assert.deepEqual(
-    await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(4) }),
+    (await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(4) })).candidates,
     [],
     "the first clean tick after loss may re-establish state but must not emit novelty",
   );
@@ -512,7 +512,7 @@ test("computeProcessLineageBaselineCandidates: a corrupt baseline store forces a
   await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
   await appendFactPoints(paths, flatten([completeTick(tickTs(0)), completeTick(tickTs(1))]), { now: tickTs(1) });
   const control = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(1), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(control, [], "not enough complete history yet -- unrelated to the corruption below");
+  assert.deepEqual(control.candidates, [], "not enough complete history yet -- unrelated to the corruption below");
 
   // Corrupt the persisted baseline store (disk error, partial write, ...).
   const { storeFile } = resolveProcessLineageBaselineStorePaths(paths);
@@ -522,7 +522,7 @@ test("computeProcessLineageBaselineCandidates: a corrupt baseline store forces a
   // while the store read is corrupt this round -> zero claims (fail-closed, pre-existing).
   await appendFactPoints(paths, completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]), { now: tickTs(2) });
   const corruptTick = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(corruptTick, [], "corrupt store this tick fails closed");
+  assert.deepEqual(corruptTick.candidates, [], "corrupt store this tick fails closed");
 
   // Tick N+1: the store has self-healed (the corrupt tick above wrote a valid file back) and
   // facts.jsonl is completely clean. This is exactly the scenario that used to fabricate:
@@ -531,7 +531,7 @@ test("computeProcessLineageBaselineCandidates: a corrupt baseline store forces a
   // It must still be zero: self-healing the store file is not the same as re-establishing trust.
   await appendFactPoints(paths, completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]]), { now: tickTs(3) });
   const nextTick = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(3), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(nextTick, [], "still zero right after self-heal -- not re-established yet, not 0-then-1");
+  assert.deepEqual(nextTick.candidates, [], "still zero right after self-heal -- not re-established yet, not 0-then-1");
 
   const midState = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(midState.cold_start_pending, true, "only 1 of 2 required fresh ticks has accumulated since the reset");
@@ -543,7 +543,7 @@ test("computeProcessLineageBaselineCandidates: a corrupt baseline store forces a
   // the tick after.
   await appendFactPoints(paths, completeTick(tickTs(4), [["shell", "node"], ["shell", "python"]]), { now: tickTs(4) });
   const reestablishingTick = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(4), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(reestablishingTick, []);
+  assert.deepEqual(reestablishingTick.candidates, []);
   const reestablishedState = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(reestablishedState.cold_start_pending, false);
 });
@@ -574,7 +574,7 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
   await settleFactStore(controlPaths, tickTs(2));
   const control = await computeProcessLineageBaselineCandidates(controlPaths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(control.length, 1);
+  assert.equal(control.candidates.length, 1);
 
   // No baseline-store file has ever been written for `paths` -- it is missing, not corrupt.
   const missing = await loadProcessLineageBaselineStore(paths);
@@ -582,13 +582,13 @@ test("computeProcessLineageBaselineCandidates: a missing baseline store with ret
   assert.equal(missing.state.cold_start_pending, true);
 
   const first = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(first, [], "missing store must cold-start, not trust the retained fact-history immediately");
+  assert.deepEqual(first.candidates, [], "missing store must cold-start, not trust the retained fact-history immediately");
 
   // A second call against the SAME unchanged fact window (no genuinely new ticks since the
   // reset) must also stay at zero -- re-establishment needs real new ticks, not repeated
   // queries of the same stale-relative-to-the-loss data.
   const second = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(second, []);
+  assert.deepEqual(second.candidates, []);
 
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
@@ -622,7 +622,7 @@ test("computeProcessLineageBaselineCandidates: a parseable-but-schema-invalid ba
   await appendFactPoints(controlPaths, points, { now: tickTs(2) });
   await settleFactStore(controlPaths, tickTs(2));
   const control = await computeProcessLineageBaselineCandidates(controlPaths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(control.length, 1);
+  assert.equal(control.candidates.length, 1);
 
   // A parseable-but-schema-invalid store: valid JSON, but missing schema_version, counters, and
   // the cold-start anchor entirely -- exactly the shape a hand-edited or foreign file might have.
@@ -632,7 +632,7 @@ test("computeProcessLineageBaselineCandidates: a parseable-but-schema-invalid ba
   await fs.writeFile(storeFile, JSON.stringify({ cold_start_pending: false }), { mode: 0o600 });
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, [], "schema-invalid store must not be trusted -- zero novel-edge claims, not fabricated ones");
+  assert.deepEqual(result.candidates, [], "schema-invalid store must not be trusted -- zero novel-edge claims, not fabricated ones");
 
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
@@ -658,7 +658,7 @@ test("computeProcessLineageBaselineCandidates: an old-format/empty baseline stor
 
   await appendFactPoints(paths, completeTick(tickTs(0)), { now: tickTs(0) });
   const tick0 = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(0), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(tick0, []);
+  assert.deepEqual(tick0.candidates, []);
   const afterTick0 = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(afterTick0.cold_start_pending, true);
   assert.equal(typeof afterTick0.cold_start_since_ts, "string", "anchor must be set on entering cold-start, not left undefined");
@@ -667,7 +667,7 @@ test("computeProcessLineageBaselineCandidates: an old-format/empty baseline stor
   // First genuinely new complete tick strictly after the anchor: not enough yet.
   await appendFactPoints(paths, completeTick(tickTs(1)), { now: tickTs(1) });
   const tick1 = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(1), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(tick1, []);
+  assert.deepEqual(tick1.candidates, []);
   assert.equal((await loadProcessLineageBaselineStore(paths)).state.cold_start_pending, true, "only 1 of 2 required fresh ticks so far");
 
   // Second genuinely new complete tick since the reset satisfies minHistoryTickCount --
@@ -675,14 +675,14 @@ test("computeProcessLineageBaselineCandidates: an old-format/empty baseline stor
   // regains trust), but the store flips cold_start_pending off for the tick after.
   await appendFactPoints(paths, completeTick(tickTs(2)), { now: tickTs(2) });
   const tick2 = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(tick2, []);
+  assert.deepEqual(tick2.candidates, []);
   assert.equal((await loadProcessLineageBaselineStore(paths)).state.cold_start_pending, false, "must ACTUALLY re-establish, not stay stuck forever (not Infinity/never)");
 
   // Sanity: with trust genuinely restored, a subsequent real novel edge fires normally -- the
   // detector is not permanently silenced.
   await appendFactPoints(paths, completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]]), { now: tickTs(3) });
   const tick3 = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(3), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(tick3.length, 1, "trust genuinely restored after re-establishment -- detector works again");
+  assert.equal(tick3.candidates.length, 1, "trust genuinely restored after re-establishment -- detector works again");
 });
 
 test("computeProcessLineageBaselineCandidates: a fully schema-valid established store is trusted immediately -- no regression from the schema-validation fix", async () => {
@@ -719,7 +719,7 @@ test("computeProcessLineageBaselineCandidates: a fully schema-valid established 
   assert.equal(loaded.state.cold_start_pending, false);
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(result.length, 1, "fully-valid established store trusts immediately, same as before the fix");
+  assert.equal(result.candidates.length, 1, "fully-valid established store trusts immediately, same as before the fix");
 });
 
 // TERMINAL fix (gpt-5.6-sol review -- exact-schema pattern): the prior "full schema validation"
@@ -763,7 +763,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol TERMINAL fix -- an es
   await fs.writeFile(storeFile, JSON.stringify(minimalStoreMissingLastFolded), { mode: 0o600 });
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, [], "store missing last_folded_ts must not be trusted -- zero novel-edge claims, not fabricated ones");
+  assert.deepEqual(result.candidates, [], "store missing last_folded_ts must not be trusted -- zero novel-edge claims, not fabricated ones");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_reason, "invalid_store_schema");
@@ -783,7 +783,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol TERMINAL fix -- an es
   await fs.mkdir(controlLocation.dir, { recursive: true, mode: 0o700 });
   await fs.writeFile(controlLocation.storeFile, JSON.stringify(controlStoreWithLastFolded), { mode: 0o600 });
   const controlResult = await computeProcessLineageBaselineCandidates(controlPaths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(controlResult.length, 1, "the identical store WITH last_folded_ts trusts and fires the novel edge");
+  assert.equal(controlResult.candidates.length, 1, "the identical store WITH last_folded_ts trusts and fires the novel edge");
 });
 
 test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a foreign/unknown top-level key is rejected into cold-start", async () => {
@@ -811,7 +811,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a
   await fs.writeFile(storeFile, JSON.stringify(foreignKeyStore), { mode: 0o600 });
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, [], "store with a foreign top-level key must not be trusted");
+  assert.deepEqual(result.candidates, [], "store with a foreign top-level key must not be trusted");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_reason, "invalid_store_schema");
@@ -851,7 +851,7 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- a store with a
   await fs.writeFile(storeFile, JSON.stringify(negativeCounterStore), { mode: 0o600 });
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.deepEqual(result, [], "store with a negative counter must not be trusted");
+  assert.deepEqual(result.candidates, [], "store with a negative counter must not be trusted");
   const state = (await loadProcessLineageBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
   assert.equal(state.cold_start_reason, "invalid_store_schema");
@@ -882,5 +882,98 @@ test("computeProcessLineageBaselineCandidates: gpt-5.6-sol fix -- an exact-valid
   await fs.writeFile(storeFile, JSON.stringify(exactValidStore), { mode: 0o600 });
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
-  assert.equal(result.length, 1, "exact-valid established store trusts and fires -- no regression from the stricter schema check");
+  assert.equal(result.candidates.length, 1, "exact-valid established store trusts and fires -- no regression from the stricter schema check");
+});
+
+// Detector-reported recovery coverage (plan §8.B/§8.C): computeProcessLineageBaselineCandidates now
+// returns { candidates, evaluatedAlertKeys }. evaluatedAlertKeys is the set of alert identities the
+// detector GENUINELY evaluated this tick (every edge it held complete-census knowledge of across
+// the ready window -- whether it fired a candidate OR found it clear), EXCLUDING any tick it could
+// not trustworthily evaluate (cold-start / stale / too-little-history). The daemon recovers a
+// persisted alert only if its identity is reported here, and freezes one that is not -- so a genuine
+// clear MUST report its identity, and an unevaluable tick MUST report none.
+
+test("computeProcessLineageBaselineCandidates (recovery coverage): a genuine clear reports the identity in evaluatedAlertKeys so a persisted alert can recover", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const minHistoryTickCount = 2;
+
+  // Fire tick: shell->python first appears at tick 2, novel against ticks 0-1 -> one candidate.
+  const firePoints = flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
+  ]);
+  const fire = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(firePoints),
+  });
+  assert.equal(fire.candidates.length, 1, "shell->python is novel at tick 2");
+  const firedId = fire.candidates[0].id;
+  assert.ok(fire.evaluatedAlertKeys.includes(firedId), "the edge it fired on was genuinely evaluated this tick");
+
+  // Clear tick: shell->python is now part of the established history (folded in at tick 2), so it is
+  // no longer novel -> no candidate. But the detector still genuinely evaluated it this tick, so its
+  // identity MUST be reported so the daemon recovers the previously-persisted alert (rather than
+  // freezing it forever) -- using the firing tick's OWN candidate .id proves exact identity
+  // alignment with what the daemon would have persisted.
+  const clearPoints = flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
+    completeTick(tickTs(3), [["shell", "node"], ["shell", "python"]]),
+  ]);
+  const clear = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(3),
+    minHistoryTickCount,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(clearPoints),
+  });
+  assert.deepEqual(clear.candidates, [], "shell->python is established now, no longer novel");
+  assert.ok(
+    clear.evaluatedAlertKeys.includes(firedId),
+    "a genuinely-evaluated cleared identity must be reported so the persisted alert can recover",
+  );
+});
+
+test("computeProcessLineageBaselineCandidates (recovery coverage): a stale/unevaluable tick reports NO identities so a persisted alert freezes (never a fabricated recovery)", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const minHistoryTickCount = 2;
+
+  // Established store, intact history with shell->python already folded in -- but the freshest
+  // complete census is 2h old against a 1h freshness window. Nothing is corrupt or lost, so
+  // coldStartPendingThisTick is FALSE here; only the readiness predicate's freshness gate (mirroring
+  // detectNovelProcessLineageEdges' own) makes this tick unevaluable. This is precisely the case
+  // (plan line 99) where coverage derived from the cold-start flag alone would fabricate a recovery:
+  // the sibling predicate must report ZERO identities so any persisted alert freezes instead.
+  const points = flatten([
+    completeTick(tickTs(0)),
+    completeTick(tickTs(1)),
+    completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]]),
+  ]);
+  const result = await computeProcessLineageBaselineCandidates(paths, {
+    now: new Date(Date.parse(tickTs(2)) + 2 * HOUR_MS).toISOString(),
+    minHistoryTickCount,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points),
+  });
+  assert.deepEqual(result.candidates, [], "a stale latest census cannot fire");
+  assert.deepEqual(
+    result.evaluatedAlertKeys,
+    [],
+    "a stale/unevaluable tick must report no coverage -> persisted alert freezes, never a fabricated recovery",
+  );
+  // Pin that it was the readiness (freshness) predicate, NOT cold-start, that zeroed coverage here:
+  // if cold-start were somehow true this assertion would also produce []. This is what makes the
+  // test discriminate the sibling predicate from the cold-start flag (plan line 99).
+  assert.equal(
+    (await loadProcessLineageBaselineStore(paths)).state.cold_start_pending,
+    false,
+    "nothing corrupt/lost -- staleness alone gates this tick, not cold-start",
+  );
 });

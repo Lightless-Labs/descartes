@@ -209,6 +209,46 @@ export function findQualifyingPeerObservations(peerPoints = [], anchor, options 
 }
 
 /**
+ * Detector-reported recovery coverage (§8.B/§8.C, correlation recipe) — the STREAM-WIDE
+ * evaluation-readiness predicate. findQualifyingPeerObservations returns [] for THREE reasons that
+ * today collapse into one `continue` at the call site: (1) overflow (fail-closed, must-fix 5), (2)
+ * insufficient stream history (the must-fix 4 cold-start gate), and (3) a ready stream with no
+ * qualifying peer (a GENUINE non-match). Coverage must tell reason 3 (evaluated-clear) apart from
+ * reasons 1 & 2 (UNEVALUATED). This sibling predicate surfaces that reason by recomputing exactly
+ * the overflow + stream-history gate findQualifyingPeerObservations applies (deliberately duplicated
+ * rather than changing that helper's exported return shape — §7.2's "sibling predicate reusing the
+ * same computation, no detection-logic change"; the agreement is pinned by test). It does NOT
+ * evaluate proximity/odd-hour/novelty — those are the per-observation MATCH, so a ready stream that
+ * matches nothing is an evaluated CLEAR, not an unevaluated skip.
+ */
+export function assessPeerStreamReadiness(peerPoints = [], options = {}) {
+  const minPeerHistoryTickGroups = options.minPeerHistoryTickGroups ?? CORRELATION_MIN_PEER_HISTORY_TICK_GROUPS;
+  const minPeerHistoryDays = options.minPeerHistoryDays ?? CORRELATION_MIN_PEER_HISTORY_DAYS;
+
+  // MUST-FIX 5: any overflow-marker tick undercounts every peer's prior-tick history -> the whole
+  // window is unevaluable (fail closed), mirroring findQualifyingPeerObservations' own early return.
+  const hasOverflowTick = (peerPoints ?? []).some((point) => point?.entity_key === PEER_OVERFLOW_ENTITY_KEY);
+  if (hasOverflowTick) return { ready: false, reason: "overflow" };
+
+  const realPoints = (peerPoints ?? []).filter(
+    (point) =>
+      point?.entity_key !== PEER_OVERFLOW_ENTITY_KEY &&
+      point?.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY &&
+      point?.fact_name === PEER_FACT_NAME,
+  );
+  const distinctTicksOverall = [...new Set(realPoints.map((point) => point.ts))]
+    .map((ts) => ({ ts, ms: tsMs(ts) }))
+    .filter((entry) => entry.ms !== undefined)
+    .sort((a, b) => a.ms - b.ms);
+  const tickGroupCount = distinctTicksOverall.length;
+  const spanDays = tickGroupCount > 1 ? (distinctTicksOverall[tickGroupCount - 1].ms - distinctTicksOverall[0].ms) / DAY_MS : 0;
+  if (tickGroupCount < minPeerHistoryTickGroups || spanDays < minPeerHistoryDays) {
+    return { ready: false, reason: "insufficient_history" };
+  }
+  return { ready: true, reason: "ready" };
+}
+
+/**
  * Ranking + candidate cap (Decision 1, no-storm discipline): at most one candidate is ever
  * emitted per anchor, even when several peer observations qualify -- the qualifying observation
  * with the smallest delta wins, ties broken by lexicographically-smaller entity_key for
@@ -285,14 +325,32 @@ export function buildCorrelationCandidate(anchor, bestPeer, poolSize) {
  * No state file of its own (Decision 1's "re-derives fresh every tick, no new store" note) -- a
  * pure function over already-persisted alert-history/fact-history, recomputed fresh on every call
  * exactly like session-baseline.js's detectSessionChurn.
+ *
+ * Detector-reported recovery coverage (§8.B/§8.C): returns `{ candidates, evaluatedAlertKeys }`.
+ * `candidates` is exactly what this producer emitted before. `evaluatedAlertKeys` is the set of
+ * `alertId(CORRELATION_RULE_ID, fingerprint)` for every persisted correlation identity this
+ * stateless detector GENUINELY evaluated this tick -- expired/orphaned anchors (designed
+ * end-of-life, always clear) plus, when the peer stream is trusted+ready, the per-anchor-prefix
+ * identities under each live anchor (documented exception to exact per-identity matching, §8.C).
+ * Unevaluated cases (gate-off, non-finite clock, untrusted history, overflow, insufficient peer
+ * history) report NO coverage for the affected identities so the daemon freezes rather than
+ * fabricates a recovery.
  */
 export async function computeCorrelationCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
   const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return [];
+  // Detector-reported recovery coverage (§8.B): a gate-off tick evaluated NOTHING -> report empty
+  // coverage, so the daemon freezes every persisted correlation alert rather than fabricating a
+  // recovery from a bare short-circuit.
+  if (!learnedConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const now = options.now ?? new Date().toISOString();
   const nowMs = new Date(now).getTime();
+  // A non-finite clock means the anchor scan below cannot run: treat it as UNEVALUATED (freeze all),
+  // NOT as "anchors.length === 0 => everything expired-clear". Without this guard the new
+  // expiry/orphan branch would fabricate a recovery for every persisted correlation alert whenever
+  // `now` failed to parse (production `now` is always valid; this closes the unevaluated!=clear seam).
+  if (!Number.isFinite(nowMs)) return { candidates: [], evaluatedAlertKeys: [] };
   const lookbackMs = options.lookbackMs ?? DEFAULT_CORRELATION_LOOKBACK_MS;
   const windowMs = options.correlationWindowMs ?? DEFAULT_CORRELATION_WINDOW_MS;
   const oddHours = options.oddHours ?? CORRELATION_ODD_HOURS;
@@ -309,14 +367,45 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
     readFacts(descartesPaths, { now, windowMs: factWindowMs }),
   ]);
 
+  // The correlation alerts persisted from prior ticks (the identities this detector OWNS and may
+  // report evaluated this tick). Skip any row with a non-string fingerprint: it cannot be
+  // prefix-matched and its alertId(rule, fingerprint) would not equal its stored id -- freeze it
+  // (never report a malformed row as clear). This read is AFTER a clean readAlertRecords; whole-file
+  // corruption re-throws (-> failedDetectorLabels), so an empty/expired anchor universe here is
+  // genuinely empty, not lost evidence (§7.5).
+  const persistedCorrelationAlerts = (alertRecords ?? []).filter(
+    (record) => record?.rule_id === CORRELATION_RULE_ID && typeof record.fingerprint === "string",
+  );
+
   const anchors = findKillSideAnchors(alertRecords, { now, lookbackMs });
-  if (anchors.length === 0) return [];
+  const liveAnchorPrefixes = anchors.map((anchor) => `${anchor.fingerprint}__`);
+  const underLiveAnchor = (fingerprint) => liveAnchorPrefixes.some((prefix) => fingerprint.startsWith(prefix));
+
+  const evaluatedAlertKeys = [];
+  // EXPIRY / ORPHAN branch (§7.5 + §8.C's "anchors.length===0 => all clear", GENERALIZED --
+  // documented deviation): a persisted correlation alert whose fingerprint matches NO currently-live
+  // anchor prefix has a kill-side anchor that aged past the 24h lookback -- the alert's DESIGNED
+  // end-of-life. Requiring anchors to still be present makes it IMMORTAL. This is independent of
+  // peer-stream trust/readiness (the join has no live anchor to re-evaluate), so it is reported
+  // BEFORE the trust gate, exactly as the plan's anchors.length===0 short-circuit sat before it.
+  // anchors.length===0 is simply the special case where EVERY persisted correlation alert is orphaned.
+  // Safe under never-fabricate: same trust boundary the anchors===0 rule already accepts (anyone who
+  // can delete a kill-side row from a clean alerts.json could flip the correlation row directly).
+  for (const alert of persistedCorrelationAlerts) {
+    if (!underLiveAnchor(alert.fingerprint)) evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
+  }
+
+  if (anchors.length === 0) {
+    // No live anchor to join against: every persisted correlation alert is already collected as an
+    // orphan above; no peer evaluation is possible or needed.
+    return { candidates: [], evaluatedAlertKeys };
+  }
 
   // Slice 8: this detector is intentionally stateless, so trust is recomputed from the full
   // fact-store read on every call. Omit anchorTs because the correlation joins two observations
   // from the current read window; the helper's stateless path therefore requires an intact
   // completeness status while excluding future loss timestamps relative to this injected nowMs.
-  if (!factHistoryTrustworthy(readResult, { nowMs }).trust) return [];
+  const historyTrusted = factHistoryTrustworthy(readResult, { nowMs }).trust;
 
   // Regression fix (post-Slice-4c): strip the census marker here too, mirroring the realPoints
   // exclusion inside findQualifyingPeerObservations -- the overflow marker is deliberately KEPT
@@ -326,19 +415,39 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
     (point) => point?.fact_name === PEER_FACT_NAME && point?.entity_key !== PEER_CENSUS_MARKER_ENTITY_KEY,
   );
 
+  // The peer stream is genuinely EVALUABLE (per-anchor-prefix coverage §8.C) only when history is
+  // trusted AND the stream cleared the overflow + stream-history gate. Overflow / insufficient-
+  // history / untrusted are UNEVALUATED (freeze the live-anchor identities); a ready stream that
+  // simply matched no peer is a genuine CLEAR that must be reported so a now-quiet correlation can
+  // recover. This is a STREAM-WIDE property (the overflow/history gate is not per-anchor), so it
+  // gates every live anchor identically this tick.
+  const readiness = assessPeerStreamReadiness(peerPoints, { minPeerHistoryTickGroups, minPeerHistoryDays });
+  const liveAnchorsEvaluated = historyTrusted && readiness.ready;
+
   const candidates = [];
-  for (const anchor of anchors) {
-    const qualifying = findQualifyingPeerObservations(peerPoints, anchor, {
-      windowMs,
-      oddHours,
-      noveltyMaxPriorTicks,
-      minPeerHistoryTickGroups,
-      minPeerHistoryDays,
-    });
-    if (qualifying.length === 0) continue;
-    const ranked = rankAndSelectBestPeer(qualifying);
-    if (!ranked) continue;
-    candidates.push(buildCorrelationCandidate(anchor, ranked.best, ranked.poolSize));
+  if (liveAnchorsEvaluated) {
+    // Per-anchor-prefix coverage (deliberate documented exception to exact per-identity matching,
+    // §8.C): the fingerprint bakes in the WINNING peer, so exact identity matching cannot fit the
+    // ready-anchor branch. Instead report every persisted correlation alert id whose fingerprint
+    // startsWith(anchor.fingerprint + "__") for the live anchors we just evaluated -- whether it
+    // re-fired this tick or is a genuine clear.
+    for (const alert of persistedCorrelationAlerts) {
+      if (underLiveAnchor(alert.fingerprint)) evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
+    }
+    for (const anchor of anchors) {
+      const qualifying = findQualifyingPeerObservations(peerPoints, anchor, {
+        windowMs,
+        oddHours,
+        noveltyMaxPriorTicks,
+        minPeerHistoryTickGroups,
+        minPeerHistoryDays,
+      });
+      if (qualifying.length === 0) continue;
+      const ranked = rankAndSelectBestPeer(qualifying);
+      if (!ranked) continue;
+      candidates.push(buildCorrelationCandidate(anchor, ranked.best, ranked.poolSize));
+    }
   }
-  return candidates;
+
+  return { candidates, evaluatedAlertKeys: [...new Set(evaluatedAlertKeys)] };
 }
