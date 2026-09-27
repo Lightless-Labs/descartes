@@ -32,7 +32,7 @@ identity, architecture, and conventions this repo follows.
 - [Operational lifecycle](#operational-lifecycle)
 - [What `triage` does today](#what-triage-does-today)
 - [Local history daemon and deterministic alerts](#local-history-daemon-and-deterministic-alerts)
-- [Self-learning and defensive detection](#self-learning-and-defensive-detection-opt-in-default-off) — [detectors](#defensive-detectors) · [current limits](#current-limits)
+- [Self-learning and defensive detection](#self-learning-and-defensive-detection-watch-by-default-author-opt-in) — [detectors](#defensive-detectors) · [current limits](#current-limits)
 - [Login and model selection](#login-and-model-selection)
 - [JSON output](#json-output)
 - [Safety and privacy invariants](#safety-and-privacy-invariants)
@@ -49,17 +49,18 @@ identity, architecture, and conventions this repo follows.
 |---|---|---|
 | **Triage** | Answers a question about the host. The model leads. The diagnosis uses only read-only evidence envelopes (`actions_taken: []`). | Live |
 | **Local history and alerts** | Keeps a bounded local metric history. Raises alerts on memory, load, disk, and daemon staleness. Uses no LLM. | Live |
-| **Self-learning monitoring** | Mines candidate rules and baselines from the host history. A person must approve each one before it becomes active. | Off by default |
-| **Defensive detection** | Runs novelty detectors, deception canaries, and intrusion signals. See the [detector list](#defensive-detectors). | Off by default |
+| **Structural watching** | Builds local fact history and runs deterministic novelty and statistical detectors. | On by default |
+| **Self-learning authoring** | Mines candidate rules and baselines. A person must approve each one before it becomes active. | Opt-in |
+| **Defensive detection** | Runs novelty detectors, deception canaries, and intrusion signals. See the [detector list](#defensive-detectors). | On by default |
 | **Containment recommendations** | Recommends containment through a local notification. It only recommends. It makes no change. | Off by default |
 | **Evidence freeze** | Makes a read-only forensic evidence bundle. An operator starts it (`descartes incident freeze`). | Live |
 | **Remediation and host actions** | No general action tool exists yet. Descartes changes only its own daemon service and its alert-state files. | Not yet |
 
-The self-learning and defensive detection functions are **off by default**. A detector
-that cannot establish a trustworthy baseline goes quiet instead of guessing, so it never
-fabricates a "first time seen" claim from lost or incomplete history. That is a specific
-guarantee, not a promise against every false positive or every missed attack. See the
-[current limits](#current-limits).
+Structural watching is **on by default**. The authoring and promotion layer stays opt-in.
+A detector that cannot establish a trustworthy baseline goes quiet instead of guessing, so
+it never fabricates a "first time seen" claim from lost or incomplete history. That is a
+specific guarantee, not a promise against every false positive or every missed attack. See
+the [current limits](#current-limits).
 
 ## Status
 
@@ -67,14 +68,16 @@ This is version 0. It has these parts:
 
 - a read-only triage CLI;
 - a local-first alerting daemon with deterministic rules;
-- a self-learning subsystem (off by default).
+- structural watching (on by default);
+- a self-learning authoring and promotion layer (opt-in).
 
-The self-learning subsystem mines rules and baselines from the machine history. It also
-runs defensive detectors: novelty baselines, deception canaries, and intrusion signals. A
-novelty detector that cannot trust its own history goes quiet rather than guessing, so it
-never fabricates a "first time seen" claim. Positive-evidence detectors (credential access,
-canaries) are not gated this way and fire on any matching metadata change, benign or not.
-See [current limits](#current-limits).
+Structural watching builds rules-free fact history and runs defensive detectors: novelty
+baselines, statistical baselines, deception canaries, and intrusion signals. The authoring
+layer mines candidate rules and baselines. A human must review and approve a candidate before
+it becomes active. A novelty detector that cannot trust its own history goes quiet rather than
+guessing, so it never fabricates a "first time seen" claim. Positive-evidence detectors
+(credential access, canaries) are not gated this way and fire on any matching metadata change,
+benign or not. See [current limits](#current-limits).
 
 The durable core will move to Rust over time. The current CLI uses Node.js, because this
 lets the tool ship quickly. The CLI includes the agent harness and the subscription login.
@@ -230,6 +233,8 @@ descartes daemon uninstall
 descartes daemon run --foreground --once      # one collection, for development
 
 descartes history summary                     # short local metric summary, no LLM
+descartes baseline status                     # watch phase for each detector domain
+descartes baseline inspect                   # current established set, recomputed live
 descartes alerts list                         # deterministic local alerts, no LLM
 descartes alerts watch --interval 30s
 descartes alerts ack alert_...
@@ -269,20 +274,36 @@ descartes alerts intelligence enable --max-per-hour 3
 descartes alerts notifications setup --channel desktop
 ```
 
-## Self-learning and defensive detection (opt-in, default off)
+## Self-learning and defensive detection (watch by default, author opt-in)
 
-One kill switch controls this subsystem: `learned.json`. It is off by default. When on,
-Descartes can do these things:
+Structural watching is on by default. It uses `watch.json` and can do these things:
 
 - read its own fact history;
-- mine candidate rules and provenance and identity baselines;
-- run the defensive detectors.
+- run deterministic novelty and statistical detectors;
+- report whether each detector domain is still learning or watching.
 
-Descartes promotes a mined candidate to live monitoring only after a human approval. The
-approval is explicit, single-use, and audited.
+The authoring and promotion layer uses `learned.json`. It stays off until a person enables it.
+It can mine candidate rules and provenance and identity baselines. The two switches are
+independent.
+
+The `baseline` commands report and control structural watching:
 
 ```bash
-descartes learned enable                # turn the subsystem on (off by default)
+descartes baseline status                # show each domain's learning phase
+descartes baseline status --json
+descartes baseline inspect               # show current established sets
+descartes baseline inspect --domain service --json
+descartes baseline enable                # enable structural watching
+descartes baseline disable               # disable structural watching
+```
+
+`baseline inspect` recomputes its answer from the fact-history window. Its answer can differ
+slightly from the daemon's last tick. `descartes alerts watch` remains the live alert tail.
+
+The authoring commands remain separate:
+
+```bash
+descartes learned enable                # enable authoring and promotion
 descartes learned mine                  # mine candidates from the facts
 descartes learned soak                  # shadow test; never alerts on its own
 descartes learned review                # list candidates that wait for approval
@@ -326,7 +347,8 @@ The **fact-store completeness** substrate supports these detectors. It makes the
 fabricate" rule hold. A durable, tamper-aware integrity ledger records whether the fact
 history is complete. So a detector can separate two cases: "I have never seen this" and "I
 cannot trust my history". In the second case, the detector stays quiet. The state `intact`
-needs positive proof. `descartes learned status` shows the current completeness state.
+needs positive proof. `descartes baseline status` shows the watch phase and
+`descartes learned status` shows the authoring state and fact-store completeness.
 
 The **recommend-only containment surface** turns a strong signal into a recommendation, for
 example "throttle, block, or quarantine X". It sends the recommendation through the
@@ -338,9 +360,9 @@ option does not turn on unless `descartes learned enable` is already on.
 
 These are the limits of the defensive layer today:
 
-- **Off by default.** This layer protects nothing until you enable it with
-  `descartes learned enable` and run the daemon. For alerts, you must also turn on
-  notifications.
+- **Watch phase.** Structural watching is on by default. A detector stays quiet until it has
+  enough clean history for a baseline. Use `descartes baseline status` to see each domain.
+  For alerts, you must also turn on notifications.
 - **Cold-start and setup time.** A detector stays quiet until it has enough clean history
   for a baseline. A new install reports nothing. A detector that recovers from a real
   history loss also reports nothing. Recovery after a real loss takes up to the
