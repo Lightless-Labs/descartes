@@ -118,7 +118,7 @@ function killSideAlertRecord(ruleId, firstSeenTs, { severity = "critical", finge
 // detector-reported recovery-coverage tests. Its fingerprint is `${anchorFingerprint}__${peerKey}`
 // exactly as buildCorrelationCandidate constructs it, so the per-anchor-prefix coverage logic keys
 // on it correctly.
-function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active" } = {}) {
+function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active", diagnostics = {} } = {}) {
   return {
     id: alertId(CORRELATION_RULE_ID, fingerprint),
     rule_id: CORRELATION_RULE_ID,
@@ -130,7 +130,7 @@ function correlationAlertRecord(fingerprint, { firstSeenTs, status = "active" } 
     evidence_refs: ["session-baseline", "peer-presence"],
     first_seen: firstSeenTs,
     last_seen: firstSeenTs,
-    diagnostics: {},
+    diagnostics,
   };
 }
 
@@ -806,7 +806,101 @@ test("Recovery coverage (ii) UNEVALUATED: when the peer stream is unevaluable th
   );
 });
 
-test("Recovery coverage — expiry/orphan (generalized anchors===0): a persisted correlation alert whose kill-side anchor has aged past the 24h lookback is reported evaluated-clear even while OTHER anchors remain live, independent of peer-stream trust/readiness (the designed end-of-life; requiring the anchor to persist would make it immortal)", async () => {
+test("Recovery coverage — future-dated source anchor freezes a persisted correlation alert after clock rollback", async () => {
+  const paths = await tempPaths();
+  const liveAnchorTs = dayTs(2, 2);
+  const futureAnchorTs = dayTs(2, 14);
+  const now = dayTs(2, 13);
+  const liveCorr = "global__peer.wireguard.1111111111111111";
+  const futureCorr = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999";
+  await seed(paths, {
+    alerts: [
+      killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs),
+      killSideAlertRecord(SESSION_CHURN_RULE_ID, futureAnchorTs, { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
+      correlationAlertRecord(liveCorr, { firstSeenTs: liveAnchorTs }),
+      correlationAlertRecord(futureCorr, {
+        firstSeenTs: liveAnchorTs,
+        diagnostics: { kill_rule_id: SESSION_CHURN_RULE_ID, anchor_fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" },
+      }),
+    ],
+    now,
+  });
+
+  const result = await computeCorrelationCandidates(paths, {
+    now,
+    readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
+  });
+  assert.ok(
+    !result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, futureCorr)),
+    "a future-dated source anchor is not evaluated and must not authorize correlation recovery",
+  );
+
+  const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
+    now,
+    coveredAlertIds: new Set(result.evaluatedAlertKeys),
+  });
+  assert.equal(applied.alerts.find((alert) => alert.fingerprint === futureCorr)?.status, "active");
+});
+
+test("Recovery coverage — missing or quarantined source anchor freezes a persisted correlation alert", async () => {
+  const cases = [
+    {
+      label: "missing",
+      prepare: async (paths, liveAnchorTs, now) => {
+        await seed(paths, {
+          alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs)],
+          now,
+        });
+      },
+    },
+    {
+      label: "quarantined",
+      prepare: async (paths, liveAnchorTs, now) => {
+        const alertsDir = path.join(paths.stateDir, "alerts");
+        const alertsFile = path.join(alertsDir, "alerts.json");
+        await fs.mkdir(alertsDir, { recursive: true, mode: 0o700 });
+        await fs.writeFile(alertsFile, JSON.stringify({
+          version: 1,
+          alerts: [
+            killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs),
+            killSideAlertRecord(SESSION_CHURN_RULE_ID, "not-a-date", { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
+          ],
+        }));
+      },
+    },
+  ];
+
+  for (const { label, prepare } of cases) {
+    const paths = await tempPaths();
+    const liveAnchorTs = dayTs(2, 2);
+    const now = dayTs(2, 13);
+    const missingCorr = "session.tmux.aaaaaaaaaaaaaaaa__peer.wireguard.9999999999999999";
+    await writeLearnedConfig(paths, { enabled: true });
+    await prepare(paths, liveAnchorTs, now);
+    const existingAlerts = await readAlertRecords(paths);
+    await writeAlertRecords(paths, [
+      ...existingAlerts,
+      correlationAlertRecord(missingCorr, { firstSeenTs: liveAnchorTs }),
+    ]);
+
+    const result = await computeCorrelationCandidates(paths, {
+      now,
+      readFactPoints: async () => completeFactReadResult([], { status: "degraded" }),
+    });
+    assert.ok(
+      !result.evaluatedAlertKeys.includes(alertId(CORRELATION_RULE_ID, missingCorr)),
+      `${label} source anchor must not authorize correlation recovery`,
+    );
+
+    const applied = applyAlertCandidates(await readAlertRecords(paths), result.candidates, {
+      now,
+      coveredAlertIds: new Set(result.evaluatedAlertKeys),
+    });
+    assert.equal(applied.alerts.find((alert) => alert.fingerprint === missingCorr)?.status, "active", label);
+  }
+});
+
+test("Recovery coverage — expiry: a persisted correlation alert whose PRESENT source anchor is older than the 24h lookback is reported evaluated-clear even while OTHER anchors remain live, independent of peer-stream trust/readiness", async () => {
   const paths = await tempPaths();
   const liveAnchorTs = dayTs(2, 2); // still within the 24h lookback of `now`
   const expiredAnchorTs = dayTs(0, 2); // > 24h before `now` -> no longer an anchor
@@ -816,11 +910,12 @@ test("Recovery coverage — expiry/orphan (generalized anchors===0): a persisted
   await seed(paths, {
     alerts: [
       killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, liveAnchorTs), // live "global__" anchor
-      // The churn anchor whose first_seen has aged out is intentionally NOT persisted anymore (or is
-      // simply outside lookback); either way findKillSideAnchors won't surface it, so orphanCorr has
-      // no live prefix.
+      killSideAlertRecord(SESSION_CHURN_RULE_ID, expiredAnchorTs, { fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" }),
       correlationAlertRecord(liveCorr, { firstSeenTs: liveAnchorTs }),
-      correlationAlertRecord(orphanCorr, { firstSeenTs: expiredAnchorTs }),
+      correlationAlertRecord(orphanCorr, {
+        firstSeenTs: expiredAnchorTs,
+        diagnostics: { kill_rule_id: SESSION_CHURN_RULE_ID, anchor_fingerprint: "session.tmux.aaaaaaaaaaaaaaaa" },
+      }),
     ],
     // A degraded/empty peer read: even with the peer stream UNEVALUATED, the orphan must still be
     // reported clear (its clearance is anchor-expiry, not a peer join), while the live-anchor

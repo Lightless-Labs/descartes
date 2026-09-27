@@ -382,22 +382,43 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   const underLiveAnchor = (fingerprint) => liveAnchorPrefixes.some((prefix) => fingerprint.startsWith(prefix));
 
   const evaluatedAlertKeys = [];
-  // EXPIRY / ORPHAN branch (§7.5 + §8.C's "anchors.length===0 => all clear", GENERALIZED --
-  // documented deviation): a persisted correlation alert whose fingerprint matches NO currently-live
-  // anchor prefix has a kill-side anchor that aged past the 24h lookback -- the alert's DESIGNED
-  // end-of-life. Requiring anchors to still be present makes it IMMORTAL. This is independent of
-  // peer-stream trust/readiness (the join has no live anchor to re-evaluate), so it is reported
-  // BEFORE the trust gate, exactly as the plan's anchors.length===0 short-circuit sat before it.
-  // anchors.length===0 is simply the special case where EVERY persisted correlation alert is orphaned.
-  // Safe under never-fabricate: same trust boundary the anchors===0 rule already accepts (anyone who
-  // can delete a kill-side row from a clean alerts.json could flip the correlation row directly).
+  // EXPIRY branch (§7.5 + §8.C): a persisted correlation alert may be clear solely because its
+  // exact source anchor is provably past the lookback. A missing, quarantined, malformed, or
+  // future-dated source anchor is evidence loss, not expiry, so it must remain unevaluated.
+  const expiredSourceAnchor = (correlationAlert) => {
+    const diagnostics = correlationAlert?.diagnostics;
+    const diagnosticRuleId = typeof diagnostics?.kill_rule_id === "string" ? diagnostics.kill_rule_id : undefined;
+    const diagnosticFingerprint = typeof diagnostics?.anchor_fingerprint === "string" ? diagnostics.anchor_fingerprint : undefined;
+    const hasDiagnosticIdentity = diagnosticRuleId !== undefined && diagnosticFingerprint !== undefined;
+
+    const matchingAnchors = (alertRecords ?? []).filter((anchor) => {
+      if (!KILL_SIDE_RULE_IDS.has(anchor?.rule_id)) return false;
+      const anchorFingerprint = typeof anchor.fingerprint === "string" ? anchor.fingerprint : "global";
+      if (hasDiagnosticIdentity) {
+        return anchor.rule_id === diagnosticRuleId && anchorFingerprint === diagnosticFingerprint;
+      }
+      return typeof correlationAlert.fingerprint === "string" && correlationAlert.fingerprint.startsWith(`${anchorFingerprint}__`);
+    });
+
+    // Prefix-only legacy records are safe only when the source identity is unambiguous. The
+    // diagnostic identity on newly emitted candidates avoids this ambiguity when rule fingerprints
+    // overlap across kill-side families.
+    if (matchingAnchors.length !== 1) return false;
+    const firstSeenMs = tsMs(matchingAnchors[0].first_seen);
+    if (firstSeenMs === undefined) return false;
+    const ageMs = nowMs - firstSeenMs;
+    return ageMs >= 0 && ageMs > lookbackMs;
+  };
+
   for (const alert of persistedCorrelationAlerts) {
-    if (!underLiveAnchor(alert.fingerprint)) evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
+    if (!underLiveAnchor(alert.fingerprint) && expiredSourceAnchor(alert)) {
+      evaluatedAlertKeys.push(alertId(CORRELATION_RULE_ID, alert.fingerprint));
+    }
   }
 
   if (anchors.length === 0) {
-    // No live anchor to join against: every persisted correlation alert is already collected as an
-    // orphan above; no peer evaluation is possible or needed.
+    // No live anchor to join against: only persisted identities with a present, provably expired
+    // source anchor were collected above. Missing/future/quarantined sources remain frozen.
     return { candidates: [], evaluatedAlertKeys };
   }
 
