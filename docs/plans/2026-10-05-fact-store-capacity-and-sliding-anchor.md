@@ -1107,6 +1107,6 @@ Each full suite uses fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
 | commit | disposition | tests | pass | product fail | sandbox fail | skipped |
 |---|---|---:|---:|---:|---:|---:|
 | `a5e87ce` | HIGH-1 fixed; sandbox-only failures | 2216 | 2160 | 0 | 22 | 34 |
-| `42cb8df` | MEDIUM fixed; sandbox-only failures | 2217 | 2161 | 0 | 22 | 34 |
+| `55c0103` | MEDIUM fixed; sandbox-only failures | 2216 | 2160 | 0 | 22 | 34 |
 
 The sandbox failures are environment-only: 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. The focused migration, seen-set, and fact-store-status files are green, including the earlier HIGH-2 successful-pass recovery test.
