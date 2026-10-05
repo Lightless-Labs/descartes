@@ -3,6 +3,7 @@
 **Created:** 2026-10-05
 **Status:** PLAN. Awaiting operator decisions (§12) and a pre-build multi-model plan review (Fable code-grounded, daybreak-blue, Astra) per `docs/solutions/2026-09-14-multi-model-review-and-planning-playbook.md`.
 **Reviewed:** 2026-10-05 (adversarial plan review, NEEDS-REVISION(7) → folded)
+**Addendum:** 2026-10-05: S0 grounding (§15), then S1 and S2 built on `feat/fact-store-capacity-2026-10` (§16). The branch awaits G1.
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -709,3 +710,44 @@ The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48
    - a v1 ledger with `bytecap_evicted_total === 0` → v2 with `bytecap_floor_ts: null` (reads intact; T6);
    - a v1 ledger with `bytecap_evicted_total > 0` is **not** migrated. It stays v1, fails validation as `invalid`, and takes the existing continuity-break bootstrap: never intact, never a clean `floor: null`. In the shipped slice S5 quarantines the legacy store before any v2 code reads it, so this only ever governs the never-shipped S2 interim state and tests. **G1 question.**
 5. **T1 on HEAD.** `test/fact-store-lockout-e2e.test.js` drives `runDaemonIteration` for 40 hourly structural ticks, plus half-hour fast ticks from tick 26, using the seeded real-volume generator (`test/fixtures/real-volume-tick.js`: 714 records and ~191 KB per tick, against the real 722 records and 185 KB; it omits `provenance.warning`). The 5 MB store starts evicting at tick index 27, the 28th tick. From tick 28 on, it reports all three legs: every structural and fast history read is `degraded` (Leg A); the service, lineage and persistence anchors re-arm on every tick (Leg B); none of them reports coverage (Leg C). It is committed as `todo` (red) in S0 and flips to a normal test in S2. Runtime is about 29 s.
+
+---
+
+## 16. Addendum: S1 and S2 executed (2026-10-05)
+
+**Addendum:** 2026-10-05. S1 and S2 are built on `feat/fact-store-capacity-2026-10`. Nothing is pushed. Following §7, the branch stops before S3 and **awaits daybreak gate G1**. The full suite passes after every commit (scratch `XDG_*`): 2079 tests, 2045 pass, 0 fail, 34 skipped (the pre-existing platform skips), 0 todo.
+
+**Commits.**
+- `4d5eea1`: S0, plus T1 committed as `todo`.
+- `db7e5a8`: S1, the dedupe.
+- `953027a`: tick-aligned eviction and the suffix assertion (T3, T5 eviction half).
+- `4c11f9f`: ledger v2 and the floor. Includes HIGH-1, MEDIUM-3, plausibility, below-floor eviction and the first-run carve-out (T5 ledger half, T6).
+- `0d1fb80`: read-side exclusion, coverage fields, the F2-Tier1 fold-in, and the T4 oracle.
+- `9f3f510`: byte-cap reclassification. T1 turns green.
+
+**T1 after S2.** It passes. From tick 28 on, the 5 MB store evicts on every structural tick. Even so, the daemon's history read is `intact` on both structural and fast ticks, the service, lineage and persistence detectors stay established with no anchor re-arm, and service, service-appearance, process-lineage and scheduled-job report coverage on every tick. Leg D (count rules can't reach 30 samples at 5 MB) still stands, as expected. T2 covers it after S4.
+
+**Deviations from the plan text (each also stated in code comments and commit messages).**
+1. **Below-floor eviction** (§15.5 decision 2): records with `ts <= floor` are evicted physically and counted as byte-cap. The plan only filtered them on read.
+2. **First-run carve-out for HIGH-1** (§15.5 decision 3): `appendFactPoints` observes before appending. "Non-empty" means `bytes > 0 || record_count > 0`, which is stricter than the plan's `record_count > 0`: a file holding only corrupt lines also counts as non-empty.
+3. **`future_floor`.** A new `degraded_reason`; the read reports status `unknown`. It is the empty-store floor bound (§15.5 decision 1). It takes precedence over the in-window-loss attribution; both outcomes are untrusted.
+4. **`continuity_oldest_ts` is removed from `buildCompleteness`, not just from the operator surfaces** (§4.1 item 6). A test pins that no `src` file other than the ledger writer reads `continuity.oldest_ts`.
+5. **`selectFactStoreCompleteness` reports `coverage: "unknown"`** when there is no read to report (fact history never enabled, or a malformed shape), instead of defaulting to `"full"`.
+6. **T3 is store-level.** Each real per-family record order (service; session with overflow; peer VPN plus Tailscale) is produced by the real translators, and the test asserts that no part of a split tick is physically kept or returned. It makes no detector-candidate assertions: with tick-aligned eviction the store can no longer produce a split tick for a detector to read.
+7. **T4 omits the horizon assertion** (`certifiedHorizonOk`, which is S3). The "blind for at most one window after a fast clock is corrected" property is pinned by a dedicated MEDIUM-3 test rather than inside the oracle. The oracle treats a ledger `generation` change as a new lineage (I8); the T6 tests pin the HIGH-1 stamp separately.
+8. **T5's "ineligible horizon" half is deferred to S3.** S2 asserts coverage `narrowed` and an empty certified span instead.
+9. **S1 removed `canary-baseline.js`'s deliberately independent copy** of the re-arm check. Its own comment called that copy defense-in-depth against a widening of the shared helper. The removal follows §4.1 item 7.
+10. **Test fixtures that used `last_bytecap_evict_ts` as a stand-in loss** (the six detector `degradedReadResult` helpers, plus the shadow and miner "future loss is ignored" tests) now use `last_continuity_break_ts` or `last_corrupt_ts`, so they still exercise a real loss channel. Two tests pinned the old trust semantics; both are rewritten with the reason stated in place:
+    - "byte-cap eviction degrades completeness";
+    - "missing-ledger bootstrap over a pre-existing non-empty store reaches intact".
+
+**G1 questions.**
+1. **Zero-cap or all-evicted status (§7 S2).** Today such a store reads **`unknown`** (fail-closed), not intact. This was established in code, not decided. The root cause is `observeFactContinuity`: it returns `"unknown"` whenever the committed rewrite was empty and records were appended afterwards (`expectedNewest === null`), so a store that is fully evicted on every pass never reaches `continuity_ok: true`.
+   - For it to read intact with coverage `narrowed`, as the plan leans, that continuity rule must change. The argument for changing it: an empty committed prefix makes all live content a pure append.
+   - Consequence if left as is: a family whose per-tick volume exceeds its budget (`cap_below_tick`) is permanently untrusted. That is an over-freeze, never a fabrication. Pinned by a test.
+2. **Empty-store floor bound.** Is the two-layer answer acceptable: a clamp plus loss stamp on every pass, and a fail-closed `future_floor` read in between? The alternative is a new ledger field holding the last committed pass's `nowIso`.
+3. **v1 ledger that has evicted** → continuity-break bootstrap in the S2 interim (never certified). S5 quarantines it in the shipped slice.
+4. **Below-floor eviction counted as byte-cap.** It bumps `bytecap_evicted_total` and `last_bytecap_evict_ts` after a rollback.
+5. **The first-run carve-out**, and its consequence: a crash between the very first append and the first retention pass reads as a 31-day lineage break.
+6. **Removing canary's independent re-arm copy** (deviation 9).
+7. **For the operator (Q1 follow-up):** the S0 budget revision. Service 18, process_lineage 10, scheduled_job 5 and peer 16 MiB, so 65 MiB in total (§15.4). This lands in S4.
