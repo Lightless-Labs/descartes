@@ -15,7 +15,6 @@ import {
   computeServiceAppearanceCandidates,
   computeServiceBaselineCandidates,
   DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT,
-  DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT,
   groupServiceFactsByTick,
   loadServiceAppearanceBaselineStore,
   loadServiceBaselineStore,
@@ -25,7 +24,6 @@ import {
 import {
   computeSessionBaselineCandidates,
   computeWindowedSessionStats,
-  DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT,
   groupSessionFactsByTick,
   loadSessionBaselineStore,
   SESSION_CHURN_RULE_ID,
@@ -36,7 +34,6 @@ import {
   computePeerBaselineCandidates,
   computeWindowedPeerDropStats,
   computeWindowedPeerStats,
-  DEFAULT_PEER_MIN_HISTORY_TICK_COUNT,
   groupPeerFactsByTick,
   loadPeerBaselineStore,
   PEER_COUNT_DROP_RULE_ID,
@@ -258,7 +255,6 @@ const DOMAIN_DEFINITIONS = [
     domain: "service",
     family: "service",
     group: groupServiceFactsByTick,
-    required: DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT,
     producers: [
       { label: "service", compute: computeServiceBaselineCandidates, loadKey: "loadServiceBaselineStore", load: loadServiceBaselineStore, writeKey: "writeServiceBaselineStore", freshness: true, rules: [SERVICE_DISAPPEARED_RULE_ID] },
       { label: "service-appearance", compute: computeServiceAppearanceCandidates, loadKey: "loadServiceAppearanceBaselineStore", load: loadServiceAppearanceBaselineStore, writeKey: "writeServiceAppearanceBaselineStore", freshness: true, rules: [SERVICE_APPEARED_RULE_ID] },
@@ -268,7 +264,6 @@ const DOMAIN_DEFINITIONS = [
     domain: "session",
     family: "session",
     group: groupSessionFactsByTick,
-    required: DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT,
     producers: [
       { label: "session", compute: computeSessionBaselineCandidates, loadKey: "loadSessionBaselineStore", load: loadSessionBaselineStore, writeKey: "writeSessionBaselineStore", freshness: false, rules: [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID] },
     ],
@@ -277,7 +272,6 @@ const DOMAIN_DEFINITIONS = [
     domain: "peer",
     family: "peer",
     group: groupPeerFactsByTick,
-    required: DEFAULT_PEER_MIN_HISTORY_TICK_COUNT,
     producers: [
       { label: "peer", compute: computePeerBaselineCandidates, loadKey: "loadPeerBaselineStore", load: loadPeerBaselineStore, writeKey: "writePeerBaselineStore", freshness: false, rules: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID] },
     ],
@@ -286,7 +280,6 @@ const DOMAIN_DEFINITIONS = [
     domain: "scheduled-job",
     family: "scheduled_job",
     group: groupScheduledJobFactsByTick,
-    required: DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
     producers: [
       { label: "scheduled-job", compute: computeScheduledJobBaselineCandidates, loadKey: "loadPersistenceBaselineStore", load: loadPersistenceBaselineStore, writeKey: "writePersistenceBaselineStore", freshness: true, rules: [SCHEDULED_JOB_APPEARED_RULE_ID] },
     ],
@@ -295,7 +288,6 @@ const DOMAIN_DEFINITIONS = [
     domain: "process-lineage",
     family: "process_lineage",
     group: groupProcessLineageFactsByTick,
-    required: DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
     producers: [
       { label: "process-lineage", compute: computeProcessLineageBaselineCandidates, loadKey: "loadProcessLineageBaselineStore", load: loadProcessLineageBaselineStore, writeKey: "writeProcessLineageBaselineStore", freshness: true, rules: [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID] },
     ],
@@ -539,9 +531,10 @@ function buildDomainReports(inputs) {
     const pendingEntries = runs.map((run) => run.entry).filter((entry) => entry?.state?.cold_start_pending);
     const watchingCount = rules.filter((rule) => rule.watching).length;
     const phases = [...new Set(rules.map((rule) => rule.phase))];
+    // L2: when no rule watches and their gates differ, name every gate (not just the first rule's).
     const phase = phases.length === 1
       ? phases[0]
-      : watchingCount > 0 ? `partially watching — ${watchingCount} of ${rules.length} rules` : rules[0].phase;
+      : watchingCount > 0 ? `partially watching — ${watchingCount} of ${rules.length} rules` : `not watching — ${phases.join("; ")}`;
     return {
       domain: definition.domain,
       family: definition.family,
@@ -638,7 +631,10 @@ function renderFamilyLine(family) {
 function renderStatus(report) {
   const lines = [`Structural watching: ${report.watch_config.enabled ? "enabled" : "disabled"}`];
   for (const domain of report.domains) {
-    const reason = domain.cold_start_reason ? ` (${domain.cold_start_reason})` : "";
+    // L5: the cold-start reason only beside a domain with a rule that is actually cold-start pending
+    // (a never-created store is "not observed", not learning; the JSON keeps cold_start_reason).
+    const pendingRule = (domain.rules ?? []).some((rule) => rule.gate === "cold_start_pending");
+    const reason = domain.cold_start_reason && pendingRule ? ` (${domain.cold_start_reason})` : "";
     lines.push(`- ${domain.domain}: ${domain.phase}${reason}`);
     if (report.watch_config.enabled) {
       for (const rule of domain.rules) {

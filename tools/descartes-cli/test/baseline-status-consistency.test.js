@@ -562,6 +562,29 @@ test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick
   assert.equal(unreadable.daemon_record.status, "unreadable");
 });
 
+test("L2: a domain whose rules are stopped by different gates names every gate, not just the first", { timeout: 120_000 }, async () => {
+  const paths = await tempPaths("mixed-gates");
+  await writeLearnedConfig(paths, { enabled: true });
+  await seedLockedOutLegacyStore(paths);
+  const rig = scenarioRig();
+  for (let hour = 0; hour <= 7; hour += 1) await rig.structural(paths, hour);
+  // service.appeared is horizon-short since the upgrade (novelty memory certified from h0, 48 h
+  // horizon); losing the disappearance store re-arms that rule's lockout.
+  await fs.rm(resolveServiceBaselineStorePaths(paths).storeFile);
+  const nowIso = iso(BASE_MS + 7.5 * HOUR_MS);
+  const status = await buildBaselineStatus(paths, { now: nowIso });
+  const service = status.domains.find((domain) => domain.domain === "service");
+  const phases = service.rules.map((rule) => rule.phase);
+  assert.equal(new Set(phases).size, 2, `precondition: two different phases (${phases})`);
+  assert.ok(service.rules.every((rule) => !rule.watching), "precondition: no service rule watches");
+  assert.equal(service.phase, `not watching — ${phases.join("; ")}`);
+  const human = [];
+  const { runBaseline } = await import("../src/baseline.js");
+  await runBaseline(paths, ["status"], { output: (line) => human.push(line), now: nowIso });
+  // L5: the cold-start reason is shown, because a service rule IS cold-start pending.
+  assert.match(human[0], /- service: not watching — .*\(/);
+});
+
 test("M3: the recorded structural interval is used only within the daemon's own profile bounds, and its source is shown", async () => {
   const paths = await tempPaths("interval-bounds");
   const rig = scenarioRig();

@@ -65,6 +65,9 @@ test("baseline status renders human and JSON forms", async () => {
   assert.match(human.values[0], /service: not observed \(no store\)/);
   assert.match(human.values[0], /service\.disappeared: not observed \(no store\)/);
   assert.match(human.values[0], /process-lineage: not observed \(no store\)/);
+  // L5: the cold-start reason is rendered only beside a rule that is actually cold-start pending; a
+  // store that was never created is not "learning" (the JSON keeps cold_start_reason).
+  assert.doesNotMatch(human.values[0], /initial_baseline/);
 
   const json = capture();
   await runBaseline(paths, ["status", "--json"], { output: json.output, now: "2026-09-27T12:00:00.000Z" });
