@@ -306,6 +306,26 @@ test("T8 config floor: resolveFactStoreBudgets rejects a value below the horizon
   for (const value of [undefined, null, [], "x"]) assert.deepEqual(resolveFactStoreBudgets(value).budgets, Object.fromEntries(FAMILY_DEFAULT_BUDGET_BYTES));
 });
 
+// G2 L3: the T8 invariant counts TICKS, so it depends on the structural interval, which is
+// operator-settable. Below 1 h more ticks fit in a horizon and the floor scales up; above 1 h it is
+// held at the 1 h figure (never loosened).
+test("G2 L3: the T8 floor is computed at the structural interval -- scaled up below 1 h, never below the 1 h figure", () => {
+  const MIN = 60 * 1000;
+  for (const family of FAMILY_HORIZON_MAX_MS.keys()) {
+    const hourly = familyBudgetFloorBytes(family);
+    assert.equal(familyBudgetFloorBytes(family, { structuralIntervalMs: HOUR }), hourly);
+    assert.equal(familyBudgetFloorBytes(family, { structuralIntervalMs: 15 * MIN }), Math.ceil((FAMILY_HORIZON_MAX_MS.get(family) / (15 * MIN)) * FAMILY_TICK_SHAPES.get(family).worstTickBytes * 1.25));
+    assert.ok(familyBudgetFloorBytes(family, { structuralIntervalMs: 15 * MIN }) > hourly);
+    assert.equal(familyBudgetFloorBytes(family, { structuralIntervalMs: 2 * HOUR }), hourly, "a slower interval never lowers the floor");
+    for (const bad of [0, -1, Number.NaN, Infinity, "60000"]) assert.equal(familyBudgetFloorBytes(family, { structuralIntervalMs: bad }), hourly);
+  }
+  // The reviewer's case: a 15-minute interval leaves the default peer budget below the invariant
+  // (~106 worst-case ticks, ~26 h, under the 30 h count-rule horizon and the 72 h correlation one).
+  assert.ok(FAMILY_DEFAULT_BUDGET_BYTES.get("peer") < familyBudgetFloorBytes("peer", { structuralIntervalMs: 15 * MIN }));
+  // network/provenance have no horizon: their floor stays the default at any interval.
+  assert.equal(familyBudgetFloorBytes("network", { structuralIntervalMs: MIN }), FAMILY_DEFAULT_BUDGET_BYTES.get("network"));
+});
+
 test("T12 routing: groupFactPointsByFamily routes by fact_name and THROWS on an unregistered name (whole batch, before anything is returned)", () => {
   const grouped = groupFactPointsByFamily([
     { fact_name: "service.presence", entity_key: "a" },

@@ -172,6 +172,27 @@ test("G2 L1: a network or provenance store above its budget reads retention_fail
   assert.equal(families.canary.bytes, undefined, "a never-created store the daemon does not read (canary: learned off) reports no size");
 });
 
+// G2 L3: at a structural interval below 1 h the default budgets hold fewer HOURS than their family's
+// longest horizon; that is reported per family, not left to the horizon-short signal alone.
+test("G2 L3: a budget below the T8 invariant at the configured structural interval is reported as horizon_invariant_unmet; at 1 h, or once raised, it is not", async () => {
+  const MIN = 60 * 1000;
+  const fastProfile = { ...structuralProfile(), structural: { interval_ms: 15 * MIN, collectors: { services: { enabled: true } } } };
+  const hourly = await tick(await tempPaths(), 0);
+  for (const family of FACT_FAMILY_IDS) assert.equal(hourly.status.fact_store_budgets.families[family].horizon_invariant_unmet, undefined, `${family} at 1 h`);
+
+  const paths = await tempPaths();
+  const peerFloor = familyBudgetFloorBytes("peer", { structuralIntervalMs: 15 * MIN });
+  await writeWatchConfig(paths, { enabled: true, fact_store_budgets: { peer: peerFloor } });
+  const result = await tick(paths, 0, { profile: fastProfile });
+  const { families } = result.status.fact_store_budgets;
+  assert.deepEqual(families.session.horizon_invariant_unmet, { required_bytes: familyBudgetFloorBytes("session", { structuralIntervalMs: 15 * MIN }), structural_interval_ms: 15 * MIN });
+  assert.ok(families.service.horizon_invariant_unmet, "the default service budget is short at 15 min too");
+  assert.equal(families.peer.budget_bytes, peerFloor);
+  assert.equal(families.peer.horizon_invariant_unmet, undefined, "raised to the 15-minute floor: met");
+  assert.equal(families.network.horizon_invariant_unmet, undefined, "no horizon, no invariant");
+  assert.equal(result.status.fact_store_completeness.families.service.horizon_invariant_unmet, true, "carried on the completeness entry");
+});
+
 test("status: a family store that was never created is `absent` (not observed), never 'unknown'", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: false });

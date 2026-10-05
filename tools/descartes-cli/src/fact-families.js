@@ -323,13 +323,23 @@ export const FAMILY_HORIZON_MAX_MS = buildFamilyHorizonMax();
  * family's certified span, but never below its longest eligibility horizon (§5 N4). Families with no
  * history-dependent rule (network, provenance) have no horizon to protect: their floor is their
  * default budget, so an operator value can only RAISE it (S4 deviation, G2 question).
+ *
+ * G2 L3: the invariant counts structural TICKS, and the structural interval is operator-settable
+ * (profile.structural.interval_ms, any positive number). `structuralIntervalMs` computes it at that
+ * interval: below 1 h more ticks fall inside a horizon, so the floor scales up; at or above 1 h (or
+ * for a missing/invalid value) it is the 1 h figure -- a slower interval never loosens it. The
+ * defaults and the config floor are still sized at 1 h; the daemon reports a budget below the
+ * interval's floor as `horizon_invariant_unmet` rather than silently going horizon-short.
  */
-export function familyBudgetFloorBytes(family) {
+export function familyBudgetFloorBytes(family, { structuralIntervalMs } = {}) {
   requireFactFamily(family);
   const horizonMs = FAMILY_HORIZON_MAX_MS.get(family);
   const shape = FAMILY_TICK_SHAPES.get(family);
   if (horizonMs === undefined || shape === undefined) return FAMILY_DEFAULT_BUDGET_BYTES.get(family);
-  return Math.ceil((horizonMs / BUDGET_STRUCTURAL_INTERVAL_MS) * shape.worstTickBytes * BUDGET_INVARIANT_HEADROOM);
+  const intervalMs = typeof structuralIntervalMs === "number" && Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
+    ? Math.min(structuralIntervalMs, BUDGET_STRUCTURAL_INTERVAL_MS)
+    : BUDGET_STRUCTURAL_INTERVAL_MS;
+  return Math.ceil((horizonMs / intervalMs) * shape.worstTickBytes * BUDGET_INVARIANT_HEADROOM);
 }
 
 for (const family of FACT_FAMILY_IDS) {

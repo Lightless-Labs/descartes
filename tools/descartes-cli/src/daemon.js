@@ -1391,6 +1391,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // (no I/O otherwise). Per family:
   //   - budget_bytes / source / floor_bytes, and `rejected` ({reason: budget_below_horizon_floor |
   //     invalid}) when watch.json's value was refused;
+  //   - `horizon_invariant_unmet` ({required_bytes, structural_interval_ms}) when the effective budget is
+  //     below the T8 invariant at this tick's structural interval (G2 L3: below 1 h it scales up);
   //   - last_tick_bytes and `cap_below_tick` (live per-tick volume above the effective budget: the
   //     family is fully evicted every tick), from this structural tick, carried across fast ticks;
   //   - retention_error with retention_error_since_ts (carried while it keeps failing, cleared by a
@@ -1429,6 +1431,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         floor_bytes: familyBudgetFloorBytes(family),
         ...(budgetResolution.rejected[family] ? { rejected: budgetResolution.rejected[family] } : {}),
       };
+      // G2 L3: the T8 invariant at THIS tick's structural interval (operator-settable). Below 1 h the
+      // same bytes hold fewer hours, so a budget sized at 1 h can leave the family permanently
+      // horizon-short; say so here instead of leaving the horizon-short signal as the only sign.
+      const intervalFloorBytes = familyBudgetFloorBytes(family, { structuralIntervalMs });
+      if (budgetBytes < intervalFloorBytes) entry.horizon_invariant_unmet = { required_bytes: intervalFloorBytes, structural_interval_ms: structuralIntervalMs };
       const prior = priorOf(family);
       let lastTickBytes;
       let retentionError;
@@ -1476,6 +1483,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         if (!budget) continue;
         entry.budget_bytes = budget.budget_bytes;
         if (budget.cap_below_tick) entry.cap_below_tick = true;
+        if (budget.horizon_invariant_unmet) entry.horizon_invariant_unmet = true;
         if (budget.retention_error) entry.retention_error = budget.retention_error;
         if (budget.retention_failing) entry.retention_failing = true;
         const shortSince = Object.entries(historyHorizonShort?.rules ?? {})

@@ -1009,3 +1009,15 @@ Final code commit `708e379`: **2196 tests, 2162 pass, 0 fail, 34 skipped, 0 todo
 
 **Confirmed.** The oversize check used `familyHistoryReads.get(family).bytes`. `historyFamilies` comes from `RULE_HORIZONS`, which names neither network nor provenance, so for those two families `bytes` was never set and only the 24-interval timer could raise `retention_failing`. Deviation 8's "(network/provenance: above budget)" was untrue as built. For any family without a history read this tick, the status block now sizes the store with `factStoreFileBytes` (`fact-store.js`: one `stat`, no read or parse; `undefined` when the file is absent or cannot be stat'ed). It runs only inside the tier-on block, so a disabled install still does no I/O. Network and provenance have no pinned worst tick, so their threshold is the budget itself. `fact_store_budgets.families.<f>.bytes` is now reported for them too. Test: `fact-store-status.test.js` "G2 L1" grows a network store above its 4 MiB budget between structural ticks; the next fast tick reports `bytes` and `retention_failing`, and an in-budget provenance store and a never-created canary store do not.
 
+### 20.4 L3: the T8 floor assumed a 1 h structural interval (reported, not auto-scaled)
+
+**Confirmed.** `familyBudgetFloorBytes` divided by the constant `BUDGET_STRUCTURAL_INTERVAL_MS` (1 h). `profile.structural.interval_ms` accepts any positive number (`validateDaemonProfile`). At 15 minutes, the default 16 MiB peer store holds about 106 worst-case ticks, about 26 h. That is below the 30 h count-rule horizon and the 72 h correlation horizon, so those rules are permanently horizon-short, and the horizon-short signal was the only sign of it.
+
+**Fix.** `familyBudgetFloorBytes(family, { structuralIntervalMs })` computes the invariant at `min(interval, 1 h)`. Below 1 h the floor scales up (4x at 15 minutes). A slower interval, or a missing or invalid value, keeps the 1 h figure, so the floor never loosens. The daemon's `fact_store_budgets` entry reports `horizon_invariant_unmet: {required_bytes, structural_interval_ms}` when the effective budget is below the floor at the running interval. The family's `fact_store_completeness` entry carries `horizon_invariant_unmet: true`.
+
+**Deliberately not done.** Defaults are not auto-raised and the config floor is not moved:
+- Auto-scaling the defaults to a 15-minute interval would make the default service budget about 4x larger, and T9's read-cost bound is modelled only at the 1 h defaults. Section 4.5's decision rule says to stop and escalate rather than take that cost silently.
+- Raising the config floor to the interval figure would reject an operator's raise that still falls short, and fall back to an even smaller default. That is worse than accepting the raise and reporting it.
+
+The operator restores the invariant by raising `fact_store_budgets`. Tests cover the floor at 15 minutes, 1 h and 2 h and on invalid input (`fact-families.test.js` "G2 L3"), and the status entry at 1 h, at 15 minutes, and after a raise (`fact-store-status.test.js` "G2 L3"). Auto-scaling is left as G2 question 2 (§20.7).
+
