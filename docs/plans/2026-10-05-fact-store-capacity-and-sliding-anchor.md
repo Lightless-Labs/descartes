@@ -999,7 +999,7 @@ Final code commit `708e379`: **2196 tests, 2162 pass, 0 fail, 34 skipped, 0 todo
 
 **Tests.** `novelty-seen-set.test.js` covers five kinds of legacy evidence (marker, garbled marker, legacy `facts.jsonl` left after a failed quarantine, `seen-sets/`, stray tmp file). For each it checks that `certified_since_ts` and `scope_ts` equal the first pass, and that the rule is ineligible at +47 h and eligible at +48 h. It also covers a seen-set lost after the upgrade, which re-seeds at the pass time, and the fresh-install guard. **T10** moves its novelty bound to the horizons. Within 8 ticks the lockout clears on all four watch-tier stores and `service.disappeared` evaluates. From tick 1 the three novelty rules are horizon-short with `since_ts` = tick 0, both on `history_horizon_short` and on each family's `horizon_short_since`, and they evaluate nothing. The fixed signal is active by tick 33 and names all three rules. On the final reads, each seen-set is valid, certified from tick 0 and scoped to tick 0; each rule is ineligible 1 ms before its Q2 horizon and eligible at it.
 
-**Not covered (pre-existing, unchanged).** If a whole family store directory is deleted on a host that never had a legacy store, it still re-bootstraps as a genuine first run. No evidence of the lost history survives in that case.
+**Not covered (pre-existing, unchanged).** If a whole family store directory is deleted on a host that never had a legacy store, it still re-bootstraps as a genuine first run. No evidence of the lost history survives in that case. The same holds if a same-UID process deletes `learned/facts-legacy.json` (and every legacy item): later `null` re-seeds then get fresh-install semantics. This is the same trust class as §19.5 Q4 and the `integrity_level` caveat; a same-UID process can delete the seen-set or the ledger outright too.
 
 ### 20.2 L2: the no-fact-I/O tests only checked the service store (fixed)
 
@@ -1056,5 +1056,7 @@ Every run used fresh scratch `XDG_*` directories (`mktemp -d`). Baseline before 
 | `d8fd52d` | L2 | 2203 | 2169 | 0 | 34 |
 | `cb654c0` | L1 | 2204 | 2170 | 0 | 34 |
 | `d5f38de` | L3 | 2206 | 2172 | 0 | 34 |
-| (L4, this commit) | L4 + §20.5-§20.8 | see the final state in HANDOFF | | | |
+| `fe91927` | L4 + §20.5-§20.8 | 2208 | 2174 | 0 | 34 |
+
+Final state: **2208 tests, 2174 pass, 0 fail, 34 skipped.** Next: the daybreak G2 re-gate, with §18.5, §19.5 (Q3 still open) and §20.7.
 

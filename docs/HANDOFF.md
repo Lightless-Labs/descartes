@@ -2,7 +2,17 @@
 
 **Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity S4 + S5 built; awaiting daybreak G2 (2026-10-05)
+## Current continuity — fact-store capacity S4 + S5 built; daybreak G2 NEEDS-REWORK folded; awaiting G2 re-gate (2026-10-05)
+
+**G2 rework (plan §20):** the G2 review found 1 HIGH and 5 LOWs; 5 were fixed and 1 rejected.
+- **H1** `ae282c8`: an upgraded install's novelty seen-set is now certified only from its first pass, because the legacy history was quarantined. Novelty is reported horizon-short for 48 h / 6 d after an upgrade, instead of making a 30-day "new" claim. T10's bound has moved to the horizons.
+- **L2** `d8fd52d`: the no-fact-I/O tests now assert that `learned/facts/` is absent.
+- **L1** `cb654c0`: network/provenance oversize is checked via `stat`.
+- **L3** `d5f38de`: the T8 floor is computed at the structural interval, and `horizon_invariant_unmet` is reported.
+- **L4** `fe91927`: a configured budget above 4x the default is clamped and reported as `budget_above_ceiling`.
+- **L5** rejected: the seam is unreachable in production, like the ~100 other injection keys. §19.5 Q3 stays open.
+
+Full suite on `fe91927`: 2208 tests, 2174 pass, 0 fail, 34 skipped. **Next:** daybreak G2 re-gate, with §20.7's new questions.
 
 Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged. Plan: `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md` (§19 is the S4/S5 execution record, deviations and G2 questions; §18 is S3/S3b).
 
