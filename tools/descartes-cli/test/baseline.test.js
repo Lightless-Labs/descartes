@@ -15,7 +15,11 @@ import { loadWatchConfig, resolveWatchStorePaths, writeWatchConfig } from "../sr
 import { writeDaemonStatus } from "../src/history-store.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { computePeerBaselineCandidates, writePeerBaselineStore } from "../src/peer-baseline.js";
-import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
+import {
+  PEER_COUNT_DROP_RULE_ID,
+  PEER_COUNT_SPIKE_RULE_ID,
+  PEER_COUNT_VPN_FINGERPRINT,
+} from "../src/peer-baseline.js";
 
 // ---------------------------------------------------------------------------------------------
 // A1 (2026-10 calibration review) fixtures: status-vs-detector consistency. `baseline status` must
@@ -308,8 +312,8 @@ for (const scenario of A1_SCENARIOS) {
             [SESSION_CHURN_RULE_ID]: alertId(SESSION_CHURN_RULE_ID, "session.tmux.0000000000000000"),
           }
         : {
-            [PEER_COUNT_SPIKE_RULE_ID]: alertId(PEER_COUNT_SPIKE_RULE_ID, "global"),
-            [PEER_COUNT_DROP_RULE_ID]: alertId(PEER_COUNT_DROP_RULE_ID, "global"),
+            [PEER_COUNT_SPIKE_RULE_ID]: alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT),
+            [PEER_COUNT_DROP_RULE_ID]: alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT),
           };
       for (const [ruleId, key] of Object.entries(ruleKeys)) {
         assert.equal(

@@ -29,6 +29,7 @@ import {
   computeWindowedPeerStats,
   groupPeerFactsByTick,
   PEER_COUNT_DROP_RULE_ID,
+  peerCountFingerprintForAvailabilitySignature,
   PEER_COUNT_SPIKE_RULE_ID,
   loadPeerBaselineStore,
 } from "./peer-baseline.js";
@@ -233,6 +234,7 @@ function sessionRuleReadiness(groups, points, nowMs, freshnessMs) {
 function peerRuleReadiness(groups, entries, nowMs, freshnessMs) {
   const spike = computeWindowedPeerStats(groups);
   const drop = computeWindowedPeerDropStats(groups);
+  const currentFingerprint = peerCountFingerprintForAvailabilitySignature(groups.at(-1)?.availabilitySignature);
   const spikeReady = spike.confidence_state === "established" && isFiniteFreshObservation(spike.last_observation, nowMs, freshnessMs);
   const dropObservation = drop.last_observation;
   const anchorTs = entries[0]?.state?.cold_start_since_ts;
@@ -255,8 +257,8 @@ function peerRuleReadiness(groups, entries, nowMs, freshnessMs) {
       ...(dropReady ? [PEER_COUNT_DROP_RULE_ID] : []),
     ],
     evaluatedAlertKeys: [
-      ...(spikeReady ? [alertId(PEER_COUNT_SPIKE_RULE_ID, "global")] : []),
-      ...(dropReady ? [alertId(PEER_COUNT_DROP_RULE_ID, "global")] : []),
+      ...(spikeReady ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : []),
+      ...(dropReady ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : []),
     ],
   };
 }

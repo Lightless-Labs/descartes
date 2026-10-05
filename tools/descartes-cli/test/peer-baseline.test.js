@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { alertId } from "../src/alert-store.js";
+import { alertId, applyAlertCandidates } from "../src/alert-store.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
 import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
@@ -14,6 +14,8 @@ import {
   DEFAULT_PEER_DEVIATION_SIGMA,
   DEFAULT_PEER_MIN_SAMPLE_COUNT,
   DEFAULT_PEER_STDDEV_FLOOR,
+  PEER_COUNT_MARKERLESS_FINGERPRINT,
+  PEER_COUNT_VPN_FINGERPRINT,
   PEER_COUNT_DROP_RULE_ID,
   PEER_COUNT_SPIKE_RULE_ID,
   PEER_SIGNATURE_INVALID,
@@ -1018,7 +1020,7 @@ test("candidate shape matches the existing extraCandidates sources (buildCountDr
   const spike = candidates.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spike);
   assert.equal(typeof spike.id, "string");
-  assert.equal(spike.fingerprint, "global");
+  assert.equal(spike.fingerprint, PEER_COUNT_MARKERLESS_FINGERPRINT);
   assert.equal(typeof spike.title, "string");
   assert.equal(typeof spike.summary, "string");
   assert.equal(typeof spike.diagnostics, "object");
@@ -1530,7 +1532,7 @@ test("computePeerBaselineCandidates coverage: a GENUINE clear (both directions e
   const { candidates, evaluatedAlertKeys } = await seedAndCompute(paths, flatTicks);
   assert.deepEqual(
     [...evaluatedAlertKeys].sort(),
-    [alertId(PEER_COUNT_SPIKE_RULE_ID, "global"), alertId(PEER_COUNT_DROP_RULE_ID, "global")].sort(),
+    [alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT), alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT)].sort(),
     "both directions were genuinely evaluated (established, clear) -- both identities must be reported so a persisted alert of either kind can recover",
   );
   assert.deepEqual(candidates, [], "a genuine clear produces no candidate");
@@ -1574,8 +1576,8 @@ test("computePeerBaselineCandidates coverage: a tick where spike is established+
     "established",
     "sanity: windowedDrop IS established this tick, so the drop key's absence below is dropRecoveryReady doing its job, not ordinary Welford warm-up",
   );
-  const spikeKey = alertId(PEER_COUNT_SPIKE_RULE_ID, "global");
-  const dropKey = alertId(PEER_COUNT_DROP_RULE_ID, "global");
+  const spikeKey = alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT);
+  const dropKey = alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT);
   assert.equal(
     evaluatedAlertKeys.includes(dropKey),
     false,
@@ -1600,8 +1602,8 @@ test("A2: a STALE latest peer tick emits no peer.count_spike / peer.count_drop a
   dropTicks.push(...activeTickWithMarker(tickTs(30), 1));
   const freshNow = new Date(Date.parse(tickTs(30)) + HOUR_MS).toISOString();
   const staleNow = new Date(Date.parse(tickTs(30)) + 4 * HOUR_MS).toISOString();
-  const spikeKey = alertId(PEER_COUNT_SPIKE_RULE_ID, "global");
-  const dropKey = alertId(PEER_COUNT_DROP_RULE_ID, "global");
+  const spikeKey = alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT);
+  const dropKey = alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT);
 
   const freshSpike = await seedAndCompute(await tempPaths(), spikeTicks, { now: freshNow });
   assert.equal(freshSpike.candidates.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1, "control: fresh spike fires");
@@ -1616,6 +1618,81 @@ test("A2: a STALE latest peer tick emits no peer.count_spike / peer.count_drop a
       assert.equal(result.evaluatedAlertKeys.includes(dropKey), false);
     }
   }
+});
+
+test("R8 identity migration: a legacy global peer alert freezes under VPN-only evaluation, while the v2 identity raises and clears normally", async () => {
+  const legacyKey = alertId(PEER_COUNT_SPIKE_RULE_ID, "global");
+  const vpnKey = alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT);
+  const legacyAlert = {
+    id: legacyKey,
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    fingerprint: "global",
+    severity: "warning",
+    title: "Peer count deviation",
+    summary: "legacy alert",
+    diagnostics: {},
+    evidence_refs: ["peer-baseline"],
+    status: "active",
+    first_seen: tickTs(0),
+    last_seen: tickTs(30),
+    last_notified: null,
+    cooldown_until: null,
+    acknowledged_at: null,
+  };
+
+  const stablePaths = await tempPaths();
+  const stableTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    stableTicks.push(...activeTickWithMarker(tickTs(i), 2));
+    stableTicks.push(...tailscalePoints(tickTs(i), [tailscalePeer(`${i}-a`), tailscalePeer(`${i}-b`)]));
+  }
+  const stableTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  stableTicks.push(...activeTickWithMarker(stableTs, 2));
+  stableTicks.push(...tailscalePoints(stableTs, Array.from({ length: 40 }, (_, i) => tailscalePeer(`stable-burst-${i}`))));
+  const stable = await seedAndCompute(stablePaths, stableTicks, { now: stableTs });
+  assert.equal(stable.evaluatedAlertKeys.includes(legacyKey), false, "legacy global identity must never be covered by the new detector");
+  assert.equal(stable.evaluatedAlertKeys.includes(vpnKey), true, "the VPN-only source universe is genuinely evaluated");
+  const legacyMerge = applyAlertCandidates([legacyAlert], stable.candidates, {
+    now: stableTs,
+    coveredAlertIds: new Set(stable.evaluatedAlertKeys),
+  });
+  assert.equal(legacyMerge.alerts.find((alert) => alert.id === legacyKey)?.status, "active", "legacy global alert must freeze until acknowledged");
+
+  const spikePaths = await tempPaths();
+  const spikeTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    spikeTicks.push(...activeTickWithMarker(tickTs(i), 2));
+    spikeTicks.push(...tailscalePoints(tickTs(i), [tailscalePeer(`${i}-a`), tailscalePeer(`${i}-b`)]));
+  }
+  const spikeTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  spikeTicks.push(...activeTickWithMarker(spikeTs, 8));
+  spikeTicks.push(...tailscalePoints(spikeTs, Array.from({ length: 40 }, (_, i) => tailscalePeer(`spike-burst-${i}`))));
+  const spike = await seedAndCompute(spikePaths, spikeTicks, { now: spikeTs });
+  const newCandidate = spike.candidates.find((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(newCandidate?.fingerprint, PEER_COUNT_VPN_FINGERPRINT, "new R8 semantics must raise under a new source-scoped identity");
+  let alerts = applyAlertCandidates([], spike.candidates, {
+    now: spikeTs,
+    coveredAlertIds: new Set(spike.evaluatedAlertKeys),
+  }).alerts;
+  assert.equal(alerts.find((alert) => alert.id === vpnKey)?.status, "active");
+
+  let clear;
+  for (let i = 1; i <= 40; i += 1) {
+    const ts = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + i);
+    await appendFactPoints(spikePaths, [
+      ...activeTickWithMarker(ts, 8),
+      ...tailscalePoints(ts, Array.from({ length: 40 }, (_, peerIndex) => tailscalePeer(`steady-${i}-${peerIndex}`))),
+    ], { now: ts });
+    clear = await computePeerBaselineCandidates(spikePaths, { now: ts });
+    if (!clear.candidates.some((candidate) => candidate.id === vpnKey)) break;
+  }
+  assert.ok(clear, "expected at least one clear evaluation");
+  assert.equal(clear.candidates.some((candidate) => candidate.id === vpnKey), false, "the new source-scoped spike must eventually clear");
+  alerts = applyAlertCandidates(alerts, clear.candidates, {
+    now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 40),
+    coveredAlertIds: new Set(clear.evaluatedAlertKeys),
+  }).alerts;
+  assert.equal(alerts.find((alert) => alert.id === vpnKey)?.status, "recovered");
 });
 
 test("computePeerBaselineCandidates calls the real (default) loadWatchConfig when not injected -- watch.json defaults to enabled:true (the inversion of learned.json's old enabled:false), so a fresh state dir now proceeds PAST the gate and reaches real I/O, returning [] only for lack of history (cold-start), not a kill switch", async () => {

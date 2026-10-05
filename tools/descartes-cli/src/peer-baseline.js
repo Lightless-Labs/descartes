@@ -47,6 +47,19 @@ export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
 // Slice 4c (observed-incident collectors plan) — the sign-flipped mirror of PEER_COUNT_SPIKE_RULE_ID.
 export const PEER_COUNT_DROP_RULE_ID = "peer.count_drop";
 
+// R8 identity migration: the count input is no longer one undifferentiated global peer universe.
+// Marker-backed ticks are signed by the VPN census and therefore count only VPN-source peers;
+// markerless ticks retain the legacy all-peer count. Version both identities so a persisted alert
+// created under the old global semantics can never be recovered by a differently-scoped detector.
+export const PEER_COUNT_VPN_FINGERPRINT = "v2:vpn";
+export const PEER_COUNT_MARKERLESS_FINGERPRINT = "v2:markerless";
+
+export function peerCountFingerprintForAvailabilitySignature(availabilitySignature) {
+  return availabilitySignature === undefined
+    ? PEER_COUNT_MARKERLESS_FINGERPRINT
+    : PEER_COUNT_VPN_FINGERPRINT;
+}
+
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
 // chosen to unblock shipping v0, NOT tuned values; peer-count variance dynamics are a fresh,
 // untuned surface. Independently named (NOT imported from session-baseline.js), even though the
@@ -652,7 +665,7 @@ export function computeWindowedPeerDropStats(groups, { stddevFloor = DEFAULT_PEE
  * constant exists only as a named placeholder for a future critical tier, to be tuned alongside the
  * other PROVISIONAL constants (and gated behind a min-absolute-spike guard) if v0's data warrants.
  */
-export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA } = {}) {
+export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA, fingerprint = PEER_COUNT_MARKERLESS_FINGERPRINT } = {}) {
   if (state?.confidence_state !== "established") return undefined;
   const obs = state.last_observation;
   if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
@@ -667,9 +680,9 @@ export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_
     confidence_state: state.confidence_state,
   });
   return {
-    id: alertId(PEER_COUNT_SPIKE_RULE_ID, "global"),
+    id: alertId(PEER_COUNT_SPIKE_RULE_ID, fingerprint),
     rule_id: PEER_COUNT_SPIKE_RULE_ID,
-    fingerprint: "global",
+    fingerprint,
     // MUST-FIX 1: capped at "warning" unconditionally — never "critical" in v0.
     severity: "warning",
     title: "Peer count deviation",
@@ -692,7 +705,7 @@ export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_
  * DEFAULT_PEER_CRITICAL_SIGMA (already inert for peer.count_spike) is reused as the same
  * future-facing placeholder here too.
  */
-export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA } = {}) {
+export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA, fingerprint = PEER_COUNT_MARKERLESS_FINGERPRINT } = {}) {
   if (state?.confidence_state !== "established") return undefined;
   const obs = state.last_observation;
   if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
@@ -707,9 +720,9 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_D
     confidence_state: state.confidence_state,
   });
   return {
-    id: alertId(PEER_COUNT_DROP_RULE_ID, "global"),
+    id: alertId(PEER_COUNT_DROP_RULE_ID, fingerprint),
     rule_id: PEER_COUNT_DROP_RULE_ID,
-    fingerprint: "global",
+    fingerprint,
     // Decision 0 (plan pinned), mirrors peer.count_spike's own MUST-FIX-1 cap: severity is
     // HARDCODED "warning" -- never escalates to "critical" in v0, regardless of z magnitude.
     // Peer-count variance dynamics remain an untuned PROVISIONAL surface for BOTH directions.
@@ -928,17 +941,18 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // marker-complete one. A stale scored tick freezes that direction (no candidate, no coverage).
   const spikeFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
   const dropFresh = isFreshTs(windowedDrop.last_observation?.ts, nowMs, freshnessMs);
+  const currentFingerprint = peerCountFingerprintForAvailabilitySignature(currentGroups.at(-1)?.availabilitySignature);
   const spikeCandidate = spikeFresh
     ? buildCountSpikeCandidate(
       { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-      { deviationSigma },
+      { deviationSigma, fingerprint: currentFingerprint },
     )
     : undefined;
   if (spikeCandidate) candidates.push(spikeCandidate);
   const dropCandidate = dropFresh
     ? buildCountDropCandidate(
       { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
-      { deviationSigma },
+      { deviationSigma, fingerprint: currentFingerprint },
     )
     : undefined;
   // count_drop needs marker-complete history, unlike count_spike. BASE-complete markerless
@@ -964,7 +978,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // -- EXCLUDING anything it could not evaluate (cold-start already returned above; per-direction
   // warm-up / drop-readiness gated off here). The daemon freezes any owned identity NOT reported
   // (never fabricates a recovery) and recovers a genuinely-cleared one that IS reported. Both
-  // directions are singletons keyed on fingerprint "global".
+  // directions are keyed on the current source universe, never on the legacy "global" identity.
   //   - spike: evaluated iff its windowed baseline is "established" (Welford warm-up satisfied for
   //     the current regime). Reported regardless of whether the spike candidate fired.
   //   - drop: evaluated iff its OWN windowed baseline is "established" AND dropRecoveryReady --
@@ -975,10 +989,10 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const evaluatedAlertKeys = [];
   //   - both: additionally only when the scored tick is FRESH (A2) -- a stale tick is not evaluated.
   if (spikeFresh && windowed.confidence_state === "established") {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, "global"));
+    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint));
   }
   if (dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady) {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, "global"));
+    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint));
   }
   return { candidates, evaluatedAlertKeys };
 }
