@@ -88,12 +88,34 @@ function fakeElevatedOptions({ statOverrides = trustedHelperFixture(), helperPat
 const SOCKET_TARGET = Object.freeze({ kind: "socket", protocol: "tcp", port: 8080, inode: "424242", uid: 1000 });
 const PRIMARY = Object.freeze({ uid: 1000, protocol: "tcp", inode: "424242" });
 
-function validHelperStdout({ port, protocol = "tcp", inode = "424242", holders = 1, pid = 4242, tgid = pid, startTime = 123, uid = 1000, executablePath = "/opt/svc/bin/app", command = "app", argv } = {}) {
+function validHelperStdout({ port, protocol = "tcp", inode = "424242", holders = 1, pid = 4242, tgid = pid, startTime = 123, uid = 1000, executablePath = "/opt/svc/bin/app", command = "app", argv, argvTruncated = false } = {}) {
   return JSON.stringify({
     requested: { protocol, port, inode },
-    resolved: { pid, tgid, start_time: startTime, uid, executable_path: executablePath, argv: argv ?? command.split(" "), holders },
+    resolved: { pid, tgid, start_time: startTime, uid, executable_path: executablePath, argv: argv ?? command.split(" "), ...(argvTruncated ? { argv_truncated: true } : {}), holders },
   });
 }
+
+test("parseAndVerifyHelperResponse propagates cmdline truncation as incomplete evidence", () => {
+  const parsed = parseAndVerifyHelperResponse(validHelperStdout({ port: 8080, argv: ["app", "partial"], argvTruncated: true }), { ...SOCKET_TARGET });
+  assert.equal(parsed.argv_truncated, true);
+  assert.equal(parsed.args_redaction.truncated, true);
+  assert.equal(parsed.args_redaction.reason, "cmdline_truncated");
+});
+
+test("resolveCrossUidPortResult keeps cmdline truncation visible in the resolved evidence", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets: [] }, fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, argvTruncated: true }) }),
+  }));
+  assert.equal(outcome.resolvedStatus, "ok");
+  assert.equal(outcome.result.resolved.command_truncated, true);
+  assert.equal(outcome.result.resolved.command_truncation_reason, "cmdline_truncated");
+  assert.equal(outcome.result.resolved.args_redaction.truncated, true);
+  assert.equal(outcome.result.resolved.args_redaction.reason, "cmdline_truncated");
+});
 
 // ---------------------------------------------------------------------------------------------
 // 1/2. Two-condition AND gate: config.elevated.enabled===true AND probe available:true. Both

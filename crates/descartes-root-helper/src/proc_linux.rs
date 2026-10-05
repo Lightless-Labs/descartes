@@ -100,7 +100,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     let executable_identity = procfs::stat_at(pid_dir, "exe")
         .map(|identity| (identity.device, identity.inode))
         .map_err(|_| IdentityFailure::UnreadableExe)?;
-    let argv = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
+    let (argv, argv_truncated) = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
     // Bind the argv to the executable generation observed before it. A process can exec while
     // retaining its pid and socket; the path check catches a different target and the dev+ino
     // check catches an atomically replaced binary at the same path. Socket resolution retries the
@@ -121,6 +121,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
         uid,
         executable_path,
         argv,
+        argv_truncated,
     })
 }
 
@@ -505,14 +506,23 @@ fn read_exe(pid_dir: BorrowedFd<'_>) -> Option<String> {
 /// kernel thread, or a zombie mid-reap) is a valid identity component when the executable link is
 /// readable. The JSON boundary preserves these elements so downstream redaction cannot mistake
 /// spaces inside one argument for separate argv values. Reads relative to `pid_dir`.
-fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<Vec<String>> {
-    let raw = procfs::read_file_at(pid_dir, "cmdline").ok()?;
-    Some(decode_cmdline(&raw))
+fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<(Vec<String>, bool)> {
+    let (raw, truncated) = procfs::read_file_at_bounded(pid_dir, "cmdline", 65_536).ok()?;
+    Some((decode_cmdline(&raw), truncated))
 }
 
 fn decode_cmdline(raw: &[u8]) -> Vec<String> {
-    raw.split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = raw.split(|&b| b == 0).collect::<Vec<_>>();
+    // A complete proc cmdline has one framing NUL after the final argv element. Remove only that
+    // terminator; empty elements inside argv (including an empty argv[0]) remain observable.
+    if raw.last() == Some(&0) {
+        parts.pop();
+    }
+    parts
+        .into_iter()
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect()
 }
@@ -571,8 +581,12 @@ mod tests {
 
     #[test]
     fn blank_cmdline_is_not_an_identity_read_failure_when_exe_is_available() {
-        assert_eq!(decode_cmdline(b"\0\0"), Vec::<String>::new());
+        assert_eq!(decode_cmdline(b"\0\0"), vec!["", ""]);
         assert_eq!(decode_cmdline(b"app\0--serve\0"), vec!["app", "--serve"]);
+        assert_eq!(
+            decode_cmdline(b"app\0\0--serve\0"),
+            vec!["app", "", "--serve"]
+        );
     }
 
     #[test]

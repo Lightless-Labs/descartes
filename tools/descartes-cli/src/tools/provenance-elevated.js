@@ -293,11 +293,19 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   if (tgid === undefined || startTime === undefined) return undefined;
   const executablePath = typeof resolved.executable_path === "string" ? resolved.executable_path : undefined;
   if (!Array.isArray(resolved.argv) || resolved.argv.some((arg) => typeof arg !== "string")) return undefined;
+  if (resolved.argv_truncated !== undefined && typeof resolved.argv_truncated !== "boolean") return undefined;
+  const argvTruncated = resolved.argv_truncated === true;
   const redaction = redactAndBoundProcessArgv(resolved.argv);
   const command = redaction.value;
 
   const out = { pid, uid, executable_path: executablePath, command };
-  Object.defineProperty(out, "args_redaction", { value: redaction, enumerable: false });
+  Object.defineProperty(out, "args_redaction", {
+    value: argvTruncated
+      ? { ...redaction, truncated: true, reason: "cmdline_truncated" }
+      : redaction,
+    enumerable: false,
+  });
+  Object.defineProperty(out, "argv_truncated", { value: argvTruncated, enumerable: false });
   Object.defineProperties(out, {
     tgid: { value: tgid, enumerable: false },
     start_time: { value: startTime, enumerable: false },
@@ -409,6 +417,7 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
     uid: parsed.uid,
     executablePath: parsed.executable_path,
     command: parsed.command,
+    ...(parsed.argv_truncated === true ? { argv_truncated: true } : {}),
     mechanism: attemptedMechanism,
   };
   if (parsed.holders !== undefined) success.holders = parsed.holders;

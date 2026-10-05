@@ -49,6 +49,7 @@ pub struct Resolved {
     pub uid: u32,
     pub executable_path: String,
     pub argv: Vec<String>,
+    pub argv_truncated: bool,
 }
 
 /// Escapes `input` for embedding inside a JSON string literal (the literal's surrounding quotes
@@ -117,8 +118,13 @@ pub fn emit_response(requested: Requested, resolved: &Resolved, holders: Option<
         })
         .collect::<Vec<_>>()
         .join(",");
+    let argv_truncated = if resolved.argv_truncated {
+        ",\"argv_truncated\":true"
+    } else {
+        ""
+    };
     format!(
-        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"tgid\":{},\"start_time\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"argv\":[{argv}]{holders_field}}}}}",
+        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"tgid\":{},\"start_time\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"argv\":[{argv}]{argv_truncated}{holders_field}}}}}",
         resolved.pid, resolved.tgid, resolved.start_time, resolved.uid,
     )
 }
@@ -208,6 +214,7 @@ mod tests {
             uid: 997,
             executable_path: "/opt/svc/bin/app".to_string(),
             argv: vec!["app".to_string(), "--serve".to_string()],
+            argv_truncated: false,
         };
         let target = crate::socket::SocketTarget {
             protocol: crate::socket::Protocol::Tcp,
@@ -249,6 +256,7 @@ mod tests {
             uid: 0,
             executable_path: "/x".to_string(),
             argv: vec!["x".to_string()],
+            argv_truncated: false,
         };
         let target = crate::socket::SocketTarget {
             protocol: crate::socket::Protocol::Udp6,
@@ -272,6 +280,7 @@ mod tests {
             uid: 0,
             executable_path: "/bin/sh".to_string(),
             argv: vec!["sh".to_string()],
+            argv_truncated: false,
         };
         let emitted = emit_response(Requested::Pid(99), &resolved, None);
         let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
@@ -281,5 +290,22 @@ mod tests {
             parsed["resolved"].get("holders").is_none(),
             "pid responses keep the pre-2026-10 shape"
         );
+    }
+
+    #[test]
+    fn emit_response_marks_a_truncated_cmdline_explicitly() {
+        let resolved = Resolved {
+            pid: 99,
+            tgid: 99,
+            start_time: 1,
+            executable_identity: (1, 1),
+            uid: 0,
+            executable_path: "/bin/sh".to_string(),
+            argv: vec!["sh".to_string()],
+            argv_truncated: true,
+        };
+        let emitted = emit_response(Requested::Pid(99), &resolved, None);
+        let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+        assert_eq!(parsed["resolved"]["argv_truncated"], true);
     }
 }

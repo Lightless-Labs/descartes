@@ -1001,10 +1001,12 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       command: elevatedCommand,
       args_redaction: {
         redacted: elevatedCommandRedaction.redacted,
-        truncated: elevatedCommandRedaction.truncated,
+        truncated: elevatedCommandRedaction.truncated || upgrade.argv_truncated === true,
         original_length: elevatedCommandRedaction.original_length,
         max_length: elevatedCommandRedaction.max_length,
+        ...(upgrade.argv_truncated === true ? { reason: "cmdline_truncated" } : {}),
       },
+      ...(upgrade.argv_truncated === true ? { command_truncated: true, command_truncation_reason: "cmdline_truncated" } : {}),
       // Always the trusted, unprivileged-derived owning uid — never the helper's self-report.
       user: { uid: primary.uid, username: undefined, username_unavailable: true },
     },
