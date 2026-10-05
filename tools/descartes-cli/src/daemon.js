@@ -12,6 +12,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPointsByFamily, readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.js";
 import { combineFamilyCompleteness } from "./fact-store-integrity.js";
+import { migrateLegacyFactStore } from "./fact-store-migration.js";
 import {
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
@@ -956,6 +957,26 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
+  // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
+  // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
+  // delete quarantines older than 31 days. Fact I/O only when a tier is on (no I/O when disabled).
+  // Never fatal: a failure is reported on the status record and the move resumes next tick (into the
+  // same directory). The per-family stores themselves start fresh by construction (M2, I8).
+  let factStoreLegacy;
+  if (configSnapshot.watch.enabled || configSnapshot.learned.enabled) {
+    const migrate = options.migrateLegacyFactStore ?? migrateLegacyFactStore;
+    try {
+      const migration = await migrate(descartesPaths, { now: nowMs });
+      if (migration && (migration.status !== "none" || migration.deleted?.length > 0 || migration.pending?.length > 0 || migration.marker)) {
+        factStoreLegacy = migration;
+      }
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)) || "unknown legacy fact-store migration error";
+      console.warn(`[daemon] legacy fact-store quarantine failed this tick (${message}); it is never read, and the move resumes next tick`);
+      factStoreLegacy = { status: "error", error: message };
+    }
+  }
+
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
   // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
@@ -1467,6 +1488,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
     ...(factStoreBudgetsStatus ? { fact_store_budgets: factStoreBudgetsStatus } : {}),
+    ...(factStoreLegacy ? { fact_store_legacy: factStoreLegacy } : {}),
     ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
     ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
