@@ -92,7 +92,8 @@ pub fn open_pid_dir(pid: u32) -> io::Result<OwnedFd> {
 
 /// Opens `/proc` itself as a directory fd (2026-10). Used for the top-level pid listing
 /// (`read_dir_entries_at(root, ".")`) and the `net/<protocol>` socket tables
-/// (`read_file_at_bounded(root, "net/tcp", ..)`) so `proc_linux.rs` needs no `std::fs` at all:
+/// (`open_dir_at(root, "net")` then `read_file_at_bounded(net, "tcp", ..)`) so `proc_linux.rs`
+/// needs no `std::fs` at all:
 /// std's `read_to_string`/`read_dir` paths issue statx/fstat (and glibc's opendir an O_NONBLOCK
 /// open), none of which the tightened seccomp policy admits.
 pub fn open_proc_root() -> io::Result<OwnedFd> {
@@ -370,8 +371,9 @@ mod tests {
             read_dir_entries_at(root.as_fd(), ".", 1 << 20).expect("/proc must be listable");
         let own = std::process::id().to_string();
         assert!(entries.iter().any(|e| e.to_str() == Some(own.as_str())));
+        let net = open_dir_at(root.as_fd(), "net").expect("/proc/net must open");
         let (tcp, truncated) =
-            read_file_at_bounded(root.as_fd(), "net/tcp", 16 << 20).expect("net/tcp must read");
+            read_file_at_bounded(net.as_fd(), "tcp", 16 << 20).expect("net/tcp must read");
         assert!(
             String::from_utf8_lossy(&tcp).starts_with("  sl"),
             "header row expected"

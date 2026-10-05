@@ -384,7 +384,12 @@ mod tests {
     /// socket), filtering on `state` when given.
     fn inode_for(protocol: Protocol, port: u16, state: Option<&str>) -> u64 {
         let root = procfs::open_proc_root().expect("/proc must open");
-        let (bytes, _) = procfs::read_file_at_bounded(root.as_fd(), protocol.net_table(), 1 << 24)
+        let net_dir = procfs::open_dir_at(root.as_fd(), "net").expect("/proc/net must open");
+        let table = protocol
+            .net_table()
+            .strip_prefix("net/")
+            .expect("socket protocol table must be relative to /proc/net");
+        let (bytes, _) = procfs::read_file_at_bounded(net_dir.as_fd(), table, 1 << 24)
             .expect("socket table must read");
         let text = String::from_utf8_lossy(&bytes);
         for line in text.lines().skip(1) {
