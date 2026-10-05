@@ -132,6 +132,38 @@ test("T12: a persistently failing retention pass surfaces retention_error with a
   assert.equal(healed.status.fact_store_budgets.families.service.retention_failing, undefined);
 });
 
+test("G2 HIGH-2: carried retention failure stays fixed-alert-active across fast ticks and recovers only after a successful structural pass", async () => {
+  const paths = await tempPaths();
+  const failingPersist = async (descartesPaths, points, options) => {
+    const result = await appendFactPointsByFamily(descartesPaths, points, options);
+    return {
+      ...result,
+      families: { ...result.families, service: { ...result.families.service, retention_error: "simulated persistent retention failure" } },
+      retention_error: "service: simulated persistent retention failure",
+    };
+  };
+
+  const structuralFailure = await tick(paths, 0, { appendFactPoints: failingPersist });
+  const alertId = "daemon.fact_store.retention_failing";
+  const firstAlert = structuralFailure.alerts.alerts.find((alert) => alert.rule_id === alertId);
+  assert.ok(firstAlert, "the structural retention failure must raise a fixed alert");
+  assert.equal(firstAlert.fingerprint, "service");
+  assert.equal(firstAlert.status, "active");
+  assert.equal(structuralFailure.status.state, "error");
+
+  const fast = await tick(paths, 0.5);
+  const carriedAlert = fast.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
+  assert.ok(carriedAlert, "the carried persisted retention failure must remain visible on a fast tick");
+  assert.equal(carriedAlert.status, "active");
+  assert.equal(fast.status.state, "error", "carried retention failure must not fabricate daemon health ok");
+
+  const recovered = await tick(paths, 1);
+  const recoveredAlert = recovered.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
+  assert.equal(recoveredAlert?.status, "recovered", "only a successful structural retention pass may recover the fixed alert");
+  assert.equal(recovered.status.fact_store_budgets.families.service.retention_error, undefined);
+  assert.equal(recovered.status.state, "ok");
+});
+
 test("T12: a store larger than its budget by more than one worst-case tick reads retention_failing at once", async () => {
   const paths = await tempPaths();
   await tick(paths, 0);

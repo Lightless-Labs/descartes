@@ -1417,6 +1417,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       note: "the single fact-store cap is replaced by per-family budgets (watch.json fact_store_budgets, each at or above its horizon floor); this value no longer sizes any store",
     }));
   let factStoreBudgetsStatus;
+  let carriedRetentionFailure = false;
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const priorFamilies = (await readPriorStatusOnce())?.fact_store_budgets?.families;
     const priorOf = (family) => {
@@ -1444,13 +1445,26 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       let lastTickBytes;
       let retentionError;
       let retentionSince;
+      let retentionFailing = false;
       if (structuralFamilies) {
         const result = structuralFamilies[family];
+        const retentionPassSucceeded = result && typeof result === "object" && !Array.isArray(result)
+          && Object.prototype.hasOwnProperty.call(result, "retention")
+          && result.append_error === undefined;
         if (Number.isSafeInteger(result?.appended_bytes) && result.written_count > 0) lastTickBytes = result.appended_bytes;
         if (typeof result?.retention_error === "string" && result.retention_error) {
           retentionError = result.retention_error;
           const priorSinceMs = typeof prior.retention_error_since_ts === "string" && prior.retention_error ? Date.parse(prior.retention_error_since_ts) : Number.NaN;
           retentionSince = Number.isFinite(priorSinceMs) && priorSinceMs <= nowMs ? new Date(priorSinceMs).toISOString() : new Date(nowMs).toISOString();
+        } else if (!retentionPassSucceeded) {
+          // A structural tick that did not return this family's successful retention result (for
+          // example an append error or an injected whole-pass failure) has no authority to clear a
+          // carried failure. Recovery is granted only by a genuinely completed family pass.
+          if (typeof prior.retention_error === "string" && prior.retention_error && typeof prior.retention_error_since_ts === "string") {
+            retentionError = prior.retention_error;
+            retentionSince = prior.retention_error_since_ts;
+          }
+          retentionFailing = prior.retention_failing === true;
         }
       } else {
         if (Number.isSafeInteger(prior.last_tick_bytes)) lastTickBytes = prior.last_tick_bytes;
@@ -1458,6 +1472,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           retentionError = prior.retention_error;
           retentionSince = prior.retention_error_since_ts;
         }
+        retentionFailing = prior.retention_failing === true;
       }
       if (lastTickBytes !== undefined) {
         entry.last_tick_bytes = lastTickBytes;
@@ -1475,7 +1490,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
       const failingFor = retentionSince !== undefined && nowMs - Date.parse(retentionSince) >= HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs;
       const oversize = Number.isSafeInteger(readBytes) && readBytes > budgetBytes + (FAMILY_TICK_SHAPES.get(family)?.worstTickBytes ?? 0);
-      if (failingFor || oversize) entry.retention_failing = true;
+      if (failingFor || oversize || retentionFailing) entry.retention_failing = true;
+      if (entry.retention_error || entry.retention_failing === true) carriedRetentionFailure = true;
       families[family] = entry;
     }
     factStoreBudgetsStatus = { families, ...(budgetResolution.unknown_families ? { unknown_families: budgetResolution.unknown_families } : {}) };
@@ -1508,7 +1524,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const retentionError = combineErrors(write.retention_error, structuralFacts?.retention_error);
   const statusRecord = {
     ts,
-    state: collectorHasError || storageWriteError || retentionError ? "error" : "ok",
+    state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure ? "error" : "ok",
     mode: options.mode ?? "foreground",
     profile,
     collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),

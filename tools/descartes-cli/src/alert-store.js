@@ -73,6 +73,7 @@ export const FIXED_ALERT_RULE_IDS = new Set([
   // Fact-store capacity plan §4.2/I12 (step S3): HISTORY_HORIZON_SHORT_RULE_ID (fact-families.js),
   // kept as a literal here like its siblings; alert-store.test.js pins the two equal.
   "daemon.fact_history.horizon_short",
+  "daemon.fact_store.retention_failing",
 ]);
 
 // Detector-reported recovery coverage (§8.A): coverage is now keyed on alert IDENTITY
@@ -172,6 +173,33 @@ export function evaluateAlertRules(historySummary, daemonStatus, options = {}) {
           rule_ids: overdue.map(({ ruleId }) => ruleId).join(","),
           oldest_since_ts: new Date(Math.min(...overdue.map(({ sinceMs }) => sinceMs))).toISOString(),
           threshold_ms: horizonThresholdMs,
+        },
+      });
+    }
+  }
+
+  // Fact-store capacity plan §4.3 / G2 HIGH-2: retention failures are durable family state, not a
+  // one-tick structural-only condition. The daemon carries each family's retention_error or
+  // retention_failing block through fast ticks, so evaluate this fixed rule from the persisted
+  // status on every tick. One alert identity per family prevents a service failure from hiding or
+  // recovering a peer/network failure, and a clean structural pass removes the family's candidate.
+  const retentionFamilies = daemonStatus?.fact_store_budgets?.families;
+  if (retentionFamilies && typeof retentionFamilies === "object" && !Array.isArray(retentionFamilies)) {
+    for (const family of Object.keys(retentionFamilies).sort()) {
+      const entry = retentionFamilies[family];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      if (!(typeof entry.retention_error === "string" && entry.retention_error) && entry.retention_failing !== true) continue;
+      pushCandidate(candidates, {
+        rule_id: "daemon.fact_store.retention_failing",
+        fingerprint: family,
+        severity: "warning",
+        title: "Fact-store retention is failing",
+        summary: `Fact retention for the ${family} family is failing; the store may grow beyond its bounded history.`,
+        diagnostics: {
+          family,
+          ...(typeof entry.retention_error === "string" ? { retention_error: entry.retention_error } : {}),
+          ...(typeof entry.retention_error_since_ts === "string" ? { retention_error_since_ts: entry.retention_error_since_ts } : {}),
+          ...(entry.retention_failing === true ? { retention_failing: true } : {}),
         },
       });
     }
