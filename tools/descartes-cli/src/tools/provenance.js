@@ -593,6 +593,17 @@ export async function listProcPids() {
   return { pids: pids.slice(0, MAX_LINUX_FD_SCAN_PIDS), truncated: pids.length > MAX_LINUX_FD_SCAN_PIDS };
 }
 
+// Before any Node same-UID /proc resolution, prove that this procfs view's self entry names the
+// current process. An ancestor-visible procfs mount can otherwise make a numeric PID appear to
+// be a local same-UID process when it belongs to another PID namespace.
+export async function verifyProcfsPidNamespace({ readlinkFn = readlink } = {}) {
+  try {
+    return (await readlinkFn("/proc/self")) === String(process.pid);
+  } catch {
+    return false;
+  }
+}
+
 export async function scanProcFdForInode(candidatePids, { listingTruncated = false } = {}) {
   const results = [];
   let uncertain = listingTruncated;
@@ -1224,7 +1235,10 @@ export async function resolveByPortLinux(port, options = {}) {
   const sockets = matches.map(buildLinuxSocketFact);
 
   const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  const pidListing = currentUid !== undefined && matches.some((entry) => entry.uid === currentUid)
+  const hasSameUidSocket = currentUid !== undefined && matches.some((entry) => entry.uid === currentUid);
+  const procfsNamespaceMatches = !hasSameUidSocket
+    || await (options.verifyProcfsPidNamespace ?? verifyProcfsPidNamespace)({ readlinkFn: options.readlink ?? readlink });
+  const pidListing = procfsNamespaceMatches && hasSameUidSocket
     ? await listProcPidsFn()
     : { pids: [], truncated: false };
   const candidatePids = Array.isArray(pidListing) ? pidListing : pidListing.pids;
@@ -1236,6 +1250,10 @@ export async function resolveByPortLinux(port, options = {}) {
   for (const [index, entry] of matches.entries()) {
     const socket = sockets[index];
     if (currentUid !== undefined && entry.uid === currentUid) {
+      if (!procfsNamespaceMatches) {
+        attributions.push({ resolved: false, reason: "procfs_pid_namespace_mismatch" });
+        continue;
+      }
       const matchResult = await resolveVerifiedPidFromFdScanResults(entry.inode, fdScanResults, {
         scanAgain: async () => {
           const refreshedListing = await listProcPidsFn();

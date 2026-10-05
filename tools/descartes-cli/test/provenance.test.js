@@ -20,11 +20,13 @@ import {
   parseProcNetLine,
   parseProvenancePs,
   resolvePidFromFdScanResults,
+  resolveByPortLinux,
   resolveVerifiedPidFromFdScanResults,
   parseLinuxProcessIdentity,
   resolveProvenance,
   summarizeSocketAttributions,
   verifyFinalSocketResolution,
+  verifyProcfsPidNamespace,
 } from "../src/tools/provenance.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -253,6 +255,31 @@ test("a complete refresh that loses the owner is authoritative and never resurre
   assert.notEqual(result.status, "ok");
   assert.notEqual(result.pid, 100);
   assert.notEqual(result.confidence, 1);
+});
+
+test("same-UID Linux resolution refuses an injected procfs PID-namespace mismatch before listing PIDs", async () => {
+  const uid = process.getuid?.() ?? 1000;
+  const tcp = [
+    " sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
+    ` 0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${uid} 0 424242 1`,
+  ].join("\n");
+  let listed = false;
+  const outcome = await resolveByPortLinux(8080, {
+    readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcp : "header\n",
+    verifyProcfsPidNamespace: async () => false,
+    listProcPids: async () => {
+      listed = true;
+      throw new Error("must not list /proc after a namespace mismatch");
+    },
+  });
+  assert.equal(listed, false);
+  assert.equal(outcome.resolvedStatus, "ambiguous");
+  assert.equal(outcome.result.resolved.reason, "procfs_pid_namespace_mismatch");
+});
+
+test("verifyProcfsPidNamespace compares injected /proc/self exactly to process.pid", async () => {
+  assert.equal(await verifyProcfsPidNamespace({ readlinkFn: async () => String(process.pid) }), true);
+  assert.equal(await verifyProcfsPidNamespace({ readlinkFn: async () => "999999" }), false);
 });
 
 test("same-port socket attribution is ambiguous when inodes map to different executables or any row is unresolved", () => {

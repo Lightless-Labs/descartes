@@ -51,6 +51,7 @@ import {
   provenancePsArgsForPlatform,
   resolveExecutableInfo,
   verifyFinalSocketResolution,
+  verifyProcfsPidNamespace,
   resolveVerifiedPidFromFdScanResults,
   scanProcFdForInode,
 } from "./provenance.js";
@@ -374,6 +375,19 @@ async function listLinuxListeningSockets(options) {
   if (listening.length === 0) return [];
 
   const listPids = options.listProcPids ?? listProcPids;
+  const hasSameUidSocket = typeof process.getuid === "function"
+    && listening.some((entry) => entry.uid === process.getuid());
+  const procfsNamespaceMatches = !hasSameUidSocket
+    || await (options.verifyProcfsPidNamespace ?? verifyProcfsPidNamespace)({ readlinkFn: options.readlink });
+  if (!procfsNamespaceMatches) {
+    return listening.map((entry) => ({
+      protocol: entry.protocol,
+      local_address: entry.local_address,
+      local_port: entry.local_port,
+      pid: undefined,
+      reason: "procfs_pid_namespace_mismatch",
+    }));
+  }
   const scanFds = options.scanProcFdForInode ?? scanProcFdForInode;
   const pidListing = await listPids();
   const candidatePids = Array.isArray(pidListing) ? pidListing : pidListing.pids;
