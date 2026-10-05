@@ -167,7 +167,7 @@ export const AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS = new Set([
 // "witnessed" (authenticated ledger / witness, threat-model steps 3-4), and beyond that
 // interactive-hardware-approval and full attestation (threat-model steps 5-6, out of scope --
 // see plan §12). Consulted by NO trust-decision code path anywhere in this codebase -- it is
-// display/disclosure only, exactly like continuity_oldest_ts (fact-store-integrity.js). Do not
+// display/disclosure only, exactly like the completeness coverage fields (fact-store-integrity.js). Do not
 // add a branch (`=== INTEGRITY_LEVEL_UNPROTECTED_SAME_UID` or any other comparison) that gates
 // trust, suppression, recovery, promotion, or alerting on this value; the only permitted use is
 // unconditionally including it verbatim on an operator-visible status surface.

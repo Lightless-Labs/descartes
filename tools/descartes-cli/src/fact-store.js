@@ -475,6 +475,15 @@ export async function readFactPoints(descartesPaths, options = {}) {
   }
   const sinceMs = options.windowMs !== undefined ? nowMs - options.windowMs : undefined;
   const { records, corrupt_count, bytes, raw_bytes: rawBytes, exists } = await readJsonLines(storePaths.factsFile);
+  const integrity = await readFactIntegrityLedger(descartesPaths);
+  // R0b read-side floor (fact-store capacity plan §4.1 item 3, invariant I1): never return a point
+  // at or below the ledger's exclusive byte-cap floor. Enforced HERE, once, in the store -- never
+  // as six per-detector copies (six chances for one to be missing and fabricate). Points at or
+  // below the floor are physically absent anyway once eviction is tick-aligned; this is the
+  // second layer that also covers records appended with ts <= floor after a clock rollback and not
+  // yet evicted by the next pass. A missing/invalid ledger carries no floor, but then completeness
+  // is unknown/degraded and nothing downstream trusts the points.
+  const floorMs = integrity.ledger?.bytecap_floor_ts ? Date.parse(integrity.ledger.bytecap_floor_ts) : Number.NEGATIVE_INFINITY;
   let schemaInvalidCount = 0;
   const points = records
     .map((record) => {
@@ -485,9 +494,9 @@ export async function readFactPoints(descartesPaths, options = {}) {
       return normalizeFactPoint(record);
     })
     .filter(Boolean)
+    .filter((point) => new Date(point.ts).getTime() > floorMs)
     .filter((point) => sinceMs === undefined || new Date(point.ts).getTime() >= sinceMs)
     .sort((left, right) => new Date(left.ts).getTime() - new Date(right.ts).getTime());
-  const integrity = await readFactIntegrityLedger(descartesPaths);
   const live = {
     record_count: records.length,
     bytes,
@@ -504,6 +513,10 @@ export async function readFactPoints(descartesPaths, options = {}) {
     sinceMs === undefined ? Number.NEGATIVE_INFINITY : sinceMs,
     { corrupt_count, schema_invalid_count: schemaInvalidCount },
     nowMs,
+    {
+      retentionCutoffMs: nowMs - DEFAULT_FACT_RETENTION_MS,
+      oldestCertifiedTs: points.length > 0 ? points[0].ts : null,
+    },
   );
   return { points, corrupt_count, schema_invalid_count: schemaInvalidCount, completeness };
 }

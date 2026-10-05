@@ -393,3 +393,256 @@ test("T6/HIGH-1: a crash between the very first append and the first retention p
   await enforceFactRetention(direct, { now: hour(0) });
   assert.equal((await readRawLedger(direct)).last_continuity_break_ts, hour(0));
 });
+
+// ---------------------------------------------------------------------------------------------
+// Read side (§4.1 items 3, 5, 6; I1): the floor is enforced by the store, not by six detectors.
+// ---------------------------------------------------------------------------------------------
+
+const MONTH_WINDOW_MS = 31 * 24 * HOUR_MS;
+const RETENTION_MS = 30 * 24 * HOUR_MS;
+
+test("I1: readFactPoints never returns a point at or below bytecap_floor_ts, even one still physically present", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(1));
+  // A record below the floor appended WITHOUT a retention pass (rollback, before the next pass
+  // evicts it physically): the read must still hide it.
+  await fs.appendFile(resolveFactStorePaths(paths).factsFile, `${JSON.stringify(serviceTick(hour(1))[0])}\n${JSON.stringify(serviceTick(hour(0.5))[0])}\n`);
+  const read = await readFactPoints(paths, { now: hour(3), windowMs: MONTH_WINDOW_MS });
+  assert.ok(read.points.length > 0);
+  assert.ok(read.points.every((point) => Date.parse(point.ts) > Date.parse(hour(1))), "no point at or below the floor");
+  assert.deepEqual([...groupByTs(read.points).keys()], [hour(2), hour(3)]);
+});
+
+test("completeness reports the raw floor, certified_after_ts = max(floor, retention cutoff), oldest_certified_ts and coverage", async () => {
+  const paths = await tempPaths();
+  await appendHourlyTicks(paths, { count: 3, maxBytes: Number.MAX_SAFE_INTEGER });
+  const full = (await readFactPoints(paths, { now: hour(2), windowMs: MONTH_WINDOW_MS })).completeness;
+  assert.equal(full.bytecap_floor_ts, null);
+  assert.equal(full.certified_after_ts, null);
+  assert.equal(full.coverage, "full");
+  assert.equal(full.oldest_certified_ts, hour(0));
+
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendFactPoints(paths, serviceTick(hour(3)), { now: hour(3), maxBytes: cap });
+  const narrowed = (await readFactPoints(paths, { now: hour(3), windowMs: MONTH_WINDOW_MS })).completeness;
+  assert.equal(narrowed.bytecap_floor_ts, hour(1));
+  assert.equal(narrowed.certified_after_ts, hour(1));
+  assert.equal(narrowed.coverage, "narrowed");
+  assert.equal(narrowed.oldest_certified_ts, hour(2));
+
+  // Once the floor is older than the retention cutoff, certified_after_ts reports the cutoff (the
+  // range between the floor and now - 30 d has been age-evicted; reporting the floor would
+  // over-claim). The raw floor is unchanged.
+  const later = new Date(Date.parse(hour(1)) + RETENTION_MS + 5 * HOUR_MS).toISOString();
+  const aged = (await readFactPoints(paths, { now: later, windowMs: MONTH_WINDOW_MS })).completeness;
+  assert.equal(aged.bytecap_floor_ts, hour(1));
+  assert.equal(aged.certified_after_ts, new Date(Date.parse(later) - RETENTION_MS).toISOString());
+});
+
+test("a zero-cap / all-evicted store reads intact with coverage narrowed and an empty certified span (G1 question: vs fail-closed unknown)", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: 0 });
+  const read = await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS });
+  assert.deepEqual(read.points, []);
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.equal(read.completeness.bytecap_floor_ts, hour(1));
+  assert.equal(read.completeness.oldest_certified_ts, null);
+});
+
+test("a floor more than FUTURE_FACT_TOLERANCE_MS ahead of the read fails closed (status unknown, degraded_reason future_floor) -- the empty-store forged-floor bound", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
+  await enforceFactRetention(paths, { now: hour(0), maxBytes: 0 });
+  const ledger = await readRawLedger(paths);
+  assert.equal(ledger.continuity.last_rewrite_record_count, 0);
+  const forged = { ...ledger, bytecap_floor_ts: "2030-01-01T00:00:00.000Z" };
+  assert.equal(isValidFactIntegrityLedger(forged), true, "an empty store has no in-ledger plausibility referent");
+  await writeRawLedger(paths, forged);
+  const read = await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS });
+  assert.equal(read.completeness.status, "unknown");
+  assert.equal(read.completeness.degraded_reason, "future_floor");
+  // ...and the next pass clamps it with a loss stamp (MEDIUM-3), never certifying anything.
+  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  const after = await readRawLedger(paths);
+  assert.equal(after.last_continuity_break_ts, hour(1));
+  assert.ok(Date.parse(after.bytecap_floor_ts) <= Date.parse(hour(1)));
+  assert.notEqual((await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS })).completeness.status, "intact");
+});
+
+test("F2-Tier1 fold-in: continuity.oldest_ts is not a coverage boundary -- completeness reports certified fields instead, and no trust path reads oldest_ts", async () => {
+  const paths = await tempPaths();
+  await appendHourlyTicks(paths, { count: 2, maxBytes: Number.MAX_SAFE_INTEGER });
+  const read = await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS });
+  assert.equal("continuity_oldest_ts" in read.completeness, false);
+  for (const field of ["bytecap_floor_ts", "certified_after_ts", "oldest_certified_ts", "coverage"]) {
+    assert.ok(field in read.completeness, `${field} missing`);
+  }
+  const srcDir = new URL("../src/", import.meta.url);
+  const files = (await fs.readdir(srcDir, { recursive: true })).filter((name) => name.endsWith(".js"));
+  for (const name of files) {
+    const source = await fs.readFile(new URL(name, srcDir), "latin1");
+    if (name === "fact-store-integrity.js") continue; // the writer of continuity.oldest_ts
+    assert.equal(/continuity(?:\?)?\.oldest_ts|continuity_oldest_ts/.test(source.replace(/\/\/.*$/gm, "")), false, `${name} reads continuity.oldest_ts outside the ledger writer`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// T4: coverage oracle. Seeded sequences of store operations against a reference model of what was
+// appended per ts. After every operation:
+//   - I1: every returned point is strictly above the reported floor;
+//   - when status is intact: every returned ts group equals the full appended set for that ts (no
+//     partial ticks), and every appended, not-future-dropped ts above the floor and inside the read
+//     window IS returned (claimed is a subset of justified);
+//   - the floor never decreases, OR the read is not intact (an in-window loss was stamped);
+//   - certified_after_ts is never older than the floor.
+// ---------------------------------------------------------------------------------------------
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function oracleTick(ts, count, salt) {
+  return Array.from({ length: count }, (_, index) => ({
+    ts,
+    fact_name: "service.presence",
+    entity_key: `svc-${salt}-${index}`,
+    attributes: { running: "true", manager: "systemd" },
+  })).concat([{ ts, fact_name: "service.census", entity_key: "service.census-marker.v1", attributes: { census_state: "complete" }, confidence: 0 }]);
+}
+
+const ORACLE_OPS = [
+  ["append", 30], ["oversize", 3], ["budget", 6], ["corrupt", 1], ["schemaInvalid", 1], ["future", 3],
+  ["rollback", 4], ["fastThenCorrected", 1], ["crash", 3], ["ledgerDelete", 1], ["forgeFloor", 1], ["truncate", 1], ["noopPass", 4],
+];
+
+function pickOp(random) {
+  const total = ORACLE_OPS.reduce((sum, [, weight]) => sum + weight, 0);
+  let roll = random() * total;
+  for (const [name, weight] of ORACLE_OPS) {
+    roll -= weight;
+    if (roll < 0) return name;
+  }
+  return "append";
+}
+
+test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }, async () => {
+  const unitTick = tickBytes(oracleTick(hour(0), 4, "x"));
+  let checkedIntactReads = 0;
+  for (let seed = 1; seed <= 30; seed += 1) {
+    const random = mulberry32(seed);
+    const paths = await tempPaths();
+    const { dir: factsDir, factsFile } = resolveFactStorePaths(paths);
+    await fs.mkdir(factsDir, { recursive: true });
+    const model = new Map(); // ts -> { keys: sorted string[], alive: boolean }
+    let nowMs = BASE_MS;
+    let budget = Math.floor(unitTick * (1 + random() * 4));
+    let previousFloorMs = Number.NEGATIVE_INFINITY;
+    let currentGeneration;
+    let salt = 0;
+    const log = [];
+    const appendTick = async (tsMs, count, cap = budget) => {
+      salt += 1;
+      const ts = new Date(tsMs + Math.floor(random() * 900) + 1).toISOString();
+      const tick = oracleTick(ts, count, `${seed}-${salt}`);
+      model.set(ts, { keys: tick.map((point) => `${point.fact_name}|${point.entity_key}`).sort(), alive: true });
+      await appendFactPoints(paths, tick, { now: new Date(nowMs).toISOString(), maxBytes: cap });
+      markFutureDropped();
+    };
+    const markFutureDropped = () => {
+      for (const [ts, entry] of model) if (Date.parse(ts) > nowMs + FUTURE_FACT_TOLERANCE_MS) entry.alive = false;
+    };
+    for (let step = 0; step < 30; step += 1) {
+      const op = pickOp(random);
+      log.push(op);
+      switch (op) {
+        case "append": nowMs += HOUR_MS; await appendTick(nowMs, 1 + Math.floor(random() * 6)); break;
+        case "oversize": nowMs += HOUR_MS; await appendTick(nowMs, 40); break;
+        case "budget": budget = random() < 0.15 ? 0 : Math.floor(unitTick * (0.5 + random() * 5)); break;
+        case "corrupt": await fs.appendFile(factsFile, "not-json\n"); break;
+        case "schemaInvalid": await fs.appendFile(factsFile, `${JSON.stringify({ ts: new Date(nowMs).toISOString(), fact_name: "service.presence", attributes: {} })}\n`); break;
+        case "future": await appendTick(nowMs + FUTURE_FACT_TOLERANCE_MS + HOUR_MS, 3); break;
+        case "rollback": nowMs -= Math.floor(1 + random() * 4) * HOUR_MS; await appendTick(nowMs, 1 + Math.floor(random() * 4)); break;
+        case "fastThenCorrected": {
+          const realMs = nowMs;
+          nowMs += 3 * 24 * HOUR_MS;
+          await appendTick(nowMs, 3);
+          nowMs += HOUR_MS;
+          await appendTick(nowMs, 3, 0);
+          nowMs = realMs + HOUR_MS;
+          await appendTick(nowMs, 2);
+          break;
+        }
+        case "crash": {
+          nowMs += HOUR_MS;
+          const hook = random() < 0.5 ? "beforeFactsRename" : "afterFactsRename";
+          await enforceFactRetention(paths, { now: new Date(nowMs).toISOString(), maxBytes: budget, [hook]: async () => { throw new Error("crash"); } }).catch(() => {});
+          break;
+        }
+        case "ledgerDelete": await fs.unlink(resolveFactIntegrityPaths(paths).integrityFile).catch(() => {}); break;
+        case "forgeFloor": {
+          const raw = await fs.readFile(resolveFactIntegrityPaths(paths).integrityFile, "utf8").catch(() => undefined);
+          if (raw) await fs.writeFile(resolveFactIntegrityPaths(paths).integrityFile, JSON.stringify({ ...JSON.parse(raw), bytecap_floor_ts: "2030-01-01T00:00:00.000Z", bytecap_evicted_total: 1, last_bytecap_evict_ts: new Date(nowMs).toISOString() }));
+          break;
+        }
+        case "truncate": {
+          const lines = (await fs.readFile(factsFile, "utf8").catch(() => "")).split("\n").filter(Boolean);
+          await fs.writeFile(factsFile, lines.slice(0, Math.floor(lines.length / 2)).map((line) => `${line}\n`).join(""));
+          break;
+        }
+        case "noopPass": await enforceFactRetention(paths, { now: new Date(nowMs).toISOString(), maxBytes: budget }); markFutureDropped(); break;
+        default: break;
+      }
+
+      // A new ledger lineage (generation change: a re-bootstrap) never carries trust over (I8). A
+      // re-bootstrap over a NON-empty store stamps a loss (HIGH-1, pinned by the T6 tests and by the
+      // floor-backwards check below); one over an empty store is a fresh store. Either way, ticks
+      // appended before the new lineage began are no longer part of what it can justify.
+      const generation = await fs.readFile(resolveFactIntegrityPaths(paths).integrityFile, "utf8")
+        .then((raw) => JSON.parse(raw).generation, () => undefined);
+      if (generation !== undefined && currentGeneration !== undefined && generation !== currentGeneration) {
+        for (const entry of model.values()) entry.alive = false;
+      }
+      if (generation !== undefined) currentGeneration = generation;
+      const read = await readFactPoints(paths, { now: nowMs, windowMs: MONTH_WINDOW_MS });
+      const { completeness } = read;
+      const floorMs = completeness.bytecap_floor_ts === null ? Number.NEGATIVE_INFINITY : Date.parse(completeness.bytecap_floor_ts);
+      const where = `seed ${seed} step ${step} (${log.join(",")})`;
+      assert.ok(read.points.every((point) => Date.parse(point.ts) > floorMs), `I1 violated at ${where}`);
+      if (completeness.certified_after_ts !== null) {
+        assert.ok(Date.parse(completeness.certified_after_ts) >= floorMs, `certified_after_ts older than the floor at ${where}`);
+      }
+      if (floorMs < previousFloorMs) {
+        assert.notEqual(completeness.status, "intact", `floor moved backwards with no loss stamped at ${where}`);
+      }
+      previousFloorMs = floorMs;
+      if (completeness.status === "intact") {
+        checkedIntactReads += 1;
+        const groups = groupByTs(read.points);
+        for (const [ts, keys] of groups) {
+          const expected = model.get(ts);
+          assert.ok(expected, `returned a ts the model never appended at ${where}`);
+          assert.deepEqual(keys, expected.keys, `partial tick ${ts} returned at ${where}`);
+        }
+        const sinceMs = nowMs - MONTH_WINDOW_MS;
+        for (const [ts, entry] of model) {
+          const tsMs = Date.parse(ts);
+          if (!entry.alive || tsMs <= floorMs || tsMs < sinceMs) continue;
+          assert.ok(groups.has(ts), `appended tick ${ts} above the floor is missing from an intact read at ${where}`);
+        }
+      }
+    }
+  }
+  // While byte-cap eviction is still a loss channel (until the S2 reclassification commit), almost
+  // every read after the first eviction is degraded, so few intact reads are checked.
+  assert.ok(checkedIntactReads > 20, `the oracle exercised too few intact reads (${checkedIntactReads})`);
+});

@@ -298,7 +298,8 @@ function renderLearnedConfigStatus(config, configFile) {
   return lines.join("\n");
 }
 
-const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "none"];
+const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "future_floor", "none"];
+const COVERAGE_VALUES = ["full", "narrowed"]; // "unknown" only when there is no read to report
 const LOSS_TS_FIELD_NAMES = ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"];
 
 function unknownFactStoreCompleteness() {
@@ -315,7 +316,13 @@ function unknownFactStoreCompleteness() {
     // tick, right now" and see how much history is actually retained, not just a cumulative
     // lifetime total.
     last_bytecap_evict_ts: null,
-    continuity_oldest_ts: null,
+    // R0b coverage reporting (fact-store capacity plan §4.1 items 3/6): replaces the F2-Tier1
+    // continuity_oldest_ts, which only ever moved older and could predate the retained facts (an
+    // over-claim). Display only; no trust-decision path consults these here.
+    bytecap_floor_ts: null,
+    certified_after_ts: null,
+    oldest_certified_ts: null,
+    coverage: "unknown",
     // Fix 2 (trusted-state step-1 revision, "R1 made signable"): additive surfacing fields, plus
     // the two loss-ts fields (last_corrupt_ts/last_schema_invalid_ts/last_continuity_break_ts)
     // this selector used to strip -- an operator diagnosing a degraded store needs to see WHICH
@@ -348,7 +355,10 @@ export function selectFactStoreCompleteness(completeness) {
     first_degraded_ts: typeof completeness.first_degraded_ts === "string" ? completeness.first_degraded_ts : null,
     continuity_ok: [true, false, null].includes(completeness.continuity_ok) ? completeness.continuity_ok : null,
     last_bytecap_evict_ts: isNullableTimestampString(completeness.last_bytecap_evict_ts) ? completeness.last_bytecap_evict_ts : null,
-    continuity_oldest_ts: isNullableTimestampString(completeness.continuity_oldest_ts) ? completeness.continuity_oldest_ts : null,
+    bytecap_floor_ts: isNullableTimestampString(completeness.bytecap_floor_ts) ? completeness.bytecap_floor_ts : null,
+    certified_after_ts: isNullableTimestampString(completeness.certified_after_ts) ? completeness.certified_after_ts : null,
+    oldest_certified_ts: isNullableTimestampString(completeness.oldest_certified_ts) ? completeness.oldest_certified_ts : null,
+    coverage: COVERAGE_VALUES.includes(completeness.coverage) ? completeness.coverage : "unknown",
     // Fix 2: no longer stripped, plus the new future-fact channel/reporting fields.
     last_corrupt_ts: isNullableTimestampString(completeness.last_corrupt_ts) ? completeness.last_corrupt_ts : null,
     last_schema_invalid_ts: isNullableTimestampString(completeness.last_schema_invalid_ts) ? completeness.last_schema_invalid_ts : null,

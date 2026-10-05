@@ -635,7 +635,37 @@ function futureLossFields(base, nowMs) {
 
 // Fix 2: the field set every buildCompleteness return branch shares (a deepEqual fixture across
 // branches -- see fact-store-integrity.test.js -- is the signal this was done inconsistently).
-function commonCompletenessFields(base, nowMs) {
+// R0b coverage reporting (fact-store capacity plan §4.1 items 3, 5, 6). Byte-cap narrowing is
+// reported ONLY through these fields -- never as a fourth `status` value (factHistoryTrustworthy
+// maps any unknown status to history_unknown, which would recreate the lockout):
+//   - bytecap_floor_ts: the raw exclusive floor; what the coverage oracle and the S3 eligibility
+//     horizon use.
+//   - certified_after_ts: max(floor, retention cutoff), or null when the floor is null; what status
+//     surfaces display. The range between the floor and now - 30 d has been age-evicted, so
+//     reporting the bare floor there would over-claim.
+//   - oldest_certified_ts: the oldest point this read actually returned.
+//   - coverage: "full" (never byte-evicted in this lineage) | "narrowed".
+// These replace continuity_oldest_ts (F2-Tier1): ledger.continuity.oldest_ts only ever moves older
+// and can predate the retained facts, so it is NOT a coverage boundary and no trust or operator
+// path may read it (pinned by fact-store-coverage.test.js).
+function coverageFields(base, nowMs, extras) {
+  const floorTs = base.bytecap_floor_ts ?? null;
+  let certifiedAfterTs = null;
+  if (floorTs !== null) {
+    const cutoffMs = extras?.retentionCutoffMs;
+    certifiedAfterTs = Number.isFinite(cutoffMs) && cutoffMs > Date.parse(floorTs)
+      ? new Date(cutoffMs).toISOString()
+      : floorTs;
+  }
+  return {
+    bytecap_floor_ts: floorTs,
+    certified_after_ts: certifiedAfterTs,
+    oldest_certified_ts: typeof extras?.oldestCertifiedTs === "string" ? extras.oldestCertifiedTs : null,
+    coverage: floorTs === null ? "full" : "narrowed",
+  };
+}
+
+function commonCompletenessFields(base, nowMs, extras) {
   return {
     last_corrupt_ts: base.last_corrupt_ts,
     last_schema_invalid_ts: base.last_schema_invalid_ts,
@@ -648,23 +678,30 @@ function commonCompletenessFields(base, nowMs) {
     age_evicted_total: base.age_evicted_total,
     future_fact_dropped_total: base.future_fact_dropped_total,
     first_degraded_ts: base.first_degraded_ts,
-    // Finding F2-Tier1, additive read-only reporting: mirrors ledger.continuity.oldest_ts so
-    // an operator can see how much fact history is actually retained (not just a cumulative
-    // lifetime eviction total) even on an unknown/broken-continuity read -- no trust-decision
-    // code path consults this field.
-    continuity_oldest_ts: base.continuity.oldest_ts,
+    ...coverageFields(base, nowMs, extras),
     future_loss_fields: futureLossFields(base, nowMs),
   };
 }
 
-export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINITY, currentCounts = {}, nowMs) {
+// R0b empty-store floor bound (fact-store capacity plan §15.5 decision 1): a floor more than
+// FUTURE_FACT_TOLERANCE_MS ahead of this read cannot have come from an honest pass at this clock
+// (eviction sets it to at most pass nowIso + tolerance). For a non-empty store the ledger validator
+// already rejects it (floor must be < last_rewrite_newest_ts); for an EMPTY store there is no
+// in-ledger referent, so the read fails closed here until the next retention pass clamps it and
+// stamps a loss.
+function hasFutureFloor(base, nowMs) {
+  if (!base.bytecap_floor_ts || !Number.isFinite(nowMs)) return false;
+  return Date.parse(base.bytecap_floor_ts) > nowMs + FUTURE_FACT_TOLERANCE_MS;
+}
+
+export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINITY, currentCounts = {}, nowMs, extras = {}) {
   const base = ledger ?? createFactIntegrityLedger();
   const continuityObservation = observeFactContinuity(ledger, live);
   const thisReadHasLoss = (currentCounts.corrupt_count ?? 0) > 0 || (currentCounts.schema_invalid_count ?? 0) > 0;
   if (continuityObservation === "broken") {
     return {
       status: "unknown",
-      ...commonCompletenessFields(base, nowMs),
+      ...commonCompletenessFields(base, nowMs, extras),
       continuity_ok: null,
       degraded_reason: "continuity_unknown",
     };
@@ -681,7 +718,7 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
     const status = continuityOk === false && lossAtOrAfter(base.last_continuity_break_ts, asOfMs) ? "degraded" : "unknown";
     return {
       status,
-      ...commonCompletenessFields(base, nowMs),
+      ...commonCompletenessFields(base, nowMs, extras),
       continuity_ok: continuityOk,
       degraded_reason: status === "degraded" ? "continuity_break" : "continuity_unknown",
     };
@@ -690,9 +727,17 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
   if (thisReadHasLoss) {
     return {
       status: "degraded",
-      ...commonCompletenessFields(base, nowMs),
+      ...commonCompletenessFields(base, nowMs, extras),
       continuity_ok: base.continuity.continuity_ok,
       degraded_reason: "this_read_loss",
+    };
+  }
+  if (hasFutureFloor(base, nowMs)) {
+    return {
+      status: "unknown",
+      ...commonCompletenessFields(base, nowMs, extras),
+      continuity_ok: base.continuity.continuity_ok,
+      degraded_reason: "future_floor",
     };
   }
   const lossChannel = LOSS_CHANNEL_FIELDS.find((field) => lossAtOrAfter(base[field], asOfMs));
@@ -706,7 +751,7 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
         : "in_window_loss";
   return {
     status: degraded ? "degraded" : "intact",
-    ...commonCompletenessFields(base, nowMs),
+    ...commonCompletenessFields(base, nowMs, extras),
     continuity_ok: base.continuity.continuity_ok,
     degraded_reason: degradedReason,
   };

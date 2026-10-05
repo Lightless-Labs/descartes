@@ -85,15 +85,20 @@ test("age eviction alone leaves completeness intact", async () => {
   assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.age_evicted_total, 1);
   assert.equal(read.completeness.first_degraded_ts, null);
-  // Finding F2-Tier1, additive coverage-loss reporting field: mirrors ledger.continuity.oldest_ts
-  // so an operator can see how much history is actually retained, not just a cumulative total.
-  assert.equal(read.completeness.continuity_oldest_ts, NOW);
+  // Fact-store capacity plan (2026-10-05, §4.1 item 6): the F2-Tier1 continuity_oldest_ts field
+  // is replaced by the R0b coverage fields. Age eviction is not byte-cap narrowing: coverage stays
+  // "full", and oldest_certified_ts is the oldest point actually returned.
+  assert.equal(read.completeness.coverage, "full");
+  assert.equal(read.completeness.oldest_certified_ts, NOW);
 });
 
-// --- Finding F2-Tier1: buildCompleteness surfaces continuity_oldest_ts (read-only reporting,
-// additive -- sourced straight from ledger.continuity.oldest_ts, no trust-decision involvement) ---
+// --- Finding F2-Tier1, superseded by the fact-store capacity plan (2026-10-05, §4.1 item 6): these
+// tests used to pin buildCompleteness's continuity_oldest_ts (a mirror of ledger.continuity.
+// oldest_ts). That value only ever moves older and can predate the retained facts, so it over-
+// claimed retained history; it is replaced on every surface by bytecap_floor_ts /
+// certified_after_ts / oldest_certified_ts / coverage, which every branch still carries. ---
 
-test("buildCompleteness surfaces continuity_oldest_ts from the ledger on an intact/degraded read", async () => {
+test("buildCompleteness reports the coverage fields from the ledger on an intact read", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, [
     { ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} },
@@ -103,17 +108,23 @@ test("buildCompleteness surfaces continuity_oldest_ts from the ledger on an inta
   assert.equal(ledger.continuity.oldest_ts, NOW);
 
   const read = await readFactPoints(paths, { now: NOW });
-  assert.equal(read.completeness.continuity_oldest_ts, NOW);
+  assert.equal("continuity_oldest_ts" in read.completeness, false);
+  assert.equal(read.completeness.bytecap_floor_ts, null);
+  assert.equal(read.completeness.certified_after_ts, null);
+  assert.equal(read.completeness.oldest_certified_ts, NOW);
+  assert.equal(read.completeness.coverage, "full");
 });
 
-test("buildCompleteness reports continuity_oldest_ts: null before any retention pass has ever run (no ledger)", () => {
+test("buildCompleteness reports null coverage fields before any retention pass has ever run (no ledger)", () => {
   const live = { record_count: 0, bytes: 0, raw_bytes: Buffer.alloc(0), exists: false, newest_ts: null };
   const completeness = buildCompleteness(null, live, Number.NEGATIVE_INFINITY, {}, Date.parse(NOW));
   assert.equal(completeness.status, "unknown");
-  assert.equal(completeness.continuity_oldest_ts, null);
+  assert.equal(completeness.bytecap_floor_ts, null);
+  assert.equal(completeness.certified_after_ts, null);
+  assert.equal(completeness.oldest_certified_ts, null);
 });
 
-test("buildCompleteness surfaces continuity_oldest_ts even on a broken-continuity (unknown) read", async () => {
+test("buildCompleteness carries the coverage fields even on a broken-continuity (unknown) read", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, [
     { ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} },
@@ -125,7 +136,8 @@ test("buildCompleteness surfaces continuity_oldest_ts even on a broken-continuit
 
   const read = await readFactPoints(paths, { now: NOW });
   assert.equal(read.completeness.status, "unknown");
-  assert.equal(read.completeness.continuity_oldest_ts, NOW);
+  assert.equal(read.completeness.coverage, "full");
+  assert.equal(read.completeness.bytecap_floor_ts, null);
   assert.equal(read.completeness.degraded_reason, "continuity_unknown");
 });
 

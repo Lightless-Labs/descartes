@@ -508,12 +508,17 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   // last_continuity_break_ts) are no longer stripped, plus the new future-fact channel/
   // reporting fields (last_future_fact_ts, future_fact_dropped_total, degraded_reason,
   // future_loss_fields). No existing field is removed or renamed.
+  // Fact-store capacity plan (2026-10-05, §4.1 item 6): continuity_oldest_ts is REPLACED by the R0b
+  // coverage fields (bytecap_floor_ts, certified_after_ts, oldest_certified_ts, coverage) -- it only
+  // ever moved older and could predate the retained facts, so it over-claimed retained history.
   assert.deepEqual(Object.keys(completeness).sort(), [
     "age_evicted_total",
     "bytecap_evicted_total",
+    "bytecap_floor_ts",
+    "certified_after_ts",
     "continuity_ok",
-    "continuity_oldest_ts",
     "corrupt_dropped_total",
+    "coverage",
     "degraded_reason",
     "first_degraded_ts",
     "future_fact_dropped_total",
@@ -523,6 +528,7 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
     "last_corrupt_ts",
     "last_future_fact_ts",
     "last_schema_invalid_ts",
+    "oldest_certified_ts",
     "schema_invalid_dropped_total",
     "status",
   ].sort());
@@ -534,7 +540,9 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   assert.equal(completeness.first_degraded_ts, null);
   assert.equal(completeness.continuity_ok, true);
   assert.equal(completeness.last_bytecap_evict_ts, null);
-  assert.equal(completeness.continuity_oldest_ts, now);
+  assert.equal(completeness.bytecap_floor_ts, null);
+  assert.equal(completeness.certified_after_ts, null);
+  assert.equal(completeness.coverage, "full");
   assert.equal(completeness.last_corrupt_ts, null);
   assert.equal(completeness.last_schema_invalid_ts, null);
   assert.equal(completeness.last_continuity_break_ts, null);
@@ -555,7 +563,9 @@ test("descartes learned status --json degrades to unknown when fact history was 
   assert.equal(completeness.status, "unknown");
   assert.equal(completeness.continuity_ok, null);
   assert.equal(completeness.last_bytecap_evict_ts, null);
-  assert.equal(completeness.continuity_oldest_ts, null);
+  assert.equal(completeness.bytecap_floor_ts, null);
+  assert.equal(completeness.certified_after_ts, null);
+  assert.equal(completeness.oldest_certified_ts, null);
   assert.equal(completeness.degraded_reason, "continuity_unknown");
   assert.deepEqual(completeness.future_loss_fields, []);
 });
@@ -563,17 +573,19 @@ test("descartes learned status --json degrades to unknown when fact history was 
 // Finding F2-Tier1: coverage-loss reporting. Real (not hand-authored-fixture) sustained
 // bytecap eviction pressure via appendFactPoints -> enforceFactRetention, so an operator can
 // SEE via `descartes learned status --json` when normal eviction is degrading novelty coverage
-// (last_bytecap_evict_ts stamped, continuity_oldest_ts advancing) rather than only observing a
+// (last_bytecap_evict_ts stamped, the byte-cap floor advancing) rather than only observing a
 // cumulative lifetime bytecap_evicted_total with no sense of "is this happening right now".
-test("descartes learned status --json surfaces last_bytecap_evict_ts and continuity_oldest_ts once bytecap eviction is real and ongoing", async () => {
+// Updated by the fact-store capacity plan (2026-10-05, §4.1 item 6): continuity_oldest_ts is
+// replaced by the R0b coverage fields; the floor is the newest evicted ts and coverage reads
+// "narrowed".
+test("descartes learned status --json surfaces last_bytecap_evict_ts and the byte-cap floor / coverage once bytecap eviction is real and ongoing", async () => {
   const paths = await tempPaths();
   const day1 = "2026-07-11T00:00:00.000Z";
   const day2 = "2026-07-12T00:00:00.000Z";
 
   // Tiny (but not zero) maxBytes forces routine bytecap eviction while still keeping room for
   // exactly the single newest record (a maxBytes too small to keep even one record would evict
-  // everything, leaving continuity_oldest_ts null -- not the sustained-but-nonempty pressure
-  // this finding is about).
+  // everything -- not the sustained-but-nonempty pressure this finding is about).
   await appendFactPoints(paths, [
     { ts: day1, fact_name: "service.presence", entity_key: "one", attributes: {} },
   ], { now: day1, maxBytes: 150 });
@@ -587,7 +599,9 @@ test("descartes learned status --json surfaces last_bytecap_evict_ts and continu
 
   assert.equal(completeness.bytecap_evicted_total > 0, true);
   assert.equal(completeness.last_bytecap_evict_ts, day2);
-  assert.equal(typeof completeness.continuity_oldest_ts, "string");
+  assert.equal(completeness.bytecap_floor_ts, day1);
+  assert.equal(completeness.coverage, "narrowed");
+  assert.equal(typeof completeness.certified_after_ts, "string");
 });
 
 // Fix 2 (trusted-state step-1 revision, "R1 made signable"): the review's core undiscoverability
