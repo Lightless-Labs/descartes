@@ -99,12 +99,108 @@ test("Linux socket facts retain protocol, inode, and uid for every attributed ro
 
 test("resolvePidFromFdScanResults matches an inode to its owning pid for an accessible own-uid scan", () => {
   const fdScanResults = [
-    { pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }] },
+    {
+      pid: 100,
+      tgid: 100,
+      start_time: "10",
+      executable_path: "/usr/bin/app",
+      executable_dev: "7",
+      executable_ino: "8",
+      cmdline: "app\u0000--port\u00008080\u0000",
+      accessible: true,
+      fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }],
+    },
     { pid: 200, accessible: true, fds: [{ fd: "3", target: "socket:[99999]" }] },
   ];
   assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), {
-    status: "ok", pid: 100, confidence: 1, owners: [{ pid: 100, tgid: 100, start_time: "10" }],
+    status: "ok", pid: 100, confidence: 1, owners: [{
+      pid: 100,
+      tgid: 100,
+      start_time: "10",
+      executable_path: "/usr/bin/app",
+      executable_dev: "7",
+      executable_ino: "8",
+      cmdline: "app\u0000--port\u00008080\u0000",
+    }],
   });
+});
+
+test("Linux port attribution returns evidence checked by the real default final verifier", async () => {
+  const uid = process.getuid?.() ?? 1000;
+  const socketRow = [
+    " sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
+    ` 0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${uid} 0 424242 1`,
+  ].join("\n");
+  const cmdline = "app\u0000--port\u00008080\u0000";
+  const stat = `100 (app) S ${Array.from({ length: 18 }, () => "0").join(" ")} 10`;
+  const owner = {
+    pid: 100,
+    tgid: 100,
+    start_time: "10",
+    executable_path: "/verified",
+    executable_dev: "7",
+    executable_ino: "8",
+    cmdline,
+    accessible: true,
+    fds: [{ fd: "3", target: "socket:[424242]" }],
+  };
+  let verifierStarted = false;
+  let coreCalls = 0;
+  const result = await resolveByPortLinux(8080, {
+    readFile: async (filePath) => {
+      if (filePath === "/proc/net/tcp") return socketRow;
+      if (filePath === "/proc/100/stat") return stat;
+      if (filePath === "/proc/100/cmdline") return cmdline;
+      return "header\n";
+    },
+    readlink: async (filePath) => {
+      if (filePath === "/proc/100/fd/3") return "socket:[424242]";
+      if (filePath === "/proc/100/exe") return "/verified";
+      throw new Error(`unexpected readlink: ${filePath}`);
+    },
+    readdir: async (filePath) => {
+      if (filePath === "/proc/100/fd") {
+        verifierStarted = true;
+        return ["3"];
+      }
+      throw new Error(`unexpected readdir: ${filePath}`);
+    },
+    open: async () => ({ stat: async () => ({ dev: "7", ino: "8" }), close: async () => {} }),
+    verifyProcfsPidNamespace: async () => true,
+    listProcPids: async () => ({ pids: [100], truncated: false }),
+    scanProcFdForInode: async () => ({ results: [owner], truncated: false, uncertain: false }),
+    resolvePidCore: async (pid) => {
+      coreCalls += 1;
+      const executablePath = verifierStarted ? "/unverified-later" : "/verified";
+      return {
+        resolvedStatus: "ok",
+        resolved: {
+          status: "ok",
+          pid,
+          ppid: 1,
+          executable_path: executablePath,
+          executable_path_unavailable: false,
+          command: "app --port 8080",
+          args_redaction: { redacted: false, truncated: false, original_length: 16, max_length: 240 },
+          user: { uid, username: undefined, username_unavailable: true },
+          tgid: 100,
+          start_time: "10",
+          start_time_unavailable: false,
+          process_identity: { tgid: 100, start_time: "10" },
+        },
+        ancestry: [],
+        source: { type: "supervisor", name: "app", confidence: 1, review_hint: "none", details: {} },
+      };
+    },
+  });
+  assert.equal(result.resolvedStatus, "ok");
+  assert.equal(result.result.resolved.executable_path, "/verified");
+  assert.equal(result.result.resolved.executable_dev, "7");
+  assert.equal(result.result.resolved.executable_ino, "8");
+  assert.equal(result.result.resolved.command, "app --port 8080");
+  assert.deepEqual(result.result.resolved.process_identity, { tgid: 100, start_time: "10" });
+  assert.equal(result.result.sockets[0].inode, "424242");
+  assert.equal(coreCalls, 1);
 });
 
 test("resolvePidFromFdScanResults degrades to partial with no fabricated pid when the fd walk is EACCES", () => {
@@ -233,17 +329,20 @@ test("final verification runs after the stable enumeration and rejects an exec-g
   assert.equal(finalChecks, 2, "the final phase runs only after each proof's last enumeration");
 });
 
-test("final socket verification catches a UDP state change with injected proc readers", async () => {
+test("final socket verification checks UDP owner evidence after the row remains stable", async () => {
   const oldRow = { protocol: "udp", local_address: "127.0.0.1", local_port: 5353, state: "UNCONN", uid: 1000, inode: "424242" };
-  const udpStateChanged = [
+  const stableUdpRow = [
     " sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
-    " 0: 0100007F:14E9 00000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 424242 1",
+    " 0: 0100007F:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000 1000 0 424242 1",
   ].join("\n");
   const result = await verifyFinalSocketResolution("424242", oldRow, [{ pid: 100, tgid: 100, start_time: "10" }], {
-    readFileFn: async () => udpStateChanged,
+    readFileFn: async () => stableUdpRow,
+    readdirFn: async () => ["3"],
+    readlinkFn: async (filePath) => filePath.endsWith("/fd/3") ? "socket:[424242]" : "/usr/bin/app",
+    openFn: async () => ({ stat: async () => ({ dev: "7", ino: "8" }), close: async () => {} }),
   });
-  assert.equal(result.status, "retry");
-  assert.equal(result.reason, "socket_row_changed");
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.reason, "owner_evidence_unavailable");
 });
 
 test("a complete refresh that loses the owner is authoritative and never resurrects the old pid", async () => {
@@ -310,6 +409,7 @@ test("classifyOwnerAmbiguityReason gives every owner uncertainty an explicit non
   assert.equal(classifyOwnerAmbiguityReason("owner_ambiguous").status, "ambiguous");
   assert.equal(classifyOwnerAmbiguityReason("elevated_owner_ambiguous").status, "ambiguous");
   assert.equal(classifyOwnerAmbiguityReason("owner_identity_unavailable").status, "ambiguous");
+  assert.equal(classifyOwnerAmbiguityReason("owner_evidence_unavailable").status, "ambiguous");
   assert.equal(classifyOwnerAmbiguityReason("fd_scan_truncated").status, "truncated");
   assert.equal(classifyOwnerAmbiguityReason("fd_scan_uncertain").status, "ambiguous");
   assert.equal(classifyOwnerAmbiguityReason("owner_identity_unavailable").owner_dependent, true);

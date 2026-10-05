@@ -205,6 +205,7 @@ export function classifyOwnerAmbiguityReason(reason) {
     "owner_ambiguous",
     "elevated_owner_ambiguous",
     "owner_identity_unavailable",
+    "owner_evidence_unavailable",
     "fd_scan_uncertain",
     "owner_identity_changed",
     "fd_recheck_uncertain",
@@ -357,10 +358,18 @@ export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
       return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_identity_unavailable" };
     }
     const distinct = new Set(identities.map((identity) => `${identity.tgid}:${identity.start_time}`));
+    const owners = matches.map((entry, index) => ({
+      pid: entry.pid,
+      ...identities[index],
+      executable_path: entry.executable_path,
+      executable_dev: entry.executable_dev,
+      executable_ino: entry.executable_ino,
+      cmdline: entry.cmdline,
+    }));
     if (distinct.size > 1) {
-      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_ambiguous", owners: matches.map((entry, index) => ({ pid: entry.pid, ...identities[index] })) };
+      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_ambiguous", owners };
     }
-    return { status: "ok", pid: matches[0].pid, confidence: 1, owners: matches.map((entry, index) => ({ pid: entry.pid, ...identities[index] })) };
+    return { status: "ok", pid: matches[0].pid, confidence: 1, owners };
   }
   const hadInaccessible = scanResults.some((entry) => entry.accessible === false);
   if (hadInaccessible) return { status: "partial", pid: undefined, confidence: 0, review_hint: "missing_permission" };
@@ -372,6 +381,12 @@ async function verifyProcFdHolder(targetInode, owner, options = {}) {
   const readFileFn = options.readFileFn ?? readFile;
   const readlinkFn = options.readlinkFn ?? readlink;
   const openFn = options.openFn ?? open;
+  if (typeof owner.executable_path !== "string"
+    || owner.executable_dev === undefined
+    || owner.executable_ino === undefined
+    || typeof owner.cmdline !== "string") {
+    return { status: "ambiguous", reason: "owner_evidence_unavailable" };
+  }
   try {
     const fdNames = await readdirFn(`/proc/${owner.pid}/fd`);
     const processStat = await readFileFn(`/proc/${owner.pid}/stat`, "utf8");
@@ -420,6 +435,7 @@ export async function verifyFinalSocketResolution(targetInode, expectedRow, owne
   const readFileFn = options.readFileFn ?? readFile;
   const readlinkFn = options.readlinkFn ?? readlink;
   const openFn = options.openFn ?? open;
+  const readdirFn = options.readdirFn ?? readdir;
   const protocolPath = `/proc/net/${expectedRow.protocol}`;
   let contents;
   try {
@@ -435,7 +451,7 @@ export async function verifyFinalSocketResolution(targetInode, expectedRow, owne
     return { status: "retry", reason: "socket_row_changed" };
   }
   for (const owner of owners) {
-    const verification = await verifyProcFdHolder(targetInode, owner, { readFileFn, readlinkFn, openFn });
+    const verification = await verifyProcFdHolder(targetInode, owner, { readFileFn, readlinkFn, openFn, readdirFn });
     if (verification.status !== "ok") return verification;
   }
   return { status: "ok" };
@@ -488,7 +504,7 @@ function holderIdentitySet(scan, targetInode) {
 // the last enumeration. That phase rechecks the socket row, every selected holder's fd link,
 // (tgid,start_time), freshly-opened-exe fstat generation, and cmdline. This ordering is an
 // invariant: later edits must not move a check back in front of the final enumeration.
-export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanResults, { scanAgain, verifyHolder, verifyFinal } = {}) {
+export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanResults, { scanAgain, verifyHolder, verifyFinal, prepareOwner } = {}) {
   const verify = verifyHolder ?? verifyProcFdHolder;
   const verifyAll = verifyFinal ?? (async (inode, owners) => {
     for (const owner of owners) {
@@ -497,6 +513,18 @@ export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanRes
     }
     return { status: "ok" };
   });
+  const prepareAndVerify = async (match, currentScan) => {
+    let owners;
+    try {
+      owners = prepareOwner
+        ? await Promise.all((match.owners ?? [{ pid: match.pid }]).map(async (owner) => (await prepareOwner(owner, currentScan)) ?? owner))
+        : (match.owners ?? [{ pid: match.pid }]);
+    } catch {
+      return { status: "retry", reason: "owner_evidence_unavailable" };
+    }
+    const verification = await verifyAll(targetInode, owners, currentScan);
+    return verification.status === "ok" ? { ...match, owners, pid: owners[0]?.pid ?? match.pid } : { status: "retry", reason: verification.reason };
+  };
 
   const resolveOnce = async (initialScan) => {
     let currentScan = initialScan;
@@ -504,8 +532,7 @@ export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanRes
       const match = resolvePidFromFdScanResults(targetInode, currentScan);
       if (match.status !== "ok") return match;
       if (!scanAgain) {
-        const verification = await verifyAll(targetInode, match.owners ?? [{ pid: match.pid }], currentScan);
-        return verification.status === "ok" ? match : { status: "retry", reason: verification.reason };
+        return prepareAndVerify(match, currentScan);
       }
 
       const refreshedScan = await scanAgain();
@@ -526,8 +553,7 @@ export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanRes
 
       const stableMatch = resolvePidFromFdScanResults(targetInode, refreshedScan);
       if (stableMatch.status !== "ok") return stableMatch;
-      const verification = await verifyAll(targetInode, stableMatch.owners ?? [{ pid: stableMatch.pid }], refreshedScan);
-      return verification.status === "ok" ? stableMatch : { status: "retry", reason: verification.reason };
+      return prepareAndVerify(stableMatch, refreshedScan);
     }
     return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_recheck_exhausted" };
   };
@@ -1029,7 +1055,7 @@ async function resolveByPortMac(port) {
 // (plan §0): every elevated-path failure mode returns this unprivileged outcome UNCHANGED --
 // never the more-degraded `unable`/`0` shape (that's timedEnvelope's thrown-exception contract
 // only, untouched here).
-export async function resolveCrossUidPortResult({ port, primary, sockets }, options = {}) {
+export async function resolveCrossUidPortResult({ port, primary, sockets, ownerReason }, options = {}) {
   const unprivilegedCore = {
     resolvedStatus: "partial",
     resolved: {
@@ -1112,7 +1138,8 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
     ...(fdScanTruncated ? ["fd_scan_truncated"] : []),
     ...(ownerAmbiguous ? ["elevated_owner_ambiguous"] : []),
     ...(procfsNamespaceMismatch ? ["procfs_pid_namespace_mismatch"] : []),
-  ];
+    ...(ownerReason ? [ownerReason] : []),
+  ].filter((reason, index, reasons) => reasons.indexOf(reason) === index);
   const helperDiagnosticReasons = [
     ...(helperHardeningFailure ? ["helper_hardening_failure"] : []),
     ...(helperSeccompKilled ? ["helper_seccomp_killed"] : []),
@@ -1273,26 +1300,58 @@ export async function resolveByPortLinux(port, options = {}) {
             readFileFn,
             readlinkFn: options.readlink ?? readlink,
             openFn: options.open ?? open,
+            readdirFn: options.readdir ?? readdir,
           }),
         }),
         ...(options.verifyProcFdHolder ? { verifyHolder: options.verifyProcFdHolder } : {}),
+        prepareOwner: async (owner) => {
+          const core = await resolvePidCoreFn(owner.pid);
+          return {
+            ...owner,
+            // The core snapshot is gathered before final verification. The verifier then checks
+            // this path, alongside the scan's fd/stat/cmdline evidence, before it can be emitted.
+            ...(typeof core.resolved?.executable_path === "string"
+              ? { executable_path: core.resolved.executable_path }
+              : {}),
+            preverifiedCore: core,
+          };
+        },
       });
       if (matchResult.status === "ok") {
-        const cores = await Promise.all((matchResult.owners ?? [{ pid: matchResult.pid }]).map(async (owner) => ({
-          owner,
-          core: await resolvePidCoreFn(owner.pid),
-        })));
-        const resolvedCores = cores.filter(({ core }) => core.resolvedStatus === "ok");
+        const owners = matchResult.owners ?? [{ pid: matchResult.pid }];
+        const cores = owners.map((owner) => ({ owner, core: owner.preverifiedCore }));
+        const resolvedCores = cores.filter(({ core }) => core?.resolvedStatus === "ok");
         const identitiesAgree = resolvedCores.length === cores.length
           && resolvedCores.every(({ owner, core }) => core.resolved.process_identity?.tgid === owner.tgid
             && core.resolved.process_identity?.start_time === owner.start_time);
-        const distinctIdentities = new Set(resolvedCores.map(({ core }) => {
-          const identity = core.resolved.process_identity;
+        const distinctIdentities = new Set(resolvedCores.map(({ owner }) => {
+          const identity = { tgid: owner.tgid, start_time: owner.start_time };
           return identity ? `${identity.tgid}:${identity.start_time}` : "missing";
         }));
         if (identitiesAgree && distinctIdentities.size === 1) {
-          const core = resolvedCores[0].core;
-          const processIdentity = core.resolved.process_identity;
+          const { owner, core: preparedCore } = resolvedCores[0];
+          const processIdentity = { tgid: owner.tgid, start_time: owner.start_time };
+          const verifiedCommand = redactAndBoundProcessArgs(String(owner.cmdline ?? "").replaceAll("\0", " ").trim());
+          const core = {
+            ...preparedCore,
+            resolved: {
+              ...preparedCore.resolved,
+              pid: owner.pid,
+              tgid: owner.tgid,
+              start_time: owner.start_time,
+              process_identity: processIdentity,
+              executable_path: owner.executable_path,
+              executable_dev: owner.executable_dev,
+              executable_ino: owner.executable_ino,
+              command: verifiedCommand.value,
+              args_redaction: {
+                redacted: verifiedCommand.redacted,
+                truncated: verifiedCommand.truncated,
+                original_length: verifiedCommand.original_length,
+                max_length: verifiedCommand.max_length,
+              },
+            },
+          };
           attributions.push({ resolved: true, executablePath: core.resolved.executable_path, processIdentity });
           outcomes.push(finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets }));
           continue;
@@ -1302,7 +1361,7 @@ export async function resolveByPortLinux(port, options = {}) {
       }
       const originalReason = matchResult.reason ?? "socket_attribution_unresolved";
       if (options.paths) {
-        const elevatedOutcome = await resolveCrossUidPortResult({ port, primary: entry, sockets: [socket] }, options);
+        const elevatedOutcome = await resolveCrossUidPortResult({ port, primary: entry, sockets: [socket], ownerReason: originalReason }, options);
         if (elevatedOutcome.resolvedStatus === "ok") {
           attributions.push({ resolved: true, executablePath: elevatedOutcome.result.resolved.executable_path, processIdentity: elevatedOutcome.result.resolved.process_identity });
           outcomes.push(elevatedOutcome);
@@ -1310,11 +1369,18 @@ export async function resolveByPortLinux(port, options = {}) {
         }
         const originalClass = classifyOwnerAmbiguityReason(originalReason);
         const elevatedReason = elevatedOutcome.result.resolved.reason;
+        const elevatedReasons = elevatedOutcome.result.resolved.reasons
+          ?? [elevatedReason].filter((reason) => reason !== undefined);
         const elevatedClass = classifyOwnerAmbiguityReason(elevatedReason);
         const rank = { unknown: 0, partial: 1, truncated: 2, ambiguous: 3 };
         const originalRank = rank[originalClass?.status ?? "partial"];
         const elevatedRank = rank[elevatedClass?.status ?? "partial"];
-        attributions.push({ resolved: false, reason: elevatedRank >= originalRank ? elevatedReason : originalReason });
+        attributions.push({
+          resolved: false,
+          reason: elevatedRank >= originalRank ? elevatedReason : originalReason,
+          reasons: elevatedReasons,
+          privilege: elevatedOutcome.result.privilege,
+        });
         continue;
       }
       attributions.push({ resolved: false, reason: originalReason });
@@ -1371,7 +1437,9 @@ export async function resolveByPortLinux(port, options = {}) {
   if (outcomes.length === 1) return outcomes[0];
 
   if (matches.length === 1 && attributions[0]?.resolved !== true && currentUid !== undefined && primary.uid === currentUid) {
-    const reason = attributions[0]?.reason ?? "socket_attribution_unresolved";
+    const attribution = attributions[0] ?? {};
+    const reason = attribution.reason ?? "socket_attribution_unresolved";
+    const reasons = attribution.reasons ?? [reason];
     const resolvedStatus = classifyOwnerAmbiguityReason(reason)?.status ?? "partial";
     const core = {
       resolvedStatus,
@@ -1380,11 +1448,12 @@ export async function resolveByPortLinux(port, options = {}) {
         pid: undefined,
         user: { uid: primary.uid, username: undefined, username_unavailable: true },
         reason,
+        ...(reasons.length > 0 ? { reasons } : {}),
       },
       ancestry: [],
-      source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason } },
+      source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason, ...(reasons.length > 0 ? { reasons } : {}) } },
     };
-    return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+    return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets, privilege: attribution.privilege });
   }
 
   // Cross-UID, or fd-walk could not resolve a pid: the owning UID is a confident fact; the pid

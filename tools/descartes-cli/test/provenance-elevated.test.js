@@ -411,6 +411,35 @@ test("same-UID ambiguity stays ambiguous when the enabled elevated helper also c
   assert.equal(outcome.result.resolved.pid, undefined);
 });
 
+test("same-UID elevated fallback preserves every owner and helper failure reason", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const currentUid = process.getuid?.() ?? 1000;
+  const outcome = await resolveByPortLinux(8080, fakeElevatedOptions({
+    paths,
+    readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcpListeningFixture({ uid: currentUid }) : "1\n",
+    listProcPids: async () => ({ pids: [100], truncated: false }),
+    verifyProcfsPidNamespace: async () => true,
+    scanProcFdForInode: async () => ({
+      results: [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [] }],
+      truncated: false,
+      uncertain: true,
+    }),
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({
+      status: "unable",
+      fd_scan_uncertain: true,
+      helper_hardening_failure: true,
+      stdout: "",
+      stderr: "",
+    }),
+  }));
+  assert.equal(outcome.resolvedStatus, "ambiguous");
+  assert.deepEqual(outcome.result.resolved.reasons, ["fd_scan_uncertain", "helper_hardening_failure"]);
+  assert.equal(outcome.result.privilege.helper_hardening_failure, true);
+  assert.equal(outcome.result.privilege.elevated_available, false);
+});
+
 test("defaultInvokeElevatedHelper maps the helper's EXIT_OWNER_AMBIGUOUS (5) to owner_ambiguous:true, and resolveCrossUidPortResult surfaces it while degrading (real subprocess)", async () => {
   const paths = await tempPaths();
   const helperPath = path.join(paths.stateDir, "helper-exit5");
