@@ -11,6 +11,7 @@ import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from 
 import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { RULE_HORIZONS } from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
   factPointsFromNetworkEvidence,
@@ -110,6 +111,19 @@ export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
   CORRELATION_RULE_ID,
   CANARY_TAMPERED_RULE_ID,
 ]);
+
+// Fact-store capacity plan §4.3 / I7 (step S3): every history-dependent rule must have a
+// fact-families.js registry entry (families + eligibility horizon), and the registry must name no
+// rule this set does not. The registry is a leaf module and can only hold string literals, so this
+// check -- against the set built from the detectors' own exported constants -- is also what catches
+// a registry literal that has drifted from its constant. Throws at module init, like the
+// duplicate-owner throw in SECURITY_RULE_OWNERSHIP below.
+for (const ruleId of HISTORY_DEPENDENT_ALERT_RULE_IDS) {
+  if (!RULE_HORIZONS.has(ruleId)) throw new Error(`fact-families registry has no horizon entry for history-dependent rule ${ruleId}`);
+}
+for (const ruleId of RULE_HORIZONS.keys()) {
+  if (!HISTORY_DEPENDENT_ALERT_RULE_IDS.has(ruleId)) throw new Error(`fact-families registry names ${ruleId}, which is not a history-dependent rule`);
+}
 
 // BLOCKER-3 (daybreak-blue re-gate round 2, the root of the class -- subsumes BLOCKER-1/BLOCKER-2):
 // global `historyTrust` alone is not enough to authorize recovery. A detector can short-circuit to

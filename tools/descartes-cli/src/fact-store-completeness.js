@@ -97,6 +97,92 @@ export function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
   });
 }
 
+// A completeness object carries a VALID ledger's coverage report only when coverage is exactly
+// "full" or "narrowed" (LOW-2, review fold: buildCompleteness reports "unknown" when there is no
+// ledger at all, whose null floor would otherwise read as "never narrowed").
+function validLedgerFloors(readResult) {
+  const completeness = readResult?.completeness;
+  if (!isObject(completeness)) return undefined;
+  if (completeness.coverage !== "full" && completeness.coverage !== "narrowed") return undefined;
+  const floors = {};
+  for (const field of ["bytecap_floor_ts", "age_floor_ts"]) {
+    if (!Object.prototype.hasOwnProperty.call(completeness, field)) return undefined;
+    const value = completeness[field];
+    if (value === null) {
+      floors[field] = null;
+      continue;
+    }
+    if (!isValidTimestamp(value)) return undefined;
+    floors[field] = Date.parse(value);
+  }
+  return floors;
+}
+
+/**
+ * The per-rule eligibility horizon (fact-store capacity plan §4.2, step S3). Pure and fail-closed.
+ * True when the read's certified span is at least `horizonMs` long: no floor at all (nothing was
+ * ever narrowed in this lineage -- the existing per-detector minimum-history gates govern, so day-1
+ * behavior is unchanged), or `nowMs - floor >= horizonMs`.
+ *
+ * The floor is max(bytecap_floor_ts, age_floor_ts): the same boundary readFactPoints excludes
+ * points at or below, so the predicate is never looser than what the store itself certifies. In
+ * normal operation the age floor sits ~30 days back and never binds; after a wall-clock rollback it
+ * can, and then it must.
+ *
+ * False on: no valid ledger (coverage not "full"/"narrowed" -- LOW-2), a missing/malformed
+ * completeness or floor field, a floor in the future, or non-finite inputs.
+ *
+ * I5: this only ever REMOVES an evaluation. It is never an input to the cold-start re-arm, never
+ * extends certified_after_ts, never adds points.
+ */
+export function certifiedHorizonOk(readResult, { nowMs, horizonMs } = {}) {
+  try {
+    if (!Number.isFinite(nowMs) || !Number.isFinite(horizonMs) || horizonMs < 0) return false;
+    const floors = validLedgerFloors(readResult);
+    if (!floors) return false;
+    const floorMs = Math.max(floors.bytecap_floor_ts ?? Number.NEGATIVE_INFINITY, floors.age_floor_ts ?? Number.NEGATIVE_INFINITY);
+    if (floorMs === Number.NEGATIVE_INFINITY) return true;
+    if (floorMs > nowMs) return false;
+    return nowMs - floorMs >= horizonMs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The non-detector readers' narrowing gate (fact-families.js READER_COVERAGE "read_window"; replaces
+ * the interim requireFullCoverage gate of review-fold MEDIUM-1). True exactly when byte-cap eviction
+ * is INVISIBLE to a read of `windowMs` ending at `nowMs` (windowMs undefined = an unbounded read):
+ *   - no byte-cap floor; or
+ *   - the floor is strictly before the window start (the floor is exclusive, the window inclusive,
+ *     so a point at exactly the start would otherwise be hidden); or
+ *   - the floor is at or below the age floor: every record it removed has ts <= the age floor, and
+ *     the same retention passes would have age-evicted all of those from a store that never
+ *     byte-evicted, so that store holds none of them either. This is the only way an UNBOUNDED read
+ *     can qualify.
+ * Referent (stated, not assumed): "a store that never byte-evicted under the same age retention".
+ * Under that referent the read returns byte-identical points (fact-families.test.js proves it on
+ * two real stores), so the gate is provably no weaker than "no byte-cap narrowing" for the reader's
+ * inputs. An age floor alone never refuses: age retention narrowed every reader on `main` too.
+ * Fails closed on no valid ledger, malformed completeness/floors, or bad inputs. Status/loss trust
+ * is NOT decided here -- callers still require factHistoryTrustworthy(...).trust.
+ */
+export function certifiedReadWindowOk(readResult, { nowMs, windowMs } = {}) {
+  try {
+    if (!Number.isFinite(nowMs)) return false;
+    if (windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs < 0)) return false;
+    const floors = validLedgerFloors(readResult);
+    if (!floors) return false;
+    const bytecapFloorMs = floors.bytecap_floor_ts;
+    if (bytecapFloorMs === null) return true;
+    if (floors.age_floor_ts !== null && bytecapFloorMs <= floors.age_floor_ts) return true;
+    if (windowMs === undefined) return false;
+    return bytecapFloorMs < nowMs - windowMs;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Makes the one central, fail-closed trust decision for fact-history consumers.
  * Pure: it performs no I/O and never mutates either input.
