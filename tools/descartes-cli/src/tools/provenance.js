@@ -11,7 +11,7 @@
 //     set of small parser/matcher functions used to keep the orchestration testable via fixtures.
 
 import { execFile } from "node:child_process";
-import { readdir, readFile, readlink, stat } from "node:fs/promises";
+import { open, readdir, readFile, readlink, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { parseMacLsofListeningSockets } from "./network.js";
@@ -288,7 +288,7 @@ function decodeProcNetIPv6(hex) {
   return `[${hextets.join(":")}]`;
 }
 
-export function parseProcNetLine(line, { protocol } = {}) {
+export function parseProcNetLine(line, { protocol, includeAllUdpStates = false } = {}) {
   const parts = String(line ?? "").trim().split(/\s+/);
   if (parts.length < 10) return undefined;
 
@@ -302,7 +302,7 @@ export function parseProcNetLine(line, { protocol } = {}) {
 
   const stateHex = String(parts[3] ?? "").toUpperCase();
   const isUdp = String(protocol ?? "").startsWith("udp");
-  if (isUdp && stateHex !== "07") return undefined;
+  if (isUdp && stateHex !== "07" && !includeAllUdpStates) return undefined;
   const uid = Number(parts[7]);
   const inode = parts[9];
 
@@ -310,7 +310,7 @@ export function parseProcNetLine(line, { protocol } = {}) {
     protocol: protocol ?? (isV6 ? "tcp6" : "tcp"),
     local_address: address,
     local_port: localPort,
-    state: isUdp ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
+    state: isUdp && stateHex === "07" ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
     uid: Number.isFinite(uid) ? uid : undefined,
     inode,
   };
@@ -367,10 +367,14 @@ export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
   return { status: "unknown", pid: undefined, confidence: 0 };
 }
 
-async function verifyProcFdHolder(targetInode, owner) {
+async function verifyProcFdHolder(targetInode, owner, options = {}) {
+  const readdirFn = options.readdirFn ?? readdir;
+  const readFileFn = options.readFileFn ?? readFile;
+  const readlinkFn = options.readlinkFn ?? readlink;
+  const openFn = options.openFn ?? open;
   try {
-    const fdNames = await readdir(`/proc/${owner.pid}/fd`);
-    const processStat = await readFile(`/proc/${owner.pid}/stat`, "utf8");
+    const fdNames = await readdirFn(`/proc/${owner.pid}/fd`);
+    const processStat = await readFileFn(`/proc/${owner.pid}/stat`, "utf8");
     const identity = parseLinuxProcessIdentity(processStat, owner.pid);
     if (identity.tgid !== owner.tgid || identity.start_time !== owner.start_time) {
       return { status: "ambiguous", reason: "owner_identity_changed" };
@@ -378,16 +382,63 @@ async function verifyProcFdHolder(targetInode, owner) {
     for (const fdName of fdNames) {
       let target;
       try {
-        target = await readlink(`/proc/${owner.pid}/fd/${fdName}`);
+        target = await readlinkFn(`/proc/${owner.pid}/fd/${fdName}`);
       } catch {
         return { status: "ambiguous", reason: "fd_recheck_uncertain" };
       }
-      if (target === `socket:[${targetInode}]`) return { status: "ok" };
+      if (target !== `socket:[${targetInode}]`) continue;
+
+      const executablePath = await readlinkFn(`/proc/${owner.pid}/exe`).catch(() => undefined);
+      if (executablePath === undefined || executablePath !== owner.executable_path) {
+        return { status: "ambiguous", reason: "executable_generation_changed" };
+      }
+      const exeFd = await openFn(`/proc/${owner.pid}/exe`, "r").catch(() => undefined);
+      if (!exeFd) return { status: "ambiguous", reason: "executable_generation_unavailable" };
+      let exeStat;
+      try {
+        exeStat = await exeFd.stat();
+      } finally {
+        await exeFd.close();
+      }
+      if (owner.executable_dev !== undefined && owner.executable_ino !== undefined
+        && (String(exeStat.dev) !== String(owner.executable_dev) || String(exeStat.ino) !== String(owner.executable_ino))) {
+        return { status: "ambiguous", reason: "executable_generation_changed" };
+      }
+      const cmdline = await readFileFn(`/proc/${owner.pid}/cmdline`, "utf8").catch(() => undefined);
+      if (cmdline === undefined || (owner.cmdline !== undefined && cmdline !== owner.cmdline)) {
+        return { status: "ambiguous", reason: "cmdline_changed" };
+      }
+      return { status: "ok" };
     }
     return { status: "ambiguous", reason: "owner_fd_recheck_failed" };
   } catch {
     return { status: "ambiguous", reason: "fd_recheck_uncertain" };
   }
+}
+
+export async function verifyFinalSocketResolution(targetInode, expectedRow, owners, options = {}) {
+  const readFileFn = options.readFileFn ?? readFile;
+  const readlinkFn = options.readlinkFn ?? readlink;
+  const openFn = options.openFn ?? open;
+  const protocolPath = `/proc/net/${expectedRow.protocol}`;
+  let contents;
+  try {
+    contents = await readFileFn(protocolPath, "utf8");
+  } catch {
+    return { status: "ambiguous", reason: "socket_row_recheck_uncertain" };
+  }
+  const row = String(contents).split("\n")
+    .map((line) => parseProcNetLine(line, { protocol: expectedRow.protocol, includeAllUdpStates: true }))
+    .find((candidate) => candidate?.inode === expectedRow.inode);
+  if (!row || row.local_port !== expectedRow.local_port || row.state !== expectedRow.state
+    || row.uid !== expectedRow.uid || row.local_address !== expectedRow.local_address) {
+    return { status: "retry", reason: "socket_row_changed" };
+  }
+  for (const owner of owners) {
+    const verification = await verifyProcFdHolder(targetInode, owner, { readFileFn, readlinkFn, openFn });
+    if (verification.status !== "ok") return verification;
+  }
+  return { status: "ok" };
 }
 
 const MAX_OWNER_STABILITY_PASSES = 3;
@@ -424,49 +475,73 @@ function scanHasReusedHolder(targetInode, previousScan, nextScan) {
   });
 }
 
-function mergeScanResults(previousScan, nextScan) {
-  if (Array.isArray(nextScan)) return nextScan;
-  const merged = new Map(scanResultEntries(previousScan).map((entry) => [entry.pid, entry]));
-  for (const entry of scanResultEntries(nextScan)) merged.set(entry.pid, entry);
-  return {
-    results: [...merged.values()],
-    truncated: (previousScan?.truncated === true) || (nextScan?.truncated === true),
-    uncertain: (previousScan?.uncertain === true) || (nextScan?.uncertain === true),
-  };
+function holderIdentitySet(scan, targetInode) {
+  return scanResultEntries(scan)
+    .filter((entry) => entry.accessible !== false && (entry.fds ?? []).some((fd) => fd.target === `socket:[${targetInode}]`))
+    .map((entry) => `${entry.pid}:${entry.tgid}:${entry.start_time}`)
+    .sort()
+    .join("|");
 }
 
-// A scan snapshot is not itself a current ownership proof. Once a sole owner is selected, verify
-// both its identity and the exact socket link again, then enumerate and scan the PID set again.
-// Newly-created PIDs and reused numeric PIDs are part of the proof obligation even when the first
-// selected owner still passes its recheck. Three consecutive additions are a bounded
-// non-converging scan, not permission to report the first owner.
-export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanResults, { scanAgain, verifyHolder } = {}) {
+// A scan snapshot is not itself a current ownership proof. Scan first, re-enumerate until the
+// complete PID/holder snapshot is stable, then run ONE final verification phase strictly after
+// the last enumeration. That phase rechecks the socket row, every selected holder's fd link,
+// (tgid,start_time), freshly-opened-exe fstat generation, and cmdline. This ordering is an
+// invariant: later edits must not move a check back in front of the final enumeration.
+export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanResults, { scanAgain, verifyHolder, verifyFinal } = {}) {
   const verify = verifyHolder ?? verifyProcFdHolder;
-  let currentScan = fdScanResults;
-  for (let pass = 0; pass < MAX_OWNER_STABILITY_PASSES; pass += 1) {
-    const match = resolvePidFromFdScanResults(targetInode, currentScan);
-    if (match.status !== "ok") return match;
-    const owner = (match.owners ?? [{ pid: match.pid }])[0];
-    const verification = await verify(targetInode, owner);
-    if (verification.status !== "ok") {
-      if (pass < MAX_OWNER_STABILITY_PASSES - 1 && scanAgain) {
-        currentScan = await scanAgain();
+  const verifyAll = verifyFinal ?? (async (inode, owners) => {
+    for (const owner of owners) {
+      const verification = await verify(inode, owner);
+      if (verification.status !== "ok") return verification;
+    }
+    return { status: "ok" };
+  });
+
+  const resolveOnce = async (initialScan) => {
+    let currentScan = initialScan;
+    for (let pass = 0; pass < MAX_OWNER_STABILITY_PASSES; pass += 1) {
+      const match = resolvePidFromFdScanResults(targetInode, currentScan);
+      if (match.status !== "ok") return match;
+      if (!scanAgain) {
+        const verification = await verifyAll(targetInode, match.owners ?? [{ pid: match.pid }], currentScan);
+        return verification.status === "ok" ? match : { status: "retry", reason: verification.reason };
+      }
+
+      const refreshedScan = await scanAgain();
+      if (scanHasReusedHolder(targetInode, currentScan, refreshedScan)) {
+        return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_identity_changed" };
+      }
+      const pidSetChanged = scanHasNewOrReusedPids(currentScan, refreshedScan);
+      const holderSetChanged = holderIdentitySet(currentScan, targetInode) !== holderIdentitySet(refreshedScan, targetInode);
+      if (pidSetChanged || holderSetChanged) {
+        if (pass === MAX_OWNER_STABILITY_PASSES - 1) {
+          return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_recheck_exhausted" };
+        }
+        // The complete refresh is authoritative. Removed PIDs/holders are intentionally not
+        // merged back into the next proof; a union could resurrect a stale or reused owner.
+        currentScan = refreshedScan;
         continue;
       }
-      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: verification.reason };
-    }
-    if (!scanAgain) return match;
 
-    const refreshedScan = await scanAgain();
-    if (scanHasReusedHolder(targetInode, currentScan, refreshedScan)) {
-      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_identity_changed" };
+      const stableMatch = resolvePidFromFdScanResults(targetInode, refreshedScan);
+      if (stableMatch.status !== "ok") return stableMatch;
+      const verification = await verifyAll(targetInode, stableMatch.owners ?? [{ pid: stableMatch.pid }], refreshedScan);
+      return verification.status === "ok" ? stableMatch : { status: "retry", reason: verification.reason };
     }
-    if (!scanHasNewOrReusedPids(currentScan, refreshedScan)) {
-      return resolvePidFromFdScanResults(targetInode, mergeScanResults(currentScan, refreshedScan));
+    return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_recheck_exhausted" };
+  };
+
+  let currentScan = fdScanResults;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const outcome = await resolveOnce(currentScan);
+    if (outcome.status !== "retry") return outcome;
+    if (!scanAgain || attempt === 1) {
+      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: outcome.reason ?? "owner_recheck_failed" };
     }
-    currentScan = mergeScanResults(currentScan, refreshedScan);
+    // A final-generation change retries the entire scan/enumeration/verification proof once.
+    currentScan = await scanAgain();
   }
-  return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_recheck_exhausted" };
 }
 
 // A numeric port is not an identity: TCP/UDP rows and SO_REUSEPORT siblings can coexist. This
@@ -537,7 +612,28 @@ export async function scanProcFdForInode(candidatePids, { listingTruncated = fal
           uncertain = true;
         }
       }
-      results.push({ pid, ...processIdentity, accessible: true, fds });
+      const result = { pid, ...processIdentity, accessible: true, fds };
+      if (fds.some((fd) => fd.target.startsWith("socket:["))) {
+        try {
+          const executablePath = await readlink(`/proc/${pid}/exe`);
+          const exeFd = await open(`/proc/${pid}/exe`, "r");
+          let exeStat;
+          try {
+            exeStat = await exeFd.stat();
+          } finally {
+            await exeFd.close();
+          }
+          result.executable_path = executablePath;
+          result.executable_dev = String(exeStat.dev);
+          result.executable_ino = String(exeStat.ino);
+          result.cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8");
+        } catch {
+          // A matching holder whose identity evidence cannot be read is uncertain, never a
+          // confident owner. The final verification phase also requires these fields.
+          uncertain = true;
+        }
+      }
+      results.push(result);
     } catch (error) {
       uncertain = true;
       results.push({ pid, accessible: false, error: error?.code });
@@ -1148,6 +1244,14 @@ export async function resolveByPortLinux(port, options = {}) {
             listingTruncated: !Array.isArray(refreshedListing) && refreshedListing.truncated,
           });
         },
+        ...(options.verifyFinal ? { verifyFinal: options.verifyFinal } : options.verifyProcFdHolder ? {} : {
+          verifyFinal: (inode, owners) => verifyFinalSocketResolution(inode, entry, owners, {
+            readFileFn,
+            readlinkFn: options.readlink ?? readlink,
+            openFn: options.open ?? open,
+          }),
+        }),
+        ...(options.verifyProcFdHolder ? { verifyHolder: options.verifyProcFdHolder } : {}),
       });
       if (matchResult.status === "ok") {
         const cores = await Promise.all((matchResult.owners ?? [{ pid: matchResult.pid }]).map(async (owner) => ({

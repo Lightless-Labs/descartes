@@ -50,6 +50,7 @@ import {
   parseProvenancePs,
   provenancePsArgsForPlatform,
   resolveExecutableInfo,
+  verifyFinalSocketResolution,
   resolveVerifiedPidFromFdScanResults,
   scanProcFdForInode,
 } from "./provenance.js";
@@ -389,7 +390,12 @@ async function listLinuxListeningSockets(options) {
           listingTruncated: !Array.isArray(refreshedListing) && refreshedListing.truncated,
         });
       },
-      verifyHolder: options.verifyProcFdHolder,
+      ...(options.verifyFinal ? { verifyFinal: options.verifyFinal } : options.verifyProcFdHolder ? {} : {
+        verifyFinal: (inode, owners) => verifyFinalSocketResolution(inode, entry, owners, {
+          readFileFn,
+        }),
+      }),
+      ...(options.verifyProcFdHolder ? { verifyHolder: options.verifyProcFdHolder } : {}),
     });
     return {
       protocol: entry.protocol,

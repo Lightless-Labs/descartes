@@ -24,6 +24,7 @@ import {
   parseLinuxProcessIdentity,
   resolveProvenance,
   summarizeSocketAttributions,
+  verifyFinalSocketResolution,
 } from "../src/tools/provenance.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -208,6 +209,50 @@ test("resolveVerifiedPidFromFdScanResults treats a reused PID as a new process",
   });
   assert.equal(result.status, "ambiguous");
   assert.equal(result.reason, "owner_identity_changed");
+});
+
+test("final verification runs after the stable enumeration and rejects an exec-generation change", async () => {
+  const stable = [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] }];
+  let enumerations = 0;
+  let finalChecks = 0;
+  const result = await resolveVerifiedPidFromFdScanResults("12345", stable, {
+    scanAgain: async () => {
+      enumerations += 1;
+      return stable;
+    },
+    verifyFinal: async () => {
+      finalChecks += 1;
+      return { status: "ambiguous", reason: "executable_generation_changed" };
+    },
+  });
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.reason, "executable_generation_changed");
+  assert.equal(enumerations, 3, "a changed final generation retries the whole proof once");
+  assert.equal(finalChecks, 2, "the final phase runs only after each proof's last enumeration");
+});
+
+test("final socket verification catches a UDP state change with injected proc readers", async () => {
+  const oldRow = { protocol: "udp", local_address: "127.0.0.1", local_port: 5353, state: "UNCONN", uid: 1000, inode: "424242" };
+  const udpStateChanged = [
+    " sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
+    " 0: 0100007F:14E9 00000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 424242 1",
+  ].join("\n");
+  const result = await verifyFinalSocketResolution("424242", oldRow, [{ pid: 100, tgid: 100, start_time: "10" }], {
+    readFileFn: async () => udpStateChanged,
+  });
+  assert.equal(result.status, "retry");
+  assert.equal(result.reason, "socket_row_changed");
+});
+
+test("a complete refresh that loses the owner is authoritative and never resurrects the old pid", async () => {
+  const owner = { pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] };
+  const result = await resolveVerifiedPidFromFdScanResults("12345", [owner], {
+    scanAgain: async () => ({ results: [], truncated: false, uncertain: false }),
+    verifyFinal: async () => ({ status: "ok" }),
+  });
+  assert.notEqual(result.status, "ok");
+  assert.notEqual(result.pid, 100);
+  assert.notEqual(result.confidence, 1);
 });
 
 test("same-port socket attribution is ambiguous when inodes map to different executables or any row is unresolved", () => {
