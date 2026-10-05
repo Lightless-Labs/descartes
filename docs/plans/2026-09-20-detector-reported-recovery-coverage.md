@@ -165,7 +165,7 @@ Defense-in-depth requirements are part of this addendum: macOS socket census inv
 - **Bounded storage cannot authorize recovery.** The five-entry `port_target_keys`/`current_port_target_keys` fields remain introspection/candidate inputs only. Coverage does not use `current_port_target_keys`, and a historical list at the five-entry bound is treated as potentially truncated and cannot yield port recovery keys. Five old plus five new live ports therefore remain frozen rather than falsely recovering.
 - **Sibling folding is fail-closed for identity/drift coverage too.** Coverage groups all observations sharing an identity key and requires every sibling to be clear before reporting its `unknown_identity` or `identity_drift` key; last-observation-wins is not a recovery authority.
 
-Regression coverage now includes the listenerless sibling-last reproduction, the re-keyed provisional holder plus same-key decoy, five-plus-five live ports, complete-census true absence, and incomplete-census no-clear behavior. The focused provenance-store/identity gate is 80/80 locally; the required fresh-XDG full `npm test` remains the final gate.
+Regression coverage now includes the listenerless sibling-last reproduction, the re-keyed provisional holder plus same-key decoy, five-plus-five live ports, complete-census true absence, and incomplete-census no-clear behavior. The focused provenance-store/identity gate is 80/80 locally. Fresh-XDG full `npm test` completed at 2,046 pass / 22 sandbox-environment failures / 34 skip / 2,102 total; the final daybreak re-gate remains pending.
 
 ---
 
