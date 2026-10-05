@@ -185,6 +185,29 @@ async function uniqueTarget(dir, item) {
   return candidate;
 }
 
+function normalizeMovedItems(value) {
+  const byItem = new Map();
+  for (const entry of Array.isArray(value) ? value : []) {
+    if (entry && typeof entry.item === "string" && entry.item.length > 0 && isIso(entry.moved_ts)) {
+      byItem.set(entry.item, entry.moved_ts);
+    }
+  }
+  return byItem;
+}
+
+function serializeMovedItems(movedItems) {
+  return [...movedItems.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([item, moved_ts]) => ({ item, moved_ts }));
+}
+
+function quarantineDeleteAfterMs(entry) {
+  const timestamps = [entry.quarantined_ts, ...normalizeMovedItems(entry.moved_items).values()]
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite);
+  return timestamps.length > 0 ? Math.max(...timestamps) + LEGACY_QUARANTINE_RETENTION_MS : Number.NaN;
+}
+
 /**
  * Quarantines the legacy single store (M3) and deletes quarantines older than 31 days (Q4). Returns
  * { status: "none" | "quarantined" | "resumed", quarantine_dir?, moved: [...], deleted: [...],
@@ -222,16 +245,18 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
     });
   }
   if (items.length > 0 || resumable) {
-    const eventEpoch = resumable?.quarantine_epoch ?? (markerEpoch + 1);
-    // A new quarantine is its own discard episode. Never inherit the previous marker timestamp:
-    // doing so makes later legacy evidence indistinguishable from the first quarantine.
-    const resumableTs = resumable?.quarantine_ts ?? resumable?.started_ts;
-    const eventTs = resumableTs && Date.parse(resumableTs) <= nowMs ? resumableTs : nowIso;
+    // A pass that moves root data is a new discard episode, even when it resumes an existing
+    // quarantine directory. Seen-sets use this pair as their novelty boundary; retaining the old
+    // pair would let data discovered during downtime become eligible immediately after resume.
+    const movesRootItems = items.length > 0;
+    const eventEpoch = movesRootItems ? markerEpoch + 1 : (resumable?.quarantine_epoch ?? (markerEpoch + 1));
+    const eventTs = movesRootItems ? nowIso : (resumable?.quarantine_ts ?? resumable?.started_ts ?? nowIso);
     markerEpoch = eventEpoch;
     markerEpochTs = eventTs;
+    const movedItems = normalizeMovedItems(resumable?.moved_items);
     const inProgress = resumable
-      ? { ...resumable, quarantine_epoch: eventEpoch, quarantine_ts: eventTs }
-      : { dir: quarantineDirName(nowIso), started_ts: nowIso, quarantine_epoch: eventEpoch, quarantine_ts: eventTs };
+      ? { ...resumable, quarantine_epoch: eventEpoch, quarantine_ts: eventTs, moved_items: serializeMovedItems(movedItems) }
+      : { dir: quarantineDirName(nowIso), started_ts: nowIso, quarantine_epoch: eventEpoch, quarantine_ts: eventTs, moved_items: [] };
     status = resumable ? "resumed" : "quarantined";
     quarantineDir = inProgress.dir;
     // Record the target BEFORE anything moves (crash -> resume into the same directory).
@@ -244,11 +269,41 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
     });
     const target = path.join(learnedDir, inProgress.dir);
     await fs.mkdir(target, { recursive: true, mode: 0o700 });
+    if (resumable) {
+      // An old in-progress marker may predate per-item timestamps. Stamp already-present target
+      // items at this observation before any deletion decision; extending retention is safe, while
+      // falling back to the original started_ts could delete a half-moved item too early.
+      for (const targetItem of (await fs.readdir(target)).sort()) {
+        if (!movedItems.has(targetItem)) movedItems.set(targetItem, nowIso);
+      }
+      inProgress.moved_items = serializeMovedItems(movedItems);
+      await writeMarker(markerFile, {
+        schema_version: MARKER_SCHEMA_VERSION,
+        in_progress: inProgress,
+        quarantines,
+        quarantine_epoch: eventEpoch,
+        quarantine_epoch_ts: eventTs,
+      });
+    }
     for (const item of items) {
-      await fs.rename(path.join(factsRootDir, item), await uniqueTarget(target, item));
+      const destination = await uniqueTarget(target, item);
+      movedItems.set(path.basename(destination), nowIso);
+      inProgress.moved_items = serializeMovedItems(movedItems);
+      // Record the per-item move time before the rename, so a crash after the rename cannot lose
+      // the retention boundary for the newly moved item.
+      await writeMarker(markerFile, {
+        schema_version: MARKER_SCHEMA_VERSION,
+        in_progress: inProgress,
+        quarantines,
+        quarantine_epoch: eventEpoch,
+        quarantine_epoch_ts: eventTs,
+      });
+      await fs.rename(path.join(factsRootDir, item), destination);
       moved.push(item);
     }
-    if (!quarantines.some((entry) => entry.dir === inProgress.dir)) quarantines.push({ dir: inProgress.dir, quarantined_ts: inProgress.started_ts });
+    const quarantineEntry = quarantines.find((entry) => entry.dir === inProgress.dir);
+    if (quarantineEntry) quarantineEntry.moved_items = serializeMovedItems(movedItems);
+    else quarantines.push({ dir: inProgress.dir, quarantined_ts: inProgress.started_ts, moved_items: serializeMovedItems(movedItems) });
     await writeMarker(markerFile, {
       schema_version: MARKER_SCHEMA_VERSION,
       in_progress: null,
@@ -262,7 +317,7 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
   if (valid) {
     const kept = [];
     for (const entry of quarantines) {
-      if (nowMs - Date.parse(entry.quarantined_ts) >= LEGACY_QUARANTINE_RETENTION_MS) {
+      if (nowMs >= quarantineDeleteAfterMs(entry)) {
         await fs.rm(path.join(learnedDir, entry.dir), { recursive: true, force: true });
         deleted.push(entry.dir);
       } else {
@@ -287,7 +342,7 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
     pending: quarantines.map((entry) => ({
       dir: entry.dir,
       quarantined_ts: entry.quarantined_ts,
-      delete_after_ts: new Date(Date.parse(entry.quarantined_ts) + LEGACY_QUARANTINE_RETENTION_MS).toISOString(),
+      delete_after_ts: new Date(quarantineDeleteAfterMs(entry)).toISOString(),
     })),
   };
 }

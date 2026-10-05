@@ -77,7 +77,16 @@ test("M3: the legacy facts.jsonl, integrity.json, seen-sets/ and stray tmp files
   assert.equal(await fs.readFile(path.join(factsRootDir, "service", "facts.jsonl"), "utf8"), "{\"family\":true}\n");
   const marker = JSON.parse(await fs.readFile(markerFile, "utf8"));
   assert.equal(marker.in_progress, null);
-  assert.deepEqual(marker.quarantines, [{ dir: result.quarantine_dir, quarantined_ts: NOW }]);
+  assert.deepEqual(marker.quarantines, [{
+    dir: result.quarantine_dir,
+    quarantined_ts: NOW,
+    moved_items: [
+      { item: "facts.jsonl", moved_ts: NOW },
+      { item: "facts.jsonl.4242.tmp", moved_ts: NOW },
+      { item: "integrity.json", moved_ts: NOW },
+      { item: "seen-sets", moved_ts: NOW },
+    ],
+  }]);
   const again = await migrateLegacyFactStore(paths, { now: NOW });
   assert.equal(again.status, "none");
   assert.deepEqual(JSON.parse(await fs.readFile(markerFile, "utf8")), marker);
@@ -100,7 +109,50 @@ test("M3 idempotent per file: a half-done move (marker in progress, one file alr
   }
   const marker = JSON.parse(await fs.readFile(markerFile, "utf8"));
   assert.equal(marker.in_progress, null);
-  assert.deepEqual(marker.quarantines, [{ dir, quarantined_ts: "2026-10-04T00:00:00.000Z" }]);
+  assert.deepEqual(marker.quarantines, [{
+    dir,
+    quarantined_ts: "2026-10-04T00:00:00.000Z",
+    moved_items: [
+      { item: "facts.jsonl", moved_ts: NOW },
+      { item: "facts.jsonl.4242.tmp", moved_ts: NOW },
+      { item: "integrity.json", moved_ts: NOW },
+      { item: "seen-sets", moved_ts: NOW },
+    ],
+  }]);
+});
+
+test("G2 HIGH-1 re-gate: a resumed quarantine with a new root item advances the epoch and retains that item from its move time", async () => {
+  const paths = await tempPaths();
+  const { factsRootDir, learnedDir, markerFile } = resolveLegacyFactStorePaths(paths);
+  const dir = "facts-legacy-2026-09-01T00-00-00-000Z";
+  const started = "2026-09-01T00:00:00.000Z";
+  const resumed = "2026-10-03T00:00:00.000Z";
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.mkdir(path.join(learnedDir, dir), { recursive: true });
+  await fs.writeFile(path.join(learnedDir, dir, "facts.jsonl"), "{\"old\":true}\n");
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), "{\"new\":true}\n");
+  await fs.writeFile(markerFile, JSON.stringify({
+    schema_version: 2,
+    in_progress: { dir, started_ts: started, quarantine_epoch: 1, quarantine_ts: started },
+    quarantines: [],
+    quarantine_epoch: 1,
+    quarantine_epoch_ts: started,
+  }));
+
+  const result = await migrateLegacyFactStore(paths, { now: resumed });
+  assert.equal(result.status, "resumed");
+  assert.deepEqual(result.deleted, [], "the resumed directory must not be deleted on the move pass");
+  const marker = JSON.parse(await fs.readFile(markerFile, "utf8"));
+  assert.equal(marker.quarantine_epoch, 2);
+  assert.equal(marker.quarantine_epoch_ts, resumed);
+  const entry = marker.quarantines.find((candidate) => candidate.dir === dir);
+  assert.equal(entry.moved_items.find((item) => item.item === "facts.jsonl.1").moved_ts, resumed);
+  assert.equal(result.pending[0].delete_after_ts, new Date(Date.parse(resumed) + LEGACY_QUARANTINE_RETENTION_MS).toISOString());
+
+  const justBefore = new Date(Date.parse(resumed) + LEGACY_QUARANTINE_RETENTION_MS - 1).toISOString();
+  assert.deepEqual((await migrateLegacyFactStore(paths, { now: justBefore })).deleted, []);
+  const due = new Date(Date.parse(resumed) + LEGACY_QUARANTINE_RETENTION_MS).toISOString();
+  assert.deepEqual((await migrateLegacyFactStore(paths, { now: due })).deleted, [dir]);
 });
 
 test("Q4: a quarantine is deleted 31 days after it was taken -- not a moment before -- and only directories the marker lists, by a validated name", async () => {
