@@ -12,7 +12,8 @@
 //!
 //!   CLOSED by this policy, even under arbitrary code execution inside the helper:
 //!     - any write to any file (`openat` access mode must be O_RDONLY; O_CREAT/O_TRUNC/O_APPEND/
-//!       O_TMPFILE/O_PATH and every other flag outside the four the helper uses are killed);
+//!       O_TMPFILE/O_PATH and every other flag outside the four the helper uses are killed; every
+//!       admitted open must also set O_NOFOLLOW);
 //!     - writing another process's memory via `/proc/<pid>/mem` (needs O_RDWR/O_WRONLY);
 //!     - READING another process's memory via `/proc/<pid>/mem`: `lseek`, `pread64`, `preadv*`
 //!       are absent, so a `read` can only ever start at offset 0 (never a mapped address);
@@ -24,10 +25,12 @@
 //!       every `fcntl` except the F_GETFD validity probe.
 //!
 //!   NOT CLOSED (honest residual -- needs a different mechanism, see the research doc):
-//!     - read-only `openat` + sequential `read`/`getdents64`/`readlinkat` of ANY path the
-//!       capability pair reaches, e.g. `/etc/shadow` (CAP_DAC_READ_SEARCH bypasses file read
-//!       DAC) and `/proc/<pid>/environ` (CAP_SYS_PTRACE satisfies ptrace_may_access), with the
-//!       bytes able to leave only via stdout/stderr to the (helper-group) invoker. Path-scoped
+//!     - read-only `openat` + sequential `read`/`getdents64`/`readlinkat` of ANY non-symlink path
+//!       component the capability pair reaches, e.g. `/etc/shadow` (CAP_DAC_READ_SEARCH bypasses
+//!       file read DAC) and `/proc/<pid>/environ` (CAP_SYS_PTRACE satisfies ptrace_may_access),
+//!       with the bytes able to leave only via stdout/stderr to the (helper-group) invoker.
+//!       O_NOFOLLOW is required on every open and all helper path components are opened one at a
+//!       time, so the helper does not intentionally traverse a symlink component. Path-scoped
 //!       confinement would need Landlock, which was evaluated and REJECTED: Landlock's
 //!       `ptrace_access_check` hook denies a landlocked process ptrace-mode access to tasks outside
 //!       its domain, and `/proc/<pid>/exe` + `/proc/<pid>/fd/*` readlinks -- the helper's entire
@@ -96,7 +99,7 @@ pub const STDERR_FD: u32 = 2;
 /// fork/clone is allowlisted, so it can never change afterwards).
 ///
 /// Call-site justification for every rule (see the module doc for what each restriction closes):
-///   - openat [flags ⊆ CLOEXEC|DIRECTORY|NOFOLLOW|LARGEFILE, so access mode = O_RDONLY]:
+///   - openat [O_NOFOLLOW required; flags ⊆ CLOEXEC|DIRECTORY|NOFOLLOW|LARGEFILE, so access mode = O_RDONLY]:
 ///     `procfs::{open_proc_root, open_pid_dir, open_dir_at, read_file_at*}` -- the ONLY opens
 ///     after `engage()` (`proc_linux.rs` no longer uses `std::fs`, whose `read_to_string`/
 ///     `read_dir` paths needed statx/fstat).
@@ -109,7 +112,8 @@ pub const STDERR_FD: u32 = 2;
 ///   - mmap [no PROT_EXEC, MAP_ANONYMOUS required], mprotect [no PROT_EXEC], munmap, brk, mremap,
 ///     madvise: the glibc allocator (anonymous RW maps only) and std's exit-time alt-stack teardown.
 ///   - exit, exit_group: termination.
-///   - futex: std/glibc locks (stdout's ReentrantLock, allocator).
+///   - futex [arg1 ∈ FUTEX_PRIVATE_FLAG|WAIT/WAKE/WAIT_BITSET, plus 393 for std compatibility]:
+///     std/glibc locks (stdout's ReentrantLock, allocator).
 ///   - capget, capset, prctl [option == PR_CAP_AMBIENT, arg2 == CLEAR_ALL]: `drop_capabilities()`.
 ///   - rt_sigreturn, rt_sigaction, sigaltstack: signal return and std's exit-time
 ///     stack-overflow-guard teardown (empirically pinned on the CI guest, build #127).
@@ -117,8 +121,9 @@ pub const STDERR_FD: u32 = 2;
 ///   - clock_gettime: normally vDSO-served; allowlisted because strace under-reports vDSO calls.
 ///
 /// REMOVED relative to the pre-2026-10 allowlist: lseek (the `/proc/<pid>/mem` read primitive),
-/// statx/newfstatat/fstat (metadata oracle; only std::fs needed them), getrandom (only HashSet's
-/// seed needed it -- now a BTreeSet), readlink (x86_64 path-based variant; only std::fs::read_link
+/// statx/newfstatat/fstat (metadata oracle; only std::fs needed them), getrandom (the policy model
+/// currently has only ALLOW/KILL actions, so it remains KILL rather than using SECCOMP_RET_ERRNO;
+/// the helper no longer needs it), readlink (x86_64 path-based variant; only std::fs::read_link
 /// needed it).
 pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
     let allowed_open_flags = t.o_cloexec | t.o_directory | t.o_nofollow | t.o_largefile;
@@ -134,10 +139,16 @@ pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
     let rules = vec![
         Rule::when(
             t.openat,
-            vec![ArgCheck::Low32BitsClear {
-                arg: 2,
-                mask: !allowed_open_flags,
-            }],
+            vec![
+                ArgCheck::Low32BitsClear {
+                    arg: 2,
+                    mask: !allowed_open_flags,
+                },
+                ArgCheck::Low32BitsSet {
+                    arg: 2,
+                    mask: t.o_nofollow,
+                },
+            ],
         ),
         Rule::allow(t.read),
         Rule::allow(t.getdents64),
@@ -169,7 +180,13 @@ pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
         Rule::allow(t.madvise),
         Rule::allow(t.exit),
         Rule::allow(t.exit_group),
-        Rule::allow(t.futex),
+        Rule::when(
+            t.futex,
+            vec![ArgCheck::Low32OneOf {
+                arg: 1,
+                values: vec![128, 129, 137, 393],
+            }],
+        ),
         Rule::allow(t.capget),
         Rule::allow(t.capset),
         Rule::when(
@@ -448,7 +465,7 @@ mod tests {
             let h = Harness::new(t.clone());
             let at_fdcwd = (-100i64) as u64;
             // procfs::open_pid_dir / open_proc_root.
-            let pid_dir = u64::from(t.o_directory | t.o_cloexec);
+            let pid_dir = u64::from(t.o_directory | t.o_nofollow | t.o_cloexec);
             assert!(h.allowed(t.openat, [at_fdcwd, 0, pid_dir, 0, 0, 0]));
             // procfs::open_dir_at ("fd", ".").
             let sub_dir = u64::from(t.o_directory | t.o_nofollow | t.o_cloexec);
@@ -458,6 +475,18 @@ mod tests {
             assert!(h.allowed(t.openat, [3, 0, file, 0, 0, 0]));
             // A kernel-added/glibc-added O_LARGEFILE must not self-kill.
             assert!(h.allowed(t.openat, [3, 0, file | u64::from(t.o_largefile), 0, 0, 0]));
+        }
+    }
+
+    #[test]
+    fn every_openat_must_request_no_follow() {
+        for (t, _) in both_arches() {
+            let h = Harness::new(t.clone());
+            let directory = u64::from(t.o_directory | t.o_cloexec);
+            let file = u64::from(t.o_cloexec);
+            assert!(h.killed(t.openat, [3, 0, directory, 0, 0, 0]));
+            assert!(h.killed(t.openat, [3, 0, file, 0, 0, 0]));
+            assert!(h.allowed(t.openat, [3, 0, file | u64::from(t.o_nofollow), 0, 0, 0]));
         }
     }
 
@@ -524,6 +553,25 @@ mod tests {
     }
 
     #[test]
+    fn futex_is_limited_to_private_wait_and_wake_operations() {
+        // FUTEX_PRIVATE_FLAG | WAIT/WAKE/WAIT_BITSET. 393 is retained for the std runtime's
+        // observed compatibility operation on Linux; it remains a private, non-shared command.
+        const PRIVATE_STD_FUTEX_OPS: &[u32] = &[128, 129, 137, 393];
+        for (t, _) in both_arches() {
+            let h = Harness::new(t.clone());
+            for op in PRIVATE_STD_FUTEX_OPS {
+                assert!(h.allowed(t.futex, [0, u64::from(*op), 0, 0, 0, 0]));
+            }
+            for op in [0u32, 1, 9, 10, 138, 141, 999] {
+                assert!(
+                    h.killed(t.futex, [0, u64::from(op), 0, 0, 0, 0]),
+                    "shared or unsupported futex op {op} must be killed"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_number_only_allow_is_reachable() {
         for (t, _) in both_arches() {
             let h = Harness::new(t.clone());
@@ -538,7 +586,6 @@ mod tests {
                 t.madvise,
                 t.exit,
                 t.exit_group,
-                t.futex,
                 t.capget,
                 t.capset,
                 t.rt_sigreturn,

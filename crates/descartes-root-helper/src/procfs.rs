@@ -64,7 +64,7 @@ const MAX_READ_BYTES: usize = 65_536;
 /// than that is returned truncated (`readlinkat`'s own documented silent-truncation contract)
 /// rather than as an error, since a bounded prefix is still useful for display/comparison and a
 /// hard error here would turn an unusually long (but legitimate) path into a resolution failure.
-const MAX_LINK_TARGET_BYTES: usize = 4096;
+pub const MAX_LINK_TARGET_BYTES: usize = 4096;
 
 /// Stack buffer size for each individual `getdents64` call inside `read_dir_entries_at`. Purely a
 /// per-syscall I/O chunk size, NOT the total-entries bound -- that's the caller-supplied
@@ -108,7 +108,7 @@ fn open_absolute_dir(path: &str) -> io::Result<OwnedFd> {
         libc::openat(
             libc::AT_FDCWD,
             path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -223,8 +223,26 @@ pub fn read_file_at_bounded(
 /// `MAX_LINK_TARGET_BYTES`. `readlinkat` never NUL-terminates its output, so the syscall's
 /// returned byte count is used verbatim as the length -- there is no NUL to search for.
 pub fn read_link_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<OsString> {
-    let path = cpath(name)?;
     let mut buf = vec![0u8; MAX_LINK_TARGET_BYTES];
+    let bytes = read_link_at_into(dirfd, name, &mut buf)?;
+    Ok(OsString::from_vec(bytes.to_vec()))
+}
+
+/// Reads a symlink target into a caller-provided reusable buffer. The returned slice borrows that
+/// buffer, allowing a directory scan to inspect thousands of fd links without allocating a new
+/// kernel-facing path buffer for every `readlinkat` call.
+pub fn read_link_at_into<'a>(
+    dirfd: BorrowedFd<'_>,
+    name: &str,
+    buf: &'a mut [u8],
+) -> io::Result<&'a [u8]> {
+    let path = cpath(name)?;
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "readlink buffer must not be empty",
+        ));
+    }
     // SAFETY: `dirfd` is live for the whole call; `path` is a valid NUL-terminated C string;
     // `buf` is a valid, writable buffer of `buf.len()` bytes for the kernel to fill with at most
     // that many bytes.
@@ -239,8 +257,7 @@ pub fn read_link_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<OsString> {
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    buf.truncate(n as usize);
-    Ok(OsString::from_vec(buf))
+    Ok(&buf[..n as usize])
 }
 
 // Offsets of the fields this module actually reads out of a `getdents64` record, computed
