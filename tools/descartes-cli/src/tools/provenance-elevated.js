@@ -50,6 +50,7 @@ const HELPER_EXIT_HARDENING_FAILURE = 4;
 // held by processes running DIFFERENT executables (e.g. systemd socket activation), so the helper
 // names no owner. Still a plain failure for the degrade path; surfaced as its own diagnostic.
 const HELPER_EXIT_OWNER_AMBIGUOUS = 5;
+const HELPER_EXIT_PROCFS_NAMESPACE_MISMATCH = 6;
 
 // The four /proc/net tables resolveByPortLinux observes; passed to the helper verbatim.
 const SOCKET_PROTOCOLS = new Set(["tcp", "tcp6", "udp", "udp6"]);
@@ -130,6 +131,7 @@ async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {})
     if (error?.code === HELPER_EXIT_FD_SCAN_TRUNCATED) result.fd_scan_truncated = true;
     if (error?.code === HELPER_EXIT_HARDENING_FAILURE) result.helper_hardening_failure = true;
     if (error?.code === HELPER_EXIT_OWNER_AMBIGUOUS) result.owner_ambiguous = true;
+    if (error?.code === HELPER_EXIT_PROCFS_NAMESPACE_MISMATCH) result.procfs_namespace_mismatch = true;
     if (error?.signal === "SIGSYS") result.helper_seccomp_killed = true;
     if (error?.killed === true) result.helper_timeout_killed = true;
     return result;

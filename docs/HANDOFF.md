@@ -2,6 +2,27 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — daybreak-blue re-gate fixes (2026-10-05)
+
+On branch `harden/root-helper-2026-10`, the re-gate findings are fixed locally and are not
+pushed. The five finding-scoped commits are `15d3505` (port-owner process identity), `e4ba338`
+(argv-preserving elevated redaction), `a35b25c` (ambiguous/truncated state propagation),
+`2c1a68e` (device+inode executable-generation pinning with one retry), and `eece799` (procfs
+PID-namespace mount check). Port ownership now requires `(tgid,start_time)` equality and uses all
+holders on same-UID and elevated paths. Rust emits argv arrays; Node redacts each element before
+any elevated result leaves the module. Failed per-socket reasons survive aggregation. The helper
+pins `/proc/<pid>/exe` by device+inode before cmdline and after the final recheck. Before opening
+`/proc/<helper-pid>/net`, it verifies `/proc/self` names the helper PID and fails closed with
+`procfs_pid_namespace_mismatch` otherwise.
+
+The accepted seccomp residual remains documented: compromised helper control flow still has the
+deliberately retained bounded read-only open/read/stdout capability. `newfstatat` was admitted only
+for the required fixed-path executable-generation check; `statx` and `fstat` remain denied.
+Focused Node tests pass after updating the injected Linux fd-scan fixture to include process
+identity. Escalated fresh-XDG `npm test` is green at 2,038 passed, 0 failed, and 34 skipped.
+The sandboxed run's localhost `listen` EPERM and live `ps` denials are environment-only; Linux
+runtime tests remain CI-only on this macOS host.
+
 ## Current session — daybreak-blue root-helper findings (2026-10-05)
 
 On branch `harden/root-helper-2026-10`, the current review fixes are implemented in this worktree

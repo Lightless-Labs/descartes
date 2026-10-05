@@ -382,7 +382,13 @@ test("listListeningSocketsWithPid('linux', ...) resolves an own-UID listener's p
       throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
     },
     listProcPids: async () => [777],
-    scanProcFdForInode: async (pids) => pids.map((pid) => ({ pid, accessible: true, fds: [{ fd: "12", target: "socket:[12345]" }] })),
+    scanProcFdForInode: async (pids) => pids.map((pid) => ({
+      pid,
+      tgid: pid,
+      start_time: "777000",
+      accessible: true,
+      fds: [{ fd: "12", target: "socket:[12345]" }],
+    })),
   });
   assert.deepEqual(sockets, [
     { protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777 },

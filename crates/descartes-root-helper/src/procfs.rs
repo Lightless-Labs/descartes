@@ -44,7 +44,7 @@
 //! open flag) that isn't already admitted there. No `lseek`/`pread`/`*stat*`: reads are a plain
 //! sequential `read` loop from offset 0.
 
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::mem::{offset_of, MaybeUninit};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -65,6 +65,7 @@ const MAX_READ_BYTES: usize = 65_536;
 /// rather than as an error, since a bounded prefix is still useful for display/comparison and a
 /// hard error here would turn an unusually long (but legitimate) path into a resolution failure.
 pub const MAX_LINK_TARGET_BYTES: usize = 4096;
+pub const PROCFS_NAMESPACE_MISMATCH_REASON: &str = "procfs_pid_namespace_mismatch";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdentity {
@@ -111,8 +112,21 @@ pub fn open_proc_root() -> io::Result<OwnedFd> {
 /// socket resolution. The numeric pid is resolved by this process and remains valid under the
 /// helper's seccomp policy.
 pub fn open_proc_net() -> io::Result<OwnedFd> {
+    let proc_root = open_proc_root()?;
+    let pid = std::process::id();
+    let self_target = read_link_at(proc_root.as_fd(), "self")?;
+    if !proc_self_target_matches_pid(&self_target, pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            PROCFS_NAMESPACE_MISMATCH_REASON,
+        ));
+    }
     let pid_dir = open_pid_dir(std::process::id())?;
     open_dir_at(pid_dir.as_fd(), "net")
+}
+
+fn proc_self_target_matches_pid(target: &OsStr, pid: u32) -> bool {
+    target.to_str().and_then(|value| value.parse::<u32>().ok()) == Some(pid)
 }
 
 /// Follows a fixed relative proc entry and returns the mapped file's device/inode identity. The
@@ -131,8 +145,8 @@ pub fn stat_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<FileIdentity> {
     // SAFETY: fstatat returned success, so the kernel initialized the stat structure.
     let metadata = unsafe { metadata.assume_init() };
     Ok(FileIdentity {
-        device: metadata.st_dev as u64,
-        inode: metadata.st_ino as u64,
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
     })
 }
 
@@ -466,6 +480,13 @@ mod tests {
             "same path must not imply same executable generation"
         );
         std::fs::remove_dir_all(root).expect("test directory must be removable");
+    }
+
+    #[test]
+    fn proc_self_target_must_name_the_helper_pid() {
+        assert!(proc_self_target_matches_pid(OsStr::new("1234"), 1234));
+        assert!(!proc_self_target_matches_pid(OsStr::new("1235"), 1234));
+        assert!(!proc_self_target_matches_pid(OsStr::new("self"), 1234));
     }
 
     #[test]

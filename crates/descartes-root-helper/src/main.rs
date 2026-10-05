@@ -63,6 +63,10 @@ const EXIT_RESOLUTION_TRUNCATED: i32 = 3;
 // failure; distinct so Node can surface `elevated_owner_ambiguous`. Linux `--resolve-socket` only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const EXIT_OWNER_AMBIGUOUS: i32 = 5;
+// 6 is a fail-closed procfs mount/active PID-namespace mismatch. It is distinct from scan
+// truncation so operators can tell an invalid `/proc` view from an incomplete lookup.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EXIT_PROCFS_NAMESPACE_MISMATCH: i32 = 6;
 
 fn main() {
     // FIRST statement, unconditionally, before any argv logic: fail-closed by construction (see
@@ -177,6 +181,13 @@ fn run_resolve_socket(target: socket::SocketTarget) -> i32 {
             );
             EXIT_OWNER_AMBIGUOUS
         }
+        SocketOutcome::ProcfsNamespaceMismatch => {
+            eprintln!(
+                "descartes-root-helper: {what} unavailable ({})",
+                descartes_root_helper::procfs::PROCFS_NAMESPACE_MISMATCH_REASON
+            );
+            EXIT_PROCFS_NAMESPACE_MISMATCH
+        }
         SocketOutcome::NotFound => {
             eprintln!(
                 "descartes-root-helper: could not resolve {what} (gone, rebound, not listening, or changed during resolution)"
@@ -210,6 +221,7 @@ mod tests {
             EXIT_RESOLUTION_TRUNCATED,
             hardening::EXIT_HARDENING_FAILURE,
             EXIT_OWNER_AMBIGUOUS,
+            EXIT_PROCFS_NAMESPACE_MISMATCH,
         ];
         let unique: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
         assert_eq!(unique.len(), codes.len(), "exit codes collide: {codes:?}");

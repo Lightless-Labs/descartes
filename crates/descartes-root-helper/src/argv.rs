@@ -21,7 +21,7 @@ use crate::socket::{Protocol, SocketTarget};
 pub const USAGE: &str = "usage: descartes-root-helper --probe | --resolve-pid <pid> | \
 --resolve-socket <tcp|tcp6|udp|udp6> <port> <inode>\n\
 exit codes: 0 success, 1 resolution failure, 2 usage error, 3 scan truncated (uncertain), \
-4 hardening failure, 5 ambiguous owner";
+4 hardening failure, 5 ambiguous owner, 6 procfs pid-namespace mismatch";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {

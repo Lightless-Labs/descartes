@@ -137,6 +137,8 @@ pub enum SocketOutcome {
     Truncated,
     /// Exit 5: holders disagree on executable: no single process can honestly be named the owner.
     Ambiguous,
+    /// Exit 6: the helper's `/proc` mount is from a different PID namespace than its own pid.
+    ProcfsNamespaceMismatch,
     /// Internal retry signal: executable generation changed while the socket was being pinned.
     #[doc(hidden)]
     GenerationChanged,
@@ -182,9 +184,12 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
     let Ok(proc_root) = procfs::open_proc_root() else {
         return SocketOutcome::NotFound;
     };
-    let (row, table_truncated) = read_socket_row(target);
+    let (row, table_status) = read_socket_row(target);
+    if table_status == SocketTableStatus::NamespaceMismatch {
+        return SocketOutcome::ProcfsNamespaceMismatch;
+    }
     let Some(row) = row else {
-        return if table_truncated {
+        return if table_status == SocketTableStatus::Truncated {
             SocketOutcome::Truncated
         } else {
             SocketOutcome::NotFound
@@ -223,7 +228,10 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
     if !still_held {
         return SocketOutcome::GenerationChanged;
     }
-    let (row_again, _) = read_socket_row(target);
+    let (row_again, row_again_status) = read_socket_row(target);
+    if row_again_status == SocketTableStatus::NamespaceMismatch {
+        return SocketOutcome::ProcfsNamespaceMismatch;
+    }
     if row_again.as_ref() != Some(&row) {
         return SocketOutcome::NotFound;
     }
@@ -249,9 +257,20 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
 /// Reads ONLY `/proc/<helper-pid>/net/<target.protocol>` and returns the row whose inode is exactly
 /// `target.inode` (no port/state judgement here -- see `socket::row_admits`), plus whether the
 /// table read was truncated at `MAX_NET_TABLE_BYTES`.
-fn read_socket_row(target: &SocketTarget) -> (Option<SocketRow>, bool) {
-    let Ok(net_dir) = procfs::open_proc_net() else {
-        return (None, true);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketTableStatus {
+    Complete,
+    Truncated,
+    NamespaceMismatch,
+}
+
+fn read_socket_row(target: &SocketTarget) -> (Option<SocketRow>, SocketTableStatus) {
+    let net_dir = match procfs::open_proc_net() {
+        Ok(net_dir) => net_dir,
+        Err(error) if error.to_string() == procfs::PROCFS_NAMESPACE_MISMATCH_REASON => {
+            return (None, SocketTableStatus::NamespaceMismatch);
+        }
+        Err(_) => return (None, SocketTableStatus::Truncated),
     };
     let table = target
         .protocol
@@ -261,11 +280,15 @@ fn read_socket_row(target: &SocketTarget) -> (Option<SocketRow>, bool) {
     let Ok((bytes, truncated)) =
         procfs::read_file_at_bounded(net_dir.as_fd(), table, MAX_NET_TABLE_BYTES)
     else {
-        return (None, true);
+        return (None, SocketTableStatus::Truncated);
     };
     (
         socket::find_row(&String::from_utf8_lossy(&bytes), target.inode),
-        truncated,
+        if truncated {
+            SocketTableStatus::Truncated
+        } else {
+            SocketTableStatus::Complete
+        },
     )
 }
 

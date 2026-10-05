@@ -358,6 +358,21 @@ test("defaultInvokeElevatedHelper maps the helper's EXIT_OWNER_AMBIGUOUS (5) to 
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1", elevated_owner_ambiguous: true });
 });
 
+test("resolveCrossUidPortResult preserves a procfs PID-namespace mismatch as a distinct fail-closed reason", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "unable", code: 6, procfs_namespace_mismatch: true, stdout: "", stderr: "" }),
+  }));
+
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.equal(outcome.result.resolved.reason, "procfs_pid_namespace_mismatch");
+  assert.equal(outcome.result.privilege.procfs_pid_namespace_mismatch, true);
+});
+
 test("resolveCrossUidPortResult degrades when the helper's self-reported uid disagrees with the trusted owning uid (never overwrites a free fact), with the real ptrace_scope diagnostic attached", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });

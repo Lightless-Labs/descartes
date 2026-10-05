@@ -852,15 +852,17 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // 2026-10 (research finding 2): the exact socket is held by processes running different
   // executables -- the helper named no owner rather than guess.
   const ownerAmbiguous = observedInvoke?.owner_ambiguous === true;
+  const procfsNamespaceMismatch = observedInvoke?.procfs_namespace_mismatch === true;
   const degradedReasons = [
     ...(fdScanTruncated ? ["fd_scan_truncated"] : []),
     ...(ownerAmbiguous ? ["elevated_owner_ambiguous"] : []),
+    ...(procfsNamespaceMismatch ? ["procfs_pid_namespace_mismatch"] : []),
   ];
   const degradedOutcome = degradedReasons.length === 0
     ? unprivilegedOutcome
     : (() => {
-      const resolvedStatus = ownerAmbiguous ? "ambiguous" : "truncated";
-      const reason = ownerAmbiguous ? "elevated_owner_ambiguous" : "fd_scan_truncated";
+      const resolvedStatus = ownerAmbiguous ? "ambiguous" : fdScanTruncated ? "truncated" : "partial";
+      const reason = ownerAmbiguous ? "elevated_owner_ambiguous" : fdScanTruncated ? "fd_scan_truncated" : "procfs_pid_namespace_mismatch";
       const core = {
         ...unprivilegedCore,
         resolvedStatus,
@@ -870,7 +872,7 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
     })();
   const withDiagnostics = (outcome) => {
-    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure && !helperSeccompKilled && !helperTimeoutKilled && !ownerAmbiguous) return outcome; // byte-identical: no diagnostic fields.
+    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure && !helperSeccompKilled && !helperTimeoutKilled && !ownerAmbiguous && !procfsNamespaceMismatch) return outcome; // byte-identical: no diagnostic fields.
     const privilege = { ...outcome.result.privilege };
     if (ptraceScope !== undefined) privilege.ptrace_scope = ptraceScope;
     if (fdScanTruncated) privilege.fd_scan_truncated = true;
@@ -878,6 +880,7 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
     if (helperSeccompKilled) privilege.helper_seccomp_killed = true;
     if (helperTimeoutKilled) privilege.helper_timeout_killed = true;
     if (ownerAmbiguous) privilege.elevated_owner_ambiguous = true;
+    if (procfsNamespaceMismatch) privilege.procfs_pid_namespace_mismatch = true;
     return { ...outcome, result: { ...outcome.result, privilege } };
   };
 
