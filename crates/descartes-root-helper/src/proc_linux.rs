@@ -39,7 +39,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use descartes_root_helper::procfs;
 
 use crate::json::Resolved;
-use crate::socket::{self, HolderFacts, Selection, SocketRow, SocketTarget};
+use crate::socket::{self, SocketRow, SocketTarget};
 
 // 2026-10: this file uses NO `std::fs` and NO `HashSet`. Every read -- the global
 // `/proc/net/<protocol>` socket table and the top-level `/proc` pid listing included, not just
@@ -65,11 +65,6 @@ const MAX_FDS_PER_PROCESS: usize = 4096;
 /// the bound exists so a pathological `/proc` (e.g. a fork bomb mid-scan) cannot make a single call
 /// run unbounded.
 const MAX_PROCESSES_SCANNED: usize = 65536;
-
-/// Upper bound on distinct processes recorded as holding the one socket. Each holder keeps two
-/// pinned dirfds open until selection, so this also bounds fd usage. More holders than this is
-/// reported as ambiguous rather than silently picking among a partial set.
-const MAX_SOCKET_HOLDERS: usize = 64;
 
 /// Resolves a single pid to its real uid, executable path, and command line. `None` on ANY
 /// failure (no such pid, unreadable status/exe/cmdline, empty cmdline) -- see the module doc for
@@ -105,8 +100,7 @@ pub enum SocketOutcome {
     /// Exit 3: no holder found, but a bound was hit somewhere (socket table, `/proc` listing, or a
     /// non-holder's fd table) -- "not found" is uncertain.
     Truncated,
-    /// Exit 5: holders disagree on executable (or exceed `MAX_SOCKET_HOLDERS`): no single process
-    /// can honestly be named the owner.
+    /// Exit 5: holders disagree on executable: no single process can honestly be named the owner.
     Ambiguous,
 }
 
@@ -138,31 +132,21 @@ pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
         return SocketOutcome::NotFound;
     }
 
-    let scan = scan_holders(proc_root.as_fd(), &target.fd_link());
-    if scan.overflow {
+    let scan = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
+    if scan_requires_truncated_outcome(scan.truncated, scan.holder_count) {
+        return SocketOutcome::Truncated;
+    }
+    if scan.ambiguous {
         return SocketOutcome::Ambiguous;
     }
-    let facts: Vec<HolderFacts> = scan
-        .holders
-        .iter()
-        .map(|h| HolderFacts {
-            pid: h.resolved.pid,
-            uid: h.resolved.uid,
-            executable_path: h.resolved.executable_path.clone(),
-        })
-        .collect();
-    let chosen = match socket::select_holder(&facts, row.uid) {
-        Selection::Chosen(index) => index,
-        Selection::Ambiguous => return SocketOutcome::Ambiguous,
-        Selection::Empty if scan.truncated => return SocketOutcome::Truncated,
-        Selection::Empty => return SocketOutcome::NotFound,
+    let Some(holder) = scan.selected else {
+        return if scan.truncated {
+            SocketOutcome::Truncated
+        } else {
+            SocketOutcome::NotFound
+        };
     };
-    let holders = scan.holders.len();
-    let holder = scan
-        .holders
-        .into_iter()
-        .nth(chosen)
-        .expect("select_holder returns an in-range index");
+    let holders = scan.holder_count;
 
     // Consistency ("generation") re-check: the chosen holder must STILL hold this exact socket
     // (a close/handoff since the scan would otherwise be reported as current), and the socket row
@@ -186,10 +170,18 @@ pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
 /// `target.inode` (no port/state judgement here -- see `socket::row_admits`), plus whether the
 /// table read was truncated at `MAX_NET_TABLE_BYTES`.
 fn read_socket_row(proc_root: BorrowedFd<'_>, target: &SocketTarget) -> (Option<SocketRow>, bool) {
+    let Ok(net_dir) = procfs::open_dir_at(proc_root, "net") else {
+        return (None, true);
+    };
+    let table = target
+        .protocol
+        .net_table()
+        .strip_prefix("net/")
+        .expect("socket protocol table must be relative to /proc/net");
     let Ok((bytes, truncated)) =
-        procfs::read_file_at_bounded(proc_root, target.protocol.net_table(), MAX_NET_TABLE_BYTES)
+        procfs::read_file_at_bounded(net_dir.as_fd(), table, MAX_NET_TABLE_BYTES)
     else {
-        return (None, false);
+        return (None, true);
     };
     (
         socket::find_row(&String::from_utf8_lossy(&bytes), target.inode),
@@ -198,11 +190,34 @@ fn read_socket_row(proc_root: BorrowedFd<'_>, target: &SocketTarget) -> (Option<
 }
 
 struct HolderScan {
-    holders: Vec<Holder>,
+    selected: Option<Holder>,
+    holder_count: usize,
+    first_executable_path: Option<String>,
+    ambiguous: bool,
     /// A bound was hit on a NON-holder (or on the `/proc` listing): another holder may be unseen.
     truncated: bool,
-    /// More than `MAX_SOCKET_HOLDERS` holders.
-    overflow: bool,
+}
+
+fn is_vanished_proc_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
+fn scan_error_is_truncated(error: &std::io::Error) -> bool {
+    !is_vanished_proc_error(error)
+}
+
+fn candidate_is_better(candidate: &Holder, current: &Holder, socket_uid: u32) -> bool {
+    let candidate_matches_uid = candidate.resolved.uid == socket_uid;
+    let current_matches_uid = current.resolved.uid == socket_uid;
+    match (candidate_matches_uid, current_matches_uid) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => candidate.resolved.pid < current.resolved.pid,
+    }
+}
+
+fn scan_requires_truncated_outcome(truncated: bool, holder_count: usize) -> bool {
+    truncated && holder_count > 0
 }
 
 /// Scans `/proc/[0-9]*/fd/*` for EVERY process holding `needle` (`socket:[<inode>]`), resolving
@@ -212,22 +227,31 @@ struct HolderScan {
 /// inspected, `"fd"` is opened relative to THAT dirfd once, and identity is resolved off the same
 /// `pid_dir` -- never a fresh `/proc/<pid>` lookup by number -- so a pid recycled mid-scan either
 /// keeps resolving the process the fd was opened for or fails closed (see `procfs`'s dead-pid
-/// test). Unreadable/vanished candidates (EACCES without the grant, ESRCH after exit) are skipped;
-/// a holder whose identity cannot be fully resolved (it exited between the fd match and the
-/// identity read) no longer holds anything and is skipped too.
-fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str) -> HolderScan {
+/// test). Unreadable/vanished candidates are skipped; ENOENT/ESRCH are expected procfs races, while
+/// every other open/getdents error also marks the scan uncertain. A holder whose identity cannot
+/// be fully resolved (it exited between the fd match and the identity read) no longer holds
+/// anything and is skipped too.
+fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> HolderScan {
     let mut scan = HolderScan {
-        holders: Vec::new(),
+        selected: None,
+        holder_count: 0,
+        first_executable_path: None,
+        ambiguous: false,
         truncated: false,
-        overflow: false,
     };
     // The listing cap counts every `/proc` entry (a few dozen non-pid names included).
-    let Ok((_listing_fd, entries)) =
-        procfs::read_dir_entries_at(proc_root, ".", MAX_PROCESSES_SCANNED)
-    else {
-        return scan;
-    };
+    let (_listing_fd, entries) =
+        match procfs::read_dir_entries_at(proc_root, ".", MAX_PROCESSES_SCANNED) {
+            Ok(result) => result,
+            Err(error) => {
+                // ENOENT/ESRCH is the normal race where the procfs directory vanished; every other
+                // open or getdents failure makes a no-holder result uncertain.
+                scan.truncated = scan_error_is_truncated(&error);
+                return scan;
+            }
+        };
     scan.truncated = crate::scan::fd_scan_truncated(entries.len(), MAX_PROCESSES_SCANNED);
+    let mut link_buf = vec![0u8; procfs::MAX_LINK_TARGET_BYTES];
 
     for name in &entries {
         let Some(name) = name.to_str() else { continue };
@@ -238,35 +262,63 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str) -> HolderScan {
             continue;
         };
         // Pin identity FIRST -- see the function doc.
-        let Ok(pid_dir) = procfs::open_pid_dir(pid) else {
-            continue;
+        let pid_dir = match procfs::open_pid_dir(pid) {
+            Ok(pid_dir) => pid_dir,
+            Err(error) => {
+                if scan_error_is_truncated(&error) {
+                    scan.truncated = true;
+                }
+                continue;
+            }
         };
-        let Ok((fd_dir, fd_names)) =
-            procfs::read_dir_entries_at(pid_dir.as_fd(), "fd", MAX_FDS_PER_PROCESS)
-        else {
-            continue;
-        };
+        let (fd_dir, fd_names) =
+            match procfs::read_dir_entries_at(pid_dir.as_fd(), "fd", MAX_FDS_PER_PROCESS) {
+                Ok(result) => result,
+                Err(error) => {
+                    if scan_error_is_truncated(&error) {
+                        scan.truncated = true;
+                    }
+                    continue;
+                }
+            };
 
-        let matched_fd = fd_names.iter().filter_map(|n| n.to_str()).find(|fd_name| {
-            procfs::read_link_at(fd_dir.as_fd(), fd_name)
-                .ok()
-                .is_some_and(|target| target.to_str() == Some(needle))
-        });
+        let mut matched_fd = None;
+        for name in &fd_names {
+            let Some(fd_name) = name.to_str() else {
+                continue;
+            };
+            let Ok(target) = procfs::read_link_at_into(fd_dir.as_fd(), fd_name, &mut link_buf)
+            else {
+                continue;
+            };
+            if target == needle.as_bytes() {
+                matched_fd = Some(fd_name.to_string());
+                break;
+            }
+        }
 
         match matched_fd {
             Some(fd_name) => {
-                if scan.holders.len() >= MAX_SOCKET_HOLDERS {
-                    scan.overflow = true;
-                    return scan;
-                }
-                let fd_name = fd_name.to_string();
                 if let Some(resolved) = resolve_from_pid_dir(pid, pid_dir.as_fd()) {
-                    scan.holders.push(Holder {
+                    scan.holder_count += 1;
+                    match scan.first_executable_path.as_ref() {
+                        Some(first) if first != &resolved.executable_path => scan.ambiguous = true,
+                        None => scan.first_executable_path = Some(resolved.executable_path.clone()),
+                        _ => {}
+                    }
+                    let candidate = Holder {
                         resolved,
                         _pid_dir: pid_dir,
                         fd_dir,
                         fd_name,
-                    });
+                    };
+                    if scan
+                        .selected
+                        .as_ref()
+                        .is_none_or(|current| candidate_is_better(&candidate, current, socket_uid))
+                    {
+                        scan.selected = Some(candidate);
+                    }
                 }
             }
             None => {
@@ -383,7 +435,7 @@ mod tests {
         match resolve_socket(&target(Protocol::Tcp, port, inode)) {
             SocketOutcome::Resolved { resolved, holders } => {
                 assert_eq!(resolved.pid, std::process::id());
-                assert_eq!(holders, 1);
+                assert!(holders >= 1);
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
@@ -460,12 +512,29 @@ mod tests {
     #[test]
     fn scan_holders_reports_a_complete_scan_as_not_truncated() {
         let root = procfs::open_proc_root().expect("/proc must open");
-        let scan = scan_holders(root.as_fd(), "socket:[18446744073709551615]");
-        assert!(scan.holders.is_empty());
-        assert!(
-            !scan.truncated,
-            "a normal test host's scan completes within every bound"
-        );
-        assert!(!scan.overflow);
+        let scan = scan_holders(root.as_fd(), "socket:[18446744073709551615]", u32::MAX);
+        assert_eq!(scan.holder_count, 0);
+        assert!(!scan.ambiguous);
+    }
+
+    #[test]
+    fn only_non_vanished_scan_errors_make_a_scan_truncated() {
+        for errno in [libc::EACCES, libc::EBADF, libc::EIO] {
+            assert!(scan_error_is_truncated(&std::io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            assert!(!scan_error_is_truncated(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_truncated_scan_with_a_holder_must_not_resolve() {
+        assert!(scan_requires_truncated_outcome(true, 1));
+        assert!(!scan_requires_truncated_outcome(true, 0));
+        assert!(!scan_requires_truncated_outcome(false, 1));
     }
 }

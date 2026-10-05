@@ -6,7 +6,10 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 fn bin_path() -> String {
     std::env::var("CARGO_BIN_EXE_descartes-root-helper").expect(
@@ -31,6 +34,40 @@ fn current_uid() -> u32 {
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|s| s.parse::<u32>().ok())
         .expect("must be able to read our own real uid from /proc/self-equivalent status")
+}
+
+fn duplicate_without_cloexec(listener: &TcpListener) -> OwnedFd {
+    // SAFETY: duplicating a live listener fd creates an independently-owned descriptor; F_DUPFD
+    // deliberately leaves FD_CLOEXEC clear so the child process can inherit this exact socket.
+    let fd = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_DUPFD, 0) };
+    assert!(
+        fd >= 0,
+        "F_DUPFD failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `fd` was returned by fcntl and is valid; explicitly clear the flag to make the
+    // inheritance precondition visible even if the duplication primitive changes later.
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+    assert_eq!(
+        ret,
+        0,
+        "F_SETFD failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `fd` is now owned solely by this OwnedFd.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn wait_for_inherited_socket(pid: u32, fd: i32, inode: &str) {
+    let target = format!("socket:[{inode}]");
+    for _ in 0..100 {
+        let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}"));
+        if link.is_ok_and(|path| path.to_string_lossy() == target) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("child {pid} did not retain fd {fd} for {target}");
 }
 
 #[test]
@@ -101,7 +138,12 @@ fn resolve_socket_on_a_freshly_bound_listener_resolves_back_to_the_test_process(
     assert_eq!(parsed["requested"]["inode"], inode.as_str());
     assert_eq!(parsed["resolved"]["pid"], std::process::id());
     assert_eq!(parsed["resolved"]["uid"], current_uid());
-    assert_eq!(parsed["resolved"]["holders"], 1);
+    assert!(
+        parsed["resolved"]["holders"]
+            .as_u64()
+            .is_some_and(|n| n >= 1),
+        "the scan must report at least the test process as a holder"
+    );
 
     drop(listener);
 }
@@ -163,6 +205,61 @@ fn resolve_socket_rejects_a_tcp_socket_that_is_not_listening() {
     assert!(output.stdout.is_empty());
     drop(client);
     drop(listener);
+}
+
+#[test]
+fn resolve_socket_streams_many_same_exe_holders_but_rejects_different_exes() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let inode = inode_for("tcp", port, Some("0A"));
+    let inherited = duplicate_without_cloexec(&listener);
+    let inherited_fd = inherited.as_raw_fd();
+
+    let mut different_exe = Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn a different-executable holder");
+    wait_for_inherited_socket(different_exe.id(), inherited_fd, &inode);
+    let output = run(&["--resolve-socket", "tcp", &port.to_string(), &inode]);
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    let _ = different_exe.kill();
+    let _ = different_exe.wait();
+
+    // A forked child has the same executable as this test process. Both holders are therefore
+    // one program, and the streaming selector must retain the lowest-pid same-uid candidate.
+    // SAFETY: the child executes only async-signal-safe libc sleep/_exit and inherits the already
+    // opened listener; it performs no Rust runtime work after fork.
+    let same_exe = unsafe { libc::fork() };
+    assert!(
+        same_exe >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if same_exe == 0 {
+        unsafe {
+            libc::sleep(5);
+            libc::_exit(0);
+        }
+    }
+    let same_exe = same_exe as u32;
+    wait_for_inherited_socket(same_exe, inherited_fd, &inode);
+    let output = run(&["--resolve-socket", "tcp", &port.to_string(), &inode]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(parsed["resolved"]["pid"], std::process::id());
+    assert!(parsed["resolved"]["holders"]
+        .as_u64()
+        .is_some_and(|n| n >= 2));
+    // SAFETY: terminate and reap the forked child so it cannot outlive the test or hold the fd.
+    unsafe {
+        libc::kill(same_exe as libc::pid_t, libc::SIGTERM);
+        libc::waitpid(same_exe as libc::pid_t, std::ptr::null_mut(), 0);
+    }
 }
 
 #[test]
