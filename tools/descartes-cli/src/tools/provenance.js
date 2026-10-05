@@ -745,11 +745,15 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // result.privilege), never gating resolution. Only ever true on the degrade path (a successful
   // upgrade exits 0, so the flag is absent there).
   const fdScanTruncated = observedInvoke?.fd_scan_truncated === true;
+  // 2026-10 (research finding 8): the helper's confinement (NNP/seccomp/cap-drop) failed to engage
+  // and it aborted fail-closed -- its own exit code now, never conflated with a truncated scan.
+  const helperHardeningFailure = observedInvoke?.helper_hardening_failure === true;
   const withDiagnostics = (outcome) => {
-    if (ptraceScope === undefined && !fdScanTruncated) return outcome; // byte-identical: no diagnostic fields.
+    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure) return outcome; // byte-identical: no diagnostic fields.
     const privilege = { ...outcome.result.privilege };
     if (ptraceScope !== undefined) privilege.ptrace_scope = ptraceScope;
     if (fdScanTruncated) privilege.fd_scan_truncated = true;
+    if (helperHardeningFailure) privilege.helper_hardening_failure = true;
     return { ...outcome, result: { ...outcome.result, privilege } };
   };
 

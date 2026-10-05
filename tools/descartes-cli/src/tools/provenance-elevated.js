@@ -38,6 +38,12 @@ const DEFAULT_MAX_BUFFER = 64 * 1024;
 // (failure) exit — the degrade-to-unprivileged flow is unchanged — but distinguishable, so the
 // truncation can be surfaced as an observable provenance signal instead of a silent negative.
 const HELPER_EXIT_FD_SCAN_TRUNCATED = 3;
+// descartes-root-helper's hardening::EXIT_HARDENING_FAILURE: NO_NEW_PRIVS / seccomp / capability
+// drop failed to engage and the helper aborted fail-closed. Before 2026-10 this shared exit 3 with
+// the truncated scan, so a confinement failure was mislabelled `fd_scan_truncated` exactly when the
+// security boundary failed (research 2026-09-26, finding 8). Now distinct, and surfaced as its own
+// diagnostic; still a plain failure for the degrade path.
+const HELPER_EXIT_HARDENING_FAILURE = 4;
 // Stricter than execFile's own maxBuffer -- a bounded-length check applied BEFORE JSON.parse is
 // ever attempted, so a technically-below-maxBuffer-but-still-huge response can't reach the parser.
 const MAX_RESPONSE_BYTES = 8 * 1024;
@@ -109,6 +115,7 @@ async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {})
     // degrades to the unprivileged shape exactly as before. On a real process exit the child's
     // numeric exit status arrives as error.code; a signal/ENOENT string code simply won't match.
     if (error?.code === HELPER_EXIT_FD_SCAN_TRUNCATED) result.fd_scan_truncated = true;
+    if (error?.code === HELPER_EXIT_HARDENING_FAILURE) result.helper_hardening_failure = true;
     return result;
   }
 }

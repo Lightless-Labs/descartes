@@ -11,7 +11,8 @@
 
 pub const USAGE: &str =
     "usage: descartes-root-helper --probe | --resolve-pid <pid> | --resolve-port <port>\n\
-exit codes: 0 success, 1 resolution failure, 2 usage error";
+exit codes: 0 success, 1 resolution failure, 2 usage error, 3 scan truncated (uncertain), \
+4 hardening failure";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {

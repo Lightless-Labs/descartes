@@ -261,6 +261,37 @@ test("defaultInvokeElevatedHelper maps the helper's EXIT_RESOLUTION_TRUNCATED (3
   assert.equal(plainFailure.status, "unable");
   assert.equal(plainFailure.code, 1);
   assert.equal(plainFailure.fd_scan_truncated, undefined, "an ordinary nonzero exit is not a truncated scan");
+  assert.equal(plainFailure.helper_hardening_failure, undefined);
+});
+
+test("defaultInvokeElevatedHelper maps the helper's EXIT_HARDENING_FAILURE (4) to helper_hardening_failure:true and NEVER to fd_scan_truncated (research finding 8: exit codes are no longer shared) (real subprocess)", async () => {
+  const paths = await tempPaths();
+  const helperPath = path.join(paths.stateDir, "helper-exit4");
+  await fs.mkdir(path.dirname(helperPath), { recursive: true });
+  await fs.writeFile(helperPath, "#!/bin/sh\nexit 4\n", { mode: 0o755 });
+
+  const result = await defaultInvokeElevatedHelper(helperPath, ["--resolve-pid", "1"]);
+  assert.equal(result.status, "unable");
+  assert.equal(result.code, 4);
+  assert.equal(result.helper_hardening_failure, true);
+  assert.equal(result.fd_scan_truncated, undefined, "a confinement failure must never be labelled a truncated scan");
+});
+
+test("resolveCrossUidPortResult surfaces helper_hardening_failure (not fd_scan_truncated) when the helper aborted fail-closed on confinement (exit 4), still degrading to the unprivileged baseline", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "unable", code: 4, helper_hardening_failure: true, stdout: "", stderr: "" }),
+    readFile: async () => "1\n",
+  });
+
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.equal(outcome.result.resolved.pid, undefined);
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1", helper_hardening_failure: true });
 });
 
 test("resolveCrossUidPortResult bounds the untrusted helper's executable_path (truncated) before it reaches the envelope/LLM", async () => {

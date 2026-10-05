@@ -35,11 +35,13 @@
 //! other production modules stay `#![deny(unsafe_code)]`/`#![forbid(unsafe_code)]` clean.
 //! `src/bin/hardening-probe.rs` is the one other file with unsafe, and it is test-support only.
 
-/// Exit code for a fail-closed hardening abort -- distinct from the production binary's
-/// 0/1/2 (success / resolution failure / usage error) so a hardening abort is never mistaken for
-/// an ordinary resolution failure.
-#[cfg(target_os = "linux")]
-const EXIT_HARDENING_FAILURE: i32 = 3;
+/// Exit code for a fail-closed hardening abort. Deliberately DISTINCT from every code the
+/// production binary's own paths return (see `main.rs`; pinned distinct by a host unit test
+/// there). Before 2026-10 this was `3`, colliding with the truncated-scan code, so the Node side
+/// labelled a confinement failure `fd_scan_truncated` exactly when the security boundary failed to
+/// initialize (docs/research/2026-09-26-sandbox-and-microvm-boundaries-research.md, finding 8).
+/// Defined on every platform so that distinctness is testable on any host.
+pub const EXIT_HARDENING_FAILURE: i32 = 4;
 
 #[cfg(target_os = "linux")]
 mod linux {

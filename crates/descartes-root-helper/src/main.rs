@@ -54,6 +54,7 @@ const EXIT_USAGE_ERROR: i32 = 2;
 // indistinguishable-from-genuine negative. Only ever returned on Linux `--resolve-port`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const EXIT_RESOLUTION_TRUNCATED: i32 = 3;
+// 4 is `hardening::EXIT_HARDENING_FAILURE` (fail-closed confinement abort) -- never reused here.
 
 fn main() {
     // FIRST statement, unconditionally, before any argv logic: fail-closed by construction (see
@@ -172,6 +173,27 @@ fn run_resolve_port(_port: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Research finding 8: every exit code means exactly one thing, so the Node side can never
+    /// mislabel a confinement failure as a truncated scan (or vice versa). Host-runnable.
+    #[test]
+    fn every_exit_code_is_distinct_and_documented_in_usage() {
+        let codes = [
+            EXIT_SUCCESS,
+            EXIT_RESOLUTION_FAILURE,
+            EXIT_USAGE_ERROR,
+            EXIT_RESOLUTION_TRUNCATED,
+            hardening::EXIT_HARDENING_FAILURE,
+        ];
+        let unique: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "exit codes collide: {codes:?}");
+        for code in codes {
+            assert!(
+                argv::USAGE.contains(&format!("{code} ")),
+                "USAGE must document exit code {code}"
+            );
+        }
+    }
 
     #[test]
     fn bad_argv_never_reaches_a_command_variant() {
