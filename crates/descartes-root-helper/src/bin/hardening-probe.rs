@@ -247,7 +247,7 @@ mod linux_probe {
             let listed = entries
                 .iter()
                 .any(|e| e.to_str() == Some(own_name.as_str()));
-            let net_dir = procfs::open_dir_at(root.as_fd(), "net")?;
+            let net_dir = procfs::open_proc_net()?;
             let (_tcp, _truncated) = procfs::read_file_at_bounded(net_dir.as_fd(), "tcp", 1 << 24)?;
             let pid_dir = procfs::open_pid_dir(own)?;
             let status = procfs::read_file_at(pid_dir.as_fd(), "status")?;

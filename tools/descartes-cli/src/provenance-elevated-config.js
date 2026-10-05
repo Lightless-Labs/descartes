@@ -11,8 +11,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 // Closed enum (plan §1 TDD item 5): an unrecognized/invalid mechanism string is never silently
-// accepted (which could be misread downstream by a later slice) — it always normalizes to
-// "auto" instead. "auto" and "none" are always safe/no-op defaults; "cap_sys_ptrace" and
+// accepted (which could be misread downstream by a later slice) — it normalizes to an inert,
+// disabled shape with an explicit reason. "auto" and "none" are always safe/no-op defaults; "cap_sys_ptrace" and
 // "helper_xpc" are probed under "auto"; "root_helper" must be named explicitly (never
 // auto-selected — see plan §1/§6 open questions, enforced starting Slice 2).
 export const PROVENANCE_MECHANISMS = ["auto", "cap_sys_ptrace", "root_helper", "helper_xpc", "none"];
@@ -29,12 +29,22 @@ async function ensureParent(file) {
 /**
  * Coerces a raw (possibly absent/malformed/hand-edited) config object to the closed shape
  * `{ elevated: { enabled: boolean, mechanism: PROVENANCE_MECHANISMS } }`. Never throws: an
- * unrecognized/missing mechanism value degrades to "auto"; a non-`true` enabled value degrades
+ * unrecognized mechanism values become disabled with `mechanism:"none"` and a reason; a
+ * missing mechanism retains the disabled-default `"auto"`; a non-`true` enabled value degrades
  * to `false` (mirrors normalizeLearnedConfig's `config.enabled === true` coercion).
  */
 export function normalizeProvenanceConfig(config = {}) {
   const elevated = config?.elevated ?? {};
-  const mechanism = MECHANISM_SET.has(elevated.mechanism) ? elevated.mechanism : "auto";
+  if (elevated.mechanism !== undefined && !MECHANISM_SET.has(elevated.mechanism)) {
+    return {
+      elevated: {
+        enabled: false,
+        mechanism: "none",
+        disabled_reason: "invalid_mechanism",
+      },
+    };
+  }
+  const mechanism = elevated.mechanism ?? "auto";
   return {
     elevated: {
       enabled: elevated.enabled === true,

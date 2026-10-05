@@ -64,6 +64,7 @@ const MAX_RESPONSE_BYTES = 8 * 1024;
 export const DEFAULT_HELPER_PATH = "/usr/local/libexec/descartes/descartes-root-helper";
 
 const UNSAFE_MODE_BITS = 0o022; // group- or world-writable
+const VALID_MECHANISMS = new Set(["auto", "cap_sys_ptrace", "root_helper", "helper_xpc", "none"]);
 
 // ---------------------------------------------------------------------------------------------
 // S3-priv Slice 5 Phase 2 Part B: real (non-mock) ptrace_scope diagnostic, deferred from Slice 2.
@@ -342,6 +343,9 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
   if (config?.elevated?.enabled !== true) return undefined; // condition 1 of the two-condition AND gate.
 
   const configuredMechanism = config.elevated.mechanism ?? "auto";
+  // DI callers and hand-written config can bypass normalizeProvenanceConfig. Never let an
+  // unknown mechanism reach probing/invocation, even if enabled was also true.
+  if (!VALID_MECHANISMS.has(configuredMechanism)) return undefined;
   if (configuredMechanism === "none") return undefined;
 
   const helperPath = options.helperPath ?? DEFAULT_HELPER_PATH;

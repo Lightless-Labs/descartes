@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { redactAndBoundProcessArgs } from "../src/tools/processes.js";
 import {
+  buildLinuxSocketFact,
   buildMacPortSockets,
   classifySourceFromAncestry,
   computeProvenanceEnvelopeFields,
@@ -19,6 +20,7 @@ import {
   parseProvenancePs,
   resolvePidFromFdScanResults,
   resolveProvenance,
+  summarizeSocketAttributions,
 } from "../src/tools/provenance.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -70,6 +72,25 @@ test("parseProcNetContents parses a multi-row /proc/net/tcp fixture, skipping th
   assert.equal(parsed[1].local_address, "0.0.0.0");
 });
 
+test("Linux socket facts retain protocol, inode, and uid for every attributed row", () => {
+  assert.deepEqual(buildLinuxSocketFact({
+    protocol: "udp",
+    local_address: "0.0.0.0",
+    local_port: 5353,
+    state: "UNCONN",
+    inode: "777777",
+    uid: 1001,
+  }), {
+    protocol: "udp",
+    local_address: "0.0.0.0",
+    local_port: 5353,
+    state: "UNCONN",
+    public_bind: true,
+    inode: "777777",
+    uid: 1001,
+  });
+});
+
 test("resolvePidFromFdScanResults matches an inode to its owning pid for an accessible own-uid scan", () => {
   const fdScanResults = [
     { pid: 100, accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }] },
@@ -95,6 +116,21 @@ test("resolvePidFromFdScanResults returns unknown (not partial) when nothing was
   const result = resolvePidFromFdScanResults("999999", fdScanResults);
   assert.equal(result.status, "unknown");
   assert.equal(result.pid, undefined);
+});
+
+test("same-port socket attribution is ambiguous when inodes map to different executables or any row is unresolved", () => {
+  assert.deepEqual(summarizeSocketAttributions([
+    { resolved: true, executablePath: "/usr/sbin/nginx" },
+    { resolved: true, executablePath: "/usr/sbin/nginx" },
+  ]), { status: "ok", executablePath: "/usr/sbin/nginx", reason: "socket_attribution_consistent" });
+  assert.equal(summarizeSocketAttributions([
+    { resolved: true, executablePath: "/usr/sbin/nginx" },
+    { resolved: true, executablePath: "/usr/bin/node" },
+  ]).status, "ambiguous");
+  assert.equal(summarizeSocketAttributions([
+    { resolved: true, executablePath: "/usr/sbin/nginx" },
+    { resolved: false },
+  ]).status, "ambiguous");
 });
 
 // ---------------------------------------------------------------------------------------------

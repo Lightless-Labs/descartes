@@ -2,9 +2,10 @@
 //! `main.rs` for the non-Linux stub path, which never reaches any code in this module.
 //!
 //! Slice 3 deliberately keeps resolution all-or-nothing: `resolve_pid` returns `None` unless the
-//! uid, executable path, AND cmdline all read successfully. In particular, a status file that
-//! reads fine but an unreadable `exe` symlink (EACCES on another UID's process today) still fails
-//! the whole lookup -- we never emit a partial resolution. Cross-UID reads are exactly the gap
+//! uid, executable path, AND cmdline all read successfully. A blank cmdline is valid when the
+//! executable link is readable; the executable remains the identity key. In particular, a status
+//! file that reads fine but an unreadable `exe` symlink (EACCES on another UID's process today)
+//! still fails the whole lookup -- we never emit a partial resolution. Cross-UID reads are exactly the gap
 //! Slice 5/6's grant unlocks -- empirically the UNION `cap_sys_ptrace,cap_dac_read_search=ep`, not
 //! `cap_sys_ptrace` alone (a real privileged CI run proved `cap_sys_ptrace`-only insufficient for
 //! `scan_holders` below). `/proc/<pid>/fd` is a DIRECTORY whose kernel permission hook
@@ -67,21 +68,42 @@ const MAX_FDS_PER_PROCESS: usize = 4096;
 const MAX_PROCESSES_SCANNED: usize = 65536;
 
 /// Resolves a single pid to its real uid, executable path, and command line. `None` on ANY
-/// failure (no such pid, unreadable status/exe/cmdline, empty cmdline) -- see the module doc for
-/// why this is intentionally all-or-nothing.
+/// failure (no such pid, unreadable status/exe/cmdline) -- see the module doc for why this is
+/// intentionally all-or-nothing. A blank cmdline is retained when exe is readable.
 pub fn resolve_pid(pid: u32) -> Option<Resolved> {
-    let pid_dir = procfs::open_pid_dir(pid).ok()?;
-    resolve_from_pid_dir(pid, pid_dir.as_fd())
+    for attempt in 0..2 {
+        let pid_dir = procfs::open_pid_dir(pid).ok()?;
+        match resolve_from_pid_dir(pid, pid_dir.as_fd()) {
+            Ok(resolved) => return Some(resolved),
+            Err(IdentityFailure::GenerationChanged) if attempt == 0 => continue,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Reads uid/exe/cmdline relative to an already-pinned `pid_dir`, all-or-nothing (see the module
 /// doc). Shared by `resolve_pid` (which pins its own dirfd) and `scan_holders` (which pins a dirfd
 /// per candidate and, on a match, resolves identity off that SAME dirfd).
-fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Option<Resolved> {
-    let uid = read_uid(pid_dir)?;
-    let executable_path = read_exe(pid_dir)?;
-    let command = read_cmdline(pid_dir)?;
-    Some(Resolved {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityFailure {
+    UnreadableUid,
+    UnreadableExe,
+    UnreadableCommand,
+    GenerationChanged,
+}
+
+fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, IdentityFailure> {
+    let uid = read_uid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
+    let executable_path = read_exe(pid_dir).ok_or(IdentityFailure::UnreadableExe)?;
+    let command = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
+    // Bind the command line to the executable generation observed before it. A process can exec
+    // while retaining its pid and socket; the second exe-link read catches that change before the
+    // identity is admitted. Socket resolution retries the whole attempt once.
+    if read_exe(pid_dir).as_deref() != Some(executable_path.as_str()) {
+        return Err(IdentityFailure::GenerationChanged);
+    }
+    Ok(Resolved {
         pid,
         uid,
         executable_path,
@@ -102,6 +124,9 @@ pub enum SocketOutcome {
     Truncated,
     /// Exit 5: holders disagree on executable: no single process can honestly be named the owner.
     Ambiguous,
+    /// Internal retry signal: executable generation changed while the socket was being pinned.
+    #[doc(hidden)]
+    GenerationChanged,
 }
 
 /// One process found holding the target socket, with everything pinned for the consistency
@@ -117,10 +142,28 @@ struct Holder {
 /// every holder (pin-then-verify) -> select (or ambiguous) -> consistency re-check of BOTH the
 /// chosen holder's fd link and the socket row against what was admitted.
 pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
+    resolve_with_one_generation_retry(|| resolve_socket_once(target))
+}
+
+fn resolve_with_one_generation_retry<F>(mut resolve_once: F) -> SocketOutcome
+where
+    F: FnMut() -> SocketOutcome,
+{
+    for attempt in 0..2 {
+        match resolve_once() {
+            SocketOutcome::GenerationChanged if attempt == 0 => continue,
+            SocketOutcome::GenerationChanged => return SocketOutcome::Ambiguous,
+            outcome => return outcome,
+        }
+    }
+    SocketOutcome::Ambiguous
+}
+
+fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
     let Ok(proc_root) = procfs::open_proc_root() else {
         return SocketOutcome::NotFound;
     };
-    let (row, table_truncated) = read_socket_row(proc_root.as_fd(), target);
+    let (row, table_truncated) = read_socket_row(target);
     let Some(row) = row else {
         return if table_truncated {
             SocketOutcome::Truncated
@@ -133,11 +176,14 @@ pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
     }
 
     let scan = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
-    if scan_requires_truncated_outcome(scan.truncated, scan.holder_count) {
-        return SocketOutcome::Truncated;
+    if scan.generation_changed {
+        return SocketOutcome::GenerationChanged;
     }
     if scan.ambiguous {
         return SocketOutcome::Ambiguous;
+    }
+    if scan_requires_truncated_outcome(scan.truncated, scan.holder_count) {
+        return SocketOutcome::Truncated;
     }
     let Some(holder) = scan.selected else {
         return if scan.truncated {
@@ -155,9 +201,20 @@ pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
     let still_held = procfs::read_link_at(holder.fd_dir.as_fd(), &holder.fd_name)
         .ok()
         .is_some_and(|link| link.to_str() == Some(target.fd_link().as_str()));
-    let (row_again, _) = read_socket_row(proc_root.as_fd(), target);
-    if !still_held || row_again.as_ref() != Some(&row) {
+    if !still_held {
+        return SocketOutcome::GenerationChanged;
+    }
+    let (row_again, _) = read_socket_row(target);
+    if row_again.as_ref() != Some(&row) {
         return SocketOutcome::NotFound;
+    }
+    // Final executable-generation check closes the window between the holder identity read and
+    // the fd/socket recheck. A changed path retries once, then becomes ambiguous.
+    if procfs::read_link_at(holder._pid_dir.as_fd(), "exe")
+        .ok()
+        .is_none_or(|link| link.to_string_lossy() != holder.resolved.executable_path)
+    {
+        return SocketOutcome::GenerationChanged;
     }
 
     SocketOutcome::Resolved {
@@ -166,11 +223,11 @@ pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
     }
 }
 
-/// Reads ONLY `/proc/net/<target.protocol>` and returns the row whose inode is exactly
+/// Reads ONLY `/proc/<helper-pid>/net/<target.protocol>` and returns the row whose inode is exactly
 /// `target.inode` (no port/state judgement here -- see `socket::row_admits`), plus whether the
 /// table read was truncated at `MAX_NET_TABLE_BYTES`.
-fn read_socket_row(proc_root: BorrowedFd<'_>, target: &SocketTarget) -> (Option<SocketRow>, bool) {
-    let Ok(net_dir) = procfs::open_dir_at(proc_root, "net") else {
+fn read_socket_row(target: &SocketTarget) -> (Option<SocketRow>, bool) {
+    let Ok(net_dir) = procfs::open_proc_net() else {
         return (None, true);
     };
     let table = target
@@ -194,8 +251,32 @@ struct HolderScan {
     holder_count: usize,
     first_executable_path: Option<String>,
     ambiguous: bool,
+    generation_changed: bool,
     /// A bound was hit on a NON-holder (or on the `/proc` listing): another holder may be unseen.
     truncated: bool,
+}
+
+impl HolderScan {
+    fn record_fd_link_failure(&mut self) {
+        // A failed readlink can hide a matching holder; it is never a clean non-match.
+        self.truncated = true;
+    }
+
+    fn record_identity_failure(&mut self, failure: IdentityFailure) {
+        match failure {
+            IdentityFailure::UnreadableExe => {
+                // An unreadable executable is an explicit ambiguity: another executable may be
+                // hidden behind the failed identity read.
+                self.ambiguous = true;
+                self.truncated = true;
+            }
+            IdentityFailure::GenerationChanged => self.generation_changed = true,
+            IdentityFailure::UnreadableUid | IdentityFailure::UnreadableCommand => {
+                // A known matching holder was omitted even if its executable could be read.
+                self.truncated = true;
+            }
+        }
+    }
 }
 
 fn is_vanished_proc_error(error: &std::io::Error) -> bool {
@@ -227,16 +308,16 @@ fn scan_requires_truncated_outcome(truncated: bool, holder_count: usize) -> bool
 /// inspected, `"fd"` is opened relative to THAT dirfd once, and identity is resolved off the same
 /// `pid_dir` -- never a fresh `/proc/<pid>` lookup by number -- so a pid recycled mid-scan either
 /// keeps resolving the process the fd was opened for or fails closed (see `procfs`'s dead-pid
-/// test). Unreadable/vanished candidates are skipped; ENOENT/ESRCH are expected procfs races, while
-/// every other open/getdents error also marks the scan uncertain. A holder whose identity cannot
-/// be fully resolved (it exited between the fd match and the identity read) no longer holds
-/// anything and is skipped too.
+/// test). Candidates that vanish before they are matched may be skipped, but every fd readlink
+/// error and every matched holder identity failure marks the scan uncertain. An unreadable
+/// executable is explicitly ambiguous; a blank cmdline is compared by executable path.
 fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> HolderScan {
     let mut scan = HolderScan {
         selected: None,
         holder_count: 0,
         first_executable_path: None,
         ambiguous: false,
+        generation_changed: false,
         truncated: false,
     };
     // The listing cap counts every `/proc` entry (a few dozen non-pid names included).
@@ -289,6 +370,7 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
             };
             let Ok(target) = procfs::read_link_at_into(fd_dir.as_fd(), fd_name, &mut link_buf)
             else {
+                scan.record_fd_link_failure();
                 continue;
             };
             if target == needle.as_bytes() {
@@ -298,8 +380,8 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
         }
 
         match matched_fd {
-            Some(fd_name) => {
-                if let Some(resolved) = resolve_from_pid_dir(pid, pid_dir.as_fd()) {
+            Some(fd_name) => match resolve_from_pid_dir(pid, pid_dir.as_fd()) {
+                Ok(resolved) => {
                     scan.holder_count += 1;
                     match scan.first_executable_path.as_ref() {
                         Some(first) if first != &resolved.executable_path => scan.ambiguous = true,
@@ -320,7 +402,8 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
                         scan.selected = Some(candidate);
                     }
                 }
-            }
+                Err(failure) => scan.record_identity_failure(failure),
+            },
             None => {
                 // This candidate did not show the socket; if its fd table was capped, it may hold
                 // it beyond the fds enumerated.
@@ -358,20 +441,21 @@ fn read_exe(pid_dir: BorrowedFd<'_>) -> Option<String> {
 }
 
 /// Reads `/proc/<pid>/cmdline` (NUL-separated argv, lossily decoded) and space-joins it into a
-/// single display string. An empty cmdline (kernel threads, or a zombie mid-reap) is treated as a
-/// failed resolution, not an empty-string success. Reads relative to `pid_dir` -- see the module
-/// doc.
+/// single display string. An empty cmdline (blanked argv, a kernel thread, or a zombie mid-reap)
+/// is a valid identity component when the executable link is readable; holders are compared by
+/// executable path. Reads relative to `pid_dir` -- see the module doc.
 fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<String> {
     let raw = procfs::read_file_at(pid_dir, "cmdline").ok()?;
+    Some(decode_cmdline(&raw))
+}
+
+fn decode_cmdline(raw: &[u8]) -> String {
     let parts: Vec<String> = raw
         .split(|&b| b == 0)
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
-    if parts.is_empty() {
-        return None;
-    }
-    Some(parts.join(" "))
+    parts.join(" ")
 }
 
 #[cfg(test)]
@@ -383,8 +467,7 @@ mod tests {
     /// Looks up the inode of the socket bound to `port` in `/proc/net/<protocol>` (the test's own
     /// socket), filtering on `state` when given.
     fn inode_for(protocol: Protocol, port: u16, state: Option<&str>) -> u64 {
-        let root = procfs::open_proc_root().expect("/proc must open");
-        let net_dir = procfs::open_dir_at(root.as_fd(), "net").expect("/proc/net must open");
+        let net_dir = procfs::open_proc_net().expect("/proc/<pid>/net must open");
         let table = protocol
             .net_table()
             .strip_prefix("net/")
@@ -425,6 +508,12 @@ mod tests {
         assert_eq!(resolved.uid, self_uid);
         assert!(!resolved.executable_path.is_empty());
         assert!(!resolved.command.is_empty());
+    }
+
+    #[test]
+    fn blank_cmdline_is_not_an_identity_read_failure_when_exe_is_available() {
+        assert_eq!(decode_cmdline(b"\0\0"), "");
+        assert_eq!(decode_cmdline(b"app\0--serve\0"), "app --serve");
     }
 
     #[test]
@@ -537,9 +626,55 @@ mod tests {
     }
 
     #[test]
+    fn matched_holder_read_failures_are_never_silently_dropped() {
+        let mut scan = HolderScan {
+            selected: None,
+            holder_count: 0,
+            first_executable_path: None,
+            ambiguous: false,
+            generation_changed: false,
+            truncated: false,
+        };
+        scan.record_fd_link_failure();
+        assert!(scan.truncated);
+
+        scan.truncated = false;
+        scan.record_identity_failure(IdentityFailure::UnreadableCommand);
+        assert!(scan.truncated);
+        assert!(!scan.ambiguous);
+
+        scan.record_identity_failure(IdentityFailure::UnreadableExe);
+        assert!(scan.truncated);
+        assert!(scan.ambiguous);
+    }
+
+    #[test]
     fn a_truncated_scan_with_a_holder_must_not_resolve() {
         assert!(scan_requires_truncated_outcome(true, 1));
         assert!(!scan_requires_truncated_outcome(true, 0));
         assert!(!scan_requires_truncated_outcome(false, 1));
+    }
+
+    #[test]
+    fn executable_generation_change_retries_once_then_becomes_ambiguous() {
+        let mut calls = 0;
+        let outcome = resolve_with_one_generation_retry(|| {
+            calls += 1;
+            SocketOutcome::GenerationChanged
+        });
+        assert_eq!(outcome, SocketOutcome::Ambiguous);
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let outcome = resolve_with_one_generation_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                SocketOutcome::GenerationChanged
+            } else {
+                SocketOutcome::NotFound
+            }
+        });
+        assert_eq!(outcome, SocketOutcome::NotFound);
+        assert_eq!(calls, 2);
     }
 }

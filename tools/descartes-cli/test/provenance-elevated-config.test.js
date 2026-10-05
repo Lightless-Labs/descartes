@@ -106,10 +106,11 @@ test("normalizeProvenanceConfig accepts every value in the closed mechanism enum
   }
 });
 
-test("normalizeProvenanceConfig degrades an unrecognized mechanism value to 'auto'", () => {
+test("normalizeProvenanceConfig makes an unrecognized mechanism inert with an explicit reason", () => {
   const normalized = normalizeProvenanceConfig({ elevated: { enabled: true, mechanism: "sudo_everything" } });
-  assert.equal(normalized.elevated.mechanism, "auto");
-  assert.equal(normalized.elevated.enabled, true);
+  assert.deepEqual(normalized, {
+    elevated: { enabled: false, mechanism: "none", disabled_reason: "invalid_mechanism" },
+  });
 });
 
 test("normalizeProvenanceConfig defaults a missing mechanism to 'auto' and a missing enabled to false", () => {
@@ -118,25 +119,26 @@ test("normalizeProvenanceConfig defaults a missing mechanism to 'auto' and a mis
   assert.deepEqual(normalizeProvenanceConfig({ elevated: {} }), { elevated: { enabled: false, mechanism: "auto" } });
 });
 
-test("an unrecognized mechanism value hand-written directly to provenance.json normalizes to 'auto' on load (never crashes, never silently accepted)", async () => {
+test("an unrecognized mechanism value hand-written directly to provenance.json loads inert with a reason", async () => {
   const paths = await tempPaths();
   const { configFile } = resolveProvenanceConfigPaths(paths);
   await fs.mkdir(path.dirname(configFile), { recursive: true, mode: 0o700 });
   await fs.writeFile(configFile, JSON.stringify({ elevated: { enabled: true, mechanism: "not_a_real_mechanism" } }), { mode: 0o600 });
 
   const config = await loadProvenanceConfig(paths);
-  assert.equal(config.elevated.mechanism, "auto");
-  assert.equal(config.elevated.enabled, true);
+  assert.equal(config.elevated.mechanism, "none");
+  assert.equal(config.elevated.enabled, false);
+  assert.equal(config.elevated.disabled_reason, "invalid_mechanism");
   assert.equal(config.corrupt, undefined);
 });
 
-test("writeProvenanceConfig never persists an invalid mechanism value verbatim — it is normalized to 'auto' before the atomic write", async () => {
+test("writeProvenanceConfig never persists an invalid mechanism value verbatim — it is persisted inert with a reason", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "not_a_real_mechanism" } });
 
   const { configFile } = resolveProvenanceConfigPaths(paths);
   const onDisk = JSON.parse(await fs.readFile(configFile, "utf8"));
-  assert.equal(onDisk.elevated.mechanism, "auto");
+  assert.deepEqual(onDisk.elevated, { enabled: false, mechanism: "none", disabled_reason: "invalid_mechanism" });
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -291,6 +291,18 @@ export function parseProcNetContents(contents, { protocol } = {}) {
   return lines.map((line) => (line.trim() ? parseProcNetLine(line, { protocol }) : undefined)).filter(Boolean);
 }
 
+export function buildLinuxSocketFact(entry) {
+  return {
+    protocol: entry.protocol,
+    local_address: entry.local_address,
+    local_port: entry.local_port,
+    state: entry.state,
+    public_bind: isPublicBindAddress(entry.local_address),
+    inode: entry.inode,
+    uid: entry.uid,
+  };
+}
+
 // Pure inode->pid matcher over an already-performed fd scan. fdScanResults is
 // [{ pid, accessible: bool, fds?: [{ fd, target }] }, ...] — accessible:false represents an
 // EACCES (cross-UID, permission-limited) /proc/<pid>/fd readdir. Never fabricates a pid.
@@ -303,6 +315,27 @@ export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
   const hadInaccessible = fdScanResults.some((entry) => entry.accessible === false);
   if (hadInaccessible) return { status: "partial", pid: undefined, confidence: 0, review_hint: "missing_permission" };
   return { status: "unknown", pid: undefined, confidence: 0 };
+}
+
+// A numeric port is not an identity: TCP/UDP rows and SO_REUSEPORT siblings can coexist. This
+// pure reducer is shared by the live Linux path and fixtures so a result is confident only when
+// every matching row was attributed and all attributed rows name the same executable.
+export function summarizeSocketAttributions(attributions = []) {
+  if (!Array.isArray(attributions) || attributions.length === 0) {
+    return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_missing" };
+  }
+  const executablePaths = new Set();
+  for (const attribution of attributions) {
+    const executablePath = attribution?.executablePath;
+    if (attribution?.resolved !== true || typeof executablePath !== "string" || executablePath.length === 0) {
+      return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_unresolved" };
+    }
+    executablePaths.add(executablePath);
+  }
+  if (executablePaths.size !== 1) {
+    return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_different_executables" };
+  }
+  return { status: "ok", executablePath: executablePaths.values().next().value, reason: "socket_attribution_consistent" };
 }
 
 // Exported (additive, S4): the structural provenance-warning collector needs to enumerate all
@@ -789,7 +822,8 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // Bound the untrusted helper's path/command exactly like the unprivileged path (resolvePidCore
   // truncates executable_path) before either reaches the evidence envelope / triage LLM.
   const elevatedExecutablePath = truncate(upgrade.executablePath);
-  const elevatedCommand = truncate(upgrade.command);
+  const elevatedCommandRedaction = redactAndBoundProcessArgs(upgrade.command ?? "");
+  const elevatedCommand = elevatedCommandRedaction.value;
   const upgradedCore = {
     resolvedStatus: "ok",
     resolved: {
@@ -798,6 +832,12 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       executable_path: elevatedExecutablePath,
       executable_path_unavailable: !upgrade.executablePath,
       command: elevatedCommand,
+      args_redaction: {
+        redacted: elevatedCommandRedaction.redacted,
+        truncated: elevatedCommandRedaction.truncated,
+        original_length: elevatedCommandRedaction.original_length,
+        max_length: elevatedCommandRedaction.max_length,
+      },
       // Always the trusted, unprivileged-derived owning uid — never the helper's self-report.
       user: { uid: primary.uid, username: undefined, username_unavailable: true },
     },
@@ -845,29 +885,63 @@ async function resolveByPortLinux(port, options = {}) {
   const matches = entries.filter((entry) => entry.local_port === port && (entry.protocol.startsWith("tcp") ? entry.state === "LISTEN" : true));
   if (matches.length === 0) return { resolvedStatus: "unknown", result: buildNotFoundResult("port", port) };
 
-  const primary = matches[0];
-  const sockets = matches.map((entry) => ({
-    protocol: entry.protocol,
-    local_address: entry.local_address,
-    local_port: entry.local_port,
-    state: entry.state,
-    public_bind: isPublicBindAddress(entry.local_address),
-  }));
+  const sockets = matches.map(buildLinuxSocketFact);
 
   const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (currentUid !== undefined && primary.uid === currentUid) {
-    const candidatePids = await listProcPids();
-    const fdScanResults = await scanProcFdForInode(candidatePids);
-    const matchResult = resolvePidFromFdScanResults(primary.inode, fdScanResults);
-    if (matchResult.status === "ok") {
-      const core = await resolvePidCore(matchResult.pid);
-      return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+  const candidatePids = currentUid !== undefined && matches.some((entry) => entry.uid === currentUid)
+    ? await listProcPids()
+    : [];
+  const fdScanResults = candidatePids.length > 0 ? await scanProcFdForInode(candidatePids) : [];
+  const attributions = [];
+  const outcomes = [];
+  for (const [index, entry] of matches.entries()) {
+    const socket = sockets[index];
+    if (currentUid !== undefined && entry.uid === currentUid) {
+      const matchResult = resolvePidFromFdScanResults(entry.inode, fdScanResults);
+      if (matchResult.status === "ok") {
+        const core = await resolvePidCore(matchResult.pid);
+        if (core.resolvedStatus === "ok") {
+          attributions.push({ resolved: true, executablePath: core.resolved.executable_path });
+          outcomes.push(finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets }));
+          continue;
+        }
+      }
+    } else if (options.paths) {
+      const outcome = await resolveCrossUidPortResult({ port, primary: entry, sockets: [socket] }, options);
+      if (outcome.resolvedStatus === "ok") {
+        attributions.push({ resolved: true, executablePath: outcome.result.resolved.executable_path });
+        outcomes.push(outcome);
+        continue;
+      }
     }
+    attributions.push({ resolved: false });
   }
 
+  if (matches.length > 1) {
+    const summary = summarizeSocketAttributions(attributions);
+    if (summary.status !== "ok") {
+      const core = {
+        resolvedStatus: "partial",
+        resolved: {
+          status: "partial",
+          pid: undefined,
+          user: { uid: undefined, username: undefined, username_unavailable: true },
+          reason: summary.reason,
+        },
+        ancestry: [],
+        source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: summary.reason, socket_count: matches.length } },
+      };
+      return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+    }
+    const selected = outcomes[0];
+    return { ...selected, result: { ...selected.result, sockets } };
+  }
+
+  const primary = matches[0];
+  if (outcomes.length === 1) return outcomes[0];
+
   // Cross-UID, or fd-walk could not resolve a pid: the owning UID is a confident fact; the pid
-  // itself is never fabricated. See resolveCrossUidPortResult above for the S3-priv Slice 2
-  // elevated-upgrade wrap.
+  // itself is never fabricated. See resolveCrossUidPortResult above for the S3-priv upgrade.
   return resolveCrossUidPortResult({ port, primary, sockets }, options);
 }
 

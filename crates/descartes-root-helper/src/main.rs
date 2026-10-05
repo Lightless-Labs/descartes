@@ -183,6 +183,9 @@ fn run_resolve_socket(target: socket::SocketTarget) -> i32 {
             );
             EXIT_RESOLUTION_FAILURE
         }
+        // This is an internal retry signal and should be consumed by resolve_socket, but retain a
+        // fail-closed mapping if a future refactor lets it escape.
+        SocketOutcome::GenerationChanged => EXIT_OWNER_AMBIGUOUS,
     }
 }
 

@@ -126,6 +126,20 @@ on exec, not merely inheritable). Do **not** grant a broader capability set —
 and do **not** leave a narrower one in place (e.g. the stale single-cap `cap_sys_ptrace=ep` grant
 from before 2026-07-12): see the upgrade warning below.
 
+### Privileged-helper residual (accepted and bounded)
+
+The helper's seccomp filter is deliberately read-only and requires `O_NOFOLLOW`, but seccomp cannot
+filter pathname strings. After a control-flow compromise, a reachable non-symlink path could still
+be opened and read sequentially (for example `/etc/shadow` or `/proc/<pid>/environ`); bytes can
+leave only through the helper's stdout/stderr channel to its invoking group. This residual is
+accepted for the current design and is not presented as complete post-compromise containment.
+
+Landlock is not a suitable add-on here because its `ptrace_access_check` interaction blocks the
+helper's required cross-UID `/proc/<pid>/exe` and `/proc/<pid>/fd` reads. Dropping
+`CAP_DAC_READ_SEARCH` would preserve PID-only visibility but breaks cross-UID socket resolution,
+which must enumerate another user's `/proc/<pid>/fd` directory; keep the two-capability union for
+the supported socket path.
+
 ### 5. Add the daemon's account to the group
 
 ```bash

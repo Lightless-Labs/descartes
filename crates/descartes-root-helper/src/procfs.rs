@@ -47,7 +47,7 @@
 use std::ffi::{CString, OsString};
 use std::io;
 use std::mem::offset_of;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 
 /// Bound applied to every `read_file_at` call, regardless of which `/proc/<pid>` file is being
@@ -92,12 +92,21 @@ pub fn open_pid_dir(pid: u32) -> io::Result<OwnedFd> {
 
 /// Opens `/proc` itself as a directory fd (2026-10). Used for the top-level pid listing
 /// (`read_dir_entries_at(root, ".")`) and the `net/<protocol>` socket tables
-/// (`open_dir_at(root, "net")` then `read_file_at_bounded(net, "tcp", ..)`) so `proc_linux.rs`
+/// (`open_proc_net()` then `read_file_at_bounded(net, "tcp", ..)`) so `proc_linux.rs`
 /// needs no `std::fs` at all:
 /// std's `read_to_string`/`read_dir` paths issue statx/fstat (and glibc's opendir an O_NONBLOCK
 /// open), none of which the tightened seccomp policy admits.
 pub fn open_proc_root() -> io::Result<OwnedFd> {
     open_absolute_dir("/proc")
+}
+
+/// Opens the helper's own `/proc/<pid>/net` directory. Linux exposes `/proc/net` as a symlink to
+/// `self/net`; `O_NOFOLLOW|O_DIRECTORY` must reject that symlink rather than silently disabling
+/// socket resolution. The numeric pid is resolved by this process and remains valid under the
+/// helper's seccomp policy.
+pub fn open_proc_net() -> io::Result<OwnedFd> {
+    let pid_dir = open_pid_dir(std::process::id())?;
+    open_dir_at(pid_dir.as_fd(), "net")
 }
 
 fn open_absolute_dir(path: &str) -> io::Result<OwnedFd> {
@@ -371,7 +380,7 @@ mod tests {
             read_dir_entries_at(root.as_fd(), ".", 1 << 20).expect("/proc must be listable");
         let own = std::process::id().to_string();
         assert!(entries.iter().any(|e| e.to_str() == Some(own.as_str())));
-        let net = open_dir_at(root.as_fd(), "net").expect("/proc/net must open");
+        let net = open_proc_net().expect("/proc/<pid>/net must open");
         let (tcp, truncated) =
             read_file_at_bounded(net.as_fd(), "tcp", 16 << 20).expect("net/tcp must read");
         assert!(

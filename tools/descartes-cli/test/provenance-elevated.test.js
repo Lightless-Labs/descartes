@@ -127,6 +127,18 @@ test("resolveElevated never attempts when the helper is absent (probe reports un
   assert.equal(invokeCalls, 0);
 });
 
+test("resolveElevated treats an invalid enabled mechanism as inert instead of falling back to auto", async () => {
+  const paths = await tempPaths();
+  let probeCalls = 0;
+  const options = fakeElevatedOptions({
+    loadProvenanceConfig: async () => ({ elevated: { enabled: true, mechanism: "typo_mechanism" } }),
+    probeElevatedHelper: async () => { probeCalls++; return { available: true }; },
+    invokeElevatedHelper: async () => { throw new Error("must not invoke an invalid mechanism"); },
+  });
+  assert.equal(await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options), undefined);
+  assert.equal(probeCalls, 0);
+});
+
 test("resolveCrossUidPortResult falls through to the unprivileged partial/0.4/missing_permission baseline when the gate fails (either leg)", async () => {
   const paths = await tempPaths(); // disabled default.
   const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
@@ -190,6 +202,23 @@ test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved 
 
   const fields = computeProvenanceEnvelopeFields(outcome.resolvedStatus, outcome.result.source.type);
   assert.deepEqual(fields, { status: "ok", confidence: 1, reviewHint: "none" }, "upgrade must reach the same ok/1/none envelope shape as an own-uid resolution");
+});
+
+test("resolveCrossUidPortResult redacts elevated command arguments before resolved or source fields reach the envelope", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const secret = "sk-test-secret-value";
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, command: `app --api-key ${secret}` }) }),
+  }));
+  assert.equal(outcome.resolvedStatus, "ok");
+  assert.equal(outcome.result.resolved.command.includes(secret), false);
+  assert.equal(outcome.result.source.name.includes(secret), false);
+  assert.equal(outcome.result.resolved.command, "app --api-key [REDACTED]");
+  assert.equal(outcome.result.resolved.args_redaction.redacted, true);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -64,6 +64,18 @@ impl Protocol {
         }
     }
 
+    /// Explicit components for `/proc/<pid>/net/<table>`. This deliberately avoids the Linux
+    /// `/proc/net` symlink and is pure so its path contract can be tested on every host.
+    #[cfg(test)]
+    pub fn proc_net_path_components(self, pid: u32) -> [String; 4] {
+        [
+            "/proc".to_string(),
+            pid.to_string(),
+            "net".to_string(),
+            self.net_table().strip_prefix("net/").unwrap().to_string(),
+        ]
+    }
+
     /// TCP sockets must still be LISTENing (Node only ever selects LISTEN rows for TCP); UDP is
     /// limited to state 07, the bound/unconnected rows Node can attribute as listeners.
     pub fn requires_listen(self) -> bool {
@@ -230,6 +242,18 @@ mod tests {
         for bad in ["", "TCP", "tcp4", "raw", "unix", "tcp6 ", "../tcp"] {
             assert_eq!(Protocol::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn socket_tables_use_explicit_proc_pid_net_components_not_proc_net_symlink() {
+        assert_eq!(
+            Protocol::Tcp.proc_net_path_components(4242),
+            ["/proc", "4242", "net", "tcp"].map(String::from)
+        );
+        assert_eq!(
+            Protocol::Udp6.proc_net_path_components(4242),
+            ["/proc", "4242", "net", "udp6"].map(String::from)
+        );
     }
 
     #[test]

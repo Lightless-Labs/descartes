@@ -2,6 +2,27 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — daybreak-blue root-helper findings (2026-10-05)
+
+On branch `harden/root-helper-2026-10`, the current review fixes are implemented in this worktree
+and are not pushed. Linux socket-table reads now use explicit `/proc/<helper-pid>/net` components
+with `O_NOFOLLOW`; every same-port Linux row is resolved before attribution, with protocol/inode/uid
+retained in socket facts; matched holder read/identity failures are uncertain rather than skipped;
+blank cmdline is accepted only as an executable-keyed identity; executable generation is rechecked
+after cmdline and after the final socket check with one retry; elevated commands use the shared secret
+redactor; and invalid enabled mechanisms become disabled/inert with a reason. The accepted residual
+sequential-read exposure after helper compromise is documented in the plan addendum and operator
+setup guide; Landlock remains unsuitable and `CAP_DAC_READ_SEARCH` cannot be removed without
+breaking cross-UID socket fd enumeration.
+
+Added tests cover explicit proc-net path components, a real Linux listener path (existing Linux
+integration, CI-only on this macOS host), multi-socket ambiguity and socket identity fields, elevated
+`--api-key` redaction, invalid mechanisms, blank cmdline identity, matched-holder failure accounting,
+and one-retry generation behavior. Host Rust formatting/check/test/clippy and both Linux-target
+`cargo check --tests` and clippy commands are green for both Linux targets. Escalated full Node tests are green: 2034 pass, 0 fail, 34
+Linux-only skips. The host cannot execute Linux live-filter, `/proc`, inherited-listener,
+cross-UID/capability tests; those remain Linux CI work.
+
 ## Current session — root-helper review fixes (2026-10-05)
 
 On branch `harden/root-helper-2026-10`, the adversarial review fixes are implemented and committed
