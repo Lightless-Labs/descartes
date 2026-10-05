@@ -377,3 +377,28 @@ test("G1 reproduction (S3b) for process.lineage.novel_edge and scheduled_job.app
     assert.equal((await loadStore(paths)).state.cold_start_pending, false, `${family}: no re-arm`);
   }
 });
+
+test("S3/S3b novelty horizon: with a valid seen-set the 48 h horizon is measured against the set's certified span -- short emits nothing, reports no coverage and never re-arms; met resumes on the same tick", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: at(-1) });
+  const points = [0, 1, 2, 3].flatMap((hour) => serviceTick(at(hour), ["base"])).concat(serviceTick(at(4), ["base", "brand-new"]));
+  const nowMs = Date.parse(at(4));
+  const run = (certifiedSinceMs) => computeServiceAppearanceCandidates(paths, {
+    now: at(4),
+    readFactPoints: async () => ({
+      points,
+      corrupt_count: 0,
+      schema_invalid_count: 0,
+      completeness: { status: "intact", coverage: "narrowed", bytecap_floor_ts: at(-1), age_floor_ts: null },
+      seen_sets: { service: { family: "service", status: "valid", certified_since_ts: new Date(certifiedSinceMs).toISOString(), scope_ts: new Date(certifiedSinceMs).toISOString(), entry_count: 0, entries: new Map() } },
+    }),
+  });
+  const short = await run(nowMs - 47 * HOUR);
+  assert.deepEqual(short.candidates, []);
+  assert.deepEqual(short.evaluatedAlertKeys, []);
+  assert.equal((await loadServiceAppearanceBaselineStore(paths)).state.cold_start_pending, false, "a short novelty horizon never re-arms (I5)");
+  const met = await run(nowMs - 48 * HOUR);
+  assert.equal(met.candidates.length, 1, "exactly 48 h of certified seen-set memory: the genuinely new service alerts");
+  assert.ok(met.evaluatedAlertKeys.length > 0);
+});
