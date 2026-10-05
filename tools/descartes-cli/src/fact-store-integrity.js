@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
 
 export const FACT_INTEGRITY_SCHEMA_VERSION = 1;
 
@@ -498,17 +499,10 @@ function lossAtOrAfter(timestamp, asOfMs) {
   return lossMs >= asOfMs;
 }
 
-// The five loss-timestamp channels buildCompleteness's degraded evaluation consults. Order is
-// significant for degraded_reason's channel attribution below (last_future_fact_ts first: a
-// future-fact-only incident should report as such, not be absorbed into a same-tick continuity-
-// break attribution).
-const LOSS_CHANNEL_FIELDS = [
-  "last_future_fact_ts",
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-];
+// The loss-timestamp channels buildCompleteness's degraded evaluation consults: the single shared
+// list in fact-store-completeness.js (see its comment; order is significant for degraded_reason's
+// channel attribution below).
+const LOSS_CHANNEL_FIELDS = COMPLETENESS_LOSS_TIMESTAMP_FIELDS;
 
 // Fix 2 (surfacing, additive, no trust-decision path touched): the subset of last_*_ts field
 // names whose parsed value is strictly after nowMs -- i.e. still forward-dated as of this read.

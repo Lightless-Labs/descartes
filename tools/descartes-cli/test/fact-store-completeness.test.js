@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { appendFactPoints, enforceFactRetention, FUTURE_FACT_TOLERANCE_MS, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
-import { factHistoryTrustworthy } from "../src/fact-store-completeness.js";
+import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS, factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "../src/fact-store-completeness.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-fact-completeness-test-"));
@@ -374,4 +374,41 @@ test("BLOCKER 2: a future-fact loss whose marker aged out of the read window sti
   const anchorTs = "2025-12-31T23:59:59.000Z";
   const trust = factHistoryTrustworthy(read, { anchorTs, nowMs: Date.parse(readNow) });
   assert.deepEqual(trust, { trust: false, reason: "history_degraded" }, "an anchor older than an aged-out future-fact marker must not be fabricated as trustworthy");
+});
+
+// --- S1 of the fact-store capacity plan (2026-10-05, §4.1 item 7): one shared loss-channel list
+// and one shared detector re-arm check instead of six detector copies. No behavior change.
+
+test("S1: the shared loss-channel list is the single definition buildCompleteness and the detectors use", () => {
+  assert.deepEqual([...COMPLETENESS_LOSS_TIMESTAMP_FIELDS].sort(), [...LOSS_CHANNELS].sort());
+  assert.equal(Object.isFrozen(COMPLETENESS_LOSS_TIMESTAMP_FIELDS), true);
+  // degraded_reason attribution order: the future-fact channel is consulted first.
+  assert.equal(COMPLETENESS_LOSS_TIMESTAMP_FIELDS[0], "last_future_fact_ts");
+});
+
+test("S1: hasCompletenessLossAfterAnchor keeps the detectors' exact re-arm semantics", () => {
+  const anchor = "2026-08-21T00:00:10.000Z";
+  const nowMs = Date.parse("2026-08-21T00:01:00.000Z");
+  const read = (completeness) => ({ corrupt_count: 0, schema_invalid_count: 0, completeness });
+  for (const channel of LOSS_CHANNELS) {
+    assert.equal(hasCompletenessLossAfterAnchor(read({ [channel]: "2026-08-21T00:00:11.000Z" }), anchor, nowMs), true, `${channel} after anchor`);
+    assert.equal(hasCompletenessLossAfterAnchor(read({ [channel]: anchor }), anchor, nowMs), false, `${channel} at anchor`);
+    assert.equal(hasCompletenessLossAfterAnchor(read({ [channel]: "2026-08-21T00:02:00.000Z" }), anchor, nowMs), false, `${channel} after nowMs is ignored`);
+    assert.equal(hasCompletenessLossAfterAnchor(read({ [channel]: "not-a-date" }), anchor, nowMs), true, `${channel} malformed fails closed`);
+    assert.equal(hasCompletenessLossAfterAnchor(read({ [channel]: "2026-08-21T00:00:01.000Z" }), undefined, nowMs), true, `${channel} with no anchor counts`);
+    assert.equal(hasCompletenessLossAfterAnchor(read({ [channel]: "2026-08-21T00:00:01.000Z" }), "garbage", nowMs), true, `${channel} with an invalid anchor counts`);
+  }
+  assert.equal(hasCompletenessLossAfterAnchor({}, anchor, nowMs), false, "missing completeness is not itself a re-arm");
+  assert.equal(hasCompletenessLossAfterAnchor(read([]), anchor, nowMs), false);
+  assert.equal(hasCompletenessLossAfterAnchor(read({ last_corrupt_ts: "2026-08-21T00:02:00.000Z" }), anchor, Number.NaN), true, "no finite nowMs means no upper bound");
+});
+
+test("S1: no detector keeps its own copy of the loss-channel list or the re-arm check (read as latin1: canary-baseline.js carries a NUL byte)", async () => {
+  const detectors = ["session-baseline.js", "peer-baseline.js", "service-baseline.js", "process-lineage-baseline.js", "persistence-baseline.js", "canary-baseline.js"];
+  for (const name of detectors) {
+    const source = await fs.readFile(new URL(`../src/${name}`, import.meta.url), "latin1");
+    assert.equal(source.includes("const COMPLETENESS_LOSS_TIMESTAMP_FIELDS"), false, `${name} defines its own loss-channel list`);
+    assert.equal(source.includes("function hasCompletenessLossAfterAnchor"), false, `${name} defines its own re-arm check`);
+    assert.match(source, /import \{[^}]*\bhasCompletenessLossAfterAnchor\b[^}]*\} from "\.\/fact-store-completeness\.js";/, `${name} must import the shared re-arm check`);
+  }
 });

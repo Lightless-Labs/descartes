@@ -25,7 +25,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, computeZScore, emptyWelfordStats, foldWelford, updateEwma } from "./welford-stats.js";
 
@@ -144,31 +144,9 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 function normalizeStatsShape(rawStats) {
   const stats = rawStats && typeof rawStats === "object" && !Array.isArray(rawStats) ? rawStats : {};
