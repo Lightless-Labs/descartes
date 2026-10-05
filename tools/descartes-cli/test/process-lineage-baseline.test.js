@@ -81,7 +81,7 @@ function flatten(ticks) {
   return ticks.flat();
 }
 
-function intactReadResult(points, completeness = { status: "intact" }) {
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return {
     points,
     corrupt_count: 0,
@@ -372,7 +372,7 @@ test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor 
   const options = {
     minHistoryTickCount: 6,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }),
   };
   await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal((await loadProcessLineageBaselineStore(paths)).state.last_folded_ts, undefined);
@@ -720,6 +720,32 @@ test("computeProcessLineageBaselineCandidates: a fully schema-valid established 
 
   const result = await computeProcessLineageBaselineCandidates(paths, { now: tickTs(2), minHistoryTickCount, activeFreshnessMs: HOUR_MS });
   assert.equal(result.candidates.length, 1, "fully-valid established store trusts immediately, same as before the fix");
+});
+
+test("computeProcessLineageBaselineCandidates: narrowed history re-arms before evaluating an edge that predates the evicted prefix", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // The edge existed at t0, was absent at t1..t3, and returned at t4. With t0 evicted, the
+  // retained union alone would call it novel unless the detector requires full coverage.
+  const retainedPoints = flatten([
+    completeTick(tickTs(1), []),
+    completeTick(tickTs(2), []),
+    completeTick(tickTs(3), []),
+    completeTick(tickTs(4), [["shell", "python"]]),
+  ]);
+  const result = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(4),
+    minHistoryTickCount: 3,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }),
+  });
+
+  assert.deepEqual(result.candidates, [], "a narrowed retained window must not fabricate process.lineage.novel_edge");
+  const state = (await loadProcessLineageBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, true, "narrowed coverage must re-arm the established state");
+  assert.equal(state.cold_start_since_ts, tickTs(4));
 });
 
 // TERMINAL fix (gpt-5.6-sol review -- exact-schema pattern): the prior "full schema validation"

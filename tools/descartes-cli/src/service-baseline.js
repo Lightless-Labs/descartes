@@ -911,7 +911,15 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  // Interim S2 guard (daybreak G1 blocker): service.appeared claims an entity was never seen in
+  // the host's prior history. A narrowed byte-cap window can hide that prior sighting and turn a
+  // return into a fabricated first-seen claim, so narrowing reuses the existing cold-start/re-arm
+  // path until S3's certified horizon/first-last-seen design is available.
+  const historyTrust = factHistoryTrustworthy(readResult, {
+    anchorTs: persistedState.cold_start_since_ts,
+    nowMs,
+    requireFullCoverage: true,
+  });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
   // previously computed only after `appearances`, purely to gate the store WRITE) and added as a

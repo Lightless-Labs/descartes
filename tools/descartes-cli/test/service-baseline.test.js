@@ -132,7 +132,7 @@ function establishedTicks(entityKeys, count = DEFAULT_SERVICE_ESTABLISHED_MIN_CE
 // peer-baseline.test.js's own intactReadResult/degradedReadResult exactly -- injected via
 // options.readFactPoints so the dedicated cold-start tests below don't need to fabricate real
 // ledger corruption/eviction.
-function intactReadResult(points, completeness = { status: "intact" }) {
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return {
     points,
     corrupt_count: 0,
@@ -1313,6 +1313,33 @@ test("computeServiceAppearanceCandidates: degraded/untrustworthy retained histor
   assert.deepEqual(result.candidates, []);
   const state = (await loadServiceAppearanceBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
+});
+
+test("computeServiceAppearanceCandidates: narrowed history re-arms before evaluating a service that predates the evicted prefix", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // `old` was present at t0, absent at t1..t3, and returned at t4. The narrowed read omits only
+  // t0, exactly the byte-cap reproduction: without a full-coverage gate, t4 looks first-seen.
+  const retainedPoints = flatten([
+    completeTick(tickTs(1), []),
+    completeTick(tickTs(2), []),
+    completeTick(tickTs(3), []),
+    completeTick(tickTs(4), ["old"]),
+  ]);
+  const result = await computeServiceAppearanceCandidates(paths, {
+    now: tickTs(4),
+    minHistoryTickCount: 1,
+    establishedMinCensusCount: 3,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }),
+  });
+
+  assert.deepEqual(result.candidates, [], "a narrowed retained window must not fabricate service.appeared");
+  const state = (await loadServiceAppearanceBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, true, "narrowed coverage must re-arm the established state");
+  assert.equal(state.cold_start_since_ts, tickTs(4));
 });
 
 test("computeServiceAppearanceCandidates recovery coverage (GENUINE clear): a still-firing appearance and an established, no-longer-novel service are BOTH reported in evaluatedAlertKeys; the emitted candidate's id is one of them", async () => {

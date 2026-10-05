@@ -2,11 +2,10 @@
 // real per-tick volume, on the real daemon path (runDaemonIteration -> real translators -> real
 // fact store at its 5 MB default -> real detectors -> computeCoveredAlerts).
 //
-// On HEAD 134e811 every structural tick past ~28 byte-evicts, byte-cap eviction is a loss channel,
-// so (Leg A) the daemon's history read stays `degraded` for 31 days and (Leg B) every detector's
-// cold-start anchor re-arms each hour: the watch tier never evaluates. This test asserts the
-// absence of that lockout, so it is RED on HEAD and turns green once R0b (S2) reclassifies
-// byte-cap eviction as coverage narrowing.
+// The daemon's own history read remains usable when byte-cap eviction narrows coverage, while
+// novelty-only producers fail closed until a full-history read is available. This test keeps the
+// routine-volume lockout contract explicit: ordinary baseline evaluation continues, but the three
+// novelty paths re-arm exactly as they did before byte-cap coverage was reported separately.
 //
 // Scope: Leg A/B/C only. The count rules (session.count_drop, peer.count_*) cannot reach
 // MIN_SAMPLE_COUNT=30 in a 5 MB shared store at this volume (Leg D); that is T2's job once the
@@ -127,21 +126,26 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
     if (tick.status !== "intact") problems.push(`Leg A: tick ${tick.index} daemon fact-history read is ${tick.status}`);
     if (tick.fastStatus !== undefined && tick.fastStatus !== "intact") problems.push(`Leg A: tick ${tick.index}+30m fast-tick history read is ${tick.fastStatus}`);
   }
-  // Leg B: no detector's cold-start anchor re-arms hourly; each family is established well before
-  // eviction starts and stays established through it.
+  // Leg B: the ordinary service baseline remains established. The three novelty paths are gated
+  // on full coverage, so their stores re-arm on every narrowed structural read.
   const last = ticks[ticks.length - 1];
-  for (const [family, anchor] of Object.entries(last.anchors)) {
-    if (anchor.pending !== false) problems.push(`Leg B: ${family} detector still cold-start pending at tick ${last.index} (anchor ${anchor.since})`);
+  if (last.anchors.service.pending !== false) problems.push(`Leg B: service baseline unexpectedly cold-start pending at tick ${last.index} (anchor ${last.anchors.service.since})`);
+  for (const family of ["lineage", "persistence"]) {
+    const anchor = last.anchors[family];
+    if (anchor.pending !== true) problems.push(`Leg B: ${family} novelty detector did not re-arm at tick ${last.index}`);
   }
   for (const tick of afterEviction) {
     for (const [family, anchor] of Object.entries(tick.anchors)) {
-      if (anchor.since === tick.ts) problems.push(`Leg B: ${family} cold-start anchor re-armed to tick ${tick.index} after a byte-cap eviction`);
+      const novelty = family === "lineage" || family === "persistence";
+      if (!novelty && anchor.since === tick.ts) problems.push(`Leg B: ${family} baseline anchor re-armed to tick ${tick.index} after a byte-cap eviction`);
     }
   }
-  // Leg C: the converted watch-tier producers keep reporting coverage while eviction continues.
+  // Leg C: the ordinary baseline keeps evaluating; novelty producers deliberately emit no
+  // evaluated keys because the narrowed window cannot prove first-seen history.
   for (const tick of afterEviction) {
-    for (const label of ["service", "service-appearance", "process-lineage", "scheduled-job"]) {
-      if (!((tick.coverage[label] ?? 0) > 0)) problems.push(`Leg C: tick ${tick.index} ${label} reported no evaluated alert keys`);
+    if (!((tick.coverage.service ?? 0) > 0)) problems.push(`Leg C: tick ${tick.index} service baseline reported no evaluated alert keys`);
+    for (const label of ["service-appearance", "process-lineage", "scheduled-job"]) {
+      if ((tick.coverage[label] ?? 0) !== 0) problems.push(`Leg C: tick ${tick.index} ${label} evaluated narrowed novelty history`);
     }
   }
   assert.deepEqual(problems, [], `watch-tier lockout under routine byte-cap eviction:\n${problems.join("\n")}`);

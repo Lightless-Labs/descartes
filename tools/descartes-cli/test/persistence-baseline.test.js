@@ -90,7 +90,7 @@ function flatten(ticks) {
   return ticks.flat();
 }
 
-function intactReadResult(points, completeness = { status: "intact" }) {
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return { points, corrupt_count: 0, schema_invalid_count: 0, completeness };
 }
 
@@ -422,6 +422,32 @@ test("computeScheduledJobBaselineCandidates: degraded/untrustworthy retained his
   assert.deepEqual(result.evaluatedAlertKeys, [], "untrustworthy history is cold-start — no coverage reported");
   const state = (await loadPersistenceBaselineStore(paths)).state;
   assert.equal(state.cold_start_pending, true);
+});
+
+test("computeScheduledJobBaselineCandidates: narrowed history re-arms before evaluating a job that predates the evicted prefix", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+
+  // The job existed at t0, was absent at t1..t3, and returned at t4. Removing only t0 must not
+  // turn the return into a scheduled_job.appeared candidate.
+  const retainedPoints = flatten([
+    completeTick(tickTs(1), []),
+    completeTick(tickTs(2), []),
+    completeTick(tickTs(3), []),
+    completeTick(tickTs(4), [KEY_TIMER]),
+  ]);
+  const result = await computeScheduledJobBaselineCandidates(paths, {
+    now: tickTs(4),
+    minHistoryTickCount: 3,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }),
+  });
+
+  assert.deepEqual(result.candidates, [], "a narrowed retained window must not fabricate scheduled_job.appeared");
+  const state = (await loadPersistenceBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, true, "narrowed coverage must re-arm the established state");
+  assert.equal(state.cold_start_since_ts, tickTs(4));
 });
 
 test("computeScheduledJobBaselineCandidates: a corrupt baseline store forces a PERSISTENT cold-start -- corrupt tick then the self-healed tick right after both stay at zero (not 0-then-1); a second genuinely-new complete tick since the reset re-establishes, and the detector fires normally afterward (positive control)", async () => {
