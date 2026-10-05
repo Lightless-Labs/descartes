@@ -352,7 +352,7 @@ test("hashExecutablePath produces a fixed-length hex digest and never echoes the
 test("listListeningSocketsWithPid('darwin', ...) parses a fixed lsof fixture into pid-attributed sockets", async () => {
   const lsofFixture = "COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n"
     + "node     1234 me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:3000 (LISTEN)\n"
-    + "launchd   431 root   10u  IPv6 0xdef              0t0  TCP 127.0.0.1:5000 (LISTEN)\n";
+    + "launchd   431 root   10u  IPv6 0xdef              0t0  TCP [::]:5000 (LISTEN)\n";
   const sockets = await listListeningSocketsWithPid("darwin", {
     runFixedExecFile: async (command, args) => {
       assert.equal(command, "lsof");
@@ -363,7 +363,7 @@ test("listListeningSocketsWithPid('darwin', ...) parses a fixed lsof fixture int
   });
   assert.deepEqual(sockets, [
     { protocol: "tcp", local_address: "0.0.0.0", local_port: 3000, pid: 1234 },
-    { protocol: "tcp", local_address: "127.0.0.1", local_port: 5000, pid: 431 },
+    { protocol: "tcp6", local_address: "[::]", local_port: 5000, pid: 431 },
   ]);
 });
 

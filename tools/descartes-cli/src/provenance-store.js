@@ -80,7 +80,7 @@ function normalizePortTargetKey(value) {
   const separator = text.indexOf(".");
   if (separator < 1) return text;
   const protocol = text.slice(0, separator).toLowerCase();
-  const normalizedProtocol = protocol === "tcp6" ? "tcp" : protocol === "udp6" ? "udp" : protocol;
+  const normalizedProtocol = protocol === "tcp4" ? "tcp" : protocol === "udp4" ? "udp" : protocol;
   return `${normalizedProtocol}${text.slice(separator)}`;
 }
 

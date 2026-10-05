@@ -28,7 +28,7 @@ import {
   writeSignatureStore,
 } from "../provenance-store.js";
 import { buildParentTreeResult } from "./processes.js";
-import { normalizeSocketAddress, normalizeSocketProtocol } from "./network.js";
+import { normalizeSocketAddress, normalizeSocketProtocolForFamily } from "./network.js";
 import { classifySourceFromAncestry, isPublicBindAddress, resolveExecutableInfo } from "./provenance.js";
 import { listListeningSocketsWithPidStatus, snapshotProvenanceProcessesStatus } from "./provenance-warnings.js";
 
@@ -256,7 +256,7 @@ export async function collectIdentityObservations(options = {}) {
       ...new Set(
         pidSockets
           .filter((socket) => isPublicBindAddress(normalizeSocketAddress(socket.local_address)))
-          .map((socket) => `${normalizeSocketProtocol(socket.protocol)}.${socket.local_port}`),
+          .map((socket) => `${normalizeSocketProtocolForFamily(socket.protocol, socket.address_family ?? socket.local_address)}.${socket.local_port}`),
       ),
     ];
 

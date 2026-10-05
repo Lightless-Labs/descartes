@@ -45,13 +45,13 @@ test("parseProcNetLine recognizes the all-zero IPv4 and IPv6 public-bind literal
   const v6 = " 2: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 54322 1 0000000000000000 100 0 0 10 0";
   const parsedV6 = parseProcNetLine(v6, { protocol: "tcp6" });
   assert.equal(parsedV6.local_address, "[::]");
-  assert.equal(parsedV6.protocol, "tcp", "tcp6 and tcp share one transport fingerprint");
+  assert.equal(parsedV6.protocol, "tcp6", "the proc source identifies the IPv6 transport family");
 });
 
-test("parseProcNetLine normalizes udp6 to udp while preserving the IPv6 wildcard", () => {
+test("parseProcNetLine preserves udp6 while preserving the IPv6 wildcard", () => {
   const v6 = " 2: 00000000000000000000000000000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 54323 1 0000000000000000 100 0 0 10 0";
   const parsed = parseProcNetLine(v6, { protocol: "udp6" });
-  assert.equal(parsed.protocol, "udp");
+  assert.equal(parsed.protocol, "udp6");
   assert.equal(parsed.local_address, "[::]");
   assert.equal(parsed.local_port, 5353);
 });

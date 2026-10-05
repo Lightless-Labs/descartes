@@ -60,12 +60,13 @@ test("DNS resolver parsers deduplicate and bound resolver addresses", () => {
   ]);
 });
 
-test("parseLinuxListeningSockets parses ss listener rows", () => {
-  const sockets = parseLinuxListeningSockets(`tcp LISTEN 0 4096 127.0.0.1:5432 0.0.0.0:*\nudp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*\ntcp LISTEN 0 128 [::]:22 [::]:*\n`, { limit: 2 });
+test("parseLinuxListeningSockets parses ss listener rows with address families", () => {
+  const sockets = parseLinuxListeningSockets(`tcp LISTEN 0 4096 127.0.0.1:5432 0.0.0.0:*\nudp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*\ntcp LISTEN 0 128 [::]:22 [::]:*\n`, { limit: 3 });
 
   assert.deepEqual(sockets, [
     { protocol: "tcp", state: "LISTEN", local_address: "127.0.0.1", local_port: 5432, raw: "tcp LISTEN 0 4096 127.0.0.1:5432 0.0.0.0:*" },
     { protocol: "udp", state: "UNCONN", local_address: "0.0.0.0", local_port: 5353, raw: "udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*" },
+    { protocol: "tcp6", state: "LISTEN", local_address: "[::]", local_port: 22, raw: "tcp LISTEN 0 128 [::]:22 [::]:*" },
   ]);
 });
 
@@ -74,7 +75,7 @@ test("parseMacLsofListeningSockets parses bounded lsof listener rows", () => {
 
   assert.deepEqual(sockets, [
     { protocol: "tcp", state: "LISTEN", command: "node", pid: 1234, local_address: "127.0.0.1", local_port: 3000 },
-    { protocol: "tcp", state: "LISTEN", command: "Control", pid: 431, local_address: "*", local_port: 5000 },
+    { protocol: "tcp6", state: "LISTEN", command: "Control", pid: 431, local_address: "*", local_port: 5000 },
   ]);
 });
 
@@ -85,6 +86,6 @@ mdns     4321 me     24u  IPv6 0xdef              0t0  UDP *:*
 `, { limit: 10 });
 
   assert.deepEqual(sockets, [
-    { protocol: "tcp", state: "LISTEN", command: "node", pid: 1234, local_address: "[::]", local_port: 3000 },
+    { protocol: "tcp6", state: "LISTEN", command: "node", pid: 1234, local_address: "[::]", local_port: 3000 },
   ]);
 });

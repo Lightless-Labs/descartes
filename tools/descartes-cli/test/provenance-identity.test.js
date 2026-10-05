@@ -10,6 +10,7 @@ import {
   UNKNOWN_IDENTITY_RULE_ID,
   computeExecutableStatFingerprint,
   computeIdentitySignature,
+  deriveIdentityCandidates,
   loadSignatureStore,
   newPublicBindFingerprint,
   reconcileSignatures,
@@ -126,7 +127,62 @@ test("gatherIdentityObservations treats macOS :: as public and normalizes tcp6/u
     ],
   }));
   assert.equal(observations.length, 1);
-  assert.deepEqual(observations[0].portTargetKeys.sort(), ["tcp.8080", "udp.5353"]);
+  assert.deepEqual(observations[0].portTargetKeys.sort(), ["tcp6.8080", "udp6.5353"]);
+});
+
+test("collectIdentityObservations spells the same IPv4/IPv6 sockets identically on macOS and Linux", async () => {
+  const processes = [{ pid: 100, ppid: 1, uid: OWN_UID, command: "svc" }];
+  const collect = (platform, socket) => collectIdentityObservations({
+    platform,
+    ownUid: OWN_UID,
+    listListeningSocketsWithPidStatus: async () => ({ status: "ok", sockets: [socket], reasons: [] }),
+    snapshotProvenanceProcessesStatus: async () => ({ status: "ok", processes, reasons: [] }),
+    resolveExecutableInfo: async () => ({ executable_path: "/opt/svc/bin" }),
+  });
+
+  const macIpv4 = await collect("darwin", { protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 100 });
+  const linuxIpv4 = await collect("linux", { protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 100 });
+  const macIpv6 = await collect("darwin", { protocol: "tcp", local_address: "[::]", local_port: 8080, pid: 100 });
+  const linuxIpv6 = await collect("linux", { protocol: "tcp6", local_address: "[::]", local_port: 8080, pid: 100 });
+
+  assert.deepEqual(macIpv4.observations[0].portTargetKeys, ["tcp.8080"]);
+  assert.deepEqual(linuxIpv4.observations[0].portTargetKeys, ["tcp.8080"]);
+  assert.deepEqual(macIpv6.observations[0].portTargetKeys, ["tcp6.8080"]);
+  assert.deepEqual(linuxIpv6.observations[0].portTargetKeys, ["tcp6.8080"]);
+});
+
+test("dual-stack owners on one port produce no identity drift and distinct public-bind identities", () => {
+  const now = "2026-07-10T01:00:00.000Z";
+  const store = {
+    version: 1,
+    bootstrapped_at: now,
+    signatures: {
+      ipv4: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: now,
+        inputs_hash: { executable_path_hash: "exe-v4", source_classification: "shell", owning_user_hash: "user-v4" },
+        current_port_target_keys: ["tcp.8080"],
+        port_target_keys: ["tcp.8080"],
+      },
+      ipv6: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: now,
+        inputs_hash: { executable_path_hash: "exe-v6", source_classification: "shell", owning_user_hash: "user-v6" },
+        current_port_target_keys: ["tcp6.8080"],
+        port_target_keys: ["tcp6.8080"],
+      },
+    },
+  };
+
+  const candidates = deriveIdentityCandidates(store, { now });
+  const drift = candidates.filter((candidate) => candidate.rule_id === "provenance.process.identity_drift");
+  const binds = candidates.filter((candidate) => candidate.rule_id === "provenance.port.new_public_bind");
+
+  assert.deepEqual(drift, []);
+  assert.equal(binds.length, 2);
+  assert.deepEqual(new Set(binds.map((candidate) => candidate.fingerprint)), new Set(["port.tcp.8080", "port.tcp6.8080"]));
 });
 
 test("gatherIdentityObservations: DEGRADE-NOT-FABRICATE -- a stat failure (ENOENT/permission/race) leaves identityHash undefined, never a fabricated value, and never throws", async () => {

@@ -127,9 +127,9 @@ test("computeIdentitySignature changes when exactly one input (source_classifica
   assert.notEqual(base, differentSource);
 });
 
-test("public-bind and drift fingerprints normalize IPv4/IPv6 transport protocol suffixes", () => {
-  assert.equal(newPublicBindFingerprint("tcp6.8080"), newPublicBindFingerprint("tcp.8080"));
-  assert.equal(identityDriftFingerprint("port.udp6.5353"), identityDriftFingerprint("port.udp.5353"));
+test("public-bind and drift fingerprints preserve IPv4/IPv6 transport families", () => {
+  assert.notEqual(newPublicBindFingerprint("tcp6.8080"), newPublicBindFingerprint("tcp.8080"));
+  assert.notEqual(identityDriftFingerprint("port.udp6.5353"), identityDriftFingerprint("port.udp.5353"));
 });
 
 // ---------------------------------------------------------------------------------------------

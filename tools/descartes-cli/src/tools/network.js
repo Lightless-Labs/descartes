@@ -51,9 +51,27 @@ function uniqueBy(items, keyFn) {
 
 export function normalizeSocketProtocol(protocol) {
   const value = String(protocol ?? "").toLowerCase();
-  if (value === "tcp6") return "tcp";
-  if (value === "udp6") return "udp";
+  if (value === "tcp4") return "tcp";
+  if (value === "udp4") return "udp";
   return value;
+}
+
+// Keep the transport family when the source exposes it explicitly (Linux /proc/net/tcp6 or
+// lsof's IPv6 TYPE column), and infer it from the canonical bracketed address when that is all a
+// source provides (for example, an `ss` row). IPv4 keeps the legacy `tcp`/`udp` spelling so
+// persisted provenance target keys remain stable.
+export function normalizeSocketProtocolForFamily(protocol, familyOrAddress) {
+  const normalized = normalizeSocketProtocol(protocol);
+  const base = normalized.replace(/6$/, "");
+  if (base !== "tcp" && base !== "udp") return normalized;
+  const hint = String(familyOrAddress ?? "").toLowerCase();
+  const ipv6 = normalized.endsWith("6")
+    || hint === "ipv6"
+    || hint === "6"
+    || hint.includes("inet6")
+    || hint.startsWith("[")
+    || hint === "::";
+  return `${base}${ipv6 ? "6" : ""}`;
 }
 
 export function normalizeSocketAddress(address) {
@@ -145,7 +163,7 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
     if (parts.length < 5) return undefined;
     const local = parseAddressPort(parts[4]);
     return {
-      protocol: normalizeSocketProtocol(parts[0]),
+      protocol: normalizeSocketProtocolForFamily(parts[0], local.address),
       state: parts[1],
       local_address: local.address,
       local_port: local.port,
@@ -159,6 +177,7 @@ export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}
   let rejected = 0;
   for (const line of String(stdout ?? "").split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
     const match = line.match(/^(\S+)\s+(\d+)\s+\S+.*\s+(TCP|UDP)\s+(.+?)(?:\s+\(LISTEN\))?$/);
+    const family = line.match(/\s(IPv[46])\s/)?.[1];
     const protocol = normalizeSocketProtocol(match?.[3]);
     const isTcp = protocol === "tcp";
     if (!match || (isTcp && !/\(LISTEN\)$/.test(line))) {
@@ -178,8 +197,9 @@ export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}
       rejected += 1;
       continue;
     }
+    const familyProtocol = normalizeSocketProtocolForFamily(protocol, family ?? local.address);
     entries.push({
-      protocol,
+      protocol: familyProtocol,
       state: isTcp ? "LISTEN" : "UNCONN",
       command: match[1],
       pid: Number(match[2]),
