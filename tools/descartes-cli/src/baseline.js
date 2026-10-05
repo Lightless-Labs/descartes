@@ -169,6 +169,9 @@ function peerEntities(points, groups) {
   return [...new Set(points
     .filter((point) => point?.fact_name === "peer.presence" && completeTimestamps.has(point.ts))
     .filter((point) => !String(point.entity_key).includes("census-marker") && !String(point.entity_key).includes("overflow-marker"))
+    // R8: tailscale peers are not part of the peer-count baseline (groupPeerFactsByTick excludes
+    // them), so they must not be listed as established for it either.
+    .filter((point) => point.attributes?.source_type !== "tailscale")
     .map((point) => point.entity_key))].sort();
 }
 

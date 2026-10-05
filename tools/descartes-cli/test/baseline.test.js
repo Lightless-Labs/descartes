@@ -105,6 +105,22 @@ test("baseline inspect is live, supports a domain filter, and exposes the recomp
   assert.deepEqual(JSON.parse(json.values[0]).domains[0].established, ["service.example"]);
 });
 
+test("baseline inspect (R8): tailscale peers are not listed as established for the peer-count baseline that excludes them", async () => {
+  const paths = await tempPaths();
+  const points = [];
+  for (let index = 0; index < 31; index += 1) {
+    const ts = new Date(Date.parse("2026-09-26T00:00:00.000Z") + index * 3600000).toISOString();
+    points.push(
+      { ts, fact_name: "peer.presence", entity_key: "peer.ssh.aaaaaaaaaaaaaaaa", attributes: { source_type: "ssh", presence_state: "observed_active" } },
+      { ts, fact_name: "peer.presence", entity_key: "peer.tailscale.bbbbbbbbbbbbbbbb", attributes: { source_type: "tailscale", presence_state: "observed_active" } },
+      { ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } },
+    );
+  }
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const result = await buildBaselineInspect(paths, { now: "2026-09-27T07:00:00.000Z", readFactPoints, domain: "peer" });
+  assert.deepEqual(result.domains[0].established, ["peer.ssh.aaaaaaaaaaaaaaaa"]);
+});
+
 test("baseline enable and disable write only watch.json", async () => {
   const paths = await tempPaths();
   await writeWatchConfig(paths, { enabled: true, fact_store_max_bytes: 2048 }, { now: "2026-09-27T11:00:00.000Z" });

@@ -264,15 +264,39 @@ test("groupPeerFactsByTick: orders tick-groups ascending by ts regardless of inp
   assert.deepEqual(groups.map((g) => g.ts), [tickTs(0), tickTs(1), tickTs(2)]);
 });
 
-test("groupPeerFactsByTick: VPN and Tailscale peer points sharing one tick sum into one combined count", () => {
+test("groupPeerFactsByTick (R8): Tailscale peer points sharing a tick with VPN peers are EXCLUDED from the peer count -- the vpn-peer-status availability signature does not cover tailscale-status, so its peers cannot be part of a regime-keyed count", () => {
   const ts = tickTs(0);
   const groups = groupPeerFactsByTick([
     ...activeTickWithMarker(ts, 2),
     ...tailscalePoints(ts, [tailscalePeer(1), tailscalePeer(2)]),
   ]);
   assert.equal(groups.length, 1);
-  assert.equal(groups[0].count, 4);
+  assert.equal(groups[0].count, 2, "only the 2 vpn-peer-status peers count; the 2 tailscale peers are excluded");
   assert.equal(groups[0].availabilitySignature, DEFAULT_SIGNATURE);
+});
+
+test("R8 (calibration review): tailscale-status going 'unable' (no points, no marker) under an UNCHANGED vpn-peer availability signature must NOT fabricate a peer.count_drop", async () => {
+  const paths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    ticks.push(...activeTickWithMarker(tickTs(i), 3));
+    ticks.push(...tailscalePoints(tickTs(i), [tailscalePeer(`${i}-a`), tailscalePeer(`${i}-b`), tailscalePeer(`${i}-c`), tailscalePeer(`${i}-d`)]));
+  }
+  // tailscale-status reports "unable": its translator emits NOTHING (no peers, no marker), while
+  // vpn-peer-status keeps reporting the identical availability signature and the same 3 peers.
+  const unableTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  ticks.push(...activeTickWithMarker(unableTs, 3));
+  assert.deepEqual(factPointsFromTailscaleStatusEvidence([{ id: "tailscale-status", status: "unable", result: {} }], { ts: unableTs }), []);
+
+  const { candidates } = await seedAndCompute(paths, ticks);
+  assert.deepEqual(
+    candidates.filter((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID),
+    [],
+    "a collector outage that the regime signature does not record is not a peer-count drop",
+  );
+  const drop = computeWindowedPeerDropStats(groupPeerFactsByTick(ticks));
+  assert.equal(drop.last_observation.count, 3);
+  assert.equal(drop.last_observation.mean_before, 3, "history must exclude tailscale too -- no step, no relearn");
 });
 
 test("Tailscale-only markerless ticks stay provisional for drop detection while spike detection establishes", () => {

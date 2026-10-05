@@ -335,7 +335,9 @@ export async function writePeerBaselineStore(descartesPaths, state) {
  *   - `count` is the number of NON-overflow, non-marker peer.presence points in this tick-group
  *     whose attributes.presence_state is NOT "observed_historical" — i.e. every point that is
  *     "observed_active" OR carries an unrecognized/missing presence_state (matching
- *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)).
+ *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)) — and
+ *     whose attributes.source_type is NOT "tailscale" (R8: tailscale-status is outside the
+ *     availability signature, so its peers are never counted).
  *   - `hasOverflow` is true iff this tick-group carries the PEER_OVERFLOW_ENTITY_KEY marker.
  *   - `availabilitySignature` (Slice 4c) is the string carried by this tick-group's
  *     PEER_CENSUS_MARKER_ENTITY_KEY point's `attributes.availability_signature`, or `undefined`
@@ -398,6 +400,15 @@ export function groupPeerFactsByTick(points = []) {
       group.censusMarkerSeen = true;
       continue;
     }
+    // R8 (2026-10 calibration review): Tailscale peers are EXCLUDED from the count, in history and
+    // in the scored tick alike. tailscale-status emits no census marker and is not one of the five
+    // sources in vpn-peer-status's availability signature, so when it goes "unable" its translator
+    // emits nothing at all -- the summed count would step down while the regime key stayed
+    // identical, fabricating a peer.count_drop (and its recovery would fabricate a spike). A count
+    // the regime signature cannot vouch for must not be counted. The point still creates/joins its
+    // tick-group above (a tailscale-only tick stays a real zero-count group, unchanged), it just
+    // never adds to `count`.
+    if (point.attributes?.source_type === "tailscale") continue;
     if (point.attributes?.presence_state !== "observed_historical") {
       group.count += 1;
     }
