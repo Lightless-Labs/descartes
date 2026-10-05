@@ -638,6 +638,27 @@ test("session.churn non-fire (A3): an older observation K+1 complete ticks back 
   }
 });
 
+test("session.churn (A3): a multi-day host outage is wall-clock stale even when only two ticks fit the tick lookback", () => {
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [
+    sessionPoint(tickTs(0), entityKey, "1111111111111111"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(72), entityKey, "2222222222222222"), censusMarkerPoint(tickTs(72), "complete"),
+  ];
+  assert.deepEqual(detectSessionChurn(points, { structuralIntervalMs: HOUR_MS }), []);
+});
+
+test("session.churn (A3): a sleep/wake gap within the structural wall-clock bound still fires", () => {
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [
+    sessionPoint(tickTs(0), entityKey, "1111111111111111"), censusMarkerPoint(tickTs(0), "complete"),
+    sessionPoint(tickTs(3), entityKey, "2222222222222222"), censusMarkerPoint(tickTs(3), "complete"),
+  ];
+  assert.deepEqual(
+    detectSessionChurn(points, { structuralIntervalMs: HOUR_MS }),
+    [{ entity_key: entityKey, prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" }],
+  );
+});
+
 test("session.churn non-fire: pre-existing-history-at-first-run (upgrade-day storm guard, must-fix 4) — weeks of already-differing MARKERLESS fingerprints emit ZERO churn on the first post-deploy call", () => {
   const legacyPoints = [
     sessionPoint(tickTs(0), "session.tmux.aaaaaaaaaaaaaaaa", "fp-reboot-old"), // no census marker: pre-Slice-4-addendum history

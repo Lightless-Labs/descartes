@@ -458,6 +458,7 @@ const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16
 // bound is UNEVALUABLE (no fresh pair): not a churn entry and not reported as evaluated, so any
 // persisted churn alert for it freezes rather than falsely recovering.
 export const DEFAULT_SESSION_CHURN_LOOKBACK_TICKS = 3;
+export const DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * Must-fix 4 (recency bound, hard requirement): for each entity_key with two or more
@@ -505,18 +506,31 @@ export const DEFAULT_SESSION_CHURN_LOOKBACK_TICKS = 3;
  *     neither "unknown", is RECENCY-FRESH (its newest observation is in the latest complete
  *     tick-group), carries a CONFORMING (in-contract) hashed entity_key, and whose chosen earlier
  *     observation lies within the A3 lookback bound (DEFAULT_SESSION_CHURN_LOOKBACK_TICKS complete
- *     ticks before the latest). Entities skipped as
+ *     ticks before the latest) AND the corresponding wall-clock bound ((K+1) structural intervals).
+ *     Entities skipped as
  *     <2-obs / same-tick-ambiguous / missing-or-unknown-fingerprint (per §8.C's named skip
  *     reasons), and additionally as STALE or OUT-OF-CONTRACT (per the recovery-coverage contract's
  *     "excluding entities it skipped as ... stale / unevaluable"), are NOT reported — so the daemon
  *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
  */
-function evaluateSessionChurn(points = [], { lookbackTicks = DEFAULT_SESSION_CHURN_LOOKBACK_TICKS } = {}) {
+export function evaluateSessionChurn(points = [], {
+  lookbackTicks = DEFAULT_SESSION_CHURN_LOOKBACK_TICKS,
+  structuralIntervalMs = DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS,
+  activeFreshnessMs,
+  maxObservationAgeMs,
+} = {}) {
   const groups = groupSessionFactsByTick(points);
   const completeGroups = groups.filter((group) => group.censusState === "complete");
   if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [] };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
+  const resolvedStructuralIntervalMs = Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
+    ? structuralIntervalMs
+    : Number.isFinite(activeFreshnessMs) && activeFreshnessMs > 0
+      ? activeFreshnessMs / 3
+      : DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS;
+  const resolvedMaxObservationAgeMs = maxObservationAgeMs
+    ?? (lookbackTicks + 1) * resolvedStructuralIntervalMs;
   // A3 lookback bound: the earliest instant an OLDER observation may carry -- the ts of the K-th
   // complete tick-group before the latest (or the earliest complete tick-group when fewer exist).
   // Compared by parsed instant, like every other ts comparison in this function.
@@ -610,6 +624,7 @@ function evaluateSessionChurn(points = [], { lookbackTicks = DEFAULT_SESSION_CHU
     if (newerMs !== latestCompleteMs) continue; // must-fix 4 recency bound (K=1) -- STALE pair, unevaluable
     if (!SESSION_CHURN_ENTITY_KEY_PATTERN.test(entityKey)) continue; // F7: nonconforming entity_key shape -- unevaluable, never republished
     if (!(olderMs >= lookbackBoundMs)) continue; // A3 lookback bound -- prior observation too old, unevaluable (freeze)
+    if (latestCompleteMs - olderMs > resolvedMaxObservationAgeMs) continue; // A3 wall-clock bound -- tick count alone cannot span a host outage
 
     // Fresh + conforming + unambiguous + both fingerprints known: a definitive verdict either way,
     // so this identity WAS genuinely evaluated (whether it churned or is clear) and is reported.
@@ -719,6 +734,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT;
   const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SESSION_FRESHNESS_FALLBACK_MS;
+  const structuralIntervalMs = options.structuralIntervalMs ?? freshnessMs / 3;
 
   // Fact-store completeness hardening (Slice 4): the FULL read result is captured (not just
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
@@ -904,7 +920,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   const churnFresh = churnCompleteGroups.length > 0
     && isFreshTs(churnCompleteGroups[churnCompleteGroups.length - 1].ts, nowMs, freshnessMs);
   const { churnEntries, evaluatedEntityKeys } = churnFresh
-    ? evaluateSessionChurn(currentPoints)
+    ? evaluateSessionChurn(currentPoints, { structuralIntervalMs, activeFreshnessMs: freshnessMs })
     : { churnEntries: [], evaluatedEntityKeys: [] };
   candidates.push(...buildChurnCandidates(churnEntries));
   for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));

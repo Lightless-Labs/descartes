@@ -4562,7 +4562,7 @@ test("A2 wiring: the session and peer baseline producers receive the SAME active
   const now = S_LIVE_1_TICK_TS;
   const seen = {};
   const spy = (label) => async (_paths, options) => {
-    seen[label] = options.activeFreshnessMs;
+    seen[label] = { activeFreshnessMs: options.activeFreshnessMs, structuralIntervalMs: options.structuralIntervalMs };
     return { candidates: [], evaluatedAlertKeys: [] };
   };
   await runDaemonIteration(paths, {
@@ -4574,9 +4574,10 @@ test("A2 wiring: the session and peer baseline producers receive the SAME active
     computePeerBaselineCandidates: spy("peer"),
     computeServiceBaselineCandidates: spy("service"),
   });
-  assert.equal(seen.service, 3 * DEFAULT_STRUCTURAL_INTERVAL_MS, "sanity: the sibling producer's freshness horizon");
-  assert.equal(seen.session, seen.service, "session-baseline must be freshness-gated like its siblings");
-  assert.equal(seen.peer, seen.service, "peer-baseline must be freshness-gated like its siblings");
+  assert.equal(seen.service.activeFreshnessMs, 3 * DEFAULT_STRUCTURAL_INTERVAL_MS, "sanity: the sibling producer's freshness horizon");
+  assert.equal(seen.session.activeFreshnessMs, seen.service.activeFreshnessMs, "session-baseline must be freshness-gated like its siblings");
+  assert.equal(seen.peer.activeFreshnessMs, seen.service.activeFreshnessMs, "peer-baseline must be freshness-gated like its siblings");
+  assert.equal(seen.session.structuralIntervalMs, DEFAULT_STRUCTURAL_INTERVAL_MS, "session churn must receive the wall-clock structural interval");
 });
 
 // ---------------------------------------------------------------------------------------------
