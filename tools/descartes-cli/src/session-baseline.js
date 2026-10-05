@@ -343,7 +343,7 @@ export function groupSessionFactsByTick(points = []) {
  *     on censusState === "complete", never as an else-catch-all, so an "unknown" tick can never
  *     slip through as trusted.
  */
-function tickGroupDisposition(group) {
+export function tickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
   if (group.censusState === "complete") return "complete";
   if (group.censusState === "partial") return "partial";

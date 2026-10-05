@@ -29,6 +29,7 @@ import {
   loadSessionBaselineStore,
   SESSION_CHURN_RULE_ID,
   SESSION_COUNT_DROP_RULE_ID,
+  tickGroupDisposition as sessionTickGroupDisposition,
 } from "./session-baseline.js";
 import {
   computePeerBaselineCandidates,
@@ -39,7 +40,7 @@ import {
   loadPeerBaselineStore,
   PEER_COUNT_DROP_RULE_ID,
   PEER_COUNT_SPIKE_RULE_ID,
-  PEER_SIGNATURE_INVALID,
+  tickGroupDisposition as peerTickGroupDisposition,
 } from "./peer-baseline.js";
 import {
   computeScheduledJobBaselineCandidates,
@@ -139,9 +140,14 @@ function currentGroups(group, points, nowMs) {
   });
 }
 
+// Display only: a tick-group is "complete" by the disposition each domain's cold-start lockout counts
+// (the detectors' own functions for peer and session; censusState for the four census detectors), so
+// "still learning — n of 6" tracks the lockout's re-accumulation. For peer that is the BASE
+// overflow-vs-complete disposition: an invalid-signature tick clears the shared lockout (only
+// count_drop's stricter disposition excludes it).
 function isComplete(domain, group) {
-  if (domain === "peer") return !group.hasOverflow && group.availabilitySignature !== PEER_SIGNATURE_INVALID;
-  if (domain === "session") return group.censusState === "complete" && !group.hasOverflow;
+  if (domain === "peer") return peerTickGroupDisposition(group) === "complete";
+  if (domain === "session") return sessionTickGroupDisposition(group) === "complete";
   return group.censusState === "complete";
 }
 

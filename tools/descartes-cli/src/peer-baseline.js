@@ -389,7 +389,7 @@ export function groupPeerFactsByTick(points = []) {
  *   - "overflow": PEER_OVERFLOW_ENTITY_KEY-marked — its true count is only bucketed, never exact.
  *   - "complete": every other tick-group, including a genuine (or false, per MUST-FIX 2) zero.
  */
-function tickGroupDisposition(group) {
+export function tickGroupDisposition(group) {
   return group.hasOverflow ? "overflow" : "complete";
 }
 

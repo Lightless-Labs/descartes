@@ -25,7 +25,7 @@ import test from "node:test";
 import { buildBaselineStatus, BASELINE_STATUS_RULE_IDS } from "../src/baseline.js";
 import { runDaemonIteration } from "../src/daemon.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
-import { readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { RULE_HORIZONS } from "../src/fact-families.js";
 import { factHistoryTrustworthy, ruleEligible, validNoveltySeenSet } from "../src/fact-store-completeness.js";
 import { resolveLegacyFactStorePaths } from "../src/fact-store-migration.js";
@@ -352,6 +352,33 @@ test("Leg E regression: a domain whose lockout cleared but whose count rule is s
   assert.equal(session.rules.find((rule) => rule.rule_id === SESSION_COUNT_DROP_RULE_ID).gate, "baseline_warming_up");
   assert.equal(session.rules.find((rule) => rule.rule_id === SESSION_CHURN_RULE_ID).phase, "watching");
   assert.match(session.phase, /^partially watching — 1 of 2 rules$/);
+});
+
+test("L1: peer re-accumulation progress counts what the peer lockout counts (an invalid-signature tick is lockout-complete)", { timeout: 120_000 }, async () => {
+  const paths = await tempPaths("peer-progress");
+  const rig = scenarioRig();
+  for (let hour = 0; hour <= 2; hour += 1) await rig.structural(paths, hour);
+  // Peer ticks whose census marker carries a garbled availability signature: the peer lockout's base
+  // tickGroupDisposition (overflow-vs-complete) counts them; only count_drop's stricter disposition
+  // excludes them.
+  for (let hour = 3; hour <= 6; hour += 1) {
+    const ts = iso(BASE_MS + hour * HOUR_MS);
+    await appendFactPoints(paths, [
+      { ts, fact_name: "peer.presence", entity_key: "peer.ssh.401c192722ae6bd2", attributes: { source_type: "ssh", presence_state: "observed_active", login_hour_bucket: "00", handshake_age_bucket: "n/a", exit_node_role: "n/a" }, source_envelope_id: "vpn-peer-status", source_tool: "collect_vpn_peer_status", sensitivity: "operational" },
+      { ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "garbled" }, source_envelope_id: "vpn-peer-status", source_tool: "collect_vpn_peer_status", sensitivity: "operational", confidence: 0 },
+    ], { family: "peer", ts, now: ts });
+  }
+  const nowIso = iso(BASE_MS + 6.5 * HOUR_MS);
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, true, "precondition: the peer lockout is still persisted pending");
+  const status = await buildBaselineStatus(paths, { now: nowIso });
+  const peer = status.domains.find((domain) => domain.domain === "peer");
+  // h1..h6 are strictly after the h0 anchor: six lockout-complete ticks, so the detector clears on its
+  // next tick (deviation 5: "6 of 6" until the clear is persisted).
+  assert.equal(peer.complete_ticks, 6);
+  for (const rule of peer.rules) assert.equal(rule.phase, "still learning — 6 of 6", rule.rule_id);
+  const observed = await rig.fastTick(paths, nowIso);
+  assert.ok(observed.get("peer"), "the daemon ran the peer producer");
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false, "the detector cleared the lockout on those six ticks");
 });
 
 test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick, retention_failing and the horizon-short since from the daemon record; status never writes", async () => {
