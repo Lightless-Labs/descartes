@@ -126,7 +126,8 @@ test("baseline status on a fresh install is watch-on and reports every domain st
     "process-lineage",
   ]);
   for (const domain of result.domains) {
-    assert.equal(domain.phase, "still learning — 0 of 6");
+    // R2: session/peer show the binding 30-sample count requirement (see the dedicated R2 test).
+    assert.equal(domain.phase, domain.domain === "session" || domain.domain === "peer" ? "still learning — 0 of 30" : "still learning — 0 of 6");
     assert.equal(domain.cold_start_reason, "initial_baseline");
   }
 });
@@ -267,6 +268,49 @@ test("A1: untrustworthy history and a stale census each report their own reason,
     readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } }),
   });
   assert.match(stale.domains.find((entry) => entry.domain === "session").phase, /^stale — /);
+});
+
+test("R2: on a fresh install the count rules (session, peer) show progress toward the 30-sample count baseline, the binding requirement; the census domains keep N of 6", async () => {
+  const paths = await tempPaths();
+  const result = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z" });
+  for (const domain of result.domains) {
+    const countRule = domain.domain === "session" || domain.domain === "peer";
+    assert.equal(domain.phase, countRule ? "still learning — 0 of 30" : "still learning — 0 of 6", domain.domain);
+    assert.equal(domain.required_ticks, countRule ? 30 : 6, domain.domain);
+  }
+});
+
+test("R2: during a lockout the count rules show whichever requirement has more ticks remaining", async () => {
+  const pendingStore = (anchorHour) => ({
+    cold_start_pending: true,
+    cold_start_reason: "history_lost",
+    cold_start_since_ts: new Date(A1_BASE_MS + anchorHour * A1_HOUR_MS + 1).toISOString(),
+    last_folded_ts: a1Ts(anchorHour),
+  });
+  const statusFor = async (tickCount, anchorHour) => {
+    const paths = await tempPaths();
+    await writeSessionBaselineStore(paths, pendingStore(anchorHour));
+    await writePeerBaselineStore(paths, pendingStore(anchorHour));
+    const points = a1Points(tickCount);
+    const result = await buildBaselineStatus(paths, {
+      now: a1Ts(tickCount - 0.5),
+      readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } }),
+    });
+    return Object.fromEntries(result.domains.map((domain) => [domain.domain, domain]));
+  };
+
+  // 10 complete ticks, 3 after the anchor: lockout needs 3 more, the count baseline 20 more.
+  const countBinding = await statusFor(10, 6);
+  for (const domain of ["session", "peer"]) {
+    assert.equal(countBinding[domain].phase, "still learning — 10 of 30", domain);
+    assert.equal(countBinding[domain].required_ticks, 30, domain);
+  }
+  // 31 complete ticks (count baseline already met), 2 after the anchor: the lockout binds.
+  const lockoutBinding = await statusFor(31, 28);
+  for (const domain of ["session", "peer"]) {
+    assert.equal(lockoutBinding[domain].phase, "still learning — 2 of 6", domain);
+    assert.equal(lockoutBinding[domain].required_ticks, 6, domain);
+  }
 });
 
 test("baseline enable and disable write only watch.json", async () => {

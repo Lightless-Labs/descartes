@@ -223,6 +223,17 @@ function domainPhase({ enabled, entries, domain, groups, nowMs, readResult, fres
 
   if (coldStartPending) {
     const progress = Math.min(...pendingEntries.map(({ entry, gate }) => lockoutProgress(entry, gate, domain, groups, nowMs)));
+    // R2 (2026-10 calibration review): for the count rules (session/peer) the 30-sample count
+    // baseline can be the BINDING requirement, not the 6-tick lockout. Each new complete tick
+    // advances both, so show whichever has more ticks remaining (ties go to the lockout).
+    if (domain === "session" || domain === "peer") {
+      const readiness = readinessFor(domain, groups);
+      const countRemaining = readiness.required - readiness.progress;
+      const lockoutRemaining = Math.max(0, STATUS_TICK_COUNT - progress);
+      if (!readiness.established && countRemaining > lockoutRemaining) {
+        return { ...base, phase: `still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required };
+      }
+    }
     if (progress < STATUS_TICK_COUNT) {
       return { ...base, phase: `still learning — ${progress} of ${STATUS_TICK_COUNT}`, progress, required: STATUS_TICK_COUNT };
     }
