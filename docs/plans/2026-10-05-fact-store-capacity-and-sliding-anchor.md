@@ -563,6 +563,19 @@ The per-family stores sit in new paths. The legacy store is only quarantined (if
 7. **Census ceiling coupling.** Should raising `services` `censusCeiling` scale the service budget automatically, or keep the fixed budget and accept novelty ineligibility (status reports `history_horizon_short`)? *(Corrected premise: that ineligibility is not fail-closed. It is a novelty-absorbing window, so services first seen during it never alert; §4.2, §5 N5.)*
 8. **Network and provenance stores.** *(Corrected premise: `provenance.warning` **is** read, on every fast tick, by `tools/provenance-warnings.js:329-336`, and it drives `deleted_exe_running` and `public_bind_no_supervisor`.)* Keep writing it into its own `provenance` store (the plan's default), or stop? Stopping is an explicit **detection-removal** decision for those two rules, not a storage clean-up, and would need its own change.
 
+### Operator answers (2026-10-05)
+
+- **Q1 Budgets:** plan defaults (§4.5 as revised, so peer is about 18 MB and the total about 62 MB; still provisional until S0 measures record sizes).
+- **Q2 Novelty horizon:** the operator asked "Isn't 24 h short?". The answer given: the horizon is the *minimum* certified memory before a novelty rule may claim "new". It is not the memory length, which the budget sets. A horizon above a family's worst-case span blinds that family during volume spikes. **Proposed** (to be applied unless the operator objects):
+  - `service.appeared`: 48 h;
+  - `scheduled_job.appeared`: 48 h;
+  - `process.lineage.novel_edge`: 6 d, to cover weekly runtime edges; stays below the ~6.9 d worst case.
+
+  Each stays below its family's worst-case certified span. The horizon applies only after narrowing (the default).
+- **Q3 Migration:** fresh per-family stores. This removes M2′ and M4 (§14).
+- **Q4 Legacy store:** quarantine for 31 days, outside the facts tree, then delete.
+- **Q5–Q8:** the recommended defaults (Q5 ignore + deprecation note; Q6 defer; Q7 fixed budget + `history_horizon_short`; Q8 keep the `provenance` store).
+
 ---
 
 ## 13. Key code refs (HEAD `134e811`)
