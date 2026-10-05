@@ -2,7 +2,9 @@
 
 **Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity S4 + S5 built; daybreak G2 rework complete; awaiting G2 re-gate (2026-10-05)
+## Current continuity — fact-store capacity S4 + S5 built; daybreak G2 re-gate findings fixed; not pushed or merged (2026-10-05)
+
+The follow-up G2 re-gate is complete on the current branch. Three atomic commits fix the repeated-quarantine/unreadable-boundary HIGH-1, retention recovery HIGH-2, and future-dated quarantine MEDIUM findings. Targeted regression tests are 40/40 green. Final fresh-XDG full suite: 2213 tests, 2157 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
 
 **G2 rework (plan §20–§21):** the G2 review's two HIGH findings and interval MEDIUM are fixed; the §20 LOW dispositions remain recorded.
 - **H1** `fb63477`: quarantine epochs/timestamps now invalidate continuous-null novelty certification after later legacy evidence.

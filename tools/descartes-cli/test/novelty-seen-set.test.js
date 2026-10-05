@@ -244,6 +244,31 @@ test("G2 HIGH-1 re-gate: corrupted marker plus pending legacy data is a new disc
   assert.equal(secondUnreadable.certified_since_ts, at(4), "a later corrupt-marker observation is not already handled");
 });
 
+test("G2 MEDIUM re-gate: a future quarantine epoch is corrected at the pass time, so novelty eligibility starts from the correction", async () => {
+  const paths = await tempPaths();
+  const future = "2099-01-01T00:00:00.000Z";
+  const corrected = "2026-10-05T00:00:00.000Z";
+  const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(future, "svc-future"))}\n`);
+  await migrateLegacyFactStore(paths, { now: future });
+  await appendFactPoints(paths, serviceTick(future, ["svc-A"]), { family: "service", now: future });
+  assert.equal((await readSeenSetFile(paths, "service")).set.certified_since_ts, future);
+
+  await migrateLegacyFactStore(paths, { now: corrected });
+  const correctedMarker = JSON.parse(await fs.readFile(markerFile, "utf8"));
+  assert.equal(correctedMarker.quarantine_epoch_ts, corrected, "the future marker is stamped at the correction pass");
+  await appendFactPoints(paths, serviceTick(corrected, ["svc-A"]), { family: "service", now: corrected });
+
+  const shortNow = new Date(Date.parse(corrected) + 47 * HOUR).toISOString();
+  const eligibleNow = new Date(Date.parse(corrected) + 48 * HOUR).toISOString();
+  const shortRead = await readFactPoints(paths, { family: "service", now: shortNow, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const eligibleRead = await readFactPoints(paths, { family: "service", now: eligibleNow, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  assert.equal(shortRead.seen_sets.service.certified_since_ts, corrected);
+  assert.equal(noveltyRuleEligible(shortRead, SERVICE_APPEARED_RULE_ID, Date.parse(shortNow)), false);
+  assert.equal(noveltyRuleEligible(eligibleRead, SERVICE_APPEARED_RULE_ID, Date.parse(eligibleNow)), true, "the registered horizon starts at the corrected pass, not 2099");
+});
+
 test("fold rule: partial, unknown and markerless ticks are never folded; neither is a tick dated after the pass clock", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, [

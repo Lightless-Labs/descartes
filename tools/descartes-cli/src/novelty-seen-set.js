@@ -235,8 +235,9 @@ function quarantineBoundary({ priorSet, quarantineState, nowIso }) {
   if (!epochChanged) return { certifiedSince: priorSince, epoch: priorEpoch, epochTs: priorEpochTs };
   // A trusted quarantine event discards the old store's sightings. The boundary can only move
   // forward; it must never remain null when the set was certified before that event.
-  const boundary = currentEpochTs ?? nowIso;
-  return { certifiedSince: laterIso(priorSince, boundary) ?? nowIso, epoch: currentEpoch, epochTs: currentEpochTs ?? nowIso };
+  const boundary = currentEpochTs && Date.parse(currentEpochTs) <= Date.parse(nowIso) ? currentEpochTs : nowIso;
+  const priorSinceIsFuture = priorSince !== null && Date.parse(priorSince) > Date.parse(nowIso);
+  return { certifiedSince: priorSinceIsFuture ? nowIso : (laterIso(priorSince, boundary) ?? nowIso), epoch: currentEpoch, epochTs: boundary };
 }
 
 /**
@@ -280,7 +281,7 @@ export async function foldNoveltySeenSets(descartesPaths, {
         && prior.set.ledger_generation === nextLedger.generation
         && prior.set.ledger_pass_id === priorLedger.continuity.last_committed_pass_id,
       );
-      const quarantineState = await legacyQuarantineEpoch(descartesPaths);
+      const quarantineState = await legacyQuarantineEpoch(descartesPaths, { now: nowMs });
       let reseedSince = genuineFirstRun ? null : reseedCertifiedSince({ priorLedger, nextLedger, nowIso });
       // G2 H1: null means "complete since the lineage began", which is the host's whole history only
       // when no legacy single store ever existed. After an S5 upgrade every family store starts a new

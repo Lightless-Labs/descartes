@@ -149,8 +149,9 @@ export async function legacyFactHistoryEvidence(descartesPaths) {
  * their current pass time rather than continue a null/old certification. Root legacy items without
  * a marker are likewise conservative evidence of a migration that did not complete.
  */
-export async function legacyQuarantineEpoch(descartesPaths) {
+export async function legacyQuarantineEpoch(descartesPaths, { now } = {}) {
   const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(descartesPaths);
+  const nowMs = now !== undefined ? new Date(now).getTime() : Date.now();
   let markerResult;
   try {
     markerResult = await readMarker(markerFile);
@@ -161,6 +162,12 @@ export async function legacyQuarantineEpoch(descartesPaths) {
   const rootItems = await presentLegacyItems(factsRootDir).catch(() => null);
   if (rootItems === null) return { status: "unreadable", epoch: null, epoch_ts: null };
   if (rootItems.length > 0) return { status: "legacy_pending", epoch: null, epoch_ts: null };
+  if (Number.isFinite(nowMs) && markerResult.marker.quarantine_epoch_ts !== null
+    && Date.parse(markerResult.marker.quarantine_epoch_ts) > nowMs) {
+    // A clock correction makes the marker's future timestamp untrustworthy. Present it as a new
+    // discard episode at this pass, so the seen-set cannot remain ineligible until the old future.
+    return { status: "future", epoch: markerResult.marker.quarantine_epoch + 1, epoch_ts: new Date(nowMs).toISOString() };
+  }
   return {
     status: markerResult.present ? "valid" : "absent",
     epoch: markerResult.marker.quarantine_epoch,
@@ -201,14 +208,30 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
   let markerEpochTs = marker.quarantine_epoch_ts;
   const moved = [];
   const items = await presentLegacyItems(factsRootDir);
+  if (valid && !resumable && items.length === 0 && isIso(markerEpochTs) && Date.parse(markerEpochTs) > nowMs) {
+    // A future-dated marker is itself discarded evidence after a clock rollback. Advance the epoch
+    // and stamp the correction pass even when no legacy file remains to move.
+    markerEpoch += 1;
+    markerEpochTs = nowIso;
+    await writeMarker(markerFile, {
+      schema_version: MARKER_SCHEMA_VERSION,
+      in_progress: null,
+      quarantines,
+      quarantine_epoch: markerEpoch,
+      quarantine_epoch_ts: markerEpochTs,
+    });
+  }
   if (items.length > 0 || resumable) {
-    const eventEpoch = resumable?.quarantine_epoch ?? (marker.quarantine_epoch + 1);
+    const eventEpoch = resumable?.quarantine_epoch ?? (markerEpoch + 1);
     // A new quarantine is its own discard episode. Never inherit the previous marker timestamp:
     // doing so makes later legacy evidence indistinguishable from the first quarantine.
-    const eventTs = resumable?.quarantine_ts ?? (resumable ? resumable.started_ts : nowIso);
+    const resumableTs = resumable?.quarantine_ts ?? resumable?.started_ts;
+    const eventTs = resumableTs && Date.parse(resumableTs) <= nowMs ? resumableTs : nowIso;
     markerEpoch = eventEpoch;
     markerEpochTs = eventTs;
-    const inProgress = resumable ?? { dir: quarantineDirName(nowIso), started_ts: nowIso, quarantine_epoch: eventEpoch, quarantine_ts: eventTs };
+    const inProgress = resumable
+      ? { ...resumable, quarantine_epoch: eventEpoch, quarantine_ts: eventTs }
+      : { dir: quarantineDirName(nowIso), started_ts: nowIso, quarantine_epoch: eventEpoch, quarantine_ts: eventTs };
     status = resumable ? "resumed" : "quarantined";
     quarantineDir = inProgress.dir;
     // Record the target BEFORE anything moves (crash -> resume into the same directory).

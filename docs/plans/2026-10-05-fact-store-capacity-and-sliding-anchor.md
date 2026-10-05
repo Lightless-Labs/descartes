@@ -1089,3 +1089,13 @@ The targeted G2 regression suite is green after the three fixes (197 pass, 0 fai
 | final G2 medium commit | MEDIUM fixed; sandbox-only failures | 2210 | 2154 | 0 | 22 | 34 |
 
 The final 22 sandbox failures were 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live provenance checks (`unknown` where the host-only test expects `ok`). No G2 regression or other product test failed.
+
+### 21.5 Follow-up G2 re-gate findings (2026-10-05)
+
+The follow-up daybreak-blue re-gate reproduced all three requested gaps in the earlier §21 fixes. Each was repaired test-first in its own atomic commit; no push or merge was performed.
+
+1. **HIGH-1 — repeated quarantine and unreadable/pending episodes.** A new quarantine now always stamps its own pass time. Seen-set certification compares the epoch pair `(quarantine_epoch, quarantine_epoch_ts)` and advances to the current episode. Unreadable, corrupt, and pending migration evidence is a new discard episode on every observation, with the boundary advanced to that pass. The two-quarantine `svc-C` reproduction and the corrupt-marker/pending-data reproduction are green.
+2. **HIGH-2 — retention recovery evidence.** `daemon.fact_store.retention_failing` is no longer blanket fixed-rule recovery coverage. Active retention alerts are carried from the alert store when status is missing/unreadable, the tick is fast, or both tiers are off. Recovery is authorized only for the alert's family after a genuine successful structural retention pass. The unreadable-status, both-tiers-off, and successful-structural-pass reproductions are green.
+3. **MEDIUM — future quarantine timestamps.** A future marker is advanced and stamped at the clock-correction pass. Any seen-set boundary derived from a future epoch is clamped to that pass, so the registered novelty horizon starts at the correction rather than the future date. The 2099→2026 reproduction is green.
+
+Targeted G2 migration/seen-set tests: **40/40 pass**. Final fresh-XDG full suite: **2213 tests, 2157 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped**. The sandbox failures are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.
