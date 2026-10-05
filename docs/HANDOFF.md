@@ -2,6 +2,17 @@
 
 **Last updated:** 2026-09-26
 
+## Review-fix update — 2026-10-05
+
+On branch `fix/watch-fabrication-2026-10`, the watch-fabrication review fixes are committed
+locally and are **not pushed or merged**: `98203b9` (rule-aware baseline status and persisted
+daemon freshness), `ae86a46` (session churn wall-clock bound threaded from the daemon), `6f99887`
+(R8 peer source/overflow handling), and `bdcb9f9` (R8 tradeoff documentation). The focused
+baseline, peer-baseline, session-baseline, and daemon tests are green. Full `npm test` reports
+2073 tests / 2017 pass / 22 fail / 34 skip; all 22 failures are sandbox/live-host environment
+failures (20 loopback `listen EPERM`, 2 live-process provenance checks returning `unknown`), with
+no failures in the changed behavior.
+
 ## Current Status
 
 > **RESUME HERE (2026-09-27) — watch-by-default flip FULLY BUILT + daybreak-gated + green; ready for the operator-confirmed PUSH; NOT yet pushed.** All on local `main` (~43 unpushed commits). The default-on flip is complete end-to-end: **(1) gate split** (steps 1–3, `watch.json` default-ON / `learned.json` author-opt-in) — daybreak-confirmed sound. **(2) detector-reported recovery-coverage** (the prerequisite that made the flip safe): core daybreak-READY (3 gate rounds); the six watch-tier producers + canary + credential converted to report `evaluatedAlertKeys` and daybreak whole-slice-adjudicated-safe (the census-union coverage was adjudicated SAFE — service.disappeared/appeared/scheduled_job/lineage are edge-triggered transition notices); **correlation coverage DEFERRED safe-frozen** after 3 daybreak rounds of deepening fabrication edges (`evaluatedAlertKeys: []` → correlation alerts freeze, never fabricate; follow-up `todos/2026-09-27-correlation-recovery-coverage.md`). **(3) UX layer** (steps 4/5/7/8): first-cold-start reason label (`initial_baseline` vs `history_lost`, additive — verified no gate change), `descartes baseline status/inspect/enable/disable` CLI, migration tests, README "off by default"→"structural-watching-on / authoring-opt-in" rewrite. Suite **2012 / 0 fail / 34 skip** (independently gated; codex-sandbox loopback/live-host env failures are not real). Process: ALL security-critical work daybreak-gated (codex); UX + heavy impl delegated to codex to conserve Claude quota. **NEXT:** (a) **operator confirms the PUSH** (outward-facing — flips watch default-ON on public `main`); (b) fast-follows, NOT push-blockers: step-6 correction hook (extend cleartext diagnostics to `service.appeared`/`scheduled_job.appeared`/`process.lineage.novel_edge` for a usable "that's mine" `alerts ack` — §11 #3, an open operator decision); the correlation recovery-coverage slice; the deferred-safe provenance-warning/identity + active-constraint coverage. Plans: [`docs/plans/2026-09-10-watch-by-default-slice-1.md`](plans/2026-09-10-watch-by-default-slice-1.md), [`docs/plans/2026-09-20-detector-reported-recovery-coverage.md`](plans/2026-09-20-detector-reported-recovery-coverage.md).

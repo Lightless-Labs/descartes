@@ -302,8 +302,9 @@ slightly from the daemon's last tick. `descartes alerts watch` remains the live 
 
 `baseline status` says a domain is `watching` only when its detector would really evaluate on
 the next tick. That means the cold-start lockout has cleared, the fact history is trusted, the
-latest census is complete and fresh, and the detector's own baseline is ready. Otherwise it
-reports one of these, with the reason:
+rule-specific evidence is complete and fresh, and that rule's own baseline is ready. Overflow
+ticks are handled per rule: churn and peer spikes can still evaluate a capped tick, while the
+affected count baseline remains learning. Otherwise it reports one of these, with the reason:
 
 - `still learning — N of M`
 - `locked out — fact history untrustworthy (…)`
