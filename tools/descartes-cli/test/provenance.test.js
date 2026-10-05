@@ -6,6 +6,7 @@ import {
   buildLinuxSocketFact,
   buildMacPortSockets,
   classifySourceFromAncestry,
+  classifyOwnerAmbiguityReason,
   computeProvenanceEnvelopeFields,
   detectWarnings,
   inferMacosDeletedExe,
@@ -175,6 +176,16 @@ test("same-port socket attribution is ambiguous when inodes map to different exe
   });
 });
 
+test("classifyOwnerAmbiguityReason gives every owner uncertainty an explicit non-confident class", () => {
+  assert.equal(classifyOwnerAmbiguityReason("owner_ambiguous").status, "ambiguous");
+  assert.equal(classifyOwnerAmbiguityReason("elevated_owner_ambiguous").status, "ambiguous");
+  assert.equal(classifyOwnerAmbiguityReason("owner_identity_unavailable").status, "ambiguous");
+  assert.equal(classifyOwnerAmbiguityReason("fd_scan_truncated").status, "truncated");
+  assert.equal(classifyOwnerAmbiguityReason("fd_scan_uncertain").status, "ambiguous");
+  assert.equal(classifyOwnerAmbiguityReason("owner_identity_unavailable").owner_dependent, true);
+  assert.equal(classifyOwnerAmbiguityReason("ordinary_other_reason"), undefined);
+});
+
 test("same-executable SO_REUSEPORT holders are ambiguous, while TCP and UDP from one process agree", () => {
   assert.equal(summarizeSocketAttributions([
     { resolved: true, executablePath: "/usr/bin/node", processIdentity: { tgid: 100, start_time: "10" } },
@@ -323,6 +334,15 @@ test("detectWarnings flags a public bind with no recognized supervisor, includin
 test("detectWarnings does not flag public bind when a recognized supervisor is the classified source", () => {
   const record = { resolved: {}, source: { type: "launchd" }, ancestry: [] };
   assert.equal(detectWarnings(record, [{ local_address: "0.0.0.0", local_port: 80 }]).some((item) => item.rule_id === "public_bind_no_supervisor"), false);
+});
+
+test("detectWarnings does not derive an owner-dependent public-bind warning from ambiguous ownership", () => {
+  const record = {
+    resolved: { status: "ambiguous", reason: "owner_identity_unavailable" },
+    source: { type: "unknown", details: { reason: "owner_identity_unavailable" } },
+    ancestry: [],
+  };
+  assert.equal(detectWarnings(record, [{ local_address: "0.0.0.0", local_port: 80 }]).length, 0);
 });
 
 test("detectWarnings does not flag a non-public bind address", () => {

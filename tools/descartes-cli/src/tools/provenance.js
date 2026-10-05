@@ -195,6 +195,34 @@ export function hasPublicBindNoSupervisor(sourceType, sockets = []) {
   );
 }
 
+// Owner-dependent conclusions must remain monotonic when a scan cannot prove ownership. Keep this
+// classification in one place because both the per-socket and same-port aggregation paths receive
+// these reasons from different layers (Node fd scans and the elevated helper).
+export function classifyOwnerAmbiguityReason(reason) {
+  if (typeof reason !== "string") return undefined;
+  if (reason === "fd_scan_truncated") return { status: "truncated", review_hint: "out_of_range", owner_dependent: true };
+  if (new Set([
+    "owner_ambiguous",
+    "elevated_owner_ambiguous",
+    "owner_identity_unavailable",
+    "fd_scan_uncertain",
+    "owner_identity_changed",
+    "fd_recheck_uncertain",
+    "owner_fd_recheck_failed",
+    "owner_recheck_exhausted",
+    "procfs_pid_namespace_mismatch",
+    "process_identity_unavailable",
+    "socket_attribution_missing",
+    "socket_attribution_incomplete",
+  ]).has(reason)) {
+    return { status: "ambiguous", review_hint: "ambiguous", owner_dependent: true };
+  }
+  if (new Set(["cross_uid_or_unresolved_pid", "socket_attribution_unresolved", "missing_permission"]).has(reason)) {
+    return { status: "partial", review_hint: "missing_permission", owner_dependent: true };
+  }
+  return undefined;
+}
+
 export function detectWarnings(record = {}, sockets = []) {
   const warnings = [];
   const resolved = record.resolved ?? {};
@@ -211,7 +239,9 @@ export function detectWarnings(record = {}, sockets = []) {
     });
   }
 
-  if (hasPublicBindNoSupervisor(source.type, sockets)) {
+  const ownerClassification = classifyOwnerAmbiguityReason(resolved.reason ?? source.details?.reason);
+  const ownerFactsUncertain = ownerClassification?.owner_dependent === true && resolved.status !== "ok";
+  if (!ownerFactsUncertain && hasPublicBindNoSupervisor(source.type, sockets)) {
     warnings.push({
       rule_id: "public_bind_no_supervisor",
       message: "Socket is bound to a public address with no recognized supervising source.",
@@ -398,16 +428,18 @@ export function summarizeSocketAttributions(attributions = []) {
     }
     const identity = attribution.processIdentity;
     if (!identity || !Number.isInteger(identity.tgid) || typeof identity.start_time !== "string") {
-      return { status: "ambiguous", executablePath: undefined, reason: "owner_identity_unavailable" };
+      const classification = classifyOwnerAmbiguityReason("owner_identity_unavailable");
+      return { status: classification.status, executablePath: undefined, reason: "owner_identity_unavailable" };
     }
     identities.add(`${identity.tgid}:${identity.start_time}`);
   }
   if (reasons.length > 0) {
-    const status = reasons.some((reason) => ["owner_ambiguous", "elevated_owner_ambiguous"].includes(reason))
+    const classifications = reasons.map(classifyOwnerAmbiguityReason).filter(Boolean);
+    const status = classifications.some((classification) => classification.status === "ambiguous")
       ? "ambiguous"
-      : reasons.includes("fd_scan_truncated")
+      : classifications.some((classification) => classification.status === "truncated")
         ? "truncated"
-        : "partial";
+        : classifications.find((classification) => classification.status === "partial")?.status ?? "partial";
     return { status, executablePath: undefined, reason: reasons[0], reasons };
   }
   if (identities.size !== 1) {
@@ -640,7 +672,7 @@ function buildNotFoundResult(kind, value, probe) {
 // Every pre-existing call site omits it, so `computePrivilege()`'s byte-identical default is
 // unaffected.
 function finalizeProvenanceResult({ targetSelection, core, sockets, privilege }) {
-  const warnings = core.resolvedStatus !== "unknown" ? detectWarnings({ resolved: core.resolved, ancestry: core.ancestry, source: core.source }, sockets) : [];
+  const warnings = core.resolvedStatus === "ok" ? detectWarnings({ resolved: core.resolved, ancestry: core.ancestry, source: core.source }, sockets) : [];
   return {
     resolvedStatus: core.resolvedStatus,
     result: {
@@ -1122,9 +1154,7 @@ async function resolveByPortLinux(port, options = {}) {
 
   if (matches.length === 1 && attributions[0]?.resolved !== true && currentUid !== undefined && primary.uid === currentUid) {
     const reason = attributions[0]?.reason ?? "socket_attribution_unresolved";
-    const resolvedStatus = ["owner_ambiguous", "elevated_owner_ambiguous"].includes(reason)
-      ? "ambiguous"
-      : reason === "fd_scan_truncated" ? "truncated" : "partial";
+    const resolvedStatus = classifyOwnerAmbiguityReason(reason)?.status ?? "partial";
     const core = {
       resolvedStatus,
       resolved: {
