@@ -60,6 +60,7 @@ import {
   writeWatchConfig,
 } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
+import { legacyFactStorePendingItems } from "./fact-store-migration.js";
 
 // S6 (docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md §7 S6, §8 T11, I11): `baseline
 // status` reports, PER RULE, whether that rule WOULD EVALUATE on the current state -- and it does so by
@@ -368,6 +369,9 @@ async function readBaselineInputs(descartesPaths, options) {
   // kill-switch short-circuit, checked before any read).
   if (!config.enabled) return { config, nowMs, disabled: true, domains: DOMAIN_DEFINITIONS.map((definition) => ({ definition, runs: [], groups: [], points: [] })) };
   const daemonRecord = await readDaemonRecord(descartesPaths, options);
+  // L4: a legacy single store still at the facts root (quarantine not yet run): per-family stores are
+  // absent, but the host has history the daemon's next tick will quarantine (never read again).
+  const legacy = await (options.legacyFactStorePendingItems ?? legacyFactStorePendingItems)(descartesPaths);
   const { intervalMs: structuralIntervalMs, source: structuralIntervalSource } = structuralIntervalOf(daemonRecord);
   const activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE * structuralIntervalMs;
   const domains = [];
@@ -384,7 +388,7 @@ async function readBaselineInputs(descartesPaths, options) {
     const groups = currentGroups(definition.group, points, nowMs);
     domains.push({ definition, runs, familyRead, points, groups });
   }
-  return { config, nowMs, daemonRecord, structuralIntervalMs, structuralIntervalSource, activeFreshnessMs, domains };
+  return { config, nowMs, daemonRecord, structuralIntervalMs, structuralIntervalSource, activeFreshnessMs, legacy, domains };
 }
 
 function configPayload(config, descartesPaths) {
@@ -462,9 +466,10 @@ function horizonShortSinceOf(daemonRecord, ruleId, nowMs) {
 
 // The status reasons for one rule (fact-store capacity plan §4.4/§7 S6). Annotations only: the phase
 // comes from the detector's own gate; a reason never makes a rule "watching" or stops it.
-function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale }) {
+function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale, legacyPending }) {
   const reasons = [];
   if (absent) reasons.push("not_observed_no_store");
+  if (absent && legacyPending) reasons.push("legacy_store_pending_migration");
   if (!absent && (censusStale || ruleEvaluation?.gate === "latest_census_stale")) reasons.push("latest_census_stale");
   if (ruleEvaluation?.gate === "history_horizon_short") reasons.push("history_horizon_short");
   if (familyBlock.cap_below_tick) reasons.push("cap_below_tick");
@@ -524,7 +529,7 @@ function buildDomainReports(inputs) {
           evaluated_count: keys.length,
           horizon_ms: RULE_HORIZONS.get(ruleId)?.horizonMs,
           ...(horizonShortSince ? { horizon_short_since_ts: horizonShortSince } : {}),
-          reasons: ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale }),
+          reasons: ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale, legacyPending: inputs.legacy?.status === "pending_migration" }),
         });
       }
     }
@@ -574,6 +579,7 @@ export async function buildBaselineStatus(descartesPaths, options = {}) {
     domains,
     families,
     ...(daemon ? { daemon_record: daemon } : {}),
+    ...(inputs.legacy && inputs.legacy.status !== "none" ? { legacy_fact_store: inputs.legacy } : {}),
     fact_history_window_ms: options.windowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS,
     note: LIVE_RECOMPUTE_NOTE,
   };
@@ -657,6 +663,11 @@ function renderStatus(report) {
       lines.push(`  ${deprecation.source} ${deprecation.key}: ${deprecation.status}`);
     }
     if (report.daemon_record.fact_store_legacy?.status) lines.push(`  legacy fact store: ${report.daemon_record.fact_store_legacy.status}`);
+  }
+  if (report.legacy_fact_store?.status === "pending_migration") {
+    lines.push("Legacy fact store: pending migration (the daemon's next tick quarantines it; per-family history starts then)");
+  } else if (report.legacy_fact_store?.status === "unknown") {
+    lines.push("Legacy fact store: unknown (the facts directory could not be read)");
   }
   lines.push(`Config path: ${report.watch_config.config_path}`);
   lines.push(report.note);

@@ -585,6 +585,31 @@ test("L2: a domain whose rules are stopped by different gates names every gate, 
   assert.match(human[0], /- service: not watching — .*\(/);
 });
 
+test("L4: a legacy store not yet quarantined (new binary, before the daemon's first tick) is reported as pending migration", { timeout: 120_000 }, async () => {
+  const paths = await tempPaths("legacy-pending");
+  await seedLockedOutLegacyStore(paths);
+  const nowIso = iso(BASE_MS - 0.5 * HOUR_MS);
+  const before = await snapshotTree(path.dirname(path.dirname(paths.stateDir)));
+  const status = await buildBaselineStatus(paths, { now: nowIso });
+  assert.deepEqual(await snapshotTree(path.dirname(path.dirname(paths.stateDir))), before, "status never moves or writes the legacy store");
+  assert.equal(status.legacy_fact_store?.status, "pending_migration");
+  assert.ok(status.legacy_fact_store.items.includes("facts.jsonl"));
+  for (const rule of status.domains.flatMap((domain) => domain.rules)) {
+    assert.equal(rule.phase, "not observed (no store)", rule.rule_id);
+    assert.ok(rule.reasons.includes("legacy_store_pending_migration"), `${rule.rule_id}: ${rule.reasons}`);
+  }
+  const human = [];
+  const { runBaseline } = await import("../src/baseline.js");
+  await runBaseline(paths, ["status"], { output: (line) => human.push(line), now: nowIso });
+  assert.match(human[0], /Legacy fact store: pending migration/);
+  // After the daemon's first tick quarantines it, the flag and the reason are gone.
+  const rig = scenarioRig();
+  await rig.structural(paths, 0);
+  const after = await buildBaselineStatus(paths, { now: iso(BASE_MS + 0.5 * HOUR_MS) });
+  assert.equal(after.legacy_fact_store, undefined);
+  for (const rule of after.domains.flatMap((domain) => domain.rules)) assert.ok(!rule.reasons.includes("legacy_store_pending_migration"), rule.rule_id);
+});
+
 test("M3: the recorded structural interval is used only within the daemon's own profile bounds, and its source is shown", async () => {
   const paths = await tempPaths("interval-bounds");
   const rig = scenarioRig();

@@ -125,6 +125,23 @@ async function presentLegacyItems(factsRootDir) {
 }
 
 /**
+ * S6 review L4 (display only, read-only: lstat/readdir, never opens a legacy file): the legacy items
+ * still sitting at the facts root, i.e. a quarantine that has not run yet (a new binary before the
+ * daemon's first tick) or failed part-way. Unlike legacyFactHistoryEvidence this is false once the
+ * quarantine completed (the marker alone does not count). An I/O error other than ENOENT reads as
+ * "unknown".
+ */
+export async function legacyFactStorePendingItems(descartesPaths) {
+  const { factsRootDir } = resolveLegacyFactStorePaths(descartesPaths);
+  try {
+    const items = await presentLegacyItems(factsRootDir);
+    return { status: items.length > 0 ? "pending_migration" : "none", items };
+  } catch {
+    return { status: "unknown", items: [] };
+  }
+}
+
+/**
  * G2 H1: whether this install ever held (or still holds) a legacy single store -- the marker exists
  * (in any state, even unparseable), or any legacy item is still at the facts root (a quarantine that
  * failed or has not run yet). Consulted by the novelty seen-set fold when it would otherwise certify
