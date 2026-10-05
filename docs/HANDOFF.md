@@ -1,6 +1,24 @@
 # Descartes Handoff
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-10-05
+
+## Current session — root-helper review fixes (2026-10-05)
+
+On branch `harden/root-helper-2026-10`, the adversarial review fixes are implemented and committed
+atomically without push/merge: `9be49be` (required `O_NOFOLLOW`, private futex policy, explicit
+getrandom KILL rationale), `77cd685` (truncation propagation and streaming holder selection),
+`75550ee` (UDP state-07 contract and Node SIGSYS/timeout diagnostics), `3214589` (live allocator /
+anonymous mmap hardening probe and operator/plan docs), `bc79871` (test-only legacy selection
+fixtures), and `8259da1` (separate `net`/table opens for every helper/probe/test caller). The
+holder cap is gone; only the current best holder retains pinned dirfds, and different executable
+holders remain exit 5. The Node/helper output contract and golden fixture are unchanged.
+
+Verification is green: `cargo fmt --check`; `cargo check --workspace --all-targets`; host
+`cargo test --workspace`; host clippy; `cargo check --tests` and `cargo clippy --all-targets -- -D
+warnings` for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; and escalated `npm test`
+(2030 pass, 0 fail, 34 Linux-only skips). The macOS host cannot execute the Linux-gated live
+seccomp probes, `/proc` resolution integration tests, or privileged inherited-listener tests;
+those require Linux CI, and the real capability-grant/elevated path remains CI-only.
 
 ## Current Status
 
