@@ -19,6 +19,7 @@ import {
   parseProcNetLine,
   parseProvenancePs,
   resolvePidFromFdScanResults,
+  parseLinuxProcessIdentity,
   resolveProvenance,
   summarizeSocketAttributions,
 } from "../src/tools/provenance.js";
@@ -93,10 +94,12 @@ test("Linux socket facts retain protocol, inode, and uid for every attributed ro
 
 test("resolvePidFromFdScanResults matches an inode to its owning pid for an accessible own-uid scan", () => {
   const fdScanResults = [
-    { pid: 100, accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }] },
+    { pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }] },
     { pid: 200, accessible: true, fds: [{ fd: "3", target: "socket:[99999]" }] },
   ];
-  assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), { status: "ok", pid: 100, confidence: 1 });
+  assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), {
+    status: "ok", pid: 100, confidence: 1, owners: [{ pid: 100, tgid: 100, start_time: "10" }],
+  });
 });
 
 test("resolvePidFromFdScanResults degrades to partial with no fabricated pid when the fd walk is EACCES", () => {
@@ -120,17 +123,33 @@ test("resolvePidFromFdScanResults returns unknown (not partial) when nothing was
 
 test("same-port socket attribution is ambiguous when inodes map to different executables or any row is unresolved", () => {
   assert.deepEqual(summarizeSocketAttributions([
-    { resolved: true, executablePath: "/usr/sbin/nginx" },
-    { resolved: true, executablePath: "/usr/sbin/nginx" },
-  ]), { status: "ok", executablePath: "/usr/sbin/nginx", reason: "socket_attribution_consistent" });
+    { resolved: true, executablePath: "/usr/sbin/nginx", processIdentity: { tgid: 100, start_time: "10" } },
+    { resolved: true, executablePath: "/usr/sbin/nginx", processIdentity: { tgid: 100, start_time: "10" } },
+  ]), { status: "ok", reason: "socket_attribution_consistent" });
   assert.equal(summarizeSocketAttributions([
-    { resolved: true, executablePath: "/usr/sbin/nginx" },
-    { resolved: true, executablePath: "/usr/bin/node" },
+    { resolved: true, executablePath: "/usr/sbin/nginx", processIdentity: { tgid: 100, start_time: "10" } },
+    { resolved: true, executablePath: "/usr/bin/node", processIdentity: { tgid: 101, start_time: "11" } },
   ]).status, "ambiguous");
   assert.equal(summarizeSocketAttributions([
-    { resolved: true, executablePath: "/usr/sbin/nginx" },
+    { resolved: true, executablePath: "/usr/sbin/nginx", processIdentity: { tgid: 100, start_time: "10" } },
     { resolved: false },
   ]).status, "ambiguous");
+});
+
+test("same-executable SO_REUSEPORT holders are ambiguous, while TCP and UDP from one process agree", () => {
+  assert.equal(summarizeSocketAttributions([
+    { resolved: true, executablePath: "/usr/bin/node", processIdentity: { tgid: 100, start_time: "10" } },
+    { resolved: true, executablePath: "/usr/bin/node", processIdentity: { tgid: 101, start_time: "11" } },
+  ]).reason, "owner_ambiguous");
+  assert.equal(summarizeSocketAttributions([
+    { resolved: true, executablePath: "/usr/bin/node", processIdentity: { tgid: 100, start_time: "10" } },
+    { resolved: true, executablePath: "/usr/bin/node", processIdentity: { tgid: 100, start_time: "10" } },
+  ]).status, "ok");
+});
+
+test("parseLinuxProcessIdentity uses the stat start-time field without trusting the executable path", () => {
+  const stat = "100 (node) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 21";
+  assert.deepEqual(parseLinuxProcessIdentity(stat, 100), { tgid: 100, start_time: "424242" });
 });
 
 // ---------------------------------------------------------------------------------------------

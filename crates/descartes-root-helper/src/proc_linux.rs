@@ -95,6 +95,7 @@ enum IdentityFailure {
 
 fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, IdentityFailure> {
     let uid = read_uid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
+    let start_time = read_process_start_time(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let executable_path = read_exe(pid_dir).ok_or(IdentityFailure::UnreadableExe)?;
     let command = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
     // Bind the command line to the executable generation observed before it. A process can exec
@@ -105,6 +106,8 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     }
     Ok(Resolved {
         pid,
+        tgid: pid,
+        start_time,
         uid,
         executable_path,
         command,
@@ -136,6 +139,12 @@ struct Holder {
     _pid_dir: OwnedFd,
     fd_dir: OwnedFd,
     fd_name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    tgid: u32,
+    start_time: u64,
 }
 
 /// See `socket.rs` for the contract. Sequence: admit the live row for the exact inode -> collect
@@ -249,7 +258,7 @@ fn read_socket_row(target: &SocketTarget) -> (Option<SocketRow>, bool) {
 struct HolderScan {
     selected: Option<Holder>,
     holder_count: usize,
-    first_executable_path: Option<String>,
+    first_identity: Option<ProcessIdentity>,
     ambiguous: bool,
     generation_changed: bool,
     /// A bound was hit on a NON-holder (or on the `/proc` listing): another holder may be unseen.
@@ -315,7 +324,7 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
     let mut scan = HolderScan {
         selected: None,
         holder_count: 0,
-        first_executable_path: None,
+        first_identity: None,
         ambiguous: false,
         generation_changed: false,
         truncated: false,
@@ -380,30 +389,34 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
         }
 
         match matched_fd {
-            Some(fd_name) => match resolve_from_pid_dir(pid, pid_dir.as_fd()) {
-                Ok(resolved) => {
-                    scan.holder_count += 1;
-                    match scan.first_executable_path.as_ref() {
-                        Some(first) if first != &resolved.executable_path => scan.ambiguous = true,
-                        None => scan.first_executable_path = Some(resolved.executable_path.clone()),
-                        _ => {}
+            Some(fd_name) => {
+                match resolve_from_pid_dir(pid, pid_dir.as_fd()) {
+                    Ok(resolved) => {
+                        scan.holder_count += 1;
+                        let identity = ProcessIdentity {
+                            tgid: resolved.tgid,
+                            start_time: resolved.start_time,
+                        };
+                        match scan.first_identity {
+                            Some(first) if first != identity => scan.ambiguous = true,
+                            None => scan.first_identity = Some(identity),
+                            _ => {}
+                        }
+                        let candidate = Holder {
+                            resolved,
+                            _pid_dir: pid_dir,
+                            fd_dir,
+                            fd_name,
+                        };
+                        if scan.selected.as_ref().is_none_or(|current| {
+                            candidate_is_better(&candidate, current, socket_uid)
+                        }) {
+                            scan.selected = Some(candidate);
+                        }
                     }
-                    let candidate = Holder {
-                        resolved,
-                        _pid_dir: pid_dir,
-                        fd_dir,
-                        fd_name,
-                    };
-                    if scan
-                        .selected
-                        .as_ref()
-                        .is_none_or(|current| candidate_is_better(&candidate, current, socket_uid))
-                    {
-                        scan.selected = Some(candidate);
-                    }
+                    Err(failure) => scan.record_identity_failure(failure),
                 }
-                Err(failure) => scan.record_identity_failure(failure),
-            },
+            }
             None => {
                 // This candidate did not show the socket; if its fd table was capped, it may hold
                 // it beyond the fds enumerated.
@@ -430,6 +443,17 @@ fn read_uid(pid_dir: BorrowedFd<'_>) -> Option<u32> {
         }
     }
     None
+}
+
+/// Reads field 22 (`starttime`) from `/proc/<pid>/stat`. The command name is parenthesized and may
+/// itself contain `)`, so split at the final closing parenthesis before indexing the remaining
+/// fields. Top-level `/proc/<pid>` entries are TGIDs, so the caller's pid is the TGID in the
+/// process identity tuple.
+fn read_process_start_time(pid_dir: BorrowedFd<'_>) -> Option<u64> {
+    let stat = procfs::read_file_at(pid_dir, "stat").ok()?;
+    let stat = String::from_utf8_lossy(&stat);
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Reads relative to `pid_dir` -- see the module doc.
@@ -630,7 +654,7 @@ mod tests {
         let mut scan = HolderScan {
             selected: None,
             holder_count: 0,
-            first_executable_path: None,
+            first_identity: None,
             ambiguous: false,
             generation_changed: false,
             truncated: false,
@@ -646,6 +670,34 @@ mod tests {
         scan.record_identity_failure(IdentityFailure::UnreadableExe);
         assert!(scan.truncated);
         assert!(scan.ambiguous);
+    }
+
+    #[test]
+    fn holder_identity_uses_tgid_and_start_time_not_executable_path() {
+        let same_executable_different_processes = [
+            ProcessIdentity {
+                tgid: 100,
+                start_time: 10,
+            },
+            ProcessIdentity {
+                tgid: 101,
+                start_time: 11,
+            },
+        ];
+        assert_ne!(
+            same_executable_different_processes[0],
+            same_executable_different_processes[1]
+        );
+        assert_eq!(
+            ProcessIdentity {
+                tgid: 100,
+                start_time: 10,
+            },
+            ProcessIdentity {
+                tgid: 100,
+                start_time: 10,
+            }
+        );
     }
 
     #[test]

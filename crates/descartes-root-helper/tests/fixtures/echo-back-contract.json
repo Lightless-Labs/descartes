@@ -1,1 +1,1 @@
-{"requested":{"protocol":"tcp","port":8080,"inode":"424242"},"resolved":{"pid":4242,"uid":997,"executable_path":"/opt/svc/bin/app","command":"app --serve","holders":1}}
+{"requested":{"protocol":"tcp","port":8080,"inode":"424242"},"resolved":{"pid":4242,"tgid":4242,"start_time":123,"uid":997,"executable_path":"/opt/svc/bin/app","command":"app --serve","holders":1}}

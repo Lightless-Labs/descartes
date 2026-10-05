@@ -43,6 +43,8 @@ pub enum Requested {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub pid: u32,
+    pub tgid: u32,
+    pub start_time: u64,
     pub uid: u32,
     pub executable_path: String,
     pub command: String,
@@ -105,8 +107,8 @@ pub fn emit_response(requested: Requested, resolved: &Resolved, holders: Option<
         escape_json_string(&truncate_bytes(&resolved.executable_path, MAX_FIELD_BYTES));
     let command = escape_json_string(&truncate_bytes(&resolved.command, MAX_FIELD_BYTES));
     format!(
-        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"command\":\"{command}\"{holders_field}}}}}",
-        resolved.pid, resolved.uid,
+        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"tgid\":{},\"start_time\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"command\":\"{command}\"{holders_field}}}}}",
+        resolved.pid, resolved.tgid, resolved.start_time, resolved.uid,
     )
 }
 
@@ -189,6 +191,8 @@ mod tests {
         let fixture = include_str!("../tests/fixtures/echo-back-contract.json");
         let resolved = Resolved {
             pid: 4242,
+            tgid: 4242,
+            start_time: 123,
             uid: 997,
             executable_path: "/opt/svc/bin/app".to_string(),
             command: "app --serve".to_string(),
@@ -210,6 +214,8 @@ mod tests {
             "inode echoes as a decimal string (u64 > JS safe integer)"
         );
         assert_eq!(parsed["resolved"]["pid"], 4242);
+        assert_eq!(parsed["resolved"]["tgid"], 4242);
+        assert_eq!(parsed["resolved"]["start_time"], 123);
         assert_eq!(parsed["resolved"]["uid"], 997);
         assert_eq!(parsed["resolved"]["executable_path"], "/opt/svc/bin/app");
         assert_eq!(parsed["resolved"]["command"], "app --serve");
@@ -222,6 +228,8 @@ mod tests {
     fn emit_response_echoes_a_u64_inode_exactly() {
         let resolved = Resolved {
             pid: 1,
+            tgid: 1,
+            start_time: 1,
             uid: 0,
             executable_path: "/x".to_string(),
             command: "x".to_string(),
@@ -242,6 +250,8 @@ mod tests {
     fn emit_response_echoes_a_pid_request_shape() {
         let resolved = Resolved {
             pid: 99,
+            tgid: 99,
+            start_time: 1,
             uid: 0,
             executable_path: "/bin/sh".to_string(),
             command: "sh".to_string(),

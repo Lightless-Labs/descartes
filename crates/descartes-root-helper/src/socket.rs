@@ -165,6 +165,8 @@ pub fn row_admits(row: &SocketRow, target: &SocketTarget) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HolderFacts {
     pub pid: u32,
+    pub tgid: u32,
+    pub start_time: u64,
     pub uid: u32,
     pub executable_path: String,
 }
@@ -174,7 +176,7 @@ pub struct HolderFacts {
 pub enum Selection {
     /// Index into the holder slice.
     Chosen(usize),
-    /// Holders disagree on executable: no single process can honestly be named the owner.
+    /// Holders are different processes: no single process can honestly be named the owner.
     Ambiguous,
     /// No holders at all.
     Empty,
@@ -182,13 +184,9 @@ pub enum Selection {
 
 /// Chooses the process to report for a socket held by `holders`.
 ///
-/// - Holders running DIFFERENT executables (e.g. systemd socket activation handing a listener to
-///   a service, or a socket passed over SCM_RIGHTS to an unrelated program) are `Ambiguous`.
-/// - Holders all running the SAME executable (pre-fork servers: nginx/gunicorn master + workers)
-///   are one program; the reported holder is the lowest pid whose uid equals the socket's owning
-///   uid (the `/proc/net` uid column -- the creator, typically the master), else the lowest pid.
-///   Node independently cross-checks the reported uid against the uid it observed, so a holder
-///   whose uid differs from the socket's is degraded there rather than trusted.
+/// Different `(tgid, start_time)` tuples are different processes even when their executable paths
+/// match (for example, unrelated SO_REUSEPORT services). Only repeated observations of the same
+/// process may be collapsed to one owner.
 #[cfg(test)]
 pub fn select_holder(holders: &[HolderFacts], socket_uid: u32) -> Selection {
     let Some(first) = holders.first() else {
@@ -196,7 +194,7 @@ pub fn select_holder(holders: &[HolderFacts], socket_uid: u32) -> Selection {
     };
     if holders
         .iter()
-        .any(|h| h.executable_path != first.executable_path)
+        .any(|h| h.tgid != first.tgid || h.start_time != first.start_time)
     {
         return Selection::Ambiguous;
     }
@@ -314,6 +312,8 @@ mod tests {
     fn holder(pid: u32, uid: u32, exe: &str) -> HolderFacts {
         HolderFacts {
             pid,
+            tgid: pid,
+            start_time: u64::from(pid),
             uid,
             executable_path: exe.to_string(),
         }
@@ -329,26 +329,27 @@ mod tests {
     }
 
     #[test]
-    fn select_holder_prefork_same_exe_reports_the_socket_owning_uid_lowest_pid() {
-        // nginx: master (root, created the socket) + workers (www-data), listed out of order.
+    fn select_holder_same_process_repeated_observations_are_collapsed() {
         let holders = [
-            holder(300, 33, "/usr/sbin/nginx"),
-            holder(200, 0, "/usr/sbin/nginx"),
-            holder(100, 33, "/usr/sbin/nginx"),
+            holder(300, 33, "/usr/bin/node"),
+            holder(200, 0, "/usr/bin/node"),
+            holder(100, 33, "/usr/bin/node"),
         ];
-        assert_eq!(select_holder(&holders, 0), Selection::Chosen(1));
-        // Same set, socket owned by uid 33: lowest-pid uid-33 holder.
-        assert_eq!(select_holder(&holders, 33), Selection::Chosen(2));
-        // No holder shares the socket's uid: lowest pid (Node's uid cross-check then degrades).
-        assert_eq!(select_holder(&holders, 4242), Selection::Chosen(2));
+        assert_eq!(
+            select_holder(&[holders[0].clone()], 33),
+            Selection::Chosen(0)
+        );
+        assert_eq!(
+            select_holder(&[holders[0].clone(), holders[0].clone()], 33),
+            Selection::Chosen(0)
+        );
     }
 
     #[test]
-    fn select_holder_different_executables_are_ambiguous() {
-        // systemd socket activation: pid 1 holds the listener AND the service holds it.
+    fn select_holder_different_processes_are_ambiguous_even_with_the_same_executable() {
         let holders = [
-            holder(1, 0, "/usr/lib/systemd/systemd"),
-            holder(900, 0, "/usr/bin/app"),
+            holder(1, 0, "/usr/bin/node"),
+            holder(900, 0, "/usr/bin/node"),
         ];
         assert_eq!(select_holder(&holders, 0), Selection::Ambiguous);
     }

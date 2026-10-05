@@ -285,10 +285,17 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   if (requestedTarget.kind === "pid" && pid !== requestedTarget.value) return undefined;
 
   const uid = Number.isInteger(resolved.uid) ? resolved.uid : undefined;
+  const tgid = Number.isInteger(resolved.tgid) && resolved.tgid > 0 ? resolved.tgid : undefined;
+  const startTime = Number.isSafeInteger(resolved.start_time) && resolved.start_time >= 0 ? String(resolved.start_time) : undefined;
+  if (tgid === undefined || startTime === undefined) return undefined;
   const executablePath = typeof resolved.executable_path === "string" ? resolved.executable_path : undefined;
   const command = typeof resolved.command === "string" ? resolved.command : undefined;
 
   const out = { pid, uid, executable_path: executablePath, command };
+  Object.defineProperties(out, {
+    tgid: { value: tgid, enumerable: false },
+    start_time: { value: startTime, enumerable: false },
+  });
   if (requestedTarget.kind === "socket") {
     // Number of processes the helper found holding the exact socket (all one executable -- it
     // reports disagreeing holders as ambiguous instead). Must be a positive integer if present.
@@ -389,7 +396,15 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
   const parsed = parseAndVerifyHelperResponse(invokeResult.stdout, target);
   if (!parsed) return undefined;
 
-  const success = { pid: parsed.pid, uid: parsed.uid, executablePath: parsed.executable_path, command: parsed.command, mechanism: attemptedMechanism };
+  const success = {
+    pid: parsed.pid,
+    tgid: parsed.tgid,
+    startTime: parsed.start_time,
+    uid: parsed.uid,
+    executablePath: parsed.executable_path,
+    command: parsed.command,
+    mechanism: attemptedMechanism,
+  };
   if (parsed.holders !== undefined) success.holders = parsed.holders;
   return success;
 }

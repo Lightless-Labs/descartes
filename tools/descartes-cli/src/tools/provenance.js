@@ -307,10 +307,21 @@ export function buildLinuxSocketFact(entry) {
 // [{ pid, accessible: bool, fds?: [{ fd, target }] }, ...] — accessible:false represents an
 // EACCES (cross-UID, permission-limited) /proc/<pid>/fd readdir. Never fabricates a pid.
 export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
-  for (const entry of fdScanResults) {
-    if (entry.accessible === false) continue;
-    const match = (entry.fds ?? []).find((fd) => fd.target === `socket:[${targetInode}]`);
-    if (match) return { status: "ok", pid: entry.pid, confidence: 1 };
+  const matches = fdScanResults.filter((entry) => entry.accessible !== false
+    && (entry.fds ?? []).some((fd) => fd.target === `socket:[${targetInode}]`));
+  if (matches.length > 0) {
+    const identities = matches.map((entry) => ({
+      tgid: entry.tgid ?? entry.pid,
+      start_time: entry.start_time,
+    }));
+    if (identities.some((identity) => !Number.isInteger(identity.tgid) || typeof identity.start_time !== "string")) {
+      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_identity_unavailable" };
+    }
+    const distinct = new Set(identities.map((identity) => `${identity.tgid}:${identity.start_time}`));
+    if (distinct.size > 1) {
+      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_ambiguous", owners: matches.map((entry, index) => ({ pid: entry.pid, ...identities[index] })) };
+    }
+    return { status: "ok", pid: matches[0].pid, confidence: 1, owners: matches.map((entry, index) => ({ pid: entry.pid, ...identities[index] })) };
   }
   const hadInaccessible = fdScanResults.some((entry) => entry.accessible === false);
   if (hadInaccessible) return { status: "partial", pid: undefined, confidence: 0, review_hint: "missing_permission" };
@@ -324,18 +335,21 @@ export function summarizeSocketAttributions(attributions = []) {
   if (!Array.isArray(attributions) || attributions.length === 0) {
     return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_missing" };
   }
-  const executablePaths = new Set();
+  const identities = new Set();
   for (const attribution of attributions) {
-    const executablePath = attribution?.executablePath;
-    if (attribution?.resolved !== true || typeof executablePath !== "string" || executablePath.length === 0) {
-      return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_unresolved" };
+    if (attribution?.resolved !== true) {
+      return { status: "ambiguous", executablePath: undefined, reason: attribution?.reason ?? "socket_attribution_unresolved" };
     }
-    executablePaths.add(executablePath);
+    const identity = attribution.processIdentity;
+    if (!identity || !Number.isInteger(identity.tgid) || typeof identity.start_time !== "string") {
+      return { status: "ambiguous", executablePath: undefined, reason: "owner_identity_unavailable" };
+    }
+    identities.add(`${identity.tgid}:${identity.start_time}`);
   }
-  if (executablePaths.size !== 1) {
-    return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_different_executables" };
+  if (identities.size !== 1) {
+    return { status: "ambiguous", executablePath: undefined, reason: "owner_ambiguous" };
   }
-  return { status: "ok", executablePath: executablePaths.values().next().value, reason: "socket_attribution_consistent" };
+  return { status: "ok", reason: "socket_attribution_consistent" };
 }
 
 // Exported (additive, S4): the structural provenance-warning collector needs to enumerate all
@@ -354,6 +368,8 @@ export async function scanProcFdForInode(candidatePids) {
   for (const pid of candidatePids) {
     try {
       const fdNames = await readdir(`/proc/${pid}/fd`);
+      const processStat = await readFile(`/proc/${pid}/stat`, "utf8");
+      const processIdentity = parseLinuxProcessIdentity(processStat, pid);
       const fds = [];
       for (const fdName of fdNames) {
         try {
@@ -363,12 +379,19 @@ export async function scanProcFdForInode(candidatePids) {
           // Individual fd readlink race/permission — skip only this fd.
         }
       }
-      results.push({ pid, accessible: true, fds });
+      results.push({ pid, ...processIdentity, accessible: true, fds });
     } catch (error) {
       results.push({ pid, accessible: false, error: error?.code });
     }
   }
   return results;
+}
+
+export function parseLinuxProcessIdentity(statContents, pid) {
+  const afterComm = String(statContents ?? "").match(/^\d+\s+\(.*\)\s+(.*)$/s)?.[1];
+  const fields = afterComm?.trim().split(/\s+/) ?? [];
+  const startTime = fields[19];
+  return { tgid: pid, start_time: /^\d+$/.test(startTime ?? "") ? startTime : undefined };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -657,6 +680,24 @@ async function resolvePidCore(pid) {
     };
   }
 
+  const processIdentity = process.platform === "linux"
+    ? await (async () => {
+      try {
+        return parseLinuxProcessIdentity(await readFile(`/proc/${pid}/stat`, "utf8"), pid);
+      } catch {
+        return { tgid: pid, start_time: undefined };
+      }
+    })()
+    : { tgid: pid, start_time: `pid:${pid}` };
+  if (typeof processIdentity.start_time !== "string") {
+    return {
+      resolvedStatus: "unknown",
+      resolved: { status: "unknown", pid: undefined, reason: "process_identity_unavailable" },
+      ancestry: [],
+      source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: "process_identity_unavailable" } },
+    };
+  }
+
   const treeResult = buildParentTreeResult(processes, pid, MAX_ANCESTRY_DEPTH);
   const chain = treeResult.result?.chain ?? [];
   const ancestryChain = chain.map((item) => ({ pid: item.pid, ppid: item.ppid, comm: item.command }));
@@ -681,8 +722,10 @@ async function resolvePidCore(pid) {
       command: target.command,
       args_redaction: target.args_redaction,
       user: { uid: target.uid, username: userInfo.username, username_unavailable: userInfo.username_unavailable },
-      start_time: undefined,
-      start_time_unavailable: true,
+      tgid: processIdentity.tgid,
+      start_time: processIdentity.start_time,
+      start_time_unavailable: false,
+      process_identity: processIdentity,
       codesign,
     },
     ancestry,
@@ -829,6 +872,9 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
     resolved: {
       status: "ok",
       pid: upgrade.pid,
+      tgid: upgrade.tgid,
+      start_time: upgrade.startTime,
+      process_identity: { tgid: upgrade.tgid, start_time: upgrade.startTime },
       executable_path: elevatedExecutablePath,
       executable_path_unavailable: !upgrade.executablePath,
       command: elevatedCommand,
@@ -899,22 +945,41 @@ async function resolveByPortLinux(port, options = {}) {
     if (currentUid !== undefined && entry.uid === currentUid) {
       const matchResult = resolvePidFromFdScanResults(entry.inode, fdScanResults);
       if (matchResult.status === "ok") {
-        const core = await resolvePidCore(matchResult.pid);
-        if (core.resolvedStatus === "ok") {
-          attributions.push({ resolved: true, executablePath: core.resolved.executable_path });
+        const cores = await Promise.all((matchResult.owners ?? [{ pid: matchResult.pid }]).map(async (owner) => ({
+          owner,
+          core: await resolvePidCore(owner.pid),
+        })));
+        const resolvedCores = cores.filter(({ core }) => core.resolvedStatus === "ok");
+        const identitiesAgree = resolvedCores.length === cores.length
+          && resolvedCores.every(({ owner, core }) => core.resolved.process_identity?.tgid === owner.tgid
+            && core.resolved.process_identity?.start_time === owner.start_time);
+        const distinctIdentities = new Set(resolvedCores.map(({ core }) => {
+          const identity = core.resolved.process_identity;
+          return identity ? `${identity.tgid}:${identity.start_time}` : "missing";
+        }));
+        if (identitiesAgree && distinctIdentities.size === 1) {
+          const core = resolvedCores[0].core;
+          const processIdentity = core.resolved.process_identity;
+          attributions.push({ resolved: true, executablePath: core.resolved.executable_path, processIdentity });
           outcomes.push(finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets }));
           continue;
         }
+        attributions.push({ resolved: false, reason: distinctIdentities.size > 1 ? "owner_ambiguous" : "owner_identity_unavailable" });
+        continue;
       }
+      attributions.push({ resolved: false, reason: matchResult.reason ?? "socket_attribution_unresolved" });
+      continue;
     } else if (options.paths) {
       const outcome = await resolveCrossUidPortResult({ port, primary: entry, sockets: [socket] }, options);
       if (outcome.resolvedStatus === "ok") {
-        attributions.push({ resolved: true, executablePath: outcome.result.resolved.executable_path });
+        attributions.push({ resolved: true, executablePath: outcome.result.resolved.executable_path, processIdentity: outcome.result.resolved.process_identity });
         outcomes.push(outcome);
         continue;
       }
+      attributions.push({ resolved: false, reason: outcome.result.resolved.reason ?? "socket_attribution_unresolved" });
+      continue;
     }
-    attributions.push({ resolved: false });
+    attributions.push({ resolved: false, reason: "socket_attribution_unresolved" });
   }
 
   if (matches.length > 1) {
@@ -933,12 +998,42 @@ async function resolveByPortLinux(port, options = {}) {
       };
       return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
     }
+    if (outcomes.length !== matches.length) {
+      const core = {
+        resolvedStatus: "partial",
+        resolved: {
+          status: "partial",
+          pid: undefined,
+          user: { uid: undefined, username: undefined, username_unavailable: true },
+          reason: "socket_attribution_incomplete",
+        },
+        ancestry: [],
+        source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: "socket_attribution_incomplete", socket_count: matches.length } },
+      };
+      return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+    }
     const selected = outcomes[0];
     return { ...selected, result: { ...selected.result, sockets } };
   }
 
   const primary = matches[0];
   if (outcomes.length === 1) return outcomes[0];
+
+  if (matches.length === 1 && attributions[0]?.resolved !== true && currentUid !== undefined && primary.uid === currentUid) {
+    const reason = attributions[0]?.reason ?? "socket_attribution_unresolved";
+    const core = {
+      resolvedStatus: "partial",
+      resolved: {
+        status: "partial",
+        pid: undefined,
+        user: { uid: primary.uid, username: undefined, username_unavailable: true },
+        reason,
+      },
+      ancestry: [],
+      source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason } },
+    };
+    return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+  }
 
   // Cross-UID, or fd-walk could not resolve a pid: the owning UID is a confident fact; the pid
   // itself is never fabricated. See resolveCrossUidPortResult above for the S3-priv upgrade.
