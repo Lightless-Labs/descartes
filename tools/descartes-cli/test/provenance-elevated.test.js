@@ -233,6 +233,33 @@ test("parseAndVerifyHelperResponse rejects a response for a different protocol, 
   assert.equal(parseAndVerifyHelperResponse(legacy, { kind: "port", value: 8080 }), undefined, "the port kind is gone");
 });
 
+test("parseAndVerifyHelperResponse binds a PID response to the requested pid: echoing the request while resolving another pid is rejected (research finding 6)", () => {
+  const response = (requestedPid, resolvedPid) => JSON.stringify({
+    requested: { pid: requestedPid },
+    resolved: { pid: resolvedPid, uid: 1000, executable_path: "/bin/app", command: "app" },
+  });
+  assert.deepEqual(
+    parseAndVerifyHelperResponse(response(4242, 4242), { kind: "pid", value: 4242 }),
+    { pid: 4242, uid: 1000, executable_path: "/bin/app", command: "app" },
+  );
+  assert.equal(parseAndVerifyHelperResponse(response(4242, 1), { kind: "pid", value: 4242 }), undefined, "echoed request, different resolved pid");
+  assert.equal(parseAndVerifyHelperResponse(response(1, 1), { kind: "pid", value: 4242 }), undefined, "different request echoed");
+});
+
+test("resolveElevated never returns a different pid than a PID request asked for", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const options = fakeElevatedOptions({
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({
+      status: "ok",
+      stdout: JSON.stringify({ requested: { pid: 9999 }, resolved: { pid: 1, uid: 0, executable_path: "/sbin/init", command: "init" } }),
+    }),
+  });
+  const result = await resolveElevated({ target: { kind: "pid", value: 9999 }, paths }, options);
+  assert.equal(result, undefined);
+});
+
 test("parseAndVerifyHelperResponse rejects a malformed holders count", () => {
   for (const holders of [0, -1, 1.5, "1", null]) {
     assert.equal(parseAndVerifyHelperResponse(validHelperStdout({ port: 8080, holders }), { ...SOCKET_TARGET }), undefined, `holders=${JSON.stringify(holders)}`);

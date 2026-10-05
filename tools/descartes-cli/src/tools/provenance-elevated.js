@@ -257,6 +257,10 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
 
   const pid = Number.isInteger(resolved.pid) && resolved.pid > 0 ? resolved.pid : undefined;
   if (pid === undefined) return undefined; // never merge a response without a concrete resolved pid.
+  // 2026-10 (research finding 6): for a PID request the answer must describe THAT pid. Echoing the
+  // requested pid while resolving another (buggy or compromised helper) is a scope mismatch, not
+  // an answer -- the echo alone only proved the helper read the request, not what it resolved.
+  if (requestedTarget.kind === "pid" && pid !== requestedTarget.value) return undefined;
 
   const uid = Number.isInteger(resolved.uid) ? resolved.uid : undefined;
   const executablePath = typeof resolved.executable_path === "string" ? resolved.executable_path : undefined;
