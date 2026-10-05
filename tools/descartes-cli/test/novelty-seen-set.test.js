@@ -193,6 +193,21 @@ test("re-seed boundary: a set lost over a NARROWED store re-seeds with certified
   assert.equal(afterBreak.certified_since_ts, at(4));
 });
 
+test("LOW-4 (S3b review): a complete tick appended at or below the byte-cap floor after a small clock rollback is still folded -- memory only ever suppresses a claim", async () => {
+  const paths = await tempPaths();
+  const ticks = [0, 1, 2].map((hour) => serviceTick(at(hour), ["base"]));
+  const budget = tickBytes(ticks[0]) * 2 + 10;
+  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
+  const floor = (await readFactPoints(paths, { now: at(2), windowMs: 31 * DAY })).completeness.bytecap_floor_ts;
+  assert.equal(floor, at(0));
+  // The clock steps back below the floor (within the future tolerance, so no loss is stamped) and a
+  // complete tick lands there: the store evicts it physically (below-floor), but it was observed.
+  const rolledBack = new Date(Date.parse(at(0)) - HOUR / 2).toISOString();
+  await appendFactPoints(paths, serviceTick(rolledBack, ["rb-only"]), { now: at(0), maxBytes: budget });
+  const entries = await seenEntries(paths);
+  assert.deepEqual(entries["rb-only"], [rolledBack, rolledBack], "the below-floor tick's observation is remembered");
+});
+
 test("overflow: a set past its cap is never silently truncated -- it reads as overflow (novelty ineligible), and a later pass whose seed fits recovers it", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, serviceTick(at(0), ["a", "b", "c"]), { now: at(0), seenSetMaxEntries: 2 });

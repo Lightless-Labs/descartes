@@ -422,9 +422,11 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   await writeFactIntegrityLedger(descartesPaths, finalizedLedger);
   // S3b (fact-store capacity plan §17): fold this pass's certified candidates into the novelty
   // seen-sets, in the SAME pass as the append, stamped with the ledger this pass just committed.
-  // `aboveAgeFloor` is every non-future candidate above the prior pass's floors, BEFORE this pass's
-  // byte-cap eviction (see novelty-seen-set.js for why the pre-eviction set; the fold itself keeps
-  // only complete ticks at or before nowMs). Never throws: a failed fold leaves the old file, which
+  // `sortedCandidates` is every in-retention, non-dropped candidate, BEFORE this pass's byte-cap
+  // eviction (see novelty-seen-set.js for why the pre-eviction set; the fold itself keeps only
+  // complete ticks at or before nowMs) -- INCLUDING the below-floor / age-floor-recovered records a
+  // clock rollback can append (S3b review LOW-4): they are evicted physically, but they were
+  // observed, and added memory can only suppress a novelty claim. Never throws: a failed fold leaves the old file, which
   // no longer matches the ledger's committed pass id and therefore reads as not valid (no novelty
   // claim under narrowing) until the next pass re-seeds it.
   const seenSetFold = await foldNoveltySeenSets(descartesPaths, {
@@ -433,7 +435,7 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     liveExists,
     nextLedger: finalizedLedger,
     passId: prepared.passId,
-    records: aboveAgeFloor.map(({ record }) => record),
+    records: sortedCandidates.map(({ record }) => record),
     nowMs,
     retentionMs,
     ...(options.seenSetMaxEntries !== undefined ? { maxEntries: options.seenSetMaxEntries } : {}),

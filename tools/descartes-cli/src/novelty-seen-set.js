@@ -11,9 +11,10 @@
 //   - FOLDED ONLY BY THE FACT-STORE RETENTION PASS, in the same pass as the append (fact-store.js
 //     runFactRetention calls foldNoveltySeenSets after the ledger is finalized), only from COMPLETE
 //     census ticks (strict census grouping, parity-tested against the detectors' groupers), only
-//     ticks at or before the pass's own clock (non-future), and only from records above the prior
-//     pass's floors (certified history). Fold source deviation (plan §18): the pass's PRE-eviction
-//     candidate set, so a tick this pass byte-evicts is still folded -- added memory can only
+//     ticks at or before the pass's own clock (non-future), and only from the pass's in-retention
+//     candidates. Fold source deviation (plan §18): the pass's PRE-eviction candidate set, so a
+//     tick this pass byte-evicts is still folded -- and so is a tick a clock rollback appended at
+//     or below a prior floor (S3b review LOW-4: evicted physically, but observed) -- added memory can only
 //     SUPPRESS a novelty claim, never create one, and it closes the "kept at P, fold write lost,
 //     evicted at P+1" gap without relying on the next pass seeing the tick.
 //   - LINEAGE-STAMPED to the fact ledger: ledger_generation + ledger_pass_id (the committed pass it
