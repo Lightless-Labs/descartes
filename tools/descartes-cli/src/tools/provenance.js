@@ -307,8 +307,17 @@ export function buildLinuxSocketFact(entry) {
 // [{ pid, accessible: bool, fds?: [{ fd, target }] }, ...] — accessible:false represents an
 // EACCES (cross-UID, permission-limited) /proc/<pid>/fd readdir. Never fabricates a pid.
 export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
-  const matches = fdScanResults.filter((entry) => entry.accessible !== false
+  const scanResults = Array.isArray(fdScanResults) ? fdScanResults : (fdScanResults.results ?? []);
+  const scanTruncated = !Array.isArray(fdScanResults) && fdScanResults.truncated === true;
+  const scanUncertain = !Array.isArray(fdScanResults) && fdScanResults.uncertain === true;
+  const matches = scanResults.filter((entry) => entry.accessible !== false
     && (entry.fds ?? []).some((fd) => fd.target === `socket:[${targetInode}]`));
+  if (scanTruncated) {
+    return { status: "truncated", pid: undefined, confidence: 0, review_hint: "out_of_range", reason: "fd_scan_truncated" };
+  }
+  if (scanUncertain) {
+    return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "fd_scan_uncertain" };
+  }
   if (matches.length > 0) {
     const identities = matches.map((entry) => ({
       tgid: entry.tgid ?? entry.pid,
@@ -323,9 +332,53 @@ export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
     }
     return { status: "ok", pid: matches[0].pid, confidence: 1, owners: matches.map((entry, index) => ({ pid: entry.pid, ...identities[index] })) };
   }
-  const hadInaccessible = fdScanResults.some((entry) => entry.accessible === false);
+  const hadInaccessible = scanResults.some((entry) => entry.accessible === false);
   if (hadInaccessible) return { status: "partial", pid: undefined, confidence: 0, review_hint: "missing_permission" };
   return { status: "unknown", pid: undefined, confidence: 0 };
+}
+
+async function verifyProcFdHolder(targetInode, owner) {
+  try {
+    const fdNames = await readdir(`/proc/${owner.pid}/fd`);
+    const processStat = await readFile(`/proc/${owner.pid}/stat`, "utf8");
+    const identity = parseLinuxProcessIdentity(processStat, owner.pid);
+    if (identity.tgid !== owner.tgid || identity.start_time !== owner.start_time) {
+      return { status: "ambiguous", reason: "owner_identity_changed" };
+    }
+    for (const fdName of fdNames) {
+      let target;
+      try {
+        target = await readlink(`/proc/${owner.pid}/fd/${fdName}`);
+      } catch {
+        return { status: "ambiguous", reason: "fd_recheck_uncertain" };
+      }
+      if (target === `socket:[${targetInode}]`) return { status: "ok" };
+    }
+    return { status: "ambiguous", reason: "owner_fd_recheck_failed" };
+  } catch {
+    return { status: "ambiguous", reason: "fd_recheck_uncertain" };
+  }
+}
+
+// A scan snapshot is not itself a current ownership proof. Once a sole owner is selected, verify
+// both its identity and the exact socket link again. A handoff or identity change gets one fresh
+// scan; if the second verification still cannot prove the same owner, fail closed.
+export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanResults, { scanAgain, verifyHolder } = {}) {
+  const verify = verifyHolder ?? verifyProcFdHolder;
+  let currentScan = fdScanResults;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const match = resolvePidFromFdScanResults(targetInode, currentScan);
+    if (match.status !== "ok") return match;
+    const owner = (match.owners ?? [{ pid: match.pid }])[0];
+    const verification = await verify(targetInode, owner);
+    if (verification.status === "ok") return match;
+    if (attempt === 0 && scanAgain) {
+      currentScan = await scanAgain();
+      continue;
+    }
+    return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: verification.reason };
+  }
+  return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_recheck_exhausted" };
 }
 
 // A numeric port is not an identity: TCP/UDP rows and SO_REUSEPORT siblings can coexist. This
@@ -371,11 +424,13 @@ export async function listProcPids() {
   // /proc mounted (e.g. an unusual chroot/container) is a genuinely exceptional condition this
   // module has no graceful degrade for; timedEnvelope's fail-closed contract covers it.
   const entries = await readdir("/proc");
-  return entries.filter((name) => /^\d+$/.test(name)).map(Number).slice(0, MAX_LINUX_FD_SCAN_PIDS);
+  const pids = entries.filter((name) => /^\d+$/.test(name)).map(Number);
+  return { pids: pids.slice(0, MAX_LINUX_FD_SCAN_PIDS), truncated: pids.length > MAX_LINUX_FD_SCAN_PIDS };
 }
 
-export async function scanProcFdForInode(candidatePids) {
+export async function scanProcFdForInode(candidatePids, { listingTruncated = false } = {}) {
   const results = [];
+  let uncertain = listingTruncated;
   for (const pid of candidatePids) {
     try {
       const fdNames = await readdir(`/proc/${pid}/fd`);
@@ -387,15 +442,18 @@ export async function scanProcFdForInode(candidatePids) {
           const target = await readlink(`/proc/${pid}/fd/${fdName}`);
           fds.push({ fd: fdName, target });
         } catch {
-          // Individual fd readlink race/permission — skip only this fd.
+          // An unread fd can hide the target socket. Keep scanning, but never call the result
+          // exhaustive or confident.
+          uncertain = true;
         }
       }
       results.push({ pid, ...processIdentity, accessible: true, fds });
     } catch (error) {
+      uncertain = true;
       results.push({ pid, accessible: false, error: error?.code });
     }
   }
-  return results;
+  return { results, truncated: listingTruncated, uncertain };
 }
 
 export function parseLinuxProcessIdentity(statContents, pid) {
@@ -965,16 +1023,27 @@ async function resolveByPortLinux(port, options = {}) {
   const sockets = matches.map(buildLinuxSocketFact);
 
   const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  const candidatePids = currentUid !== undefined && matches.some((entry) => entry.uid === currentUid)
+  const pidListing = currentUid !== undefined && matches.some((entry) => entry.uid === currentUid)
     ? await listProcPids()
-    : [];
-  const fdScanResults = candidatePids.length > 0 ? await scanProcFdForInode(candidatePids) : [];
+    : { pids: [], truncated: false };
+  const candidatePids = Array.isArray(pidListing) ? pidListing : pidListing.pids;
+  const fdScanResults = candidatePids.length > 0
+    ? await scanProcFdForInode(candidatePids, { listingTruncated: !Array.isArray(pidListing) && pidListing.truncated })
+    : { results: [], truncated: false, uncertain: false };
   const attributions = [];
   const outcomes = [];
   for (const [index, entry] of matches.entries()) {
     const socket = sockets[index];
     if (currentUid !== undefined && entry.uid === currentUid) {
-      const matchResult = resolvePidFromFdScanResults(entry.inode, fdScanResults);
+      const matchResult = await resolveVerifiedPidFromFdScanResults(entry.inode, fdScanResults, {
+        scanAgain: async () => {
+          const refreshedListing = await listProcPids();
+          const refreshedPids = Array.isArray(refreshedListing) ? refreshedListing : refreshedListing.pids;
+          return scanProcFdForInode(refreshedPids, {
+            listingTruncated: !Array.isArray(refreshedListing) && refreshedListing.truncated,
+          });
+        },
+      });
       if (matchResult.status === "ok") {
         const cores = await Promise.all((matchResult.owners ?? [{ pid: matchResult.pid }]).map(async (owner) => ({
           owner,

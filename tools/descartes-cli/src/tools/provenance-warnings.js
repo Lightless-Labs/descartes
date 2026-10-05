@@ -19,7 +19,7 @@
 // Reuses S3's pure exports (classifySourceFromAncestry, detectWarnings, isPublicBindAddress,
 // hasPublicBindNoSupervisor, isRecognizedSupervisorSourceType, resolveExecutableInfo,
 // parseProvenancePs/provenancePsArgsForPlatform, parseProcNetContents,
-// listProcPids/scanProcFdForInode, resolvePidFromFdScanResults) rather than reimplementing
+// listProcPids/scanProcFdForInode, resolveVerifiedPidFromFdScanResults) rather than reimplementing
 // classification/warning logic — see tools/provenance.js.
 //
 // Bounded I/O (plan section 4, load-bearing): the only NEW per-process I/O this module adds
@@ -50,7 +50,7 @@ import {
   parseProvenancePs,
   provenancePsArgsForPlatform,
   resolveExecutableInfo,
-  resolvePidFromFdScanResults,
+  resolveVerifiedPidFromFdScanResults,
   scanProcFdForInode,
 } from "./provenance.js";
 
@@ -374,18 +374,24 @@ async function listLinuxListeningSockets(options) {
 
   const listPids = options.listProcPids ?? listProcPids;
   const scanFds = options.scanProcFdForInode ?? scanProcFdForInode;
-  const candidatePids = await listPids();
-  const fdScanResults = await scanFds(candidatePids);
+  const pidListing = await listPids();
+  const candidatePids = Array.isArray(pidListing) ? pidListing : pidListing.pids;
+  const fdScanResults = await scanFds(candidatePids, {
+    listingTruncated: !Array.isArray(pidListing) && pidListing.truncated,
+  });
 
-  return listening.map((entry) => {
-    const match = resolvePidFromFdScanResults(entry.inode, fdScanResults);
+  return Promise.all(listening.map(async (entry) => {
+    const match = await resolveVerifiedPidFromFdScanResults(entry.inode, fdScanResults, {
+      scanAgain: async () => scanFds(candidatePids),
+      verifyHolder: options.verifyProcFdHolder,
+    });
     return {
       protocol: entry.protocol,
       local_address: entry.local_address,
       local_port: entry.local_port,
       pid: match.status === "ok" ? match.pid : undefined,
     };
-  });
+  }));
 }
 
 /**

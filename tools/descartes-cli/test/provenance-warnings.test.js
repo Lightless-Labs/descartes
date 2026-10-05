@@ -389,6 +389,7 @@ test("listListeningSocketsWithPid('linux', ...) resolves an own-UID listener's p
       accessible: true,
       fds: [{ fd: "12", target: "socket:[12345]" }],
     })),
+    verifyProcFdHolder: async () => ({ status: "ok" }),
   });
   assert.deepEqual(sockets, [
     { protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777 },

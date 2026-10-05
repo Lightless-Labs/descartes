@@ -19,6 +19,7 @@ import {
   parseProcNetLine,
   parseProvenancePs,
   resolvePidFromFdScanResults,
+  resolveVerifiedPidFromFdScanResults,
   parseLinuxProcessIdentity,
   resolveProvenance,
   summarizeSocketAttributions,
@@ -119,6 +120,35 @@ test("resolvePidFromFdScanResults returns unknown (not partial) when nothing was
   const result = resolvePidFromFdScanResults("999999", fdScanResults);
   assert.equal(result.status, "unknown");
   assert.equal(result.pid, undefined);
+});
+
+test("resolvePidFromFdScanResults never reports confidence when the exhaustive PID scan hit its cap or had a read failure", () => {
+  const owner = { pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] };
+  const truncated = resolvePidFromFdScanResults("12345", { results: [owner], truncated: true, uncertain: false });
+  assert.equal(truncated.status, "truncated");
+  assert.equal(truncated.reason, "fd_scan_truncated");
+  assert.equal(truncated.confidence, 0);
+
+  const uncertain = resolvePidFromFdScanResults("12345", { results: [owner], truncated: false, uncertain: true });
+  assert.equal(uncertain.status, "ambiguous");
+  assert.equal(uncertain.reason, "fd_scan_uncertain");
+  assert.equal(uncertain.confidence, 0);
+});
+
+test("resolveVerifiedPidFromFdScanResults refreshes once after a stale holder recheck", async () => {
+  const first = [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] }];
+  const second = [{ pid: 200, tgid: 200, start_time: "20", accessible: true, fds: [{ fd: "4", target: "socket:[12345]" }] }];
+  let refreshes = 0;
+  const result = await resolveVerifiedPidFromFdScanResults("12345", first, {
+    scanAgain: async () => {
+      refreshes += 1;
+      return second;
+    },
+    verifyHolder: async (_inode, owner) => owner.pid === 200 ? { status: "ok" } : { status: "ambiguous", reason: "owner_fd_recheck_failed" },
+  });
+  assert.equal(refreshes, 1);
+  assert.equal(result.status, "ok");
+  assert.equal(result.pid, 200);
 });
 
 test("same-port socket attribution is ambiguous when inodes map to different executables or any row is unresolved", () => {
