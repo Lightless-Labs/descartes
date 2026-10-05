@@ -6,6 +6,7 @@
 **Addendum:** 2026-10-05: S0 grounding (§15), then S1 and S2 built on `feat/fact-store-capacity-2026-10` (§16). G1 ran; Q6 pulled in as S3b (§17).
 **Addendum:** 2026-10-05: S3 (eligibility horizon) and S3b (first/last-seen set) built, plus the G1 re-gate LOWs (§18).
 **Addendum:** 2026-10-05: S4 (per-family stores, routing, per-family veto, budgets, status) and S5 (legacy quarantine, Q5) built, with T7-T10 and T12 (§19). S6/S7 not started; the branch awaits **daybreak G2**.
+**Addendum:** 2026-10-05: daybreak G2 review rework (NEEDS-REWORK: H1 + L1-L5): an upgraded install no longer certifies novelty memory over the history S5 quarantined; per-finding dispositions in §20.
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -348,6 +349,7 @@ That totals about 1 s per minute (~1.6% of a core), versus about 0.55 s per minu
   - Established detectors (`cold_start_pending: false`, rare: only hosts that never evicted) re-arm once on the `unknown` read and clear after 6 ticks.
   - Count rules establish after 30 complete ticks.
   - Novelty memory starts over, the same as a fresh install.
+    - **Addendum (G2 H1, §20.1):** not quite. A fresh install has no history before its first pass; an upgraded one does, and S5 quarantined it. So an upgraded family store's seen-set is certified only from its first pass (`certified_since_ts` = that pass, not `null`), and the novelty rules read `history_horizon_short` for their Q2 horizons (48 h service/scheduled_job, 6 d lineage) after the upgrade instead of claiming "new" over a 30-day scope. A fresh install (no marker, no legacy item) still starts at `null`.
   - **Cost.** On evicting hosts, nothing is lost, because they were locked out anyway. That covers the one real macOS host measured, and very likely typical Linux hosts too: about 200-300 systemd units plus lineage is an estimated ~110 KB/tick, which fills 5 MB in about 2 days. That Linux figure is not measured; S0 should confirm it on a Linux host. Low-volume hosts lose established baselines: about 30 h of statistical warm-up, plus a burst of possible false novelty alerts like a day-1 install.
   - No detector-store schema changes.
 - **M3: quarantine the legacy store.** On first run, rename `learned/facts/facts.jsonl` and `integrity.json` into a quarantine directory **outside the facts tree**: `learned/facts-legacy-<iso>/`, not inside `learned/facts/`. *(Review fold, LOW.)* Inside the tree it would sit next to the family directories, and any filesystem walk would see it. Every reader and the sweep already iterate the closed registry (§4.3), so this is a second layer. No trust path reads it again. Deleting it (immediately or after 31 days) is §12 Q4.
@@ -977,3 +979,25 @@ The final code commit is `d1f96c6`; this addendum and the HANDOFF update follow 
 ### 19.6 Final state
 
 Final code commit `708e379`: **2196 tests, 2162 pass, 0 fail, 34 skipped, 0 todo** (fresh scratch `XDG_*`). S4 and S5 are complete per §7; **next is daybreak G2** (scope §9: per-family `computeCoveredAlerts` veto, family registry, routing, required-`family` reader contract, non-detector reader horizons, plus the S5 quarantine and §19.3), then S6 (CLI consistency) and S7 (soak).
+
+## 20. Addendum: daybreak G2 review rework (2026-10-05)
+
+**Addendum:** 2026-10-05. The daybreak G2 review of §19 returned NEEDS-REWORK: one HIGH, five LOWs, no MEDIUM. Each finding was checked against the code before it was fixed (verify-don't-worship). Every test ran with fresh scratch `XDG_*` directories.
+
+### 20.1 H1: an upgraded install claimed "new" over history it had quarantined (fixed)
+
+**Finding (confirmed).** S5's quarantine moves the legacy single store out of the facts tree, so every family store's first pass then sees no ledger and no `facts.jsonl`. `foldNoveltySeenSets` took that as a genuine first run and seeded `certified_since_ts: null` ("complete since the lineage began"). `noveltyHorizonOk` treats `null` as eligible, which skips the Q2 horizons, and the claim scope became `now - 30 d`. A weekly service, edge or job that was last seen in the quarantined store, and returned after the 6-tick re-arm, would fire `*.appeared` / `novel_edge` "not seen since <30 days ago>". That breaks never-fabricate. Before S5, a v1 legacy ledger re-bootstrapped with a continuity break and was handled correctly.
+
+**Fix.** `legacyFactHistoryEvidence` (`fact-store-migration.js`) is true when the marker `learned/facts-legacy.json` exists (in any state, even unparseable), when any legacy item is still at the facts root (`facts.jsonl`, `integrity.json`, `seen-sets/`, or a stray rewrite tmp file), or when the probe errors. Without the legacy-item check, a quarantine that failed on tick 0 (the daemon reports it and continues) would let the family stores be born `null`, and that value would then be carried forward continuously forever. When a re-seed boundary would be `null` and legacy evidence exists, the fold uses the pass time instead. This covers the first pass, a later re-seed (for example a seen-set lost after the upgrade, whose lineage still began at the upgrade), and the overflow retry. The probe runs only when the boundary is `null` and a re-seed actually uses it, so continuous passes do no extra I/O.
+
+**Consequences, stated.**
+- For 48 h (service, scheduled_job) and 6 d (process lineage) after an upgrade, the novelty rules are horizon-short. They are reported in `history_horizon_short` with `since_ts` = the upgrade tick, and they evaluate nothing.
+- After 24 structural intervals the fixed `daemon.fact_history.horizon_short` alert fires on every upgraded host. It stays raised for the rest of each window: about 1 d for service and scheduled_job, and about 5 d for lineage. This is new operator-visible behaviour (G2 question 1 below).
+- An entity first seen during that window is absorbed into memory without alerting. This is the §4.2 novelty-absorbing window, and it is the honest price of the discarded history.
+- The marker outlives the 31-day quarantine deletion, so any later `null` re-seed on that install also lands at the pass time. That is conservative: it can only delay a claim.
+- A fresh install, with no marker and no legacy item, still seeds `null`. The day-1 test and a new regression guard pin this.
+
+**Tests.** `novelty-seen-set.test.js` covers five kinds of legacy evidence (marker, garbled marker, legacy `facts.jsonl` left after a failed quarantine, `seen-sets/`, stray tmp file). For each it checks that `certified_since_ts` and `scope_ts` equal the first pass, and that the rule is ineligible at +47 h and eligible at +48 h. It also covers a seen-set lost after the upgrade, which re-seeds at the pass time, and the fresh-install guard. **T10** moves its novelty bound to the horizons. Within 8 ticks the lockout clears on all four watch-tier stores and `service.disappeared` evaluates. From tick 1 the three novelty rules are horizon-short with `since_ts` = tick 0, both on `history_horizon_short` and on each family's `horizon_short_since`, and they evaluate nothing. The fixed signal is active by tick 33 and names all three rules. On the final reads, each seen-set is valid, certified from tick 0 and scoped to tick 0; each rule is ineligible 1 ms before its Q2 horizon and eligible at it.
+
+**Not covered (pre-existing, unchanged).** If a whole family store directory is deleted on a host that never had a legacy store, it still re-bootstraps as a genuine first run. No evidence of the lost history survives in that case.
+

@@ -113,6 +113,63 @@ test("day 1: a genuine first run (absent store) seeds a VALID set with certified
   await assert.rejects(() => readFactPoints(paths, { family: "service", now: at(0), seenSetFamilies: ["process_lineage"] }), /not one of the families read/);
 });
 
+// G2 H1: an upgraded install's family store is born at the missing-ledger bootstrap exactly like a
+// fresh install's, but the legacy single store it replaced held real sightings that S5 quarantined
+// (never read again). Its first pass is therefore NOT a genuine first run: memory is certified only
+// from that pass, so the Q2 novelty horizons (48 h / 6 d) apply -- never a 30-day scoped "new" claim
+// over history the system discarded itself.
+async function seedLegacyEvidence(paths, kind) {
+  const learned = path.join(paths.stateDir, "learned");
+  await fs.mkdir(path.join(learned, "facts"), { recursive: true });
+  if (kind === "marker") {
+    await fs.writeFile(path.join(learned, "facts-legacy.json"), JSON.stringify({ schema_version: 1, in_progress: null, quarantines: [{ dir: "facts-legacy-2026-10-01T00-00-00-000Z", quarantined_ts: at(0) }] }));
+  } else if (kind === "garbled-marker") {
+    await fs.writeFile(path.join(learned, "facts-legacy.json"), "{not json");
+  } else if (kind === "legacy-file") {
+    // The quarantine failed this tick (daemon.js reports it and continues): the legacy store is still
+    // in place when the family stores are first written.
+    await fs.writeFile(path.join(learned, "facts", "facts.jsonl"), `${JSON.stringify(presence(at(-1), "weekly.service"))}\n`);
+  } else if (kind === "legacy-seen-sets") {
+    await fs.mkdir(path.join(learned, "facts", "seen-sets"), { recursive: true });
+  } else if (kind === "legacy-tmp") {
+    await fs.writeFile(path.join(learned, "facts", "integrity.json.4242.tmp"), "{}");
+  }
+}
+
+for (const kind of ["marker", "garbled-marker", "legacy-file", "legacy-seen-sets", "legacy-tmp"]) {
+  test(`G2 H1: a family store's first pass after a legacy quarantine (${kind}) is not a genuine first run -- certified_since is the pass time and the novelty horizon applies`, async () => {
+    const paths = await tempPaths();
+    await seedLegacyEvidence(paths, kind);
+    await appendFactPoints(paths, serviceTick(at(0), ["a"]), { family: "service", now: at(0) });
+    for (let hour = 1; hour <= 3; hour += 1) await appendFactPoints(paths, serviceTick(at(hour), ["a"]), { family: "service", now: at(hour) });
+    const { set } = await readSeenSetFile(paths, "service");
+    assert.equal(set.certified_since_ts, at(0), "memory is certified only from the upgrade's first pass");
+    const read = await readFactPoints(paths, { family: "service", now: at(3), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+    assert.equal(read.seen_sets.service.status, "valid");
+    assert.equal(read.seen_sets.service.scope_ts, at(0), "the claim scope never reaches back past the upgrade");
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(3))), false, "horizon-short, not silently eligible");
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(47))), false);
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(48))), true, "the 48 h horizon recovers on schedule");
+  });
+}
+
+test("G2 H1: a seen-set lost AFTER an upgrade re-seeds at the pass time, never null -- the lineage's start is not the start of the host's history", async () => {
+  const paths = await tempPaths();
+  await seedLegacyEvidence(paths, "marker");
+  for (let hour = 0; hour <= 4; hour += 1) await appendFactPoints(paths, serviceTick(at(hour), ["a"]), { family: "service", now: at(hour) });
+  await fs.rm(resolveSeenSetPaths(paths, "service").file);
+  await appendFactPoints(paths, serviceTick(at(5), ["a"]), { family: "service", now: at(5) });
+  assert.equal((await readSeenSetFile(paths, "service")).set.certified_since_ts, at(5));
+});
+
+test("G2 H1 regression guard: a fresh install (no marker, no legacy item) still seeds certified_since null on its first pass", async () => {
+  const paths = await tempPaths();
+  await fs.mkdir(path.join(paths.stateDir, "learned", "facts"), { recursive: true });
+  await appendFactPoints(paths, serviceTick(at(0), ["a"]), { family: "service", now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(1), ["a"]), { family: "service", now: at(1) });
+  assert.equal((await readSeenSetFile(paths, "service")).set.certified_since_ts, null);
+});
+
 test("fold rule: partial, unknown and markerless ticks are never folded; neither is a tick dated after the pass clock", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, [

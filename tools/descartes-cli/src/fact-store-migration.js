@@ -101,6 +101,25 @@ async function presentLegacyItems(factsRootDir) {
   return items;
 }
 
+/**
+ * G2 H1: whether this install ever held (or still holds) a legacy single store -- the marker exists
+ * (in any state, even unparseable), or any legacy item is still at the facts root (a quarantine that
+ * failed or has not run yet). Consulted by the novelty seen-set fold when it would otherwise certify
+ * memory "complete since the lineage began" (certified_since_ts null): after an upgrade a family
+ * store's lineage begins at the upgrade, but the host's history does not -- the sightings it held
+ * were quarantined, never read again. Read-only. Any error other than ENOENT counts as evidence
+ * (fail conservative: a horizon-short window, never a claim over lost history).
+ */
+export async function legacyFactHistoryEvidence(descartesPaths) {
+  const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(descartesPaths);
+  try {
+    if (await exists(markerFile)) return true;
+    return (await presentLegacyItems(factsRootDir)).length > 0;
+  } catch {
+    return true;
+  }
+}
+
 function quarantineDirName(nowIso) {
   return `facts-legacy-${nowIso.replace(/[:.]/g, "-")}`;
 }

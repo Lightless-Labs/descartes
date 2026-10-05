@@ -27,7 +27,9 @@
 //     pass's certified candidates with certified_since_ts = the newest point before which memory is
 //     not certified: max(prior byte-cap floor, prior age floor, every loss marker) when this pass's
 //     continuity observation is ok, else the pass time. null ONLY for a genuine first run (ENOENT
-//     store) or a lineage that never evicted or lost anything -- "complete since the lineage began".
+//     store) or a lineage that never evicted or lost anything -- "complete since the lineage began" --
+//     and never on an install that held a legacy single store (G2 H1: marker or legacy item present;
+//     the lineage began at the upgrade, not with the host's history), where it is the pass time.
 //     When the prior file still parses as a valid, non-overflow set for the family, its entries are
 //     carried into the re-seed (S3b review MEDIUM-1: memory that can only suppress a claim), but
 //     never its certified_since_ts; if carrying them would overflow, the re-seed retries bare.
@@ -46,6 +48,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
 import { NOVELTY_FAMILIES } from "./fact-families.js";
+import { legacyFactHistoryEvidence } from "./fact-store-migration.js";
 
 export const SEEN_SET_SCHEMA_VERSION = 1;
 // Sized against §2's measured host (518 services, 175 lineage edges, 7 scheduled jobs per tick):
@@ -253,7 +256,14 @@ export async function foldNoveltySeenSets(descartesPaths, {
         && prior.set.ledger_generation === nextLedger.generation
         && prior.set.ledger_pass_id === priorLedger.continuity.last_committed_pass_id,
       );
-      const reseedSince = genuineFirstRun ? null : reseedCertifiedSince({ priorLedger, nextLedger, nowIso });
+      let reseedSince = genuineFirstRun ? null : reseedCertifiedSince({ priorLedger, nextLedger, nowIso });
+      // G2 H1: null means "complete since the lineage began", which is the host's whole history only
+      // when no legacy single store ever existed. After an S5 upgrade every family store starts a new
+      // lineage (a "genuine first run" by the store's own evidence) over sightings the quarantine
+      // discarded, so a null boundary would let the 30-day scoped novelty claim reach back over them
+      // and skip the Q2 horizons entirely. With legacy evidence, nothing before this pass is
+      // certified. Probed only when the boundary is null and would actually be used (a re-seed).
+      if (reseedSince === null && !continuous && await legacyFactHistoryEvidence(descartesPaths)) reseedSince = nowIso;
       // S3b review MEDIUM-1: a NON-continuous re-seed still starts from the prior file's entries when
       // it parses as a valid, non-overflow set for this family (readSeenSetFile enforces both) --
       // e.g. a lost fold write, or a daemon death between the ledger finalize and the set rename.
@@ -271,6 +281,7 @@ export async function foldNoveltySeenSets(descartesPaths, {
         // bare re-seed from this pass's certified candidates (older memory is discarded, so the
         // boundary moves up to the re-seed boundary).
         map = new Map();
+        if (reseedSince === null && await legacyFactHistoryEvidence(descartesPaths)) reseedSince = nowIso;
         certifiedSince = reseedSince;
         status = "reseeded";
         foldedThroughMs = foldTicks(map, records, family, nowMs);
