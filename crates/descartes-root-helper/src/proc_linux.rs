@@ -97,17 +97,27 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     let uid = read_uid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let start_time = read_process_start_time(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let executable_path = read_exe(pid_dir).ok_or(IdentityFailure::UnreadableExe)?;
+    let executable_identity = procfs::stat_at(pid_dir, "exe")
+        .map(|identity| (identity.device, identity.inode))
+        .map_err(|_| IdentityFailure::UnreadableExe)?;
     let argv = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
-    // Bind the command line to the executable generation observed before it. A process can exec
-    // while retaining its pid and socket; the second exe-link read catches that change before the
-    // identity is admitted. Socket resolution retries the whole attempt once.
-    if read_exe(pid_dir).as_deref() != Some(executable_path.as_str()) {
+    // Bind the argv to the executable generation observed before it. A process can exec while
+    // retaining its pid and socket; the path check catches a different target and the dev+ino
+    // check catches an atomically replaced binary at the same path. Socket resolution retries the
+    // whole attempt once.
+    if read_exe(pid_dir).as_deref() != Some(executable_path.as_str())
+        || procfs::stat_at(pid_dir, "exe")
+            .ok()
+            .map(|identity| (identity.device, identity.inode))
+            != Some(executable_identity)
+    {
         return Err(IdentityFailure::GenerationChanged);
     }
     Ok(Resolved {
         pid,
         tgid: pid,
         start_time,
+        executable_identity,
         uid,
         executable_path,
         argv,
@@ -222,6 +232,10 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
     if procfs::read_link_at(holder._pid_dir.as_fd(), "exe")
         .ok()
         .is_none_or(|link| link.to_string_lossy() != holder.resolved.executable_path)
+        || procfs::stat_at(holder._pid_dir.as_fd(), "exe")
+            .ok()
+            .map(|identity| (identity.device, identity.inode))
+            != Some(holder.resolved.executable_identity)
     {
         return SocketOutcome::GenerationChanged;
     }

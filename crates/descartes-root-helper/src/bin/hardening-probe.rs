@@ -162,19 +162,6 @@ mod linux_probe {
                     libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
                 }
             },
-            "--do-newfstatat" => || {
-                // SAFETY: `st` is a valid, writable stat buffer for the duration of the call.
-                unsafe {
-                    let mut st: libc::stat = std::mem::zeroed();
-                    libc::syscall(
-                        libc::SYS_newfstatat,
-                        libc::AT_FDCWD,
-                        c"/etc/shadow".as_ptr(),
-                        &mut st as *mut libc::stat,
-                        0,
-                    );
-                }
-            },
             "--do-statx" => || {
                 // SAFETY: `buf` is a valid, writable statx buffer for the duration of the call.
                 unsafe {

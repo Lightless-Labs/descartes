@@ -122,7 +122,6 @@ fn tightened_policy_kills_every_closed_primitive() {
         "--do-write-non-stdio-fd",
         "--do-mmap-exec",
         "--do-mprotect-exec",
-        "--do-newfstatat",
         "--do-statx",
         "--do-getrandom",
         "--do-prctl-dumpable",

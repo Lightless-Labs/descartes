@@ -58,8 +58,8 @@ const EXIT_USAGE_ERROR: i32 = 2;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const EXIT_RESOLUTION_TRUNCATED: i32 = 3;
 // 4 is `hardening::EXIT_HARDENING_FAILURE` (fail-closed confinement abort) -- never reused here.
-// 2026-10 (research finding 2): the socket is held by processes running DIFFERENT executables (or
-// by more than the holder cap), so no single owner can be named. Nonzero + empty stdout like every
+// 2026-10 (research finding 2): the socket is held by more than one distinct process (or by more
+// than the holder cap), so no single owner can be named. Nonzero + empty stdout like every
 // failure; distinct so Node can surface `elevated_owner_ambiguous`. Linux `--resolve-socket` only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const EXIT_OWNER_AMBIGUOUS: i32 = 5;
@@ -173,7 +173,7 @@ fn run_resolve_socket(target: socket::SocketTarget) -> i32 {
         }
         SocketOutcome::Ambiguous => {
             eprintln!(
-                "descartes-root-helper: {what} is held by processes running different executables (or too many holders); no single owner"
+                "descartes-root-helper: {what} is held by multiple distinct processes (or too many holders); no single owner"
             );
             EXIT_OWNER_AMBIGUOUS
         }

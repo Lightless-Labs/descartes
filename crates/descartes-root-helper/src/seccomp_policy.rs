@@ -58,6 +58,7 @@ pub struct SyscallTable {
     pub fcntl: u32,
     pub getdents64: u32,
     pub readlinkat: u32,
+    pub newfstatat: u32,
     pub mmap: u32,
     pub mprotect: u32,
     pub munmap: u32,
@@ -102,7 +103,8 @@ pub const STDERR_FD: u32 = 2;
 ///   - openat [O_NOFOLLOW required; flags ⊆ CLOEXEC|DIRECTORY|NOFOLLOW|LARGEFILE, so access mode = O_RDONLY]:
 ///     `procfs::{open_proc_root, open_pid_dir, open_dir_at, read_file_at*}` -- the ONLY opens
 ///     after `engage()` (`proc_linux.rs` no longer uses `std::fs`, whose `read_to_string`/
-///     `read_dir` paths needed statx/fstat).
+///     `read_dir` paths needed statx/fstat; `newfstatat` is used only for the fixed executable
+///     generation check).
 ///   - read: `procfs::read_file_at*`'s bounded raw `read` loop.
 ///   - getdents64: `procfs::read_dir_entries_at` (`/proc` and `/proc/<pid>/fd` listings).
 ///   - readlinkat: `procfs::read_link_at` (`exe`, fd symlinks).
@@ -121,7 +123,8 @@ pub const STDERR_FD: u32 = 2;
 ///   - clock_gettime: normally vDSO-served; allowlisted because strace under-reports vDSO calls.
 ///
 /// REMOVED relative to the pre-2026-10 allowlist: lseek (the `/proc/<pid>/mem` read primitive),
-/// statx/newfstatat/fstat (metadata oracle; only std::fs needed them), getrandom (the policy model
+/// statx/fstat (metadata oracle; the admitted newfstatat is limited by code to the fixed `exe`
+/// entry below a pinned proc dirfd), getrandom (the policy model
 /// currently has only ALLOW/KILL actions, so it remains KILL rather than using SECCOMP_RET_ERRNO;
 /// the helper no longer needs it), readlink (x86_64 path-based variant; only std::fs::read_link
 /// needed it).
@@ -153,6 +156,9 @@ pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
         Rule::allow(t.read),
         Rule::allow(t.getdents64),
         Rule::allow(t.readlinkat),
+        // The helper uses this only to follow the fixed "exe" entry below a pinned /proc/<pid>
+        // dirfd and compare the mapped binary's dev+ino across the cmdline/final checks.
+        Rule::allow(t.newfstatat),
         Rule::allow(t.close),
         Rule::when(
             t.fcntl,
@@ -246,6 +252,7 @@ pub const fn same_table(a: &SyscallTable, b: &SyscallTable) -> bool {
         && a.fcntl == b.fcntl
         && a.getdents64 == b.getdents64
         && a.readlinkat == b.readlinkat
+        && a.newfstatat == b.newfstatat
         && a.mmap == b.mmap
         && a.mprotect == b.mprotect
         && a.munmap == b.munmap
@@ -292,6 +299,7 @@ pub const fn pinned_x86_64() -> SyscallTable {
         fcntl: 72,
         getdents64: 217,
         readlinkat: 267,
+        newfstatat: 262,
         mmap: 9,
         mprotect: 10,
         munmap: 11,
@@ -337,6 +345,7 @@ pub const fn pinned_aarch64() -> SyscallTable {
         fcntl: 25,
         getdents64: 61,
         readlinkat: 78,
+        newfstatat: 79,
         mmap: 222,
         mprotect: 226,
         munmap: 215,
@@ -385,7 +394,6 @@ mod tests {
         ("pread64", 17, Some(67)),
         ("preadv", 295, Some(69)),
         ("preadv2", 327, Some(286)),
-        ("newfstatat", 262, Some(79)),
         ("fstat", 5, Some(80)),
         ("statx", 332, Some(291)),
         ("getrandom", 318, Some(278)),
