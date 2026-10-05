@@ -19,6 +19,7 @@ import {
   FAMILY_TICK_SHAPES,
   familyBudgetCeilingBytes,
   familyBudgetFloorBytes,
+  MIN_STRUCTURAL_INTERVAL_MS,
   HISTORY_HORIZON_SHORT_ALERT_TICKS,
   NOVELTY_FAMILIES,
   readerFamilies,
@@ -287,6 +288,9 @@ export function validateDaemonProfile(profile) {
     }
     if (!isPositiveFiniteNumber(structural.interval_ms)) {
       throw new Error(`Daemon profile structural.interval_ms must be a positive finite number, got: ${JSON.stringify(structural.interval_ms)}`);
+    }
+    if (structural.interval_ms < MIN_STRUCTURAL_INTERVAL_MS) {
+      throw new Error(`Daemon profile structural.interval_ms ${structural.interval_ms}ms is below ${MIN_STRUCTURAL_INTERVAL_MS}ms; required family budget floor exceeds the 4x budget ceiling`);
     }
     if (!isPlainObject(structural.collectors)) {
       throw new Error("Daemon profile structural.collectors must be an object when present");
@@ -1015,7 +1019,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // the default and is reported as `budget_below_horizon_floor`). `options.factStoreBudgets` is a
   // TEST-ONLY seam (T1 forces routine eviction at real volume) that bypasses that floor -- exactly
   // why it is not a config path.
-  const budgetResolution = resolveFactStoreBudgets(configSnapshot.watch.fact_store_budgets);
+  const budgetResolution = resolveFactStoreBudgets(configSnapshot.watch.fact_store_budgets, { structuralIntervalMs });
   const effectiveBudgets = options.factStoreBudgets ?? budgetResolution.budgets;
   let structuralEvidence;
   let structuralCollectorStatuses;
@@ -1431,7 +1435,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       const entry = {
         budget_bytes: budgetBytes,
         source: options.factStoreBudgets ? "override" : budgetResolution.source[family],
-        floor_bytes: familyBudgetFloorBytes(family),
+        floor_bytes: familyBudgetFloorBytes(family, { structuralIntervalMs }),
         ceiling_bytes: familyBudgetCeilingBytes(family),
         ...(budgetResolution.rejected[family] ? { rejected: budgetResolution.rejected[family] } : {}),
         ...(budgetResolution.clamped?.[family] ? { clamped: budgetResolution.clamped[family] } : {}),

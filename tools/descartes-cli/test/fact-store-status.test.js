@@ -204,9 +204,9 @@ test("G2 L1: a network or provenance store above its budget reads retention_fail
   assert.equal(families.canary.bytes, undefined, "a never-created store the daemon does not read (canary: learned off) reports no size");
 });
 
-// G2 L3: at a structural interval below 1 h the default budgets hold fewer HOURS than their family's
-// longest horizon; that is reported per family, not left to the horizon-short signal alone.
-test("G2 L3: a budget below the T8 invariant at the configured structural interval is reported as horizon_invariant_unmet; at 1 h, or once raised, it is not", async () => {
+// G2 MEDIUM: supported structural intervals auto-scale missing family budgets. A profile below the
+// ceiling boundary is rejected by validateDaemonProfile before this status path can run.
+test("G2 MEDIUM: a supported 15-minute interval auto-scales defaults and accepts an explicitly raised family budget", async () => {
   const MIN = 60 * 1000;
   const fastProfile = { ...structuralProfile(), structural: { interval_ms: 15 * MIN, collectors: { services: { enabled: true } } } };
   const hourly = await tick(await tempPaths(), 0);
@@ -217,12 +217,12 @@ test("G2 L3: a budget below the T8 invariant at the configured structural interv
   await writeWatchConfig(paths, { enabled: true, fact_store_budgets: { peer: peerFloor } });
   const result = await tick(paths, 0, { profile: fastProfile });
   const { families } = result.status.fact_store_budgets;
-  assert.deepEqual(families.session.horizon_invariant_unmet, { required_bytes: familyBudgetFloorBytes("session", { structuralIntervalMs: 15 * MIN }), structural_interval_ms: 15 * MIN });
-  assert.ok(families.service.horizon_invariant_unmet, "the default service budget is short at 15 min too");
+  assert.equal(families.session.horizon_invariant_unmet, undefined, "the default session budget is auto-scaled at 15 minutes");
+  assert.equal(families.service.horizon_invariant_unmet, undefined, "the default service budget is auto-scaled at 15 minutes");
   assert.equal(families.peer.budget_bytes, peerFloor);
   assert.equal(families.peer.horizon_invariant_unmet, undefined, "raised to the 15-minute floor: met");
   assert.equal(families.network.horizon_invariant_unmet, undefined, "no horizon, no invariant");
-  assert.equal(result.status.fact_store_completeness.families.service.horizon_invariant_unmet, true, "carried on the completeness entry");
+  assert.equal(result.status.fact_store_completeness.families.service.horizon_invariant_unmet, undefined);
 });
 
 // G2 L4: a same-UID watch.json cannot size a store (and its whole-file reads every fast tick) without

@@ -582,6 +582,19 @@ test("validateDaemonProfile accepts default and structural-less profiles, reject
     }),
     /structural\.deadline_ms/,
   );
+  assert.doesNotThrow(() => validateDaemonProfile({
+    interval_ms: 60000,
+    collectors: {},
+    structural: { interval_ms: 15 * 60 * 1000, collectors: {} },
+  }));
+  assert.throws(
+    () => validateDaemonProfile({
+      interval_ms: 60000,
+      collectors: {},
+      structural: { interval_ms: 5 * 60 * 1000, collectors: {} },
+    }),
+    /structural\.interval_ms.*budget ceiling/,
+  );
 });
 
 test("collectStructuralEvidence calls only enabled structural collectors in a stable order", async () => {
@@ -1279,7 +1292,7 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
   await writeLearnedConfig(paths, { enabled: true });
 
   const structuralCalls = [];
-  const profile = structuralProfile({ interval_ms: 5 * 60000 });
+  const profile = structuralProfile({ interval_ms: 15 * 60000 });
   let simulatedNowMs = 0;
   let fastTicks = 0;
   const outputs = [];
@@ -1287,7 +1300,7 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
   await runForegroundDaemonLoop(paths, {
     intervalMs: profile.interval_ms,
     sleep: async () => {},
-    shouldStop: () => fastTicks >= 12,
+    shouldStop: () => fastTicks >= 32,
     output: (line) => outputs.push(JSON.parse(line)),
     iterate: async (iterationPaths) => {
       fastTicks += 1;
@@ -1305,10 +1318,10 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
     },
   });
 
-  // 12 fast ticks at 60s each span 0..660000ms; structural (every 300000ms) is due at ticks
-  // 1 (now=0, no checkpoint), 6 (now=300000), and 11 (now=600000) -> exactly 3 structural runs.
-  assert.equal(fastTicks, 12);
-  assert.equal(outputs.length, 12);
+  // 32 fast ticks at 60s each span 0..1860000ms; structural (every 900000ms) is due at ticks
+  // 1 (now=0, no checkpoint), 16 (now=900000), and 31 (now=1800000) -> exactly 3 structural runs.
+  assert.equal(fastTicks, 32);
+  assert.equal(outputs.length, 32);
   assert.equal(structuralCalls.filter((call) => call === "services").length, 3);
   assert.equal(structuralCalls.length, 9);
 });

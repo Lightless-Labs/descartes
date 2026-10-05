@@ -1060,3 +1060,32 @@ Every run used fresh scratch `XDG_*` directories (`mktemp -d`). Baseline before 
 
 Final state: **2208 tests, 2174 pass, 0 fail, 34 skipped.** Next: the daybreak G2 re-gate, with §18.5, §19.5 (Q3 still open) and §20.7.
 
+## 21. Addendum: daybreak G2 rework (2026-10-05)
+
+**Addendum:** 2026-10-05. The daybreak-blue G2 re-gate reproduced two HIGH findings and the §20.7 interval finding. All three were fixed test-first on the current branch, with one atomic commit per finding. The full-suite sandbox-only loopback/live-host failures are recorded separately from product failures.
+
+### 21.1 HIGH-1: later legacy quarantine revokes continuous novelty certification (fixed, `fb63477`)
+
+The legacy migration marker now carries a monotonic `quarantine_epoch` and its quarantine timestamp. Each seen-set records the epoch and timestamp under which its certification was established. Every fold compares the current marker/evidence with that set: a later quarantine advances `certified_since_ts` to the quarantine time even when the ledger lineage remains continuous. An unreadable or forged marker is handled conservatively by advancing to the current pass once, rather than preserving a null boundary. Epoch and timestamp state survive quarantine deletion/resume.
+
+The regression reproduces daybreak's continuous-null set followed by a legacy store containing `svc-B`: the store is quarantined, the set is no longer null, its scope starts at the quarantine boundary, and `svc-B` is not claimed new before the configured horizon. Fresh installs without legacy evidence retain the null certification.
+
+### 21.2 HIGH-2: carried retention failures remain fixed-alert-active (fixed, `1c0f5d6`)
+
+`daemon.fact_store.retention_failing` is now a fixed alert with one fingerprint per family. It is evaluated from the persisted per-family retention error/failing state on both structural and fast ticks. A carried failure keeps daemon health in `error` and the fixed alert active; only a structural tick whose retention pass genuinely succeeds for that family clears the carried state and recovers the alert. The regression covers structural failure, the next fast tick, and structural recovery.
+
+### 21.3 MEDIUM: interval-scaled budgets and the safe minimum (fixed)
+
+Default horizon-bearing family budgets now scale to the configured structural interval when their existing default is insufficient, bounded by the fixed 4x ceiling. The derived minimum supported interval is `833276 ms` (about 13.9 minutes); daemon profile validation rejects a smaller `structural.interval_ms` with a clear budget-ceiling error. A 15-minute interval is accepted and satisfies every family floor. Tests cover default scaling, the ceiling, validation rejection, daemon cadence, and the resulting absence of the prior permanent horizon-short status.
+
+### 21.4 Verification disposition
+
+The targeted G2 regression suite is green after the three fixes (197 pass, 0 fail). Full `npm test` used fresh `XDG_*` directories on every run. The managed sandbox does not permit the loopback listeners used by notifier/tap tests and does not expose the live-host provenance facts; those are environment failures, not product failures.
+
+| commit | disposition | tests | pass | product fail | sandbox fail | skipped |
+|---|---|---:|---:|---:|---:|---:|
+| `fb63477` | HIGH-1 fixed; sandbox-only failures | 2208 | 2152 | 0 | 22 | 34 |
+| `1c0f5d6` | HIGH-2 fixed; sandbox-only failures | 2209 | 2153 | 0 | 22 | 34 |
+| final G2 medium commit | MEDIUM fixed; sandbox-only failures | 2210 | 2154 | 0 | 22 | 34 |
+
+The final 22 sandbox failures were 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live provenance checks (`unknown` where the host-only test expects `ok`). No G2 regression or other product test failed.

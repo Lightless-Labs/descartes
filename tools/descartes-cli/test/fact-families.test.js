@@ -327,6 +327,22 @@ test("G2 L3: the T8 floor is computed at the structural interval -- scaled up be
   assert.equal(familyBudgetFloorBytes("network", { structuralIntervalMs: MIN }), FAMILY_DEFAULT_BUDGET_BYTES.get("network"));
 });
 
+test("G2 MEDIUM: default budgets auto-scale to a supported structural interval, while the 4x ceiling remains a hard bound", () => {
+  const interval = 15 * 60 * 1000;
+  const resolved = resolveFactStoreBudgets(undefined, { structuralIntervalMs: interval });
+  for (const family of FAMILY_HORIZON_MAX_MS.keys()) {
+    const expected = Math.min(
+      familyBudgetCeilingBytes(family),
+      Math.max(FAMILY_DEFAULT_BUDGET_BYTES.get(family), familyBudgetFloorBytes(family, { structuralIntervalMs: interval })),
+    );
+    assert.equal(resolved.budgets[family], expected, `${family} default scales to its 15-minute floor when needed`);
+    assert.ok(resolved.budgets[family] <= familyBudgetCeilingBytes(family), `${family} stays below its ceiling`);
+    assert.equal(resolved.rejected[family], undefined);
+  }
+  assert.equal(resolved.budgets.network, FAMILY_DEFAULT_BUDGET_BYTES.get("network"));
+  assert.equal(resolved.budgets.provenance, FAMILY_DEFAULT_BUDGET_BYTES.get("provenance"));
+});
+
 // G2 L4: a configured budget has an upper bound -- the file, and its whole-file reads every fast tick,
 // stay bounded (T9 is modelled at the defaults; read cost scales linearly up to this ceiling).
 test("G2 L4: a configured budget above the per-family ceiling (4x the default) is clamped to it and reported as budget_above_ceiling", () => {

@@ -328,8 +328,9 @@ export const FAMILY_HORIZON_MAX_MS = buildFamilyHorizonMax();
  * (profile.structural.interval_ms, any positive number). `structuralIntervalMs` computes it at that
  * interval: below 1 h more ticks fall inside a horizon, so the floor scales up; at or above 1 h (or
  * for a missing/invalid value) it is the 1 h figure -- a slower interval never loosens it. The
- * defaults and the config floor are still sized at 1 h; the daemon reports a budget below the
- * interval's floor as `horizon_invariant_unmet` rather than silently going horizon-short.
+ * defaults scale to the interval floor up to the ceiling; an explicit budget below the interval's
+ * floor is rejected and reported as `budget_below_horizon_floor`. The daemon reports any effective
+ * budget below the interval's floor as `horizon_invariant_unmet` rather than silently going horizon-short.
  */
 export function familyBudgetFloorBytes(family, { structuralIntervalMs } = {}) {
   requireFactFamily(family);
@@ -361,31 +362,40 @@ export function familyBudgetCeilingBytes(family) {
   return BUDGET_CEILING_MULTIPLIER * FAMILY_DEFAULT_BUDGET_BYTES.get(family);
 }
 
+// The shortest structural interval for which every horizon-bearing family can fit its required
+// floor under the fixed 4x ceiling. Profiles below this boundary are rejected by daemon validation;
+// they cannot be made safe by silently selecting any bounded budget.
+export const MIN_STRUCTURAL_INTERVAL_MS = Math.max(...[...FAMILY_HORIZON_MAX_MS].map(([family, horizonMs]) => (
+  Math.ceil((horizonMs * FAMILY_TICK_SHAPES.get(family).worstTickBytes * BUDGET_INVARIANT_HEADROOM) / familyBudgetCeilingBytes(family))
+)));
+
 /**
  * Effective per-family budgets from watch.json's `fact_store_budgets` map (§4.5 Config). A missing,
  * non-finite, non-integer, or too-small value falls back to the family default; "too small" means
  * below the T8 invariant (familyBudgetFloorBytes), never merely below one tick, because a budget
  * between one tick and the invariant would leave the family permanently horizon-short (a
- * novelty-absorbing window, §4.2). Rejected values are reported (status reason
+ * novelty-absorbing window, §4.2). A missing default scales to the interval floor when needed,
+ * bounded by the 4x ceiling. Rejected values are reported (status reason
  * `budget_below_horizon_floor` / `invalid`), never silently applied. A value above the ceiling
  * (familyBudgetCeilingBytes, G2 L4) is clamped to it and reported (`budget_above_ceiling`). Keys that are not registry
  * families are ignored (and reported). Pure.
  */
-export function resolveFactStoreBudgets(configured) {
+export function resolveFactStoreBudgets(configured, { structuralIntervalMs } = {}) {
   const budgets = {};
   const rejected = {};
   const clamped = {};
   const source = {};
   const map = configured && typeof configured === "object" && !Array.isArray(configured) ? configured : {};
   for (const family of FACT_FAMILY_IDS) {
-    const fallback = FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+    const intervalFloor = familyBudgetFloorBytes(family, { structuralIntervalMs });
+    const fallback = Math.min(familyBudgetCeilingBytes(family), Math.max(FAMILY_DEFAULT_BUDGET_BYTES.get(family), intervalFloor));
     if (!Object.prototype.hasOwnProperty.call(map, family)) {
       budgets[family] = fallback;
       source[family] = "default";
       continue;
     }
     const value = map[family];
-    const floor = familyBudgetFloorBytes(family);
+    const floor = intervalFloor;
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
       budgets[family] = fallback;
       source[family] = "default";

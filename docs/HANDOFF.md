@@ -2,9 +2,12 @@
 
 **Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity S4 + S5 built; daybreak G2 NEEDS-REWORK folded; awaiting G2 re-gate (2026-10-05)
+## Current continuity — fact-store capacity S4 + S5 built; daybreak G2 rework complete; awaiting G2 re-gate (2026-10-05)
 
-**G2 rework (plan §20):** the G2 review found 1 HIGH and 5 LOWs; 5 were fixed and 1 rejected.
+**G2 rework (plan §20–§21):** the G2 review's two HIGH findings and interval MEDIUM are fixed; the §20 LOW dispositions remain recorded.
+- **H1** `fb63477`: quarantine epochs/timestamps now invalidate continuous-null novelty certification after later legacy evidence.
+- **H2** `1c0f5d6`: carried per-family retention failures keep a fixed alert active across fast ticks and recover only after structural success.
+- **MEDIUM** (final G2 rework commit): default budgets scale to the structural interval up to 4x, and profiles below `833276 ms` are rejected.
 - **H1** `ae282c8`: an upgraded install's novelty seen-set is now certified only from its first pass, because the legacy history was quarantined. Novelty is reported horizon-short for 48 h / 6 d after an upgrade, instead of making a 30-day "new" claim. T10's bound has moved to the horizons.
 - **L2** `d8fd52d`: the no-fact-I/O tests now assert that `learned/facts/` is absent.
 - **L1** `cb654c0`: network/provenance oversize is checked via `stat`.
@@ -12,7 +15,7 @@
 - **L4** `fe91927`: a configured budget above 4x the default is clamped and reported as `budget_above_ceiling`.
 - **L5** rejected: the seam is unreachable in production, like the ~100 other injection keys. §19.5 Q3 stays open.
 
-Full suite on `fe91927`: 2208 tests, 2174 pass, 0 fail, 34 skipped. **Next:** daybreak G2 re-gate, with §20.7's new questions.
+Full suite (fresh scratch `XDG_*`) after the final G2 rework commit: 2210 tests, 2154 pass, 0 product fail, 22 managed-sandbox failures, 34 skipped. The 22 are 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live provenance checks. **Next:** daybreak G2 re-gate.
 
 Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged. Plan: `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md` (§19 is the S4/S5 execution record, deviations and G2 questions; §18 is S3/S3b).
 
