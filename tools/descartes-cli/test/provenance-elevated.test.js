@@ -427,6 +427,27 @@ test("same-UID uncertain fd attribution falls through to the enabled elevated ex
   assert.equal(outcome.result.privilege.elevated_used, true);
 });
 
+test("single cross-UID elevation reuses the first failed helper outcome and diagnostics", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const otherUid = (process.getuid?.() ?? 1000) + 1;
+  let helperCalls = 0;
+  const outcome = await resolveByPortLinux(8080, fakeElevatedOptions({
+    paths,
+    readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcpListeningFixture({ uid: otherUid }) : "1\n",
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => {
+      helperCalls += 1;
+      return { status: "unable", helper_timeout_killed: true, stdout: "", stderr: "" };
+    },
+  }));
+
+  assert.equal(helperCalls, 1);
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.deepEqual(outcome.result.resolved.reasons, ["helper_timeout_killed"]);
+  assert.equal(outcome.result.privilege.helper_timeout_killed, true);
+});
+
 test("same-UID ambiguity stays ambiguous when the enabled elevated helper also cannot resolve it", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });

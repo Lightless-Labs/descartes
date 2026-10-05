@@ -1306,6 +1306,7 @@ export async function resolveByPortLinux(port, options = {}) {
     : { results: [], truncated: false, uncertain: false };
   const attributions = [];
   const outcomes = [];
+  let singleResolutionOutcome;
   for (const [index, entry] of matches.entries()) {
     const socket = sockets[index];
     if (currentUid !== undefined && entry.uid === currentUid) {
@@ -1419,6 +1420,7 @@ export async function resolveByPortLinux(port, options = {}) {
         continue;
       }
       attributions.push({ resolved: false, reason: outcome.result.resolved.reason ?? "socket_attribution_unresolved" });
+      singleResolutionOutcome = outcome;
       continue;
     }
     attributions.push({ resolved: false, reason: "socket_attribution_unresolved" });
@@ -1481,6 +1483,8 @@ export async function resolveByPortLinux(port, options = {}) {
     };
     return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets, privilege: attribution.privilege });
   }
+
+  if (singleResolutionOutcome) return singleResolutionOutcome;
 
   // Cross-UID, or fd-walk could not resolve a pid: the owning UID is a confident fact; the pid
   // itself is never fabricated. See resolveCrossUidPortResult above for the S3-priv upgrade.

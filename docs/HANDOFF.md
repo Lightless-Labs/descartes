@@ -2,6 +2,22 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — daybreak-blue remaining root-helper MEDIUM fixes (2026-10-05)
+
+The two remaining Node provenance findings are fixed locally on `harden/root-helper-2026-10`
+without push or merge. Multi-row same-port aggregation now unions every per-row reason and
+preserves elevated privilege diagnostics instead of falling back to the default privilege
+object. A failed single cross-UID elevation now returns the first helper outcome after one
+attempt, including its diagnostics. Each finding has its own local atomic commit, and both
+carry the required Claude trailer.
+
+Focused regression coverage passes, including the two-row `fd_scan_uncertain` plus helper
+hardening-failure reproduction and a counting fake helper that asserts one invocation on
+timeout. `cargo test --workspace` passes all 72 tests. Fresh-XDG `npm test` ran 2,095 tests:
+2,039 passed, 22 environment-only failures, and 34 skips. The 22 failures are 20 sandbox
+loopback `listen` EPERM notifier/tap tests and two live macOS provenance smoke tests returning
+`unknown`; no changed-path regression failed. No Rust files were modified.
+
 ## Current session — daybreak-blue seventh-gate Node redaction fix (2026-10-05)
 
 The seventh-gate high redaction finding is fixed locally on `harden/root-helper-2026-10` and is
