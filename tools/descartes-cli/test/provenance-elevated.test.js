@@ -390,7 +390,7 @@ test("resolveCrossUidPortResult preserves a procfs PID-namespace mismatch as a d
     invokeElevatedHelper: async () => ({ status: "unable", code: 6, procfs_namespace_mismatch: true, stdout: "", stderr: "" }),
   }));
 
-  assert.equal(outcome.resolvedStatus, "partial");
+  assert.equal(outcome.resolvedStatus, "ambiguous");
   assert.equal(outcome.result.resolved.reason, "procfs_pid_namespace_mismatch");
   assert.equal(outcome.result.privilege.procfs_pid_namespace_mismatch, true);
 });

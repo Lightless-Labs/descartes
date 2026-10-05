@@ -1006,11 +1006,20 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
     ...(ownerAmbiguous ? ["elevated_owner_ambiguous"] : []),
     ...(procfsNamespaceMismatch ? ["procfs_pid_namespace_mismatch"] : []),
   ];
+  const degradedClassifications = degradedReasons.map(classifyOwnerAmbiguityReason).filter(Boolean);
+  const degradedClassification = degradedClassifications.find((classification) => classification.status === "ambiguous")
+    ?? degradedClassifications.find((classification) => classification.status === "truncated")
+    ?? degradedClassifications[0];
+  const degradedReason = degradedReasons.find((reason) => classifyOwnerAmbiguityReason(reason)?.status === degradedClassification?.status)
+    ?? degradedReasons[0];
   const degradedOutcome = degradedReasons.length === 0
     ? unprivilegedOutcome
     : (() => {
-      const resolvedStatus = ownerAmbiguous ? "ambiguous" : fdScanTruncated ? "truncated" : "partial";
-      const reason = ownerAmbiguous ? "elevated_owner_ambiguous" : fdScanTruncated ? "fd_scan_truncated" : "procfs_pid_namespace_mismatch";
+      // The centralized owner classifier is the sole authority for status. In particular, a
+      // procfs namespace mismatch is ambiguity about which process namespace was observed, not a
+      // permission-only partial result.
+      const resolvedStatus = degradedClassification?.status ?? unprivilegedCore.resolvedStatus;
+      const reason = degradedReason ?? unprivilegedCore.resolved.reason;
       const core = {
         ...unprivilegedCore,
         resolvedStatus,
