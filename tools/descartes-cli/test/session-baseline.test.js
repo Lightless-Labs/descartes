@@ -1298,6 +1298,43 @@ test("DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS is exactly [SESSION_COUNT_DROP_RULE_
 // freezes any owned identity NOT reported (never fabricates a recovery).
 // ---------------------------------------------------------------------------------------------
 
+// A2 (2026-10 calibration review): freshness gate. If structural ticks keep failing, the last
+// complete tick (possibly days old) must not be re-scored as "now" every fast tick -- emit nothing
+// for that rule AND leave its identity out of evaluatedAlertKeys (freeze).
+function a2SessionFixture() {
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeTick(tickTs(i), 20));
+  // Latest complete tick (hour 30): a deep count drop AND a fresh churn pair (hour 29 -> hour 30).
+  ticks.push(sessionPoint(tickTs(29), entityKey, "1111111111111111"));
+  ticks.push(...completeTick(tickTs(30), 2));
+  ticks.push(sessionPoint(tickTs(30), entityKey, "2222222222222222"));
+  return { ticks, entityKey };
+}
+
+test("A2 control: a FRESH latest complete tick fires both session.count_drop and session.churn and reports both identities", async () => {
+  const { ticks, entityKey } = a2SessionFixture();
+  const result = await seedAndCompute(await tempPaths(), ticks, { now: new Date(Date.parse(tickTs(30)) + HOUR_MS).toISOString() });
+  assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 1);
+  assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 1);
+  assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")), true);
+  assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)), true);
+});
+
+test("A2: a STALE latest complete tick (older than the freshness window) emits no session.count_drop / session.churn and reports neither identity (freeze)", async () => {
+  const { ticks, entityKey } = a2SessionFixture();
+  const staleNow = new Date(Date.parse(tickTs(30)) + 4 * HOUR_MS).toISOString();
+  for (const extra of [{}, { activeFreshnessMs: 3 * HOUR_MS }]) {
+    const result = await seedAndCompute(await tempPaths(), ticks, { now: staleNow, ...extra });
+    assert.deepEqual(result.candidates, [], "a 4h-old tick must not be re-scored as current");
+    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")), false);
+    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)), false);
+  }
+  // A wider explicit window (as the daemon threads for a slower structural cadence) keeps it fresh.
+  const wide = await seedAndCompute(await tempPaths(), ticks, { now: staleNow, activeFreshnessMs: 6 * HOUR_MS });
+  assert.equal(wide.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 1);
+});
+
 test("recovery coverage (i) — GENUINE clear reports the identity so a persisted alert can recover: a churned-then-stable entity and an established-but-normal count_drop are both surfaced in evaluatedAlertKeys", async () => {
   // (a) churn: an entity that churned (fp1 -> fp2) then STABILIZED (fp2 -> fp2 on the latest
   // complete tick) is no longer anomalous, yet was FRESHLY evaluated this tick (>=2 obs, fresh,

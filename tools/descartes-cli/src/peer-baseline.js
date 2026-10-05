@@ -79,6 +79,19 @@ const DEFAULT_PEER_EWMA_ALPHA = 2 / (DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
 // detector owning its own re-establishment tuning.
 export const DEFAULT_PEER_MIN_HISTORY_TICK_COUNT = 6;
 
+// A2 (2026-10 calibration review): freshness gate, mirroring service-baseline.js's
+// DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS (locally defined to avoid a daemon.js import cycle). Only a
+// fallback for direct/unit invocation: daemon.js threads the SAME per-tick activeFreshnessMs (3x the
+// structural interval) it gives the service/lineage/scheduled-job producers. A scored tick older
+// than this is not "now" -- each direction freezes (no candidate, no coverage) rather than
+// re-scoring and re-notifying a possibly days-old tick every fast tick.
+export const DEFAULT_PEER_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
+
+function isFreshTs(ts, nowMs, freshnessMs) {
+  const tsMs = typeof ts === "string" ? new Date(ts).getTime() : NaN;
+  return nowMs - tsMs <= freshnessMs; // NaN-safe: an unparseable/absent ts is never fresh
+}
+
 // ---------------------------------------------------------------------------------------------
 // Store I/O (atomic tmp+rename 0o600, corrupt-tolerant — mirrors session-baseline.js's own
 // loadSessionBaselineStore/writeSessionBaselineStore convention exactly, simpler shape: v0 has no
@@ -732,6 +745,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const ewmaAlpha = options.ewmaAlpha ?? DEFAULT_PEER_EWMA_ALPHA;
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_PEER_MIN_HISTORY_TICK_COUNT;
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_PEER_FRESHNESS_FALLBACK_MS;
 
   // Fact-store completeness hardening (Slice 5): the FULL read result is captured (not just
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
@@ -897,15 +911,24 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // folded — so applyAlertCandidates never spuriously "recovers" an active peer.count_spike/
   // peer.count_drop just because this source skipped a redundant write.
   const candidates = [];
-  const spikeCandidate = buildCountSpikeCandidate(
-    { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-    { deviationSigma },
-  );
+  // A2 freshness gate, per direction, on the tick each direction actually SCORES: spike scores the
+  // most recent tick-group (overflow included -- score-but-never-fold); drop scores the latest
+  // marker-complete one. A stale scored tick freezes that direction (no candidate, no coverage).
+  const spikeFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
+  const dropFresh = isFreshTs(windowedDrop.last_observation?.ts, nowMs, freshnessMs);
+  const spikeCandidate = spikeFresh
+    ? buildCountSpikeCandidate(
+      { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
+      { deviationSigma },
+    )
+    : undefined;
   if (spikeCandidate) candidates.push(spikeCandidate);
-  const dropCandidate = buildCountDropCandidate(
-    { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
-    { deviationSigma },
-  );
+  const dropCandidate = dropFresh
+    ? buildCountDropCandidate(
+      { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
+      { deviationSigma },
+    )
+    : undefined;
   // count_drop needs marker-complete history, unlike count_spike. BASE-complete markerless
   // ticks intentionally clear the shared lockout so spike detection can recover in Tailscale-only
   // environments, but those same ticks cannot prove that the drop history is complete. Recompute
@@ -938,10 +961,11 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     count_drop-only warm-up the spike direction does not share), so gating drop on
   //     windowedDrop.confidence_state alone would fabricate a recovery.
   const evaluatedAlertKeys = [];
-  if (windowed.confidence_state === "established") {
+  //   - both: additionally only when the scored tick is FRESH (A2) -- a stale tick is not evaluated.
+  if (spikeFresh && windowed.confidence_state === "established") {
     evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, "global"));
   }
-  if (windowedDrop.confidence_state === "established" && dropRecoveryReady) {
+  if (dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady) {
     evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, "global"));
   }
   return { candidates, evaluatedAlertKeys };

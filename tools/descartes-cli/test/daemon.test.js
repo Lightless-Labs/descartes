@@ -4557,6 +4557,28 @@ test("Fix 3 control (detector-reported coverage §8): a detector that REPORTS it
   assert.equal(canaryAlert.status, "recovered");
 });
 
+test("A2 wiring: the session and peer baseline producers receive the SAME activeFreshnessMs (3x structural interval) the service/lineage/scheduled-job producers already get", async () => {
+  const paths = await tempPaths();
+  const now = S_LIVE_1_TICK_TS;
+  const seen = {};
+  const spy = (label) => async (_paths, options) => {
+    seen[label] = options.activeFreshnessMs;
+    return { candidates: [], evaluatedAlertKeys: [] };
+  };
+  await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: spy("session"),
+    computePeerBaselineCandidates: spy("peer"),
+    computeServiceBaselineCandidates: spy("service"),
+  });
+  assert.equal(seen.service, 3 * DEFAULT_STRUCTURAL_INTERVAL_MS, "sanity: the sibling producer's freshness horizon");
+  assert.equal(seen.session, seen.service, "session-baseline must be freshness-gated like its siblings");
+  assert.equal(seen.peer, seen.service, "peer-baseline must be freshness-gated like its siblings");
+});
+
 // ---------------------------------------------------------------------------------------------
 // Detector-reported recovery coverage (§8) — CORE acceptance: freeze-by-default, FIXED exempt,
 // owner-scoped acceptance, and the §7.7 intersection (a report cannot override a global veto).

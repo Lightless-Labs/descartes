@@ -1564,6 +1564,35 @@ test("computePeerBaselineCandidates coverage: a tick where spike is established+
   assert.equal(candidates.some((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID), false, "and the drop candidate itself is correctly still suppressed");
 });
 
+// A2 (2026-10 calibration review): freshness gate -- a stale latest tick (structural collection
+// failing for longer than the freshness window) must not be re-scored as current every fast tick.
+test("A2: a STALE latest peer tick emits no peer.count_spike / peer.count_drop and reports neither identity (freeze); the same tick while FRESH still fires", async () => {
+  const spikeTicks = [];
+  for (let i = 0; i < 30; i += 1) spikeTicks.push(...activeTickWithMarker(tickTs(i), 5));
+  spikeTicks.push(...activeTickWithMarker(tickTs(30), 40));
+  const dropTicks = [];
+  for (let i = 0; i < 30; i += 1) dropTicks.push(...activeTickWithMarker(tickTs(i), 10));
+  dropTicks.push(...activeTickWithMarker(tickTs(30), 1));
+  const freshNow = new Date(Date.parse(tickTs(30)) + HOUR_MS).toISOString();
+  const staleNow = new Date(Date.parse(tickTs(30)) + 4 * HOUR_MS).toISOString();
+  const spikeKey = alertId(PEER_COUNT_SPIKE_RULE_ID, "global");
+  const dropKey = alertId(PEER_COUNT_DROP_RULE_ID, "global");
+
+  const freshSpike = await seedAndCompute(await tempPaths(), spikeTicks, { now: freshNow });
+  assert.equal(freshSpike.candidates.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1, "control: fresh spike fires");
+  const freshDrop = await seedAndCompute(await tempPaths(), dropTicks, { now: freshNow });
+  assert.equal(freshDrop.candidates.filter((c) => c.rule_id === PEER_COUNT_DROP_RULE_ID).length, 1, "control: fresh drop fires");
+
+  for (const extra of [{}, { activeFreshnessMs: 3 * HOUR_MS }]) {
+    for (const ticks of [spikeTicks, dropTicks]) {
+      const result = await seedAndCompute(await tempPaths(), ticks, { now: staleNow, ...extra });
+      assert.deepEqual(result.candidates, [], "a 4h-old peer tick must not be re-scored as current");
+      assert.equal(result.evaluatedAlertKeys.includes(spikeKey), false);
+      assert.equal(result.evaluatedAlertKeys.includes(dropKey), false);
+    }
+  }
+});
+
 test("computePeerBaselineCandidates calls the real (default) loadWatchConfig when not injected -- watch.json defaults to enabled:true (the inversion of learned.json's old enabled:false), so a fresh state dir now proceeds PAST the gate and reaches real I/O, returning [] only for lack of history (cold-start), not a kill switch", async () => {
   const paths = await tempPaths();
   let readCalled = false;

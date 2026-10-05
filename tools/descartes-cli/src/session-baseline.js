@@ -91,6 +91,20 @@ export const DEFAULT_MIN_SAMPLE_COUNT = 30;
 // DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT value exactly.
 export const DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT = 6;
 
+// A2 (2026-10 calibration review): freshness gate, mirroring service-baseline.js's
+// DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS exactly (locally defined -- importing daemon.js's
+// ACTIVE_FRESHNESS_MULTIPLE back would create an import cycle). Only a fallback for direct/unit
+// invocation: daemon.js threads the SAME per-tick activeFreshnessMs (3x the structural interval) it
+// gives the service/lineage/scheduled-job producers. When the latest complete tick-group is older
+// than this, structural collection has been failing; re-scoring that old tick as "now" every fast
+// tick would re-notify a days-old state, so both rules freeze instead (no candidate, no coverage).
+export const DEFAULT_SESSION_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
+
+function isFreshTs(ts, nowMs, freshnessMs) {
+  const tsMs = typeof ts === "string" ? new Date(ts).getTime() : NaN;
+  return nowMs - tsMs <= freshnessMs; // NaN-safe: an unparseable ts is never fresh
+}
+
 // A reasonable, undramatic smoothing constant for the persisted (but not v0-trigger-consuming,
 // see Decision 3's "EWMA's role, scoped explicitly") ewma/ewma_variance fields — not part of the
 // trigger math, so not flagged PROVISIONAL alongside the three sigma/floor constants above.
@@ -704,6 +718,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   const ewmaAlpha = options.ewmaAlpha ?? DEFAULT_EWMA_ALPHA;
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT;
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SESSION_FRESHNESS_FALLBACK_MS;
 
   // Fact-store completeness hardening (Slice 4): the FULL read result is captured (not just
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
@@ -850,13 +865,18 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
 
   const candidates = [];
   const evaluatedAlertKeys = [];
+  // A2 freshness gate: count_drop scores windowed.last_observation (the latest complete tick-group);
+  // if that tick is older than freshnessMs it is not "now" -- emit nothing and report nothing.
+  const dropFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
   // — including ticks where nothing new was folded — so applyAlertCandidates never spuriously
   // "recovers" an active session.count_drop just because this source skipped a redundant write.
-  const dropCandidate = buildCountDropCandidate(
-    { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-    { deviationSigma, criticalSigma },
-  );
+  const dropCandidate = dropFresh
+    ? buildCountDropCandidate(
+      { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
+      { deviationSigma, criticalSigma },
+    )
+    : undefined;
   if (dropCandidate) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
@@ -864,7 +884,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // requires before it can fire OR find-clear. A provisional (warm-up) window reaches no verdict, so
   // "global" is NOT reported and any persisted count_drop freezes rather than falsely recovering.
   const dropObservation = windowed.last_observation;
-  const dropEvaluated = windowed.confidence_state === "established"
+  const dropEvaluated = dropFresh
+    && windowed.confidence_state === "established"
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
@@ -877,7 +898,14 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // evaluateSessionChurn. Each evaluated key (whether it churned or was clear) is reported so the
   // daemon can recover a now-stable session's persisted churn alert; skipped/stale/ambiguous entities
   // are absent, so their alerts freeze.
-  const { churnEntries, evaluatedEntityKeys } = evaluateSessionChurn(currentPoints);
+  // A2 freshness gate for churn: evaluateSessionChurn anchors on the latest complete tick-group (by
+  // the same censusState === "complete" filter it uses); when that tick is stale, churn freezes.
+  const churnCompleteGroups = currentGroups.filter((group) => group.censusState === "complete");
+  const churnFresh = churnCompleteGroups.length > 0
+    && isFreshTs(churnCompleteGroups[churnCompleteGroups.length - 1].ts, nowMs, freshnessMs);
+  const { churnEntries, evaluatedEntityKeys } = churnFresh
+    ? evaluateSessionChurn(currentPoints)
+    : { churnEntries: [], evaluatedEntityKeys: [] };
   candidates.push(...buildChurnCandidates(churnEntries));
   for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
 
