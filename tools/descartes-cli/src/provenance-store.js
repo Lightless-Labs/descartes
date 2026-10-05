@@ -828,15 +828,37 @@ async function runSnapshot(descartesPaths, args, runtime) {
     }
   }
 
-  const gather = runtime.gatherIdentityObservations
-    ?? (await import("./tools/provenance-identity.js")).gatherIdentityObservations;
-  const observations = await gather(runtime);
+  const legacyArrayInjection = Object.hasOwn(runtime, "listListeningSocketsWithPid")
+    || Object.hasOwn(runtime, "snapshotProvenanceProcesses");
+  if (legacyArrayInjection && runtime.allowLegacyArrayCensus !== true) {
+    throw new Error("Provenance snapshot refused: legacy array census injection is degraded unless explicitly opted in");
+  }
+
+  const collect = runtime.collectIdentityObservations
+    ?? (await import("./tools/provenance-identity.js")).collectIdentityObservations;
+  const collection = await collect({ ...runtime, allowLegacyArrayCensus: runtime.allowLegacyArrayCensus === true });
+  const observations = Array.isArray(collection?.observations) ? collection.observations : [];
+  if (collection?.status !== "ok" || !Array.isArray(collection?.observations)) {
+    const reasons = Array.isArray(collection?.reasons) && collection.reasons.length > 0
+      ? collection.reasons.join(",")
+      : "malformed_collection";
+    throw new Error(`Provenance snapshot refused: identity collection degraded (${reasons})`);
+  }
 
   const loadStore = runtime.loadSignatureStore ?? loadSignatureStore;
   const { store } = await loadStore(descartesPaths);
   const ts = runtime.now ? new Date(runtime.now).toISOString() : new Date().toISOString();
   const reconciled = reconcileSignatures(store, observations, { ts, iterationKey: ts, seedKnownGood: true });
-  const nextStore = { ...reconciled, bootstrapped_at: ts, last_reconciled_at: ts };
+  const preservedReconcileBookkeeping = {};
+  for (const key of ["last_reconcile_attempt_at", "last_reconcile_status", "last_reconcile_degraded_reasons"]) {
+    if (Object.hasOwn(store, key)) preservedReconcileBookkeeping[key] = store[key];
+  }
+  const nextStore = {
+    ...reconciled,
+    ...preservedReconcileBookkeeping,
+    bootstrapped_at: ts,
+    last_reconciled_at: ts,
+  };
 
   const writeStore = runtime.writeSignatureStore ?? writeSignatureStore;
   await writeStore(descartesPaths, nextStore);

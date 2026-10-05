@@ -61,6 +61,9 @@ const STAT_B = { dev: 1, ino: 111, size: 4096, mtimeMs: 2000 };
 function fakeCollectorOptions(overrides = {}) {
   return {
     ownUid: OWN_UID,
+    // These fixtures intentionally exercise the legacy array seams; the explicit opt-in keeps
+    // that compatibility test-only path distinct from the status-authoritative production path.
+    allowLegacyArrayCensus: true,
     listListeningSocketsWithPid: async () => MIXED_SOCKETS,
     snapshotProvenanceProcesses: async () => MIXED_PROCESSES,
     resolveExecutableInfo: async (pid) => ({ executable_path: `/opt/svc/${pid}/bin`, executable_path_unavailable: false }),

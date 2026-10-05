@@ -457,7 +457,7 @@ test("runProvenanceStore snapshot seeds known_good entries and is idempotent (ru
   const paths = await tempPaths();
   const observations = [{ executablePath: "/bin/svc", sourceClassification: "launchd", owningUser: "0" }];
   const outputs = [];
-  const runtime = { output: (line) => outputs.push(line), gatherIdentityObservations: async () => observations, now: "2026-07-10T00:00:00.000Z" };
+  const runtime = { output: (line) => outputs.push(line), collectIdentityObservations: async () => ({ status: "ok", observations, reasons: [] }), now: "2026-07-10T00:00:00.000Z" };
 
   const first = await runProvenanceStore(paths, ["snapshot"], runtime);
   assert.equal(first.seeded_identity_count, 1);
@@ -474,10 +474,58 @@ test("runProvenanceStore snapshot seeds known_good entries and is idempotent (ru
   assert.equal(record.origin, "snapshot");
 });
 
+test("runProvenanceStore snapshot uses the status collector, refuses degraded collection, and preserves reconcile bookkeeping", async () => {
+  const paths = await tempPaths();
+  const before = {
+    version: 1,
+    bootstrapped_at: "2026-07-09T00:00:00.000Z",
+    last_reconciled_at: "2026-07-10T00:00:00.000Z",
+    last_reconcile_attempt_at: "2026-07-10T01:00:00.000Z",
+    last_reconcile_status: "degraded",
+    last_reconcile_degraded_reasons: ["proc_net_unreadable"],
+    signatures: {},
+  };
+  await writeSignatureStore(paths, before);
+  await assert.rejects(
+    () => runProvenanceStore(paths, ["snapshot"], {
+      collectIdentityObservations: async () => ({ status: "degraded", observations: [], reasons: ["proc_net_unreadable"] }),
+      now: "2026-07-10T02:00:00.000Z",
+    }),
+    /degraded/i,
+  );
+  const { store } = await loadSignatureStore(paths);
+  assert.equal(store.last_reconciled_at, before.last_reconciled_at);
+  assert.equal(store.last_reconcile_attempt_at, before.last_reconcile_attempt_at);
+  assert.equal(store.last_reconcile_status, before.last_reconcile_status);
+  assert.deepEqual(store.last_reconcile_degraded_reasons, before.last_reconcile_degraded_reasons);
+
+  await runProvenanceStore(paths, ["snapshot"], {
+    collectIdentityObservations: async () => ({ status: "ok", observations: [], reasons: [] }),
+    now: "2026-07-10T03:00:00.000Z",
+  });
+  const afterSuccessfulSnapshot = await loadSignatureStore(paths);
+  assert.equal(afterSuccessfulSnapshot.store.last_reconcile_attempt_at, before.last_reconcile_attempt_at);
+  assert.equal(afterSuccessfulSnapshot.store.last_reconcile_status, before.last_reconcile_status);
+  assert.deepEqual(afterSuccessfulSnapshot.store.last_reconcile_degraded_reasons, before.last_reconcile_degraded_reasons);
+});
+
+test("runProvenanceStore snapshot treats legacy array census injections as degraded unless explicitly opted in", async () => {
+  const paths = await tempPaths();
+  await assert.rejects(
+    () => runProvenanceStore(paths, ["snapshot"], {
+      ownUid: 501,
+      listListeningSocketsWithPid: async () => [],
+      snapshotProvenanceProcesses: async () => [],
+      now: "2026-07-10T00:00:00.000Z",
+    }),
+    /degraded/i,
+  );
+});
+
 test("runProvenanceStore baseline show is bounded and redacted -- never a raw executable path in its output", async () => {
   const paths = await tempPaths();
   const observations = [{ executablePath: "/usr/local/bin/very-secret-tool", sourceClassification: "launchd", owningUser: "0" }];
-  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, gatherIdentityObservations: async () => observations, now: "2026-07-10T00:00:00.000Z" });
+  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, collectIdentityObservations: async () => ({ status: "ok", observations, reasons: [] }), now: "2026-07-10T00:00:00.000Z" });
 
   const outputs = [];
   const entries = await runProvenanceStore(paths, ["baseline", "show", "--json"], { output: (line) => outputs.push(line) });
@@ -493,7 +541,7 @@ test("runProvenanceStore baseline show supports --identity filtering", async () 
     { executablePath: "/bin/one", sourceClassification: "launchd", owningUser: "0" },
     { executablePath: "/bin/two", sourceClassification: "systemd", owningUser: "0" },
   ];
-  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, gatherIdentityObservations: async () => observations, now: "2026-07-10T00:00:00.000Z" });
+  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, collectIdentityObservations: async () => ({ status: "ok", observations, reasons: [] }), now: "2026-07-10T00:00:00.000Z" });
   const { store } = await loadSignatureStore(paths);
   const [targetHash] = Object.keys(store.signatures);
 

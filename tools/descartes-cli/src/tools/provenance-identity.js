@@ -102,24 +102,33 @@ export async function gatherIdentityObservations(options = {}) {
   // Legacy array contract (used by the operator-invoked `descartes provenance snapshot` CLI): the
   // observations only, WITHOUT the collection status. It must never be used as a recovery-coverage
   // authority -- computeProvenanceIdentityCandidates uses collectIdentityObservations below.
-  return (await collectIdentityObservations(options)).observations;
+  // This is the deliberately legacy, array-only API retained for callers that do not consume
+  // census status. Its test seams explicitly opt into the old array contract; the status path and
+  // the snapshot CLI never silently promote those seams to a complete census.
+  return (await collectIdentityObservations({ ...options, allowLegacyArrayCensus: true })).observations;
 }
 
 // Degradation reasons added by the identity gatherer itself (on top of the socket/ps census
 // reasons from provenance-warnings.js's *Status collectors). Fixed enum strings.
 export const IDENTITY_COLLECTION_DEGRADED_REASONS = Object.freeze({
   OWN_UID_UNKNOWN: "own_uid_unknown",
+  OWN_UID_SOCKET_UNATTRIBUTED: "own_uid_socket_unattributed",
   PID_UNRESOLVED: "pid_unresolved",
   EXECUTABLE_UNRESOLVED: "executable_unresolved",
+  LEGACY_ARRAY_CENSUS: "legacy_array_census",
 });
 
 // Resolves a census collector through the DI seams. The status-returning seam
 // (`options.<name>Status`) wins; otherwise a legacy array-returning injection
 // (`options.<name>`, test fakes that REPLACE the raw collector and therefore assert what it saw) is
-// treated as a successful census; otherwise the real status-returning collector runs.
+// treated as a successful census only when an explicit compatibility opt-in is present; otherwise
+// the legacy seam is degraded and the real status-returning collector is used by default.
 async function runCensus(statusFn, legacyFn, defaultStatusFn, field, platform, options) {
   if (statusFn) return statusFn(platform, options);
-  if (legacyFn) return { status: "ok", [field]: await legacyFn(platform, options), reasons: [] };
+  if (legacyFn) {
+    if (options.allowLegacyArrayCensus === true) return { status: "ok", [field]: await legacyFn(platform, options), reasons: [] };
+    return { status: "degraded", [field]: [], reasons: [IDENTITY_COLLECTION_DEGRADED_REASONS.LEGACY_ARRAY_CENSUS] };
+  }
   return defaultStatusFn(platform, options);
 }
 
@@ -350,7 +359,11 @@ export async function computeProvenanceIdentityCandidates(descartesPaths, option
     }
     const writeStore = options.writeSignatureStore ?? writeSignatureStore;
     await writeStore(descartesPaths, currentStore);
-    if (collectionOk) evaluatedAlertKeys = deriveIdentityCoverage(currentStore, { skippedObservations });
+    if (collectionOk) evaluatedAlertKeys = deriveIdentityCoverage(currentStore, {
+      skippedObservations,
+      observations,
+      ts,
+    });
   }
 
   const candidates = deriveIdentityCandidates(currentStore, { now: nowMs, presenceWindowMs: options.identityPresenceWindowMs });
