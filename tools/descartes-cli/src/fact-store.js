@@ -484,6 +484,15 @@ export async function readFactPoints(descartesPaths, options = {}) {
   if (options.windowMs !== undefined && (!Number.isFinite(options.windowMs) || options.windowMs < 0)) {
     throw new Error("readFactPoints requires a finite, non-negative windowMs");
   }
+  // LOW-6 (review fold): certified_after_ts (below) reports max(floor, retention cutoff) -- the
+  // cutoff must be the SAME retentionMs the caller's own write-side retention pass actually uses,
+  // or this surface over/under-claims relative to what that pass really kept. Defaults to
+  // DEFAULT_FACT_RETENTION_MS, mirroring enforceFactRetention's own default exactly; validated the
+  // same way as windowMs just above.
+  if (options.retentionMs !== undefined && (!Number.isFinite(options.retentionMs) || options.retentionMs < 0)) {
+    throw new Error("readFactPoints requires a finite, non-negative retentionMs");
+  }
+  const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const sinceMs = options.windowMs !== undefined ? nowMs - options.windowMs : undefined;
   const { records, corrupt_count, bytes, raw_bytes: rawBytes, exists } = await readJsonLines(storePaths.factsFile);
   const integrity = await readFactIntegrityLedger(descartesPaths);
@@ -525,7 +534,7 @@ export async function readFactPoints(descartesPaths, options = {}) {
     { corrupt_count, schema_invalid_count: schemaInvalidCount },
     nowMs,
     {
-      retentionCutoffMs: nowMs - DEFAULT_FACT_RETENTION_MS,
+      retentionCutoffMs: nowMs - retentionMs,
       oldestCertifiedTs: points.length > 0 ? points[0].ts : null,
     },
   );

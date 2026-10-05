@@ -498,6 +498,33 @@ test("completeness reports the raw floor, certified_after_ts = max(floor, retent
   assert.equal(aged.certified_after_ts, new Date(Date.parse(later) - RETENTION_MS).toISOString());
 });
 
+test("LOW-6 (review fold): certified_after_ts = max(floor, retention cutoff) uses THIS read's own retentionMs, not the hardcoded 30-day default", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(1), "setup: the floor sits at hour(1)");
+
+  const now = hour(6);
+  // With the (hardcoded) 30-day default, the cutoff is far earlier than the floor, so the floor
+  // itself wins -- this is the existing, already-pinned "aged" case above, just at a much shorter
+  // horizon so the distinction below is unambiguous.
+  const withDefault = (await readFactPoints(paths, { now, windowMs: MONTH_WINDOW_MS })).completeness;
+  assert.equal(withDefault.certified_after_ts, hour(1));
+
+  // A caller whose actual retention pass uses a short custom retentionMs (2h) must see a read-side
+  // certified_after_ts that reflects THAT cutoff, not the module default -- otherwise this surface
+  // over-claims certified history the caller's own (shorter) retention window never kept.
+  const customRetentionMs = 2 * HOUR_MS;
+  const withCustom = (await readFactPoints(paths, { now, retentionMs: customRetentionMs, windowMs: MONTH_WINDOW_MS })).completeness;
+  assert.equal(withCustom.bytecap_floor_ts, hour(1), "the raw floor itself is unaffected by retentionMs");
+  assert.equal(
+    withCustom.certified_after_ts,
+    new Date(Date.parse(now) - customRetentionMs).toISOString(),
+    "certified_after_ts must track this read's own retentionMs",
+  );
+  assert.notEqual(withCustom.certified_after_ts, withDefault.certified_after_ts);
+});
+
 test("a zero-cap / all-evicted store reports coverage narrowed, the evicted floor and an empty certified span", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
