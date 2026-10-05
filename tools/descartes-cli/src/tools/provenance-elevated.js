@@ -263,7 +263,7 @@ function requestedEchoMatches(requested, target) {
 }
 
 export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
-  if (typeof rawStdout !== "string" || rawStdout.length === 0 || rawStdout.length > MAX_RESPONSE_BYTES) return undefined;
+  if (typeof rawStdout !== "string" || rawStdout.length === 0 || Buffer.byteLength(rawStdout, "utf8") > MAX_RESPONSE_BYTES) return undefined;
 
   let parsed;
   try {

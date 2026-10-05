@@ -4,24 +4,22 @@
 
 ## Current session — daybreak-blue re-gate fixes (2026-10-05)
 
-On branch `harden/root-helper-2026-10`, the re-gate findings are fixed locally and are not
-pushed. The five finding-scoped commits are `15d3505` (port-owner process identity), `e4ba338`
-(argv-preserving elevated redaction), `a35b25c` (ambiguous/truncated state propagation),
-`2c1a68e` (device+inode executable-generation pinning with one retry), and `eece799` (procfs
-PID-namespace mount check). Port ownership now requires `(tgid,start_time)` equality and uses all
-holders on same-UID and elevated paths. Rust emits argv arrays; Node redacts each element before
-any elevated result leaves the module. Failed per-socket reasons survive aggregation. The helper
-pins `/proc/<pid>/exe` by device+inode before cmdline and after the final recheck. Before opening
-`/proc/<helper-pid>/net`, it verifies `/proc/self` names the helper PID and fails closed with
-`procfs_pid_namespace_mismatch` otherwise.
+On branch `harden/root-helper-2026-10`, the six third-gate findings are fixed locally and are not
+pushed. The finding-scoped commits are `5b5b4ba` (exhaustive same-UID holder scans and socket
+re-verification), `b0d7752` (monotonic owner ambiguity), `f1e7f06` (PID-namespace guard before
+every proc resolution), `bf1d2c1` (argument-filtered `newfstatat`), `3916fbc` (cmdline truncation
+evidence), and `27992a5` (UTF-8 byte response bound). All six carry the required Claude trailer.
+Holder scans now collect every candidate, surface caps/read failures, and recheck the selected
+socket holder and `(tgid,start_time)` once before returning confidence 1. Owner-dependent warnings
+are suppressed for every classified ambiguous/truncated/identity-unavailable reason. The helper
+guards `/proc/self` before `--resolve-pid` and socket resolution; `newfstatat` requires a pinned
+non-`AT_FDCWD` dirfd and zero flags; cmdline truncation is explicit in Rust and Node evidence.
 
-The accepted seccomp residual remains documented: compromised helper control flow still has the
-deliberately retained bounded read-only open/read/stdout capability. `newfstatat` was admitted only
-for the required fixed-path executable-generation check; `statx` and `fstat` remain denied.
-Focused Node tests pass after updating the injected Linux fd-scan fixture to include process
-identity. Escalated fresh-XDG `npm test` is green at 2,038 passed, 0 failed, and 34 skipped.
-The sandboxed run's localhost `listen` EPERM and live `ps` denials are environment-only; Linux
-runtime tests remain CI-only on this macOS host.
+Host Rust formatting/check/test/clippy and both Linux-target test-check/clippy commands pass.
+Escalated fresh-XDG `npm test` is green at 2,045 passed, 0 failed, and 34 skipped. The sandboxed
+fresh-XDG run had 2,023 passed, 22 environment-only failures, and 34 skipped: localhost `listen`
+EPERM in notifier/tap tests plus live process-inspection denials in provenance smoke tests. Linux
+runtime tests remain CI-only on this macOS host. No push or merge was performed.
 
 ## Current session — daybreak-blue root-helper findings (2026-10-05)
 

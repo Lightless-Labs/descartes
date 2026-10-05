@@ -656,6 +656,24 @@ test("resolveElevated degrades on an oversized helper response, rejected before 
   assert.equal(parseAndVerifyHelperResponse(oversized, { ...SOCKET_TARGET }), undefined);
 });
 
+test("parseAndVerifyHelperResponse enforces MAX_RESPONSE_BYTES in UTF-8 bytes, not JavaScript characters", () => {
+  const multibyte = JSON.stringify({
+    requested: { protocol: "tcp", port: 8080, inode: "424242" },
+    resolved: {
+      pid: 4242,
+      tgid: 4242,
+      start_time: 123,
+      uid: 1000,
+      executable_path: "/opt/svc/bin/app",
+      argv: ["app"],
+      padding: "é".repeat(4100),
+    },
+  });
+  assert.ok(multibyte.length < 8 * 1024, "fixture must stay under the old character-count bound");
+  assert.ok(Buffer.byteLength(multibyte, "utf8") > 8 * 1024, "fixture must exceed the byte bound");
+  assert.equal(parseAndVerifyHelperResponse(multibyte, { ...SOCKET_TARGET }), undefined);
+});
+
 // ---------------------------------------------------------------------------------------------
 // 9. Echo-back scope mismatch: a well-formed response for a DIFFERENT pid/port never merges.
 // ---------------------------------------------------------------------------------------------
