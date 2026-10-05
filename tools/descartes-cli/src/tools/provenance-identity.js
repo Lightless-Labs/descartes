@@ -23,13 +23,14 @@ import {
   computeExecutableStatFingerprint,
   computeIdentitySignature,
   deriveIdentityCandidates,
+  deriveIdentityCoverage,
   loadSignatureStore,
-  reconcileSignatures,
+  reconcileSignaturesDetailed,
   writeSignatureStore,
 } from "../provenance-store.js";
 import { buildParentTreeResult } from "./processes.js";
 import { classifySourceFromAncestry, isPublicBindAddress, resolveExecutableInfo } from "./provenance.js";
-import { listListeningSocketsWithPid, snapshotProvenanceProcesses } from "./provenance-warnings.js";
+import { listListeningSocketsWithPidStatus, snapshotProvenanceProcessesStatus } from "./provenance-warnings.js";
 
 const MAX_ANCESTRY_DEPTH = 16;
 
@@ -98,15 +99,83 @@ async function computeIdentityHash(executablePath, options) {
  * (asserts silence, not a degraded-confidence candidate, per the plan's explicit requirement).
  */
 export async function gatherIdentityObservations(options = {}) {
+  // Legacy array contract (used by the operator-invoked `descartes provenance snapshot` CLI): the
+  // observations only, WITHOUT the collection status. It must never be used as a recovery-coverage
+  // authority -- computeProvenanceIdentityCandidates uses collectIdentityObservations below.
+  return (await collectIdentityObservations(options)).observations;
+}
+
+// Degradation reasons added by the identity gatherer itself (on top of the socket/ps census
+// reasons from provenance-warnings.js's *Status collectors). Fixed enum strings.
+export const IDENTITY_COLLECTION_DEGRADED_REASONS = Object.freeze({
+  OWN_UID_UNKNOWN: "own_uid_unknown",
+  PID_UNRESOLVED: "pid_unresolved",
+  EXECUTABLE_UNRESOLVED: "executable_unresolved",
+});
+
+// Resolves a census collector through the DI seams. The status-returning seam
+// (`options.<name>Status`) wins; otherwise a legacy array-returning injection
+// (`options.<name>`, test fakes that REPLACE the raw collector and therefore assert what it saw) is
+// treated as a successful census; otherwise the real status-returning collector runs.
+async function runCensus(statusFn, legacyFn, defaultStatusFn, field, platform, options) {
+  if (statusFn) return statusFn(platform, options);
+  if (legacyFn) return { status: "ok", [field]: await legacyFn(platform, options), reasons: [] };
+  return defaultStatusFn(platform, options);
+}
+
+function censusIsOk(census, field) {
+  return census?.status === "ok" && Array.isArray(census[field]);
+}
+
+/**
+ * Status-reporting own-UID identity gatherer (2026-10, provenance-identity recovery coverage):
+ * `{ status: "ok" | "degraded", observations, reasons }`. Same observations as the pre-2026-10
+ * gatherer, but every way the census could MISS an own-UID identity is surfaced instead of being
+ * swallowed into a silent `[]`:
+ *   - the socket census or ps snapshot itself degraded (lsof/ps/proc failure, truncation, ...);
+ *   - the caller's own uid is undeterminable while listeners exist (every pid would be skipped);
+ *   - a listener pid is missing from the ps snapshot (cannot tell whether it is own-UID);
+ *   - an own-UID pid's executable path cannot be resolved (it could be a tracked identity).
+ * `status:"ok"` therefore means "genuinely and completely observed (possibly nothing)", and ONLY
+ * then may absence be treated as evidence. An OTHER-UID pid is an in-scope exclusion (the UID-scoping
+ * invariant), not a degradation. A degraded result still carries the observations that WERE
+ * genuinely resolved (real presence, safe to fold), never fabricated ones. Residual (documented, not
+ * closable here): on Linux an own-UID socket whose fd-scan races its process exit is
+ * indistinguishable from a cross-UID socket (both come back pid:undefined).
+ */
+export async function collectIdentityObservations(options = {}) {
   const platform = options.platform ?? process.platform;
-  const listSockets = options.listListeningSocketsWithPid ?? listListeningSocketsWithPid;
-  const sockets = await listSockets(platform, options);
+  const reasons = [];
+  const addReason = (reason) => { if (!reasons.includes(reason)) reasons.push(reason); };
+
+  const socketCensus = await runCensus(
+    options.listListeningSocketsWithPidStatus,
+    options.listListeningSocketsWithPid,
+    listListeningSocketsWithPidStatus,
+    "sockets",
+    platform,
+    options,
+  );
+  if (!censusIsOk(socketCensus, "sockets")) {
+    for (const reason of Array.isArray(socketCensus?.reasons) && socketCensus.reasons.length > 0 ? socketCensus.reasons : ["socket_census_degraded"]) addReason(reason);
+  }
+  const sockets = Array.isArray(socketCensus?.sockets) ? socketCensus.sockets : [];
 
   const pids = [...new Set(sockets.map((socket) => socket.pid).filter((pid) => Number.isInteger(pid)))];
-  if (pids.length === 0) return [];
+  if (pids.length === 0) return { status: reasons.length === 0 ? "ok" : "degraded", observations: [], reasons };
 
-  const snapshotProcesses = options.snapshotProvenanceProcesses ?? snapshotProvenanceProcesses;
-  const processes = await snapshotProcesses(platform, options);
+  const processCensus = await runCensus(
+    options.snapshotProvenanceProcessesStatus,
+    options.snapshotProvenanceProcesses,
+    snapshotProvenanceProcessesStatus,
+    "processes",
+    platform,
+    options,
+  );
+  if (!censusIsOk(processCensus, "processes")) {
+    for (const reason of Array.isArray(processCensus?.reasons) && processCensus.reasons.length > 0 ? processCensus.reasons : ["process_census_degraded"]) addReason(reason);
+  }
+  const processes = Array.isArray(processCensus?.processes) ? processCensus.processes : [];
   const processByPid = new Map(processes.map((item) => [item.pid, item]));
 
   // Object.hasOwn, not a `!== undefined` check: an EXPLICIT `ownUid: undefined` means "the uid
@@ -129,15 +198,32 @@ export async function gatherIdentityObservations(options = {}) {
   const maxAncestryDepth = options.maxAncestryDepth ?? MAX_ANCESTRY_DEPTH;
   const observations = [];
 
+  // Listeners exist but whose they are cannot be decided: no pid can be confirmed own-UID, so the
+  // census cannot claim any tracked identity is absent.
+  if (ownUid === undefined) addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.OWN_UID_UNKNOWN);
+  const processCensusOk = censusIsOk(processCensus, "processes");
+
   for (const pid of pids) {
     const processRecord = processByPid.get(pid);
-    if (!processRecord || ownUid === undefined || processRecord.uid !== ownUid) continue; // UID-scoped: silent skip, never degraded.
+    if (!processRecord) {
+      // Not in the ps snapshot (exited between lsof and ps, or a partial snapshot): ownership
+      // unknown. Still never fabricated into an observation -- but it IS a census gap. (When the ps
+      // census itself already degraded, that reason already covers every pid.)
+      if (processCensusOk) addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.PID_UNRESOLVED);
+      continue;
+    }
+    if (ownUid === undefined || processRecord.uid !== ownUid) continue; // UID-scoped: other-UID is out of scope (silent, never an observation).
 
     const ancestryChain = buildAncestryChain(processes, pid, maxAncestryDepth);
     const source = classifySourceFromAncestry(ancestryChain);
     const executableInfo = await resolveExeInfo(pid);
     const executablePath = executableInfo?.executable_path;
-    if (!executablePath) continue; // Never fabricate an identity around an unresolved path.
+    if (!executablePath) {
+      // Never fabricate an identity around an unresolved path -- but an own-UID listener we could
+      // not identify might be a tracked identity, so the census is incomplete.
+      addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.EXECUTABLE_UNRESOLVED);
+      continue;
+    }
 
     const pidSockets = socketsByPid.get(pid) ?? [];
     const publicPortKeys = [
@@ -163,7 +249,7 @@ export async function gatherIdentityObservations(options = {}) {
     });
   }
 
-  return observations;
+  return { status: reasons.length === 0 ? "ok" : "degraded", observations, reasons };
 }
 
 /**
@@ -183,36 +269,86 @@ export async function gatherIdentityObservations(options = {}) {
  *
  * S5-follow-2 (Codex review finding #5, Part A): the same `now` this function already computes
  * for its own rate-limit due-check is also threaded into deriveIdentityCandidates as its presence
- * reference point, so a candidate recovers once its record's last_seen falls outside
+ * reference point, so a candidate stops being emitted once its record's last_seen falls outside
  * provenance-store.js's DEFAULT_IDENTITY_PRESENCE_WINDOW_MS -- see that function's own doc
- * comment for the recovery mechanism itself.
+ * comment.
+ *
+ * DETECTOR-REPORTED RECOVERY COVERAGE (plan 2026-09-20 §8.B; 2026-10 conversion of this DEFERRED
+ * producer). Returns `{ candidates, evaluatedAlertKeys }` on EVERY path. A candidate no longer being
+ * emitted is NOT, by itself, a recovery: the daemon recovers a persisted identity alert only when
+ * its alertId is in `evaluatedAlertKeys`, and this function reports an identity there ONLY when
+ * THIS tick's collection genuinely and successfully re-observed the host:
+ *   - gate off / never bootstrapped / store unreadable-as-empty -> no keys (freeze);
+ *   - not due (inside the reconcile interval; no fresh host I/O this tick) -> no keys (freeze; a
+ *     present candidate is still emitted from the store, so active alerts stay active);
+ *   - due + collection DEGRADED (any census gap -- see collectIdentityObservations) or malformed ->
+ *     no keys, `last_reconciled_at` NOT advanced, no record treated as departed; only the
+ *     genuinely-resolved observations (real presence) are folded;
+ *   - due + collection OK -> every identity/port/target the freshly re-observed store tracks
+ *     (provenance-store.js's deriveIdentityCoverage): present -> evaluated (still fires); genuinely
+ *     absent -> evaluated-clear (recovers once outside the presence window); except anything a
+ *     transient-stat-skipped observation could be (running but unverified -> never clear).
+ *
+ * RECONCILE BOOKKEEPING: `last_reconciled_at` = last SUCCESSFUL complete reconcile only;
+ * `last_reconcile_attempt_at` = the rate-limit clock, advanced on every attempt (so a persistently
+ * degraded host is re-probed hourly, not every fast tick). A legacy store without the attempt field
+ * falls back to `last_reconciled_at` for the due-check.
  */
 export async function computeProvenanceIdentityCandidates(descartesPaths, options = {}) {
   const loadConfig = options.loadLearnedConfig ?? loadLearnedConfig;
   const learnedConfig = await loadConfig(descartesPaths);
-  if (!learnedConfig.enabled) return [];
+  if (!learnedConfig.enabled) return { candidates: [], evaluatedAlertKeys: [] };
 
   const loadStore = options.loadSignatureStore ?? loadSignatureStore;
   const { store } = await loadStore(descartesPaths);
-  if (!store.bootstrapped_at) return [];
+  if (!store.bootstrapped_at) return { candidates: [], evaluatedAlertKeys: [] };
 
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
-  const lastReconciledMs = new Date(store.last_reconciled_at ?? 0).getTime();
+  const lastAttemptMs = new Date(store.last_reconcile_attempt_at ?? store.last_reconciled_at ?? 0).getTime();
   const reconcileIntervalMs = options.identityReconcileIntervalMs ?? DEFAULT_IDENTITY_RECONCILE_INTERVAL_MS;
-  const due = !Number.isFinite(lastReconciledMs) || nowMs - lastReconciledMs >= reconcileIntervalMs;
+  const due = !Number.isFinite(lastAttemptMs) || nowMs - lastAttemptMs >= reconcileIntervalMs;
 
   let currentStore = store;
+  let evaluatedAlertKeys = [];
   if (due) {
-    const gather = options.gatherIdentityObservations ?? gatherIdentityObservations;
-    const observations = await gather(options);
+    const collect = options.collectIdentityObservations ?? collectIdentityObservations;
+    const collection = await collect(options);
+    // Fail-safe: only an explicit, well-formed "ok" is a successful observation. A bare array, a
+    // missing/unknown status, or a non-array observations field is DEGRADED.
+    const observations = Array.isArray(collection?.observations) ? collection.observations : [];
+    const collectionOk = collection?.status === "ok" && Array.isArray(collection?.observations);
     const ts = options.ts ?? new Date(nowMs).toISOString();
-    const reconciled = reconcileSignatures(store, observations, { ts, iterationKey: ts, ...options, seedKnownGood: false });
-    currentStore = { ...reconciled, last_reconciled_at: ts };
+    const { store: reconciled, skippedObservations } = reconcileSignaturesDetailed(
+      store,
+      observations,
+      { ts, iterationKey: ts, ...options, seedKnownGood: false },
+    );
+    if (collectionOk) {
+      currentStore = {
+        ...reconciled,
+        last_reconciled_at: ts,
+        last_reconcile_attempt_at: ts,
+        last_reconcile_status: "ok",
+        last_reconcile_degraded_reasons: [],
+      };
+    } else {
+      const reasons = Array.isArray(collection?.reasons) && collection.reasons.length > 0
+        ? collection.reasons
+        : ["malformed_collection"];
+      currentStore = {
+        ...reconciled, // carries the store's previous last_reconciled_at through UNCHANGED
+        last_reconcile_attempt_at: ts,
+        last_reconcile_status: "degraded",
+        last_reconcile_degraded_reasons: reasons,
+      };
+    }
     const writeStore = options.writeSignatureStore ?? writeSignatureStore;
     await writeStore(descartesPaths, currentStore);
+    if (collectionOk) evaluatedAlertKeys = deriveIdentityCoverage(currentStore, { skippedObservations });
   }
 
-  return deriveIdentityCandidates(currentStore, { now: nowMs, presenceWindowMs: options.identityPresenceWindowMs });
+  const candidates = deriveIdentityCandidates(currentStore, { now: nowMs, presenceWindowMs: options.identityPresenceWindowMs });
+  return { candidates, evaluatedAlertKeys };
 }
 
 // Additive, exported for test-fixture reuse/clarity (mirrors provenance-store.js's own export of
