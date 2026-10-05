@@ -46,6 +46,7 @@ import {
   isPublicBindAddress,
   isRecognizedSupervisorSourceType,
   listProcPids,
+  MAX_LINUX_FD_SCAN_PIDS,
   parseProcNetContents,
   parseProvenancePs,
   provenancePsArgsForPlatform,
@@ -340,44 +341,81 @@ export async function computeProvenanceWarningCandidates(descartesPaths, options
 // I/O-performing structural sub-collector.
 // ---------------------------------------------------------------------------------------------
 
-async function listMacListeningSockets(options) {
+// Bound on the macOS lsof listener parse (unchanged from S4). The status-reporting variant parses
+// one entry past it so a census that HIT the bound is reported as truncated, not complete.
+const MAX_MAC_LISTENING_SOCKETS = 200;
+
+// Degradation reason codes surfaced by the *Status siblings below (fixed enum strings, safe to
+// persist/log -- never raw host data).
+export const SOCKET_CENSUS_DEGRADED_REASONS = Object.freeze({
+  LSOF_UNAVAILABLE: "lsof_unavailable",
+  LSOF_TRUNCATED: "lsof_truncated",
+  PROC_NET_UNREADABLE: "proc_net_unreadable",
+  PROC_PID_ENUMERATION_FAILED: "proc_pid_enumeration_failed",
+  PROC_PID_SCAN_TRUNCATED: "proc_pid_scan_truncated",
+  UNSUPPORTED_PLATFORM: "unsupported_platform",
+  PS_UNAVAILABLE: "ps_unavailable",
+  PS_EMPTY: "ps_empty",
+});
+
+// Shared detail-returning implementations: `{ sockets, reasons }`, where `reasons` lists every way
+// this census could NOT claim completeness. The legacy array wrappers below return `.sockets` only
+// (byte-identical to the pre-2026-10 behavior, including the Linux pid-enumeration THROW, which the
+// warnings collector's timedEnvelope deliberately relies on to fail closed).
+async function listMacListeningSocketsDetailed(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const probe = await runExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { timeout: 3500, maxBuffer: 512 * 1024 });
-  if (probe.status !== "ok") return [];
-  return parseMacLsofListeningSockets(probe.stdout, { limit: 200 }).map((entry) => ({
+  // NOTE (conservative, documented): lsof also exits non-zero when there are simply NO listeners,
+  // and runFixedExecFile discards the failed run's stdout/stderr, so that case is indistinguishable
+  // from a genuine failure here and is reported degraded (an over-freeze, never a fabricated clear).
+  if (probe.status !== "ok") return { sockets: [], reasons: [SOCKET_CENSUS_DEGRADED_REASONS.LSOF_UNAVAILABLE] };
+  const parsed = parseMacLsofListeningSockets(probe.stdout, { limit: MAX_MAC_LISTENING_SOCKETS + 1 });
+  const reasons = parsed.length > MAX_MAC_LISTENING_SOCKETS ? [SOCKET_CENSUS_DEGRADED_REASONS.LSOF_TRUNCATED] : [];
+  const sockets = parsed.slice(0, MAX_MAC_LISTENING_SOCKETS).map((entry) => ({
     protocol: entry.protocol,
     local_address: entry.local_address,
     local_port: entry.local_port,
     pid: entry.pid,
   }));
+  return { sockets, reasons };
 }
 
-async function listLinuxListeningSockets(options) {
+const LINUX_PROC_NET_SOURCES = [
+  ["tcp", "/proc/net/tcp"],
+  ["tcp6", "/proc/net/tcp6"],
+  ["udp", "/proc/net/udp"],
+  ["udp6", "/proc/net/udp6"],
+];
+
+async function listLinuxListeningSocketsDetailed(options) {
   const readFileFn = options.readFile ?? ((file) => fsReadFile(file, "utf8"));
-  const sources = [
-    ["tcp", "/proc/net/tcp"],
-    ["tcp6", "/proc/net/tcp6"],
-    ["udp", "/proc/net/udp"],
-    ["udp6", "/proc/net/udp6"],
-  ];
+  const reasons = [];
   const entries = [];
-  for (const [protocol, filePath] of sources) {
+  for (const [protocol, filePath] of LINUX_PROC_NET_SOURCES) {
     try {
       const contents = await readFileFn(filePath);
       entries.push(...parseProcNetContents(contents, { protocol }));
-    } catch {
-      // This /proc source is unavailable on this host; continue with the others.
+    } catch (error) {
+      // This /proc source is unavailable on this host; continue with the others (legacy behavior).
+      // For the census STATUS: ENOENT on an IPv6 source means the kernel exposes no such family
+      // (IPv6 disabled) -- no socket of that family can exist, so the census is still complete.
+      // Any other failure (or any failure on an IPv4 source) leaves sockets unobserved.
+      const familyAbsent = error?.code === "ENOENT" && protocol.endsWith("6");
+      if (!familyAbsent && !reasons.includes(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_UNREADABLE)) {
+        reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_UNREADABLE);
+      }
     }
   }
   const listening = entries.filter((entry) => (entry.protocol.startsWith("tcp") ? entry.state === "LISTEN" : true));
-  if (listening.length === 0) return [];
+  if (listening.length === 0) return { sockets: [], reasons };
 
   const listPids = options.listProcPids ?? listProcPids;
   const scanFds = options.scanProcFdForInode ?? scanProcFdForInode;
-  const candidatePids = await listPids();
+  const candidatePids = await listPids(); // may throw: the legacy wrapper propagates, the status variant catches
+  if (candidatePids.length >= MAX_LINUX_FD_SCAN_PIDS) reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.PROC_PID_SCAN_TRUNCATED);
   const fdScanResults = await scanFds(candidatePids);
 
-  return listening.map((entry) => {
+  const sockets = listening.map((entry) => {
     const match = resolvePidFromFdScanResults(entry.inode, fdScanResults);
     return {
       protocol: entry.protocol,
@@ -386,6 +424,7 @@ async function listLinuxListeningSockets(options) {
       pid: match.status === "ok" ? match.pid : undefined,
     };
   });
+  return { sockets, reasons };
 }
 
 /**
@@ -393,11 +432,44 @@ async function listLinuxListeningSockets(options) {
  * via lsof; Linux: own-UID only, via the /proc/net + fd-walk mechanism — cross-UID sockets
  * come back with pid:undefined and are silently excluded from any per-pid classification
  * below, never fabricated). Exported so it is independently unit-testable per platform.
+ *
+ * Legacy contract: degrades to a (possibly empty) array and never says WHY. Callers that must
+ * distinguish "observed nothing" from "could not observe" (the provenance-identity reconcile's
+ * recovery coverage) use listListeningSocketsWithPidStatus instead.
  */
 export async function listListeningSocketsWithPid(platform, options = {}) {
-  if (platform === "darwin") return listMacListeningSockets(options);
-  if (platform === "linux") return listLinuxListeningSockets(options);
+  if (platform === "darwin") return (await listMacListeningSocketsDetailed(options)).sockets;
+  if (platform === "linux") return (await listLinuxListeningSocketsDetailed(options)).sockets;
   return [];
+}
+
+/**
+ * Status-reporting sibling of listListeningSocketsWithPid (2026-10, provenance-identity recovery
+ * coverage): `{ status: "ok" | "degraded", sockets, reasons }`. `status:"ok"` means the census was
+ * genuinely and completely obtained (possibly empty); `"degraded"` means some listening sockets may
+ * be unobserved (lsof failure/truncation, unreadable /proc/net source, pid-enumeration failure or
+ * truncation, unsupported platform), so ABSENCE from `sockets` proves nothing. Never throws for a
+ * collector failure -- a failure is a reason, not an exception.
+ */
+export async function listListeningSocketsWithPidStatus(platform, options = {}) {
+  let detailed;
+  try {
+    if (platform === "darwin") detailed = await listMacListeningSocketsDetailed(options);
+    else if (platform === "linux") detailed = await listLinuxListeningSocketsDetailed(options);
+    else return { status: "degraded", sockets: [], reasons: [SOCKET_CENSUS_DEGRADED_REASONS.UNSUPPORTED_PLATFORM] };
+  } catch {
+    return { status: "degraded", sockets: [], reasons: [SOCKET_CENSUS_DEGRADED_REASONS.PROC_PID_ENUMERATION_FAILED] };
+  }
+  return { status: detailed.reasons.length === 0 ? "ok" : "degraded", sockets: detailed.sockets, reasons: detailed.reasons };
+}
+
+async function snapshotProvenanceProcessesDetailed(platform, options) {
+  const runExec = options.runFixedExecFile ?? runFixedExecFile;
+  const psResult = await runExec("ps", provenancePsArgsForPlatform(platform), { timeout: 3000, maxBuffer: 8 * 1024 * 1024 });
+  if (psResult.status !== "ok") return { processes: [], reasons: [SOCKET_CENSUS_DEGRADED_REASONS.PS_UNAVAILABLE] };
+  const processes = parseProvenancePs(psResult.stdout);
+  // A successful ps always lists at least itself: an empty parse is a broken snapshot, not "no processes".
+  return { processes, reasons: processes.length === 0 ? [SOCKET_CENSUS_DEGRADED_REASONS.PS_EMPTY] : [] };
 }
 
 /**
@@ -405,9 +477,16 @@ export async function listListeningSocketsWithPid(platform, options = {}) {
  * listening pid's ancestry lookup below) — not one `ps` call per listener.
  */
 export async function snapshotProvenanceProcesses(platform, options = {}) {
-  const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const psResult = await runExec("ps", provenancePsArgsForPlatform(platform), { timeout: 3000, maxBuffer: 8 * 1024 * 1024 });
-  return psResult.status === "ok" ? parseProvenancePs(psResult.stdout) : [];
+  return (await snapshotProvenanceProcessesDetailed(platform, options)).processes;
+}
+
+/**
+ * Status-reporting sibling of snapshotProvenanceProcesses (2026-10): `{ status, processes, reasons }`
+ * -- a failed or empty ps snapshot is `"degraded"`, never a silent `[]`.
+ */
+export async function snapshotProvenanceProcessesStatus(platform, options = {}) {
+  const detailed = await snapshotProvenanceProcessesDetailed(platform, options);
+  return { status: detailed.reasons.length === 0 ? "ok" : "degraded", processes: detailed.processes, reasons: detailed.reasons };
 }
 
 /**

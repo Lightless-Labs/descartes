@@ -27,7 +27,10 @@ const execFileAsync = promisify(execFile);
 // `ucomm` alias, so one column set works unmodified on both platforms.
 const PROVENANCE_PS_COLUMNS = "pid,ppid,uid,pcpu,pmem,rss,ucomm,args";
 const MAX_ANCESTRY_DEPTH = 16;
-const MAX_LINUX_FD_SCAN_PIDS = 4096;
+// Exported (additive, 2026-10 provenance-identity recovery coverage): the status-reporting socket
+// lister in provenance-warnings.js needs this cap to detect a TRUNCATED pid scan (owners past the
+// cap are unobserved, not absent).
+export const MAX_LINUX_FD_SCAN_PIDS = 4096;
 
 const CRON_COMMS = new Set(["cron", "crond", "atd"]);
 const SHELL_COMMS = new Set(["bash", "zsh", "sh", "fish"]);
