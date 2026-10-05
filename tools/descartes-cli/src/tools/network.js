@@ -142,20 +142,36 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
   }).filter(Boolean).slice(0, limit);
 }
 
-export function parseMacLsofListeningSockets(stdout, { limit = 50 } = {}) {
-  return stdout.split("\n").slice(1).map((line) => line.trim()).filter(Boolean).map((line) => {
-    const match = line.match(/^(\S+)\s+(\d+)\s+\S+.*\s+(TCP)\s+(.+?)\s+\(LISTEN\)$/);
-    if (!match) return undefined;
+export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}) {
+  const entries = [];
+  let rejected = 0;
+  for (const line of String(stdout ?? "").split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
+    const match = line.match(/^(\S+)\s+(\d+)\s+\S+.*\s+(TCP|UDP)\s+(.+?)(?:\s+\(LISTEN\))?$/);
+    const protocol = match?.[3]?.toLowerCase();
+    const isTcp = protocol === "tcp";
+    if (!match || (isTcp && !/\(LISTEN\)$/.test(line))) {
+      rejected += 1;
+      continue;
+    }
     const local = parseAddressPort(match[4]);
-    return {
-      protocol: match[3].toLowerCase(),
-      state: "LISTEN",
+    if (!local.address || local.port === undefined) {
+      rejected += 1;
+      continue;
+    }
+    entries.push({
+      protocol,
+      state: isTcp ? "LISTEN" : "UNCONN",
       command: match[1],
       pid: Number(match[2]),
       local_address: local.address,
       local_port: local.port,
-    };
-  }).filter(Boolean).slice(0, limit);
+    });
+  }
+  return { entries: entries.slice(0, limit), rejected, truncated: entries.length > limit };
+}
+
+export function parseMacLsofListeningSockets(stdout, { limit = 50 } = {}) {
+  return parseMacLsofListeningSocketsDetailed(stdout, { limit }).entries;
 }
 
 async function collectDefaultRoutes() {

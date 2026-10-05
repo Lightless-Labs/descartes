@@ -37,7 +37,7 @@ import { loadLearnedConfig } from "../constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "../diagnostics-sanitizer.js";
 import { readFactPoints } from "../fact-store.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
-import { parseMacLsofListeningSockets } from "./network.js";
+import { parseMacLsofListeningSocketsDetailed } from "./network.js";
 import { buildParentTreeResult } from "./processes.js";
 import {
   classifySourceFromAncestry,
@@ -47,7 +47,7 @@ import {
   isRecognizedSupervisorSourceType,
   listProcPids,
   MAX_LINUX_FD_SCAN_PIDS,
-  parseProcNetContents,
+  parseProcNetContentsDetailed,
   parseProvenancePs,
   provenancePsArgsForPlatform,
   resolveExecutableInfo,
@@ -349,8 +349,10 @@ const MAX_MAC_LISTENING_SOCKETS = 200;
 // persist/log -- never raw host data).
 export const SOCKET_CENSUS_DEGRADED_REASONS = Object.freeze({
   LSOF_UNAVAILABLE: "lsof_unavailable",
+  LSOF_UNPARSEABLE: "lsof_unparseable",
   LSOF_TRUNCATED: "lsof_truncated",
   PROC_NET_UNREADABLE: "proc_net_unreadable",
+  PROC_NET_UNPARSEABLE: "proc_net_unparseable",
   PROC_PID_ENUMERATION_FAILED: "proc_pid_enumeration_failed",
   PROC_PID_SCAN_TRUNCATED: "proc_pid_scan_truncated",
   UNSUPPORTED_PLATFORM: "unsupported_platform",
@@ -364,19 +366,31 @@ export const SOCKET_CENSUS_DEGRADED_REASONS = Object.freeze({
 // warnings collector's timedEnvelope deliberately relies on to fail closed).
 async function listMacListeningSocketsDetailed(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { timeout: 3500, maxBuffer: 512 * 1024 });
-  // NOTE (conservative, documented): lsof also exits non-zero when there are simply NO listeners,
-  // and runFixedExecFile discards the failed run's stdout/stderr, so that case is indistinguishable
-  // from a genuine failure here and is reported degraded (an over-freeze, never a fabricated clear).
-  if (probe.status !== "ok") return { sockets: [], reasons: [SOCKET_CENSUS_DEGRADED_REASONS.LSOF_UNAVAILABLE] };
-  const parsed = parseMacLsofListeningSockets(probe.stdout, { limit: MAX_MAC_LISTENING_SOCKETS + 1 });
-  const reasons = parsed.length > MAX_MAC_LISTENING_SOCKETS ? [SOCKET_CENSUS_DEGRADED_REASONS.LSOF_TRUNCATED] : [];
-  const sockets = parsed.slice(0, MAX_MAC_LISTENING_SOCKETS).map((entry) => ({
+  const tcpProbe = await runExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { timeout: 3500, maxBuffer: 512 * 1024 });
+  const udpProbe = await runExec("lsof", ["-nP", "-iUDP"], { timeout: 3500, maxBuffer: 512 * 1024 });
+  // Both protocol families are required for a complete census. In particular, a successful TCP
+  // probe cannot authorize absence when the UDP probe failed or was not run.
+  const reasons = [];
+  if (tcpProbe.status !== "ok" || udpProbe.status !== "ok") reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.LSOF_UNAVAILABLE);
+  const parsedProbes = [tcpProbe, udpProbe]
+    .filter((probe) => probe.status === "ok")
+    .map((probe) => parseMacLsofListeningSocketsDetailed(probe.stdout, { limit: MAX_MAC_LISTENING_SOCKETS + 1 }));
+  if (parsedProbes.some((parsed) => parsed.rejected > 0)) reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.LSOF_UNPARSEABLE);
+  if (parsedProbes.some((parsed) => parsed.truncated)) reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.LSOF_TRUNCATED);
+  const parsed = parsedProbes.flatMap((result) => result.entries);
+  const unique = [...new Map(parsed.map((entry) => [
+    `${entry.protocol}\u0000${entry.local_address}\u0000${entry.local_port}\u0000${entry.pid}`,
+    entry,
+  ])).values()];
+  const sockets = unique.slice(0, MAX_MAC_LISTENING_SOCKETS).map((entry) => ({
     protocol: entry.protocol,
     local_address: entry.local_address,
     local_port: entry.local_port,
     pid: entry.pid,
   }));
+  if (unique.length > MAX_MAC_LISTENING_SOCKETS && !reasons.includes(SOCKET_CENSUS_DEGRADED_REASONS.LSOF_TRUNCATED)) {
+    reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.LSOF_TRUNCATED);
+  }
   return { sockets, reasons };
 }
 
@@ -394,7 +408,11 @@ async function listLinuxListeningSocketsDetailed(options) {
   for (const [protocol, filePath] of LINUX_PROC_NET_SOURCES) {
     try {
       const contents = await readFileFn(filePath);
-      entries.push(...parseProcNetContents(contents, { protocol }));
+      const parsed = parseProcNetContentsDetailed(contents, { protocol });
+      entries.push(...parsed.entries);
+      if (parsed.rejected > 0 && !reasons.includes(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_UNPARSEABLE)) {
+        reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_UNPARSEABLE);
+      }
     } catch (error) {
       // This /proc source is unavailable on this host; continue with the others (legacy behavior).
       // For the census STATUS: ENOENT on an IPv6 source means the kernel exposes no such family
@@ -422,6 +440,7 @@ async function listLinuxListeningSocketsDetailed(options) {
       local_address: entry.local_address,
       local_port: entry.local_port,
       pid: match.status === "ok" ? match.pid : undefined,
+      pids: match.status === "ok" ? match.pids : [],
       // Linux /proc/net exposes the owning uid even when /proc/<pid>/fd is EACCES. The
       // status path carries this fact so provenance-identity can distinguish an unattributed
       // own-UID listener from an out-of-scope cross-UID listener. The legacy wrapper below
@@ -445,7 +464,7 @@ async function listLinuxListeningSocketsDetailed(options) {
 export async function listListeningSocketsWithPid(platform, options = {}) {
   if (platform === "darwin") return (await listMacListeningSocketsDetailed(options)).sockets;
   if (platform === "linux") {
-    return (await listLinuxListeningSocketsDetailed(options)).sockets.map(({ uid: _uid, ...socket }) => socket);
+    return (await listLinuxListeningSocketsDetailed(options)).sockets.map(({ uid: _uid, pids: _pids, ...socket }) => socket);
   }
   return [];
 }

@@ -356,6 +356,7 @@ test("listListeningSocketsWithPid('darwin', ...) parses a fixed lsof fixture int
   const sockets = await listListeningSocketsWithPid("darwin", {
     runFixedExecFile: async (command, args) => {
       assert.equal(command, "lsof");
+      if (args.includes("-iUDP")) return { status: "ok", stdout: `${LSOF_HEADER}` };
       assert.deepEqual(args, ["-nP", "-iTCP", "-sTCP:LISTEN"]);
       return { status: "ok", stdout: lsofFixture };
     },
@@ -436,11 +437,33 @@ const LSOF_HEADER = "COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF 
 
 test("listListeningSocketsWithPidStatus('darwin'): a clean lsof census is status ok with its sockets", async () => {
   const result = await listListeningSocketsWithPidStatus("darwin", {
-    runFixedExecFile: async () => ({ status: "ok", stdout: `${LSOF_HEADER}node     1234 me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:3000 (LISTEN)\n` }),
+    runFixedExecFile: async (_command, args) => ({
+      status: "ok",
+      stdout: args.includes("-iUDP")
+        ? `${LSOF_HEADER}node     1234 me     24u  IPv4 0xabc              0t0  UDP 0.0.0.0:5353\n`
+        : `${LSOF_HEADER}node     1234 me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:3000 (LISTEN)\n`,
+    }),
   });
   assert.equal(result.status, "ok");
   assert.deepEqual(result.reasons, []);
-  assert.deepEqual(result.sockets, [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 3000, pid: 1234 }]);
+  assert.deepEqual(result.sockets, [
+    { protocol: "tcp", local_address: "0.0.0.0", local_port: 3000, pid: 1234 },
+    { protocol: "udp", local_address: "0.0.0.0", local_port: 5353, pid: 1234 },
+  ]);
+});
+
+test("listListeningSocketsWithPidStatus('darwin'): UDP is inventoried and an unparseable lsof row degrades the census", async () => {
+  const result = await listListeningSocketsWithPidStatus("darwin", {
+    runFixedExecFile: async (_command, args) => ({
+      status: "ok",
+      stdout: args.includes("-iUDP")
+        ? `${LSOF_HEADER}node     1234 me     24u  IPv4 0xabc              0t0  UDP 0.0.0.0:5353\nBROKEN UDP ROW\n`
+        : LSOF_HEADER,
+    }),
+  });
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("lsof_unparseable"));
+  assert.deepEqual(result.sockets, [{ protocol: "udp", local_address: "0.0.0.0", local_port: 5353, pid: 1234 }]);
 });
 
 test("listListeningSocketsWithPidStatus('darwin'): lsof failure is DEGRADED, never a silent empty census", async () => {
@@ -487,7 +510,7 @@ test("listListeningSocketsWithPidStatus('linux'): every v4 /proc/net source read
   const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions());
   assert.equal(result.status, "ok");
   assert.deepEqual(result.reasons, []);
-  assert.deepEqual(result.sockets, [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777, uid: 1000 }]);
+  assert.deepEqual(result.sockets, [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777, pids: [777], uid: 1000 }]);
 });
 
 test("listListeningSocketsWithPidStatus('linux'): ENOENT on every /proc/net source is DEGRADED, including tcp", async () => {
@@ -508,6 +531,30 @@ test("listListeningSocketsWithPidStatus('linux'): an unreadable v4 /proc/net sou
   }));
   assert.equal(result.status, "degraded");
   assert.ok(result.reasons.includes("proc_net_unreadable"));
+});
+
+test("listListeningSocketsWithPidStatus('linux'): an unparseable /proc/net row is DEGRADED", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") return `${PROC_NET_TCP_LISTEN_OWN_UID}\nnot a proc net row`;
+      if (file === "/proc/net/udp") return "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("proc_net_unparseable"));
+});
+
+test("listListeningSocketsWithPidStatus('linux'): a socket census records every pid holding an inode", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    scanProcFdForInode: async (pids) => pids.map((pid) => ({
+      pid,
+      accessible: true,
+      fds: pid === 777 || pid === 778 ? [{ fd: "12", target: "socket:[12345]" }] : [],
+    })),
+    listProcPids: async () => [777, 778],
+  }));
+  assert.deepEqual(result.sockets[0].pids, [777, 778]);
 });
 
 test("listListeningSocketsWithPidStatus('linux'): a non-ENOENT failure on a v6 /proc/net source is DEGRADED", async () => {

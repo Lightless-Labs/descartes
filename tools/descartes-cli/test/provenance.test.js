@@ -68,7 +68,15 @@ test("resolvePidFromFdScanResults matches an inode to its owning pid for an acce
     { pid: 100, accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }] },
     { pid: 200, accessible: true, fds: [{ fd: "3", target: "socket:[99999]" }] },
   ];
-  assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), { status: "ok", pid: 100, confidence: 1 });
+  assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), { status: "ok", pid: 100, pids: [100], confidence: 1 });
+});
+
+test("resolvePidFromFdScanResults returns every pid holding the inode, not only the first match", () => {
+  const result = resolvePidFromFdScanResults("12345", [
+    { pid: 100, accessible: true, fds: [{ fd: "1", target: "socket:[12345]" }] },
+    { pid: 200, accessible: true, fds: [{ fd: "2", target: "socket:[12345]" }] },
+  ]);
+  assert.deepEqual(result.pids, [100, 200]);
 });
 
 test("resolvePidFromFdScanResults degrades to partial with no fabricated pid when the fd walk is EACCES", () => {
