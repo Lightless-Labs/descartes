@@ -722,6 +722,15 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
     return {
       status,
       ...commonCompletenessFields(base, nowMs, extras),
+      // LOW-2 (review fold, fact-store capacity plan 2026-10-05): `base` falls back to
+      // createFactIntegrityLedger() when `ledger` is null, and a fresh ledger's floor is always
+      // null -- so coverageFields would otherwise report "full", over-claiming that this read
+      // knows byte-cap eviction never narrowed this store. With no ledger there is nothing to
+      // support that claim either way; coverage is itself unknown. This is narrower than the
+      // branch's own `!ledger` condition on purpose: a ledger that DOES exist but is merely
+      // unresolvable this read (continuityObservation "unknown", e.g. a pending pass) still
+      // carries a real floor worth reporting.
+      ...(ledger === null ? { coverage: "unknown" } : {}),
       continuity_ok: continuityOk,
       degraded_reason: status === "degraded" ? "continuity_break" : "continuity_unknown",
     };

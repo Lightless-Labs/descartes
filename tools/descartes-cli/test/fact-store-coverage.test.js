@@ -473,6 +473,20 @@ test("a floor more than FUTURE_FACT_TOLERANCE_MS ahead of the read fails closed 
   assert.notEqual((await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS })).completeness.status, "intact");
 });
 
+test("LOW-2 (review fold): when there is no ledger at all (missing/unreadable/invalid), completeness reports coverage 'unknown', never the over-claimed 'full' -- a fresh/default ledger's floor is always null, so coverageFields alone cannot tell 'no ledger to support the claim' apart from 'never narrowed'", async () => {
+  const paths = await tempPaths();
+  const { dir, factsFile } = resolveFactStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(factsFile, `${serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n")}\n`);
+  await writeRawLedger(paths, { not: "a valid ledger" });
+  assert.equal((await readFactIntegrityLedger(paths)).ledger, null, "setup: the ledger does not parse as valid");
+  const read = await readFactPoints(paths, { now: hour(0), windowMs: MONTH_WINDOW_MS });
+  assert.notEqual(read.completeness.status, "intact");
+  assert.equal(read.completeness.coverage, "unknown", "no ledger means coverage is itself unknown, not an over-claimed 'full'");
+  assert.equal(read.completeness.bytecap_floor_ts, null);
+  assert.equal(read.completeness.certified_after_ts, null);
+});
+
 test("F2-Tier1 fold-in: continuity.oldest_ts is not a coverage boundary -- completeness reports certified fields instead, and no trust path reads oldest_ts", async () => {
   const paths = await tempPaths();
   await appendHourlyTicks(paths, { count: 2, maxBytes: Number.MAX_SAFE_INTEGER });

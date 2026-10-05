@@ -300,7 +300,11 @@ function renderLearnedConfigStatus(config, configFile) {
 }
 
 const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "future_floor", "none"];
-const COVERAGE_VALUES = ["full", "narrowed"]; // "unknown" only when there is no read to report
+// LOW-2 (review fold): "unknown" is now also what a real read reports when there is no ledger at
+// all (buildCompleteness, fact-store-integrity.js) -- not only the no-read-to-report case here.
+// Either way, COVERAGE_VALUES itself still only validates "full"/"narrowed"; a genuine "unknown"
+// falls through this selector's own invalid-value fallback to "unknown" below.
+const COVERAGE_VALUES = ["full", "narrowed"];
 // The loss channels, from the single shared definition (fact-store-completeness.js). Since R0b
 // (fact-store capacity plan §4.1 item 4) last_bytecap_evict_ts is NOT among them: byte-cap eviction
 // narrows coverage (reported via bytecap_floor_ts/certified_after_ts/coverage), it is not a loss.
