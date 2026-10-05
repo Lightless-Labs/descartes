@@ -592,7 +592,8 @@ The per-family stores sit in new paths. The legacy store is only quarantined (if
   Each stays below its family's worst-case certified span (re-confirmed against the S0-revised budgets at §15.4). The horizon applies only after narrowing (the default).
 - **Q3 Migration:** fresh per-family stores. This removes M2′ and M4 (§14).
 - **Q4 Legacy store:** quarantine for 31 days, outside the facts tree, then delete.
-- **Q5–Q8:** the recommended defaults (Q5 ignore + deprecation note; Q6 defer; Q7 fixed budget + `history_horizon_short`; Q8 keep the `provenance` store).
+- **Q5, Q7, Q8:** the recommended defaults (Q5 ignore + deprecation note; Q7 fixed budget + `history_horizon_short`; Q8 keep the `provenance` store).
+- **Q6 First/last-seen set: IN SCOPE (operator, 2026-10-05, after G1).** G1 showed that novelty over a narrowed window fabricates "new" for an entity last seen before the floor (§16). The operator chose to pull §5.4 into R0 as **S3b** rather than keep novelty silent under narrowing or accept re-flags. See §17.
 
 ---
 
@@ -784,3 +785,16 @@ This is intentionally an **interim S2** gate. **S3 must not simply lift it by ad
 6. **Removing canary's independent re-arm copy** (deviation 9).
 7. **For the operator (Q1 follow-up):** the S0 budget revision. Service 18, process_lineage 10, scheduled_job 5 and peer 16 MiB, so 65 MiB in total (§15.4). This lands in S4.
 8. **MEDIUM-1's interim full-coverage gate shape.** Is `requireFullCoverage` (opt-in on `factHistoryTrustworthy`, consumed only by the miner, shadow evaluator and correlation) the right INTERIM shape for S2-S3, or should S3's per-reader horizons for those three specifically be pulled forward rather than shipping a blunter gate first? The gate has no anchor-relative carve-out and no horizon of its own: it refuses outright on ANY narrowing, which is strictly more conservative than any per-reader horizon S3 would set (a reader could still be refused long after its own horizon would have cleared it). The six watch-tier detectors and the daemon's per-family history veto are unaffected either way -- they never called `factHistoryTrustworthy` with an anchor-equivalent widening problem in the first place, since their own re-arm/coverage logic already gates on the loss channels directly, not on this generic check's coverage field.
+
+---
+
+## 17. Addendum: S3b first/last-seen set (2026-10-05)
+
+**Addendum:** 2026-10-05 — G1 blocker 1 (novelty over a narrowed window) plus operator decision Q6 = in scope. Adds step **S3b** between S3 and S4.
+
+- **What:** one compact, trust-bearing seen-set per novelty family (`service`, `scheduled_job`, `process_lineage`): entity key → `{first_seen_ts, last_seen_ts}`, retained 30 days past `last_seen_ts`, bounded by an entry cap with overflow ⇒ that family's novelty goes ineligible (never silently drops an entry).
+- **Fold rule:** folded only from complete, certified, non-future ticks, in the same pass as the fact append (crash-consistent with the fact ledger: a seen-set generation stamp tied to the family ledger lineage; a mismatch or a missing/corrupt set ⇒ cold start for that family's novelty, never "everything is new").
+- **Read rule:** `service.appeared`, `scheduled_job.appeared` and `process.lineage.novel_edge` decide novelty against the seen-set, not the retained fact window. With the seen-set valid, the interim `requireFullCoverage` novelty gate (§16) is lifted for these three rules; without it, the gate stays.
+- **Invariants (new):** I13 eviction from the fact store never changes a seen-set answer; I14 a seen-set that cannot prove continuity yields no novelty claim (re-arm), never a claim.
+- **Tests:** G1's reproduction (entity at t0, absent t1–t3, back at t4, t0 evicted ⇒ no candidate) passes via the seen-set; seen-set loss ⇒ re-arm; partial tick never folded; cap overflow ⇒ ineligible + status reason.
+- **Gate:** covered by G2 (S3b lands before S4).
