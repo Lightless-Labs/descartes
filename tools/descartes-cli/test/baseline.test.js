@@ -88,6 +88,23 @@ const A1_SCENARIOS = [
     expectWatching: false,
   },
   {
+    name: "established store but corrupt fact lines this read (detector would re-arm the lockout)",
+    store: A1_ESTABLISHED_STORE,
+    tickCount: 31,
+    nowHour: 30.5,
+    completeness: { status: "intact" },
+    corruptCount: 1,
+    expectWatching: false,
+  },
+  {
+    name: "established store whose last_folded_ts is in the future (clock rollback)",
+    store: { cold_start_pending: false, last_folded_ts: a1Ts(40) },
+    tickCount: 31,
+    nowHour: 30.5,
+    completeness: { status: "intact" },
+    expectWatching: false,
+  },
+  {
     name: "established, fresh, trusted, count baseline established (positive control)",
     store: A1_ESTABLISHED_STORE,
     tickCount: 31,
@@ -213,7 +230,7 @@ for (const scenario of A1_SCENARIOS) {
     await writeSessionBaselineStore(paths, scenario.store);
     await writePeerBaselineStore(paths, scenario.store);
     const points = a1Points(scenario.tickCount);
-    const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: scenario.completeness });
+    const readFactPoints = async () => ({ points, corrupt_count: scenario.corruptCount ?? 0, schema_invalid_count: 0, completeness: scenario.completeness });
     const now = new Date(A1_BASE_MS + scenario.nowHour * A1_HOUR_MS).toISOString();
 
     const status = await buildBaselineStatus(paths, { now, readFactPoints });
@@ -268,6 +285,33 @@ test("A1: untrustworthy history and a stale census each report their own reason,
     readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } }),
   });
   assert.match(stale.domains.find((entry) => entry.domain === "session").phase, /^stale — /);
+});
+
+test("A1: corrupt facts, a clock rollback, an incomplete latest census and an empty window each get their own non-watching phase", async () => {
+  const points = a1Points(31);
+  const statusOf = async (store, { corruptCount = 0, extraPoints = [], readPoints = [...points, ...extraPoints], nowHour = 30.5 } = {}) => {
+    const paths = await tempPaths();
+    await writeSessionBaselineStore(paths, store);
+    const result = await buildBaselineStatus(paths, {
+      now: a1Ts(nowHour),
+      readFactPoints: async () => ({ points: readPoints, corrupt_count: corruptCount, schema_invalid_count: 0, completeness: { status: "intact" } }),
+    });
+    return result.domains.find((entry) => entry.domain === "session");
+  };
+
+  const corrupt = await statusOf(A1_ESTABLISHED_STORE, { corruptCount: 1 });
+  assert.equal(corrupt.phase, "locked out — fact history untrustworthy (corrupt_facts_this_tick)");
+
+  const rollback = await statusOf({ cold_start_pending: false, last_folded_ts: a1Ts(40) });
+  assert.equal(rollback.phase, "locked out — fact history untrustworthy (clock_rollback)");
+
+  const partialLatest = await statusOf(A1_ESTABLISHED_STORE, {
+    extraPoints: [{ ts: a1Ts(30.25), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "partial" } }],
+  });
+  assert.equal(partialLatest.phase, "cannot establish — census incomplete");
+
+  const empty = await statusOf(A1_ESTABLISHED_STORE, { readPoints: [] });
+  assert.equal(empty.phase, "stale — no complete census in the fact-history window");
 });
 
 test("R2: on a fresh install the count rules (session, peer) show progress toward the 30-sample count baseline, the binding requirement; the census domains keep N of 6", async () => {
