@@ -669,7 +669,7 @@ export function deriveIdentityCandidates(store, options = {}) {
  * the store is never reported (stays frozen). A fingerprint with no safe value (the builders'
  * shared "unknown" fallback) is never reported.
  */
-export function deriveIdentityCoverage(store, { skippedObservations = [] } = {}) {
+export function deriveIdentityCoverage(store, { skippedObservations = [], observations = [], ts } = {}) {
   if (!store?.bootstrapped_at) return [];
   const signatures = store.signatures ?? {};
 
@@ -700,6 +700,57 @@ export function deriveIdentityCoverage(store, { skippedObservations = [] } = {})
     for (const identityHash of unverifiedObservationMatches(signatures, observation)) {
       excludedIdentityHashes.add(identityHash);
       for (const targetKey of recordTargetKeys(signatures[identityHash])) excludeTarget(targetKey);
+    }
+  }
+
+  // `port_target_keys` is intentionally bounded for introspection. It is not authoritative: an
+  // older port can be evicted while the process continues to bind it. A current observation is the
+  // only authority for a port held this tick, and every current holder must have a complete raw
+  // port list whose folded record still contains that port before coverage can authorize it.
+  const currentPortHolders = new Map();
+  const currentObservedIdentities = new Map(
+    ts === undefined
+      ? []
+      : Object.entries(signatures)
+        .filter(([, record]) => record?.last_seen === ts)
+        .map(([identityHash, record]) => [identityHash, { observation: undefined, record }]),
+  );
+  for (const observation of observations ?? []) {
+    const identityHash = computeIdentitySignature(observation);
+    const record = signatures[identityHash];
+    if (!record || (ts !== undefined && record.last_seen !== ts)) continue;
+    currentObservedIdentities.set(identityHash, { observation, record });
+    for (const portKey of Array.isArray(observation?.portTargetKeys) ? observation.portTargetKeys : []) {
+      if (!portKey) continue;
+      if (!currentPortHolders.has(portKey)) currentPortHolders.set(portKey, []);
+      currentPortHolders.get(portKey).push({ identityHash, observation, record });
+    }
+  }
+  for (const [portKey, holders] of currentPortHolders) {
+    const everyHolderIsComplete = holders.every(({ observation, record }) => (
+      observation?.portTargetKeysTruncated !== true
+      && observation?.portTargetKeysComplete !== false
+      && Array.isArray(record.port_target_keys)
+      && record.port_target_keys.includes(portKey)
+    ));
+    if (!everyHolderIsComplete) excludeTarget(`port.${portKey}`);
+  }
+
+  // A re-keying/reparenting event can leave the old record inside the presence window while a
+  // different record, observed on this tick, takes over its process or port target. That is not a
+  // departure and must not clear the old identity's alert. Freeze the old record and its targets;
+  // the new record may still report its own positive identity key.
+  if (ts !== undefined && currentObservedIdentities.size > 0) {
+    for (const [identityHash, record] of Object.entries(signatures)) {
+      const recordTargets = new Set(recordTargetKeys(record));
+      const hasDifferentCurrentHolder = [...currentObservedIdentities.entries()].some(([otherHash, entry]) => (
+        otherHash !== identityHash
+        && [...recordTargets].some((targetKey) => recordTargetKeys(entry.record).includes(targetKey))
+      ));
+      if (hasDifferentCurrentHolder) {
+        excludedIdentityHashes.add(identityHash);
+        for (const targetKey of recordTargets) excludeTarget(targetKey);
+      }
     }
   }
 

@@ -639,6 +639,67 @@ test("deriveIdentityCoverage EXCLUDES every identity/target a transient-stat-ski
   assert.ok(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090"))));
 });
 
+test("deriveIdentityCoverage excludes a currently-bound port when a bounded record evicted that port from its introspection list", () => {
+  const observation = {
+    executablePath: "/opt/current/bin",
+    identityHash: "cccccccccccccccc",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.7070"],
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = reconcileSignatures({ version: 1, signatures: {} }, [observation], { ts: "2026-07-10T10:00:00.000Z" });
+  store.bootstrapped_at = "2026-07-10T00:00:00.000Z";
+  // Model the bounded record after a later observation evicted the old port. The raw current
+  // observation still proves tcp.7070 is bound, but the persisted list cannot authorize coverage.
+  store.signatures[identityHash].port_target_keys = ["tcp.1", "tcp.2", "tcp.3", "tcp.4", "tcp.5"];
+  const keys = new Set(deriveIdentityCoverage(store, {
+    observations: [observation],
+    ts: "2026-07-10T10:00:00.000Z",
+  }));
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7070"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.7070"))), false);
+});
+
+test("deriveIdentityCoverage keeps a re-keyed record frozen when a different record observed this tick shares its process target", () => {
+  const oldRecord = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T00:00:00.000Z",
+    inputs_hash: { executable_path_hash: "shared-process", identity_hash: "old", source_classification: "shell", owning_user_hash: "u" },
+    port_target_keys: ["tcp.7070"],
+  };
+  const currentRecord = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T04:00:00.000Z",
+    inputs_hash: { executable_path_hash: "shared-process", identity_hash: "new", source_classification: "shell", owning_user_hash: "u" },
+    port_target_keys: ["tcp.7070"],
+  };
+  const store = { ...coverageStore(), signatures: { old: oldRecord, current: currentRecord } };
+  const keys = new Set(deriveIdentityCoverage(store, { ts: "2026-07-10T04:00:00.000Z" }));
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("old"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("process.shared-process"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.7070"))), false);
+});
+
+test("deriveIdentityCoverage never reports the builders' shared unknown fallback fingerprint", () => {
+  const store = {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      "": {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T00:00:00.000Z",
+        inputs_hash: {},
+        port_target_keys: [],
+      },
+    },
+  };
+  assert.equal(deriveIdentityCoverage(store).some((key) => key.endsWith("\u0000unknown")), false);
+});
+
 test("deriveIdentityCoverage applies exclusions in FINGERPRINT space: a covered target whose sanitized fingerprint collides with an excluded one is not reported", () => {
   const store = coverageStore();
   const observation = { executablePath: "/opt/gone/bin", identityHash: undefined, sourceClassification: "shell", owningUser: "501", portTargetKeys: [] };
