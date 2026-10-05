@@ -1165,6 +1165,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // self-contained.
   let horizonVetoedRuleIds = new Set(RULE_HORIZONS.keys());
   let horizonShortRuleIds = new Set();
+  // S3b review LOW-2: true when a tier is on but this tick's read could not report coverage
+  // (missing/invalid ledger, or the read threw) -- the horizon-short block is then carried forward.
+  let horizonStateUnknown = false;
   let noveltySeenSets;
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
@@ -1203,6 +1206,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     if (coverage === "full" || coverage === "narrowed") {
       const tierOff = new Set(tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }));
       horizonShortRuleIds = new Set([...horizonVetoedRuleIds].filter((ruleId) => !tierOff.has(ruleId)));
+    } else {
+      horizonStateUnknown = true;
     }
   } else {
     // BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf): when NEITHER tier is
@@ -1289,6 +1294,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       rules[ruleId] = { since_ts: Number.isFinite(priorSinceMs) && priorSinceMs <= nowMs ? new Date(priorSinceMs).toISOString() : nowIsoForHorizon };
     }
     historyHorizonShort = { threshold_ms: HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs, rules };
+  } else if (horizonStateUnknown) {
+    // S3b review LOW-2: an untrusted read is WORSE than short, not a clear. Omitting the block would
+    // let the always-covered fixed alert "recover" and restart every since clock, so the prior block
+    // is carried forward unchanged (whatever its age -- every rule is vetoed this tick, so none is
+    // evaluating; LOW-1's continuity gate applies to EXTENDING a short run, not to holding state
+    // through an unknown one). Nothing to carry (no prior block) stays nothing: never fabricated.
+    const priorBlock = (await readPriorStatusOnce())?.history_horizon_short;
+    if (priorBlock && typeof priorBlock === "object" && !Array.isArray(priorBlock)) historyHorizonShort = priorBlock;
   }
 
   const collectorHasError = evidence.some((envelope) => envelope.status === "error")

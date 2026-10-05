@@ -31,6 +31,7 @@ import {
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPoints, enforceFactRetention, normalizeFactPoint, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { resolveFactIntegrityPaths } from "../src/fact-store-integrity.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { alertId, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
@@ -4747,6 +4748,41 @@ test("S3b review LOW-1: since_ts carries only from a prior status at most one st
   for (const badTs of [undefined, "garbage", new Date(nowMs + 60 * 60 * 1000).toISOString()]) {
     const result = await run(badTs);
     assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now, `prior ts ${String(badTs)}`);
+  }
+});
+
+test("S3b review LOW-2: an untrusted history read (missing ledger, or the read throws) carries the prior horizon-short block forward -- the fixed alert never fabricates a recovery, and no since clock restarts", async () => {
+  for (const variant of ["ledger-missing", "read-throws"]) {
+    const paths = await tempPaths();
+    await writeLearnedConfig(paths, { enabled: true });
+    const now = S_LIVE_1_TICK_TS;
+    const nowMs = Date.parse(now);
+    const longAgo = new Date(nowMs - 3 * 24 * 60 * 60 * 1000).toISOString();
+    await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+    const first = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      readDaemonStatus: async () => ({ ts: new Date(nowMs - 30 * 60 * 1000).toISOString(), history_horizon_short: { rules: { [SESSION_COUNT_DROP_RULE_ID]: { since_ts: longAgo } } } }),
+    });
+    const before = first.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+    assert.equal(before?.status, "active", `${variant}: setup -- the signal is active`);
+
+    const next = new Date(nowMs + 60 * 1000).toISOString();
+    const options = { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: next, now: next };
+    if (variant === "ledger-missing") {
+      await fs.rm(resolveFactIntegrityPaths(paths).integrityFile);
+    } else {
+      options.readFactPoints = async (descartesPaths, readOptions) => {
+        if (readOptions?.seenSetFamilies) throw new Error("injected history read failure");
+        return readFactPoints(descartesPaths, readOptions);
+      };
+    }
+    const second = await runDaemonIteration(paths, options);
+    assert.deepEqual(second.status.history_horizon_short, first.status.history_horizon_short, `${variant}: the prior block is carried unchanged`);
+    const after = second.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+    assert.equal(after?.status, "active", `${variant}: untrusted history is worse than short -- never a fabricated recovery`);
   }
 });
 
