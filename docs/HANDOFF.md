@@ -8,8 +8,8 @@ The fifth-gate findings were fixed locally on `harden/root-helper-2026-10` witho
 merge. Finding-scoped code commits are `eae944f` (Rust final post-enumeration holder
 verification), `f486c7a` (authoritative Node refreshes plus final verification), `9a1bc43`
 (Node procfs PID-namespace guard), `ad73771` (preserved elevated-helper failure evidence), and
-`a930335` (Rust blocker clippy follow-up). They all carry the required Claude trailer. The
-handoff correction is the final commit in this round.
+`a930335` (Rust blocker clippy follow-up), and `e08dab7` (Rust pinned `Tgid:` recheck). They all
+carry the required Claude trailer. The handoff correction is the final commit in this round.
 
 Verification passed: `cargo fmt --check`; workspace/all-target `cargo check`; Linux-target
 `cargo check --tests` and `clippy -D warnings` for x86_64 and aarch64; host clippy; and
