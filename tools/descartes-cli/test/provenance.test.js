@@ -51,6 +51,13 @@ test("parseProcNetLine skips malformed rows without throwing", () => {
   assert.equal(parseProcNetLine("", { protocol: "tcp" }), undefined);
 });
 
+test("parseProcNetLine excludes connected UDP rows and keeps only state 07", () => {
+  const connected = " 0: 0100007F:1F90 0100007F:1770 01 00000000:00000000 00:00000000 00000000     1000        0 12345 1 0000000000000000 100 0 0 10 0";
+  const unconnected = " 1: 0100007F:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000     1000        0 12346 1 0000000000000000 100 0 0 10 0";
+  assert.equal(parseProcNetLine(connected, { protocol: "udp" }), undefined);
+  assert.equal(parseProcNetLine(unconnected, { protocol: "udp" }).state, "UNCONN");
+});
+
 test("parseProcNetContents parses a multi-row /proc/net/tcp fixture, skipping the header", () => {
   const contents = [
     "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",

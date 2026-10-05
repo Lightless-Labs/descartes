@@ -128,6 +128,8 @@ async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {})
     if (error?.code === HELPER_EXIT_FD_SCAN_TRUNCATED) result.fd_scan_truncated = true;
     if (error?.code === HELPER_EXIT_HARDENING_FAILURE) result.helper_hardening_failure = true;
     if (error?.code === HELPER_EXIT_OWNER_AMBIGUOUS) result.owner_ambiguous = true;
+    if (error?.signal === "SIGSYS") result.helper_seccomp_killed = true;
+    if (error?.killed === true) result.helper_timeout_killed = true;
     return result;
   }
 }

@@ -271,6 +271,8 @@ export function parseProcNetLine(line, { protocol } = {}) {
   if (address === undefined || Number.isNaN(localPort)) return undefined;
 
   const stateHex = String(parts[3] ?? "").toUpperCase();
+  const isUdp = String(protocol ?? "").startsWith("udp");
+  if (isUdp && stateHex !== "07") return undefined;
   const uid = Number(parts[7]);
   const inode = parts[9];
 
@@ -278,7 +280,7 @@ export function parseProcNetLine(line, { protocol } = {}) {
     protocol: protocol ?? (isV6 ? "tcp6" : "tcp"),
     local_address: address,
     local_port: localPort,
-    state: String(protocol ?? "").startsWith("udp") ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
+    state: isUdp ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
     uid: Number.isFinite(uid) ? uid : undefined,
     inode,
   };
@@ -753,15 +755,24 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // 2026-10 (research finding 8): the helper's confinement (NNP/seccomp/cap-drop) failed to engage
   // and it aborted fail-closed -- its own exit code now, never conflated with a truncated scan.
   const helperHardeningFailure = observedInvoke?.helper_hardening_failure === true;
+  // The live seccomp filter kills the helper with SIGSYS rather than returning a normal exit
+  // code. Keep that distinct from its own fail-closed exit 4 so operators can tell a policy
+  // violation/self-SIGSYS from an initialization failure.
+  const helperSeccompKilled = observedInvoke?.helper_seccomp_killed === true;
+  // execFile marks a child killed by its timeout with `killed:true`; preserve that as a separate
+  // diagnostic instead of making it look like a generic unavailable helper.
+  const helperTimeoutKilled = observedInvoke?.helper_timeout_killed === true;
   // 2026-10 (research finding 2): the exact socket is held by processes running different
   // executables -- the helper named no owner rather than guess.
   const ownerAmbiguous = observedInvoke?.owner_ambiguous === true;
   const withDiagnostics = (outcome) => {
-    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure && !ownerAmbiguous) return outcome; // byte-identical: no diagnostic fields.
+    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure && !helperSeccompKilled && !helperTimeoutKilled && !ownerAmbiguous) return outcome; // byte-identical: no diagnostic fields.
     const privilege = { ...outcome.result.privilege };
     if (ptraceScope !== undefined) privilege.ptrace_scope = ptraceScope;
     if (fdScanTruncated) privilege.fd_scan_truncated = true;
     if (helperHardeningFailure) privilege.helper_hardening_failure = true;
+    if (helperSeccompKilled) privilege.helper_seccomp_killed = true;
+    if (helperTimeoutKilled) privilege.helper_timeout_killed = true;
     if (ownerAmbiguous) privilege.elevated_owner_ambiguous = true;
     return { ...outcome, result: { ...outcome.result, privilege } };
   };

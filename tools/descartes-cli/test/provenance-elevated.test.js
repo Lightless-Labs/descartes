@@ -430,6 +430,30 @@ test("defaultInvokeElevatedHelper maps the helper's EXIT_HARDENING_FAILURE (4) t
   assert.equal(result.fd_scan_truncated, undefined, "a confinement failure must never be labelled a truncated scan");
 });
 
+test("defaultInvokeElevatedHelper surfaces a SIGSYS termination as helper_seccomp_killed", async () => {
+  const paths = await tempPaths();
+  const helperPath = path.join(paths.stateDir, "helper-sigsys");
+  await fs.mkdir(path.dirname(helperPath), { recursive: true });
+  await fs.writeFile(helperPath, "#!/bin/sh\nkill -SYS $$\n", { mode: 0o755 });
+
+  const result = await defaultInvokeElevatedHelper(helperPath, ["--resolve-pid", "1"]);
+  assert.equal(result.status, "unable");
+  assert.equal(result.helper_seccomp_killed, true);
+  assert.equal(result.helper_timeout_killed, undefined);
+});
+
+test("defaultInvokeElevatedHelper surfaces a timeout kill separately", async () => {
+  const paths = await tempPaths();
+  const helperPath = path.join(paths.stateDir, "helper-timeout");
+  await fs.mkdir(path.dirname(helperPath), { recursive: true });
+  await fs.writeFile(helperPath, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+
+  const result = await defaultInvokeElevatedHelper(helperPath, ["--resolve-pid", "1"], { invokeTimeoutMs: 20 });
+  assert.equal(result.status, "unable");
+  assert.equal(result.helper_timeout_killed, true);
+  assert.equal(result.helper_seccomp_killed, undefined);
+});
+
 test("resolveCrossUidPortResult surfaces helper_hardening_failure (not fd_scan_truncated) when the helper aborted fail-closed on confinement (exit 4), still degrading to the unprivileged baseline", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
@@ -445,6 +469,22 @@ test("resolveCrossUidPortResult surfaces helper_hardening_failure (not fd_scan_t
   assert.equal(outcome.resolvedStatus, "partial");
   assert.equal(outcome.result.resolved.pid, undefined);
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1", helper_hardening_failure: true });
+});
+
+test("resolveCrossUidPortResult surfaces helper seccomp and timeout diagnostics under privilege", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  for (const diagnostic of ["helper_seccomp_killed", "helper_timeout_killed"]) {
+    const options = fakeElevatedOptions({
+      paths,
+      probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+      invokeElevatedHelper: async () => ({ status: "unable", [diagnostic]: true, stdout: "", stderr: "" }),
+      readFile: async () => "1\n",
+    });
+    const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
+    assert.equal(outcome.result.privilege[diagnostic], true);
+  }
 });
 
 test("resolveCrossUidPortResult bounds the untrusted helper's executable_path (truncated) before it reaches the envelope/LLM", async () => {

@@ -11,7 +11,8 @@
 //! between Node's observation and the helper's could be misattributed at confidence 1.
 //! `--resolve-socket <protocol> <port> <inode>` binds the request to the exact socket Node observed:
 //!   1. the helper reads ONLY `/proc/net/<protocol>` and requires the row with EXACTLY that inode
-//!      to still exist with the same port (and LISTEN state for TCP) -- else "not found";
+//!      to still exist with the same port (LISTEN state for TCP, state 07 for UDP) -- else "not
+//!      found";
 //!   2. it collects every process holding `socket:[<inode>]` (a socket inode can be shared across
 //!      processes by fork inheritance / fd passing);
 //!   3. holders that disagree on executable are AMBIGUOUS (distinct exit code, no answer);
@@ -63,8 +64,8 @@ impl Protocol {
         }
     }
 
-    /// TCP sockets must still be LISTENing (Node only ever selects LISTEN rows for TCP); UDP has
-    /// no listen state (Node accepts any UDP row on the port), so its state is not constrained.
+    /// TCP sockets must still be LISTENing (Node only ever selects LISTEN rows for TCP); UDP is
+    /// limited to state 07, the bound/unconnected rows Node can attribute as listeners.
     pub fn requires_listen(self) -> bool {
         matches!(self, Protocol::Tcp | Protocol::Tcp6)
     }
@@ -102,6 +103,7 @@ const STATE_COLUMN: usize = 3;
 const UID_COLUMN: usize = 7;
 const INODE_COLUMN: usize = 9;
 const TCP_LISTEN_STATE: &str = "0A";
+const UDP_UNCONNECTED_STATE: &str = "07";
 
 /// Finds the row whose inode column is exactly `inode` in a `/proc/net/{tcp,udp}[6]` table
 /// (header line skipped). Malformed rows are skipped, never guessed at.
@@ -138,7 +140,12 @@ pub fn find_row(contents: &str, inode: u64) -> Option<SocketRow> {
 /// Whether the live row still describes the socket the caller observed: same port, and (TCP)
 /// still LISTENing. The inode already matched (`find_row`).
 pub fn row_admits(row: &SocketRow, target: &SocketTarget) -> bool {
-    row.port == target.port && (!target.protocol.requires_listen() || row.state == TCP_LISTEN_STATE)
+    row.port == target.port
+        && if target.protocol.requires_listen() {
+            row.state == TCP_LISTEN_STATE
+        } else {
+            row.state == UDP_UNCONNECTED_STATE
+        }
 }
 
 /// The facts `select_holder` decides on, one per process found holding the socket.
@@ -267,9 +274,14 @@ mod tests {
             inode: 515151,
         };
         assert!(
-            row_admits(&established, &udp),
-            "UDP has no listen state to require"
+            !row_admits(&established, &udp),
+            "UDP resolution is limited to state 07 (unconnected/bound)"
         );
+        let udp_bound = SocketRow {
+            state: "07".to_string(),
+            ..established
+        };
+        assert!(row_admits(&udp_bound, &udp));
     }
 
     fn holder(pid: u32, uid: u32, exe: &str) -> HolderFacts {
