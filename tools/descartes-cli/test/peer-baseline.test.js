@@ -1721,6 +1721,52 @@ test("R8 identity migration: a legacy global peer alert freezes under VPN-only e
   assert.equal(alerts.find((alert) => alert.id === vpnKey)?.status, "recovered");
 });
 
+test("R8 identity migration mirrors for peer.count_drop: legacy global freezes while v2:vpn raises and clears", async () => {
+  const legacyKey = alertId(PEER_COUNT_DROP_RULE_ID, "global");
+  const vpnKey = alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT);
+  const legacyAlert = {
+    id: legacyKey,
+    rule_id: PEER_COUNT_DROP_RULE_ID,
+    fingerprint: "global",
+    severity: "warning",
+    title: "Peer count drop",
+    summary: "legacy alert",
+    diagnostics: {},
+    evidence_refs: ["peer-baseline"],
+    status: "active",
+    first_seen: tickTs(0),
+    last_seen: tickTs(30),
+    last_notified: null,
+    cooldown_until: null,
+    acknowledged_at: null,
+  };
+
+  const paths = await tempPaths();
+  const stableTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) stableTicks.push(...activeTickWithMarker(tickTs(i), 10));
+  const dropTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  const dropTicks = [...stableTicks, ...activeTickWithMarker(dropTs, 1)];
+  const drop = await seedAndCompute(paths, dropTicks, { now: dropTs });
+  assert.equal(drop.candidates.find((candidate) => candidate.rule_id === PEER_COUNT_DROP_RULE_ID)?.fingerprint, PEER_COUNT_VPN_FINGERPRINT);
+  let alerts = applyAlertCandidates([legacyAlert], drop.candidates, {
+    now: dropTs,
+    coveredAlertIds: new Set(drop.evaluatedAlertKeys),
+  }).alerts;
+  assert.equal(alerts.find((alert) => alert.id === legacyKey)?.status, "active", "the legacy global drop alert must freeze");
+  assert.equal(alerts.find((alert) => alert.id === vpnKey)?.status, "active", "the v2 VPN drop alert must raise");
+
+  const clearTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
+  await appendFactPoints(paths, activeTickWithMarker(clearTs, 10), { now: clearTs });
+  const clear = await computePeerBaselineCandidates(paths, { now: clearTs });
+  assert.equal(clear.candidates.some((candidate) => candidate.id === vpnKey), false, "the v2 VPN drop must clear");
+  alerts = applyAlertCandidates(alerts, clear.candidates, {
+    now: clearTs,
+    coveredAlertIds: new Set(clear.evaluatedAlertKeys),
+  }).alerts;
+  assert.equal(alerts.find((alert) => alert.id === legacyKey)?.status, "active", "the legacy global drop must remain frozen");
+  assert.equal(alerts.find((alert) => alert.id === vpnKey)?.status, "recovered", "only the v2 VPN drop must recover");
+});
+
 test("computePeerBaselineCandidates calls the real (default) loadWatchConfig when not injected -- watch.json defaults to enabled:true (the inversion of learned.json's old enabled:false), so a fresh state dir now proceeds PAST the gate and reaches real I/O, returning [] only for lack of history (cold-start), not a kill switch", async () => {
   const paths = await tempPaths();
   let readCalled = false;
