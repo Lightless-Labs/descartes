@@ -235,7 +235,7 @@ test("evaluateAndLogShadowConstraints keeps normal behavior for intact history a
       schema_invalid_count: 0,
       completeness: {
         status: "intact",
-        last_bytecap_evict_ts: new Date(nowMs + 1).toISOString(),
+        last_corrupt_ts: new Date(nowMs + 1).toISOString(),
       },
     }),
   });

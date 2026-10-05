@@ -20,10 +20,12 @@ async function tempPaths() {
 
 const NOW = "2026-08-21T00:00:00.000Z";
 
+// Fact-store capacity plan (2026-10-05, R0b §4.1 item 4): last_bytecap_evict_ts is no longer a
+// loss channel -- byte-cap eviction narrows coverage (bytecap_floor_ts) instead. See the
+// "byte-cap eviction is informational" test below for the explicit non-loss assertion.
 const LOSS_CHANNELS = [
   "last_corrupt_ts",
   "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
   "last_continuity_break_ts",
   // BLOCKER 2 (daybreak re-gate): last_future_fact_ts must be a first-class anchor-relative loss
   // channel exactly like its four siblings above -- Fix 0 stamped it into buildCompleteness's
@@ -100,17 +102,31 @@ test("factHistoryTrustworthy never trusts a legacy or malformed read shape", () 
   }, { anchorTs: NOW }), { trust: false, reason: "history_degraded" });
 });
 
+// Fixture channel changed from last_bytecap_evict_ts to last_corrupt_ts by the fact-store capacity
+// plan (2026-10-05): byte-cap eviction is no longer a loss channel (R0b), so it can no longer stand
+// in for "a loss" here; the test's intent (a transient loss before the anchor recovers, a sustained
+// one does not) is unchanged.
 test("factHistoryTrustworthy permits recovery after a transient loss and blocks sustained loss", () => {
   const lossTs = "2026-08-21T00:00:01.000Z";
   const recovered = cleanReadResult({
-    completeness: { status: "intact", last_bytecap_evict_ts: lossTs },
+    completeness: { status: "intact", last_corrupt_ts: lossTs },
   });
   assert.deepEqual(factHistoryTrustworthy(recovered, { anchorTs: "2026-08-21T00:00:02.000Z" }), { trust: true, reason: "ok" });
 
   const sustained = cleanReadResult({
-    completeness: { status: "degraded", last_bytecap_evict_ts: "2026-08-21T00:00:03.000Z" },
+    completeness: { status: "degraded", last_corrupt_ts: "2026-08-21T00:00:03.000Z" },
   });
   assert.deepEqual(factHistoryTrustworthy(sustained, { anchorTs: "2026-08-21T00:00:02.000Z" }), { trust: false, reason: "history_degraded" });
+});
+
+test("byte-cap eviction is informational, not a loss channel (R0b): last_bytecap_evict_ts after the anchor neither untrusts history nor re-arms a detector", () => {
+  const anchorTs = "2026-08-21T00:00:10.000Z";
+  const nowMs = Date.parse("2026-08-21T00:01:00.000Z");
+  const read = cleanReadResult({ completeness: { last_bytecap_evict_ts: "2026-08-21T00:00:30.000Z", bytecap_floor_ts: "2026-08-21T00:00:05.000Z", coverage: "narrowed" } });
+  assert.deepEqual(factHistoryTrustworthy(read, { anchorTs, nowMs }), { trust: true, reason: "ok" });
+  assert.deepEqual(factHistoryTrustworthy(read), { trust: true, reason: "ok" });
+  assert.equal(hasCompletenessLossAfterAnchor(read, anchorTs, nowMs), false);
+  assert.equal(COMPLETENESS_LOSS_TIMESTAMP_FIELDS.includes("last_bytecap_evict_ts"), false);
 });
 
 test("factHistoryTrustworthy ignores future loss timestamps for the current rollback window but still blocks an in-window loss", () => {
@@ -173,25 +189,29 @@ test("retention classifies parseable schema-invalid records and read reports thi
   assert.equal(read.completeness.last_schema_invalid_ts, NOW);
 });
 
-test("retention classifies byte-cap eviction separately and degrades completeness", async () => {
+// Updated by the fact-store capacity plan (2026-10-05, R0b §4.1 item 4): this test used to pin that
+// byte-cap eviction DEGRADES completeness -- the very behavior that locked the watch tier out on
+// real hosts (31-day degraded tail, hourly anchor re-arm). Byte-cap eviction is still classified
+// separately (bytecap_evicted_total / last_bytecap_evict_ts, informational), but it now narrows
+// coverage (bytecap_floor_ts, coverage:"narrowed") and leaves status intact. (Its old setup -- a
+// hand-written facts.jsonl with no ledger -- would now read degraded for a different reason: a
+// missing ledger over a non-empty store is a lineage break, HIGH-1.)
+test("retention classifies byte-cap eviction separately and reports it as coverage narrowing, not degradation", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(factsFile, [
-    JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "one", attributes: {} }),
-    JSON.stringify({ ts: "2026-08-21T00:00:01.000Z", fact_name: "service.presence", entity_key: "two", attributes: {} }),
-    "",
-  ].join("\n"));
-
-  const retention = await enforceFactRetention(paths, { now: NOW, maxBytes: 120 });
-  assert(retention.dropped_count >= 1);
+  const ticks = [NOW, "2026-08-21T00:00:01.000Z", "2026-08-21T00:00:02.000Z"];
+  for (const [index, ts] of ticks.entries()) {
+    await appendFactPoints(paths, [{ ts, fact_name: "service.presence", entity_key: `svc-${index}`, attributes: {} }], { now: ts, maxBytes: Number.MAX_SAFE_INTEGER });
+  }
+  const retention = await enforceFactRetention(paths, { now: ticks[2], maxBytes: 200 });
   assert.equal(retention.bytecap_evicted_count, 2);
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "unknown");
-  await enforceFactRetention(paths, { now: NOW });
-  const read = await readFactPoints(paths, { now: NOW });
-  assert.equal(read.completeness.status, "degraded");
+  assert.equal(retention.kept_count, 1);
+  const read = await readFactPoints(paths, { now: ticks[2] });
+  assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.bytecap_evicted_total, 2);
-  assert.equal(read.completeness.last_bytecap_evict_ts, NOW);
+  assert.equal(read.completeness.last_bytecap_evict_ts, ticks[2]);
+  assert.equal(read.completeness.bytecap_floor_ts, ticks[1]);
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.deepEqual(read.points.map((point) => point.entity_key), ["svc-2"]);
 });
 
 test("retention classifies an invalid timestamp as schema-invalid, not age-evicted", async () => {

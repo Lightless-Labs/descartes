@@ -9,6 +9,7 @@ import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { appendFactPoints, enforceFactRetention, FUTURE_FACT_TOLERANCE_MS, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS, factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "../src/fact-store-completeness.js";
 import {
   FACT_INTEGRITY_SCHEMA_VERSION,
   isValidFactIntegrityLedger,
@@ -441,7 +442,7 @@ test("completeness reports the raw floor, certified_after_ts = max(floor, retent
   assert.equal(aged.certified_after_ts, new Date(Date.parse(later) - RETENTION_MS).toISOString());
 });
 
-test("a zero-cap / all-evicted store reads intact with coverage narrowed and an empty certified span (G1 question: vs fail-closed unknown)", async () => {
+test("a zero-cap / all-evicted store reports coverage narrowed, the evicted floor and an empty certified span", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
   await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: 0 });
@@ -486,6 +487,74 @@ test("F2-Tier1 fold-in: continuity.oldest_ts is not a coverage boundary -- compl
     const source = await fs.readFile(new URL(name, srcDir), "latin1");
     if (name === "fact-store-integrity.js") continue; // the writer of continuity.oldest_ts
     assert.equal(/continuity(?:\?)?\.oldest_ts|continuity_oldest_ts/.test(source.replace(/\/\/.*$/gm, "")), false, `${name} reads continuity.oldest_ts outside the ledger writer`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// §4.1 item 4: byte-cap eviction is reclassified from a loss channel to coverage narrowing.
+// ---------------------------------------------------------------------------------------------
+
+test("reclassification: routine byte-cap eviction leaves the store intact (coverage narrowed), stamps no first_degraded_ts, and is not a trust loss", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 6, maxBytes: cap });
+  const read = await readFactPoints(paths, { now: hour(5), windowMs: MONTH_WINDOW_MS });
+  assert.ok(read.completeness.bytecap_evicted_total > 0);
+  assert.equal(read.completeness.last_bytecap_evict_ts, hour(5), "kept as an informational field");
+  assert.equal(read.completeness.status, "intact", "narrowing alone keeps the three-valued status intact (no fourth status value)");
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.equal(read.completeness.first_degraded_ts, null, "byte-cap eviction no longer stamps first_degraded_ts");
+  assert.deepEqual(read.completeness.future_loss_fields, []);
+  assert.deepEqual(factHistoryTrustworthy(read), { trust: true, reason: "ok" }, "no-anchor consumers (daemon veto, miner, shadow, correlation) trust a narrowed store");
+  assert.deepEqual(factHistoryTrustworthy(read, { anchorTs: hour(1), nowMs: Date.parse(hour(5)) }), { trust: true, reason: "ok" }, "an anchor older than the eviction is not re-armed by it");
+  assert.equal(hasCompletenessLossAfterAnchor(read, hour(1), Date.parse(hour(5))), false, "the detectors' re-arm check ignores byte-cap eviction");
+  assert.equal(COMPLETENESS_LOSS_TIMESTAMP_FIELDS.includes("last_bytecap_evict_ts"), false);
+});
+
+// G1 QUESTION (plan §7 S2), pinned as the CURRENT fail-closed behavior, not decided here: a store
+// that is fully evicted on every pass (maxBytes 0, or per-tick volume above the budget --
+// `cap_below_tick`) reads `unknown`, NOT intact-with-an-empty-certified-span. Root cause:
+// observeFactContinuity returns "unknown" whenever the committed rewrite was EMPTY and records have
+// been appended since (`expectedNewest` null), so such a store never proves continuity and stays
+// continuity_ok:null -> unknown -> history_unknown. Making it read intact needs a change to the
+// continuity rule (an empty committed prefix makes any live content a pure append), which is a
+// trust-semantics change for the G1 daybreak gate. Consequence today: a family whose single tick
+// exceeds its budget is permanently untrusted (over-freeze, never a fabrication); the §4.5 config
+// floor keeps default budgets far above one worst-case tick.
+test("reclassification: a zero-cap / all-evicted store reads unknown (fail-closed), coverage narrowed, empty certified span -- G1 question", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(2)), { now: hour(2), maxBytes: 0 });
+  const read = await readFactPoints(paths, { now: hour(2), windowMs: MONTH_WINDOW_MS });
+  assert.equal(read.completeness.status, "unknown");
+  assert.equal(read.completeness.degraded_reason, "continuity_unknown");
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.equal(read.completeness.oldest_certified_ts, null);
+  assert.deepEqual(read.points, []);
+  assert.deepEqual(factHistoryTrustworthy(read), { trust: false, reason: "history_unknown" });
+});
+
+test("reclassification does not weaken the other loss channels (I4): corrupt, schema-invalid, continuity-break and future-fact losses still degrade and re-arm", async () => {
+  const cases = [
+    ["corrupt", (paths) => fs.appendFile(resolveFactStorePaths(paths).factsFile, "not-json\n"), "last_corrupt_ts"],
+    ["schema-invalid", (paths) => fs.appendFile(resolveFactStorePaths(paths).factsFile, `${JSON.stringify({ ts: hour(4), fact_name: "service.presence", attributes: {} })}\n`), "last_schema_invalid_ts"],
+    ["future-fact", (paths) => appendFactPoints(paths, serviceTick(hour(20)), { now: hour(4), maxBytes: Number.MAX_SAFE_INTEGER }), "last_future_fact_ts"],
+    ["truncation", async (paths) => {
+      const lines = (await fs.readFile(resolveFactStorePaths(paths).factsFile, "utf8")).split("\n").filter(Boolean);
+      await fs.writeFile(resolveFactStorePaths(paths).factsFile, `${lines.slice(0, 3).join("\n")}\n`);
+    }, "last_continuity_break_ts"],
+  ];
+  for (const [name, inflict, field] of cases) {
+    const paths = await tempPaths();
+    await appendHourlyTicks(paths, { count: 4, maxBytes: Number.MAX_SAFE_INTEGER });
+    await inflict(paths);
+    await enforceFactRetention(paths, { now: hour(4), maxBytes: Number.MAX_SAFE_INTEGER });
+    await enforceFactRetention(paths, { now: hour(5), maxBytes: Number.MAX_SAFE_INTEGER });
+    const read = await readFactPoints(paths, { now: hour(5), windowMs: MONTH_WINDOW_MS });
+    assert.equal(read.completeness.status, "degraded", name);
+    assert.notEqual(read.completeness[field], null, `${name} stamps ${field}`);
+    assert.equal(hasCompletenessLossAfterAnchor(read, hour(1), Date.parse(hour(5))), true, `${name} still re-arms an older anchor`);
   }
 });
 
@@ -642,7 +711,5 @@ test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }
       }
     }
   }
-  // While byte-cap eviction is still a loss channel (until the S2 reclassification commit), almost
-  // every read after the first eviction is degraded, so few intact reads are checked.
-  assert.ok(checkedIntactReads > 20, `the oracle exercised too few intact reads (${checkedIntactReads})`);
+  assert.ok(checkedIntactReads > 100, `the oracle exercised too few intact reads (${checkedIntactReads})`);
 });

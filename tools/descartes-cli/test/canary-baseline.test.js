@@ -96,7 +96,7 @@ function intactReadResult(points, completeness = { status: "intact" }) {
 }
 
 function degradedReadResult(points, lossTs) {
-  return { points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded", last_bytecap_evict_ts: lossTs } };
+  return { points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded", last_continuity_break_ts: lossTs } };
 }
 
 // One millisecond before the given day's ts -- a convenient "anchored strictly before this

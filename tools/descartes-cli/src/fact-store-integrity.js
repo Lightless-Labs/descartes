@@ -553,13 +553,16 @@ export function prepareFactIntegrityLedger({
   next.future_fact_dropped_total = addSaturating(next.future_fact_dropped_total, futureFactDelta);
   if (corruptDelta > 0) next.last_corrupt_ts = nowIso;
   if (schemaInvalidDelta > 0) next.last_schema_invalid_ts = nowIso;
+  // Informational only since R0b (not a loss channel; see fact-store-completeness.js).
   if (bytecapDelta > 0) next.last_bytecap_evict_ts = nowIso;
   if (effectiveContinuityBreak || invalidLedgerBootstrap || floorClampedBackwards) next.last_continuity_break_ts = nowIso;
   // Fix 0: last_future_fact_ts is always stamped with THIS pass's real nowIso -- never the
   // dropped record's own claimed future ts (see enforceFactRetention's counts.future_fact_count
   // callsite) -- mirroring last_corrupt_ts/last_schema_invalid_ts/last_bytecap_evict_ts exactly.
   if (futureFactDelta > 0) next.last_future_fact_ts = nowIso;
-  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + futureFactDelta + effectiveContinuityBreak + invalidLedgerBootstrap + floorClampedBackwards) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
+  // R0b (§4.1 item 4): byte-cap eviction is coverage narrowing, not a loss, so it no longer stamps
+  // first_degraded_ts (bytecapDelta is deliberately absent from this sum).
+  if ((corruptDelta + schemaInvalidDelta + futureFactDelta + effectiveContinuityBreak + invalidLedgerBootstrap + floorClampedBackwards) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
 
   next.continuity = {
     record_count_hwm: Math.max(next.continuity.record_count_hwm, live.record_count, outputRecords.length),

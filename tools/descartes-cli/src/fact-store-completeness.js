@@ -19,11 +19,21 @@
 // fact was dropped, never the record's own claimed future ts -- so it is a genuine past/current
 // timestamp that ages out of the upper-bound clause exactly like every other loss channel, never a
 // permanent lockout.
+//
+// R0b reclassification (fact-store capacity plan 2026-10-05, §4.1 item 4): last_bytecap_evict_ts is
+// NOT a loss channel. The store's own byte-cap eviction is suffix-preserving and tick-aligned (it
+// removes an oldest-end prefix, asserted in fact-store.js), so it NARROWS coverage -- recorded as
+// the ledger's exclusive bytecap_floor_ts, enforced by readFactPoints, reported as
+// certified_after_ts/coverage -- rather than breaking it. Treating it as a loss made every host
+// whose per-tick volume filled the store read `degraded` for 31 days and re-armed every detector's
+// cold-start anchor on every structural tick (the watch-tier lockout). Truncation by anything else
+// is still a continuity break (prefix-digest check), and the corrupt, schema-invalid, continuity
+// and future-fact channels keep their trust semantics (I4). last_bytecap_evict_ts and
+// bytecap_evicted_total stay as informational fields.
 export const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = Object.freeze([
   "last_future_fact_ts",
   "last_corrupt_ts",
   "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
   "last_continuity_break_ts",
 ]);
 

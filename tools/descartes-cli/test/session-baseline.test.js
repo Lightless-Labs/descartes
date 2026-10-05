@@ -131,7 +131,7 @@ function degradedReadResult(points, lossTs = tickTs(2)) {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
-    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+    completeness: { status: "degraded", last_continuity_break_ts: lossTs },
   };
 }
 

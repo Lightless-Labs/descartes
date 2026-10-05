@@ -1045,9 +1045,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
               // Finding F2-Tier1 (re-sourced onto watch.json, plan §12.3 fact 3): thread the
               // operator-configurable fact_store_max_bytes (validated/fail-closed in
               // watch-store.js's normalizeWatchConfig, which mirrors constraint-store.js's own
-              // normalizeLearnedConfig exactly) into the live call site as options.maxBytes --
-              // this is the only lever an operator has to stop routine bytecap eviction short of
-              // a code change. watchConfig is already loaded and enabled-checked above in this
+              // normalizeLearnedConfig exactly) into the live call site as options.maxBytes. Since
+              // R0b (fact-store capacity plan 2026-10-05) routine bytecap eviction is coverage
+              // narrowing, not a loss, so this cap sets how much certified history is kept rather
+              // than whether the watch tier locks out; per-family budgets replace it in S4.
+              // watchConfig is already loaded and enabled-checked above in this
               // same structural-tick block; the WATCH-tier fact store is what this cap now
               // governs, since structural collection/persistence runs under watchConfig.enabled.
               structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, maxBytes: watchConfig.fact_store_max_bytes });

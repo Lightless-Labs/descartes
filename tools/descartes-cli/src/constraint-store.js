@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { DEFAULT_FACT_MAX_BYTES, readFactPoints } from "./fact-store.js";
+import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
 export const SCHEMA_VERSION = 1;
@@ -300,7 +301,10 @@ function renderLearnedConfigStatus(config, configFile) {
 
 const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "future_floor", "none"];
 const COVERAGE_VALUES = ["full", "narrowed"]; // "unknown" only when there is no read to report
-const LOSS_TS_FIELD_NAMES = ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"];
+// The loss channels, from the single shared definition (fact-store-completeness.js). Since R0b
+// (fact-store capacity plan §4.1 item 4) last_bytecap_evict_ts is NOT among them: byte-cap eviction
+// narrows coverage (reported via bytecap_floor_ts/certified_after_ts/coverage), it is not a loss.
+const LOSS_TS_FIELD_NAMES = COMPLETENESS_LOSS_TIMESTAMP_FIELDS;
 
 function unknownFactStoreCompleteness() {
   return {
@@ -457,9 +461,13 @@ function renderFactStoreCompletenessText(completeness) {
     if (completeness.future_loss_fields.length > 0) {
       lines.push(`  Future-dated (untrustworthy clock) fields: ${completeness.future_loss_fields.join(", ")}`);
     }
-    for (const field of ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"]) {
+    // Loss channels only (R0b: byte-cap eviction is not one; it is reported as coverage below).
+    for (const field of ["last_corrupt_ts", "last_schema_invalid_ts", "last_continuity_break_ts", "last_future_fact_ts"]) {
       if (completeness[field] !== null) lines.push(`  ${field}: ${completeness[field]}`);
     }
+  }
+  if (completeness.coverage === "narrowed") {
+    lines.push(`  Coverage: narrowed by byte-cap eviction (certified after ${completeness.certified_after_ts}; last eviction ${completeness.last_bytecap_evict_ts})`);
   }
   return lines.join("\n");
 }

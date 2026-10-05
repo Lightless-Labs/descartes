@@ -48,7 +48,7 @@ function fastCollectorFakes() {
   };
 }
 
-test("T1: at real per-tick volume and the 5 MB default, routine byte-cap eviction does not lock the watch tier out (no 31-day degraded tail, no hourly anchor re-arm, coverage keeps being reported)", { timeout: 300_000, todo: "RED on HEAD 134e811 (Legs A/B/C); goes green with S2 (R0b)" }, async () => {
+test("T1: at real per-tick volume and the 5 MB default, routine byte-cap eviction does not lock the watch tier out (no 31-day degraded tail, no hourly anchor re-arm, coverage keeps being reported)", { timeout: 300_000 }, async () => {
   const paths = await tempPaths();
   const { collectors, structuralCollectorToggles } = realVolumeStructuralCollectors();
   const profile = {
