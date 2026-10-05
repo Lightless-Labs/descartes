@@ -1,4 +1,5 @@
 import { readFactPoints } from "./fact-store.js";
+import { alertId } from "./alert-store.js";
 import {
   DEFAULT_BASELINE_FACT_WINDOW_MS,
 } from "./welford-stats.js";
@@ -14,7 +15,10 @@ import {
   DEFAULT_MIN_SAMPLE_COUNT,
   DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT,
   computeWindowedSessionStats,
+  evaluateSessionChurn,
   groupSessionFactsByTick,
+  SESSION_CHURN_RULE_ID,
+  SESSION_COUNT_DROP_RULE_ID,
   loadSessionBaselineStore,
 } from "./session-baseline.js";
 import {
@@ -24,6 +28,8 @@ import {
   computeWindowedPeerDropStats,
   computeWindowedPeerStats,
   groupPeerFactsByTick,
+  PEER_COUNT_DROP_RULE_ID,
+  PEER_COUNT_SPIKE_RULE_ID,
   loadPeerBaselineStore,
 } from "./peer-baseline.js";
 import {
@@ -42,6 +48,7 @@ import {
   writeWatchConfig,
 } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
+import { readDaemonStatus } from "./history-store.js";
 
 const STATUS_TICK_COUNT = 6;
 const LIVE_RECOMPUTE_NOTE = "Answers are recomputed live from the fact-history window; they can differ slightly from the daemon's last tick.";
@@ -123,11 +130,10 @@ function stateReason(entry, groups) {
 // The helpers below MIRROR (never alter) each detector's own gates, from the same fact-history
 // window, stores and clock, so a domain says "watching" only when its detector would genuinely
 // evaluate this tick: persisted lockout cleared, no lockout (re-)arming term, trustworthy history,
-// a complete AND fresh latest census, and the detector's own readiness (count baseline established
-// for session/peer; enough complete history for the census detectors).
+// fresh evidence, and the detector's own per-rule readiness.
 
-// Mirrors the detectors' DEFAULT_*_FRESHNESS_FALLBACK_MS (3x the default 1h structural interval).
-// The CLI does not read the daemon profile, so a non-default structural cadence is not reflected.
+// Mirrors the detectors' DEFAULT_*_FRESHNESS_FALLBACK_MS (3x the default 1h structural interval)
+// when no daemon status record exists. A live daemon's persisted profile overrides this below.
 export const DEFAULT_STATUS_FRESHNESS_MS = 3 * 60 * 60 * 1000;
 
 const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
@@ -188,16 +194,83 @@ function lockoutProgress(entry, gate, domain, groups, nowMs) {
 }
 
 // The detector's own post-lockout readiness requirement, as { progress, required }.
-function readinessFor(domain, groups) {
+function isFiniteFreshObservation(observation, nowMs, freshnessMs) {
+  return Boolean(observation)
+    && Number.isFinite(observation.z_score)
+    && Number.isFinite(observation.mean_before)
+    && isValidIsoTimestamp(observation.ts)
+    && nowMs - new Date(observation.ts).getTime() <= freshnessMs;
+}
+
+function sessionRuleReadiness(groups, points, nowMs, freshnessMs) {
+  const baseline = computeWindowedSessionStats(groups);
+  const countReady = baseline.confidence_state === "established"
+    && isFiniteFreshObservation(baseline.last_observation, nowMs, freshnessMs);
+  const completeGroupsForChurn = groups.filter((group) => group.censusState === "complete");
+  const latestChurnGroup = completeGroupsForChurn.at(-1);
+  const churnFresh = completeGroupsForChurn.length >= 2
+    && latestChurnGroup
+    && nowMs - new Date(latestChurnGroup.ts).getTime() <= freshnessMs;
+  const churnPoints = points.filter((point) => completeGroupsForChurn.some((group) => group.ts === point.ts));
+  const churn = churnFresh
+    ? evaluateSessionChurn(churnPoints, { structuralIntervalMs: freshnessMs / 3, activeFreshnessMs: freshnessMs })
+    : { evaluatedEntityKeys: [] };
+  const evaluatedAlertKeys = [];
+  if (countReady) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
+  for (const entityKey of churn.evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+  return {
+    progress: baseline.stats.count,
+    required: DEFAULT_MIN_SAMPLE_COUNT,
+    established: baseline.confidence_state === "established",
+    watchingRules: [
+      ...(countReady ? [SESSION_COUNT_DROP_RULE_ID] : []),
+      ...(churn.evaluatedEntityKeys.length > 0 ? [SESSION_CHURN_RULE_ID] : []),
+    ],
+    evaluatedAlertKeys,
+  };
+}
+
+function peerRuleReadiness(groups, entries, nowMs, freshnessMs) {
+  const spike = computeWindowedPeerStats(groups);
+  const drop = computeWindowedPeerDropStats(groups);
+  const spikeReady = spike.confidence_state === "established" && isFiniteFreshObservation(spike.last_observation, nowMs, freshnessMs);
+  const dropObservation = drop.last_observation;
+  const anchorTs = entries[0]?.state?.cold_start_since_ts;
+  const dropRecoveryReady = !isValidIsoTimestamp(anchorTs)
+    || (isValidIsoTimestamp(dropObservation?.ts) && completeGroups("peer", groups).filter((group) => {
+      const groupMs = new Date(group.ts).getTime();
+      return dropTickGroupIsComplete(group)
+        && groupMs > new Date(anchorTs).getTime()
+        && groupMs < new Date(dropObservation.ts).getTime();
+    }).length >= DEFAULT_PEER_MIN_HISTORY_TICK_COUNT);
+  const dropReady = drop.confidence_state === "established"
+    && dropRecoveryReady
+    && isFiniteFreshObservation(dropObservation, nowMs, freshnessMs);
+  return {
+    progress: spike.stats.count,
+    required: DEFAULT_PEER_MIN_SAMPLE_COUNT,
+    established: spike.confidence_state === "established",
+    watchingRules: [
+      ...(spikeReady ? [PEER_COUNT_SPIKE_RULE_ID] : []),
+      ...(dropReady ? [PEER_COUNT_DROP_RULE_ID] : []),
+    ],
+    evaluatedAlertKeys: [
+      ...(spikeReady ? [alertId(PEER_COUNT_SPIKE_RULE_ID, "global")] : []),
+      ...(dropReady ? [alertId(PEER_COUNT_DROP_RULE_ID, "global")] : []),
+    ],
+  };
+}
+
+function dropTickGroupIsComplete(group) {
+  return !group.hasOverflow && group.availabilitySignature !== undefined && group.availabilitySignature !== PEER_SIGNATURE_INVALID;
+}
+
+function readinessFor(domain, groups, points = [], entries = [], nowMs = Date.now(), freshnessMs = DEFAULT_STATUS_FRESHNESS_MS) {
   if (domain === "session") {
-    const baseline = computeWindowedSessionStats(groups);
-    return { progress: baseline.stats.count, required: DEFAULT_MIN_SAMPLE_COUNT, established: baseline.confidence_state === "established" };
+    return sessionRuleReadiness(groups, points, nowMs, freshnessMs);
   }
   if (domain === "peer") {
-    // peer.count_spike is the direction whose coverage tracks the domain (count_drop additionally
-    // needs marker-complete history and can stay learning on a markerless host).
-    const baseline = computeWindowedPeerStats(groups);
-    return { progress: baseline.stats.count, required: DEFAULT_PEER_MIN_SAMPLE_COUNT, established: baseline.confidence_state === "established" };
+    return peerRuleReadiness(groups, entries, nowMs, freshnessMs);
   }
   const required = domain === "service"
     ? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1 // the stricter of disappearance (2) and appearance (3 + 1)
@@ -208,8 +281,21 @@ function readinessFor(domain, groups) {
   return { progress, required, established: progress >= required };
 }
 
-function domainPhase({ enabled, entries, domain, groups, nowMs, readResult, freshnessMs = DEFAULT_STATUS_FRESHNESS_MS }) {
-  if (!enabled) return { phase: "disabled", progress: 0, required: STATUS_TICK_COUNT, coldStartPending: false, coldStartReason: undefined };
+function phaseForRuleReadiness(domain, readiness) {
+  if (readiness.watchingRules?.length > 0) {
+    if (readiness.watchingRules.length === (domain === "session" ? 2 : 2)) return "watching";
+    if (domain === "session" && readiness.watchingRules.includes(SESSION_CHURN_RULE_ID)) {
+      return `watching (churn); count baseline still learning — ${readiness.progress} of ${readiness.required}`;
+    }
+    if (domain === "session") return `watching (count); churn has no fresh evaluable pair`;
+    if (readiness.watchingRules.includes(PEER_COUNT_SPIKE_RULE_ID)) return "watching (spike); drop baseline is not evaluable";
+    return "watching (drop); spike baseline is not evaluable";
+  }
+  return undefined;
+}
+
+function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, readResult, freshnessMs = DEFAULT_STATUS_FRESHNESS_MS }) {
+  if (!enabled) return { phase: "disabled", progress: 0, required: STATUS_TICK_COUNT, coldStartPending: false, coldStartReason: undefined, watchingRules: [], evaluatedAlertKeys: [] };
   const gated = entries.map((entry) => ({ entry, gate: detectorGate(entry, readResult, nowMs) }));
   const pendingEntries = gated.filter(({ gate }) => gate.pending);
   const coldStartPending = pendingEntries.length > 0;
@@ -227,7 +313,7 @@ function domainPhase({ enabled, entries, domain, groups, nowMs, readResult, fres
     // baseline can be the BINDING requirement, not the 6-tick lockout. Each new complete tick
     // advances both, so show whichever has more ticks remaining (ties go to the lockout).
     if (domain === "session" || domain === "peer") {
-      const readiness = readinessFor(domain, groups);
+      const readiness = readinessFor(domain, groups, points, entries, nowMs, freshnessMs);
       const countRemaining = readiness.required - readiness.progress;
       const lockoutRemaining = Math.max(0, STATUS_TICK_COUNT - progress);
       if (!readiness.established && countRemaining > lockoutRemaining) {
@@ -249,24 +335,28 @@ function domainPhase({ enabled, entries, domain, groups, nowMs, readResult, fres
     return { ...base, phase: `locked out — fact history untrustworthy (${historyTrust})`, progress: 0, required: STATUS_TICK_COUNT };
   }
 
-  if (hasIncompleteLatest(domain, groups)) {
+  if (domain !== "session" && domain !== "peer" && hasIncompleteLatest(domain, groups)) {
     return { ...base, phase: "cannot establish — census incomplete", progress: 0, required: STATUS_TICK_COUNT };
   }
 
   const complete = completeGroups(domain, groups);
   const latest = complete[complete.length - 1];
-  if (!latest || !(nowMs - new Date(latest.ts).getTime() <= freshnessMs)) {
+  const readiness = readinessFor(domain, groups, points, entries, nowMs, freshnessMs);
+  const rulePhase = phaseForRuleReadiness(domain, readiness);
+  if (!rulePhase && (!latest || !(nowMs - new Date(latest.ts).getTime() <= freshnessMs))) {
     const phase = latest
       ? `stale — latest complete census ${latest.ts} is older than the freshness window`
       : "stale — no complete census in the fact-history window";
     return { ...base, phase, progress: 0, required: STATUS_TICK_COUNT };
   }
 
-  const readiness = readinessFor(domain, groups);
+  if (rulePhase) {
+    return { ...base, phase: rulePhase, progress: readiness.progress, required: readiness.required, watchingRules: readiness.watchingRules, evaluatedAlertKeys: readiness.evaluatedAlertKeys };
+  }
   if (!readiness.established) {
     return { ...base, phase: `still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required };
   }
-  return { ...base, phase: "watching", progress: readiness.required, required: readiness.required };
+  return { ...base, phase: "watching", progress: readiness.required, required: readiness.required, watchingRules: readiness.watchingRules ?? [], evaluatedAlertKeys: readiness.evaluatedAlertKeys ?? [] };
 }
 
 function serviceEstablished(groups) {
@@ -295,13 +385,13 @@ function sessionEntities(groups) {
 }
 
 function peerEntities(points, groups) {
-  const completeTimestamps = new Set(completeGroups("peer", groups).map((group) => group.ts));
+  const completeByTimestamp = new Map(completeGroups("peer", groups).map((group) => [group.ts, group]));
   return [...new Set(points
-    .filter((point) => point?.fact_name === "peer.presence" && completeTimestamps.has(point.ts))
+    .filter((point) => point?.fact_name === "peer.presence" && completeByTimestamp.has(point.ts))
     .filter((point) => !String(point.entity_key).includes("census-marker") && !String(point.entity_key).includes("overflow-marker"))
-    // R8: tailscale peers are not part of the peer-count baseline (groupPeerFactsByTick excludes
-    // them), so they must not be listed as established for it either.
-    .filter((point) => point.attributes?.source_type !== "tailscale")
+    // R8: Tailscale is excluded only when the tick carries the VPN census marker that cannot vouch
+    // for it. Markerless Tailscale-only hosts are part of the legacy peer-count baseline.
+    .filter((point) => point.attributes?.source_type !== "tailscale" || completeByTimestamp.get(point.ts).availabilitySignature === undefined)
     .map((point) => point.entity_key))].sort();
 }
 
@@ -392,10 +482,20 @@ function domainPhaseFor(inputs, { definition, groups, entries }, options) {
     entries,
     domain: definition.domain,
     groups,
+    points: inputs.points,
     nowMs: inputs.nowMs,
     readResult: inputs.readResult,
     freshnessMs: options.activeFreshnessMs ?? DEFAULT_STATUS_FRESHNESS_MS,
   });
+}
+
+async function resolveStatusFreshnessMs(descartesPaths, options) {
+  if (options.activeFreshnessMs !== undefined) return options.activeFreshnessMs;
+  const status = await (options.readDaemonStatus ?? readDaemonStatus)(descartesPaths);
+  const structuralIntervalMs = status?.profile?.structural?.interval_ms;
+  return Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
+    ? 3 * structuralIntervalMs
+    : DEFAULT_STATUS_FRESHNESS_MS;
 }
 
 function configPayload(config, descartesPaths) {
@@ -403,11 +503,12 @@ function configPayload(config, descartesPaths) {
 }
 
 export async function buildBaselineStatus(descartesPaths, options = {}) {
-  const inputs = await readBaselineInputs(descartesPaths, options);
+  const freshnessMs = await resolveStatusFreshnessMs(descartesPaths, options);
+  const inputs = await readBaselineInputs(descartesPaths, { ...options, activeFreshnessMs: freshnessMs });
   return {
     watch_config: configPayload(inputs.config, descartesPaths),
     domains: inputs.domains.map(({ definition, groups, entries }) => {
-      const phase = domainPhaseFor(inputs, { definition, groups, entries }, options);
+      const phase = domainPhaseFor(inputs, { definition, groups, entries }, { ...options, activeFreshnessMs: freshnessMs });
       return {
         domain: definition.domain,
         phase: phase.phase,
@@ -417,6 +518,8 @@ export async function buildBaselineStatus(descartesPaths, options = {}) {
         complete_ticks: phase.progress,
         required_ticks: phase.required,
         established_count: establishedForDomain(definition.domain, inputs.points, groups).length,
+        watching_rules: phase.watchingRules ?? [],
+        evaluated_alert_keys: phase.evaluatedAlertKeys ?? [],
       };
     }),
     fact_history_window_ms: options.windowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS,
@@ -425,14 +528,15 @@ export async function buildBaselineStatus(descartesPaths, options = {}) {
 }
 
 export async function buildBaselineInspect(descartesPaths, options = {}) {
-  const inputs = await readBaselineInputs(descartesPaths, options);
+  const freshnessMs = await resolveStatusFreshnessMs(descartesPaths, options);
+  const inputs = await readBaselineInputs(descartesPaths, { ...options, activeFreshnessMs: freshnessMs });
   const requested = options.domain ? normalizeDomainName(options.domain) : undefined;
   if (requested && !DOMAIN_DEFINITIONS.some((definition) => definition.domain === requested)) {
     throw new Error(`Unknown baseline domain: ${options.domain}\n\n${usage()}`);
   }
   const selected = inputs.domains.filter(({ definition }) => !requested || definition.domain === requested);
   const domains = selected.map(({ definition, groups, entries }) => {
-    const phase = domainPhaseFor(inputs, { definition, groups, entries }, options);
+    const phase = domainPhaseFor(inputs, { definition, groups, entries }, { ...options, activeFreshnessMs: freshnessMs });
     const report = {
       domain: definition.domain,
       phase: phase.phase,

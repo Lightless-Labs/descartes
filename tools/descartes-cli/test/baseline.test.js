@@ -10,9 +10,12 @@ import {
   buildBaselineStatus,
   runBaseline,
 } from "../src/baseline.js";
+import { alertId } from "../src/alert-store.js";
 import { loadWatchConfig, resolveWatchStorePaths, writeWatchConfig } from "../src/watch-store.js";
-import { computeSessionBaselineCandidates, writeSessionBaselineStore } from "../src/session-baseline.js";
+import { writeDaemonStatus } from "../src/history-store.js";
+import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { computePeerBaselineCandidates, writePeerBaselineStore } from "../src/peer-baseline.js";
+import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 
 // ---------------------------------------------------------------------------------------------
 // A1 (2026-10 calibration review) fixtures: status-vs-detector consistency. `baseline status` must
@@ -28,7 +31,13 @@ function a1SessionTick(hour, count) {
   const ts = a1Ts(hour);
   const points = [];
   for (let i = 0; i < count; i += 1) {
-    points.push({ ts, fact_name: "session.presence", entity_key: `session.tmux.e-${i}`, attributes: { created_at_fingerprint: "unknown" } });
+    const entityKey = `session.tmux.${i.toString(16).padStart(16, "0")}`;
+    points.push({
+      ts,
+      fact_name: "session.presence",
+      entity_key: entityKey,
+      attributes: { created_at_fingerprint: i === 0 ? `fingerprint-${hour}` : "stable" },
+    });
   }
   points.push({ ts, fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } });
   return points;
@@ -86,6 +95,7 @@ const A1_SCENARIOS = [
     nowHour: 9.5,
     completeness: { status: "intact" },
     expectWatching: false,
+    expectSessionWatching: true,
   },
   {
     name: "established store but corrupt fact lines this read (detector would re-arm the lockout)",
@@ -224,6 +234,54 @@ test("baseline inspect (R8): tailscale peers are not listed as established for t
   assert.deepEqual(result.domains[0].established, ["peer.ssh.aaaaaaaaaaaaaaaa"]);
 });
 
+test("R8: baseline inspect keeps Tailscale-only peers in the established peer set", async () => {
+  const paths = await tempPaths();
+  const points = [];
+  for (let index = 0; index < 31; index += 1) {
+    const ts = new Date(Date.parse("2026-09-26T00:00:00.000Z") + index * 3600000).toISOString();
+    points.push({
+      ts,
+      fact_name: "peer.presence",
+      entity_key: "peer.tailscale.bbbbbbbbbbbbbbbb",
+      attributes: { source_type: "tailscale", presence_state: "observed_active" },
+    });
+  }
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const result = await buildBaselineInspect(paths, { now: "2026-09-27T07:00:00.000Z", readFactPoints, domain: "peer" });
+  assert.deepEqual(result.domains[0].established, ["peer.tailscale.bbbbbbbbbbbbbbbb"]);
+});
+
+test("baseline status uses the persisted daemon structural interval for freshness", async () => {
+  const paths = await tempPaths();
+  await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writeDaemonStatus(paths, { profile: { structural: { interval_ms: 2 * A1_HOUR_MS } } });
+  const points = a1Points(31);
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const result = await buildBaselineStatus(paths, { now: a1Ts(34), readFactPoints });
+  assert.equal(result.domains.find((domain) => domain.domain === "session").phase, "watching");
+});
+
+test("baseline status keeps rule coverage honest on overflow ticks", async () => {
+  const paths = await tempPaths();
+  await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writePeerBaselineStore(paths, A1_ESTABLISHED_STORE);
+  const points = [...a1Points(30)];
+  const sessionTs = a1Ts(30);
+  points.push(...a1SessionTick(30, 5), { ts: sessionTs, fact_name: "session.presence", entity_key: "session.overflow-marker.v1", attributes: { overflow: "true" } });
+  const peerTs = a1Ts(31);
+  points.push(
+    ...a1PeerTick(31, 40),
+    { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.overflow-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { overflow: "true" } },
+    { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } },
+  );
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const result = await buildBaselineStatus(paths, { now: a1Ts(31.5), readFactPoints });
+  const session = result.domains.find((domain) => domain.domain === "session");
+  const peer = result.domains.find((domain) => domain.domain === "peer");
+  assert.ok(session.watching_rules.includes(SESSION_CHURN_RULE_ID), "session churn still evaluates on a complete overflow tick");
+  assert.ok(peer.watching_rules.includes(PEER_COUNT_SPIKE_RULE_ID), "peer spike still scores a capped overflow tick");
+});
+
 for (const scenario of A1_SCENARIOS) {
   test(`A1 status-vs-detector consistency (${scenario.name}): status says "watching" iff the detector reports coverage`, async () => {
     const paths = await tempPaths();
@@ -241,14 +299,31 @@ for (const scenario of A1_SCENARIOS) {
     };
     for (const domain of ["session", "peer"]) {
       const reported = status.domains.find((entry) => entry.domain === domain);
-      const covered = detectors[domain].evaluatedAlertKeys.length > 0;
-      assert.equal(covered, scenario.expectWatching, `sanity: ${domain} detector coverage for this scenario`);
-      assert.equal(
-        reported.phase === "watching",
-        covered,
-        `${domain}: status phase "${reported.phase}" must not claim watching while the detector reports evaluatedAlertKeys=${JSON.stringify(detectors[domain].evaluatedAlertKeys)}`,
-      );
-      if (!covered) assert.notEqual(reported.phase, "watching");
+      const expectedKeys = new Set(detectors[domain].evaluatedAlertKeys);
+      const statusKeys = new Set(reported.evaluated_alert_keys);
+      assert.deepEqual(statusKeys, expectedKeys, `${domain}: status per-rule coverage must mirror detector evaluatedAlertKeys`);
+      const ruleKeys = domain === "session"
+        ? {
+            [SESSION_COUNT_DROP_RULE_ID]: alertId(SESSION_COUNT_DROP_RULE_ID, "global"),
+            [SESSION_CHURN_RULE_ID]: alertId(SESSION_CHURN_RULE_ID, "session.tmux.0000000000000000"),
+          }
+        : {
+            [PEER_COUNT_SPIKE_RULE_ID]: alertId(PEER_COUNT_SPIKE_RULE_ID, "global"),
+            [PEER_COUNT_DROP_RULE_ID]: alertId(PEER_COUNT_DROP_RULE_ID, "global"),
+          };
+      for (const [ruleId, key] of Object.entries(ruleKeys)) {
+        assert.equal(
+          reported.watching_rules.includes(ruleId),
+          expectedKeys.has(key),
+          `${domain}: status watching claim for ${ruleId} must agree with evaluatedAlertKeys=${JSON.stringify([...expectedKeys])}`,
+        );
+      }
+      const hasCoverage = expectedKeys.size > 0;
+      const expectedWatching = domain === "session" ? (scenario.expectSessionWatching ?? scenario.expectWatching) : scenario.expectWatching;
+      assert.equal(hasCoverage, expectedWatching, `sanity: ${domain} detector coverage for this scenario`);
+      if (scenario.name.includes("count baseline is still provisional") && domain === "session") {
+        assert.match(reported.phase, /^watching \(churn\); count baseline still learning — 10 of 30$/);
+      }
     }
   });
 }
@@ -308,7 +383,7 @@ test("A1: corrupt facts, a clock rollback, an incomplete latest census and an em
   const partialLatest = await statusOf(A1_ESTABLISHED_STORE, {
     extraPoints: [{ ts: a1Ts(30.25), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "partial" } }],
   });
-  assert.equal(partialLatest.phase, "cannot establish — census incomplete");
+  assert.equal(partialLatest.phase, "watching");
 
   const empty = await statusOf(A1_ESTABLISHED_STORE, { readPoints: [] });
   assert.equal(empty.phase, "stale — no complete census in the fact-history window");
