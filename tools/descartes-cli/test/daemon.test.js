@@ -86,6 +86,15 @@ async function tempPaths() {
   });
 }
 
+// G2 L2: "no fact I/O" means no family store at all, not just the service one -- S4 split the store
+// into eight families, so a regression writing (say) the network, provenance or canary store under a
+// disabled kill switch or a timed-out tick must fail here. The facts tree itself must not exist.
+async function assertNoFactStoreWritten(paths) {
+  const factsRoot = path.join(paths.stateDir, "learned", "facts");
+  assert.equal(path.dirname(resolveFactStorePaths(paths, "service").factsFile), path.join(factsRoot, "service"), "the facts tree root is where the family stores live");
+  await assert.rejects(() => fs.access(factsRoot), { code: "ENOENT" }, "no family fact store was created");
+}
+
 function fakeRunner(responses, calls = []) {
   return async (command, args) => {
     calls.push([command, ...args]);
@@ -989,7 +998,7 @@ test("S6b wiring: no fact-points are persisted while the watch.json kill switch 
   });
 
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("S6b wiring: a timed-out structural tick discards its evidence entirely — no fact-points are persisted for a partial/timed-out tick", async () => {
@@ -1018,7 +1027,7 @@ test("S6b wiring: a timed-out structural tick discards its evidence entirely —
 
   assert.equal(result.structuralEvidence, undefined);
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("S6b wiring: no fact-points are persisted when profile.structural is absent (regression, matches S6a's byte-identical-fast-path guarantee)", async () => {
@@ -1028,7 +1037,7 @@ test("S6b wiring: no fact-points are persisted when profile.structural is absent
 
   const result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), ts, now: ts, evaluateAlerts: false });
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 // --- Slice S7a, additive: evaluateAndLogShadowConstraints wired into the structural tick ---
@@ -1422,7 +1431,7 @@ test("S-live-1: an active constraint whose target has no current fact does not f
 
   const result = await runIsolatedDaemonTick(paths);
   assert.equal(result.alerts.alerts.some((alert) => alert.rule_id === "constraint.violation.service-presence"), false);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("BLOCKER-1: a persisted constraint.violation alert stays active when learned monitoring is off and the active-constraint producer returns []", async () => {
@@ -1796,7 +1805,7 @@ test("S4 structural wiring: a timed-out structural tick (provenance hangs) disca
   assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
   assert.equal(result.structuralEvidence, undefined);
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1886,7 +1895,7 @@ test("Slice 1: no session fact-points are persisted while the watch.json kill sw
   });
 
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("Slice 1 day-1 no-storm: the first-ever session observation seeds fact-history and emits no alert (this collector has no alert-candidate path at all)", async () => {
@@ -2075,7 +2084,7 @@ test("Slice 3: no peer fact-points are persisted while the watch.json kill switc
   });
 
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths, "service").factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("Slice 3 day-1 no-storm: the first-ever peer observation seeds fact-history and emits no alert (this collector has no alert-candidate path at all)", async () => {
