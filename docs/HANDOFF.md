@@ -2,6 +2,24 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — daybreak-blue sixth-gate Node fixes (2026-10-05)
+
+The sixth-gate Node findings are fixed locally on `harden/root-helper-2026-10`; Rust was not
+changed. Commit `6b2329a` carries the required Claude trailer and is not pushed or merged. Node
+fd-scan owners now retain executable path, executable device/inode, and cmdline evidence. The
+default final verifier checks that evidence, and Linux port attribution gathers the process core
+before verification and emits only the verified owner snapshot. The post-verification
+`resolvePidCore` read is gone. Same-UID elevated fallback now preserves the complete reason list
+and privilege diagnostics, including combined fd-scan uncertainty plus helper-hardening failure.
+Regression tests cover the real default verifier with fake `/proc` readers, the verified-versus-
+later executable-path race, combined elevated reasons, and UDP owner evidence.
+
+Checks: `cargo fmt --check`; `cargo test --workspace`; host clippy; x86_64 Linux-target clippy;
+aarch64 Linux-target clippy; and fresh-XDG `npm test` (2,092 total: 2,036 passed, 22
+environment-only failures, 34 skips). The 22 Node failures are 20 sandbox loopback `listen`
+EPERM notifier/tap tests and the two known live macOS provenance smoke tests. No Rust files were
+modified, and no push or merge was performed.
+
 ## Current session — daybreak-blue fifth-gate fixes (2026-10-05)
 
 The fifth-gate findings were fixed locally on `harden/root-helper-2026-10` without push or
