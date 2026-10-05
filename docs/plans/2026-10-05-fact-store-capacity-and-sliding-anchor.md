@@ -3,7 +3,8 @@
 **Created:** 2026-10-05
 **Status:** PLAN. Awaiting operator decisions (§12) and a pre-build multi-model plan review (Fable code-grounded, daybreak-blue, Astra) per `docs/solutions/2026-09-14-multi-model-review-and-planning-playbook.md`.
 **Reviewed:** 2026-10-05 (adversarial plan review, NEEDS-REVISION(7) → folded)
-**Addendum:** 2026-10-05: S0 grounding (§15), then S1 and S2 built on `feat/fact-store-capacity-2026-10` (§16). The branch awaits G1.
+**Addendum:** 2026-10-05: S0 grounding (§15), then S1 and S2 built on `feat/fact-store-capacity-2026-10` (§16). G1 ran; Q6 pulled in as S3b (§17).
+**Addendum:** 2026-10-05: S3 (eligibility horizon) and S3b (first/last-seen set) built, plus the G1 re-gate LOWs (§18). S4 not started; the branch awaits G2 after S4.
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -798,3 +799,98 @@ This is intentionally an **interim S2** gate. **S3 must not simply lift it by ad
 - **Invariants (new):** I13 eviction from the fact store never changes a seen-set answer; I14 a seen-set that cannot prove continuity yields no novelty claim (re-arm), never a claim.
 - **Tests:** G1's reproduction (entity at t0, absent t1–t3, back at t4, t0 evicted ⇒ no candidate) passes via the seen-set; seen-set loss ⇒ re-arm; partial tick never folded; cap overflow ⇒ ineligible + status reason.
 - **Gate:** covered by G2 (S3b lands before S4).
+
+---
+
+## 18. Addendum: S3 and S3b execution (2026-10-05)
+
+**Addendum:** 2026-10-05. S3 (eligibility horizon) and S3b (first/last-seen set) are built on `feat/fact-store-capacity-2026-10`, plus the two G1 re-gate LOWs. Nothing is pushed. S4 (per-family stores) is **not** started. Every test and command ran with fresh scratch `XDG_*` directories; full suites ran on a `git archive` snapshot of each commit so concurrent edits could not leak in. Baseline before S3: 2089 tests, 2055 pass, 0 fail, 34 skipped (no sandbox failures on this run, unlike §16's 22).
+
+### 18.1 Commits and full-suite totals
+
+| commit | step | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `9581332` | S3: `fact-families.js` registry, `certifiedHorizonOk`, `certifiedReadWindowOk`, daemon-init registry check | 2103 | 2069 | 0 | 34 |
+| `da35bc7` | S3: per-rule horizon gate in the watch-tier producers | 2107 | 2073 | 0 | 34 |
+| `2e9ffdc` | S3: miner/shadow/correlation via `certifiedReadWindowOk`; tuning reports its boundary | 2111 | 2076 | 0 | 34 (one T4 run hit its 120 s timeout under concurrent load; it passes in ~5 s alone and in every later run) |
+| `7656cf5` | S3: daemon per-rule horizon veto, `history_horizon_short`, fixed alert | 2116 | 2082 | 0 | 34 |
+| `30d2b35` | S3: novelty diagnostics `history_certified_after_ts` | 2117 | 2083 | 0 | 34 |
+| `2e79956` | G1 re-gate LOWs (learned status age floor + causes; HANDOFF refs) | 2118 | 2084 | 0 | 34 |
+| `9a306c7` | S3b: seen-set, novelty gate lifted when valid, daemon referent | 2136 | 2102 | 0 | 34 |
+| `d1f96c6` | S3/S3b: novelty horizon measured against the seen-set's certified span (test) | 2137 | 2103 | 0 | 34 |
+
+### 18.2 What landed
+
+**S3.**
+- `src/fact-families.js` (leaf, imports nothing): the closed `FACT_FAMILY_BY_NAME`, `RULE_HORIZONS` (string literals; Q2 horizons: `service.appeared` 48 h, `scheduled_job.appeared` 48 h, `process.lineage.novel_edge` 6 d; the rest per §4.2), `READER_COVERAGE` (miner, shadow, correlation, tuning), `NOVELTY_FAMILIES` (the S3b census shape), and the horizon-short rule id and N. Module-init throws on a duplicate fact_name, an unknown family, a bad horizon, or a novelty family inconsistent with the other tables. `daemon.js` init checks `HISTORY_DEPENDENT_ALERT_RULE_IDS` against `RULE_HORIZONS` in both directions (catches a literal drifting from its constant).
+- `certifiedHorizonOk(read, {nowMs, horizonMs})` in `fact-store-completeness.js`: pure, fail-closed. LOW-2: requires a **valid ledger** (`coverage` is `full` or `narrowed`; `unknown` fails). See deviation 1 for the floor it uses.
+- Per-rule gate in the producers: session (`count_drop` 30 h and `churn` 6 h, independently), peer (spike and drop, 30 h), `service.disappeared` (6 h), canary (`canary_vanished` only, 6 h), the three novelty rules, and correlation. A horizon-short rule emits no candidate and reports no `evaluatedAlertKeys`; the cold-start state machine and the fold run unchanged, so it never re-arms (I5) and resumes on the tick the span recovers. Pinned per detector: persisted lockout stays `false`, `last_folded_ts` advances, the same tick with an older floor evaluates.
+- Non-detector readers: see deviation 3.
+- Daemon: per-rule horizon veto at both `computeCoveredAlerts` passes (deviation 4); `history_horizon_short` on the status record; fixed rule `daemon.fact_history.horizon_short` (deviation 5).
+- Novelty diagnostics carry `history_certified_after_ts` (deviation 7). The sanitizer passes ISO strings and redacts `null`, so the field is omitted rather than null.
+
+**S3b** (`src/novelty-seen-set.js`): per §17, with these concrete rules.
+- **Shape:** `learned/facts/seen-sets/<family>.json` = `{schema_version, family, ledger_generation, ledger_pass_id, certified_since_ts, folded_through_ts, overflow, entries: {key: [first_ts, last_ts]}}`, exact-key validated.
+- **Fold:** by `runFactRetention`, after the ledger finalize, in the same pass as the append, for every novelty family. Complete census ticks only (strict grouping; parity-tested against all three detector groupers, including contradictory, garbled and markerless ticks), `ts <= pass now` only, from candidates above the **prior** pass's floors. Entries expire 30 days past `last_seen`. A fold failure is non-fatal and reported as `seen_set_fold[family].status = "error"`.
+- **Lineage:** the set is *continuous* only if its `ledger_generation` matches the prior and the new ledger and its `ledger_pass_id` equals the prior ledger's `last_committed_pass_id`. Otherwise it is **re-seeded** (deviation 9).
+- **Read:** `readFactPoints({seenSetFamilies})` validates each set against the **same** ledger it just read (generation, committed pass id, no pending pass). Statuses: `valid`, `missing`, `unreadable`, `invalid`, `no_ledger`, `pending_pass`, `lineage_mismatch`, `overflow`. Only `valid` carries entries.
+- **Decision:** novel ⇔ not in the window's prior complete groups **and** not seen-before in the set. The set is folded in the same pass as the append, so the latest tick's own entities are already in it: an entry whose only observation is the latest tick is still novel; any other observation, earlier or later (a future-dated entry surviving a rollback), is a prior sighting. The union only ever suppresses.
+- **Gate lift:** with a valid set the three novelty detectors call `factHistoryTrustworthy` **without** `requireFullCoverage`. Without one (any non-valid status, or an injected read carrying none) the §16 interim gate stays, so under narrowing they re-arm and claim nothing (I14).
+- **Cap:** 20,000 entries per family (§2's host: ~518 services, ~175 lineage edges, ~7 jobs per tick; expected distinct keys over 30 days are hundreds to low thousands; ~2 MB worst file). Overflow writes `{overflow: true, entries: {}}`, which is never valid, and every later pass retries a fresh re-seed. Status reason: `novelty_seen_sets[family].status = "overflow"` on the daemon status record, and the rule shows in `history_horizon_short`.
+- **Invariants pinned by tests:** I13 (the same append sequence under a 10 MiB and a one-tick budget gives identical entries and `certified_since`); I14 (set deleted over a narrowed store → re-arm, no keys, no candidate); the G1 reproduction for all three rules (t0 evicted, returner absent t1-t3, back at t4 → no candidate, **with** `evaluatedAlertKeys` non-empty and no re-arm, plus a control proving the window alone would have called it new); a lost fold write followed by eviction still remembers the entity; partial/garbled/markerless/future ticks are never folded; overflow → not valid → recovery; expiry and scope; day-1 first run → valid, `certified_since: null`.
+- **T1 updated:** at the 5 MB default the three novelty paths now keep evaluating through routine eviction (sets stay `valid` on structural and fast ticks, no anchor re-arms). Before S3b, T1 pinned the S2-interim behavior (re-arm, zero keys).
+
+**G1 re-gate LOWs.**
+- (a) `selectFactStoreCompleteness` no longer strips `age_floor_ts`. The `learned status` text names the actual cause(s): "byte-cap eviction (floor …)" and/or "age retention (floor …)".
+- (b) HANDOFF: Q6 is in scope as S3b; Blocker 2 is `dc117ca`.
+
+### 18.3 Finding: the interim `requireFullCoverage` gate went permanently silent on every host
+
+`coverageFields` reports `narrowed` whenever a byte-cap floor exists at all, or the age floor falls inside the read window. Combined with §16's interim gate:
+- the novelty detectors and correlation read a 31 d window against 30 d retention, so once a store is older than 30 days the age floor is always inside the window and they were silenced for good, on **every** host, with no byte-cap eviction at all;
+- the 3 h shadow soak refused forever after the first byte-cap eviction ever, however old;
+- the miner's unbounded read refused on any age floor, so it never mined after 30 days.
+
+This was never shipped (the branch is unpushed). It is fixed by deviation 3 (readers) and S3b (novelty), and pinned by tests: a store older than 30 days still evaluates novelty; correlation and the miner accept an age-only narrowing; shadow accepts a byte-cap floor older than its window. The interim gate is still the fallback when a set is not valid. In that case a store older than 30 days loses novelty until the next structural pass re-seeds the set and the detector's 6-tick re-establishment completes.
+
+### 18.4 Deviations from the plan text
+
+1. **`certifiedHorizonOk` uses `max(bytecap_floor_ts, age_floor_ts)`**, not the raw byte-cap floor alone. The predicate must never be looser than what `readFactPoints` excludes (both floors since `dc117ca`). In normal operation the age floor sits about 30 days back and never binds. A completeness report with `coverage: "full"` and no floor fields reads as floor-null; a `narrowed` report with no floor fails closed.
+2. **Detector test fixtures** whose hand-built completeness lacked `coverage` now say `coverage: "full"` (a real intact store always reports it). Otherwise the LOW-2 rule makes the horizon fail closed on them.
+3. **Miner, shadow and correlation use `certifiedReadWindowOk`, not the §4.2 horizons.** The plan said: miner = 7 d mining span, shadow = the shadowed constraint's horizon, correlation = 3 d. The task required a replacement for the interim gate that is provably no weaker. The referent, stated: *a store that never byte-evicted, under the same age retention*. The predicate passes exactly when byte-cap eviction is invisible to the reader's own read: no byte-cap floor, or the floor strictly before the window start, or the floor at or below the age floor. The last case is the only way an unbounded read can pass. It is proved on two real stores: whenever it passes, the read returns byte-identical points. Consequences:
+   - The miner's default read is unbounded, so on a byte-evicting store it mines only when the byte-cap floor is at or below the age floor. That is stricter than a 7 d horizon, and pre-S4 it means it never mines on an evicting host (§5 N6 already conceded service-presence mining at default budgets).
+   - Correlation additionally requires its registered 3 d horizon, which can bind on a rolled-back age floor.
+   - An age floor alone never refuses; age retention narrowed every reader on `main` too.
+4. **The daemon per-rule horizon veto landed in S3, not S4.** Computing per-rule eligibility for the I12 signal *is* the veto computation, so it is wired into both `computeCoveredAlerts` passes now as single-read defense in depth. A producer that reports coverage for a horizon-short rule is still frozen (pinned). S4 makes it per family.
+5. **The horizon-short signal is time-based, with N = 24 structural intervals.** `history_horizon_short = {threshold_ms, rules: {rule: {since_ts}}}` is written only when a rule is short over a **valid ledger report**; an untrusted read is a different condition and is reported as such. `since_ts` is carried forward from the previous status record (injectable `readDaemonStatus`). A missing or corrupt prior status, or a future `since_ts`, restarts the clock at now: that can only delay the signal, never raise it early. The fixed rule `daemon.fact_history.horizon_short` (in `FIXED_ALERT_RULE_IDS`) fires in `evaluateAlertRules` once `now - since_ts >= threshold_ms`, from the status record alone, so the CLI's read-only view agrees.
+6. **canary:** the detector gates only `canary_vanished`. `canary.tripped` (positive evidence) and the manifest/store tamper reasons (direct I/O signals) stay ungated. The daemon's horizon veto is rule-level, so `canary.tampered` is vetoed wholesale while canary is horizon-short, mirroring its wholesale `HISTORY_DEPENDENT` inclusion.
+7. **Novelty diagnostics scope:** `history_certified_after_ts` = the valid set's `max(certified_since, now - 30 d)`. Without a valid set it is `certified_after_ts` when narrowed, else the oldest retained point. The field is omitted when no scope is known; it is never null.
+8. **S3b fold source = pre-eviction candidates.** §17 says "complete, certified ticks". The fold uses every candidate above the prior pass's floors *before* this pass's byte-cap eviction, so a tick this pass evicts is still folded. Added memory can only suppress a claim, never create one. It also closes the "tick kept at pass P, fold write lost, evicted at P+1" gap by construction rather than relying on the pass-id check (pinned).
+9. **Re-seed boundary (`certified_since_ts`)** on any loss of continuity (missing, invalid or mismatched set, overflow):
+   - `max(prior byte-cap floor, prior age floor, every loss marker)` when this pass's own continuity observation is ok;
+   - the pass time otherwise (for example a re-bootstrapped ledger);
+   - `null` only on a genuine first run (ENOENT store), or when the lineage never evicted or lost anything, in which case the seed really is complete.
+   Over a narrowed store, memory before the floor is gone; the boundary says so and the novelty horizon is measured from it.
+10. **Novelty horizon referent after S3b:** the valid set's certified span (`noveltyHorizonOk`). `certified_since: null` is eligible, like a never-narrowed store. Without a valid set it is the fact floor, plus the interim full-coverage gate. The daemon uses the **same** predicate (`noveltyRuleEligible`), reading the sets in its own history read, so novelty recovery is not frozen at the 5 MB cap just because the fact floor is under 48 h. Pinned: narrowed store + valid set → a covered `service.appeared` recovers; set lost → frozen and reported.
+11. **Seen-set location** is `learned/facts/seen-sets/<family>.json`. S4 changes only `resolveSeenSetPaths` (and which family ledger the fold and read pair with). **S5/M3 must quarantine or delete legacy seen-set files too:** a generation mismatch already makes them non-valid, but orphaned files under `learned/facts/` break the "iterate the registry, never the filesystem" rule.
+12. **Tuning** reports `fact_history_certified_after_ts` in its mine summary, not per backtest.
+13. **The MEDIUM-1 confirmation fixture** in `daemon.test.js` actually evicted *every* record: its cap was the raw record size, below the normalized size. It now sizes the cap from `normalizeFactPoint` and sits 31 h back so the 30 h horizon is met. The horizon-short case has its own test.
+
+### 18.5 G2 questions
+
+1. **Re-seed boundary (deviation 9).** After a set is lost over a narrowed store and the detector re-establishes, an entity last seen *before* the boundary that returns is claimed new, scoped "not seen since `<boundary>`". The alternative boundary (pass time) only delays eligibility by the horizon; it does not recover the lost memory either. Is a scoped claim acceptable here, or should a re-seeded family stay ineligible for longer, for example until 30 days past the boundary so the set's memory is again the full retention?
+2. **`certifiedReadWindowOk` as the reader policy (deviation 3).** Is "byte-identical to a never-byte-evicted store under the same age retention" the right referent? It is stricter than the plan's 7 d miner horizon, and the miner will not mine on an evicting host until S4 gives service its own budget.
+3. **`canary.tampered` wholesale daemon horizon veto (deviation 6).** It freezes `manifest_unreadable` / `baseline_store_error` recoveries while canary is horizon-short, which at the 4 MiB budget happens only if `cap_below_tick`. Split the veto per reason, or accept?
+4. **Horizon-short signal (deviation 5).** Time-based N × interval, `since_ts` carried in the same-UID-writable status record (can only delay, never raise early). Is that acceptable, or does it need its own ledger-tied state?
+5. **Pre-eviction fold (deviation 8).** It folds ticks the pass then evicts, which were never readable as certified history. That is the safe direction for never-fabricate, but it departs from §17's "certified" wording.
+6. **A pending pass at read makes the set non-valid.** After a crash mid-pass on a narrowed store, the novelty detectors re-arm (6 ticks) rather than trusting a set folded at the previous committed pass. Accept the availability cost?
+7. **Cap and overflow:** 20k entries per family; overflow makes that family's novelty ineligible under narrowing until a re-seed fits. Is the cap right, and should overflow raise its own fixed alert rather than ride on `history_horizon_short`?
+8. **Read cost for T9 (S4).** The daemon and each novelty detector now also parse their seen-set every fast tick: three small files at this host's volume, at most about 2 MB each at the cap. T9 must count them.
+9. **Folding under a continuity break.** A pass whose prefix digest broke (an external edit) still folds that pass's candidates. Injected records can only *suppress* novelty, and that is already within a same-UID attacker's reach. Confirm.
+10. **Trust surface of the set itself.** The set is a new same-UID-writable store that can suppress novelty: forged entries hide a new entity. That is the same `integrity_level` class as everything else in `learned/` (§1 non-goal), but it is a new instance of it. Recorded for G2/G3.
+
+### 18.6 Final state
+
+The final code commit is `d1f96c6`; this addendum and the HANDOFF update follow as a docs-only commit. Full suite on `d1f96c6` (snapshot, fresh scratch `XDG_*`): 2137 tests, 2103 pass, 0 fail, 34 skipped, 0 todo. T1 runtime is about 60 s on this machine both before and after S3b; the seen-set fold and read add roughly 8 %.
+
+**Expected pre-S4 behavior on the current single 5 MB store (Leg D, not a bug).** Once eviction starts (~28 h), the certified span stays near 27 h, below the 30 h horizon of `session.count_drop`, `peer.count_spike` and `peer.count_drop`. So on every real host running this branch, those three rules are permanently horizon-short: `history_horizon_short` lists them, and `daemon.fact_history.horizon_short` fires 24 h later. Novelty is NOT affected, because with a valid seen-set it measures its horizon against the set. S4's per-family budgets (T8) resolve this. Expect it in any S7 soak or status read before S4.

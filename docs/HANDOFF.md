@@ -1,16 +1,19 @@
 # Descartes Handoff
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity G1 rework (2026-10-05)
+## Current continuity — fact-store capacity S3 + S3b built (2026-10-05)
 
-Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged.
+Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged. Plan: `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md` (§18 is the S3/S3b execution record, deviations and G2 questions).
 
-- Blocker 1 is committed as `ddbc6a6`: the three retained-window novelty producers require full coverage, with TDD regressions for the t0 / absent t1–t3 / return t4 reproduction. The §16 plan note explicitly keeps S3 from lifting this gate by horizon alone. Q6 (the first/last-seen set) is no longer open: the operator pulled it into scope after G1 as **S3b** (plan §17), which is what lifts the gate.
-- Blocker 2 is committed as `dc117ca`: ledger v2 persists monotonic `age_floor_ts`, migration/validation fail closed when an old ledger recorded age eviction without a recoverable floor, retention filters rollback-reintroduced records at or below the age floor, and completeness reports window-relative narrowed coverage with the combined certified boundary.
-- Targeted verification: 53 fact-store integrity/completeness tests pass; the lockout end-to-end regression passes.
-- Required full-suite run after the amended blocker-1 commit: 2088 tests, 2032 pass, 22 fail, 34 skipped. The 22 are sandbox-only: 17 notifier loopback-listen `EPERM`, 3 tap-token loopback-listen `EPERM`, and 2 live-host provenance checks returning `unknown`. Re-run the full suite with fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` after the blocker-2 commit and report the same classification separately.
-- Required full-suite run after the blocker-2 commit: 2088 tests, 2032 pass, 22 fail, 34 skipped, 0 todo. The same 22 are sandbox-only: 17 notifier loopback-listen `EPERM`, 3 tap-token loopback-listen `EPERM`, and 2 live-host provenance checks returning `unknown`.
+- **G1 rework (done):** blocker 1 `ddbc6a6` (interim full-coverage novelty gate), blocker 2 `dc117ca` (persisted monotonic `age_floor_ts`). Q6 (first/last-seen set) was pulled into scope by the operator as **S3b** (§17).
+- **S3 (done):** `fact-families.js` registry + `certifiedHorizonOk` (valid-ledger, max of both floors) `9581332`; per-rule horizon gate in the producers `da35bc7`; miner/shadow/correlation moved off the interim gate onto `certifiedReadWindowOk` (provably identical input to a never-byte-evicted store) `2e9ffdc`; daemon per-rule horizon veto + `history_horizon_short` + fixed alert `daemon.fact_history.horizon_short` `7656cf5`; novelty diagnostics `history_certified_after_ts` `30d2b35`.
+- **G1 re-gate LOWs (done):** `2e79956` (learned status reports `age_floor_ts` and names the narrowing cause; these HANDOFF refs).
+- **S3b (done):** `9a306c7` — `novelty-seen-set.js`; novelty decided against window ∪ seen-set; interim gate lifted only while the set is valid; daemon uses the same novelty predicate. G1 reproduction green for all three novelty rules with the gate lifted.
+- **Finding recorded (§18.3):** the interim `requireFullCoverage` gate silenced novelty/correlation/miner permanently once a store was 30 days old (age floor inside the 31 d window), and shadow after any byte-cap eviction — never shipped, fixed by S3/S3b.
+- **Full suites** (fresh scratch `XDG_*`, on a `git archive` snapshot of each commit): 0 fail at every commit (one run of `2e9ffdc` had T4 cancelled at its 120 s timeout under concurrent load, not a failure; it passes in ~5 s alone); final code commit `d1f96c6`: 2137 tests, 2103 pass, 0 fail, 34 skipped. The earlier "22 sandbox-only failures" no longer reproduce on this machine (baseline 2089 / 2055 pass / 0 fail / 34 skipped).
+- **Expected before S4 (Leg D, §18.6):** on the single 5 MB store the session/peer count rules (30 h) are permanently horizon-short once eviction starts, so `daemon.fact_history.horizon_short` fires after 24 h on real hosts. S4 budgets fix it.
+- **Next:** S4 (per-family stores, per-family veto, budgets; seen-set paths move into the family dirs; S5/M3 must also quarantine legacy seen-set files), then **daybreak G2** with the §18.5 questions.
 
 ## Current Status
 
