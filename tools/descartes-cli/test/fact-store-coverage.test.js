@@ -719,7 +719,11 @@ function pickOp(random) {
   return "append";
 }
 
-test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }, async () => {
+// Timeout: ~15 s alone, but I/O-bound (hundreds of small fsync-free rewrites), so under the full
+// suite's file-level concurrency it has run 90-120 s since S4 added more store-heavy test files
+// (T1, T7, the S4 status tests) beside it; one run hit the old 120 s bound (also seen once in S3,
+// plan §18.1). 300 s keeps it a correctness test, not a load test.
+test("T4: coverage oracle over seeded operation sequences", { timeout: 300_000 }, async () => {
   const unitTick = tickBytes(oracleTick(hour(0), 4, "x"));
   let checkedIntactReads = 0;
   for (let seed = 1; seed <= 30; seed += 1) {
