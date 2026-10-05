@@ -3,7 +3,17 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
 
-export const FACT_INTEGRITY_SCHEMA_VERSION = 1;
+// v2 (fact-store capacity plan 2026-10-05, R0b §4.1 item 2): adds `bytecap_floor_ts`.
+export const FACT_INTEGRITY_SCHEMA_VERSION = 2;
+
+// Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact continuity wedge.
+// A fact whose ts exceeds nowMs + this tolerance is untrustworthy provenance for continuity
+// purposes -- structurally the same class of problem as a corrupt/schema-invalid record -- and
+// is dropped from retention's candidates the same way. Generous by design (hours, not minutes):
+// enough to absorb NTP resync jitter, DST edge cases, and post-suspend catch-up without treating
+// ordinary clock skew as an incident. An engineering default, not an operator-facing knob.
+// Defined here (re-exported by fact-store.js) because the R0b future-floor clamp below needs it.
+export const FUTURE_FACT_TOLERANCE_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 const LEDGER_KEYS = [
   "generation",
@@ -23,6 +33,13 @@ const LEDGER_KEYS = [
   // total plus a most-recent-event marker for the new loss channel.
   "future_fact_dropped_total",
   "last_future_fact_ts",
+  // R0b (fact-store capacity plan §4.1 item 2): the EXCLUSIVE byte-cap coverage floor -- the
+  // newest ts byte-cap eviction has ever removed in this ledger lineage. Every kept record is
+  // strictly newer (tick-aligned suffix eviction), and readFactPoints never returns a point at or
+  // below it. null means byte-cap eviction has never happened in this lineage. Within a lineage it
+  // only moves forward; the two backwards moves (a ledger re-bootstrap over a non-empty store, the
+  // future-floor clamp) each stamp an in-window loss in the same pass (invariant I2).
+  "bytecap_floor_ts",
 ];
 const CONTINUITY_KEYS = [
   "record_count_hwm",
@@ -84,6 +101,7 @@ export function createFactIntegrityLedger() {
     continuity: emptyContinuity(),
     future_fact_dropped_total: 0,
     last_future_fact_ts: null,
+    bytecap_floor_ts: null,
   };
 }
 
@@ -114,6 +132,26 @@ function migrateLedgerShape(raw) {
         migrated.continuity = { ...migrated.continuity, pending_pass: { ...pendingPass, future_fact_count: 0 } };
       }
     }
+  }
+  // R0b schema bump (fact-store capacity plan §4.1 item 2 / T6), the same before-validation
+  // discipline as the Fix-0 defaults above: a v1 ledger must NOT simply fail the
+  // schema_version check, because a rejected ledger takes the invalid-ledger bootstrap and stamps a
+  // continuity break (31 days degraded) -- recreating exactly the tail R0b removes.
+  //   - v1 that never byte-evicted (bytecap_evicted_total === 0): nothing was ever narrowed, so the
+  //     exact floor is null. Upgrade to v2 in place.
+  //   - v1 that HAS byte-evicted: its floor is unknown. Operator decision Q3 (2026-10-05) chose
+  //     fresh per-family stores, so no floor is derived (M4/M2' do not apply): the ledger is left as
+  //     v1, fails validation as `invalid`, and takes the continuity-break bootstrap -- never
+  //     certified, never a clean floor:null over evicted history. In the shipped slice S5
+  //     quarantines the legacy store before any v2 code reads it; this branch governs only the
+  //     interim single store and tests.
+  if (
+    migrated.schema_version === 1 &&
+    !Object.prototype.hasOwnProperty.call(migrated, "bytecap_floor_ts") &&
+    migrated.bytecap_evicted_total === 0
+  ) {
+    migrated.schema_version = 2;
+    migrated.bytecap_floor_ts = null;
   }
   return migrated;
 }
@@ -206,7 +244,46 @@ export function isValidFactIntegrityLedger(value) {
   if (value.bytecap_evicted_total > 0 && value.last_bytecap_evict_ts === null) return false;
   if (value.future_fact_dropped_total > 0 && value.last_future_fact_ts === null) return false;
   if (continuity.continuity_ok === false && value.last_continuity_break_ts === null) return false;
+  // R0b floor validation (fact-store capacity plan §4.1 item 2): a floor exists exactly when
+  // byte-cap eviction has happened in this lineage...
+  if (!isNullableTimestamp(value.bytecap_floor_ts)) return false;
+  if ((value.bytecap_evicted_total > 0) !== (value.bytecap_floor_ts !== null)) return false;
+  // ...and is plausible: the floor sits strictly below every kept record, so for a non-empty
+  // committed rewrite it must be strictly older than that rewrite's newest record. A forged
+  // far-future floor over a non-empty store is therefore rejected as invalid (continuity-break
+  // bootstrap), never silently trusted. The empty-store case has no in-ledger referent; it is
+  // bounded instead by the future-floor clamp (prepareFactIntegrityLedger) on every pass and by
+  // buildCompleteness's fail-closed future_floor read (S0 decision, plan §15.5).
+  if (
+    value.bytecap_floor_ts !== null &&
+    continuity.last_rewrite_record_count > 0 &&
+    !(Date.parse(value.bytecap_floor_ts) < Date.parse(continuity.last_rewrite_newest_ts))
+  ) return false;
   return true;
+}
+
+// R0b future-floor clamp (fact-store capacity plan §4.1 item 2, review fold MEDIUM-3): eviction can
+// set the floor to at most pass nowIso + FUTURE_FACT_TOLERANCE_MS, so a floor further ahead than
+// that relative to THIS pass came from a clock that was fast (or a forged ledger). Left alone it
+// would blind the store until wall time caught up, while reading intact with coverage "narrowed"
+// -- an unbounded blind. Clamp it to nowIso; the caller MUST stamp an in-window loss in the same
+// pass (that stamp is what makes the backwards move safe: nothing between the clamped and the
+// original floor is ever trusted). Pure; shared by enforceFactRetention (below-floor eviction) and
+// prepareFactIntegrityLedger (the stamp) so both use the identical effective floor.
+export function resolvePriorBytecapFloor(floorTs, nowIso) {
+  if (floorTs === null || floorTs === undefined) return { floorTs: null, clamped: false };
+  const floorMs = Date.parse(floorTs);
+  const nowMs = Date.parse(nowIso);
+  if (Number.isFinite(floorMs) && Number.isFinite(nowMs) && floorMs > nowMs + FUTURE_FACT_TOLERANCE_MS) {
+    return { floorTs: nowIso, clamped: true };
+  }
+  return { floorTs, clamped: false };
+}
+
+function laterTimestamp(left, right) {
+  if (left === null || left === undefined) return right ?? null;
+  if (right === null || right === undefined) return left;
+  return Date.parse(right) > Date.parse(left) ? right : left;
 }
 
 export async function readFactIntegrityLedger(descartesPaths) {
@@ -303,7 +380,23 @@ export function observeFactContinuity(ledger, live) {
   return "ok";
 }
 
-export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live, outputRecords, outputBytes, outputDigest, counts }) {
+export function prepareFactIntegrityLedger({
+  ledger,
+  ledgerReason,
+  nowIso,
+  live,
+  outputRecords,
+  outputBytes,
+  outputDigest,
+  counts,
+  // R0b: the newest ts this pass byte-evicted (including below-floor records), or null.
+  bytecapEvictedNewestTs = null,
+  // R0b/HIGH-1 first-run carve-out: true only when appendFactPoints itself observed, BEFORE its
+  // own append, that the ledger was missing and facts.jsonl was absent or empty -- i.e. every
+  // record now in the store was appended by this very call. Never settable through the exported
+  // enforceFactRetention.
+  appendedToEmptyStore = false,
+}) {
   // daybreak-blue re-gate (2026-09-04) HIGH (residual): a ledger whose last_committed_pass_id
   // (or a still-pending pass_id) sits exactly at Number.MAX_SAFE_INTEGER is itself perfectly
   // VALID -- isValidFactIntegrityLedger's Number.isSafeInteger check accepts it -- but the next
@@ -335,7 +428,20 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
   // marker instead, so buildCompleteness degrades (not intact) until that marker ages out of
   // the retention window -- the same bounded-recovery design already used for a real
   // continuity break (see lossAtOrAfter).
-  const invalidLedgerBootstrap = bootstrap && (ledgerReason === "invalid" || ledgerReason === "unreadable" || passIdExhausted);
+  //
+  // R0b / review fold HIGH-1 (fact-store capacity plan §4.1 item 2): a MISSING ledger over a
+  // NON-EMPTY store is a lineage break too, not a first run. Under R0b the ledger carries the
+  // byte-cap floor; bootstrapping clean over a surviving facts.jsonl (operator cleanup, partial
+  // restore, half-done migration) would reset the floor to null and re-certify history the store
+  // already evicted -- and, pre-R0b, let a truncated store re-certify itself by deleting its ledger.
+  // A missing ledger over an absent/empty store (first run, a fresh per-family store) still
+  // bootstraps clean; so does the genuine first append (appendedToEmptyStore, see the parameter).
+  const missingLedgerOverNonEmptyStore = ledgerReason === "missing" &&
+    live?.exists === true && (live.bytes > 0 || live.record_count > 0) &&
+    !appendedToEmptyStore;
+  const invalidLedgerBootstrap = bootstrap && (
+    ledgerReason === "invalid" || ledgerReason === "unreadable" || passIdExhausted || missingLedgerOverNonEmptyStore
+  );
   const priorPending = next.continuity.pending_pass;
   const passId = Math.max(next.continuity.last_committed_pass_id, priorPending?.pass_id ?? 0) + 1;
   // daybreak-blue security sweep, fact-store HIGH #3, defense-in-depth: pass_id must stay in
@@ -403,6 +509,16 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
   next.last_continuity_break_ts = clampForward(next.last_continuity_break_ts);
   next.first_degraded_ts = clampForward(next.first_degraded_ts);
   next.last_future_fact_ts = clampForward(next.last_future_fact_ts);
+  // R0b floor (§4.1 item 2). NEVER passed through clampForward above: silently moving the floor
+  // backwards without a loss would certify evicted records. Within a lineage it is
+  // max(prior floor, newest ts evicted this pass), with the prior floor taken from the existing
+  // ledger (including a still-pending pass's value -- never recomputed from scratch, so crash/retry
+  // stays idempotent). The ONLY backwards move here is the future-floor clamp, which stamps an
+  // in-window loss below in this same pass (do not drop that stamp: without it the clamp would
+  // certify evicted records).
+  const priorFloor = resolvePriorBytecapFloor(next.bytecap_floor_ts, nowIso);
+  next.bytecap_floor_ts = laterTimestamp(priorFloor.floorTs, bytecapEvictedNewestTs);
+  const floorClampedBackwards = priorFloor.clamped;
 
   // daybreak-blue re-gate HIGH #2: a total already at Number.MAX_SAFE_INTEGER is itself a
   // valid, safe integer, but `total + delta` (delta > 0) overflows into an UNSAFE integer --
@@ -438,12 +554,12 @@ export function prepareFactIntegrityLedger({ ledger, ledgerReason, nowIso, live,
   if (corruptDelta > 0) next.last_corrupt_ts = nowIso;
   if (schemaInvalidDelta > 0) next.last_schema_invalid_ts = nowIso;
   if (bytecapDelta > 0) next.last_bytecap_evict_ts = nowIso;
-  if (effectiveContinuityBreak || invalidLedgerBootstrap) next.last_continuity_break_ts = nowIso;
+  if (effectiveContinuityBreak || invalidLedgerBootstrap || floorClampedBackwards) next.last_continuity_break_ts = nowIso;
   // Fix 0: last_future_fact_ts is always stamped with THIS pass's real nowIso -- never the
   // dropped record's own claimed future ts (see enforceFactRetention's counts.future_fact_count
   // callsite) -- mirroring last_corrupt_ts/last_schema_invalid_ts/last_bytecap_evict_ts exactly.
   if (futureFactDelta > 0) next.last_future_fact_ts = nowIso;
-  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + futureFactDelta + effectiveContinuityBreak + invalidLedgerBootstrap) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
+  if ((corruptDelta + schemaInvalidDelta + bytecapDelta + futureFactDelta + effectiveContinuityBreak + invalidLedgerBootstrap + floorClampedBackwards) > 0 && next.first_degraded_ts === null) next.first_degraded_ts = nowIso;
 
   next.continuity = {
     record_count_hwm: Math.max(next.continuity.record_count_hwm, live.record_count, outputRecords.length),

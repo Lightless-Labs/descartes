@@ -4,8 +4,10 @@ import path from "node:path";
 import {
   buildCompleteness,
   finalizeFactIntegrityLedger,
+  FUTURE_FACT_TOLERANCE_MS,
   prepareFactIntegrityLedger,
   readFactIntegrityLedger,
+  resolvePriorBytecapFloor,
   writeFactIntegrityLedger,
 } from "./fact-store-integrity.js";
 
@@ -18,13 +20,10 @@ import {
 export const DEFAULT_FACT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const DEFAULT_FACT_MAX_BYTES = 5 * 1024 * 1024; // 5MB
 
-// Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact continuity wedge.
-// A fact whose ts exceeds nowMs + this tolerance is untrustworthy provenance for continuity
-// purposes -- structurally the same class of problem as a corrupt/schema-invalid record -- and
-// is dropped from retention's candidates the same way. Generous by design (hours, not minutes):
-// enough to absorb NTP resync jitter, DST edge cases, and post-suspend catch-up without treating
-// ordinary clock skew as an incident. An engineering default, not an operator-facing knob.
-export const FUTURE_FACT_TOLERANCE_MS = 6 * 60 * 60 * 1000; // 6 hours
+// Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact tolerance. Defined in
+// fact-store-integrity.js (the R0b future-floor clamp needs it there) and re-exported here for
+// every existing importer.
+export { FUTURE_FACT_TOLERANCE_MS };
 
 // daybreak-blue security sweep (2026-09-04), fact-store HIGH #5 (cheap-caps portion): bound
 // attribute-key count/length and fact_name/entity_key/source_* lengths so a doctored fact
@@ -229,6 +228,13 @@ export function assertSuffixEviction(evicted, kept) {
  * than a dropped metric point.
  */
 export async function enforceFactRetention(descartesPaths, options = {}) {
+  // The exported entry point can never assert the first-run carve-out (see runFactRetention).
+  return runFactRetention(descartesPaths, options, {});
+}
+
+// `internal.appendedToEmptyStore` is passed only by appendFactPoints, which observed it BEFORE its
+// own append (fact-store capacity plan §15.5 decision 3); it is deliberately not an `options` key.
+async function runFactRetention(descartesPaths, options, internal) {
   const storePaths = resolveFactStorePaths(descartesPaths);
   const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
@@ -287,11 +293,25 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   const sortedCandidates = validRecords
     .filter(({ tsMs }) => tsMs >= cutoffMs && tsMs <= futureThresholdMs)
     .sort((left, right) => left.tsMs - right.tsMs);
+
+  // R0b below-floor eviction (fact-store capacity plan §15.5 decision 2): a candidate at or below
+  // the ledger's byte-cap floor can only have been appended AFTER the eviction that set the floor
+  // (a clock rollback) -- the read side already hides it (readFactPoints never returns ts <= floor).
+  // Evict it physically, counted as byte-cap, so "every kept record is strictly above the floor"
+  // holds by construction: the ledger's floor-plausibility validation can then never reject this
+  // pass's own output (which would fail retention on every pass from then on), and the suffix
+  // assertion below covers it too. The prior floor is resolved exactly as prepareFactIntegrityLedger
+  // resolves it (including the future-floor clamp), so the two can never disagree.
+  const existingIntegrity = await readFactIntegrityLedger(descartesPaths);
+  const priorFloor = resolvePriorBytecapFloor(existingIntegrity.ledger?.bytecap_floor_ts ?? null, nowIso);
+  const priorFloorMs = priorFloor.floorTs === null ? Number.NEGATIVE_INFINITY : Date.parse(priorFloor.floorTs);
+  const belowFloor = sortedCandidates.filter(({ tsMs }) => tsMs <= priorFloorMs);
+  const aboveFloor = sortedCandidates.filter(({ tsMs }) => tsMs > priorFloorMs);
   // Test-only seam (fact-store capacity plan T5): lets a test force a non-suffix order through the
   // keep loop below to prove assertSuffixEviction refuses it. Never set in production.
   const candidates = typeof options.orderRetentionCandidates === "function"
-    ? options.orderRetentionCandidates(sortedCandidates)
-    : sortedCandidates;
+    ? options.orderRetentionCandidates(aboveFloor)
+    : aboveFloor;
 
   // Byte-cap selection: keep the newest records that fit, walking newest-first and stopping at the
   // FIRST record that does not fit (never skipping one to fit an older one) -- so the kept set is a
@@ -315,9 +335,14 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
     const boundaryMs = candidates[keepFrom - 1].tsMs;
     while (keepFrom < candidates.length && candidates[keepFrom].tsMs === boundaryMs) keepFrom += 1;
   }
-  const evictedCandidates = candidates.slice(0, keepFrom);
+  const evictedCandidates = [...belowFloor, ...candidates.slice(0, keepFrom)];
   const keptCandidates = candidates.slice(keepFrom);
   assertSuffixEviction(evictedCandidates, keptCandidates);
+  // The floor this pass contributes: the newest ts it byte-evicted (prepareFactIntegrityLedger
+  // takes max(prior floor, this)).
+  let bytecapEvictedNewestMs = Number.NEGATIVE_INFINITY;
+  for (const { tsMs } of evictedCandidates) if (tsMs > bytecapEvictedNewestMs) bytecapEvictedNewestMs = tsMs;
+  const bytecapEvictedNewestTs = evictedCandidates.length > 0 ? new Date(bytecapEvictedNewestMs).toISOString() : null;
 
   const keptLines = keptCandidates.map(({ record }) => encodeJsonLine(record));
   const usedBytes = keptLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
@@ -342,7 +367,6 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   const outputDigest = outputRawBytes.length === 0
     ? null
     : crypto.createHash("sha256").update(outputRawBytes).digest("hex");
-  const existingIntegrity = await readFactIntegrityLedger(descartesPaths);
   const live = {
     record_count: records.length,
     bytes: liveBytes,
@@ -362,6 +386,8 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
     outputBytes: outputRawBytes.length,
     outputDigest,
     counts,
+    bytecapEvictedNewestTs,
+    appendedToEmptyStore: internal.appendedToEmptyStore === true,
   });
   await ensureFactDir(descartesPaths);
   const tmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
@@ -392,7 +418,23 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   await ensureFactDir(descartesPaths);
   const storePaths = resolveFactStorePaths(descartesPaths);
   const normalized = factPoints.map((point) => normalizeFactPoint(point, { ts: options.ts ?? options.now }));
+  // R0b / HIGH-1 first-run carve-out (fact-store capacity plan §15.5 decision 3): the very first
+  // append writes facts.jsonl BEFORE the first retention pass creates the ledger, so "missing
+  // ledger over a non-empty store" -- otherwise a lineage break -- is also the shape of a genuine
+  // first run. Observe, BEFORE appending, whether the ledger is missing and the store absent or
+  // empty; only then is every record the retention pass will see one this call appended. A crash
+  // between this append and the retention pass below leaves exactly that shape with no ledger, and
+  // the next call then (correctly, fail-closed) reads it as a lineage break.
+  let appendedToEmptyStore = false;
   if (normalized.length > 0) {
+    const ledgerBefore = await readFactIntegrityLedger(descartesPaths);
+    if (ledgerBefore.reason === "missing") {
+      const sizeBefore = await fs.stat(storePaths.factsFile).then((stat) => stat.size, (error) => {
+        if (error?.code === "ENOENT") return 0;
+        throw error;
+      });
+      appendedToEmptyStore = sizeBefore === 0;
+    }
     await fs.appendFile(storePaths.factsFile, normalized.map(encodeJsonLine).join(""), { mode: 0o600 });
   }
   // Finding F4-B2 (daybreak-blue BLOCKER), mirrors appendMetricPoints: enforceFactRetention runs
@@ -405,7 +447,7 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   let retention;
   let retentionError;
   try {
-    retention = await enforceFactRetention(descartesPaths, options);
+    retention = await runFactRetention(descartesPaths, options, { appendedToEmptyStore });
   } catch (error) {
     retentionError = (error instanceof Error ? error.message : String(error)) || "unknown retention error";
   }

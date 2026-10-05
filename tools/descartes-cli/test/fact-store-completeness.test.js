@@ -209,7 +209,15 @@ test("retention classifies an invalid timestamp as schema-invalid, not age-evict
   assert.equal(read.completeness.schema_invalid_dropped_total, 1);
 });
 
-test("missing-ledger bootstrap stays unknown until a later clean retention pass", async () => {
+// Updated by the fact-store capacity plan (2026-10-05, review fold HIGH-1, S2): this test used to
+// pin that a missing ledger over a PRE-EXISTING non-empty facts.jsonl bootstraps clean (unknown,
+// then intact). Under R0b the ledger carries the byte-cap floor, so a clean bootstrap there would
+// reset the floor to null and re-certify history the store may already have evicted (and, before
+// R0b, let a truncated store re-certify itself by deleting its ledger). That shape is now a lineage
+// break: unknown, then degraded -- never intact while the break is in the window. The genuine
+// first run (ledger missing AND store absent/empty before the first append) still bootstraps
+// clean: unknown, then intact.
+test("missing-ledger bootstrap: over a pre-existing non-empty store it is a lineage break (never intact); a genuine first append stays clean", async () => {
   const paths = await tempPaths();
   const { dir, factsFile } = resolveFactStorePaths(paths);
   await fs.mkdir(dir, { recursive: true });
@@ -218,7 +226,15 @@ test("missing-ledger bootstrap stays unknown until a later clean retention pass"
   await enforceFactRetention(paths, { now: NOW });
   assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "unknown");
   await enforceFactRetention(paths, { now: NOW });
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "intact");
+  const read = await readFactPoints(paths, { now: NOW });
+  assert.equal(read.completeness.status, "degraded");
+  assert.equal(read.completeness.last_continuity_break_ts, NOW);
+
+  const firstRun = await tempPaths();
+  await appendFactPoints(firstRun, [{ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }], { now: NOW });
+  assert.equal((await readFactPoints(firstRun, { now: NOW })).completeness.status, "unknown");
+  await enforceFactRetention(firstRun, { now: NOW });
+  assert.equal((await readFactPoints(firstRun, { now: NOW })).completeness.status, "intact");
 });
 
 test("this-read corruption cannot be reported as intact against a clean committed ledger", async () => {

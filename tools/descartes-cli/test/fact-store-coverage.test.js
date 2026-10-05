@@ -8,7 +8,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention, FUTURE_FACT_TOLERANCE_MS, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import {
+  FACT_INTEGRITY_SCHEMA_VERSION,
+  isValidFactIntegrityLedger,
+  readFactIntegrityLedger,
+  resolveFactIntegrityPaths,
+} from "../src/fact-store-integrity.js";
 import {
   factPointsFromServiceEvidence,
   factPointsFromSessionEvidence,
@@ -147,4 +153,243 @@ test("T5: the accounting sum holds with tick-aligned eviction counted as byte-ca
   assert.equal(retention.kept_count, ticks[0].length * 2);
   assert.equal(retention.bytecap_evicted_count, ticks[0].length * 2);
   assert.equal(retention.kept_count + retention.age_evicted_count + retention.bytecap_evicted_count + retention.future_fact_dropped_count, ticks.flat().length);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Ledger v2: bytecap_floor_ts (§4.1 item 2, I2, I8, T5 ledger half, T6).
+// ---------------------------------------------------------------------------------------------
+
+const tickBytes = (tick) => tick.reduce((sum, point) => sum + lineBytes(point), 0);
+
+async function readRawLedger(paths) {
+  return JSON.parse(await fs.readFile(resolveFactIntegrityPaths(paths).integrityFile, "utf8"));
+}
+
+async function writeRawLedger(paths, ledger) {
+  await fs.writeFile(resolveFactIntegrityPaths(paths).integrityFile, `${JSON.stringify(ledger, null, 2)}\n`);
+}
+
+// Appends `count` hourly service ticks (hour(0)..hour(count-1)), each through appendFactPoints
+// with the given cap, as the daemon does.
+async function appendHourlyTicks(paths, { from = 0, count, maxBytes }) {
+  const results = [];
+  for (let index = from; index < from + count; index += 1) {
+    results.push(await appendFactPoints(paths, serviceTick(hour(index)), { now: hour(index), maxBytes }));
+  }
+  return results;
+}
+
+test("T5: a new ledger is schema v2 with bytecap_floor_ts null; total > 0 <=> floor !== null is validated", async () => {
+  const paths = await tempPaths();
+  await appendHourlyTicks(paths, { count: 2, maxBytes: Number.MAX_SAFE_INTEGER });
+  const ledger = await readRawLedger(paths);
+  assert.equal(FACT_INTEGRITY_SCHEMA_VERSION, 2);
+  assert.equal(ledger.schema_version, 2);
+  assert.equal(ledger.bytecap_floor_ts, null);
+  assert.equal(isValidFactIntegrityLedger(ledger), true);
+  assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_floor_ts: hour(0) }), false, "floor set while nothing was ever byte-evicted");
+  assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_evicted_total: 3, last_bytecap_evict_ts: hour(1) }), false, "evictions recorded with no floor");
+  const { bytecap_floor_ts: _omitted, ...withoutFloor } = ledger;
+  assert.equal(isValidFactIntegrityLedger(withoutFloor), false, "the floor key is required in v2");
+  assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_floor_ts: "garbage" }), false);
+});
+
+test("T5: the floor is the newest evicted ts, is exclusive (every kept record is strictly newer), and never decreases across passes (I2)", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 3;
+  await appendHourlyTicks(paths, { count: 3, maxBytes: cap });
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, null, "nothing evicted yet");
+  let previousFloorMs = Number.NEGATIVE_INFINITY;
+  for (let index = 3; index < 9; index += 1) {
+    await appendFactPoints(paths, serviceTick(hour(index)), { now: hour(index), maxBytes: cap });
+    const ledger = await readRawLedger(paths);
+    assert.equal(ledger.bytecap_floor_ts, hour(index - 3), `after tick ${index} the floor is the newest evicted tick`);
+    assert.ok(Date.parse(ledger.bytecap_floor_ts) >= previousFloorMs, "the floor never decreases");
+    previousFloorMs = Date.parse(ledger.bytecap_floor_ts);
+    const raw = (await fs.readFile(resolveFactStorePaths(paths).factsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(raw.every((record) => Date.parse(record.ts) > previousFloorMs), "every kept record is strictly above the floor");
+    assert.equal(isValidFactIntegrityLedger(ledger), true);
+  }
+  // A pass that evicts nothing (budget raised) keeps the floor.
+  await enforceFactRetention(paths, { now: hour(9), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(5));
+});
+
+test("T5: maxBytes 0 and a single tick over the cap both leave an empty store with a set floor and a valid ledger", async () => {
+  for (const maxBytes of [0, 50]) {
+    const paths = await tempPaths();
+    await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
+    const retention = await enforceFactRetention(paths, { now: hour(0), maxBytes });
+    assert.equal(retention.kept_count, 0, `maxBytes ${maxBytes}`);
+    const ledger = await readRawLedger(paths);
+    assert.equal(ledger.bytecap_floor_ts, hour(0), `maxBytes ${maxBytes}: floor = the evicted tick`);
+    assert.equal(ledger.continuity.last_rewrite_record_count, 0);
+    assert.equal(isValidFactIntegrityLedger(ledger), true);
+  }
+});
+
+test("T5: floor plausibility -- a non-empty store's floor at or above last_rewrite_newest_ts makes the ledger invalid (forged floor rejected, not trusted)", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  const ledger = await readRawLedger(paths);
+  assert.equal(ledger.continuity.last_rewrite_newest_ts, hour(3));
+  assert.equal(isValidFactIntegrityLedger(ledger), true);
+  assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_floor_ts: hour(3) }), false, "floor equal to the newest kept record");
+  assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_floor_ts: "2027-01-01T00:00:00.000Z" }), false, "far-future forged floor");
+  await writeRawLedger(paths, { ...ledger, bytecap_floor_ts: "2027-01-01T00:00:00.000Z" });
+  assert.equal((await readFactIntegrityLedger(paths)).reason, "invalid");
+  assert.notEqual((await readFactPoints(paths, { now: hour(3) })).completeness.status, "intact");
+});
+
+test("T5: crash between the ledger write and the rename, then retry, leaves the floor exactly where one clean pass would (idempotent)", async () => {
+  for (const window of ["beforeFactsRename", "afterFactsRename"]) {
+    const reference = await tempPaths();
+    const crashed = await tempPaths();
+    const cap = tickBytes(serviceTick(hour(0))) * 2;
+    for (const paths of [reference, crashed]) await appendHourlyTicks(paths, { count: 3, maxBytes: Number.MAX_SAFE_INTEGER });
+    await enforceFactRetention(reference, { now: hour(3), maxBytes: cap });
+    await assert.rejects(() => enforceFactRetention(crashed, { now: hour(3), maxBytes: cap, [window]: async () => { throw new Error("simulated crash"); } }), /simulated crash/);
+    await enforceFactRetention(crashed, { now: hour(3), maxBytes: cap });
+    const [ref, got] = [await readRawLedger(reference), await readRawLedger(crashed)];
+    assert.equal(got.bytecap_floor_ts, hour(0), window);
+    assert.equal(got.bytecap_floor_ts, ref.bytecap_floor_ts, window);
+    assert.equal(got.bytecap_evicted_total, ref.bytecap_evicted_total, `${window}: evictions counted once`);
+  }
+});
+
+test("I2/MEDIUM-3: a floor more than FUTURE_FACT_TOLERANCE_MS ahead of the pass is clamped to the pass time AND an in-window loss is stamped in the same pass", async () => {
+  // Clock N days fast, then corrected.
+  const paths = await tempPaths();
+  const fastMs = 5 * 24 * HOUR_MS;
+  const fast = (index) => new Date(BASE_MS + fastMs + index * HOUR_MS).toISOString();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  for (let index = 0; index < 4; index += 1) {
+    await appendFactPoints(paths, serviceTick(fast(index)), { now: fast(index), maxBytes: cap });
+  }
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, fast(1));
+  // Clock corrected: the real time is hour(4), five days before the floor.
+  await appendFactPoints(paths, serviceTick(hour(4)), { now: hour(4), maxBytes: cap });
+  const ledger = await readRawLedger(paths);
+  assert.ok(Date.parse(ledger.bytecap_floor_ts) <= Date.parse(hour(4)) + FUTURE_FACT_TOLERANCE_MS, `floor ${ledger.bytecap_floor_ts} was not clamped`);
+  assert.equal(ledger.last_continuity_break_ts, hour(4), "the backwards move of the floor must stamp a loss in the same pass");
+  assert.equal(isValidFactIntegrityLedger(ledger), true);
+  // The family reads degraded (never intact) while that loss is in the window...
+  await enforceFactRetention(paths, { now: hour(5), maxBytes: cap });
+  assert.equal((await readFactPoints(paths, { now: hour(5), windowMs: 31 * 24 * HOUR_MS })).completeness.status, "degraded");
+  // ...and the blind is bounded: once the loss ages out of the 31-day window it reads intact again.
+  const later = new Date(BASE_MS + 32 * 24 * HOUR_MS).toISOString();
+  await appendFactPoints(paths, serviceTick(later), { now: later, maxBytes: cap });
+  await enforceFactRetention(paths, { now: later, maxBytes: cap });
+  assert.equal((await readFactPoints(paths, { now: later, windowMs: 31 * 24 * HOUR_MS })).completeness.status, "intact");
+});
+
+test("below-floor records (appended after a clock rollback) are evicted at the next pass instead of wedging the ledger's plausibility check", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(1));
+  // Evict everything, then roll the clock back below the floor (within the future tolerance).
+  await enforceFactRetention(paths, { now: hour(3), maxBytes: 0 });
+  assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(3));
+  const rolledBack = new Date(BASE_MS + 2.5 * HOUR_MS).toISOString();
+  const result = await appendFactPoints(paths, serviceTick(rolledBack), { now: rolledBack, maxBytes: cap });
+  assert.equal(result.retention_error, undefined, "retention must not fail on a store whose records all sit below the floor");
+  assert.equal(result.retention.kept_count, 0, "records at or below the floor are evicted");
+  assert.equal(result.retention.bytecap_evicted_count, serviceTick(rolledBack).length);
+  const ledger = await readRawLedger(paths);
+  assert.equal(ledger.bytecap_floor_ts, hour(3), "the floor does not move backwards");
+  assert.equal(isValidFactIntegrityLedger(ledger), true);
+});
+
+test("T6: a valid v1 ledger with no evictions upgrades to v2 (floor null) and reads intact -- never invalid, never a continuity break", async () => {
+  const paths = await tempPaths();
+  await appendHourlyTicks(paths, { count: 3, maxBytes: Number.MAX_SAFE_INTEGER });
+  const v2 = await readRawLedger(paths);
+  const { bytecap_floor_ts: _floor, ...v1 } = { ...v2, schema_version: 1 };
+  await writeRawLedger(paths, v1);
+  const read = await readFactIntegrityLedger(paths);
+  assert.equal(read.reason, null);
+  assert.equal(read.ledger.schema_version, 2);
+  assert.equal(read.ledger.bytecap_floor_ts, null);
+  assert.equal((await readFactPoints(paths, { now: hour(2) })).completeness.status, "intact");
+  await appendFactPoints(paths, serviceTick(hour(3)), { now: hour(3), maxBytes: Number.MAX_SAFE_INTEGER });
+  const after = await readRawLedger(paths);
+  assert.equal(after.schema_version, 2);
+  assert.equal(after.last_continuity_break_ts, null);
+  assert.equal((await readFactPoints(paths, { now: hour(3) })).completeness.status, "intact");
+});
+
+test("T6 (Q3 = fresh per-family stores, so no M4 floor derivation): a v1 ledger that has byte-evicted is never certified -- it takes the continuity-break bootstrap, never a clean floor:null", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  const v2 = await readRawLedger(paths);
+  assert.ok(v2.bytecap_evicted_total > 0);
+  const { bytecap_floor_ts: _floor, ...v1 } = { ...v2, schema_version: 1 };
+  await writeRawLedger(paths, v1);
+  assert.equal((await readFactIntegrityLedger(paths)).reason, "invalid");
+  assert.notEqual((await readFactPoints(paths, { now: hour(3) })).completeness.status, "intact");
+  await appendFactPoints(paths, serviceTick(hour(4)), { now: hour(4), maxBytes: cap });
+  await appendFactPoints(paths, serviceTick(hour(5)), { now: hour(5), maxBytes: cap });
+  const ledger = await readRawLedger(paths);
+  assert.equal(ledger.last_continuity_break_ts, hour(4), "lineage break stamped");
+  assert.equal((await readFactPoints(paths, { now: hour(5) })).completeness.status, "degraded");
+});
+
+test("T6: an already-v2 ledger round-trips unchanged through read and a no-op-eviction pass", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  const before = await readRawLedger(paths);
+  const read = await readFactIntegrityLedger(paths);
+  assert.deepEqual(read.ledger, before);
+});
+
+test("T6/HIGH-1: a missing integrity.json over a surviving non-empty facts.jsonl stamps a continuity break and never reads intact", async () => {
+  const paths = await tempPaths();
+  const cap = tickBytes(serviceTick(hour(0))) * 2;
+  await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
+  await fs.unlink(resolveFactIntegrityPaths(paths).integrityFile);
+  await appendFactPoints(paths, serviceTick(hour(4)), { now: hour(4), maxBytes: cap });
+  const ledger = await readRawLedger(paths);
+  assert.equal(ledger.last_continuity_break_ts, hour(4));
+  for (let index = 5; index < 8; index += 1) {
+    await appendFactPoints(paths, serviceTick(hour(index)), { now: hour(index), maxBytes: cap });
+    assert.notEqual((await readFactPoints(paths, { now: hour(index) })).completeness.status, "intact", `tick ${index}`);
+  }
+});
+
+test("T6/HIGH-1: a missing ledger over an absent store (first run) bootstraps clean: unknown, then intact", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readRawLedger(paths)).last_continuity_break_ts, null);
+  assert.equal((await readFactPoints(paths, { now: hour(0) })).completeness.status, "unknown");
+  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readFactPoints(paths, { now: hour(1) })).completeness.status, "intact");
+});
+
+test("T6/HIGH-1: a missing ledger over an existing EMPTY store bootstraps clean", async () => {
+  const paths = await tempPaths();
+  const { dir, factsFile } = resolveFactStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(factsFile, "");
+  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readRawLedger(paths)).last_continuity_break_ts, null);
+});
+
+test("T6/HIGH-1: a crash between the very first append and the first retention pass reads as a lineage break, never a clean bootstrap", async () => {
+  const paths = await tempPaths();
+  const { dir, factsFile } = resolveFactStorePaths(paths);
+  await fs.mkdir(dir, { recursive: true });
+  // The first append reached disk but its retention pass never ran (no ledger).
+  await fs.writeFile(factsFile, serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n") + "\n");
+  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readRawLedger(paths)).last_continuity_break_ts, hour(1));
+  // Direct retention over a ledger-less non-empty store is the same case.
+  const direct = await tempPaths();
+  await fs.mkdir(resolveFactStorePaths(direct).dir, { recursive: true });
+  await fs.writeFile(resolveFactStorePaths(direct).factsFile, serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n") + "\n");
+  await enforceFactRetention(direct, { now: hour(0) });
+  assert.equal((await readRawLedger(direct)).last_continuity_break_ts, hour(0));
 });
