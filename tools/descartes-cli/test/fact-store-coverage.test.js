@@ -144,6 +144,23 @@ test("T5: a non-suffix eviction (forced through the candidate-order seam) throws
   assert.deepEqual(after, before, "a refused pass must not rewrite the store");
 });
 
+test("LOW-5 (review fold): orderRetentionCandidates is an enforceFactRetention-only test seam -- appendFactPoints never reaches it even if a caller sets it in options", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, [...serviceTick(hour(0)), ...serviceTick(hour(1))], { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  const oneTick = serviceTick(hour(1)).reduce((sum, point) => sum + lineBytes(point), 0);
+  // Were this option honored through appendFactPoints, the newest-first keep loop would try to
+  // keep the OLDEST tick (see the sibling enforceFactRetention test above) and the suffix
+  // assertion would throw. It must instead be silently ignored.
+  const result = await appendFactPoints(paths, [], {
+    now: hour(1),
+    maxBytes: oneTick,
+    orderRetentionCandidates: (candidates) => [...candidates].reverse(),
+  });
+  assert.equal(result.retention_error, undefined, "appendFactPoints must not honor orderRetentionCandidates from its own options");
+  const read = await readFactPoints(paths, { now: hour(1) });
+  assert.deepEqual([...groupByTs(read.points).keys()], [hour(1)], "the NEWEST tick is kept -- the correct suffix eviction, proving the option was ignored");
+});
+
 test("T5: the accounting sum holds with tick-aligned eviction counted as byte-cap", async () => {
   const paths = await tempPaths();
   const ticks = [0, 1, 2, 3].map((index) => serviceTick(hour(index)));

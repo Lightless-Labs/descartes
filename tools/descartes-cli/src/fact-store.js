@@ -228,10 +228,15 @@ export function assertSuffixEviction(evicted, kept) {
  * than a dropped metric point.
  */
 export async function enforceFactRetention(descartesPaths, options = {}) {
-  return runFactRetention(descartesPaths, options);
+  // LOW-5 (review fold): `orderRetentionCandidates` (T5's non-suffix-eviction seam) is read from
+  // `internal`, never from `options` directly -- see runFactRetention below. Routing it through
+  // here, explicitly, is what makes it reachable ONLY via this exported, test-only entry point:
+  // appendFactPoints calls runFactRetention with no third argument, so the same key in ITS options
+  // can never reach the candidate order, no matter what a caller passes it.
+  return runFactRetention(descartesPaths, options, { orderRetentionCandidates: options.orderRetentionCandidates });
 }
 
-async function runFactRetention(descartesPaths, options) {
+async function runFactRetention(descartesPaths, options, internal = {}) {
   const storePaths = resolveFactStorePaths(descartesPaths);
   const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
@@ -305,9 +310,13 @@ async function runFactRetention(descartesPaths, options) {
   const belowFloor = sortedCandidates.filter(({ tsMs }) => tsMs <= priorFloorMs);
   const aboveFloor = sortedCandidates.filter(({ tsMs }) => tsMs > priorFloorMs);
   // Test-only seam (fact-store capacity plan T5): lets a test force a non-suffix order through the
-  // keep loop below to prove assertSuffixEviction refuses it. Never set in production.
-  const candidates = typeof options.orderRetentionCandidates === "function"
-    ? options.orderRetentionCandidates(aboveFloor)
+  // keep loop below to prove assertSuffixEviction refuses it. Read from `internal`, never
+  // `options` (LOW-5, review fold): `enforceFactRetention` is the only caller that threads its own
+  // `options.orderRetentionCandidates` through to `internal` above, so this is reachable only via
+  // that exported, explicitly test-only entry point -- never through appendFactPoints, no matter
+  // what a caller passes in its options.
+  const candidates = typeof internal.orderRetentionCandidates === "function"
+    ? internal.orderRetentionCandidates(aboveFloor)
     : aboveFloor;
 
   // Byte-cap selection: keep the newest records that fit, walking newest-first and stopping at the
