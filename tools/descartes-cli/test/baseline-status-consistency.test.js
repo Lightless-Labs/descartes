@@ -35,7 +35,7 @@ import { buildBaselineStatus, BASELINE_STATUS_RULE_IDS } from "../src/baseline.j
 import { runDaemonIteration } from "../src/daemon.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { appendFactPoints, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
-import { RULE_HORIZONS } from "../src/fact-families.js";
+import { MIN_STRUCTURAL_INTERVAL_MS, RULE_HORIZONS } from "../src/fact-families.js";
 import { factHistoryTrustworthy, ruleEligible, validNoveltySeenSet } from "../src/fact-store-completeness.js";
 import { resolveLegacyFactStorePaths } from "../src/fact-store-migration.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -560,6 +560,31 @@ test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick
   assert.deepEqual(absent.domains.find((domain) => domain.domain === "service").rules.find((rule) => rule.rule_id === SERVICE_DISAPPEARED_RULE_ID).reasons, ["budget_below_horizon_floor"]);
   const unreadable = await buildBaselineStatus(paths, { now: nowIso, readDaemonStatus: async () => { throw new Error("garbled"); } });
   assert.equal(unreadable.daemon_record.status, "unreadable");
+});
+
+test("M3: the recorded structural interval is used only within the daemon's own profile bounds, and its source is shown", async () => {
+  const paths = await tempPaths("interval-bounds");
+  const rig = scenarioRig();
+  for (let hour = 0; hour <= 7; hour += 1) await rig.structural(paths, hour);
+  // The census is 2.5 h old: fresh at the 1 h default (3 h), so the phase does not depend on which
+  // valid interval is used; the point is which value status accepts.
+  const nowIso = iso(BASE_MS + 9.5 * HOUR_MS);
+  const withInterval = (intervalMs) => async () => ({ ts: iso(BASE_MS + 7 * HOUR_MS), profile: { ...rig.profile, structural: { ...rig.profile.structural, interval_ms: intervalMs } } });
+  const valid = await buildBaselineStatus(paths, { now: nowIso, readDaemonStatus: withInterval(2 * HOUR_MS) });
+  assert.equal(valid.daemon_record.structural_interval_ms, 2 * HOUR_MS);
+  assert.equal(valid.daemon_record.structural_interval_source, "daemon_record");
+  // Below MIN_STRUCTURAL_INTERVAL_MS the daemon refuses to start (validateDaemonProfile), so no
+  // running daemon recorded it: status falls back to the default and says so.
+  for (const bad of [MIN_STRUCTURAL_INTERVAL_MS - 1, 0, -5, Number.NaN, "3600000"]) {
+    const rejected = await buildBaselineStatus(paths, { now: nowIso, readDaemonStatus: withInterval(bad) });
+    assert.equal(rejected.daemon_record.structural_interval_ms, HOUR_MS, `${bad}`);
+    assert.equal(rejected.daemon_record.structural_interval_source, "default_recorded_interval_invalid", `${bad}`);
+  }
+  const absent = await buildBaselineStatus(paths, { now: nowIso, readDaemonStatus: async () => undefined });
+  assert.equal(absent.daemon_record.structural_interval_ms, HOUR_MS);
+  assert.equal(absent.daemon_record.structural_interval_source, "default_no_record");
+  const noStructural = await buildBaselineStatus(paths, { now: nowIso, readDaemonStatus: async () => ({ ts: nowIso, profile: { interval_ms: 60_000, collectors: {} } }) });
+  assert.equal(noStructural.daemon_record.structural_interval_source, "default_no_recorded_interval");
 });
 
 async function snapshotTree(root) {

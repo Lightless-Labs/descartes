@@ -7,6 +7,7 @@ import {
   familyBudgetFloorBytes,
   NOVELTY_FAMILIES,
   resolveFactStoreBudgets,
+  MIN_STRUCTURAL_INTERVAL_MS,
   RULE_HORIZONS,
 } from "./fact-families.js";
 import { ACTIVE_FRESHNESS_MULTIPLE, DEFAULT_STRUCTURAL_INTERVAL_MS } from "./daemon.js";
@@ -319,9 +320,21 @@ async function readDaemonRecord(descartesPaths, options) {
 // The daemon derives its structural interval from its resolved profile (profile.structural.interval_ms,
 // default DEFAULT_STRUCTURAL_INTERVAL_MS). The CLI has no profile of its own, so it takes the one the
 // daemon last recorded; without a usable record it uses the daemon's default.
+//
+// NOT display-only (S6 review M3): the interval sets activeFreshnessMs, which decides
+// latest_census_stale vs watching for the four census rules. A recorded value is accepted only within
+// the bounds validateDaemonProfile enforces before a daemon will run (a finite number >=
+// MIN_STRUCTURAL_INTERVAL_MS; the daemon has no upper bound, so neither does this). A value outside
+// them was not written by a running daemon, so status uses the default and says which source it used.
+// Residual (disclosed): a same-UID forged in-bounds value, or a missing record on a non-default
+// profile, makes status's freshness differ from the daemon's.
 function structuralIntervalOf(daemonRecord) {
+  if (daemonRecord.status !== "present") return { intervalMs: DEFAULT_STRUCTURAL_INTERVAL_MS, source: "default_no_record" };
   const value = daemonRecord.record?.profile?.structural?.interval_ms;
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : DEFAULT_STRUCTURAL_INTERVAL_MS;
+  if (value === undefined) return { intervalMs: DEFAULT_STRUCTURAL_INTERVAL_MS, source: "default_no_recorded_interval" };
+  return typeof value === "number" && Number.isFinite(value) && value >= MIN_STRUCTURAL_INTERVAL_MS
+    ? { intervalMs: value, source: "daemon_record" }
+    : { intervalMs: DEFAULT_STRUCTURAL_INTERVAL_MS, source: "default_recorded_interval_invalid" };
 }
 
 async function runProducerReadOnly(descartesPaths, producer, { config, nowIso, activeFreshnessMs, options }) {
@@ -363,7 +376,7 @@ async function readBaselineInputs(descartesPaths, options) {
   // kill-switch short-circuit, checked before any read).
   if (!config.enabled) return { config, nowMs, disabled: true, domains: DOMAIN_DEFINITIONS.map((definition) => ({ definition, runs: [], groups: [], points: [] })) };
   const daemonRecord = await readDaemonRecord(descartesPaths, options);
-  const structuralIntervalMs = structuralIntervalOf(daemonRecord);
+  const { intervalMs: structuralIntervalMs, source: structuralIntervalSource } = structuralIntervalOf(daemonRecord);
   const activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE * structuralIntervalMs;
   const domains = [];
   for (const definition of DOMAIN_DEFINITIONS) {
@@ -379,7 +392,7 @@ async function readBaselineInputs(descartesPaths, options) {
     const groups = currentGroups(definition.group, points, nowMs);
     domains.push({ definition, runs, familyRead, points, groups });
   }
-  return { config, nowMs, daemonRecord, structuralIntervalMs, activeFreshnessMs, domains };
+  return { config, nowMs, daemonRecord, structuralIntervalMs, structuralIntervalSource, activeFreshnessMs, domains };
 }
 
 function configPayload(config, descartesPaths) {
@@ -552,6 +565,7 @@ function daemonRecordPayload(inputs) {
     status: daemonRecord.status,
     ...(isValidTimestamp(daemonRecord.record?.ts) ? { ts: daemonRecord.record.ts } : {}),
     structural_interval_ms: inputs.structuralIntervalMs,
+    structural_interval_source: inputs.structuralIntervalSource,
     ...(daemonRecord.record?.fact_store_legacy ? { fact_store_legacy: daemonRecord.record.fact_store_legacy } : {}),
     ...(Array.isArray(daemonRecord.record?.fact_store_deprecations) ? { fact_store_deprecations: daemonRecord.record.fact_store_deprecations } : {}),
     note: DAEMON_RECORD_NOTE,
@@ -640,6 +654,9 @@ function renderStatus(report) {
     lines.push(report.daemon_record.status === "present"
       ? `Daemon status record: ${report.daemon_record.ts ?? "undated"}`
       : `Daemon status record: ${report.daemon_record.status}`);
+    if (report.daemon_record.structural_interval_source !== "daemon_record") {
+      lines.push(`  structural interval ${report.daemon_record.structural_interval_ms} ms (${report.daemon_record.structural_interval_source}); census freshness may differ from the daemon's`);
+    }
     for (const deprecation of report.daemon_record.fact_store_deprecations ?? []) {
       lines.push(`  ${deprecation.source} ${deprecation.key}: ${deprecation.status}`);
     }
