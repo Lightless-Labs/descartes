@@ -440,6 +440,25 @@ test("collectIdentityObservations: a complete census is status ok (other-UID pid
   assert.equal(result.observations[0].target.value, 100);
 });
 
+test("collectIdentityObservations: every holder pid from one socket is independently observed", async () => {
+  const processes = [
+    { pid: 100, ppid: 1, uid: OWN_UID, command: "own-svc-a" },
+    { pid: 101, ppid: 1, uid: OWN_UID, command: "own-svc-b" },
+  ];
+  const result = await collectIdentityObservations({
+    ownUid: OWN_UID,
+    listListeningSocketsWithPidStatus: async () => ({
+      status: "ok",
+      sockets: [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, uid: OWN_UID, pids: [100, 101] }],
+      reasons: [],
+    }),
+    snapshotProvenanceProcessesStatus: async () => ({ status: "ok", processes, reasons: [] }),
+    resolveExecutableInfo: async (pid) => ({ executable_path: `/opt/svc/${pid}/bin` }),
+  });
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.observations.map((observation) => observation.target.value), [100, 101]);
+});
+
 test("collectIdentityObservations: zero listeners from a successful census is a genuine ok-empty observation", async () => {
   let psCalled = false;
   const result = await collectIdentityObservations(fakeCollectorOptions({
@@ -572,29 +591,29 @@ function coverageOptions(collect) {
 const okCollection = (observations) => async () => ({ status: "ok", observations, reasons: [] });
 const hoursAfterT0 = (hours) => new Date(Date.parse(T0) + hours * 60 * 60 * 1000).toISOString();
 
-test("coverage: a PRESENT identity re-observed by a successful collection is reported evaluated (and still fires)", async () => {
+test("coverage: a PRESENT identity that is still bad is NOT reported evaluated", async () => {
   const paths = await tempPaths();
   const { unknownKey, bindKey } = await seedConfirmedIdentity(paths);
   const now = hoursAfterT0(1);
   const result = await computeProvenanceIdentityCandidates(paths, { ...coverageOptions(okCollection([CONFIRMED_OBSERVATION])), now });
   assert.ok(result.candidates.some((c) => c.id === unknownKey), "present identity still fires");
   assert.ok(result.candidates.some((c) => c.id === bindKey));
-  assert.ok(result.evaluatedAlertKeys.includes(unknownKey), "present identity is evaluated");
-  assert.ok(result.evaluatedAlertKeys.includes(bindKey));
+  assert.equal(result.evaluatedAlertKeys.includes(unknownKey), false, "positive re-observation does not clear an active unknown identity");
+  assert.equal(result.evaluatedAlertKeys.includes(bindKey), false, "positive re-observation does not clear an active public bind");
   const { store } = await loadSignatureStore(paths);
   assert.equal(store.last_reconciled_at, now);
   assert.equal(store.last_reconcile_attempt_at, now);
   assert.equal(store.last_reconcile_status, "ok");
 });
 
-test("coverage: GENUINE ABSENCE after a successful observation (gone past the presence window) is evaluated-clear -- no candidate, key reported", async () => {
+test("coverage: an aged-out identity is NOT reported evaluated-clear", async () => {
   const paths = await tempPaths();
   const { unknownKey, bindKey } = await seedConfirmedIdentity(paths);
   const now = hoursAfterT0(4); // past the 3h presence window
   const result = await computeProvenanceIdentityCandidates(paths, { ...coverageOptions(okCollection([])), now });
   assert.equal(result.candidates.some((c) => c.id === unknownKey), false);
-  assert.ok(result.evaluatedAlertKeys.includes(unknownKey), "successfully looked for and not found -> evaluated-clear");
-  assert.ok(result.evaluatedAlertKeys.includes(bindKey));
+  assert.equal(result.evaluatedAlertKeys.includes(unknownKey), false, "absence never authorizes recovery");
+  assert.equal(result.evaluatedAlertKeys.includes(bindKey), false, "absence never authorizes recovery");
   const { store } = await loadSignatureStore(paths);
   assert.equal(store.last_reconciled_at, now);
 });
@@ -625,9 +644,38 @@ test("coverage: a DEGRADED collection does NOT advance last_reconciled_at or las
   assert.equal(collectCalls, 1, "a degraded host must not be re-probed every fast tick");
   assert.deepEqual(retry.evaluatedAlertKeys, []);
 
-  // Once a later collection genuinely succeeds, coverage is restored.
+  // Once a later collection genuinely succeeds, absence still does not authorize coverage.
   const recovered = await computeProvenanceIdentityCandidates(paths, { ...coverageOptions(okCollection([])), now: hoursAfterT0(5.1) });
-  assert.ok(recovered.evaluatedAlertKeys.includes(unknownKey));
+  assert.equal(recovered.evaluatedAlertKeys.includes(unknownKey), false);
+});
+
+test("coverage: the same identity observed present with its alert condition cleared is covered", async () => {
+  const paths = await tempPaths();
+  const { identityHash, unknownKey, bindKey } = await seedConfirmedIdentity(paths);
+  const { store } = await loadSignatureStore(paths);
+  store.signatures[identityHash].origin = "snapshot";
+  await writeSignatureStore(paths, store);
+  const result = await computeProvenanceIdentityCandidates(paths, {
+    ...coverageOptions(okCollection([CONFIRMED_OBSERVATION])),
+    now: hoursAfterT0(1),
+  });
+  assert.equal(result.candidates.some((candidate) => candidate.id === unknownKey), false);
+  assert.equal(result.candidates.some((candidate) => candidate.id === bindKey), false);
+  assert.ok(result.evaluatedAlertKeys.includes(unknownKey));
+  assert.ok(result.evaluatedAlertKeys.includes(bindKey));
+});
+
+test("coverage: re-keying to a different path and port never covers the old identity keys", async () => {
+  const paths = await tempPaths();
+  const { identityHash: oldIdentityHash, unknownKey, bindKey } = await seedConfirmedIdentity(paths);
+  const replacement = { ...CONFIRMED_OBSERVATION, executablePath: "/opt/other/bin/worker", portTargetKeys: ["tcp.9600"] };
+  const result = await computeProvenanceIdentityCandidates(paths, {
+    ...coverageOptions(okCollection([replacement])),
+    now: hoursAfterT0(1),
+  });
+  assert.notEqual(computeIdentitySignature(replacement), oldIdentityHash);
+  assert.equal(result.evaluatedAlertKeys.includes(unknownKey), false);
+  assert.equal(result.evaluatedAlertKeys.includes(bindKey), false);
 });
 
 test("coverage: a PARTIALLY degraded collection folds only its genuinely-resolved observations, but still reports NO coverage and does not advance last_reconciled_at", async () => {

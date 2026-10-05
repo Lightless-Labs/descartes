@@ -207,6 +207,9 @@ export function applyIdentityObservation(existingRecord, observation = {}, optio
     if (!key) continue;
     portTargetKeys = boundedPushUnique(portTargetKeys, key, MAX_PORT_TARGET_KEYS, stringEqual);
   }
+  const currentPortTargetKeys = Array.isArray(observation.portTargetKeys)
+    ? [...new Set(observation.portTargetKeys.filter(Boolean))].slice(0, MAX_PORT_TARGET_KEYS)
+    : existingRecord?.current_port_target_keys ?? [];
 
   return {
     kind: "signature",
@@ -236,6 +239,7 @@ export function applyIdentityObservation(existingRecord, observation = {}, optio
     // Additive (S5 implementation detail): bounded list of "protocol.port" strings this identity
     // has been observed publicly serving -- drives new_public_bind's reverse-index lookup below.
     port_target_keys: portTargetKeys,
+    current_port_target_keys: currentPortTargetKeys,
   };
 }
 
@@ -630,7 +634,7 @@ export function deriveIdentityCandidates(store, options = {}) {
     if (record.state !== "known_good" || record.origin !== "grace_window") continue;
     if (!isPresent(record)) continue; // Recovered: unseen for longer than the presence window.
     candidates.push(buildUnknownIdentityCandidate(identityHash, record));
-    for (const portKey of record.port_target_keys ?? []) {
+    for (const portKey of record.current_port_target_keys ?? record.port_target_keys ?? []) {
       candidates.push(buildNewPublicBindCandidate(identityHash, record, portKey));
     }
   }
@@ -649,124 +653,61 @@ export function deriveIdentityCandidates(store, options = {}) {
 }
 
 /**
- * Detector-reported recovery coverage (plan 2026-09-20 §8.B, 2026-10 provenance-identity
- * conversion) -- PURE: the alert identities (alertId(rule_id, fingerprint)) whose state
- * deriveIdentityCandidates genuinely evaluated against a store that was JUST reconciled from a
- * SUCCESSFUL, COMPLETE host re-observation. The CALLER owns that precondition
- * (tools/provenance-identity.js only calls this on a due tick whose collection status is "ok");
- * this function only answers "given a freshly re-observed store, which identities can it speak
- * for?":
- *   - every tracked record's unknown_identity key -- present (re-observed this tick -> fresh
- *     last_seen) or genuinely absent (successfully looked for and not found; the presence window
- *     then decides whether it still fires);
- *   - every tracked record's public-port new_public_bind key;
- *   - every target key's (process.<exe_path_hash> / port.<proto.port>) identity_drift key.
- * EXCLUDED (never evaluated-clear): every record a transient-stat-skipped observation could be
- * (the process is running but its identity was not verified, so its last_seen did not advance),
- * every target such a record holds, and the skipped observation's own process/port targets.
- * Exclusions are applied in FINGERPRINT space, so a covered target whose sanitized fingerprint
- * collides with an excluded one is excluded too. A persisted alert whose identity has no record in
- * the store is never reported (stays frozen). A fingerprint with no safe value (the builders'
- * shared "unknown" fallback) is never reported.
+ * Detector-reported recovery coverage for provenance identities.
+ *
+ * A successful census is not enough to authorize recovery from absence. Coverage is positive
+ * evidence only: the exact identity signature must have been observed in this tick, and the
+ * corresponding candidate predicate must now be false. A record that is absent, aged out, or
+ * superseded by a different signature contributes no key. This deliberately removes the old
+ * process/port-target supersession heuristic; target sharing is not identity evidence.
  */
 export function deriveIdentityCoverage(store, { skippedObservations = [], observations = [], ts } = {}) {
-  if (!store?.bootstrapped_at) return [];
+  if (!store?.bootstrapped_at || ts === undefined) return [];
   const signatures = store.signatures ?? {};
-
-  const excludedIdentityHashes = new Set();
-  const excludedBindFingerprints = new Set();
-  const excludedDriftFingerprints = new Set();
-  const excludeTarget = (targetKey) => {
-    if (typeof targetKey !== "string" || !targetKey) return;
-    const driftFingerprint = identityDriftFingerprint(targetKey);
-    if (driftFingerprint) excludedDriftFingerprints.add(driftFingerprint);
-    if (targetKey.startsWith("port.")) {
-      const bindFingerprint = newPublicBindFingerprint(targetKey.slice("port.".length));
-      if (bindFingerprint) excludedBindFingerprints.add(bindFingerprint);
-    }
-  };
-  for (const observation of skippedObservations ?? []) {
-    // The skipped observation's own signature is the identity_signature it would have occupied if
-    // it had been folded. This is distinct from the fingerprinted sibling matched by the fold-time
-    // guard when identity_hash is absent, so exclude it directly as well.
-    const skippedIdentityHash = computeIdentitySignature(observation);
-    excludedIdentityHashes.add(skippedIdentityHash);
-    for (const targetKey of recordTargetKeys(signatures[skippedIdentityHash])) excludeTarget(targetKey);
-    const executablePathHash = hashIdentityField(observation?.executablePath);
-    if (executablePathHash) excludeTarget(`process.${executablePathHash}`);
-    for (const portKey of Array.isArray(observation?.portTargetKeys) ? observation.portTargetKeys : []) {
-      if (portKey) excludeTarget(`port.${portKey}`);
-    }
-    for (const identityHash of unverifiedObservationMatches(signatures, observation)) {
-      excludedIdentityHashes.add(identityHash);
-      for (const targetKey of recordTargetKeys(signatures[identityHash])) excludeTarget(targetKey);
-    }
-  }
-
-  // `port_target_keys` is intentionally bounded for introspection. It is not authoritative: an
-  // older port can be evicted while the process continues to bind it. A current observation is the
-  // only authority for a port held this tick, and every current holder must have a complete raw
-  // port list whose folded record still contains that port before coverage can authorize it.
-  const currentPortHolders = new Map();
-  const currentObservedIdentities = new Map(
-    ts === undefined
-      ? []
-      : Object.entries(signatures)
-        .filter(([, record]) => record?.last_seen === ts)
-        .map(([identityHash, record]) => [identityHash, { observation: undefined, record }]),
-  );
+  const skippedHashes = new Set((skippedObservations ?? []).map((observation) => computeIdentitySignature(observation)));
+  const observed = new Map();
   for (const observation of observations ?? []) {
     const identityHash = computeIdentitySignature(observation);
+    if (skippedHashes.has(identityHash)) continue;
     const record = signatures[identityHash];
-    if (!record || (ts !== undefined && record.last_seen !== ts)) continue;
-    currentObservedIdentities.set(identityHash, { observation, record });
-    for (const portKey of Array.isArray(observation?.portTargetKeys) ? observation.portTargetKeys : []) {
-      if (!portKey) continue;
-      if (!currentPortHolders.has(portKey)) currentPortHolders.set(portKey, []);
-      currentPortHolders.get(portKey).push({ identityHash, observation, record });
-    }
-  }
-  for (const [portKey, holders] of currentPortHolders) {
-    const everyHolderIsComplete = holders.every(({ observation, record }) => (
-      observation?.portTargetKeysTruncated !== true
-      && observation?.portTargetKeysComplete !== false
-      && Array.isArray(record.port_target_keys)
-      && record.port_target_keys.includes(portKey)
-    ));
-    if (!everyHolderIsComplete) excludeTarget(`port.${portKey}`);
+    if (!record || record.last_seen !== ts) continue;
+    observed.set(identityHash, { observation, record });
   }
 
-  // A re-keying/reparenting event can leave the old record inside the presence window while a
-  // different record, observed on this tick, takes over its process or port target. That is not a
-  // departure and must not clear the old identity's alert. Freeze the old record and its targets;
-  // the new record may still report its own positive identity key.
-  if (ts !== undefined && currentObservedIdentities.size > 0) {
-    for (const [identityHash, record] of Object.entries(signatures)) {
-      const recordTargets = new Set(recordTargetKeys(record));
-      const hasDifferentCurrentHolder = [...currentObservedIdentities.entries()].some(([otherHash, entry]) => (
-        otherHash !== identityHash
-        && [...recordTargets].some((targetKey) => recordTargetKeys(entry.record).includes(targetKey))
-      ));
-      if (hasDifferentCurrentHolder) {
-        excludedIdentityHashes.add(identityHash);
-        for (const targetKey of recordTargets) excludeTarget(targetKey);
-      }
-    }
-  }
-
+  const candidates = new Set(deriveIdentityCandidates(store, { now: ts, presenceWindowMs: Number.MAX_SAFE_INTEGER }).map((candidate) => candidate.id));
   const keys = new Set();
-  for (const [identityHash, record] of Object.entries(signatures)) {
-    if (!excludedIdentityHashes.has(identityHash)) {
-      const fingerprint = unknownIdentityFingerprint(identityHash);
-      if (fingerprint) keys.add(alertId(UNKNOWN_IDENTITY_RULE_ID, fingerprint));
-    }
-    for (const portKey of record?.port_target_keys ?? []) {
+  const addIfClear = (ruleId, fingerprint) => {
+    if (!fingerprint) return;
+    const key = alertId(ruleId, fingerprint);
+    if (!candidates.has(key)) keys.add(key);
+  };
+
+  for (const [identityHash, { observation, record }] of observed) {
+    // The unknown-identity alert is cleared positively only when this same record remains
+    // observed and is no longer a grace-window identity (for example, operator-promoted).
+    addIfClear(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(identityHash));
+
+    // `port_target_keys` is historical and preserves alert identity. The current list is the
+    // positive observation used to decide whether the bind condition still holds.
+    const currentPorts = new Set(record.current_port_target_keys ?? observation.portTargetKeys ?? []);
+    for (const portKey of record.port_target_keys ?? []) {
       const fingerprint = newPublicBindFingerprint(portKey);
-      if (fingerprint && !excludedBindFingerprints.has(fingerprint)) keys.add(alertId(NEW_PUBLIC_BIND_RULE_ID, fingerprint));
+      if (!fingerprint) continue;
+      const bindKey = alertId(NEW_PUBLIC_BIND_RULE_ID, fingerprint);
+      const bindStillBad = candidates.has(bindKey) && currentPorts.has(portKey);
+      if (!bindStillBad) keys.add(bindKey);
     }
+
+    // A drift key can clear positively when the current identity is observed and no other
+    // known-good identity is currently present for that target. An absent known-good record is
+    // intentionally still a veto: it may simply have departed or been hidden by incomplete data.
     for (const targetKey of recordTargetKeys(record)) {
       const fingerprint = identityDriftFingerprint(targetKey);
-      if (fingerprint && !excludedDriftFingerprints.has(fingerprint)) keys.add(alertId(IDENTITY_DRIFT_RULE_ID, fingerprint));
+      if (!fingerprint) continue;
+      const group = groupKnownGoodByTargetKey(signatures).get(targetKey) ?? [];
+      if (group.every(({ identityHash: otherHash }) => otherHash === identityHash)) {
+        addIfClear(IDENTITY_DRIFT_RULE_ID, fingerprint);
+      }
     }
   }
   return [...keys];

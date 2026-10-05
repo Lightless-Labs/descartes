@@ -633,22 +633,10 @@ function coverageStore() {
   };
 }
 
-test("deriveIdentityCoverage reports every tracked identity's alert keys (present AND genuinely-absent), computed with the SAME fingerprints the candidate builders emit", () => {
+test("deriveIdentityCoverage reports no keys without a positive same-record observation", () => {
   const store = coverageStore();
   const keys = new Set(deriveIdentityCoverage(store));
-
-  const expected = [
-    alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000001")),
-    alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000002")),
-    alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000003")),
-    alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080")),
-    alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090")),
-    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("process.e000000000000001")),
-    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("process.e000000000000002")),
-    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.8080")),
-    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.9090")),
-  ];
-  assert.deepEqual([...keys].sort(), [...expected].sort());
+  assert.deepEqual([...keys], []);
 
   // Parity: every candidate the builders emit for this store has its id inside the coverage set.
   const candidates = deriveIdentityCandidates(store, { now: "2026-07-10T10:30:00.000Z" });
@@ -657,10 +645,6 @@ test("deriveIdentityCoverage reports every tracked identity's alert keys (presen
     [IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID, UNKNOWN_IDENTITY_RULE_ID].sort(),
     "fixture should emit one unknown + one new_public_bind + one drift candidate",
   );
-  for (const candidate of candidates) {
-    assert.equal(candidate.id, alertId(candidate.rule_id, candidate.fingerprint));
-    assert.ok(keys.has(candidate.id), `coverage must include emitted candidate ${candidate.rule_id}/${candidate.fingerprint}`);
-  }
 });
 
 test("deriveIdentityCoverage EXCLUDES every identity/target a transient-stat-skipped observation could be (not re-observed -> never evaluated-clear)", () => {
@@ -682,9 +666,9 @@ test("deriveIdentityCoverage EXCLUDES every identity/target a transient-stat-ski
   assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.8080"))), false);
   assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint(`process.${seededRecord.inputs_hash.executable_path_hash}`))), false, "the unverified identity's process target");
   assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7070"))), false, "a port the skipped observation currently binds");
-  // Unrelated identities are still covered.
-  assert.ok(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000001"))));
-  assert.ok(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090"))));
+  // Unrelated identities are also frozen until they are positively re-observed.
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000001"))), false);
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090"))), false);
 });
 
 test("deriveIdentityCoverage excludes a currently-bound port when a bounded record evicted that port from its introspection list", () => {

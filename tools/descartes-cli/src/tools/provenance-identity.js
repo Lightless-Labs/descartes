@@ -176,16 +176,19 @@ export async function collectIdentityObservations(options = {}) {
   const ownUid = Object.hasOwn(options, "ownUid")
     ? options.ownUid
     : (typeof process.getuid === "function" ? process.getuid() : undefined);
+  const socketPids = (socket) => Array.isArray(socket?.pids)
+    ? socket.pids.filter((pid) => Number.isInteger(pid))
+    : (Number.isInteger(socket?.pid) ? [socket.pid] : []);
   if (sockets.length > 0 && ownUid === undefined) addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.OWN_UID_UNKNOWN);
   if (Number.isInteger(ownUid)) {
     for (const socket of sockets) {
-      if (socket.uid === ownUid && !Number.isInteger(socket.pid)) {
+      if (socket.uid === ownUid && socketPids(socket).length === 0) {
         addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.OWN_UID_SOCKET_UNATTRIBUTED);
       }
     }
   }
 
-  const pids = [...new Set(sockets.map((socket) => socket.pid).filter((pid) => Number.isInteger(pid)))];
+  const pids = [...new Set(sockets.flatMap(socketPids))];
   if (pids.length === 0) return { status: reasons.length === 0 ? "ok" : "degraded", observations: [], reasons };
 
   const processCensus = await runCensus(
@@ -204,9 +207,10 @@ export async function collectIdentityObservations(options = {}) {
 
   const socketsByPid = new Map();
   for (const socket of sockets) {
-    if (!Number.isInteger(socket.pid)) continue;
-    if (!socketsByPid.has(socket.pid)) socketsByPid.set(socket.pid, []);
-    socketsByPid.get(socket.pid).push(socket);
+    for (const pid of socketPids(socket)) {
+      if (!socketsByPid.has(pid)) socketsByPid.set(pid, []);
+      socketsByPid.get(pid).push(socket);
+    }
   }
 
   const resolveExeInfo = options.resolveExecutableInfo ?? resolveExecutableInfo;
