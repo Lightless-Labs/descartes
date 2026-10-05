@@ -53,14 +53,11 @@ fn resolve_pid_on_the_test_s_own_pid_returns_a_verified_matching_json_blob() {
     );
     assert_eq!(parsed["resolved"]["pid"], own_pid);
     assert_eq!(parsed["resolved"]["uid"], current_uid());
-    assert!(
-        parsed["resolved"]["executable_path"]
-            .as_str()
-            .unwrap()
-            .len()
-            > 0
-    );
-    assert!(parsed["resolved"]["command"].as_str().unwrap().len() > 0);
+    assert!(!parsed["resolved"]["executable_path"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert!(!parsed["resolved"]["command"].as_str().unwrap().is_empty());
 }
 
 #[test]

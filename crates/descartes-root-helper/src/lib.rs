@@ -15,6 +15,14 @@
 #[allow(unsafe_code)]
 pub mod hardening;
 
+/// Pure classic-BPF compiler (2026-10) for the seccomp policy `hardening` installs -- no unsafe,
+/// no I/O, host-testable everywhere via its test-only interpreter.
+pub mod seccomp_bpf;
+
+/// The helper's seccomp policy (2026-10), written against a per-arch syscall table so the REAL
+/// policy is unit-tested on every host. See its module doc for what it does and does not confine.
+pub mod seccomp_policy;
+
 /// `/proc/<pid>` dirfd-pinning primitives (S3-priv Slice 5 Part A) -- INTERNAL CONTRACT, NO
 /// EXTERNAL CONSUMER. `pub` (not `pub(crate)`) purely because `src/main.rs` + `src/proc_linux.rs`
 /// (the `bin` crate) and this `lib` crate are SEPARATE crates -- `proc_linux.rs` calls into this

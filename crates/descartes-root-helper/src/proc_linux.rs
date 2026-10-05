@@ -28,22 +28,26 @@
 //! candidate's dirfd before it ever inspects that candidate's fd table, and on a match resolves
 //! identity off that SAME dirfd -- it never returns a bare pid for a second, independent lookup.
 
-use std::collections::HashSet;
-use std::fs;
+use std::collections::BTreeSet;
 use std::os::fd::{AsFd, BorrowedFd};
 
 use descartes_root_helper::procfs;
 
 use crate::json::Resolved;
 
-// This file itself still uses std free functions only (fs::read_to_string/read_dir), never `Read`
-// trait methods on an open `File`, for the two things that are NOT per-pid identity data: the
-// global /proc/net/tcp[6] listen-socket tables and the top-level /proc/[0-9]* directory listing
-// (just pid numbers -- not that pid's own files). See the allowlist note on SYS_lseek in
-// hardening.rs for why the free-functions-vs-Read-trait distinction matters under the seccomp
-// filter. Every per-pid read (status/cmdline/exe/fd) is delegated to `procfs`, which uses raw
-// `libc::read`/`readlinkat`/`getdents64` internally -- not `std::fs` at all -- see that module's
-// doc for why (CLOEXEC-via-open-flag, not fcntl; bounded reads; dirfd-relative, never by path).
+// 2026-10: this file uses NO `std::fs` and NO `HashSet`. Every read -- the global
+// `/proc/net/<protocol>` socket tables and the top-level `/proc` pid listing included, not just
+// the per-pid identity files -- goes through `procfs`'s raw `openat`/`read`/`getdents64`/
+// `readlinkat` primitives, because the tightened seccomp policy (`seccomp_policy.rs`) no longer
+// admits the statx/fstat/lseek that std's `read_to_string`/`read_dir` issue, nor the getrandom
+// that `HashSet`'s RandomState seed draws. A future refactor back to `std::fs` here would
+// self-SIGSYS under the live filter (caught by the CI live-filter tests in tests/hardening.rs and
+// tests/linux_resolution.rs).
+
+/// Bound on one `/proc/net/<protocol>` read. Each row is ~150 bytes, so this covers ~100k sockets
+/// -- far beyond a realistic host -- while still bounding a single call. Hitting it is reported as
+/// a truncated (uncertain) search, never a definitive negative.
+const MAX_NET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Upper bound on file-descriptor symlinks scanned per candidate process while hunting for the
 /// socket inode that owns a requested port. Bounds worst-case syscall cost against a process with
@@ -105,15 +109,21 @@ pub struct PortResolution {
 /// whichever owning pid `find_owning_pid` happens to encounter first while walking `/proc` --
 /// this is a recorded, deferred limitation (Layer B plan, Slice 3 section), not solved here.
 pub fn resolve_port_detailed(port: u32) -> PortResolution {
-    let inodes = listening_inodes_for_port(port);
-    if inodes.is_empty() {
-        // No listening socket at all: a definitive negative, nothing was scanned.
+    let Ok(proc_root) = procfs::open_proc_root() else {
         return PortResolution {
             resolved: None,
             truncated: false,
         };
+    };
+    let (inodes, table_truncated) = listening_inodes_for_port(proc_root.as_fd(), port);
+    if inodes.is_empty() {
+        // No listening socket at all: a definitive negative unless a socket table was cut short.
+        return PortResolution {
+            resolved: None,
+            truncated: table_truncated,
+        };
     }
-    find_owning_pid(&inodes)
+    find_owning_pid(proc_root.as_fd(), &inodes)
 }
 
 /// Reads the real uid from `/proc/<pid>/status`'s `Uid:` line, whose format is
@@ -161,18 +171,24 @@ fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<String> {
 /// local port matches `port`, returning their socket inode numbers as decimal strings (matching
 /// the `socket:[<inode>]` fd-symlink target format used by `find_owning_pid`). A missing/
 /// unreadable file (e.g. no IPv6 on this host) is skipped, not fatal -- the other family may
-/// still yield a match.
-fn listening_inodes_for_port(port: u32) -> HashSet<String> {
+/// still yield a match. The second return value is true iff a table read hit
+/// `MAX_NET_TABLE_BYTES` (rows may have been missed).
+fn listening_inodes_for_port(proc_root: BorrowedFd<'_>, port: u32) -> (BTreeSet<String>, bool) {
     const LOCAL_ADDRESS_COLUMN: usize = 1;
     const STATE_COLUMN: usize = 3;
     const INODE_COLUMN: usize = 9;
     const LISTEN_STATE: &str = "0A";
 
-    let mut inodes = HashSet::new();
-    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(contents) = fs::read_to_string(path) else {
+    let mut inodes = BTreeSet::new();
+    let mut truncated = false;
+    for path in ["net/tcp", "net/tcp6"] {
+        let Ok((bytes, table_truncated)) =
+            procfs::read_file_at_bounded(proc_root, path, MAX_NET_TABLE_BYTES)
+        else {
             continue;
         };
+        truncated |= table_truncated;
+        let contents = String::from_utf8_lossy(&bytes);
         for line in contents.lines().skip(1) {
             // sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode ...
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -197,7 +213,7 @@ fn listening_inodes_for_port(port: u32) -> HashSet<String> {
             }
         }
     }
-    inodes
+    (inodes, truncated)
 }
 
 /// Scans `/proc/[0-9]*/fd/*` symlinks for a `socket:[<inode>]` target matching one of `inodes`,
@@ -225,30 +241,27 @@ fn listening_inodes_for_port(port: u32) -> HashSet<String> {
 /// directory can be enumerated -- see the module doc), not an error condition here, and a
 /// since-exited process is precisely the reuse hazard this module defends against, so it fails
 /// closed the same way. First match wins (see `resolve_port_detailed`'s doc on the multi-owner limitation).
-fn find_owning_pid(inodes: &HashSet<String>) -> PortResolution {
-    let Ok(proc_dir) = fs::read_dir("/proc") else {
+fn find_owning_pid(proc_root: BorrowedFd<'_>, inodes: &BTreeSet<String>) -> PortResolution {
+    // The listing cap counts every `/proc` entry (a few dozen non-pid names included), not only
+    // pid directories; the bound is a safety valve far above any real pid count either way.
+    let Ok((_listing_fd, entries)) =
+        procfs::read_dir_entries_at(proc_root, ".", MAX_PROCESSES_SCANNED)
+    else {
         return PortResolution {
             resolved: None,
             truncated: false,
         };
     };
-    let mut scanned_processes = 0usize;
     // Codex-hardening #6: accumulate whether the search gave up short of a full scan. Only reported
     // on the no-owner path (a match makes any earlier cap-hit moot). A candidate whose fd table was
     // capped, OR hitting the pid-walk cap, means the eventual "no owner" is UNCERTAIN.
-    let mut truncated = false;
+    let mut truncated = crate::scan::fd_scan_truncated(entries.len(), MAX_PROCESSES_SCANNED);
 
-    for entry in proc_dir.flatten() {
-        if scanned_processes >= MAX_PROCESSES_SCANNED {
-            truncated = true; // did not finish the pid walk -- a None below is uncertain.
-            break;
-        }
-        let name = entry.file_name();
+    for name in &entries {
         let Some(name) = name.to_str() else { continue };
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
             continue; // not a pid directory (e.g. "self", "net", "sys", ...).
         }
-        scanned_processes += 1;
 
         let Ok(pid) = name.parse::<u32>() else {
             continue;
@@ -354,10 +367,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = listener.local_addr().unwrap().port() as u32;
         let resolution = resolve_port_detailed(port);
-        assert_eq!(
-            resolution.resolved.map(|r| r.pid),
-            Some(std::process::id())
-        );
+        assert_eq!(resolution.resolved.map(|r| r.pid), Some(std::process::id()));
         assert!(
             !resolution.truncated,
             "a successful owner resolution is never flagged truncated"
@@ -387,10 +397,15 @@ mod tests {
     fn listening_inodes_for_port_finds_this_process_own_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = listener.local_addr().unwrap().port() as u32;
-        let inodes = listening_inodes_for_port(port);
+        let proc_root = procfs::open_proc_root().expect("/proc must open");
+        let (inodes, truncated) = listening_inodes_for_port(proc_root.as_fd(), port);
         assert!(
             !inodes.is_empty(),
             "expected at least one LISTEN-state inode for our own bound port"
+        );
+        assert!(
+            !truncated,
+            "a test host's socket tables fit far below the bound"
         );
         drop(listener);
     }

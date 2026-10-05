@@ -28,9 +28,9 @@
 
 mod argv;
 mod json;
-mod scan;
 #[cfg(target_os = "linux")]
 mod proc_linux;
+mod scan;
 
 use argv::Command;
 use descartes_root_helper::hardening;

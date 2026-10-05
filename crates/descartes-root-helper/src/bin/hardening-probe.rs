@@ -19,9 +19,10 @@
 
 #[cfg(target_os = "linux")]
 mod linux_probe {
+    use std::os::fd::AsFd;
     use std::ptr;
 
-    use descartes_root_helper::hardening;
+    use descartes_root_helper::{hardening, procfs};
 
     /// Runs the one action named by `mode`. Returns an exit code; for the `--do-*` actions this
     /// return value is only ever observed if the syscall was NOT denied (a bug) -- a real
@@ -63,16 +64,213 @@ mod linux_probe {
                 hardening::drop_capabilities();
                 check_capdrop()
             }
-            _ => 2,
+            // 2026-10 positive control: the exact read path the production binary uses (pid dir,
+            // status, exe link, fd listing, /proc listing, net/tcp) succeeds under the live filter.
+            "--read-allowed-paths" => {
+                hardening::engage();
+                read_allowed_paths()
+            }
+            mode => match deny_probe(mode) {
+                Some(action) => {
+                    hardening::engage();
+                    action();
+                    1
+                }
+                None => 2,
+            },
         }
     }
 
-    /// Reads `/proc/self/status` and returns the whitespace-split fields on the first line whose
-    /// label matches `label` exactly (e.g. `"NoNewPrivs:"`).
+    /// 2026-10 tightened-policy deny probes (docs/research/2026-09-26-sandbox-and-microvm-
+    /// boundaries-research.md, finding 1 + "real-grant helper breakout suite"). Each action must be
+    /// SIGSYS-killed by the filter; returning to the caller (exit 1) is a policy failure.
+    fn deny_probe(mode: &str) -> Option<fn()> {
+        let action: fn() = match mode {
+            "--do-openat-wronly" => || {
+                raw_openat(c"/dev/null", libc::O_WRONLY | libc::O_CLOEXEC);
+            },
+            "--do-openat-proc-mem-rdwr" => || {
+                raw_openat(c"/proc/self/mem", libc::O_RDWR | libc::O_CLOEXEC);
+            },
+            "--do-openat-creat" => || {
+                // Under a broken filter the kernel would still refuse (no such dir); the point is
+                // that O_CREAT never reaches it.
+                raw_openat(
+                    c"/proc/self/descartes-probe-nonexistent/x",
+                    libc::O_RDONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                );
+            },
+            "--do-openat-o-path" => || {
+                raw_openat(c"/proc", libc::O_PATH | libc::O_CLOEXEC);
+            },
+            "--do-lseek-proc-mem" => || {
+                // Opening /proc/self/mem READ-ONLY is admitted (openat can't see paths); reading
+                // anything meaningful from it needs a seek to a mapped address -- killed here.
+                let fd = raw_openat(c"/proc/self/mem", libc::O_RDONLY | libc::O_CLOEXEC);
+                // SAFETY: plain lseek on an fd we own (or -1 if the open failed).
+                unsafe { libc::syscall(libc::SYS_lseek, fd, 4096i64, libc::SEEK_SET) };
+            },
+            "--do-pread" => || {
+                let fd = raw_openat(c"/proc/self/status", libc::O_RDONLY | libc::O_CLOEXEC);
+                let mut buf = [0u8; 8];
+                // SAFETY: `buf` is a valid writable 8-byte buffer for the duration of the call.
+                unsafe {
+                    libc::syscall(libc::SYS_pread64, fd, buf.as_mut_ptr(), buf.len(), 4096i64)
+                };
+            },
+            "--do-write-non-stdio-fd" => || {
+                let fd = raw_openat(c"/proc/self/status", libc::O_RDONLY | libc::O_CLOEXEC);
+                let byte = [0u8; 1];
+                // SAFETY: `byte` is a valid 1-byte buffer.
+                unsafe { libc::syscall(libc::SYS_write, fd, byte.as_ptr(), 1usize) };
+            },
+            "--do-mmap-exec" => || {
+                // SAFETY: anonymous mapping request; never executes past syscall entry under the
+                // filter, and would only create a private anonymous page otherwise.
+                unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+            },
+            "--do-mprotect-exec" => || {
+                // SAFETY: maps one private anonymous RW page (admitted), then asks to make it
+                // executable (killed). The page is never touched.
+                unsafe {
+                    let page = libc::mmap(
+                        ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    );
+                    libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+                }
+            },
+            "--do-newfstatat" => || {
+                // SAFETY: `st` is a valid, writable stat buffer for the duration of the call.
+                unsafe {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    libc::syscall(
+                        libc::SYS_newfstatat,
+                        libc::AT_FDCWD,
+                        c"/etc/shadow".as_ptr(),
+                        &mut st as *mut libc::stat,
+                        0,
+                    );
+                }
+            },
+            "--do-statx" => || {
+                // SAFETY: `buf` is a valid, writable statx buffer for the duration of the call.
+                unsafe {
+                    let mut buf: libc::statx = std::mem::zeroed();
+                    libc::syscall(
+                        libc::SYS_statx,
+                        libc::AT_FDCWD,
+                        c"/etc/shadow".as_ptr(),
+                        0,
+                        libc::STATX_BASIC_STATS,
+                        &mut buf as *mut libc::statx,
+                    );
+                }
+            },
+            "--do-getrandom" => || {
+                let mut buf = [0u8; 8];
+                // SAFETY: `buf` is a valid writable 8-byte buffer.
+                unsafe { libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr(), buf.len(), 0) };
+            },
+            "--do-prctl-dumpable" => || {
+                // SAFETY: PR_SET_DUMPABLE reads no pointer argument.
+                unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+            },
+            "--do-tgkill-other" => || {
+                // Signal 0 to pid 1: a pure permission probe even if it were admitted.
+                // SAFETY: no pointer arguments.
+                unsafe { libc::syscall(libc::SYS_tgkill, 1, 1, 0) };
+            },
+            "--do-fcntl-setfd" => || {
+                // SAFETY: F_SETFD on stdin with FD_CLOEXEC; no pointer arguments.
+                unsafe { libc::fcntl(0, libc::F_SETFD, libc::FD_CLOEXEC) };
+            },
+            "--do-execve" => || {
+                let argv = [c"/bin/true".as_ptr(), ptr::null()];
+                let envp = [ptr::null::<libc::c_char>()];
+                // SAFETY: NUL-terminated argv/envp arrays of valid C strings.
+                unsafe { libc::execve(c"/bin/true".as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            },
+            _ => return None,
+        };
+        Some(action)
+    }
+
+    /// Raw `openat(AT_FDCWD, path, flags)` -- bypasses std so the probe controls the exact flags
+    /// the kernel (and the filter) sees. Returns the raw fd or -1.
+    fn raw_openat(path: &std::ffi::CStr, flags: libc::c_int) -> libc::c_long {
+        // SAFETY: `path` is a valid NUL-terminated C string for the duration of the call; mode
+        // 0600 is only consulted with O_CREAT.
+        unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                flags,
+                0o600,
+            )
+        }
+    }
+
+    /// Positive control: exits 0 iff every read the production binary performs still works under
+    /// the live filter (and 1 if any returns an error -- a SIGSYS kill would show as a signal).
+    fn read_allowed_paths() -> i32 {
+        let own = std::process::id();
+        let ok = (|| -> std::io::Result<bool> {
+            let root = procfs::open_proc_root()?;
+            let (_listing, entries) = procfs::read_dir_entries_at(root.as_fd(), ".", 1 << 20)?;
+            let own_name = own.to_string();
+            let listed = entries
+                .iter()
+                .any(|e| e.to_str() == Some(own_name.as_str()));
+            let (_tcp, _truncated) =
+                procfs::read_file_at_bounded(root.as_fd(), "net/tcp", 1 << 24)?;
+            let pid_dir = procfs::open_pid_dir(own)?;
+            let status = procfs::read_file_at(pid_dir.as_fd(), "status")?;
+            let cmdline = procfs::read_file_at(pid_dir.as_fd(), "cmdline")?;
+            let exe = procfs::read_link_at(pid_dir.as_fd(), "exe")?;
+            let (fd_dir, fds) = procfs::read_dir_entries_at(pid_dir.as_fd(), "fd", 4096)?;
+            let first_fd = fds
+                .first()
+                .and_then(|f| f.to_str())
+                .unwrap_or("0")
+                .to_string();
+            let _target = procfs::read_link_at(fd_dir.as_fd(), &first_fd)?;
+            Ok(listed && !status.is_empty() && !cmdline.is_empty() && !exe.is_empty())
+        })();
+        match ok {
+            Ok(true) => {
+                println!("ok");
+                eprintln!("read-allowed-paths: ok");
+                0
+            }
+            _ => 1,
+        }
+    }
+
+    /// Reads our own `/proc/<pid>/status` and returns the whitespace-split fields on the first line
+    /// whose label matches `label` exactly (e.g. `"NoNewPrivs:"`). Goes through the SAME raw
+    /// `procfs` primitives as the production binary (2026-10): `std::fs::read_to_string` issues
+    /// statx/fstat, which the tightened policy kills -- so this read also proves, under the live
+    /// filter, that the helper's real read path is still admitted.
     fn status_fields(label: &str) -> Vec<String> {
+        let pid_dir = procfs::open_pid_dir(std::process::id()).expect("must open our own pid dir");
         let status =
-            std::fs::read_to_string("/proc/self/status").expect("must read our own status");
-        status
+            procfs::read_file_at(pid_dir.as_fd(), "status").expect("must read our own status");
+        String::from_utf8_lossy(&status)
             .lines()
             .find_map(|line| line.strip_prefix(label))
             .map(|rest| rest.split_whitespace().map(str::to_string).collect())
@@ -190,7 +388,7 @@ mod linux_probe {
     /// permission walk that would otherwise gate access -- in the kernel it is gated by
     /// `capable(CAP_DAC_READ_SEARCH)` (see `fs/fhandle.c`), the exact capability the Slice 6 fix
     /// adds to this binary's file-capability grant (`cap_sys_ptrace,cap_dac_read_search=ep`) for
-    /// cross-UID `/proc/<pid>/fd` enumeration. It is deliberately NOT in `allowed_syscalls()`, so
+    /// cross-UID `/proc/<pid>/fd` enumeration. It is deliberately NOT admitted by `seccomp_policy`, so
     /// the default `SECCOMP_RET_KILL_PROCESS` action must still apply even though this binary now
     /// actually holds the capability that would otherwise make the syscall usable -- regression-
     /// proofing that the seccomp allowlist, not just "we don't call it," is what keeps this

@@ -29,21 +29,20 @@
 //! module docs).
 //!
 //! `O_CLOEXEC` is set via the OPEN FLAG on every `openat` call below, NEVER retrofitted with a
-//! later `fcntl(F_SETFD)`. That rule is unchanged; only its enforcement moved. `fcntl` IS in
-//! `hardening.rs`'s seccomp allowlist -- but solely because std's `OwnedFd` `Drop`, in
-//! debug-assertions builds only, issues `fcntl(fd, F_GETFD)` as an fd-validity assertion before
-//! `close` (which self-SIGSYSed every debug `cargo test` of resolution until it was allowlisted).
-//! This module still never issues `fcntl` itself; the "via open flag, never F_SETFD" rule is now
-//! enforced by review + the security-review-required rule on any allowlist change, not by the
-//! filter. Even so, an fd stripped of CLOEXEC could not escape this process: no `exec*` and no
-//! `socket*` are allowlisted, so there is nothing to survive an exec or pass it over.
+//! later `fcntl(F_SETFD)`. Since 2026-10 that rule is FILTER-enforced again: the seccomp policy
+//! (`seccomp_policy.rs`) admits `fcntl` only with cmd `F_GETFD` -- the fd-validity probe std's
+//! `OwnedFd` `Drop` issues in debug-assertions builds -- so `F_SETFD` is SIGSYS-killed. The
+//! policy also kills every `openat` whose flags fall outside `O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW|
+//! O_LARGEFILE` (read-only access mode), so a new open below that needs any other flag must change
+//! the policy too (a security-review-required change).
 //!
 //! Every public function here returns an owned, safe value (`OwnedFd`, `Vec<u8>`, `OsString`) --
 //! never a raw fd or pointer -- so callers in `proc_linux.rs` never touch `unsafe` themselves.
 //! Syscalls issued in this file: `openat`, `read`, `readlinkat`, `getdents64` (plus `close`, and --
 //! in debug-assertions builds only -- `fcntl(F_GETFD)`, both via `OwnedFd`'s `Drop` impl in std).
-//! All are in `hardening.rs`'s `allowed_syscalls()` allowlist; this module issues no syscall that
-//! isn't already allowed there.
+//! All are admitted by `seccomp_policy::helper_policy`; this module issues no syscall (and no
+//! open flag) that isn't already admitted there. No `lseek`/`pread`/`*stat*`: reads are a plain
+//! sequential `read` loop from offset 0.
 
 use std::ffi::{CString, OsString};
 use std::io;
@@ -88,7 +87,20 @@ fn cpath(s: &str) -> io::Result<CString> {
 /// always a directory when it exists at all); `O_CLOEXEC` is the open flag, never a later
 /// `fcntl(F_SETFD)` -- see the module doc.
 pub fn open_pid_dir(pid: u32) -> io::Result<OwnedFd> {
-    let path = cpath(&format!("/proc/{pid}"))?;
+    open_absolute_dir(&format!("/proc/{pid}"))
+}
+
+/// Opens `/proc` itself as a directory fd (2026-10). Used for the top-level pid listing
+/// (`read_dir_entries_at(root, ".")`) and the `net/<protocol>` socket tables
+/// (`read_file_at_bounded(root, "net/tcp", ..)`) so `proc_linux.rs` needs no `std::fs` at all:
+/// std's `read_to_string`/`read_dir` paths issue statx/fstat (and glibc's opendir an O_NONBLOCK
+/// open), none of which the tightened seccomp policy admits.
+pub fn open_proc_root() -> io::Result<OwnedFd> {
+    open_absolute_dir("/proc")
+}
+
+fn open_absolute_dir(path: &str) -> io::Result<OwnedFd> {
+    let path = cpath(path)?;
     // SAFETY: `path` is a valid, NUL-terminated C string live for the whole call. `AT_FDCWD` is
     // the documented "resolve relative to the current working directory" sentinel, not a real fd
     // -- there is no fd-lifetime concern on that argument.
@@ -141,6 +153,20 @@ pub fn open_dir_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
 /// (`status`, `cmdline`) is a regular pseudo-file, never a symlink, so this is defense in depth,
 /// not a behavior change. `O_CLOEXEC` via the open flag, never `fcntl`.
 pub fn read_file_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<Vec<u8>> {
+    read_file_at_bounded(dirfd, name, MAX_READ_BYTES).map(|(bytes, _truncated)| bytes)
+}
+
+/// `read_file_at` with a caller-chosen bound, reporting whether the bound was hit. The buffer
+/// GROWS in `READ_CHUNK_BYTES` steps up to `max_bytes` (never preallocated to the bound), so a
+/// generous bound for a large seq_file such as `/proc/net/tcp` on a busy host costs only what is
+/// actually read. `truncated == true` means the file MAY continue past what was returned -- a caller
+/// that is searching it must treat "not found" as uncertain, never as a definitive negative.
+pub fn read_file_at_bounded(
+    dirfd: BorrowedFd<'_>,
+    name: &str,
+    max_bytes: usize,
+) -> io::Result<(Vec<u8>, bool)> {
+    const READ_CHUNK_BYTES: usize = 65_536;
     let path = cpath(name)?;
     // SAFETY: `dirfd` is live for the whole call; `path` is a valid NUL-terminated C string.
     let fd = unsafe {
@@ -157,9 +183,13 @@ pub fn read_file_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<Vec<u8>> {
     // drops, on every return path below (early `Err` returns included).
     let file = unsafe { OwnedFd::from_raw_fd(fd) };
 
-    let mut buf = vec![0u8; MAX_READ_BYTES];
+    let mut buf: Vec<u8> = Vec::new();
     let mut total = 0usize;
-    while total < buf.len() {
+    while total < max_bytes {
+        if total == buf.len() {
+            let grow_to = (buf.len() + READ_CHUNK_BYTES).min(max_bytes);
+            buf.resize(grow_to, 0);
+        }
         // SAFETY: `file` is a valid, open, readable fd for the duration of this call;
         // `buf[total..]` is a valid, writable slice of at least `buf.len() - total` bytes that
         // outlives the call (it is not moved or reallocated while the syscall is in flight).
@@ -183,7 +213,10 @@ pub fn read_file_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<Vec<u8>> {
         total += n as usize;
     }
     buf.truncate(total);
-    Ok(buf)
+    // Hitting the bound exactly is reported as truncated even if EOF happened to coincide: the
+    // conservative reading for a caller searching the contents.
+    let truncated = total >= max_bytes;
+    Ok((buf, truncated))
 }
 
 /// Reads the symlink target of `name` relative to `dirfd` (e.g. `"exe"`), bounded to
@@ -311,6 +344,35 @@ mod tests {
         let status = read_file_at(pid_dir.as_fd(), "status").expect("status must be readable");
         let status = String::from_utf8_lossy(&status);
         assert!(status.contains("Uid:"));
+    }
+
+    #[test]
+    fn open_proc_root_lists_our_own_pid_and_reads_the_socket_tables() {
+        let root = open_proc_root().expect("/proc must open as a directory");
+        let (_listing, entries) =
+            read_dir_entries_at(root.as_fd(), ".", 1 << 20).expect("/proc must be listable");
+        let own = std::process::id().to_string();
+        assert!(entries.iter().any(|e| e.to_str() == Some(own.as_str())));
+        let (tcp, truncated) =
+            read_file_at_bounded(root.as_fd(), "net/tcp", 16 << 20).expect("net/tcp must read");
+        assert!(
+            String::from_utf8_lossy(&tcp).starts_with("  sl"),
+            "header row expected"
+        );
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn read_file_at_bounded_reports_truncation_at_the_bound() {
+        let pid_dir = open_pid_dir(std::process::id()).expect("must open our own /proc/<pid> dir");
+        let (bytes, truncated) =
+            read_file_at_bounded(pid_dir.as_fd(), "status", 16).expect("status must be readable");
+        assert_eq!(bytes.len(), 16);
+        assert!(truncated, "a read cut off at the bound must say so");
+        let (full, truncated) = read_file_at_bounded(pid_dir.as_fd(), "status", 1 << 20)
+            .expect("status must be readable");
+        assert!(full.len() > 16);
+        assert!(!truncated);
     }
 
     #[test]

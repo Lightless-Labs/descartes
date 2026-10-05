@@ -1,58 +1,57 @@
-//! Kernel-level defensive hardening for descartes-root-helper (S3-priv Slice 4). This crate is
-//! currently unprivileged and stays that way in this slice (see `main.rs`'s module doc). The
-//! properties installed here exist so that WHEN Slice 5 manually grants
-//! `cap_sys_ptrace,cap_dac_read_search=ep` (a `setcap` step outside this repo's code -- see
-//! `proc_linux.rs`'s module doc for why the grant is that 2-capability UNION, not `cap_sys_ptrace`
-//! alone), that capability pair's blast radius is structurally confined: `ptrace(2)`,
-//! `open_by_handle_at(2)`, and everything that shares either capability's threat model become
-//! unreachable syscalls, not merely policy the binary promises not to use.
+//! Kernel-level defensive hardening for descartes-root-helper (S3-priv Slice 4; seccomp policy
+//! re-derived 2026-10). The helper is installed with the file-capability grant
+//! `cap_sys_ptrace,cap_dac_read_search=ep` (a manual `setcap` step outside this repo's code -- see
+//! `proc_linux.rs`'s module doc for why the grant is that 2-capability UNION). The properties
+//! installed here shrink what code running inside this process can do WITH that grant.
 //!
 //! Three properties, all KERNEL-enforced (never code-review-assumed):
 //!   1. `PR_SET_NO_NEW_PRIVS` (`engage()`) -- this process can never gain privilege beyond what it
-//!      already has. It also can never usefully execve (nothing is allowlisted below to make
-//!      execve succeed), so the bounding set is irrelevant here -- see `drop_capabilities()`.
-//!   2. A seccomp-bpf syscall ALLOWLIST (`engage()`, default action `SECCOMP_RET_KILL_PROCESS`,
-//!      the process-scoped kill, not the legacy thread-scoped `SECCOMP_RET_KILL`) that makes
-//!      `ptrace`, `process_vm_readv`, `process_vm_writev`, and `pidfd_getfd` -- the whole
-//!      CAP_SYS_PTRACE blast radius, not just `ptrace` itself -- unreachable, AND makes
-//!      `open_by_handle_at` -- CAP_DAC_READ_SEARCH's own blast-radius amplifier (opens an
-//!      arbitrary file by opaque on-disk handle, bypassing the normal directory-permission walk)
-//!      -- unreachable too, even though the real grant (Slice 5/6) is the union of both
-//!      capabilities. Requires a Linux kernel >= 4.14 (KILL_PROCESS's introduction); this repo's
-//!      CI runs 6.17.
-//!   3. A capability drop (`drop_capabilities()`, called separately by `main.rs` AFTER the /proc
-//!      reads that need the future capability and BEFORE any output) that zeroes the
-//!      effective/permitted/inheritable sets and the ambient set.
+//!      already has (and no exec* syscall is allowlisted anyway).
+//!   2. A seccomp-bpf ALLOWLIST with ARGUMENT predicates (`engage()`; default action
+//!      `SECCOMP_RET_KILL_PROCESS`, the process-scoped kill). The policy itself lives in the pure,
+//!      host-tested `seccomp_policy` module and is compiled by the pure `seccomp_bpf` module; this
+//!      file only supplies the native syscall table and installs the program. See
+//!      `seccomp_policy`'s module doc for EXACTLY what the policy closes -- and, honestly, what it
+//!      cannot: seccomp never sees path strings, so read-only opens of arbitrary paths reachable
+//!      by the capability pair (e.g. `/etc/shadow`, `/proc/<pid>/environ`) remain possible for
+//!      code executing inside the helper, with output confined to stdout/stderr. The earlier claim
+//!      that "everything sharing either capability's threat model" is unreachable was too strong
+//!      (docs/research/2026-09-26-sandbox-and-microvm-boundaries-research.md, finding 1).
+//!      Requires Linux >= 4.14 (KILL_PROCESS); CI runs 6.17.
+//!   3. A capability drop (`drop_capabilities()`, called by `main.rs` AFTER the /proc reads that
+//!      need the grant and BEFORE any output) that zeroes the effective/permitted/inheritable sets
+//!      and the ambient set.
 //!
-//! FAIL-CLOSED: any unexpected error from any step aborts the process (stderr-only diagnostic,
-//! nonzero exit) rather than continuing without the property. A silently-missing filter would gut
-//! the whole safety argument, so there is no warn-and-continue path anywhere in this file.
+//! FAIL-CLOSED: any unexpected error from any step -- including a policy that fails to compile --
+//! aborts the process (stderr-only diagnostic, nonzero exit) rather than continuing without the
+//! property.
 //!
-//! Allowlist re-derivation: `strace -f -c <bin> --resolve-pid $$` on a Linux host, cross-checked
-//! against `proc_linux.rs`'s actual syscalls plus the Rust/glibc runtime's own (allocator, panic
-//! path, vDSO fallback). The list in `allowed_syscalls` below is reasoned-then-CI-confirmed -- CI
-//! is the only oracle available (this dev host has no Linux virtualization) -- and any future
-//! addition to it is a security-review-required change, not a routine one.
+//! Any change to the policy is a security-review-required change. CI (the live-filter tests in
+//! `tests/hardening.rs` + `tests/linux_resolution.rs`, and the privileged
+//! `scripts/ci-elevated-provenance.sh` run of the release build) is the only oracle for the
+//! "no self-SIGSYS" direction -- this dev host has no Linux virtualization.
 //!
-//! ALL unsafe code in this crate's production path lives in this file AND `src/procfs.rs`
-//! (S3-priv Slice 5 Part A's `/proc/<pid>` dirfd-pinning primitives -- see that module's doc). The
-//! other production modules -- `main.rs`, `argv.rs`, `json.rs`, `proc_linux.rs` -- stay
-//! `#![deny(unsafe_code)]`/`#![forbid(unsafe_code)]` clean, i.e. would fail to compile if any of
-//! them grew an unsafe block; `proc_linux.rs` calls into `procfs`'s safe-signature functions
-//! exactly as it calls into this file's `engage()`/`drop_capabilities()`.
-//! `src/bin/hardening-probe.rs` is the one other file in this crate with unsafe, and it is
-//! test-support only, never shipped as the helper -- see its module doc.
+//! ALL unsafe code in this crate's production path lives in this file AND `src/procfs.rs`. The
+//! other production modules stay `#![deny(unsafe_code)]`/`#![forbid(unsafe_code)]` clean.
+//! `src/bin/hardening-probe.rs` is the one other file with unsafe, and it is test-support only.
+
+/// Exit code for a fail-closed hardening abort -- distinct from the production binary's
+/// 0/1/2 (success / resolution failure / usage error) so a hardening abort is never mistaken for
+/// an ordinary resolution failure.
+#[cfg(target_os = "linux")]
+const EXIT_HARDENING_FAILURE: i32 = 3;
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io;
-    use std::mem::offset_of;
     use std::ptr;
 
-    // libc (the crate) gives us arch-correct SYS_*/PR_*/BPF_*/SECCOMP_* constants and the
-    // `seccomp_data`/`sock_filter`/`sock_fprog` structs, but NOT the capset(2) structs or the
-    // AUDIT_ARCH_* constants -- both are hand-defined below, straight from the kernel UAPI headers
-    // they come from (see the Cargo.toml comment on the libc dependency for why).
+    use crate::seccomp_bpf::{compile, CompileError};
+    use crate::seccomp_policy::{helper_policy, SyscallTable};
+
+    // libc (the crate) gives us arch-correct SYS_*/PR_*/SECCOMP_* constants and the
+    // `sock_filter`/`sock_fprog` structs, but NOT the capset(2) structs or the AUDIT_ARCH_*
+    // constants -- both are hand-defined below, straight from the kernel UAPI headers.
 
     /// `<linux/capability.h>`: the version every kernel since 2.6.26 negotiates; pairs with the
     /// two-element `CapUserData` array below (32 capability bits per element, 64 bits total).
@@ -72,191 +71,97 @@ mod linux {
         inheritable: u32,
     }
 
-    /// `<linux/audit.h>`: `EM_<arch> | __AUDIT_ARCH_64BIT (0x8000_0000) | __AUDIT_ARCH_LE
-    /// (0x4000_0000)`. This binary is compiled per-target and never cross-arch at runtime, so only
-    /// the native arch's constant needs to exist.
+    /// `<linux/audit.h>`: `EM_<arch> | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`.
     #[cfg(target_arch = "x86_64")]
     const NATIVE_AUDIT_ARCH: u32 = 0xC000_003E; // EM_X86_64 = 62
 
     #[cfg(target_arch = "aarch64")]
     const NATIVE_AUDIT_ARCH: u32 = 0xC000_00B7; // EM_AARCH64 = 183
 
-    /// x32-ABI syscalls report `AUDIT_ARCH_X86_64` (identical to native x86_64) but OR this bit
-    /// into the syscall number -- the classic hand-rolled-seccomp-filter bypass (D4). aarch64 has
-    /// no x32 analog, hence no equivalent constant on that arch.
+    /// x32-ABI syscalls report `AUDIT_ARCH_X86_64` but OR this bit into the syscall number.
     #[cfg(target_arch = "x86_64")]
     const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-    /// The reasoned allowlist. Each entry is justified against a real caller:
-    ///   - openat, read, close, write, writev: file I/O throughout `proc_linux.rs`, plus stdout.
-    ///   - getdents64: `fs::read_dir("/proc")` in `find_owning_pid`.
-    ///   - readlink / readlinkat: `fs::read_link` for `/proc/<pid>/exe` and fd symlinks. aarch64
-    ///     glibc has NO `readlink` syscall at all (issues `readlinkat` only); x86_64 glibc may use
-    ///     either, so both are allowlisted on the arches where they exist (see the `#[cfg]` below).
-    ///   - statx, newfstatat, fstat: std's file-size probing tries statx then falls back to the
-    ///     others -- but under `KILL_PROCESS` a denied statx is SIGSYS, not ENOSYS, so the
-    ///     fallback never gets a chance to run unless all three are present.
-    ///   - getrandom: `HashSet`'s random seed, drawn on first use -- AFTER the filter installs.
-    ///   - mmap, munmap, brk, mremap, madvise, mprotect: the allocator.
-    ///   - exit_group, exit: normal and thread exit.
-    ///   - futex: std/glibc lock implementations.
-    ///   - capset, capget, prctl: `drop_capabilities()` below.
-    ///   - rt_sigreturn: returning from ANY signal handler taken while the filter is active dies
-    ///     without this -- including the panic path immediately below.
-    ///   - clock_gettime: usually served by the vDSO (no syscall trap at all), allowlisted anyway
-    ///     as insurance -- an strace-derived list systematically under-reports vDSO-served calls.
-    ///   - lseek: `proc_linux.rs` today uses only std's free functions (`fs::read`,
-    ///     `fs::read_to_string`, `fs::read_dir`, `fs::read_link`), none of which lseek. It is
-    ///     allowlisted anyway as insurance in the same category as clock_gettime above: std's
-    ///     `Read` trait methods (`read_to_string`/`read_to_end` on an open `File`) DO issue lseek
-    ///     via stream-position probing, so a future refactor to `File::open(...).read_to_string()`
-    ///     (or a std-internal change) would otherwise self-SIGSYS -- repositioning an fd this
-    ///     process already owns is harmless. See `proc_linux.rs`'s module doc for the matching note
-    ///     on that side of this coupling.
-    ///   - fcntl: never emitted by a RELEASE build. std's `OwnedFd` `Drop`, in debug-assertions
-    ///     builds ONLY, issues `fcntl(fd, F_GETFD)` as an fd-validity assertion before `close` -- so
-    ///     every `cargo test` (debug) run of anything that drops an `OwnedFd` (`procfs.rs`, i.e. all
-    ///     of resolution) self-SIGSYSed without this (empirically pinned by strace on the aarch64 CI
-    ///     guest). Allowlisted number-only like every other entry: all fcntl cmds act only on fds
-    ///     this process already owns, and with no `exec*` and no `socket*` allowlisted, an fd
-    ///     stripped of CLOEXEC can never leave this process -- so the cmd breadth adds nothing to the
-    ///     blast radius this filter confines. The "O_CLOEXEC via open flag, never fcntl(F_SETFD)"
-    ///     rule (`procfs.rs` module doc) is enforced by review + the security-review-required rule on
-    ///     any `allowed_syscalls()` addition from here on, not by this filter.
-    ///   - rt_sigprocmask, getpid, gettid, tgkill: a Rust panic's abort path. Without these a panic
-    ///     dies to SIGSYS instead of SIGABRT -- still loud, still a nonzero exit, but a SIGSYS core
-    ///     from this binary should be read as "maybe just a panic", not only "attack".
-    ///
-    /// ptrace, process_vm_readv, process_vm_writev, pidfd_getfd, open_by_handle_at, socket, and
-    /// everything else are deliberately ABSENT here -- caught by the default KILL_PROCESS action,
-    /// not an explicit deny (see `tests/hardening.rs`, which regression-proofs several of these by
-    /// name, including `open_by_handle_at` -- CAP_DAC_READ_SEARCH's own amplifier syscall, added
-    /// as a deny-probe for the Slice 6 grant that adds that capability).
-    fn allowed_syscalls() -> Vec<libc::c_long> {
-        // `mut` is only exercised on x86_64 (the push below); aarch64 has no such syscall to add.
-        #[allow(unused_mut)]
-        let mut allowed = vec![
-            libc::SYS_openat,
-            libc::SYS_read,
-            libc::SYS_close,
-            libc::SYS_fcntl,
-            libc::SYS_write,
-            libc::SYS_writev,
-            libc::SYS_getdents64,
-            libc::SYS_readlinkat,
-            libc::SYS_statx,
-            libc::SYS_newfstatat,
-            libc::SYS_fstat,
-            libc::SYS_getrandom,
-            libc::SYS_lseek,
-            libc::SYS_mmap,
-            libc::SYS_munmap,
-            libc::SYS_brk,
-            libc::SYS_mremap,
-            libc::SYS_madvise,
-            libc::SYS_mprotect,
-            libc::SYS_exit_group,
-            libc::SYS_exit,
-            libc::SYS_futex,
-            libc::SYS_capset,
-            libc::SYS_capget,
-            libc::SYS_prctl,
-            libc::SYS_rt_sigreturn,
-            libc::SYS_clock_gettime,
-            libc::SYS_rt_sigprocmask,
-            libc::SYS_getpid,
-            libc::SYS_gettid,
-            libc::SYS_tgkill,
-            // std::process::exit -> rt::cleanup() tears down the stack-overflow guard at process
-            // exit: sigaltstack(SS_DISABLE) + munmap(alt-stack) + rt_sigaction to restore the
-            // SIGSEGV/SIGBUS handlers. These run AFTER the filter installs, so without them EVERY
-            // invocation self-SIGSYSes on the way out (empirically confirmed by strace on the CI
-            // guest, build #127 -- the kill landed on the syscall right after PR_CAP_AMBIENT_CLEAR_ALL).
-            // Neither is a blast-radius concern: both only touch this process's own signal handling.
-            libc::SYS_sigaltstack,
-            libc::SYS_rt_sigaction,
-        ];
-        // aarch64 has no `readlink` syscall at all (see the doc above) -- there is no constant to
-        // reference on that arch, so this entry only exists to be pushed on x86_64.
+    // `seccomp_bpf` reads `seccomp_data.args` low/high words at little-endian offsets.
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("descartes-root-helper's seccomp compiler assumes a little-endian target");
+
+    /// The native table the policy (`seccomp_policy::helper_policy`) is written against, from
+    /// `libc`'s arch-correct `SYS_*` numbers. The KERNEL-visible `O_LARGEFILE` bit is hand-defined
+    /// per arch because glibc (and so the `libc` crate) defines it as 0 on 64-bit targets. A
+    /// Linux-only test below pins this table equal to `seccomp_policy`'s hand-written table for the
+    /// running arch, so the host-tested policy and the installed one cannot drift.
+    pub(super) fn native_table() -> SyscallTable {
         #[cfg(target_arch = "x86_64")]
-        allowed.push(libc::SYS_readlink);
-        allowed
-    }
-
-    fn bpf_stmt(code: u32, k: u32) -> libc::sock_filter {
-        libc::sock_filter {
-            code: code as u16,
-            jt: 0,
-            jf: 0,
-            k,
-        }
-    }
-
-    fn bpf_jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
-        libc::sock_filter {
-            code: code as u16,
-            jt,
-            jf,
-            k,
-        }
-    }
-
-    /// Builds the BPF program: arch gate -> (x86_64 only) x32 gate -> per-syscall allow cascade ->
-    /// default KILL_PROCESS. See the module doc for the overall property and `allowed_syscalls`
-    /// for the per-entry justification.
-    fn build_filter() -> Vec<libc::sock_filter> {
-        let arch_offset = offset_of!(libc::seccomp_data, arch) as u32;
-        let nr_offset = offset_of!(libc::seccomp_data, nr) as u32;
-
-        let mut program = vec![
-            bpf_stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, arch_offset),
-            // Non-native arch (e.g. the i386/arm32 compat ABI entered via a 32-bit int80/svc) hits
-            // KILL_PROCESS below; the native arch skips over it (D4).
-            bpf_jump(
-                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
-                NATIVE_AUDIT_ARCH,
-                1,
-                0,
-            ),
-            bpf_stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_KILL_PROCESS),
-            bpf_stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, nr_offset),
-        ];
-
+        const KERNEL_O_LARGEFILE: u32 = 0o100000;
+        #[cfg(target_arch = "aarch64")]
+        const KERNEL_O_LARGEFILE: u32 = 0o400000;
         #[cfg(target_arch = "x86_64")]
-        {
-            // x32 syscalls report AUDIT_ARCH_X86_64 (so they survive the gate above) but OR this
-            // bit into `nr` -- the classic hand-rolled-filter bypass (D4). Kill before `nr` is ever
-            // compared against the allowlist below, which is written in native x86_64 numbering.
-            program.push(bpf_jump(
-                libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K,
-                X32_SYSCALL_BIT,
-                0,
-                1,
-            ));
-            program.push(bpf_stmt(
-                libc::BPF_RET | libc::BPF_K,
-                libc::SECCOMP_RET_KILL_PROCESS,
-            ));
-        }
+        const X32: Option<u32> = Some(X32_SYSCALL_BIT);
+        #[cfg(target_arch = "aarch64")]
+        const X32: Option<u32> = None;
 
-        for syscall_nr in allowed_syscalls() {
-            program.push(bpf_jump(
-                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
-                syscall_nr as u32,
-                0,
-                1,
-            ));
-            program.push(bpf_stmt(
-                libc::BPF_RET | libc::BPF_K,
-                libc::SECCOMP_RET_ALLOW,
-            ));
+        let nr = |n: libc::c_long| n as u32;
+        let flag = |f: libc::c_int| f as u32;
+        SyscallTable {
+            audit_arch: NATIVE_AUDIT_ARCH,
+            x32_syscall_bit: X32,
+            read: nr(libc::SYS_read),
+            write: nr(libc::SYS_write),
+            writev: nr(libc::SYS_writev),
+            openat: nr(libc::SYS_openat),
+            close: nr(libc::SYS_close),
+            fcntl: nr(libc::SYS_fcntl),
+            getdents64: nr(libc::SYS_getdents64),
+            readlinkat: nr(libc::SYS_readlinkat),
+            mmap: nr(libc::SYS_mmap),
+            mprotect: nr(libc::SYS_mprotect),
+            munmap: nr(libc::SYS_munmap),
+            brk: nr(libc::SYS_brk),
+            mremap: nr(libc::SYS_mremap),
+            madvise: nr(libc::SYS_madvise),
+            exit: nr(libc::SYS_exit),
+            exit_group: nr(libc::SYS_exit_group),
+            futex: nr(libc::SYS_futex),
+            capget: nr(libc::SYS_capget),
+            capset: nr(libc::SYS_capset),
+            prctl: nr(libc::SYS_prctl),
+            rt_sigreturn: nr(libc::SYS_rt_sigreturn),
+            rt_sigaction: nr(libc::SYS_rt_sigaction),
+            rt_sigprocmask: nr(libc::SYS_rt_sigprocmask),
+            sigaltstack: nr(libc::SYS_sigaltstack),
+            clock_gettime: nr(libc::SYS_clock_gettime),
+            getpid: nr(libc::SYS_getpid),
+            gettid: nr(libc::SYS_gettid),
+            tgkill: nr(libc::SYS_tgkill),
+            o_cloexec: flag(libc::O_CLOEXEC),
+            o_directory: flag(libc::O_DIRECTORY),
+            o_nofollow: flag(libc::O_NOFOLLOW),
+            o_largefile: KERNEL_O_LARGEFILE,
+            f_getfd: flag(libc::F_GETFD),
+            pr_cap_ambient: flag(libc::PR_CAP_AMBIENT),
+            pr_cap_ambient_clear_all: flag(libc::PR_CAP_AMBIENT_CLEAR_ALL),
+            prot_exec: flag(libc::PROT_EXEC),
+            map_anonymous: flag(libc::MAP_ANONYMOUS),
         }
+    }
 
-        program.push(bpf_stmt(
-            libc::BPF_RET | libc::BPF_K,
-            libc::SECCOMP_RET_KILL_PROCESS,
-        ));
-        program
+    /// Compiles the policy for THIS process (its pid is baked into the tgkill rule) into the
+    /// kernel's `sock_filter` representation. See `seccomp_bpf` for the program shape.
+    fn build_filter() -> Result<Vec<libc::sock_filter>, CompileError> {
+        // Read BEFORE the filter installs; no fork/clone is allowlisted, so this stays this
+        // process's pid for its whole remaining life.
+        let own_pid = std::process::id();
+        let program = compile(&helper_policy(&native_table(), own_pid))?;
+        Ok(program
+            .into_iter()
+            .map(|insn| libc::sock_filter {
+                code: insn.code,
+                jt: insn.jt,
+                jf: insn.jf,
+                k: insn.k,
+            })
+            .collect())
     }
 
     fn abort_fail_closed(step: &str, err: io::Error) -> ! {
@@ -276,7 +181,13 @@ mod linux {
     }
 
     fn install_filter() {
-        let program = build_filter();
+        let program = match build_filter() {
+            Ok(program) => program,
+            Err(err) => abort_fail_closed(
+                "seccomp policy compile",
+                io::Error::other(format!("{err:?}")),
+            ),
+        };
         let prog = libc::sock_fprog {
             len: program.len() as u16,
             filter: program.as_ptr() as *mut libc::sock_filter,
@@ -304,27 +215,19 @@ mod linux {
     }
 
     /// Drops this process's capabilities to nothing: effective/permitted/inheritable sets via
-    /// `capset(2)`, ambient set via `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)`.
+    /// `capset(2)`, ambient set via `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)` (the ONLY
+    /// prctl the seccomp policy still admits).
     ///
-    /// Deliberately NOT `PR_CAPBSET_DROP`: that needs `CAP_SETPCAP`, which this binary never holds
-    /// (EPERM both unprivileged today and under the real `cap_sys_ptrace,cap_dac_read_search`
-    /// grant Slice 5/6 add). Deliberately does not touch the bounding set at all: it only
-    /// constrains capability GAIN across execve, and this process can never execve -- no exec*
-    /// syscall is allowlisted above, and NO_NEW_PRIVS is set regardless.
+    /// Deliberately NOT `PR_CAPBSET_DROP`: that needs `CAP_SETPCAP`, which this binary never holds.
+    /// The bounding set only constrains capability GAIN across execve, and this process can never
+    /// execve (no exec* syscall is allowlisted; NO_NEW_PRIVS is set regardless).
     ///
     /// Called by the production binary right after a resolve attempt (success or failure) and
-    /// before any output -- see `main.rs`. Unprivileged (this crate, today), this is a verified
-    /// no-op: a thread may always shrink its own capability sets, so dropping an already-empty set
-    /// always succeeds -- which is exactly what makes this genuinely uniform between CI (no caps
-    /// at all) and the real Slice-5/6 grant (`cap_sys_ptrace,cap_dac_read_search` -- the minimal
-    /// sufficient union for cross-UID `/proc/<pid>/fd` enumeration; see `proc_linux.rs`'s module
-    /// doc for why both capabilities, not `cap_sys_ptrace` alone, are required).
+    /// before any output -- see `main.rs`. Unprivileged this is a verified no-op (a thread may
+    /// always shrink its own capability sets).
     pub fn drop_capabilities() {
-        // Version probe: confirm the running kernel accepts the version this file hand-rolled the
-        // two-element CapUserData array for, rather than assume it. A null second argument is the
-        // documented "probe only" form of capget(2). Every kernel since 2.6.26 accepts VERSION_3,
-        // so in practice this is a sanity check, not live version-negotiation branching -- but it
-        // is a real syscall this filter must allowlist (capget), not a no-op.
+        // Version probe: confirm the running kernel accepts VERSION_3 rather than assume it. A
+        // null second argument is the documented "probe only" form of capget(2).
         let mut header = CapUserHeader {
             version: LINUX_CAPABILITY_VERSION_3,
             pid: 0,
@@ -383,18 +286,33 @@ mod linux {
             abort_fail_closed("PR_CAP_AMBIENT_CLEAR_ALL", io::Error::last_os_error());
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The host-tested policy (`seccomp_policy`'s pinned tables, exercised on every host
+        /// through the BPF interpreter) must be EXACTLY what gets installed here.
+        #[test]
+        fn native_table_matches_the_pinned_host_tested_table() {
+            #[cfg(target_arch = "x86_64")]
+            let pinned = crate::seccomp_policy::pinned_x86_64();
+            #[cfg(target_arch = "aarch64")]
+            let pinned = crate::seccomp_policy::pinned_aarch64();
+            assert_eq!(native_table(), pinned);
+        }
+
+        #[test]
+        fn the_native_policy_compiles() {
+            assert!(build_filter().is_ok());
+        }
+    }
 }
 
-/// Exit code for a fail-closed hardening abort -- distinct from the production binary's
-/// 0/1/2 (success / resolution failure / usage error) so a hardening abort is never mistaken for
-/// an ordinary resolution failure.
-#[cfg(target_os = "linux")]
-const EXIT_HARDENING_FAILURE: i32 = 3;
-
-/// Engages NO_NEW_PRIVS and the seccomp allowlist. Must run before any argv-driven logic (see
+/// Engages NO_NEW_PRIVS and the seccomp policy. Must run before any argv-driven logic (see
 /// `main.rs`) -- FAIL-CLOSED: on any error this aborts the process rather than continuing
-/// unconfined. Idempotent-in-intent but NOT idempotent in fact (a second seccomp install only
-/// narrows further, and NNP can't be unset) -- callers must call this exactly once, at startup.
+/// unconfined. NOT idempotent (a second seccomp install only narrows further, and NNP can't be
+/// unset) -- callers must call this exactly once, at startup.
 #[cfg(target_os = "linux")]
 pub fn engage() {
     linux::engage();
@@ -407,9 +325,8 @@ pub fn drop_capabilities() {
     linux::drop_capabilities();
 }
 
-/// Non-Linux builds (this repo's macOS dev/CI host): no ptrace-blast-radius threat model applies
-/// here -- this crate ships no non-Linux resolution path at all (see `main.rs`) -- so `engage()`
-/// is a compile-time no-op. It is still called unconditionally from `main()` so the call site
+/// Non-Linux builds: this crate ships no non-Linux resolution path at all (see `main.rs`), so
+/// `engage()` is a compile-time no-op. Still called unconditionally from `main()` so the call site
 /// never needs a `#[cfg]`.
 #[cfg(not(target_os = "linux"))]
 pub fn engage() {}

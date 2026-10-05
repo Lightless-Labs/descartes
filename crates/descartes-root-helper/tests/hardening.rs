@@ -92,7 +92,7 @@ fn process_vm_writev_is_killed_by_seccomp() {
 /// directory-permission walk, and is gated in the kernel by `capable(CAP_DAC_READ_SEARCH)`
 /// (`fs/fhandle.c`) -- the exact capability Slice 6 adds to this binary's file-capability grant
 /// (`cap_sys_ptrace,cap_dac_read_search=ep`) for cross-UID `/proc/<pid>/fd` enumeration (see
-/// `proc_linux.rs`'s module doc). It is NOT in `allowed_syscalls()`, so the default
+/// `proc_linux.rs`'s module doc). It is not admitted by `seccomp_policy::helper_policy`, so the default
 /// `KILL_PROCESS` action must still deny it even though this binary now actually holds the
 /// capability that would otherwise make the syscall usable.
 #[test]
@@ -103,6 +103,59 @@ fn open_by_handle_at_is_killed_by_seccomp() {
         Some(libc::SIGSYS),
         "expected SIGSYS (31), got {status:?}"
     );
+}
+
+/// 2026-10 tightened policy (research finding 1, "real-grant helper breakout suite"): every
+/// primitive the old number-only allowlist still admitted -- writable opens (incl. writing
+/// `/proc/<pid>/mem`), `lseek`/`pread` (the `/proc/<pid>/mem` READ primitive), writes to non-stdio
+/// fds, executable memory, the `*stat*` metadata oracle, `getrandom`, every prctl/fcntl/tgkill
+/// beyond the helper's single use, and `execve` -- is now SIGSYS-killed by the live filter.
+#[test]
+fn tightened_policy_kills_every_closed_primitive() {
+    let modes = [
+        "--do-openat-wronly",
+        "--do-openat-proc-mem-rdwr",
+        "--do-openat-creat",
+        "--do-openat-o-path",
+        "--do-lseek-proc-mem",
+        "--do-pread",
+        "--do-write-non-stdio-fd",
+        "--do-mmap-exec",
+        "--do-mprotect-exec",
+        "--do-newfstatat",
+        "--do-statx",
+        "--do-getrandom",
+        "--do-prctl-dumpable",
+        "--do-tgkill-other",
+        "--do-fcntl-setfd",
+        "--do-execve",
+    ];
+    let mut failures = Vec::new();
+    for mode in modes {
+        let status = run_probe(mode);
+        if status.signal() != Some(libc::SIGSYS) {
+            failures.push(format!("{mode}: expected SIGSYS, got {status:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 2026-10 positive control for the tightened policy: every read the production binary performs
+/// (/proc listing, net/tcp, pid dir, status, cmdline, exe link, fd listing + fd link) plus a stdout
+/// and stderr write still succeed under the live filter -- no self-SIGSYS.
+#[test]
+fn the_helper_s_own_read_path_still_works_under_the_live_filter() {
+    let output = Command::new(probe_path())
+        .arg("--read-allowed-paths")
+        .output()
+        .expect("failed to spawn hardening-probe");
+    assert!(
+        output.status.success(),
+        "expected exit 0, got {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
 }
 
 /// crit2 (NNP): PR_SET_NO_NEW_PRIVS is actually set after engage(), read back from the kernel via
