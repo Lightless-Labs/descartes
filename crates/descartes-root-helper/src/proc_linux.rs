@@ -100,6 +100,7 @@ enum IdentityFailure {
 
 fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, IdentityFailure> {
     let uid = read_uid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
+    let tgid = read_tgid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let start_time = read_process_start_time(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let executable_path = read_exe(pid_dir).ok_or(IdentityFailure::UnreadableExe)?;
     let exe_identity = executable_identity(pid_dir)
@@ -120,7 +121,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     }
     Ok(Resolved {
         pid,
-        tgid: pid,
+        tgid,
         start_time,
         executable_identity: exe_identity,
         uid,
@@ -424,6 +425,7 @@ fn verify_final_holders(
                 .ok_or(())?;
             let link =
                 procfs::read_link_at(pinned.fd_dir.as_fd(), &holder.fd_name).map_err(|_| ())?;
+            let tgid = read_tgid(pinned._pid_dir.as_fd()).ok_or(())?;
             let start_time = read_process_start_time(pinned._pid_dir.as_fd()).ok_or(())?;
             let executable_path = read_exe(pinned._pid_dir.as_fd()).ok_or(())?;
             let executable_identity =
@@ -431,7 +433,7 @@ fn verify_final_holders(
             let (argv, argv_truncated) = read_cmdline(pinned._pid_dir.as_fd()).ok_or(())?;
             Ok((
                 link.to_string_lossy().into_owned(),
-                holder.tgid,
+                tgid,
                 start_time,
                 executable_path,
                 (executable_identity.device, executable_identity.inode),
@@ -655,6 +657,17 @@ fn read_uid(pid_dir: BorrowedFd<'_>) -> Option<u32> {
         if let Some(rest) = line.strip_prefix("Uid:") {
             let real = rest.split_whitespace().next()?;
             return real.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+fn read_tgid(pid_dir: BorrowedFd<'_>) -> Option<u32> {
+    let status = procfs::read_file_at(pid_dir, "status").ok()?;
+    let status = String::from_utf8_lossy(&status);
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.split_whitespace().next()?.parse::<u32>().ok();
         }
     }
     None
@@ -1036,6 +1049,22 @@ mod tests {
             &[final_evidence()],
             || (Some(final_row("01")), SocketTableStatus::Complete),
             stable_final_holder_read,
+        );
+        assert_eq!(result, Err(SocketOutcome::GenerationChanged));
+    }
+
+    #[test]
+    fn final_verification_catches_tgid_change_during_the_final_enumeration() {
+        let result = verify_final_holders_with(
+            &final_target(),
+            &final_row("07"),
+            &[final_evidence()],
+            || (Some(final_row("07")), SocketTableStatus::Complete),
+            |holder| {
+                let mut observed = stable_final_holder_read(holder)?;
+                observed.1 = 101;
+                Ok(observed)
+            },
         );
         assert_eq!(result, Err(SocketOutcome::GenerationChanged));
     }
