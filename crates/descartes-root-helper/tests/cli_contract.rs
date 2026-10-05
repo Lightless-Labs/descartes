@@ -24,13 +24,18 @@ fn bad_argv_exits_nonzero_with_empty_stdout_never_partial_output() {
         &[],
         &["--unknown"],
         &["--resolve-pid"],
-        &["--resolve-port"],
+        &["--resolve-socket"],
+        // 2026-10: the unbound port form no longer exists (research finding 2).
+        &["--resolve-port", "8080"],
+        &["--resolve-socket", "tcp", "8080"],
+        &["--resolve-socket", "sctp", "8080", "424242"],
+        &["--resolve-socket", "tcp", "8080", "0"],
         &["--resolve-pid", "abc"],
         &["--resolve-pid", "-5"],
         &["--resolve-pid", ""],
         &["--resolve-pid", "123", "456"],
         &["--probe", "--resolve-pid", "123"],
-        &["--resolve-pid", "123", "--resolve-port", "456"],
+        &["--resolve-pid", "123", "--resolve-socket", "tcp", "1", "1"],
         &["-p", "123"],
         &["--help"],
     ];
@@ -130,9 +135,13 @@ fn probe_behaves_per_platform_contract() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn resolution_attempts_fail_cleanly_on_non_linux_with_no_stdout() {
-    for args in [vec!["--resolve-pid", "1"], vec!["--resolve-port", "1"]] {
+    for args in [
+        vec!["--resolve-pid", "1"],
+        vec!["--resolve-socket", "tcp", "1", "1"],
+    ] {
         let output = run(&args);
-        assert!(!output.status.success());
+        // A well-formed request on non-Linux is a resolution failure (1), not a usage error.
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
         assert!(output.stdout.is_empty());
     }
 }

@@ -10,7 +10,9 @@
 //!
 //! Contract (authoritative source: `tools/descartes-cli/src/tools/provenance-elevated.js`,
 //! docs/plans/2026-07-11-s3-priv-elevated-read-path.md Slice 3):
-//!   - argv is EXACTLY `--probe` | `--resolve-pid <digits>` | `--resolve-port <digits>`.
+//!   - argv is EXACTLY `--probe` | `--resolve-pid <digits>` |
+//!     `--resolve-socket <tcp|tcp6|udp|udp6> <port> <inode>` (2026-10: replaces the unbound
+//!     `--resolve-port <digits>`; see `socket.rs`).
 //!   - `--probe`: exit 0 means "available", nothing is ever printed to stdout. On a non-Linux
 //!     build this can never be true (there is no resolution mechanism), so `--probe` exits
 //!     nonzero -- reporting available would be a lie.
@@ -31,6 +33,7 @@ mod json;
 #[cfg(target_os = "linux")]
 mod proc_linux;
 mod scan;
+mod socket;
 
 use argv::Command;
 use descartes_root_helper::hardening;
@@ -47,14 +50,19 @@ use descartes_root_helper::hardening;
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_RESOLUTION_FAILURE: i32 = 1;
 const EXIT_USAGE_ERROR: i32 = 2;
-// Codex-hardening #6: a `--resolve-port` that found no owner AND gave up at least one candidate's
-// `/proc/<pid>/fd` scan at the per-process cap (or the pid walk at its cap) — so "no owner" is
+// Codex-hardening #6: a `--resolve-socket` that found no holder AND hit a bound (the socket table
+// read, the `/proc` listing, or a non-holder's `/proc/<pid>/fd` table) -- so "not found" is
 // UNCERTAIN, not definitive. A distinct nonzero code (still a failure to any caller that only
 // checks exit==0) lets the Node side surface `fd_scan_truncated` in provenance instead of a silent,
-// indistinguishable-from-genuine negative. Only ever returned on Linux `--resolve-port`.
+// indistinguishable-from-genuine negative. Only ever returned on Linux `--resolve-socket`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const EXIT_RESOLUTION_TRUNCATED: i32 = 3;
 // 4 is `hardening::EXIT_HARDENING_FAILURE` (fail-closed confinement abort) -- never reused here.
+// 2026-10 (research finding 2): the socket is held by processes running DIFFERENT executables (or
+// by more than the holder cap), so no single owner can be named. Nonzero + empty stdout like every
+// failure; distinct so Node can surface `elevated_owner_ambiguous`. Linux `--resolve-socket` only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EXIT_OWNER_AMBIGUOUS: i32 = 5;
 
 fn main() {
     // FIRST statement, unconditionally, before any argv logic: fail-closed by construction (see
@@ -86,7 +94,7 @@ fn run(args: &[String]) -> i32 {
         }
         Ok(Command::Probe) => run_probe(),
         Ok(Command::ResolvePid(pid)) => run_resolve_pid(pid),
-        Ok(Command::ResolvePort(port)) => run_resolve_port(port),
+        Ok(Command::ResolveSocket(target)) => run_resolve_socket(target),
     }
 }
 
@@ -116,7 +124,7 @@ fn run_resolve_pid(pid: u32) -> i32 {
         Some(resolved) => {
             println!(
                 "{}",
-                json::emit_response(json::Requested::Pid(pid), &resolved)
+                json::emit_response(json::Requested::Pid(pid), &resolved, None)
             );
             EXIT_SUCCESS
         }
@@ -134,38 +142,52 @@ fn run_resolve_pid(_pid: u32) -> i32 {
 }
 
 #[cfg(target_os = "linux")]
-fn run_resolve_port(port: u32) -> i32 {
-    let resolution = proc_linux::resolve_port_detailed(port);
-    // Drop right after the reads that need the (future) capability, before ANY output -- success
-    // or failure, per hardening.rs's documented sequence: resolve -> drop -> emit.
+fn run_resolve_socket(target: socket::SocketTarget) -> i32 {
+    use proc_linux::SocketOutcome;
+
+    let outcome = proc_linux::resolve_socket(&target);
+    // Drop right after the reads that need the capability, before ANY output -- success or
+    // failure, per hardening.rs's documented sequence: resolve -> drop -> emit.
     hardening::drop_capabilities();
-    match resolution.resolved {
-        Some(resolved) => {
-            // The success stdout contract is untouched (truncation on an EARLIER candidate is moot
-            // once an owner is found — the answer is complete).
+    let what = format!(
+        "{} socket inode {} on port {}",
+        target.protocol.token(),
+        target.inode,
+        target.port
+    );
+    match outcome {
+        SocketOutcome::Resolved { resolved, holders } => {
             println!(
                 "{}",
-                json::emit_response(json::Requested::Port(port), &resolved)
+                json::emit_response(json::Requested::Socket(target), &resolved, Some(holders))
             );
             EXIT_SUCCESS
         }
-        // Codex-hardening #6: distinguish "gave up at a scan cap (result uncertain)" from a
-        // definitive "no owner". Still nonzero + nothing on stdout, so the strict contract holds.
-        None if resolution.truncated => {
+        // Codex-hardening #6: distinguish "gave up at a bound (result uncertain)" from a
+        // definitive "not found". Still nonzero + nothing on stdout, so the strict contract holds.
+        SocketOutcome::Truncated => {
             eprintln!(
-                "descartes-root-helper: could not resolve port {port} (fd/pid scan hit the per-process cap; result uncertain, not a definitive no-owner)"
+                "descartes-root-helper: could not resolve {what} (a scan bound was hit; result uncertain, not a definitive not-found)"
             );
             EXIT_RESOLUTION_TRUNCATED
         }
-        None => {
-            eprintln!("descartes-root-helper: could not resolve port {port}");
+        SocketOutcome::Ambiguous => {
+            eprintln!(
+                "descartes-root-helper: {what} is held by processes running different executables (or too many holders); no single owner"
+            );
+            EXIT_OWNER_AMBIGUOUS
+        }
+        SocketOutcome::NotFound => {
+            eprintln!(
+                "descartes-root-helper: could not resolve {what} (gone, rebound, not listening, or changed during resolution)"
+            );
             EXIT_RESOLUTION_FAILURE
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_resolve_port(_port: u32) -> i32 {
+fn run_resolve_socket(_target: socket::SocketTarget) -> i32 {
     eprintln!("descartes-root-helper: elevated /proc resolution is only implemented on Linux");
     EXIT_RESOLUTION_FAILURE
 }
@@ -184,6 +206,7 @@ mod tests {
             EXIT_USAGE_ERROR,
             EXIT_RESOLUTION_TRUNCATED,
             hardening::EXIT_HARDENING_FAILURE,
+            EXIT_OWNER_AMBIGUOUS,
         ];
         let unique: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
         assert_eq!(unique.len(), codes.len(), "exit codes collide: {codes:?}");
@@ -206,7 +229,14 @@ mod tests {
     fn non_linux_probe_and_resolve_are_always_a_resolution_failure_never_a_lie() {
         assert_eq!(run_probe(), EXIT_RESOLUTION_FAILURE);
         assert_eq!(run_resolve_pid(1), EXIT_RESOLUTION_FAILURE);
-        assert_eq!(run_resolve_port(1), EXIT_RESOLUTION_FAILURE);
+        assert_eq!(
+            run_resolve_socket(socket::SocketTarget {
+                protocol: socket::Protocol::Tcp,
+                port: 1,
+                inode: 1
+            }),
+            EXIT_RESOLUTION_FAILURE
+        );
     }
 
     #[cfg(target_os = "linux")]

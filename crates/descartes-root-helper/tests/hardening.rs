@@ -186,7 +186,7 @@ fn cap_drop_is_a_clean_no_op_when_unprivileged() {
 /// crit3 (completeness): the PRODUCTION binary, which now engages the filter as the first
 /// statement of main(), still succeeds under it end-to-end -- proves the allowlist covers what
 /// `--probe` actually needs, with no self-inflicted SIGSYS. `tests/linux_resolution.rs` already
-/// spawns this same built binary for `--resolve-pid`/`--resolve-port`, so those became live-filter
+/// spawns this same built binary for `--resolve-pid`/`--resolve-socket`, so those are live-filter
 /// tests automatically the moment `engage()` started running at process start -- no changes needed
 /// there, and no separate `--probe-under-filter` plumbing exists on the production binary (its
 /// argv contract is exactly `--probe` already).

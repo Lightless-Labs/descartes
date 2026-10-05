@@ -32,7 +32,7 @@ const DEFAULT_PROBE_TIMEOUT_MS = 2000;
 const DEFAULT_INVOKE_TIMEOUT_MS = 3000;
 const DEFAULT_MAX_BUFFER = 64 * 1024;
 
-// descartes-root-helper's EXIT_RESOLUTION_TRUNCATED (main.rs): a `--resolve-port` that found no
+// descartes-root-helper's EXIT_RESOLUTION_TRUNCATED (main.rs): a `--resolve-socket` that found no
 // owner AND gave up at least one candidate's /proc/<pid>/fd scan at the per-process cap (or the pid
 // walk at its cap), so "no owner" is UNCERTAIN, not definitive (Codex-hardening #6). Still a nonzero
 // (failure) exit — the degrade-to-unprivileged flow is unchanged — but distinguishable, so the
@@ -44,6 +44,16 @@ const HELPER_EXIT_FD_SCAN_TRUNCATED = 3;
 // security boundary failed (research 2026-09-26, finding 8). Now distinct, and surfaced as its own
 // diagnostic; still a plain failure for the degrade path.
 const HELPER_EXIT_HARDENING_FAILURE = 4;
+// descartes-root-helper's EXIT_OWNER_AMBIGUOUS (2026-10, research finding 2): the exact socket is
+// held by processes running DIFFERENT executables (e.g. systemd socket activation), so the helper
+// names no owner. Still a plain failure for the degrade path; surfaced as its own diagnostic.
+const HELPER_EXIT_OWNER_AMBIGUOUS = 5;
+
+// The four /proc/net tables resolveByPortLinux observes; passed to the helper verbatim.
+const SOCKET_PROTOCOLS = new Set(["tcp", "tcp6", "udp", "udp6"]);
+// A /proc/net inode column value as the kernel prints it (%lu): no sign, no leading zero, nonzero.
+// The helper independently rejects anything that overflows u64.
+const SOCKET_INODE_PATTERN = /^[1-9][0-9]{0,19}$/;
 // Stricter than execFile's own maxBuffer -- a bounded-length check applied BEFORE JSON.parse is
 // ever attempted, so a technically-below-maxBuffer-but-still-huge response can't reach the parser.
 const MAX_RESPONSE_BYTES = 8 * 1024;
@@ -116,6 +126,7 @@ async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {})
     // numeric exit status arrives as error.code; a signal/ENOENT string code simply won't match.
     if (error?.code === HELPER_EXIT_FD_SCAN_TRUNCATED) result.fd_scan_truncated = true;
     if (error?.code === HELPER_EXIT_HARDENING_FAILURE) result.helper_hardening_failure = true;
+    if (error?.code === HELPER_EXIT_OWNER_AMBIGUOUS) result.owner_ambiguous = true;
     return result;
   }
 }
@@ -132,8 +143,8 @@ export async function defaultProbeElevatedHelper(helperPath, options = {}) {
   return { available: result.status === "ok" };
 }
 
-// argv is always one of the two literal bounded forms below -- never a template/interpolated
-// string. Callers pass `argv` in from resolveElevated, which builds it as a literal array.
+// argv is always one of the two literal bounded forms built by buildHelperArgv below -- never a
+// template/interpolated string.
 export async function defaultInvokeElevatedHelper(helperPath, argv, options = {}) {
   return runMinimalEnvExecFile(helperPath, argv, {
     timeout: options.invokeTimeoutMs ?? DEFAULT_INVOKE_TIMEOUT_MS,
@@ -208,6 +219,24 @@ export async function verifyTrustBoundary({ configPath, configDir, helperPath } 
 // a parse failure -- never merged.
 // ---------------------------------------------------------------------------------------------
 
+// 2026-10 (research finding 2): a port-attributed request is a SOCKET request bound to the exact
+// identity the unprivileged path observed -- protocol + port + inode -- never a bare port. The
+// helper echoes all three back, and every one must match (strict ===, inode compared as the exact
+// decimal string from /proc/net), with no extra keys in `requested`.
+function requestedEchoMatches(requested, target) {
+  if (target.kind === "pid") return requested.pid === target.value;
+  if (target.kind === "socket") {
+    const keys = Object.keys(requested);
+    return (
+      keys.length === 3 &&
+      requested.protocol === target.protocol &&
+      requested.port === target.port &&
+      requested.inode === target.inode
+    );
+  }
+  return false;
+}
+
 export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   if (typeof rawStdout !== "string" || rawStdout.length === 0 || rawStdout.length > MAX_RESPONSE_BYTES) return undefined;
 
@@ -223,9 +252,8 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   const resolved = parsed.resolved;
   if (!requested || typeof requested !== "object" || !resolved || typeof resolved !== "object") return undefined;
 
-  if (!requestedTarget || (requestedTarget.kind !== "pid" && requestedTarget.kind !== "port")) return undefined;
-  if (requestedTarget.kind === "port" && requested.port !== requestedTarget.value) return undefined;
-  if (requestedTarget.kind === "pid" && requested.pid !== requestedTarget.value) return undefined;
+  if (!requestedTarget || (requestedTarget.kind !== "pid" && requestedTarget.kind !== "socket")) return undefined;
+  if (!requestedEchoMatches(requested, requestedTarget)) return undefined;
 
   const pid = Number.isInteger(resolved.pid) && resolved.pid > 0 ? resolved.pid : undefined;
   if (pid === undefined) return undefined; // never merge a response without a concrete resolved pid.
@@ -234,7 +262,32 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   const executablePath = typeof resolved.executable_path === "string" ? resolved.executable_path : undefined;
   const command = typeof resolved.command === "string" ? resolved.command : undefined;
 
-  return { pid, uid, executable_path: executablePath, command };
+  const out = { pid, uid, executable_path: executablePath, command };
+  if (requestedTarget.kind === "socket") {
+    // Number of processes the helper found holding the exact socket (all one executable -- it
+    // reports disagreeing holders as ambiguous instead). Must be a positive integer if present.
+    if (resolved.holders !== undefined) {
+      if (!Number.isInteger(resolved.holders) || resolved.holders < 1) return undefined;
+      out.holders = resolved.holders;
+    }
+  }
+  return out;
+}
+
+// Builds the helper argv for a target, or `undefined` for anything outside the two literal forms
+// (fail closed: an unbuildable target never reaches the helper). Exported for tests.
+export function buildHelperArgv(target) {
+  if (!target || typeof target !== "object") return undefined;
+  if (target.kind === "pid") {
+    return Number.isInteger(target.value) && target.value > 0 ? ["--resolve-pid", String(target.value)] : undefined;
+  }
+  if (target.kind === "socket") {
+    if (!SOCKET_PROTOCOLS.has(target.protocol)) return undefined;
+    if (!Number.isInteger(target.port) || target.port < 0 || target.port > 65535) return undefined;
+    if (typeof target.inode !== "string" || !SOCKET_INODE_PATTERN.test(target.inode)) return undefined;
+    return ["--resolve-socket", target.protocol, String(target.port), target.inode];
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -242,12 +295,17 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
 // available:true. mechanism:"auto" never targets root_helper -- only probed/attempted when
 // explicitly named in config. Returns `undefined` on ANY non-success exit path (the caller is
 // responsible for falling back to the already-computed unprivileged result unchanged); returns a
-// plain success descriptor `{pid, uid, executablePath, command, mechanism}` on a verified
+// plain success descriptor `{pid, uid, executablePath, command, mechanism, holders?}` on a verified
 // echo-back-matching success.
 // ---------------------------------------------------------------------------------------------
 
 export async function resolveElevated({ target, paths } = {}, options = {}) {
   if (!target || !paths) return undefined;
+  // Fixed-argv, always one of the two literal bounded forms -- never a template/interpolated
+  // string. Built (and validated) up front: a target that cannot be expressed exactly is never
+  // attempted at all.
+  const argv = buildHelperArgv(target);
+  if (!argv) return undefined;
 
   const loadConfig = options.loadProvenanceConfig ?? defaultLoadProvenanceConfig;
   let config;
@@ -284,10 +342,6 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
   const attemptedMechanism = configuredMechanism === "auto" ? (probeResult.mechanism ?? "auto") : configuredMechanism;
   if (attemptedMechanism === "root_helper" && configuredMechanism !== "root_helper") return undefined;
 
-  // Fixed-argv, always one of the two literal bounded forms -- never a template/interpolated
-  // string.
-  const argv = target.kind === "pid" ? ["--resolve-pid", String(target.value)] : ["--resolve-port", String(target.value)];
-
   const invoke = options.invokeElevatedHelper ?? defaultInvokeElevatedHelper;
   let invokeResult;
   try {
@@ -300,5 +354,7 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
   const parsed = parseAndVerifyHelperResponse(invokeResult.stdout, target);
   if (!parsed) return undefined;
 
-  return { pid: parsed.pid, uid: parsed.uid, executablePath: parsed.executable_path, command: parsed.command, mechanism: attemptedMechanism };
+  const success = { pid: parsed.pid, uid: parsed.uid, executablePath: parsed.executable_path, command: parsed.command, mechanism: attemptedMechanism };
+  if (parsed.holders !== undefined) success.holders = parsed.holders;
+  return success;
 }

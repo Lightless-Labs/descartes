@@ -720,8 +720,13 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // gates resolution: resolveElevated still degrades to `undefined` on the same unable status.
   let observedInvoke;
   const invoke = options.invokeElevatedHelper ?? defaultInvokeElevatedHelper;
+  // 2026-10 (research finding 2): bind the elevated request to the EXACT socket this path observed
+  // (`primary`, i.e. matches[0]) -- protocol + port + inode -- not a bare port the helper would
+  // re-observe independently. A primary lacking a usable protocol/inode simply never attempts
+  // elevation (resolveElevated's buildHelperArgv fails closed to undefined).
+  const socketTarget = { kind: "socket", protocol: primary.protocol, port, inode: primary.inode, uid: primary.uid };
   const upgrade = await resolveElevated(
-    { target: { kind: "port", value: port, uid: primary.uid }, paths: options.paths },
+    { target: socketTarget, paths: options.paths },
     {
       ...options,
       loadProvenanceConfig: async (paths) => {
@@ -748,12 +753,16 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // 2026-10 (research finding 8): the helper's confinement (NNP/seccomp/cap-drop) failed to engage
   // and it aborted fail-closed -- its own exit code now, never conflated with a truncated scan.
   const helperHardeningFailure = observedInvoke?.helper_hardening_failure === true;
+  // 2026-10 (research finding 2): the exact socket is held by processes running different
+  // executables -- the helper named no owner rather than guess.
+  const ownerAmbiguous = observedInvoke?.owner_ambiguous === true;
   const withDiagnostics = (outcome) => {
-    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure) return outcome; // byte-identical: no diagnostic fields.
+    if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure && !ownerAmbiguous) return outcome; // byte-identical: no diagnostic fields.
     const privilege = { ...outcome.result.privilege };
     if (ptraceScope !== undefined) privilege.ptrace_scope = ptraceScope;
     if (fdScanTruncated) privilege.fd_scan_truncated = true;
     if (helperHardeningFailure) privilege.helper_hardening_failure = true;
+    if (ownerAmbiguous) privilege.elevated_owner_ambiguous = true;
     return { ...outcome, result: { ...outcome.result, privilege } };
   };
 
@@ -787,7 +796,14 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
       name: elevatedCommand,
       confidence: 1,
       review_hint: "none",
-      details: { reason: "resolved_via_elevated_helper", mechanism: upgrade.mechanism },
+      details: {
+        reason: "resolved_via_elevated_helper",
+        mechanism: upgrade.mechanism,
+        // The bound socket identity the helper verified, and how many processes (all one
+        // executable) hold it -- e.g. >1 for a pre-fork server's master + workers.
+        socket: { protocol: socketTarget.protocol, inode: socketTarget.inode },
+        ...(upgrade.holders !== undefined ? { socket_holders: upgrade.holders } : {}),
+      },
     },
   };
   return withDiagnostics(finalizeProvenanceResult({

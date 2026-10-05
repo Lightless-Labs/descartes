@@ -5,7 +5,8 @@
 //!
 //! The emitted shape is the authoritative contract Node's `parseAndVerifyHelperResponse`
 //! (tools/descartes-cli/src/tools/provenance-elevated.js) expects:
-//!   {"requested":{"pid"|"port":N},"resolved":{"pid":N,"uid":U,"executable_path":"...","command":"..."}}
+//!   pid:    {"requested":{"pid":N},"resolved":{"pid":N,"uid":U,"executable_path":"...","command":"..."}}
+//!   socket: {"requested":{"protocol":"tcp","port":N,"inode":"I"},"resolved":{...,"holders":H}}
 //! Key order and exact formatting are pinned by the shared golden fixture test below.
 //!
 //! This module's only production call site (`main.rs`'s `run_resolve_pid`/`run_resolve_port`) is
@@ -16,6 +17,8 @@
 
 use std::fmt::Write as _;
 
+use crate::socket::SocketTarget;
+
 /// Per-field raw (pre-escape) truncation bound matching the helper contract's documented cap.
 /// Real `/proc` paths and cmdlines are overwhelmingly printable UTF-8; a pathological
 /// all-control-byte cmdline could in principle inflate the ESCAPED form past this raw byte count
@@ -25,11 +28,14 @@ use std::fmt::Write as _;
 /// makes such a response safely rejected rather than a helper-side vulnerability.
 pub const MAX_FIELD_BYTES: usize = 2048;
 
-/// The one echoed request key: exactly the pid or port that was asked for, nothing else in the
-/// `requested` object.
+/// The echoed request: exactly what was asked for, nothing else in the `requested` object. A pid
+/// request echoes `{"pid":N}`; a socket request (2026-10) echoes the full bound identity
+/// `{"protocol":"tcp","port":N,"inode":"<digits>"}` -- the inode as a decimal STRING because a
+/// `u64` can exceed JavaScript's safe-integer range, and Node compares it verbatim against the
+/// inode string it read from `/proc/net`.
 pub enum Requested {
     Pid(u32),
-    Port(u32),
+    Socket(SocketTarget),
 }
 
 /// A complete, successful resolution. Slice 3 emits only complete resolutions -- see
@@ -79,16 +85,27 @@ pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 /// Emits the single-line JSON response for a verified successful resolution. `requested` echoes
 /// exactly the numeric target that was asked for (the Node side compares this with strict `!==`
 /// against the numeric request, so it MUST be a JSON number, never a string).
-pub fn emit_response(requested: Requested, resolved: &Resolved) -> String {
+///
+/// `holders` (socket requests only) is the number of distinct processes found holding the socket
+/// (all running the same executable -- disagreeing holders are never emitted, see `socket.rs`);
+/// appended as `"holders":N` inside `resolved`. `None` emits the pid-request shape unchanged.
+pub fn emit_response(requested: Requested, resolved: &Resolved, holders: Option<usize>) -> String {
     let requested_field = match requested {
         Requested::Pid(pid) => format!("\"pid\":{pid}"),
-        Requested::Port(port) => format!("\"port\":{port}"),
+        // `protocol.token()` is one of four fixed ASCII literals; no escaping needed.
+        Requested::Socket(target) => format!(
+            "\"protocol\":\"{}\",\"port\":{},\"inode\":\"{}\"",
+            target.protocol.token(),
+            target.port,
+            target.inode
+        ),
     };
+    let holders_field = holders.map_or(String::new(), |n| format!(",\"holders\":{n}"));
     let executable_path =
         escape_json_string(&truncate_bytes(&resolved.executable_path, MAX_FIELD_BYTES));
     let command = escape_json_string(&truncate_bytes(&resolved.command, MAX_FIELD_BYTES));
     format!(
-        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"command\":\"{command}\"}}}}",
+        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"command\":\"{command}\"{holders_field}}}}}",
         resolved.pid, resolved.uid,
     )
 }
@@ -176,18 +193,49 @@ mod tests {
             executable_path: "/opt/svc/bin/app".to_string(),
             command: "app --serve".to_string(),
         };
-        let emitted = emit_response(Requested::Port(8080), &resolved);
+        let target = crate::socket::SocketTarget {
+            protocol: crate::socket::Protocol::Tcp,
+            port: 8080,
+            inode: 424242,
+        };
+        let emitted = emit_response(Requested::Socket(target), &resolved, Some(1));
         assert_eq!(emitted, fixture.trim());
 
         // Belt-and-suspenders: also confirm it's valid, correctly-shaped JSON via the dev-only parser.
         let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+        assert_eq!(parsed["requested"]["protocol"], "tcp");
         assert_eq!(parsed["requested"]["port"], 8080);
+        assert_eq!(
+            parsed["requested"]["inode"], "424242",
+            "inode echoes as a decimal string (u64 > JS safe integer)"
+        );
         assert_eq!(parsed["resolved"]["pid"], 4242);
         assert_eq!(parsed["resolved"]["uid"], 997);
         assert_eq!(parsed["resolved"]["executable_path"], "/opt/svc/bin/app");
         assert_eq!(parsed["resolved"]["command"], "app --serve");
-        // The requested object contains ONLY the one echoed key.
-        assert_eq!(parsed["requested"].as_object().unwrap().len(), 1);
+        assert_eq!(parsed["resolved"]["holders"], 1);
+        // The requested object contains ONLY the three bound-identity keys.
+        assert_eq!(parsed["requested"].as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn emit_response_echoes_a_u64_inode_exactly() {
+        let resolved = Resolved {
+            pid: 1,
+            uid: 0,
+            executable_path: "/x".to_string(),
+            command: "x".to_string(),
+        };
+        let target = crate::socket::SocketTarget {
+            protocol: crate::socket::Protocol::Udp6,
+            port: 53,
+            inode: u64::MAX,
+        };
+        let emitted = emit_response(Requested::Socket(target), &resolved, Some(2));
+        let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+        assert_eq!(parsed["requested"]["inode"], u64::MAX.to_string());
+        assert_eq!(parsed["requested"]["protocol"], "udp6");
+        assert_eq!(parsed["resolved"]["holders"], 2);
     }
 
     #[test]
@@ -198,9 +246,13 @@ mod tests {
             executable_path: "/bin/sh".to_string(),
             command: "sh".to_string(),
         };
-        let emitted = emit_response(Requested::Pid(99), &resolved);
+        let emitted = emit_response(Requested::Pid(99), &resolved, None);
         let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
         assert_eq!(parsed["requested"]["pid"], 99);
         assert!(parsed["requested"].get("port").is_none());
+        assert!(
+            parsed["resolved"].get("holders").is_none(),
+            "pid responses keep the pre-2026-10 shape"
+        );
     }
 }

@@ -23,6 +23,7 @@ import {
   resolveCrossUidPortResult,
 } from "../src/tools/provenance.js";
 import {
+  buildHelperArgv,
   DEFAULT_HELPER_PATH,
   defaultInvokeElevatedHelper,
   defaultProbeElevatedHelper,
@@ -81,8 +82,16 @@ function fakeElevatedOptions({ statOverrides = trustedHelperFixture(), helperPat
   };
 }
 
-function validHelperStdout({ port, pid = 4242, uid = 1000, executablePath = "/opt/svc/bin/app", command = "app" } = {}) {
-  return JSON.stringify({ requested: { port }, resolved: { pid, uid, executable_path: executablePath, command } });
+// 2026-10 (research finding 2): port attribution is a SOCKET request bound to the exact identity
+// the unprivileged path observed (`primary`) -- protocol + port + inode.
+const SOCKET_TARGET = Object.freeze({ kind: "socket", protocol: "tcp", port: 8080, inode: "424242", uid: 1000 });
+const PRIMARY = Object.freeze({ uid: 1000, protocol: "tcp", inode: "424242" });
+
+function validHelperStdout({ port, protocol = "tcp", inode = "424242", holders = 1, pid = 4242, uid = 1000, executablePath = "/opt/svc/bin/app", command = "app" } = {}) {
+  return JSON.stringify({
+    requested: { protocol, port, inode },
+    resolved: { pid, uid, executable_path: executablePath, command, holders },
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -98,7 +107,7 @@ test("resolveElevated never attempts when config is disabled, even though the he
     invokeElevatedHelper: async () => { throw new Error("must not be called when config is disabled"); },
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
   assert.equal(probeCalls, 0, "the gate must short-circuit on config before ever probing the helper");
 });
@@ -112,7 +121,7 @@ test("resolveElevated never attempts when the helper is absent (probe reports un
     invokeElevatedHelper: async () => { invokeCalls++; throw new Error("must not be called when the probe is unavailable"); },
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
   assert.equal(invokeCalls, 0);
 });
@@ -122,7 +131,7 @@ test("resolveCrossUidPortResult falls through to the unprivileged partial/0.4/mi
   const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
   const options = fakeElevatedOptions({ paths, probeElevatedHelper: async () => ({ available: true }) });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "partial");
   assert.equal(outcome.result.resolved.status, "partial");
   assert.equal(outcome.result.resolved.pid, undefined);
@@ -145,8 +154,8 @@ test("resolveElevated returns a verified success descriptor when config is enabl
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080 }) }),
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
-  assert.deepEqual(result, { pid: 4242, uid: 1000, executablePath: "/opt/svc/bin/app", command: "app", mechanism: "cap_sys_ptrace" });
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
+  assert.deepEqual(result, { pid: 4242, uid: 1000, executablePath: "/opt/svc/bin/app", command: "app", mechanism: "cap_sys_ptrace", holders: 1 });
 });
 
 test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved ok/1 pid record on a verified elevated success, with the real ptrace_scope diagnostic attached", async () => {
@@ -164,15 +173,131 @@ test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved 
     readFile: async () => "1\n",
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "ok");
   assert.equal(outcome.result.resolved.status, "ok");
   assert.equal(outcome.result.resolved.pid, 4242);
   assert.equal(outcome.result.resolved.executable_path, "/opt/svc/bin/app");
   assert.deepEqual(outcome.result.privilege, { mechanism: "cap_sys_ptrace", elevated_available: true, elevated_used: true, ptrace_scope: "1" });
+  // The bound socket identity the helper verified is recorded alongside the answer.
+  assert.deepEqual(outcome.result.source.details, {
+    reason: "resolved_via_elevated_helper",
+    mechanism: "cap_sys_ptrace",
+    socket: { protocol: "tcp", inode: "424242" },
+    socket_holders: 1,
+  });
 
   const fields = computeProvenanceEnvelopeFields(outcome.resolvedStatus, outcome.result.source.type);
   assert.deepEqual(fields, { status: "ok", confidence: 1, reviewHint: "none" }, "upgrade must reach the same ok/1/none envelope shape as an own-uid resolution");
+});
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10 (research finding 2): the elevated request is bound to the observed socket identity.
+// ---------------------------------------------------------------------------------------------
+
+test("resolveCrossUidPortResult asks the helper about the EXACT observed socket (protocol + port + inode), never a bare port", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "udp6", local_address: "[::]", local_port: 5353, state: "UNCONN", public_bind: true }];
+  let capturedArgv;
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async (_helperPath, argv) => {
+      capturedArgv = argv;
+      return { status: "ok", stdout: validHelperStdout({ protocol: "udp6", port: 5353, inode: "987654321" }) };
+    },
+    readFile: async () => "1\n",
+  });
+
+  const outcome = await resolveCrossUidPortResult({ port: 5353, primary: { uid: 1000, protocol: "udp6", inode: "987654321" }, sockets }, options);
+  assert.deepEqual(capturedArgv, ["--resolve-socket", "udp6", "5353", "987654321"]);
+  assert.equal(outcome.resolvedStatus, "ok");
+});
+
+test("parseAndVerifyHelperResponse rejects a response for a different protocol, port, or inode than the observed socket (TCP/UDP collision, SO_REUSEPORT sibling, rebind)", () => {
+  const target = { ...SOCKET_TARGET };
+  assert.ok(parseAndVerifyHelperResponse(validHelperStdout({ port: 8080 }), target), "the exact echo is accepted");
+  assert.equal(parseAndVerifyHelperResponse(validHelperStdout({ port: 8080, protocol: "udp" }), target), undefined, "TCP/UDP collision");
+  assert.equal(parseAndVerifyHelperResponse(validHelperStdout({ port: 8080, inode: "424243" }), target), undefined, "different socket on the same port");
+  assert.equal(parseAndVerifyHelperResponse(validHelperStdout({ port: 8081 }), target), undefined, "different port");
+  // inode is compared as the exact decimal string, never coerced.
+  const numericInode = JSON.stringify({ requested: { protocol: "tcp", port: 8080, inode: 424242 }, resolved: { pid: 4242, uid: 1000 } });
+  assert.equal(parseAndVerifyHelperResponse(numericInode, target), undefined);
+  // An extra echoed key is not the request we made.
+  const extraKey = JSON.stringify({ requested: { protocol: "tcp", port: 8080, inode: "424242", pid: 1 }, resolved: { pid: 4242, uid: 1000 } });
+  assert.equal(parseAndVerifyHelperResponse(extraKey, target), undefined);
+  // The legacy bare-port echo is no longer a valid answer to anything.
+  const legacy = JSON.stringify({ requested: { port: 8080 }, resolved: { pid: 4242, uid: 1000 } });
+  assert.equal(parseAndVerifyHelperResponse(legacy, target), undefined);
+  assert.equal(parseAndVerifyHelperResponse(legacy, { kind: "port", value: 8080 }), undefined, "the port kind is gone");
+});
+
+test("parseAndVerifyHelperResponse rejects a malformed holders count", () => {
+  for (const holders of [0, -1, 1.5, "1", null]) {
+    assert.equal(parseAndVerifyHelperResponse(validHelperStdout({ port: 8080, holders }), { ...SOCKET_TARGET }), undefined, `holders=${JSON.stringify(holders)}`);
+  }
+});
+
+test("buildHelperArgv fails closed for any target outside the two literal forms", () => {
+  assert.deepEqual(buildHelperArgv({ ...SOCKET_TARGET }), ["--resolve-socket", "tcp", "8080", "424242"]);
+  assert.deepEqual(buildHelperArgv({ kind: "pid", value: 42 }), ["--resolve-pid", "42"]);
+  for (const bad of [
+    undefined,
+    { kind: "port", value: 8080 },
+    { ...SOCKET_TARGET, protocol: "raw" },
+    { ...SOCKET_TARGET, protocol: "TCP" },
+    { ...SOCKET_TARGET, port: 65536 },
+    { ...SOCKET_TARGET, port: "8080" },
+    { ...SOCKET_TARGET, inode: undefined },
+    { ...SOCKET_TARGET, inode: "0" },
+    { ...SOCKET_TARGET, inode: "0424242" },
+    { ...SOCKET_TARGET, inode: 424242 },
+    { ...SOCKET_TARGET, inode: "42 --probe" },
+    { kind: "pid", value: 0 },
+    { kind: "pid", value: "42" },
+  ]) {
+    assert.equal(buildHelperArgv(bad), undefined, JSON.stringify(bad));
+  }
+});
+
+test("resolveCrossUidPortResult never invokes the helper when the observed socket lacks a usable inode", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  let invoked = false;
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => { invoked = true; return { status: "ok", stdout: validHelperStdout({ port: 8080 }) }; },
+  });
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000, protocol: "tcp", inode: "0" }, sockets }, options);
+  assert.equal(invoked, false);
+  assert.equal(outcome.resolvedStatus, "partial");
+});
+
+test("defaultInvokeElevatedHelper maps the helper's EXIT_OWNER_AMBIGUOUS (5) to owner_ambiguous:true, and resolveCrossUidPortResult surfaces it while degrading (real subprocess)", async () => {
+  const paths = await tempPaths();
+  const helperPath = path.join(paths.stateDir, "helper-exit5");
+  await fs.mkdir(path.dirname(helperPath), { recursive: true });
+  await fs.writeFile(helperPath, "#!/bin/sh\nexit 5\n", { mode: 0o755 });
+  const result = await defaultInvokeElevatedHelper(helperPath, ["--resolve-socket", "tcp", "8080", "424242"]);
+  assert.equal(result.status, "unable");
+  assert.equal(result.owner_ambiguous, true);
+  assert.equal(result.fd_scan_truncated, undefined);
+
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
+  const options = fakeElevatedOptions({
+    paths,
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ ...result }),
+    readFile: async () => "1\n",
+  });
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.equal(outcome.result.resolved.pid, undefined);
+  assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1", elevated_owner_ambiguous: true });
 });
 
 test("resolveCrossUidPortResult degrades when the helper's self-reported uid disagrees with the trusted owning uid (never overwrites a free fact), with the real ptrace_scope diagnostic attached", async () => {
@@ -187,7 +312,7 @@ test("resolveCrossUidPortResult degrades when the helper's self-reported uid dis
     readFile: async () => "2\n",
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "partial", "a helper uid contradicting the known-good owning uid must degrade, not upgrade");
   assert.equal(outcome.result.resolved.pid, undefined, "the contradictory helper's pid is not trusted either");
   assert.equal(outcome.result.resolved.user.uid, 1000, "the trusted unprivileged-derived owning uid is preserved");
@@ -215,7 +340,7 @@ test("resolveCrossUidPortResult surfaces fd_scan_truncated in the provenance dia
     readFile: async () => "0\n",
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   // Fail-safe degrade is UNCHANGED — no pid fabricated, owning uid preserved, partial/0.4/missing_permission.
   assert.equal(outcome.resolvedStatus, "partial");
   assert.equal(outcome.result.resolved.pid, undefined);
@@ -237,7 +362,7 @@ test("resolveCrossUidPortResult does NOT add fd_scan_truncated for a plain (non-
     readFile: async () => "1\n",
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "partial");
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1" });
   assert.equal("fd_scan_truncated" in outcome.result.privilege, false, "a non-truncated failure must not carry the truncation diagnostic");
@@ -252,12 +377,12 @@ test("defaultInvokeElevatedHelper maps the helper's EXIT_RESOLUTION_TRUNCATED (3
     return helperPath;
   };
 
-  const truncated = await defaultInvokeElevatedHelper(await mkHelper("helper-exit3", 3), ["--resolve-port", "8080"]);
+  const truncated = await defaultInvokeElevatedHelper(await mkHelper("helper-exit3", 3), ["--resolve-socket", "tcp", "8080", "424242"]);
   assert.equal(truncated.status, "unable");
   assert.equal(truncated.code, 3);
   assert.equal(truncated.fd_scan_truncated, true, "exit 3 must be tagged as a truncated scan");
 
-  const plainFailure = await defaultInvokeElevatedHelper(await mkHelper("helper-exit1", 1), ["--resolve-port", "8080"]);
+  const plainFailure = await defaultInvokeElevatedHelper(await mkHelper("helper-exit1", 1), ["--resolve-socket", "tcp", "8080", "424242"]);
   assert.equal(plainFailure.status, "unable");
   assert.equal(plainFailure.code, 1);
   assert.equal(plainFailure.fd_scan_truncated, undefined, "an ordinary nonzero exit is not a truncated scan");
@@ -288,7 +413,7 @@ test("resolveCrossUidPortResult surfaces helper_hardening_failure (not fd_scan_t
     readFile: async () => "1\n",
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "partial");
   assert.equal(outcome.result.resolved.pid, undefined);
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1", helper_hardening_failure: true });
@@ -305,7 +430,7 @@ test("resolveCrossUidPortResult bounds the untrusted helper's executable_path (t
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, uid: 1000, executablePath: longPath, command: "app" }) }),
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(outcome.resolvedStatus, "ok");
   assert(outcome.result.resolved.executable_path.length <= 2049, "executable_path bounded like the unprivileged path");
   assert(outcome.result.resolved.executable_path.endsWith("…"), "over-long path is visibly truncated, not passed verbatim");
@@ -327,9 +452,9 @@ test("resolveElevated invokes the helper with a literal, bounded argv array -- n
     },
   });
 
-  await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(Array.isArray(capturedArgv), true);
-  assert.deepEqual(capturedArgv, ["--resolve-port", "8080"]);
+  assert.deepEqual(capturedArgv, ["--resolve-socket", "tcp", "8080", "424242"]);
   assert.equal(typeof capturedArgv[0], "string");
   assert.equal(typeof capturedArgv[1], "string");
 
@@ -360,7 +485,7 @@ test("resolveElevated degrades (does not hang) when the probe times out", async 
   });
 
   const startedAt = Date.now();
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   const elapsedMs = Date.now() - startedAt;
   assert.equal(result, undefined);
   assert.ok(elapsedMs < 2000, `expected the bounded probe timeout to resolve quickly, took ${elapsedMs}ms`);
@@ -378,7 +503,7 @@ test("resolveElevated degrades on malformed JSON stdout from the helper", async 
     invokeElevatedHelper: async () => ({ status: "ok", stdout: "not-json{{{" }),
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
 });
 
@@ -391,9 +516,9 @@ test("resolveElevated degrades on an oversized helper response, rejected before 
     invokeElevatedHelper: async () => ({ status: "ok", stdout: oversized }),
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
-  assert.equal(parseAndVerifyHelperResponse(oversized, { kind: "port", value: 8080 }), undefined);
+  assert.equal(parseAndVerifyHelperResponse(oversized, { ...SOCKET_TARGET }), undefined);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -408,16 +533,16 @@ test("resolveElevated degrades when the helper echoes back a different port than
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 9999 }) }), // requested 8080, echoes 9999.
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
 });
 
 test("parseAndVerifyHelperResponse rejects a response describing a different pid/port than requested", () => {
   const stdout = validHelperStdout({ port: 9999 });
-  assert.equal(parseAndVerifyHelperResponse(stdout, { kind: "port", value: 8080 }), undefined);
+  assert.equal(parseAndVerifyHelperResponse(stdout, { ...SOCKET_TARGET }), undefined);
   assert.deepEqual(
-    parseAndVerifyHelperResponse(stdout, { kind: "port", value: 9999 }),
-    { pid: 4242, uid: 1000, executable_path: "/opt/svc/bin/app", command: "app" },
+    parseAndVerifyHelperResponse(stdout, { ...SOCKET_TARGET, port: 9999 }),
+    { pid: 4242, uid: 1000, executable_path: "/opt/svc/bin/app", command: "app", holders: 1 },
   );
 });
 
@@ -487,7 +612,7 @@ test("resolveElevated rejects on a trust-boundary failure without ever invoking 
     invokeElevatedHelper: async () => { invokeCalls++; return { status: "ok", stdout: validHelperStdout({ port: 8080 }) }; },
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
   assert.equal(probeCalls, 0, "an untrusted helper path must never even be probed");
   assert.equal(invokeCalls, 0);
@@ -502,7 +627,7 @@ test("resolveElevated rejects when the config file lives in a group/world-writab
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080 }) }),
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
 });
 
@@ -519,7 +644,7 @@ test('mechanism:"auto" does not auto-select root_helper even when a fake probe r
     invokeElevatedHelper: async () => { invokeCalls++; return { status: "ok", stdout: validHelperStdout({ port: 8080 }) }; },
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result, undefined);
   assert.equal(invokeCalls, 0, "root_helper must never be invoked under an auto-selected mechanism");
 });
@@ -532,7 +657,7 @@ test('mechanism:"root_helper" named EXPLICITLY is allowed to proceed (the auto g
     invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080 }) }),
   });
 
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 }, paths }, options);
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
   assert.equal(result?.mechanism, "root_helper");
 });
 
@@ -563,7 +688,7 @@ test("defaultProbeElevatedHelper and defaultInvokeElevatedHelper pass an explici
   try {
     const probeResult = await defaultProbeElevatedHelper(scriptPath, {});
     assert.equal(probeResult.available, true);
-    const invokeResult = await defaultInvokeElevatedHelper(scriptPath, ["--resolve-port", "8080"], {});
+    const invokeResult = await defaultInvokeElevatedHelper(scriptPath, ["--resolve-socket", "tcp", "8080", "424242"], {});
     assert.equal(invokeResult.status, "ok");
   } finally {
     delete process.env.DESCARTES_TEST_AMBIENT_MARKER;
@@ -600,8 +725,8 @@ test("parseAndVerifyHelperResponse accepts the shared echo-back-contract.json fi
   const fixturePath = path.join(import.meta.dirname, "../../../crates/descartes-root-helper/tests/fixtures/echo-back-contract.json");
   const rawStdout = (await fs.readFile(fixturePath, "utf8")).trim();
 
-  const parsed = parseAndVerifyHelperResponse(rawStdout, { kind: "port", value: 8080 });
-  assert.deepEqual(parsed, { pid: 4242, uid: 997, executable_path: "/opt/svc/bin/app", command: "app --serve" });
+  const parsed = parseAndVerifyHelperResponse(rawStdout, { ...SOCKET_TARGET });
+  assert.deepEqual(parsed, { pid: 4242, uid: 997, executable_path: "/opt/svc/bin/app", command: "app --serve", holders: 1 });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -669,7 +794,7 @@ test("resolveCrossUidPortResult attaches ptrace_scope on a generic degrade-to-un
     readFile: async () => "3\n",
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(probeCalls, 1, "the elevated attempt was genuinely made (config enabled) -- this is the FAILURE case the diagnostic exists for");
   assert.equal(outcome.resolvedStatus, "partial");
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "3" });
@@ -686,7 +811,7 @@ test("resolveCrossUidPortResult never attaches ptrace_scope when config is disab
     probeElevatedHelper: async () => { probeCalls++; return { available: true }; },
   });
 
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, options);
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
   assert.equal(probeCalls, 0, "config disabled must short-circuit before ever probing (pre-existing gate, unaffected)");
   assert.equal(readFileCalls, 0, "the ptrace_scope diagnostic must never even be read when elevation was never configured");
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false });
@@ -698,7 +823,7 @@ test("resolveCrossUidPortResult never attaches ptrace_scope when config is disab
 
 test("resolveElevated never even calls loadProvenanceConfig when paths is not supplied (guards the byte-identical-by-default call sites)", async () => {
   let loadCalls = 0;
-  const result = await resolveElevated({ target: { kind: "port", value: 8080, uid: 1000 } }, {
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET } }, {
     loadProvenanceConfig: async () => { loadCalls++; return { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } }; },
   });
   assert.equal(result, undefined);
@@ -707,7 +832,7 @@ test("resolveElevated never even calls loadProvenanceConfig when paths is not su
 
 test("resolveCrossUidPortResult never attempts elevation when options.paths is absent (matches every pre-existing single-arg resolveProvenance call site)", async () => {
   const sockets = [];
-  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000 }, sockets }, {});
+  const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, {});
   assert.equal(outcome.resolvedStatus, "partial");
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false });
 });
