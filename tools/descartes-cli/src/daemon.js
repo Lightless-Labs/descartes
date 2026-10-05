@@ -12,7 +12,17 @@ import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPointsByFamily, readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.js";
 import { combineFamilyCompleteness } from "./fact-store-integrity.js";
-import { HISTORY_HORIZON_SHORT_ALERT_TICKS, NOVELTY_FAMILIES, readerFamilies, resolveFactStoreBudgets, RULE_HORIZONS } from "./fact-families.js";
+import {
+  FACT_FAMILY_IDS,
+  FAMILY_DEFAULT_BUDGET_BYTES,
+  FAMILY_TICK_SHAPES,
+  familyBudgetFloorBytes,
+  HISTORY_HORIZON_SHORT_ALERT_TICKS,
+  NOVELTY_FAMILIES,
+  readerFamilies,
+  resolveFactStoreBudgets,
+  RULE_HORIZONS,
+} from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
   factPointsFromNetworkEvidence,
@@ -978,6 +988,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // learned.json, which now gates only the AUTHOR layer below; watch.json defaults ON, unlike
   // learned's default-off), checked before any work is attempted (convention #4) — when
   // disabled, this block reads nothing else and writes nothing.
+  // S4 (fact-store capacity plan §4.5 Config): the per-family budgets for this tick, from the frozen
+  // watch.json snapshot, each validated against its T8 horizon floor (a rejected value falls back to
+  // the default and is reported as `budget_below_horizon_floor`). `options.factStoreBudgets` is a
+  // TEST-ONLY seam (T1 forces routine eviction at real volume) that bypasses that floor -- exactly
+  // why it is not a config path.
+  const budgetResolution = resolveFactStoreBudgets(configSnapshot.watch.fact_store_budgets);
+  const effectiveBudgets = options.factStoreBudgets ?? budgetResolution.budgets;
   let structuralEvidence;
   let structuralCollectorStatuses;
   let structuralFacts;
@@ -1072,12 +1089,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // structural tick, even one that produced no points. One family's append/retention failure
           // is reported (combined into storage_write_error/retention_error below) and never stops
           // another family from persisting. The DI seam keeps its historical name.
-          // `options.factStoreBudgets` is a TEST-ONLY seam (T1 forces routine eviction at real volume):
-          // it bypasses the watch.json floor validation, which is exactly why it is not a config path.
           const persistFacts = options.appendFactPoints ?? appendFactPointsByFamily;
-          const { budgets } = resolveFactStoreBudgets(watchConfig.fact_store_budgets);
           try {
-            structuralFacts = await persistFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, budgets: options.factStoreBudgets ?? budgets });
+            structuralFacts = await persistFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, budgets: effectiveBudgets });
             if (structuralFacts?.append_error) {
               structuralFactPersistError = structuralFacts.append_error;
               console.warn(`[daemon] structural-fact-persist failed for some families this tick (${structuralFactPersistError}); the others persisted`);
@@ -1351,6 +1365,91 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
   }
 
+  // S4 (fact-store capacity plan §4.3-§4.5): the per-family budget/retention status block, for EVERY
+  // registry family (display only; consulted by no trust decision). Computed only when a tier is on
+  // (no I/O otherwise). Per family:
+  //   - budget_bytes / source / floor_bytes, and `rejected` ({reason: budget_below_horizon_floor |
+  //     invalid}) when watch.json's value was refused;
+  //   - last_tick_bytes and `cap_below_tick` (live per-tick volume above the effective budget: the
+  //     family is fully evicted every tick), from this structural tick, carried across fast ticks;
+  //   - retention_error with retention_error_since_ts (carried while it keeps failing, cleared by a
+  //     clean structural pass), and `retention_failing` once it has failed for
+  //     HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals, or once the store (as this tick's read
+  //     saw it) exceeds its budget by more than one worst-case tick -- a retention pass that keeps
+  //     failing lets the file, and the read cost, grow without bound (appendFactPoints treats a
+  //     retention throw as non-fatal).
+  let factStoreBudgetsStatus;
+  if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
+    const priorFamilies = (await readPriorStatusOnce())?.fact_store_budgets?.families;
+    const priorOf = (family) => {
+      const entry = priorFamilies && typeof priorFamilies === "object" && !Array.isArray(priorFamilies) ? priorFamilies[family] : undefined;
+      return entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+    };
+    const structuralFamilies = structuralFacts?.families && typeof structuralFacts.families === "object" ? structuralFacts.families : undefined;
+    const families = {};
+    for (const family of FACT_FAMILY_IDS) {
+      const budgetBytes = effectiveBudgets[family] ?? FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+      const entry = {
+        budget_bytes: budgetBytes,
+        source: options.factStoreBudgets ? "override" : budgetResolution.source[family],
+        floor_bytes: familyBudgetFloorBytes(family),
+        ...(budgetResolution.rejected[family] ? { rejected: budgetResolution.rejected[family] } : {}),
+      };
+      const prior = priorOf(family);
+      let lastTickBytes;
+      let retentionError;
+      let retentionSince;
+      if (structuralFamilies) {
+        const result = structuralFamilies[family];
+        if (Number.isSafeInteger(result?.appended_bytes) && result.written_count > 0) lastTickBytes = result.appended_bytes;
+        if (typeof result?.retention_error === "string" && result.retention_error) {
+          retentionError = result.retention_error;
+          const priorSinceMs = typeof prior.retention_error_since_ts === "string" && prior.retention_error ? Date.parse(prior.retention_error_since_ts) : Number.NaN;
+          retentionSince = Number.isFinite(priorSinceMs) && priorSinceMs <= nowMs ? new Date(priorSinceMs).toISOString() : new Date(nowMs).toISOString();
+        }
+      } else {
+        if (Number.isSafeInteger(prior.last_tick_bytes)) lastTickBytes = prior.last_tick_bytes;
+        if (typeof prior.retention_error === "string" && prior.retention_error && typeof prior.retention_error_since_ts === "string" && Number.isFinite(Date.parse(prior.retention_error_since_ts))) {
+          retentionError = prior.retention_error;
+          retentionSince = prior.retention_error_since_ts;
+        }
+      }
+      if (lastTickBytes !== undefined) {
+        entry.last_tick_bytes = lastTickBytes;
+        if (lastTickBytes > budgetBytes) entry.cap_below_tick = true;
+      }
+      const readBytes = familyHistoryReads.get(family)?.bytes;
+      if (Number.isSafeInteger(readBytes)) entry.bytes = readBytes;
+      if (retentionError !== undefined) {
+        entry.retention_error = retentionError;
+        entry.retention_error_since_ts = retentionSince;
+      }
+      const failingFor = retentionSince !== undefined && nowMs - Date.parse(retentionSince) >= HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs;
+      const oversize = Number.isSafeInteger(readBytes) && readBytes > budgetBytes + (FAMILY_TICK_SHAPES.get(family)?.worstTickBytes ?? 0);
+      if (failingFor || oversize) entry.retention_failing = true;
+      families[family] = entry;
+    }
+    factStoreBudgetsStatus = { families, ...(budgetResolution.unknown_families ? { unknown_families: budgetResolution.unknown_families } : {}) };
+    // The per-family completeness entries (families the daemon read) carry the same budget state,
+    // plus the earliest horizon-short since_ts among that family's rules.
+    if (factStoreCompleteness?.families) {
+      for (const [family, entry] of Object.entries(factStoreCompleteness.families)) {
+        const budget = families[family];
+        if (!budget) continue;
+        entry.budget_bytes = budget.budget_bytes;
+        if (budget.cap_below_tick) entry.cap_below_tick = true;
+        if (budget.retention_error) entry.retention_error = budget.retention_error;
+        if (budget.retention_failing) entry.retention_failing = true;
+        const shortSince = Object.entries(historyHorizonShort?.rules ?? {})
+          .filter(([ruleId]) => RULE_HORIZONS.get(ruleId)?.families.includes(family))
+          .map(([, rule]) => rule?.since_ts)
+          .filter((since) => typeof since === "string" && Number.isFinite(Date.parse(since)))
+          .sort()[0];
+        if (shortSince) entry.horizon_short_since = shortSince;
+      }
+    }
+  }
+
   const collectorHasError = evidence.some((envelope) => envelope.status === "error")
     || (structuralCollectorStatuses ?? []).some((entry) => entry.status === "error");
   const storageWriteError = combineErrors(metricPersistError, structuralFactPersistError);
@@ -1367,6 +1466,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
+    ...(factStoreBudgetsStatus ? { fact_store_budgets: factStoreBudgetsStatus } : {}),
     ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
     ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read

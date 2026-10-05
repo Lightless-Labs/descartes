@@ -43,6 +43,20 @@ function normalizeFactStoreMaxBytes(value) {
   return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
 }
 
+// S4 (fact-store capacity plan §4.5 Config): the per-family budget map. Only its SHAPE is normalized
+// here (a plain object of at most 32 short keys with primitive values); each value is validated
+// against its family's T8 horizon floor by fact-families.js resolveFactStoreBudgets at use, so a
+// rejected value stays visible to the status surfaces (`budget_below_horizon_floor`) instead of
+// being silently rewritten away. Absent (or not a plain object) -> absent: every family default.
+const MAX_FACT_STORE_BUDGET_KEYS = 32;
+function normalizeFactStoreBudgetsConfig(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value)
+    .filter(([key, entry]) => key.length > 0 && key.length <= 64 && (entry === null || ["number", "string", "boolean"].includes(typeof entry)))
+    .slice(0, MAX_FACT_STORE_BUDGET_KEYS);
+  return Object.fromEntries(entries);
+}
+
 export function normalizeWatchConfig(config = {}) {
   return {
     // The one deliberate inversion vs. normalizeLearnedConfig's `config.enabled === true`
@@ -52,6 +66,7 @@ export function normalizeWatchConfig(config = {}) {
     enabled: config.enabled !== false,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
     fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
+    ...(normalizeFactStoreBudgetsConfig(config.fact_store_budgets) ? { fact_store_budgets: normalizeFactStoreBudgetsConfig(config.fact_store_budgets) } : {}),
   };
 }
 
