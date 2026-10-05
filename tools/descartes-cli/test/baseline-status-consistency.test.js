@@ -515,7 +515,7 @@ test("L1: peer re-accumulation progress counts what the peer lockout counts (an 
   assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false, "the detector cleared the lockout on those six ticks");
 });
 
-test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick, retention_failing and the horizon-short since from the daemon record; status never writes", async () => {
+test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick and retention_failing from the daemon record; a stale record's horizon-short since is ignored on a watching rule; status never writes", async () => {
   const paths = await tempPaths("reasons");
   const rig = scenarioRig();
   for (let hour = 0; hour <= 7; hour += 1) await rig.structural(paths, hour);
@@ -539,9 +539,14 @@ test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick
   for (const rule of service.rules) {
     for (const reason of ["budget_below_horizon_floor", "cap_below_tick", "retention_failing"]) assert.ok(rule.reasons.includes(reason), `${rule.rule_id}: ${reason} in ${rule.reasons}`);
   }
+  // M2: the record's horizon-short since clock is shown only when the LIVE gate is horizon-short; a
+  // stale record never attaches a horizon-short reason to a rule that is watching. (The since clock
+  // on a live horizon-short gate is covered by T11's upgrade scenario.)
   const appeared = service.rules.find((rule) => rule.rule_id === SERVICE_APPEARED_RULE_ID);
-  assert.equal(appeared.horizon_short_since_ts, iso(BASE_MS + 2 * HOUR_MS));
-  assert.ok(appeared.reasons.includes("history_horizon_short"));
+  assert.equal(appeared.gate, "ok");
+  assert.equal(appeared.phase, "watching");
+  assert.equal(appeared.horizon_short_since_ts, undefined);
+  assert.ok(!appeared.reasons.includes("history_horizon_short"), `${appeared.reasons}`);
   assert.equal(status.families.service.budget_rejected.reason, "budget_below_horizon_floor");
   assert.deepEqual(status.daemon_record.fact_store_deprecations, record.fact_store_deprecations);
   // Reasons annotate; they never change what the detector decides: the appearance rule (its store

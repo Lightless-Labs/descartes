@@ -82,7 +82,7 @@ import { coldStartEntryReason } from "./cold-start-reason.js";
 
 const STATUS_TICK_COUNT = 6;
 const LIVE_RECOMPUTE_NOTE = "Answers are recomputed live from the fact-history window; they can differ slightly from the daemon's last tick.";
-const DAEMON_RECORD_NOTE = "cap_below_tick, retention_failing and the horizon-short since time come from the daemon's last status record.";
+const DAEMON_RECORD_NOTE = "cap_below_tick, retention_failing and the horizon-short since time (shown only while the rule is horizon-short now) come from the daemon's last status record.";
 
 function usage() {
   return `Usage:
@@ -461,7 +461,7 @@ function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, c
   const reasons = [];
   if (absent) reasons.push("not_observed_no_store");
   if (!absent && (censusStale || ruleEvaluation?.gate === "latest_census_stale")) reasons.push("latest_census_stale");
-  if (ruleEvaluation?.gate === "history_horizon_short" || horizonShortSince) reasons.push("history_horizon_short");
+  if (ruleEvaluation?.gate === "history_horizon_short") reasons.push("history_horizon_short");
   if (familyBlock.cap_below_tick) reasons.push("cap_below_tick");
   if (familyBlock.budget_rejected?.reason === "budget_below_horizon_floor") reasons.push("budget_below_horizon_floor");
   if (familyBlock.horizon_invariant_unmet) reasons.push("horizon_invariant_unmet");
@@ -501,7 +501,11 @@ function buildDomainReports(inputs) {
       for (const ruleId of run.producer.rules) {
         const ruleEvaluation = run.result?.ruleEvaluations?.[ruleId];
         const error = run.error ?? (ruleEvaluation ? undefined : "no rule evaluation reported");
-        const horizonShortSince = horizonShortSinceOf(inputs.daemonRecord, ruleId, inputs.nowMs);
+        // M2: the daemon record's since clock is attached only when the LIVE gate is horizon-short; a
+        // record left over from an earlier horizon-short spell never annotates a rule that evaluates.
+        const horizonShortSince = ruleEvaluation?.gate === "history_horizon_short" && !absent && run.error === undefined
+          ? horizonShortSinceOf(inputs.daemonRecord, ruleId, inputs.nowMs)
+          : undefined;
         const watching = !absent && error === undefined && ruleEvaluation.evaluable === true;
         const keys = watching ? [...ruleEvaluation.evaluatedAlertKeys] : [];
         rules.push({
