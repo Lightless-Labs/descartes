@@ -149,6 +149,7 @@ pub fn row_admits(row: &SocketRow, target: &SocketTarget) -> bool {
 }
 
 /// The facts `select_holder` decides on, one per process found holding the socket.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HolderFacts {
     pub pid: u32,
@@ -156,6 +157,7 @@ pub struct HolderFacts {
     pub executable_path: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Selection {
     /// Index into the holder slice.
@@ -175,6 +177,7 @@ pub enum Selection {
 ///   uid (the `/proc/net` uid column -- the creator, typically the master), else the lowest pid.
 ///   Node independently cross-checks the reported uid against the uid it observed, so a holder
 ///   whose uid differs from the socket's is degraded there rather than trusted.
+#[cfg(test)]
 pub fn select_holder(holders: &[HolderFacts], socket_uid: u32) -> Selection {
     let Some(first) = holders.first() else {
         return Selection::Empty;
