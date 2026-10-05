@@ -652,6 +652,13 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
     new_drafts: merge.new_count,
     updated_drafts: merge.updated_count,
     unchanged_drafts: merge.unchanged_count,
+    // Fact-store capacity plan S3 (fact-families.js READER_COVERAGE "tuning_miner", report_only):
+    // tuning makes no absence/novelty claim, so narrowing does not gate it -- but the backtest's
+    // fact window is only as wide as the store certifies, so say where it starts (null = no floor:
+    // nothing was narrowed). Display only.
+    fact_history_certified_after_ts: typeof factsResult?.completeness?.certified_after_ts === "string"
+      ? factsResult.completeness.certified_after_ts
+      : null,
   };
   if (options.json) output(JSON.stringify({ learned_tuning_mine: summary }, null, 2));
   else output(renderMineSummary(mined.length, merge));

@@ -622,3 +622,27 @@ test("MUST-FIX 4(b): a MIXED fact-history (stable service.presence + stable peer
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].family, "service-presence");
 });
+
+// Fact-store capacity plan S3: the miner's narrowing gate is certifiedReadWindowOk. For its default
+// UNBOUNDED read that admits exactly two shapes -- no byte-cap floor, or a byte-cap floor at or below
+// the age floor (everything it removed, retention removed too) -- and it no longer refuses on the
+// age floor alone (the interim requireFullCoverage gate did: no mining ever again once a store was
+// 30 days old).
+test("S3: learned mine mints over an age-narrowed store and over byte-cap narrowing subsumed by the age floor, but not over a recent byte-cap floor", async () => {
+  const nowMs = BASE_TS + 8 * DAY_MS;
+  const run = async (completeness) => {
+    const paths = await tempPaths();
+    await writeConstraints(paths, []);
+    await runLearned(paths, ["mine"], {
+      now: nowMs,
+      readFactPoints: async () => ({ points: stableServiceHistory(), corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", ...completeness } }),
+      output: () => {},
+    });
+    return (await loadConstraints(paths)).constraints.length;
+  };
+  const iso = (ms) => new Date(ms).toISOString();
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: null, age_floor_ts: iso(nowMs - 30 * DAY_MS) }), 1, "age floor alone: mines");
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: iso(nowMs - 31 * DAY_MS), age_floor_ts: iso(nowMs - 30 * DAY_MS) }), 1, "byte-cap floor <= age floor: mines");
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: iso(nowMs - 2 * DAY_MS), age_floor_ts: iso(nowMs - 30 * DAY_MS) }), 0, "a recent byte-cap floor can hide counterexamples: refused");
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: iso(nowMs - 2 * DAY_MS), age_floor_ts: null }), 0, "a byte-cap floor with no age floor: refused for an unbounded read");
+});

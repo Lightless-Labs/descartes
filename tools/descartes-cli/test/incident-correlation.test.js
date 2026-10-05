@@ -815,3 +815,28 @@ test("Recovery coverage DEFERRED: a previously fabricating expiry scenario repor
   });
   assert.equal(applied.alerts.find((alert) => alert.fingerprint === corrFingerprint)?.status, "active");
 });
+
+// Fact-store capacity plan S3: correlation's narrowing gate is certifiedReadWindowOk (byte-cap
+// eviction invisible to its 31 d read) plus its 3 d horizon -- replacing the interim
+// requireFullCoverage gate, which ALSO refused on the age floor that sits inside a 31 d window once a
+// store is 30 days old (every host, permanently). A byte-cap floor inside the window still refuses.
+test("S3: correlation evaluates over an age-narrowed (30-day-old) store but refuses a byte-cap floor inside its read window", async () => {
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  const nowMs = Date.parse(now);
+  const points = [
+    ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+    peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
+  ];
+  const run = async (completeness) => {
+    const paths = await tempPaths();
+    await seed(paths, { alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)] });
+    return computeCorrelationCandidates(paths, { now, readFactPoints: async () => completeFactReadResult(points, completeness) });
+  };
+  const ageOnly = await run({ coverage: "narrowed", bytecap_floor_ts: null, age_floor_ts: new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString() });
+  assert.equal(ageOnly.candidates.length, 1, "an age floor alone (retention, as on main) does not silence correlation");
+  const oldBytecap = await run({ coverage: "narrowed", bytecap_floor_ts: new Date(nowMs - 32 * 24 * 60 * 60 * 1000).toISOString(), age_floor_ts: null });
+  assert.equal(oldBytecap.candidates.length, 1, "a byte-cap floor older than the 31 d read window is invisible to it");
+  const inWindow = await run({ coverage: "narrowed", bytecap_floor_ts: new Date(nowMs - 4 * 24 * 60 * 60 * 1000).toISOString(), age_floor_ts: null });
+  assert.deepEqual(inWindow.candidates, [], "a byte-cap floor inside the window could hide an earlier sighting of the 'new' peer: refused");
+});

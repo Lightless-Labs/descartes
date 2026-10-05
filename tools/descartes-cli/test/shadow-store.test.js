@@ -577,3 +577,30 @@ test("descartes learned soak never sets any constraint to status:\"active\"", as
   assert(constraints.every((c) => c.status !== "active"), "S7a must never write status:\"active\"");
   assert.equal(constraints[0].status, "review-ready", "review-ready is the terminal state in S7a");
 });
+
+// Fact-store capacity plan S3: the shadow evaluator's narrowing gate is certifiedReadWindowOk over
+// its own (3 h) read window. The interim requireFullCoverage gate refused on ANY byte-cap floor
+// ever recorded -- permanently, on every host whose store once filled -- even one far older than the
+// window the soak actually reads.
+test("S3: evaluateAndLogShadowConstraints soaks when the byte-cap floor is older than its read window, and refuses when the floor is inside it", async () => {
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const now = new Date(nowMs).toISOString();
+  const freshnessMs = 3 * 60 * 60 * 1000;
+  const run = async (bytecapFloorMs) => {
+    const paths = await tempPaths();
+    await writeConstraints(paths, [shadowConstraint()]);
+    return evaluateAndLogShadowConstraints(paths, {
+      now,
+      freshnessMs,
+      readFactPoints: async () => ({
+        points: [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" }, ts: now }],
+        corrupt_count: 0,
+        schema_invalid_count: 0,
+        completeness: { status: "intact", coverage: "narrowed", bytecap_floor_ts: new Date(bytecapFloorMs).toISOString(), age_floor_ts: null },
+      }),
+    });
+  };
+  assert.equal((await run(nowMs - freshnessMs - 1)).appended_count, 1, "a floor strictly before the window start is invisible to the soak");
+  assert.equal((await run(nowMs - freshnessMs)).appended_count, 0, "a floor exactly at the window start could hide an exercise at the start: refused");
+  assert.equal((await run(nowMs - 60 * 60 * 1000)).appended_count, 0, "a floor inside the window: refused");
+});

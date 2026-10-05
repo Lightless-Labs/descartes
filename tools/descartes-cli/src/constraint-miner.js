@@ -11,7 +11,7 @@
 import crypto from "node:crypto";
 import { buildConstraintTarget, loadConstraints, SCHEMA_VERSION, writeConstraints } from "./constraint-store.js";
 import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { certifiedReadWindowOk, factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { parseDurationMs } from "./history-store.js";
 import { readFactPoints } from "./fact-store.js";
 
@@ -363,11 +363,16 @@ export async function runLearned(descartesPaths, args, runtime = {}) {
   const nowMs = runtime.now !== undefined ? new Date(runtime.now).getTime() : Date.now();
   // A truncated or otherwise untrustworthy history can hide counterexamples and mint an
   // over-strong draft. Degrade to zero mining for this pass; drafts remain human-gated.
-  // MEDIUM-1 (review fold): requireFullCoverage opts into the interim fail-closed gate on a
-  // narrowed (byte-cap-evicted) store too -- the miner has no per-rule horizon of its own, so a
-  // narrowed window can hide the same counterexamples an outright loss could. S3 replaces this
-  // with the miner's own mining-span horizon entry (fact-families.js).
-  const candidates = factHistoryTrustworthy(readResult, { nowMs, requireFullCoverage: true }).trust
+  // Narrowing (fact-store capacity plan S3, fact-families.js READER_COVERAGE "constraint_miner"):
+  // mine only when byte-cap eviction is INVISIBLE to this read (certifiedReadWindowOk) -- every
+  // counterexample a never-byte-evicted store would show is still here. For the default unbounded
+  // read that means the byte-cap floor sits at or below the age floor (everything byte-cap removed,
+  // age retention removed too). Stricter than the plan's 7-day mining-span horizon (§4.2), which
+  // would mine with counterexamples older than the floor invisible; replaces the interim
+  // requireFullCoverage gate (MEDIUM-1), which also refused on the AGE floor alone -- i.e. never
+  // mined again once a store was 30 days old.
+  const candidates = factHistoryTrustworthy(readResult, { nowMs }).trust
+    && certifiedReadWindowOk(readResult, { nowMs, windowMs: options.windowMs })
     ? mineConstraintCandidates(readResult.points, [], { now: nowMs, ...runtime.mineOptions })
     : [];
   const { constraints: existing } = await loadConstraints(descartesPaths);

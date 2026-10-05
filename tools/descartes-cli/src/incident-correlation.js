@@ -33,7 +33,7 @@ import { alertId, readAlertRecords } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { certifiedReadWindowOk, factHistoryTrustworthy, ruleHorizonOk } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_PEER_PRESENCE_WINDOW_MS } from "./peer-signature-store.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
@@ -320,12 +320,18 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   // fact-store read on every call. Omit anchorTs because the correlation joins two observations
   // from the current read window; the helper's stateless path therefore requires an intact
   // completeness status while excluding future loss timestamps relative to this injected nowMs.
-  // MEDIUM-1 (review fold): requireFullCoverage opts into the interim fail-closed gate on a
-  // narrowed store too -- correlation has no per-rule horizon of its own and recomputes trust
-  // from the FULL read on every call, joining observations across the whole window, so a narrowed
-  // window can hide the same counterexamples an outright loss could. S3 replaces this with
-  // correlation's own horizon entry (fact-families.js).
-  if (!factHistoryTrustworthy(readResult, { nowMs, requireFullCoverage: true }).trust) {
+  // Narrowing (fact-store capacity plan S3, fact-families.js READER_COVERAGE "correlation"): its
+  // "unattributed-looking" test is a NOVELTY proxy over the WHOLE read window (<= 1 prior tick), so
+  // a peer last seen before a byte-cap floor would read as new. Evaluate only when byte-cap
+  // eviction is invisible to this read (certifiedReadWindowOk) -- stricter than its registered 3 d
+  // horizon, which is also required (ruleHorizonOk; it can bind on a rolled-back age floor).
+  // Replaces the interim requireFullCoverage gate (MEDIUM-1), which also refused on the age floor
+  // inside this 31 d window -- i.e. permanently, once a store was 30 days old.
+  if (
+    !factHistoryTrustworthy(readResult, { nowMs }).trust
+    || !certifiedReadWindowOk(readResult, { nowMs, windowMs: factWindowMs })
+    || !ruleHorizonOk(readResult, CORRELATION_RULE_ID, nowMs)
+  ) {
     return { candidates: [], evaluatedAlertKeys: [] };
   }
 
