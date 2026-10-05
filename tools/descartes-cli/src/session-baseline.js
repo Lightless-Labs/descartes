@@ -363,6 +363,13 @@ export function groupSessionFactsByTick(points = []) {
   return [...byTs.values()].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
 }
 
+// Churn can use markerless legacy observations, but must exclude any tick whose census explicitly
+// says partial or whose marker is malformed/unknown. Keep this predicate shared with baseline
+// status so its coverage claim cannot diverge from the real detector's observation universe.
+export function isSessionChurnObservationGroup(group) {
+  return group?.censusState !== "partial" && group?.censusState !== "unknown";
+}
+
 /**
  * Disposition of a tick-group for the WINDOWED WELFORD RECOMPUTE (Decision 3):
  *   - "overflow": excluded entirely from the recompute (an inexact/bucketed count must never
@@ -544,7 +551,7 @@ export function evaluateSessionChurn(points = [], {
     // total headcount, and a flood/mass-resurrection tick is exactly the incident shape churn
     // exists to catch. This intentionally differs from the count-drop fold, which excludes both
     // partial AND overflow groups.
-    if (group.censusState === "partial" || group.censusState === "unknown") continue; // must-fix 2 + unknown-disposition hardening
+    if (!isSessionChurnObservationGroup(group)) continue; // must-fix 2 + unknown-disposition hardening
     for (const point of group.points) {
       const fingerprint = point.attributes?.created_at_fingerprint;
       const list = byEntity.get(point.entity_key) ?? [];

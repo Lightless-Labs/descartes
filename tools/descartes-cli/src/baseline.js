@@ -17,6 +17,7 @@ import {
   computeWindowedSessionStats,
   evaluateSessionChurn,
   groupSessionFactsByTick,
+  isSessionChurnObservationGroup,
   SESSION_CHURN_RULE_ID,
   SESSION_COUNT_DROP_RULE_ID,
   loadSessionBaselineStore,
@@ -212,7 +213,8 @@ function sessionRuleReadiness(groups, points, nowMs, freshnessMs) {
   const churnFresh = completeGroupsForChurn.length >= 2
     && latestChurnGroup
     && nowMs - new Date(latestChurnGroup.ts).getTime() <= freshnessMs;
-  const churnPoints = points.filter((point) => completeGroupsForChurn.some((group) => group.ts === point.ts));
+  const churnObservationTimestamps = new Set(groups.filter(isSessionChurnObservationGroup).map((group) => group.ts));
+  const churnPoints = points.filter((point) => churnObservationTimestamps.has(point.ts));
   const churn = churnFresh
     ? evaluateSessionChurn(churnPoints, { structuralIntervalMs: freshnessMs / 3, activeFreshnessMs: freshnessMs })
     : { evaluatedEntityKeys: [] };

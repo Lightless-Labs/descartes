@@ -286,6 +286,32 @@ test("baseline status keeps rule coverage honest on overflow ticks", async () =>
   assert.ok(peer.watching_rules.includes(PEER_COUNT_SPIKE_RULE_ID), "peer spike still scores a capped overflow tick");
 });
 
+test("baseline status uses the detector's markerless session-churn observation filter", async () => {
+  const paths = await tempPaths();
+  await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [
+    { ts: a1Ts(0), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-old" } },
+    { ts: a1Ts(0), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
+    { ts: a1Ts(1), fact_name: "session.presence", entity_key: "session.other", attributes: { created_at_fingerprint: "stable" } },
+    { ts: a1Ts(1), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
+    // This prior fingerprint is deliberately markerless. The real detector retains it for churn;
+    // status must use the same observation filter rather than silently dropping it.
+    { ts: a1Ts(2), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-old" } },
+    { ts: a1Ts(3), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-new" } },
+    { ts: a1Ts(3), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
+  ];
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const now = a1Ts(3);
+  const status = await buildBaselineStatus(paths, { now, readFactPoints });
+  const detector = await computeSessionBaselineCandidates(paths, { now, readFactPoints, writeSessionBaselineStore: async () => {} });
+  const session = status.domains.find((domain) => domain.domain === "session");
+  const churnKey = alertId(SESSION_CHURN_RULE_ID, entityKey);
+  assert.equal(session.evaluated_alert_keys.includes(churnKey), true, "status must report the same churn identity as the detector");
+  assert.equal(session.evaluated_alert_keys.includes(churnKey), detector.evaluatedAlertKeys.includes(churnKey));
+  assert.match(session.phase, /^watching \(churn\)/, "status must say watching when the churn detector has a fresh pair");
+});
+
 for (const scenario of A1_SCENARIOS) {
   test(`A1 status-vs-detector consistency (${scenario.name}): status says "watching" iff the detector reports coverage`, async () => {
     const paths = await tempPaths();
