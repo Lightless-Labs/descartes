@@ -26,7 +26,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 export const LEGACY_QUARANTINE_RETENTION_MS = 31 * 24 * 60 * 60 * 1000;
-const MARKER_SCHEMA_VERSION = 1;
+const MARKER_SCHEMA_VERSION = 2;
 const LEGACY_ITEMS = ["facts.jsonl", "integrity.json", "seen-sets"];
 const LEGACY_TMP_PATTERN = /^(facts\.jsonl|integrity\.json)\.\d+\.tmp$/;
 const QUARANTINE_DIR_PATTERN = /^facts-legacy-[0-9A-Za-z-]+$/;
@@ -65,19 +65,42 @@ async function readMarker(markerFile) {
   try {
     contents = await fs.readFile(markerFile, "utf8");
   } catch (error) {
-    if (error?.code === "ENOENT") return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [] }, valid: true, present: false };
+    if (error?.code === "ENOENT") return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [], quarantine_epoch: 0, quarantine_epoch_ts: null }, valid: true, present: false };
     throw error;
   }
   try {
     const parsed = JSON.parse(contents);
-    const shapeOk = parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      && parsed.schema_version === MARKER_SCHEMA_VERSION
+    const baseShapeOk = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      && (parsed.schema_version === 1 || parsed.schema_version === MARKER_SCHEMA_VERSION)
       && Array.isArray(parsed.quarantines)
       && (parsed.in_progress === null || (parsed.in_progress && typeof parsed.in_progress === "object"));
-    if (!shapeOk) return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [] }, valid: false, present: true };
-    return { marker: parsed, valid: true, present: true };
+    if (!baseShapeOk) return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [], quarantine_epoch: 0, quarantine_epoch_ts: null }, valid: false, present: true };
+    const validV2 = parsed.schema_version === MARKER_SCHEMA_VERSION
+      && Number.isSafeInteger(parsed.quarantine_epoch)
+      && parsed.quarantine_epoch >= 0
+      && (parsed.quarantine_epoch_ts === null || isIso(parsed.quarantine_epoch_ts));
+    if (parsed.schema_version === MARKER_SCHEMA_VERSION && !validV2) {
+      return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [], quarantine_epoch: 0, quarantine_epoch_ts: null }, valid: false, present: true };
+    }
+    // Schema 1 markers predate the epoch. They remain readable, but their latest quarantine time
+    // becomes the epoch's timestamp so a later re-quarantine is still distinguishable.
+    const latestQuarantineTs = parsed.quarantines
+      .map((entry) => entry?.quarantined_ts)
+      .filter(isIso)
+      .sort()
+      .at(-1) ?? null;
+    return {
+      marker: {
+        ...parsed,
+        schema_version: MARKER_SCHEMA_VERSION,
+        quarantine_epoch: parsed.schema_version === MARKER_SCHEMA_VERSION ? parsed.quarantine_epoch : 0,
+        quarantine_epoch_ts: parsed.schema_version === MARKER_SCHEMA_VERSION ? parsed.quarantine_epoch_ts : latestQuarantineTs,
+      },
+      valid: true,
+      present: true,
+    };
   } catch {
-    return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [] }, valid: false, present: true };
+    return { marker: { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: [], quarantine_epoch: 0, quarantine_epoch_ts: null }, valid: false, present: true };
   }
 }
 
@@ -120,6 +143,31 @@ export async function legacyFactHistoryEvidence(descartesPaths) {
   }
 }
 
+/**
+ * Return the last trusted quarantine epoch for the seen-set certification boundary. A present but
+ * unreadable/ill-shaped marker is explicitly untrusted: callers must advance their boundary to
+ * their current pass time rather than continue a null/old certification. Root legacy items without
+ * a marker are likewise conservative evidence of a migration that did not complete.
+ */
+export async function legacyQuarantineEpoch(descartesPaths) {
+  const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(descartesPaths);
+  let markerResult;
+  try {
+    markerResult = await readMarker(markerFile);
+  } catch {
+    return { status: "unreadable", epoch: null, epoch_ts: null };
+  }
+  if (!markerResult.valid) return { status: "unreadable", epoch: null, epoch_ts: null };
+  const rootItems = await presentLegacyItems(factsRootDir).catch(() => null);
+  if (rootItems === null) return { status: "unreadable", epoch: null, epoch_ts: null };
+  if (rootItems.length > 0) return { status: "legacy_pending", epoch: null, epoch_ts: null };
+  return {
+    status: markerResult.present ? "valid" : "absent",
+    epoch: markerResult.marker.quarantine_epoch,
+    epoch_ts: markerResult.marker.quarantine_epoch_ts,
+  };
+}
+
 function quarantineDirName(nowIso) {
   return `facts-legacy-${nowIso.replace(/[:.]/g, "-")}`;
 }
@@ -149,14 +197,26 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
 
   let status = "none";
   let quarantineDir;
+  let markerEpoch = marker.quarantine_epoch;
+  let markerEpochTs = marker.quarantine_epoch_ts;
   const moved = [];
   const items = await presentLegacyItems(factsRootDir);
   if (items.length > 0 || resumable) {
-    const inProgress = resumable ?? { dir: quarantineDirName(nowIso), started_ts: nowIso };
+    const eventEpoch = resumable?.quarantine_epoch ?? (marker.quarantine_epoch + 1);
+    const eventTs = resumable?.quarantine_ts ?? (resumable ? resumable.started_ts : (marker.quarantine_epoch_ts ?? nowIso));
+    markerEpoch = eventEpoch;
+    markerEpochTs = eventTs;
+    const inProgress = resumable ?? { dir: quarantineDirName(nowIso), started_ts: nowIso, quarantine_epoch: eventEpoch, quarantine_ts: eventTs };
     status = resumable ? "resumed" : "quarantined";
     quarantineDir = inProgress.dir;
     // Record the target BEFORE anything moves (crash -> resume into the same directory).
-    await writeMarker(markerFile, { schema_version: MARKER_SCHEMA_VERSION, in_progress: inProgress, quarantines });
+    await writeMarker(markerFile, {
+      schema_version: MARKER_SCHEMA_VERSION,
+      in_progress: inProgress,
+      quarantines,
+      quarantine_epoch: eventEpoch,
+      quarantine_epoch_ts: eventTs,
+    });
     const target = path.join(learnedDir, inProgress.dir);
     await fs.mkdir(target, { recursive: true, mode: 0o700 });
     for (const item of items) {
@@ -164,7 +224,13 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
       moved.push(item);
     }
     if (!quarantines.some((entry) => entry.dir === inProgress.dir)) quarantines.push({ dir: inProgress.dir, quarantined_ts: inProgress.started_ts });
-    await writeMarker(markerFile, { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines });
+    await writeMarker(markerFile, {
+      schema_version: MARKER_SCHEMA_VERSION,
+      in_progress: null,
+      quarantines,
+      quarantine_epoch: eventEpoch,
+      quarantine_epoch_ts: eventTs,
+    });
   }
 
   const deleted = [];
@@ -178,7 +244,13 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
         kept.push(entry);
       }
     }
-    if (deleted.length > 0) await writeMarker(markerFile, { schema_version: MARKER_SCHEMA_VERSION, in_progress: null, quarantines: kept });
+    if (deleted.length > 0) await writeMarker(markerFile, {
+      schema_version: MARKER_SCHEMA_VERSION,
+      in_progress: null,
+      quarantines: kept,
+      quarantine_epoch: markerEpoch,
+      quarantine_epoch_ts: markerEpochTs,
+    });
     quarantines.splice(0, quarantines.length, ...kept);
   }
   return {

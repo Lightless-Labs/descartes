@@ -21,6 +21,7 @@ import { groupProcessLineageFactsByTick } from "../src/process-lineage-baseline.
 import { groupScheduledJobFactsByTick } from "../src/persistence-baseline.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
+import { migrateLegacyFactStore, resolveLegacyFactStorePaths } from "../src/fact-store-migration.js";
 import { alertId, writeAlertRecords } from "../src/alert-store.js";
 import { runDaemonIteration } from "../src/daemon.js";
 
@@ -168,6 +169,32 @@ test("G2 H1 regression guard: a fresh install (no marker, no legacy item) still 
   await appendFactPoints(paths, serviceTick(at(0), ["a"]), { family: "service", now: at(0) });
   await appendFactPoints(paths, serviceTick(at(1), ["a"]), { family: "service", now: at(1) });
   assert.equal((await readSeenSetFile(paths, "service")).set.certified_since_ts, null);
+});
+
+test("G2 HIGH-1: a later legacy quarantine advances a continuous null seen-set before it can claim the quarantined entity new", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(1), ["svc-A"]), { family: "service", now: at(1) });
+  assert.equal((await readSeenSetFile(paths, "service")).set.certified_since_ts, null, "the pre-quarantine lineage is continuous and null-certified");
+
+  const { factsRootDir } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(1), "svc-B"))}\n`);
+  const quarantine = await migrateLegacyFactStore(paths, { now: at(2) });
+  assert.equal(quarantine.status, "quarantined");
+
+  await appendFactPoints(paths, serviceTick(at(2), ["svc-A"]), { family: "service", now: at(2) });
+  const setAfterQuarantine = (await readSeenSetFile(paths, "service")).set;
+  assert.equal(setAfterQuarantine.certified_since_ts, at(2), "the quarantine epoch revokes the old null boundary");
+  assert.equal(setAfterQuarantine.quarantine_epoch, 1);
+  assert.equal(setAfterQuarantine.quarantine_epoch_ts, at(2));
+
+  await appendFactPoints(paths, serviceTick(at(3), ["svc-A", "svc-B"]), { family: "service", now: at(3) });
+  const read = await readFactPoints(paths, { family: "service", now: at(3), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  assert.equal(read.seen_sets.service.scope_ts, at(2), "scope starts at the quarantine, not at now minus 30 days");
+  assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(3))), false, "svc-B cannot be claimed new before the 48 h horizon");
+  const result = await computeServiceAppearanceCandidates(paths, { now: at(3) });
+  assert.deepEqual(result.candidates, [], "the detector stays quiet during the quarantine horizon");
 });
 
 test("fold rule: partial, unknown and markerless ticks are never folded; neither is a tick dated after the pass clock", async () => {

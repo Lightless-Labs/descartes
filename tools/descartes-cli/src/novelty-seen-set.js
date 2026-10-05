@@ -48,7 +48,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
 import { NOVELTY_FAMILIES } from "./fact-families.js";
-import { legacyFactHistoryEvidence } from "./fact-store-migration.js";
+import { legacyFactHistoryEvidence, legacyQuarantineEpoch } from "./fact-store-migration.js";
 
 export const SEEN_SET_SCHEMA_VERSION = 1;
 // Sized against §2's measured host (518 services, 175 lineage edges, 7 scheduled jobs per tick):
@@ -64,6 +64,8 @@ const SEEN_SET_KEYS = [
   "family",
   "ledger_generation",
   "ledger_pass_id",
+  "quarantine_epoch",
+  "quarantine_epoch_ts",
   "certified_since_ts",
   "folded_through_ts",
   "overflow",
@@ -123,6 +125,8 @@ export function isValidSeenSet(raw, family, { maxEntries = DEFAULT_SEEN_SET_MAX_
   if (raw.schema_version !== SEEN_SET_SCHEMA_VERSION || raw.family !== family) return false;
   if (typeof raw.ledger_generation !== "string" || raw.ledger_generation.length === 0) return false;
   if (!Number.isSafeInteger(raw.ledger_pass_id) || raw.ledger_pass_id < 0) return false;
+  if (!Number.isSafeInteger(raw.quarantine_epoch) || raw.quarantine_epoch < 0) return false;
+  if (raw.quarantine_epoch_ts !== null && !isIsoTimestamp(raw.quarantine_epoch_ts)) return false;
   if (raw.certified_since_ts !== null && !isIsoTimestamp(raw.certified_since_ts)) return false;
   if (raw.folded_through_ts !== null && !isIsoTimestamp(raw.folded_through_ts)) return false;
   if (typeof raw.overflow !== "boolean" || !isPlainObject(raw.entries)) return false;
@@ -215,6 +219,29 @@ function reseedCertifiedSince({ priorLedger, nextLedger, nowIso }) {
   return since;
 }
 
+function quarantineBoundary({ priorSet, quarantineState, nowIso }) {
+  const priorSince = priorSet?.certified_since_ts ?? null;
+  const priorEpoch = priorSet?.quarantine_epoch ?? 0;
+  const priorEpochTs = priorSet?.quarantine_epoch_ts ?? null;
+  if (quarantineState.status === "unreadable" || quarantineState.status === "legacy_pending") {
+    // The marker/root evidence has no trusted epoch. Once this pass has recorded the conservative
+    // boundary, carrying that timestamp forward is enough; sliding it on every later pass would
+    // turn one migration fault into an unbounded permanent horizon lockout.
+    if (priorEpochTs !== null) return { certifiedSince: priorSince, epoch: priorEpoch, epochTs: priorEpochTs };
+    return { certifiedSince: laterIso(priorSince, nowIso) ?? nowIso, epoch: priorEpoch, epochTs: nowIso };
+  }
+  const currentEpoch = quarantineState.epoch ?? 0;
+  const currentEpochTs = quarantineState.epoch_ts ?? null;
+  const newerEpoch = currentEpoch > priorEpoch;
+  const newerTimestamp = currentEpochTs !== null
+    && (priorEpochTs === null || Date.parse(currentEpochTs) > Date.parse(priorEpochTs));
+  if (!newerEpoch && !newerTimestamp) return { certifiedSince: priorSince, epoch: priorEpoch, epochTs: priorEpochTs };
+  // A trusted quarantine event discards the old store's sightings. The boundary can only move
+  // forward; it must never remain null when the set was certified before that event.
+  const boundary = currentEpochTs ?? nowIso;
+  return { certifiedSince: laterIso(priorSince, boundary) ?? nowIso, epoch: currentEpoch, epochTs: currentEpochTs ?? nowIso };
+}
+
 /**
  * Folds this retention pass's certified candidates into `family`'s seen-set (S4: the novelty
  * family's OWN store pass folds it; a non-novelty family has no set). Called by fact-store.js after
@@ -256,6 +283,7 @@ export async function foldNoveltySeenSets(descartesPaths, {
         && prior.set.ledger_generation === nextLedger.generation
         && prior.set.ledger_pass_id === priorLedger.continuity.last_committed_pass_id,
       );
+      const quarantineState = await legacyQuarantineEpoch(descartesPaths);
       let reseedSince = genuineFirstRun ? null : reseedCertifiedSince({ priorLedger, nextLedger, nowIso });
       // G2 H1: null means "complete since the lineage began", which is the host's whole history only
       // when no legacy single store ever existed. After an S5 upgrade every family store starts a new
@@ -273,6 +301,14 @@ export async function foldNoveltySeenSets(descartesPaths, {
       const carriesPrior = Boolean(prior.set && !prior.set.overflow);
       let map = carriesPrior ? entriesToMap(prior.set.entries) : new Map();
       let certifiedSince = continuous ? prior.set.certified_since_ts : reseedSince;
+      let quarantineEpoch = continuous ? prior.set.quarantine_epoch : (quarantineState.epoch ?? 0);
+      let quarantineEpochTs = continuous ? prior.set.quarantine_epoch_ts : (quarantineState.epoch_ts ?? null);
+      if (continuous || quarantineState.status === "unreadable" || quarantineState.status === "legacy_pending") {
+        const boundary = quarantineBoundary({ priorSet: prior.set, quarantineState, nowIso });
+        certifiedSince = boundary.certifiedSince;
+        quarantineEpoch = boundary.epoch;
+        quarantineEpochTs = boundary.epochTs;
+      }
       let status = continuous ? "folded" : "reseeded";
       let foldedThroughMs = foldTicks(map, records, family, nowMs);
       expire(map, nowMs, retentionMs);
@@ -283,6 +319,12 @@ export async function foldNoveltySeenSets(descartesPaths, {
         map = new Map();
         if (reseedSince === null && await legacyFactHistoryEvidence(descartesPaths)) reseedSince = nowIso;
         certifiedSince = reseedSince;
+        quarantineEpoch = quarantineState.epoch ?? quarantineEpoch;
+        quarantineEpochTs = quarantineState.epoch_ts ?? quarantineEpochTs;
+        if (quarantineState.status === "unreadable" || quarantineState.status === "legacy_pending") {
+          certifiedSince = laterIso(certifiedSince, nowIso) ?? nowIso;
+          quarantineEpochTs = nowIso;
+        }
         status = "reseeded";
         foldedThroughMs = foldTicks(map, records, family, nowMs);
         expire(map, nowMs, retentionMs);
@@ -295,6 +337,8 @@ export async function foldNoveltySeenSets(descartesPaths, {
         family,
         ledger_generation: nextLedger.generation,
         ledger_pass_id: passId,
+        quarantine_epoch: quarantineEpoch,
+        quarantine_epoch_ts: quarantineEpochTs,
         certified_since_ts: overflow ? nowIso : certifiedSince,
         folded_through_ts: foldedThroughTs,
         overflow,
