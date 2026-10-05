@@ -372,6 +372,7 @@ test("same-UID uncertain fd attribution falls through to the enabled elevated ex
     paths,
     readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcpListeningFixture({ uid: currentUid }) : "1\n",
     listProcPids: async () => ({ pids: [100], truncated: false }),
+    verifyProcfsPidNamespace: async () => true,
     scanProcFdForInode: async () => ({
       results: [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [] }],
       truncated: false,
@@ -395,6 +396,7 @@ test("same-UID ambiguity stays ambiguous when the enabled elevated helper also c
     paths,
     readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcpListeningFixture({ uid: currentUid }) : "1\n",
     listProcPids: async () => ({ pids: [100], truncated: false }),
+    verifyProcfsPidNamespace: async () => true,
     scanProcFdForInode: async () => ({
       results: [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [] }],
       truncated: false,
@@ -604,6 +606,8 @@ test("resolveCrossUidPortResult surfaces helper seccomp and timeout diagnostics 
     });
     const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
     assert.equal(outcome.result.privilege[diagnostic], true);
+    assert.deepEqual(outcome.result.resolved.reasons, [diagnostic], "helper diagnostics remain in the final resolution evidence");
+    assert.deepEqual(outcome.result.source.details.reasons, [diagnostic], "helper diagnostics remain in source evidence");
   }
 });
 
