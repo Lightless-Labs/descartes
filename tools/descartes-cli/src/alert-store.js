@@ -70,6 +70,9 @@ export const FIXED_ALERT_RULE_IDS = new Set([
   "system.memory.sustained_high",
   "system.load.sustained_high",
   "disk.space.high_used_fraction",
+  // Fact-store capacity plan §4.2/I12 (step S3): HISTORY_HORIZON_SHORT_RULE_ID (fact-families.js),
+  // kept as a literal here like its siblings; alert-store.test.js pins the two equal.
+  "daemon.fact_history.horizon_short",
 ]);
 
 // Detector-reported recovery coverage (§8.A): coverage is now keyed on alert IDENTITY
@@ -143,6 +146,35 @@ export function evaluateAlertRules(historySummary, daemonStatus, options = {}) {
       summary: `Local history daemon status is older than ${Math.round(staleMs / 1000)}s.`,
       diagnostics: { daemon_status_ts: new Date(daemonStatusMs).toISOString(), stale_ms: staleMs, age_ms: nowMs - daemonStatusMs },
     });
+  }
+
+  // Fact-store capacity plan §4.2/§4.4, I12 (step S3): a history-dependent rule horizon-ineligible
+  // for longer than the daemon's threshold (HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals,
+  // computed and written by the daemon) is reported, never silent: a sustained short horizon on a
+  // novelty rule is a novelty-ABSORBING window (§5 N5), not a fail-closed one. Driven purely by the
+  // status record, so the CLI's read-only view agrees with the daemon. A malformed block raises
+  // nothing (it cannot vouch for anything); a well-formed one with a long-short rule always fires.
+  const horizonShort = daemonStatus?.history_horizon_short;
+  const horizonThresholdMs = Number(horizonShort?.threshold_ms);
+  if (horizonShort && typeof horizonShort === "object" && Number.isFinite(horizonThresholdMs) && horizonThresholdMs > 0
+    && horizonShort.rules && typeof horizonShort.rules === "object" && !Array.isArray(horizonShort.rules)) {
+    const overdue = Object.entries(horizonShort.rules)
+      .map(([ruleId, entry]) => ({ ruleId, sinceMs: Date.parse(entry?.since_ts) }))
+      .filter(({ sinceMs }) => Number.isFinite(sinceMs) && nowMs - sinceMs >= horizonThresholdMs)
+      .sort((left, right) => left.ruleId.localeCompare(right.ruleId));
+    if (overdue.length > 0) {
+      pushCandidate(candidates, {
+        rule_id: "daemon.fact_history.horizon_short",
+        severity: "warning",
+        title: "Detector history horizon is short",
+        summary: `${overdue.length} history-dependent rule(s) have had too little certified fact history to evaluate for at least ${Math.round(horizonThresholdMs / 3600000)}h; novelty first seen during this window will not alert later.`,
+        diagnostics: {
+          rule_ids: overdue.map(({ ruleId }) => ruleId).join(","),
+          oldest_since_ts: new Date(Math.min(...overdue.map(({ sinceMs }) => sinceMs))).toISOString(),
+          threshold_ms: horizonThresholdMs,
+        },
+      });
+    }
   }
 
   const memory = metrics.get("system.memory.used_fraction");

@@ -10,8 +10,8 @@ import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
-import { RULE_HORIZONS } from "./fact-families.js";
+import { factHistoryTrustworthy, ruleHorizonOk } from "./fact-store-completeness.js";
+import { HISTORY_HORIZON_SHORT_ALERT_TICKS, RULE_HORIZONS } from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
   factPointsFromNetworkEvidence,
@@ -39,7 +39,7 @@ import { computeScheduledJobBaselineCandidates, SCHEDULED_JOB_APPEARED_RULE_ID }
 import { computeCredentialAccessCandidates, CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
 import { computeContainmentRecommendationCandidates, containmentRecommendationRuleIds } from "./containment-recommend.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
-import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
+import { appendMetricPoints, parseDurationMs, readDaemonStatus, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, collectProcessLineageEvidence } from "./tools/processes.js";
@@ -821,7 +821,7 @@ function ruleIdsForFailedLabel(label, persistedRuleIds) {
 // the pre-fix code already did whenever any restriction applied. Only called when
 // options.evaluateAlerts !== false, so the "no I/O when disabled" invariant (no detector/alert I/O
 // on a disabled tick) is preserved by the caller, unchanged.
-async function computeCoveredAlerts(descartesPaths, options, { historyTrust, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel }) {
+async function computeCoveredAlerts(descartesPaths, options, { historyTrust, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel, horizonVetoedRuleIds = new Set() }) {
   const historyUntrusted = historyTrust?.trust === false;
 
   const readAlerts = options.readAlertRecords ?? readAlertRecords;
@@ -837,6 +837,11 @@ async function computeCoveredAlerts(descartesPaths, options, { historyTrust, fai
   // this set freezes regardless of any coverage report.
   const vetoedRuleIds = new Set([
     ...(historyUntrusted ? HISTORY_DEPENDENT_ALERT_RULE_IDS : []),
+    // Fact-store capacity plan §4.4 / I6 (step S3): the per-rule eligibility-horizon veto -- the
+    // daemon's own, independent check (from its own read, against the same fact-families.js
+    // registry the detectors use), so a detector that forgot its horizon gate still cannot authorize
+    // a recovery off a window too short to evaluate the rule. Single read until S4 makes it per family.
+    ...horizonVetoedRuleIds,
     ...alwaysExcludedRuleIds,
   ]);
   for (const label of failedLabels) {
@@ -1153,6 +1158,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const learnedConfigForHistory = configSnapshot.learned;
   let factStoreCompleteness;
   let historyTrust;
+  // Fact-store capacity plan §4.2/§4.4 (step S3): the rules whose eligibility horizon is not met on
+  // the daemon's own read (vetoed from recovery at both persistence passes below), and the subset of
+  // those that are horizon-SHORT on a valid ledger report (the operator signal, I12). Every rule is
+  // vetoed when nothing was read -- already true via historyTrust, restated here so the veto is
+  // self-contained.
+  let horizonVetoedRuleIds = new Set(RULE_HORIZONS.keys());
+  let horizonShortRuleIds = new Set();
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
     let factHistoryReadResult;
@@ -1165,6 +1177,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
     factStoreCompleteness = selectFactStoreCompleteness(factHistoryReadResult?.completeness);
     historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
+    horizonVetoedRuleIds = new Set([...RULE_HORIZONS.keys()].filter((ruleId) => !ruleHorizonOk(factHistoryReadResult, ruleId, nowMs)));
+    // Horizon-SHORT is reported only over a valid ledger's coverage report: a missing/invalid ledger
+    // or failed read is an untrusted-history condition (reported as such), not a short horizon.
+    const coverage = factHistoryReadResult?.completeness?.coverage;
+    if (coverage === "full" || coverage === "narrowed") horizonShortRuleIds = horizonVetoedRuleIds;
   } else {
     // BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf): when NEITHER tier is
     // enabled, we cannot vouch for fact-history without a fact read we must not do when disabled
@@ -1209,6 +1226,33 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // collectors reported), and use that in-memory record for the rest of the tick regardless of
   // whether the disk write succeeded -- so evaluateAndPersistAlerts (and everything downstream) is
   // still reached, unconditionally, with real data.
+  // Fact-store capacity plan §4.2/§4.4, I12 (step S3): the horizon-short signal. Each short rule's
+  // since_ts is carried forward from the previous status record while it stays short (reset the tick
+  // it recovers), so the FIXED daemon.fact_history.horizon_short alert (alert-store.js) can fire once a
+  // rule has been short for HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals. Time-based, not a
+  // tick counter (S3 deviation): a fast tick re-reads the same history, so wall time since the rule
+  // first went short is the faithful measure of "N consecutive structural ticks". A prior status that
+  // is missing/unreadable, or a since_ts in the future (clock rollback), restarts the clock at now --
+  // that can only DELAY the signal, never raise it early, and never suppresses the status entry.
+  let historyHorizonShort;
+  if (horizonShortRuleIds.size > 0) {
+    let priorRules;
+    try {
+      const readPriorStatus = options.readDaemonStatus ?? readDaemonStatus;
+      priorRules = (await readPriorStatus(descartesPaths))?.history_horizon_short?.rules;
+    } catch {
+      priorRules = undefined;
+    }
+    const nowIsoForHorizon = new Date(nowMs).toISOString();
+    const rules = {};
+    for (const ruleId of [...horizonShortRuleIds].sort()) {
+      const priorSince = priorRules && typeof priorRules === "object" ? priorRules[ruleId]?.since_ts : undefined;
+      const priorSinceMs = typeof priorSince === "string" ? Date.parse(priorSince) : Number.NaN;
+      rules[ruleId] = { since_ts: Number.isFinite(priorSinceMs) && priorSinceMs <= nowMs ? new Date(priorSinceMs).toISOString() : nowIsoForHorizon };
+    }
+    historyHorizonShort = { threshold_ms: HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs, rules };
+  }
+
   const collectorHasError = evidence.some((envelope) => envelope.status === "error")
     || (structuralCollectorStatuses ?? []).some((entry) => entry.status === "error");
   const storageWriteError = combineErrors(metricPersistError, structuralFactPersistError);
@@ -1225,6 +1269,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
+    ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
     // property, so it is unconditional here (unlike the ...(x ? {...} : {}) spreads above, which
     // are conditional on genuinely-computed-this-tick evidence). Display/disclosure only -- see
@@ -1404,6 +1449,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historyTrust,
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
+      horizonVetoedRuleIds,
       alwaysExcludedRuleIds: [
         ...(learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : []),
         ...tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
@@ -1477,6 +1523,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historyTrust,
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
+      horizonVetoedRuleIds,
       alwaysExcludedRuleIds: tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
     });
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {

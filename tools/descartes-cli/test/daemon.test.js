@@ -30,7 +30,7 @@ import {
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
 import { writeWatchConfig } from "../src/watch-store.js";
-import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention, normalizeFactPoint, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { alertId, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
@@ -4561,13 +4561,16 @@ test("MEDIUM-1 confirmation (fact-store capacity plan review fold): the daemon's
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
-  const earlier = new Date(Date.parse(now) - 60 * 60 * 1000).toISOString();
+  // S3 (fact-store capacity plan): since the per-rule eligibility horizon landed, the evicted point
+  // sits 31 h back so session.count_drop's 30 h horizon is met -- this test is about narrowing not
+  // being a TRUST loss; the horizon-short case has its own test below.
+  const earlier = new Date(Date.parse(now) - 31 * 60 * 60 * 1000).toISOString();
 
   // Force a real byte-cap eviction, so this is an actual narrowed read (not a hand-built stub):
   // an earlier point, then a cap that only leaves room for the later one.
   const earlierPoint = { ts: earlier, fact_name: "service.presence", entity_key: "svc-old", attributes: {} };
   const laterPoint = { ts: now, fact_name: "service.presence", entity_key: "svc-new", attributes: {} };
-  const capBytes = Buffer.byteLength(`${JSON.stringify(laterPoint)}\n`);
+  const capBytes = Buffer.byteLength(`${JSON.stringify(normalizeFactPoint(laterPoint))}\n`);
   await appendFactPoints(paths, [earlierPoint], { now: earlier, maxBytes: Number.MAX_SAFE_INTEGER });
   await appendFactPoints(paths, [laterPoint], { now, maxBytes: capBytes });
   const setupRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
@@ -4589,6 +4592,109 @@ test("MEDIUM-1 confirmation (fact-store capacity plan review fold): the daemon's
 
   const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
   assert.equal(sessionAlert.status, "recovered", "narrowed coverage alone must not veto the daemon's history trust -- only a real loss (degraded/unknown) does");
+});
+
+// Fact-store capacity plan §4.4 / I6 (step S3): the daemon's own per-rule horizon veto. A narrowed
+// store whose certified span is shorter than a rule's horizon freezes that rule's persisted alert
+// EVEN IF its producer (buggy, or a stub here) reports coverage -- the independent §7.7-style check
+// that still fires when a detector forgets its own gate.
+async function narrowedStoreWithFloorHoursAgo(paths, now, hoursAgo) {
+  const earlier = new Date(Date.parse(now) - hoursAgo * 60 * 60 * 1000).toISOString();
+  const earlierPoint = { ts: earlier, fact_name: "service.presence", entity_key: "svc-old", attributes: {} };
+  const laterPoint = { ts: now, fact_name: "service.presence", entity_key: "svc-new", attributes: {} };
+  await appendFactPoints(paths, [earlierPoint], { now: earlier, maxBytes: Number.MAX_SAFE_INTEGER });
+  // Room for exactly the later (normalized) record: the earlier tick is evicted, the later one kept.
+  await appendFactPoints(paths, [laterPoint], { now, maxBytes: Buffer.byteLength(`${JSON.stringify(normalizeFactPoint(laterPoint))}\n`) });
+  const read = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(read.completeness.status, "intact");
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.equal(read.completeness.bytecap_floor_ts, earlier, "the floor is the evicted earlier tick, not the kept one");
+  assert.equal(read.points.length, 1);
+}
+
+test("S3 daemon horizon veto: a producer that reports coverage for a horizon-short rule still cannot recover its alert; a horizon-OK rule on the same read does", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 10); // 10 h certified: churn (6 h) OK, count_drop (30 h) short
+  await writeAlertRecords(paths, [
+    { rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical", title: "t", summary: "t", first_seen: now, last_seen: now, diagnostics: {} },
+    { rule_id: SESSION_CHURN_RULE_ID, fingerprint: "session.tmux.aaaaaaaaaaaaaaaa", status: "active", severity: "warning", title: "t", summary: "t", first_seen: now, last_seen: now, diagnostics: {} },
+  ]);
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => ({
+      candidates: [],
+      evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global"), alertId(SESSION_CHURN_RULE_ID, "session.tmux.aaaaaaaaaaaaaaaa")],
+    }),
+  });
+  const drop = result.alerts.alerts.find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const churn = result.alerts.alerts.find((alert) => alert.rule_id === SESSION_CHURN_RULE_ID);
+  assert.equal(drop.status, "active", "horizon-short count_drop stays frozen despite the producer's coverage report");
+  assert.equal(churn.status, "recovered", "churn's 6 h horizon is met on the same read, so it recovers");
+  assert.ok(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID], "the short rule is reported on the status record");
+  assert.equal(result.status.history_horizon_short.rules[SESSION_CHURN_RULE_ID], undefined);
+  assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+});
+
+test("S3 horizon-short signal (I12): since_ts carries forward across ticks, and the fixed daemon.fact_history.horizon_short alert fires only once a rule has been short for N structural intervals", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+  const first = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  const thresholdMs = first.status.history_horizon_short.threshold_ms;
+  assert.equal(thresholdMs, 24 * 60 * 60 * 1000, "N = 24 structural intervals at the default 1 h interval");
+  assert.equal(first.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+  assert.equal(first.alerts.alerts.some((alert) => alert.rule_id === "daemon.fact_history.horizon_short"), false, "not yet: short for 0 h");
+
+  const later = new Date(Date.parse(now) + thresholdMs).toISOString();
+  const second = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: later, now: later });
+  assert.equal(second.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now, "since_ts is carried forward while the rule stays short");
+  const signal = second.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+  assert.ok(signal, "short for N intervals: the fixed signal fires");
+  assert.equal(signal.status, "active");
+  assert.match(signal.diagnostics.rule_ids, /session\.count_drop/);
+});
+
+test("S3 horizon-short signal: a corrupt prior status or a future since_ts restarts the clock at now (can only delay the signal, never raise it early)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+  const future = new Date(Date.parse(now) + 60 * 60 * 1000).toISOString();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    readDaemonStatus: async () => ({ history_horizon_short: { rules: { [SESSION_COUNT_DROP_RULE_ID]: { since_ts: future } } } }),
+  });
+  assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+  const corrupt = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    readDaemonStatus: async () => { throw new Error("corrupt"); },
+  });
+  assert.equal(corrupt.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+});
+
+test("S3 horizon-short signal: no fact read (both tiers off) and an un-narrowed store report nothing", async () => {
+  const offPaths = await tempPaths();
+  await writeWatchConfig(offPaths, { enabled: false });
+  const off = await runDaemonIteration(offPaths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS });
+  assert.equal(off.status.history_horizon_short, undefined);
+  const fullPaths = await tempPaths();
+  await writeLearnedConfig(fullPaths, { enabled: true });
+  await appendFactPoints(fullPaths, [{ ts: S_LIVE_1_TICK_TS, fact_name: "service.presence", entity_key: "a", attributes: {} }], { now: S_LIVE_1_TICK_TS });
+  await appendFactPoints(fullPaths, [], { now: S_LIVE_1_TICK_TS });
+  const full = await runDaemonIteration(fullPaths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS });
+  assert.equal(full.status.history_horizon_short, undefined, "day-1 (no floor): every horizon is met");
 });
 
 // ---------------------------------------------------------------------------------------------
