@@ -70,6 +70,36 @@ export function factFamilyForName(factName) {
   return FACT_FAMILY_BY_NAME.get(factName);
 }
 
+/**
+ * S4 (fact-store capacity plan §4.3, I7): the ONLY way a family id reaches a store path. Throws on a
+ * missing or unknown family, so a store call that forgot its family fails loudly instead of
+ * silently reading an empty (or a legacy) store, and a family id can never carry a path segment
+ * (the registry is closed; there is no path-traversal surface).
+ */
+export function requireFactFamily(family) {
+  if (family === undefined || family === null || family === "") throw new Error("fact-store: a fact family is required (no legacy single-store default)");
+  if (typeof family !== "string" || !KNOWN_FAMILIES.has(family)) throw new Error(`fact-store: unknown fact family ${typeof family === "string" ? family : typeof family}`);
+  return family;
+}
+
+/**
+ * S4 routing (§4.3 write path, I7): groups fact points by their family. An unregistered fact_name
+ * THROWS before anything is returned -- so before any family file is written -- rather than being
+ * misrouted or silently dropped. Returns a Map<family, points[]> holding only non-empty groups, in
+ * registry order.
+ */
+export function groupFactPointsByFamily(points) {
+  const byFamily = new Map();
+  for (const point of points ?? []) {
+    const factName = typeof point?.fact_name === "string" ? point.fact_name.trim() : point?.fact_name;
+    const family = FACT_FAMILY_BY_NAME.get(factName);
+    if (family === undefined) throw new Error("fact-store: unregistered fact_name (no fact family); refusing the whole batch before any write");
+    if (!byFamily.has(family)) byFamily.set(family, []);
+    byFamily.get(family).push(point);
+  }
+  return new Map(FACT_FAMILY_IDS.filter((family) => byFamily.has(family)).map((family) => [family, byFamily.get(family)]));
+}
+
 // kind selects the eligibility predicate (fact-store-completeness.js ruleEligible, shared by the
 // detectors and the daemon's veto/horizon-short signal): the fact-floor horizon for every kind,
 // except that "novelty" rules measure their horizon against the S3b seen-set's certified span
@@ -186,6 +216,151 @@ export const NOVELTY_FAMILIES = buildNoveltyFamilies(NOVELTY_FAMILY_ENTRIES);
 export function noveltyFamilyForRule(ruleId) {
   for (const [family, entry] of NOVELTY_FAMILIES) if (entry.ruleId === ruleId) return family;
   return undefined;
+}
+
+// S4 per-family budgets (fact-store capacity plan §4.5, S0-revised table; operator Q1 as superseded by
+// §15.4): service 18, process_lineage 10, scheduled_job 5, peer 16 MiB; session, canary, network and
+// provenance 4 MiB -- 65 MiB in total.
+const MIB = 1024 * 1024;
+const FAMILY_BUDGET_ENTRIES = [
+  ["service", 18 * MIB],
+  ["process_lineage", 10 * MIB],
+  ["scheduled_job", 5 * MIB],
+  ["session", 4 * MIB],
+  ["peer", 16 * MIB],
+  ["canary", 4 * MIB],
+  ["network", 4 * MIB],
+  ["provenance", 4 * MIB],
+];
+
+// The pinned worst-case tick shape per family (§15.3): the maximum normalized record size the REAL
+// translators produce on maximum-length inputs, the bytes of the per-tick markers (census, overflow),
+// and the per-tick entity cap the DAEMON PATH actually passes (the collectors' defaults, which are now
+// also hard upper clamps for session and peer -- §2: they used to be unclamped). worst = cap x record
+// + markers. T8 (fact-families.test.js) asserts each entityCap equals the live exported collector
+// constant, so raising a collector cap without revisiting the budget fails the suite. network and
+// provenance are not pinned (they carry no history-dependent rule, so no horizon invariant applies).
+const FAMILY_TICK_SHAPE_ENTRIES = [
+  // DEFAULT_SERVICE_CENSUS_CEILING (tools/services.js); the hard clamp 5000 is an operator choice
+  // (Q7: fixed budget, accept history_horizon_short).
+  ["service", { maxRecordBytes: 291, markerBytes: 251, entityCap: 1000 }],
+  // MAX_LINEAGE_EDGES_PER_TICK (tools/processes.js).
+  ["process_lineage", { maxRecordBytes: 251, markerBytes: 297, entityCap: 200 }],
+  // MAX_JOB_LIMIT (tools/scheduled-jobs.js clamp).
+  ["scheduled_job", { maxRecordBytes: 354, markerBytes: 275, entityCap: 200 }],
+  // MAX_SESSION_ENTITY_LIMIT (tools/sessions.js clamp); markers = census + overflow.
+  ["session", { maxRecordBytes: 333, markerBytes: 530, entityCap: 200 }],
+  // MAX_PEER_ENTITY_LIMIT (vpn-peer-status.js) + MAX_TAILSCALE_PEER_ENTITY_LIMIT (tailscale-status.js);
+  // markers = VPN census + VPN overflow + Tailscale overflow.
+  ["peer", { maxRecordBytes: 392, markerBytes: 933, entityCap: 400 }],
+  // MAX_CANARIES (tools/canary.js).
+  ["canary", { maxRecordBytes: 501, markerBytes: 247, entityCap: 200 }],
+];
+
+export const BUDGET_INVARIANT_HEADROOM = 1.25;
+export const BUDGET_STRUCTURAL_INTERVAL_MS = HOUR_MS;
+
+function buildFamilyBudgets() {
+  const budgets = new Map();
+  for (const [family, bytes] of FAMILY_BUDGET_ENTRIES) {
+    if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: budget for unknown family ${family}`);
+    if (budgets.has(family)) throw new Error(`fact-families: family ${family} has two budgets`);
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error(`fact-families: family ${family} has an invalid budget`);
+    budgets.set(family, bytes);
+  }
+  for (const family of FACT_FAMILY_IDS) if (!budgets.has(family)) throw new Error(`fact-families: family ${family} has no default budget`);
+  return budgets;
+}
+
+export const FAMILY_DEFAULT_BUDGET_BYTES = buildFamilyBudgets();
+
+function buildTickShapes() {
+  const shapes = new Map();
+  for (const [family, shape] of FAMILY_TICK_SHAPE_ENTRIES) {
+    if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: tick shape for unknown family ${family}`);
+    for (const key of ["maxRecordBytes", "markerBytes", "entityCap"]) {
+      if (!Number.isSafeInteger(shape[key]) || shape[key] < 0) throw new Error(`fact-families: family ${family} has an invalid ${key}`);
+    }
+    shapes.set(family, Object.freeze({ ...shape, worstTickBytes: shape.entityCap * shape.maxRecordBytes + shape.markerBytes }));
+  }
+  return shapes;
+}
+
+export const FAMILY_TICK_SHAPES = buildTickShapes();
+
+// H_max(f): the longest eligibility horizon of any history-dependent rule reading family f (§4.5).
+function buildFamilyHorizonMax() {
+  const max = new Map();
+  for (const rule of RULE_HORIZONS.values()) {
+    for (const family of rule.families) max.set(family, Math.max(max.get(family) ?? 0, rule.horizonMs));
+  }
+  for (const family of max.keys()) {
+    if (!FAMILY_TICK_SHAPES.has(family)) throw new Error(`fact-families: family ${family} carries a rule horizon but no pinned worst-case tick`);
+  }
+  return max;
+}
+
+export const FAMILY_HORIZON_MAX_MS = buildFamilyHorizonMax();
+
+/**
+ * The T8 budget invariant / config floor (§4.5): (H_max / interval) x worst-case tick bytes x 1.25.
+ * With a budget at or above it, inflating per-tick volume up to the collector caps can NARROW the
+ * family's certified span, but never below its longest eligibility horizon (§5 N4). Families with no
+ * history-dependent rule (network, provenance) have no horizon to protect: their floor is their
+ * default budget, so an operator value can only RAISE it (S4 deviation, G2 question).
+ */
+export function familyBudgetFloorBytes(family) {
+  requireFactFamily(family);
+  const horizonMs = FAMILY_HORIZON_MAX_MS.get(family);
+  const shape = FAMILY_TICK_SHAPES.get(family);
+  if (horizonMs === undefined || shape === undefined) return FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+  return Math.ceil((horizonMs / BUDGET_STRUCTURAL_INTERVAL_MS) * shape.worstTickBytes * BUDGET_INVARIANT_HEADROOM);
+}
+
+for (const family of FACT_FAMILY_IDS) {
+  if (FAMILY_DEFAULT_BUDGET_BYTES.get(family) < familyBudgetFloorBytes(family)) {
+    throw new Error(`fact-families: family ${family}'s default budget is below its horizon invariant`);
+  }
+}
+
+/**
+ * Effective per-family budgets from watch.json's `fact_store_budgets` map (§4.5 Config). A missing,
+ * non-finite, non-integer, or too-small value falls back to the family default; "too small" means
+ * below the T8 invariant (familyBudgetFloorBytes), never merely below one tick, because a budget
+ * between one tick and the invariant would leave the family permanently horizon-short (a
+ * novelty-absorbing window, §4.2). Rejected values are reported (status reason
+ * `budget_below_horizon_floor` / `invalid`), never silently applied. Keys that are not registry
+ * families are ignored (and reported). Pure.
+ */
+export function resolveFactStoreBudgets(configured) {
+  const budgets = {};
+  const rejected = {};
+  const source = {};
+  const map = configured && typeof configured === "object" && !Array.isArray(configured) ? configured : {};
+  for (const family of FACT_FAMILY_IDS) {
+    const fallback = FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+    if (!Object.prototype.hasOwnProperty.call(map, family)) {
+      budgets[family] = fallback;
+      source[family] = "default";
+      continue;
+    }
+    const value = map[family];
+    const floor = familyBudgetFloorBytes(family);
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+      budgets[family] = fallback;
+      source[family] = "default";
+      rejected[family] = { reason: "invalid", floor_bytes: floor };
+    } else if (value < floor) {
+      budgets[family] = fallback;
+      source[family] = "default";
+      rejected[family] = { reason: "budget_below_horizon_floor", configured_bytes: value, floor_bytes: floor };
+    } else {
+      budgets[family] = value;
+      source[family] = "configured";
+    }
+  }
+  const unknownKeys = Object.keys(map).filter((key) => !KNOWN_FAMILIES.has(key)).sort();
+  return { budgets, source, rejected, ...(unknownKeys.length > 0 ? { unknown_families: unknownKeys } : {}) };
 }
 
 // The horizon-short signal (§4.2, §4.4, I12): a rule horizon-ineligible for more than

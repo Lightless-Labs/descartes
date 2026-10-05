@@ -9,6 +9,9 @@ import { redactAndBoundProcessArgs } from "./processes.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_JOB_LIMIT = 80;
+// The hard upper clamp on job_limit; the scheduled_job fact family's budget invariant (fact-families.js,
+// T8) is sized against it.
+export const MAX_JOB_LIMIT = 200;
 export const MAX_CRON_FILE_BYTES = 128 * 1024;
 const MAX_LAUNCHD_PLIST_CANDIDATES = 500;
 
@@ -20,7 +23,7 @@ function clampNumber(value, fallback, min, max) {
 
 export function normalizeScheduledJobsRequest(options = {}) {
   return {
-    job_limit: clampNumber(options.jobLimit ?? options.job_limit, DEFAULT_JOB_LIMIT, 1, 200),
+    job_limit: clampNumber(options.jobLimit ?? options.job_limit, DEFAULT_JOB_LIMIT, 1, MAX_JOB_LIMIT),
     include_system: options.includeSystem ?? options.include_system ?? true,
     include_user: options.includeUser ?? options.include_user ?? true,
   };

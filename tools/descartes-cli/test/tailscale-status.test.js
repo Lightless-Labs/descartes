@@ -7,6 +7,7 @@ import {
   collectTailscaleStatusEvidence,
   DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT,
   parseTailscaleStatusJson,
+  MAX_TAILSCALE_PEER_ENTITY_LIMIT,
 } from "../src/tools/tailscale-status.js";
 
 const SRC_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "tools", "tailscale-status.js");
@@ -218,4 +219,19 @@ test("timeout and maxBuffer options are passed to the fixed execFile probe", asy
 
 test("DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT is a positive finite bound", () => {
   assert(Number.isFinite(DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT) && DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT > 0);
+});
+
+// Fact-store capacity plan §2/S4: the Tailscale peer cap is a hard UPPER clamp (T8).
+test("an options.peerLimit above MAX_TAILSCALE_PEER_ENTITY_LIMIT is clamped down to it", async () => {
+  const peers = Object.fromEntries(Array.from({ length: MAX_TAILSCALE_PEER_ENTITY_LIMIT + 5 }, (_, index) => {
+    const key = `peer-${index}`;
+    return [key, { PublicKey: key, Online: true }];
+  }));
+  const envelope = await collectTailscaleStatusEvidence({
+    peerLimit: 100_000,
+    runFixedExecFile: scriptedExec(baseScript(ok(JSON.stringify({ BackendState: "Running", Peer: peers })))),
+  });
+  assert.equal(envelope.result.cap, MAX_TAILSCALE_PEER_ENTITY_LIMIT);
+  assert.equal(envelope.result.peers.length, MAX_TAILSCALE_PEER_ENTITY_LIMIT);
+  assert.equal(envelope.result.truncated, true);
 });

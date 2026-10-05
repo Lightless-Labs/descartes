@@ -8,6 +8,13 @@ import { appendFactPoints, enforceFactRetention, readFactPoints } from "../src/f
 import {
   FACT_FAMILY_BY_NAME,
   FACT_FAMILY_IDS,
+  FAMILY_DEFAULT_BUDGET_BYTES,
+  FAMILY_HORIZON_MAX_MS,
+  FAMILY_TICK_SHAPES,
+  familyBudgetFloorBytes,
+  groupFactPointsByFamily,
+  requireFactFamily,
+  resolveFactStoreBudgets,
   NOVELTY_FAMILIES,
   READER_COVERAGE,
   RULE_HORIZONS,
@@ -215,4 +222,139 @@ test("T5 (deferred from S2): maxBytes 0 and a single tick over the cap leave an 
     assert.equal(read.completeness.coverage, "narrowed");
     assert.equal(certifiedHorizonOk(read, { nowMs: Date.parse(ts), horizonMs: HOUR }), false);
   }
+});
+
+// --- S4 (fact-store capacity plan §4.3/§4.5): budgets, the T8 invariant, routing ---
+
+test("T8: every family's default budget meets (H_max / interval) x worst-case tick x 1.25, against the LIVE collector caps the daemon path passes", async () => {
+  const { DEFAULT_SERVICE_CENSUS_CEILING } = await import("../src/tools/services.js");
+  const { MAX_LINEAGE_EDGES_PER_TICK } = await import("../src/tools/processes.js");
+  const { MAX_JOB_LIMIT } = await import("../src/tools/scheduled-jobs.js");
+  const { MAX_SESSION_ENTITY_LIMIT, DEFAULT_SESSION_ENTITY_LIMIT } = await import("../src/tools/sessions.js");
+  const { MAX_PEER_ENTITY_LIMIT, DEFAULT_PEER_ENTITY_LIMIT } = await import("../src/tools/vpn-peer-status.js");
+  const { MAX_TAILSCALE_PEER_ENTITY_LIMIT, DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT } = await import("../src/tools/tailscale-status.js");
+  const { MAX_CANARIES } = await import("../src/tools/canary.js");
+  // The pinned entity cap per family must equal the live collector constant: raising a collector
+  // cap without revisiting the family budget fails HERE, not on a real host.
+  const liveCaps = {
+    service: DEFAULT_SERVICE_CENSUS_CEILING,
+    process_lineage: MAX_LINEAGE_EDGES_PER_TICK,
+    scheduled_job: MAX_JOB_LIMIT,
+    session: MAX_SESSION_ENTITY_LIMIT,
+    peer: MAX_PEER_ENTITY_LIMIT + MAX_TAILSCALE_PEER_ENTITY_LIMIT,
+    canary: MAX_CANARIES,
+  };
+  // §2: the session/peer defaults are now also their clamps (no unbounded operator limit).
+  assert.ok(DEFAULT_SESSION_ENTITY_LIMIT <= MAX_SESSION_ENTITY_LIMIT);
+  assert.ok(DEFAULT_PEER_ENTITY_LIMIT <= MAX_PEER_ENTITY_LIMIT);
+  assert.ok(DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT <= MAX_TAILSCALE_PEER_ENTITY_LIMIT);
+  const pinnedWorst = { service: 291_251, process_lineage: 50_497, scheduled_job: 71_075, session: 67_130, peer: 157_733, canary: 100_447 };
+  for (const [family, cap] of Object.entries(liveCaps)) {
+    const shape = FAMILY_TICK_SHAPES.get(family);
+    assert.equal(shape.entityCap, cap, `${family}: pinned entity cap must equal the live collector cap`);
+    assert.equal(shape.worstTickBytes, cap * shape.maxRecordBytes + shape.markerBytes);
+    assert.equal(shape.worstTickBytes, pinnedWorst[family], `${family}: worst-case tick must match §15.3`);
+    const hMax = FAMILY_HORIZON_MAX_MS.get(family);
+    assert.ok(hMax > 0, `${family} must carry a horizon`);
+    const required = (hMax / HOUR) * shape.worstTickBytes * 1.25;
+    assert.ok(FAMILY_DEFAULT_BUDGET_BYTES.get(family) >= required, `${family}: ${FAMILY_DEFAULT_BUDGET_BYTES.get(family)} < ${required}`);
+    assert.equal(familyBudgetFloorBytes(family), Math.ceil(required));
+  }
+  // The accepted H_max per family (§15.4, Q2).
+  assert.equal(FAMILY_HORIZON_MAX_MS.get("service"), 48 * HOUR);
+  assert.equal(FAMILY_HORIZON_MAX_MS.get("process_lineage"), 6 * DAY);
+  assert.equal(FAMILY_HORIZON_MAX_MS.get("scheduled_job"), 48 * HOUR);
+  assert.equal(FAMILY_HORIZON_MAX_MS.get("session"), 30 * HOUR);
+  assert.equal(FAMILY_HORIZON_MAX_MS.get("peer"), 72 * HOUR);
+  assert.equal(FAMILY_HORIZON_MAX_MS.get("canary"), 6 * HOUR);
+  // The S0-revised defaults (65 MiB in total).
+  const MIB = 1024 * 1024;
+  assert.deepEqual(Object.fromEntries(FAMILY_DEFAULT_BUDGET_BYTES), {
+    service: 18 * MIB, process_lineage: 10 * MIB, scheduled_job: 5 * MIB, session: 4 * MIB,
+    peer: 16 * MIB, canary: 4 * MIB, network: 4 * MIB, provenance: 4 * MIB,
+  });
+  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 65 * MIB);
+});
+
+test("T8 config floor: resolveFactStoreBudgets rejects a value below the horizon invariant (budget_below_horizon_floor) and falls back to the default; accepts one at or above it", () => {
+  const floor = familyBudgetFloorBytes("service");
+  const below = resolveFactStoreBudgets({ service: floor - 1 });
+  assert.equal(below.budgets.service, FAMILY_DEFAULT_BUDGET_BYTES.get("service"));
+  assert.deepEqual(below.rejected.service, { reason: "budget_below_horizon_floor", configured_bytes: floor - 1, floor_bytes: floor });
+  const at = resolveFactStoreBudgets({ service: floor });
+  assert.equal(at.budgets.service, floor);
+  assert.equal(at.source.service, "configured");
+  assert.equal(at.rejected.service, undefined);
+  const raised = resolveFactStoreBudgets({ peer: 64 * 1024 * 1024 });
+  assert.equal(raised.budgets.peer, 64 * 1024 * 1024);
+  // One worst-case tick is NOT enough (the pre-review rule): it would leave the family horizon-short.
+  const oneTick = resolveFactStoreBudgets({ session: FAMILY_TICK_SHAPES.get("session").worstTickBytes * 2 });
+  assert.equal(oneTick.rejected.session.reason, "budget_below_horizon_floor");
+  for (const bad of [Number.NaN, Infinity, -1, 0, 1.5, "20000000", null]) {
+    const result = resolveFactStoreBudgets({ canary: bad });
+    assert.equal(result.budgets.canary, FAMILY_DEFAULT_BUDGET_BYTES.get("canary"));
+    assert.equal(result.rejected.canary.reason, "invalid");
+  }
+  // network/provenance carry no rule horizon: their floor is the default, so only raising is accepted.
+  assert.equal(familyBudgetFloorBytes("network"), FAMILY_DEFAULT_BUDGET_BYTES.get("network"));
+  assert.equal(resolveFactStoreBudgets({ network: 1024 }).rejected.network.reason, "budget_below_horizon_floor");
+  // Unknown keys are ignored and reported, never turned into a family.
+  const unknown = resolveFactStoreBudgets({ "../etc": 99 * 1024 * 1024 });
+  assert.deepEqual(unknown.unknown_families, ["../etc"]);
+  assert.deepEqual(Object.keys(unknown.budgets).sort(), [...FACT_FAMILY_IDS].sort());
+  // Missing/garbage map -> every default.
+  for (const value of [undefined, null, [], "x"]) assert.deepEqual(resolveFactStoreBudgets(value).budgets, Object.fromEntries(FAMILY_DEFAULT_BUDGET_BYTES));
+});
+
+test("T12 routing: groupFactPointsByFamily routes by fact_name and THROWS on an unregistered name (whole batch, before anything is returned)", () => {
+  const grouped = groupFactPointsByFamily([
+    { fact_name: "service.presence", entity_key: "a" },
+    { fact_name: "network.listening_port.owner", entity_key: "b" },
+    { fact_name: "service.census", entity_key: "c" },
+  ]);
+  assert.deepEqual([...grouped.keys()], ["service", "network"]);
+  assert.equal(grouped.get("service").length, 2);
+  assert.throws(() => groupFactPointsByFamily([{ fact_name: "service.presence", entity_key: "a" }, { fact_name: "peer.seen", entity_key: "b" }]), /unregistered fact_name/);
+  assert.throws(() => groupFactPointsByFamily([{ entity_key: "b" }]), /unregistered fact_name/);
+  assert.equal(groupFactPointsByFamily([]).size, 0);
+});
+
+test("T12 routing: requireFactFamily throws on a missing or unknown family", () => {
+  assert.equal(requireFactFamily("peer"), "peer");
+  for (const bad of [undefined, null, "", "facts", "../service", "seen-sets", 7]) assert.throws(() => requireFactFamily(bad), /fact family/);
+});
+
+test("T12 routing: every fact_name each translator can emit is registered (source scan of the translators + the real-volume tick)", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const emitted = new Set();
+  for (const file of ["../src/fact-translators.js", "../src/tools/provenance-warnings.js"]) {
+    const source = await readFile(path.join(here, file), "latin1");
+    const constants = new Map([...source.matchAll(/const\s+([A-Z_][A-Z0-9_]*)\s*=\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]));
+    for (const match of source.matchAll(/fact_name:\s*(?:"([^"]+)"|([A-Z_][A-Z0-9_]*))/g)) {
+      const name = match[1] ?? constants.get(match[2]);
+      assert.ok(name, `unresolved fact_name expression ${match[0]} in ${file}`);
+      emitted.add(name);
+    }
+  }
+  assert.ok(emitted.size >= 12, `expected every translator fact_name, scanned ${[...emitted]}`);
+  for (const name of emitted) assert.ok(FACT_FAMILY_BY_NAME.has(name), `translator fact_name ${name} is not registered`);
+  // And by running the real translators over a generated real-volume tick.
+  const { realVolumeStructuralCollectors } = await import("./fixtures/real-volume-tick.js");
+  const translators = await import("../src/fact-translators.js");
+  const { collectors } = realVolumeStructuralCollectors({ scale: 0.05 });
+  const evidence = await Promise.all(Object.values(collectors).map((collect) => collect()));
+  const ts = "2026-10-05T00:00:00.000Z";
+  const points = [
+    ...translators.factPointsFromServiceEvidence(evidence, { ts }),
+    ...translators.factPointsFromNetworkEvidence(evidence, { ts }),
+    ...translators.factPointsFromSessionEvidence(evidence, { ts }),
+    ...translators.factPointsFromVpnPeerEvidence(evidence, { ts }),
+    ...translators.factPointsFromTailscaleStatusEvidence(evidence, { ts }),
+    ...translators.factPointsFromProcessLineageEvidence(evidence, { ts }),
+    ...translators.factPointsFromScheduledJobsEvidence(evidence, { ts }),
+    ...translators.factPointsFromCanaryEvidence(evidence, { ts }),
+  ];
+  assert.ok(points.length > 0);
+  assert.doesNotThrow(() => groupFactPointsByFamily(points));
 });
