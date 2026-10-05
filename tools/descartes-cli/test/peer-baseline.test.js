@@ -267,12 +267,37 @@ test("groupPeerFactsByTick: orders tick-groups ascending by ts regardless of inp
 test("groupPeerFactsByTick (R8): Tailscale peer points sharing a tick with VPN peers are EXCLUDED from the peer count -- the vpn-peer-status availability signature does not cover tailscale-status, so its peers cannot be part of a regime-keyed count", () => {
   const ts = tickTs(0);
   const groups = groupPeerFactsByTick([
-    ...activeTickWithMarker(ts, 2),
     ...tailscalePoints(ts, [tailscalePeer(1), tailscalePeer(2)]),
+    ...activeTickWithMarker(ts, 2),
   ]);
   assert.equal(groups.length, 1);
   assert.equal(groups[0].count, 2, "only the 2 vpn-peer-status peers count; the 2 tailscale peers are excluded");
   assert.equal(groups[0].availabilitySignature, DEFAULT_SIGNATURE);
+});
+
+test("groupPeerFactsByTick (R8): a Tailscale overflow marker never caps the shared peer tick", () => {
+  const ts = tickTs(0);
+  const tailscaleOverflow = {
+    ...overflowMarkerPoint(ts),
+    source_envelope_id: "tailscale-status",
+  };
+  const groups = groupPeerFactsByTick([
+    ...tailscalePoints(ts, [tailscalePeer("one")]),
+    tailscaleOverflow,
+  ]);
+  assert.equal(groups[0].hasOverflow, false);
+  assert.equal(groups[0].count, 1);
+});
+
+test("R8: Tailscale-only markerless history still establishes and fires peer.count_spike", async () => {
+  const paths = await tempPaths();
+  const ticks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    ticks.push(...tailscalePoints(tickTs(i), [tailscalePeer(`${i}-a`), tailscalePeer(`${i}-b`)]));
+  }
+  ticks.push(...tailscalePoints(tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT), Array.from({ length: 40 }, (_, i) => tailscalePeer(`burst-${i}`))));
+  const { candidates } = await seedAndCompute(paths, ticks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT) });
+  assert.ok(candidates.some((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID));
 });
 
 test("R8 (calibration review): tailscale-status going 'unable' (no points, no marker) under an UNCHANGED vpn-peer availability signature must NOT fabricate a peer.count_drop", async () => {

@@ -348,9 +348,9 @@ export async function writePeerBaselineStore(descartesPaths, state) {
  *   - `count` is the number of NON-overflow, non-marker peer.presence points in this tick-group
  *     whose attributes.presence_state is NOT "observed_historical" — i.e. every point that is
  *     "observed_active" OR carries an unrecognized/missing presence_state (matching
- *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)) — and
- *     whose attributes.source_type is NOT "tailscale" (R8: tailscale-status is outside the
- *     availability signature, so its peers are never counted).
+ *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)). On a
+ *     tick with a VPN census marker, Tailscale points are excluded because that marker cannot vouch
+ *     for them; on a markerless Tailscale-only tick they remain part of the legacy count.
  *   - `hasOverflow` is true iff this tick-group carries the PEER_OVERFLOW_ENTITY_KEY marker.
  *   - `availabilitySignature` (Slice 4c) is the string carried by this tick-group's
  *     PEER_CENSUS_MARKER_ENTITY_KEY point's `attributes.availability_signature`, or `undefined`
@@ -382,10 +382,21 @@ export function groupPeerFactsByTick(points = []) {
   for (const point of points ?? []) {
     if (!point || point.fact_name !== PEER_FACT_NAME || typeof point.ts !== "string") continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, availabilitySignature: undefined, censusMarkerSeen: false });
+      byTs.set(point.ts, {
+        ts: point.ts,
+        count: 0,
+        vpnCount: 0,
+        tailscaleCount: 0,
+        hasOverflow: false,
+        availabilitySignature: undefined,
+        censusMarkerSeen: false,
+      });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === PEER_OVERFLOW_ENTITY_KEY) {
+      // R8: Tailscale has no availability signature and its overflow describes only its own
+      // source. It must not make the whole shared tick incomplete when a VPN census is present.
+      if (point.source_envelope_id === "tailscale-status") continue;
       group.hasOverflow = true;
       continue;
     }
@@ -413,18 +424,19 @@ export function groupPeerFactsByTick(points = []) {
       group.censusMarkerSeen = true;
       continue;
     }
-    // R8 (2026-10 calibration review): Tailscale peers are EXCLUDED from the count, in history and
-    // in the scored tick alike. tailscale-status emits no census marker and is not one of the five
-    // sources in vpn-peer-status's availability signature, so when it goes "unable" its translator
-    // emits nothing at all -- the summed count would step down while the regime key stayed
-    // identical, fabricating a peer.count_drop (and its recovery would fabricate a spike). A count
-    // the regime signature cannot vouch for must not be counted. The point still creates/joins its
-    // tick-group above (a tailscale-only tick stays a real zero-count group, unchanged), it just
-    // never adds to `count`.
-    if (point.attributes?.source_type === "tailscale") continue;
-    if (point.attributes?.presence_state !== "observed_historical") {
-      group.count += 1;
-    }
+    if (point.attributes?.presence_state === "observed_historical") continue;
+    if (point.attributes?.source_type === "tailscale") group.tailscaleCount += 1;
+    else group.vpnCount += 1;
+  }
+  for (const group of byTs.values()) {
+    // The marker may arrive after Tailscale points in facts.jsonl. Choose only after the complete
+    // group has been assembled, keeping Tailscale on markerless/legacy hosts and excluding it from
+    // the VPN-signed regime.
+    group.count = group.availabilitySignature !== undefined
+      ? group.vpnCount
+      : group.vpnCount + group.tailscaleCount;
+    delete group.vpnCount;
+    delete group.tailscaleCount;
   }
   return [...byTs.values()].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
 }
