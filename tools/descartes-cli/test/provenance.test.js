@@ -43,7 +43,17 @@ test("parseProcNetLine recognizes the all-zero IPv4 and IPv6 public-bind literal
   assert.equal(parseProcNetLine(v4, { protocol: "tcp" }).local_port, 80);
 
   const v6 = " 2: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 54322 1 0000000000000000 100 0 0 10 0";
-  assert.equal(parseProcNetLine(v6, { protocol: "tcp6" }).local_address, "[::]");
+  const parsedV6 = parseProcNetLine(v6, { protocol: "tcp6" });
+  assert.equal(parsedV6.local_address, "[::]");
+  assert.equal(parsedV6.protocol, "tcp6", "the proc source identifies the IPv6 transport family");
+});
+
+test("parseProcNetLine preserves udp6 while preserving the IPv6 wildcard", () => {
+  const v6 = " 2: 00000000000000000000000000000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 54323 1 0000000000000000 100 0 0 10 0";
+  const parsed = parseProcNetLine(v6, { protocol: "udp6" });
+  assert.equal(parsed.protocol, "udp6");
+  assert.equal(parsed.local_address, "[::]");
+  assert.equal(parsed.local_port, 5353);
 });
 
 test("parseProcNetLine skips malformed rows without throwing", () => {
@@ -68,7 +78,15 @@ test("resolvePidFromFdScanResults matches an inode to its owning pid for an acce
     { pid: 100, accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }, { fd: "4", target: "/dev/null" }] },
     { pid: 200, accessible: true, fds: [{ fd: "3", target: "socket:[99999]" }] },
   ];
-  assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), { status: "ok", pid: 100, confidence: 1 });
+  assert.deepEqual(resolvePidFromFdScanResults("12345", fdScanResults), { status: "ok", pid: 100, pids: [100], confidence: 1 });
+});
+
+test("resolvePidFromFdScanResults returns every pid holding the inode, not only the first match", () => {
+  const result = resolvePidFromFdScanResults("12345", [
+    { pid: 100, accessible: true, fds: [{ fd: "1", target: "socket:[12345]" }] },
+    { pid: 200, accessible: true, fds: [{ fd: "2", target: "socket:[12345]" }] },
+  ]);
+  assert.deepEqual(result.pids, [100, 200]);
 });
 
 test("resolvePidFromFdScanResults degrades to partial with no fabricated pid when the fd walk is EACCES", () => {
@@ -216,6 +234,7 @@ test("detectWarnings flags a public bind with no recognized supervisor, includin
   const record = { resolved: {}, source: { type: "shell" }, ancestry: [] };
   assert.ok(detectWarnings(record, [{ local_address: "0.0.0.0", local_port: 8080 }]).some((item) => item.rule_id === "public_bind_no_supervisor"));
   assert.ok(detectWarnings(record, [{ local_address: "[::]", local_port: 8080 }]).some((item) => item.rule_id === "public_bind_no_supervisor"));
+  assert.ok(detectWarnings(record, [{ local_address: "::", local_port: 8080 }]).some((item) => item.rule_id === "public_bind_no_supervisor"));
   assert.ok(detectWarnings(record, [{ local_address: "*", local_port: 5432 }]).some((item) => item.rule_id === "public_bind_no_supervisor"));
 });
 
@@ -400,6 +419,7 @@ test("resolveProvenance resolves this test process's own pid on a live macOS hos
 test("isPublicBindAddress recognizes only the pinned literal set", () => {
   assert.equal(isPublicBindAddress("0.0.0.0"), true);
   assert.equal(isPublicBindAddress("[::]"), true);
+  assert.equal(isPublicBindAddress("::"), true);
   assert.equal(isPublicBindAddress("*"), true);
   assert.equal(isPublicBindAddress("127.0.0.1"), false);
   assert.equal(isPublicBindAddress(undefined), false);

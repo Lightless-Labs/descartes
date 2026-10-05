@@ -13,10 +13,13 @@ import {
   computeProvenanceWarningCandidates,
   hashExecutablePath,
   listListeningSocketsWithPid,
+  listListeningSocketsWithPidStatus,
   provenanceWarningFactPoints,
   reduceLatestProvenanceWarnings,
   snapshotProvenanceProcesses,
+  snapshotProvenanceProcessesStatus,
 } from "../src/tools/provenance-warnings.js";
+import { MAX_LINUX_FD_SCAN_PIDS, MAX_LINUX_SOCKET_ROWS_PER_SOURCE } from "../src/tools/provenance.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-provenance-warnings-test-"));
@@ -349,17 +352,18 @@ test("hashExecutablePath produces a fixed-length hex digest and never echoes the
 test("listListeningSocketsWithPid('darwin', ...) parses a fixed lsof fixture into pid-attributed sockets", async () => {
   const lsofFixture = "COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n"
     + "node     1234 me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:3000 (LISTEN)\n"
-    + "launchd   431 root   10u  IPv6 0xdef              0t0  TCP 127.0.0.1:5000 (LISTEN)\n";
+    + "launchd   431 root   10u  IPv6 0xdef              0t0  TCP [::]:5000 (LISTEN)\n";
   const sockets = await listListeningSocketsWithPid("darwin", {
     runFixedExecFile: async (command, args) => {
       assert.equal(command, "lsof");
+      if (args.includes("-iUDP")) return { status: "ok", stdout: `${LSOF_HEADER}` };
       assert.deepEqual(args, ["-nP", "-iTCP", "-sTCP:LISTEN"]);
       return { status: "ok", stdout: lsofFixture };
     },
   });
   assert.deepEqual(sockets, [
     { protocol: "tcp", local_address: "0.0.0.0", local_port: 3000, pid: 1234 },
-    { protocol: "tcp", local_address: "127.0.0.1", local_port: 5000, pid: 431 },
+    { protocol: "tcp6", local_address: "[::]", local_port: 5000, pid: 431 },
   ]);
 });
 
@@ -420,6 +424,207 @@ test("snapshotProvenanceProcesses reuses the shared ps-argv/parse pair and degra
 
   const degraded = await snapshotProvenanceProcesses("darwin", { runFixedExecFile: async () => ({ status: "unable" }) });
   assert.deepEqual(degraded, []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Status-reporting collector siblings (provenance-identity recovery coverage, 2026-10): the
+// identity reconcile needs to tell "observed, possibly nothing" apart from "could not observe".
+// The legacy array-returning functions above stay byte-identical (the warnings collector relies on
+// them); these siblings surface every degradation as an explicit reason instead of a silent [].
+// ---------------------------------------------------------------------------------------------
+
+const LSOF_HEADER = "COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n";
+
+test("listListeningSocketsWithPidStatus('darwin'): a clean lsof census is status ok with its sockets", async () => {
+  const result = await listListeningSocketsWithPidStatus("darwin", {
+    runFixedExecFile: async (_command, args) => ({
+      status: "ok",
+      stdout: args.includes("-iUDP")
+        ? `${LSOF_HEADER}node     1234 me     24u  IPv4 0xabc              0t0  UDP 0.0.0.0:5353\nmdns     4321 me     25u  IPv6 0xdef              0t0  UDP *:*\n`
+        : `${LSOF_HEADER}node     1234 me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:3000 (LISTEN)\n`,
+    }),
+  });
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.reasons, []);
+  assert.deepEqual(result.sockets, [
+    { protocol: "tcp", local_address: "0.0.0.0", local_port: 3000, pid: 1234 },
+    { protocol: "udp", local_address: "0.0.0.0", local_port: 5353, pid: 1234 },
+  ]);
+});
+
+test("listListeningSocketsWithPidStatus('darwin'): UDP is inventoried and an unparseable lsof row degrades the census", async () => {
+  const result = await listListeningSocketsWithPidStatus("darwin", {
+    runFixedExecFile: async (_command, args) => ({
+      status: "ok",
+      stdout: args.includes("-iUDP")
+        ? `${LSOF_HEADER}node     1234 me     24u  IPv4 0xabc              0t0  UDP 0.0.0.0:5353\nBROKEN UDP ROW\n`
+        : LSOF_HEADER,
+    }),
+  });
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("lsof_unparseable"));
+  assert.deepEqual(result.sockets, [{ protocol: "udp", local_address: "0.0.0.0", local_port: 5353, pid: 1234 }]);
+});
+
+test("listListeningSocketsWithPidStatus('darwin'): lsof failure is DEGRADED, never a silent empty census", async () => {
+  const result = await listListeningSocketsWithPidStatus("darwin", {
+    runFixedExecFile: async () => ({ status: "unable", error: "ENOENT" }),
+  });
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["lsof_unavailable"]);
+  assert.deepEqual(result.sockets, []);
+});
+
+test("listListeningSocketsWithPidStatus('darwin'): a census truncated at the parse limit is DEGRADED (sockets past the limit are unobserved, not absent)", async () => {
+  const lines = Array.from({ length: 201 }, (_, i) => `svc     ${1000 + i} me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:${20000 + i} (LISTEN)`);
+  const result = await listListeningSocketsWithPidStatus("darwin", {
+    runFixedExecFile: async () => ({ status: "ok", stdout: `${LSOF_HEADER}${lines.join("\n")}\n` }),
+  });
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["lsof_truncated"]);
+  assert.equal(result.sockets.length, 200, "the bounded socket list is unchanged; only the status is honest about it");
+});
+
+test("listListeningSocketsWithPid('darwin') legacy wrapper stays byte-identical on a truncated census (still 200 sockets, no throw)", async () => {
+  const lines = Array.from({ length: 201 }, (_, i) => `svc     ${1000 + i} me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:${20000 + i} (LISTEN)`);
+  const sockets = await listListeningSocketsWithPid("darwin", {
+    runFixedExecFile: async () => ({ status: "ok", stdout: `${LSOF_HEADER}${lines.join("\n")}\n` }),
+  });
+  assert.equal(sockets.length, 200);
+});
+
+function linuxStatusOptions(overrides = {}) {
+  return {
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") return PROC_NET_TCP_LISTEN_OWN_UID;
+      if (file === "/proc/net/udp") return "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); // tcp6/udp6: IPv6 family absent
+    },
+    listProcPids: async () => [777],
+    scanProcFdForInode: async (pids) => pids.map((pid) => ({ pid, accessible: true, fds: [{ fd: "12", target: "socket:[12345]" }] })),
+    ...overrides,
+  };
+}
+
+test("listListeningSocketsWithPidStatus('linux'): every v4 /proc/net source read + ENOENT on the v6 sources (IPv6 family absent) is status ok", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions());
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.reasons, []);
+  assert.deepEqual(result.sockets, [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777, pids: [777], uid: 1000 }]);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): ENOENT on every /proc/net source is DEGRADED, including tcp", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["proc_net_unreadable"]);
+  assert.deepEqual(result.sockets, []);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): an unreadable v4 /proc/net source is DEGRADED", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("proc_net_unreadable"));
+});
+
+test("listListeningSocketsWithPidStatus('linux'): an unparseable /proc/net row is DEGRADED", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") return `${PROC_NET_TCP_LISTEN_OWN_UID}\nnot a proc net row`;
+      if (file === "/proc/net/udp") return "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("proc_net_unparseable"));
+});
+
+test("listListeningSocketsWithPidStatus('linux'): a socket census records every pid holding an inode", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    scanProcFdForInode: async (pids) => pids.map((pid) => ({
+      pid,
+      accessible: true,
+      fds: pid === 777 || pid === 778 ? [{ fd: "12", target: "socket:[12345]" }] : [],
+    })),
+    listProcPids: async () => [777, 778],
+  }));
+  assert.deepEqual(result.sockets[0].pids, [777, 778]);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): a non-ENOENT failure on a v6 /proc/net source is DEGRADED", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") return PROC_NET_TCP_LISTEN_OWN_UID;
+      if (file === "/proc/net/tcp6") throw Object.assign(new Error("EIO"), { code: "EIO" });
+      if (file === "/proc/net/udp") return "";
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["proc_net_unreadable"]);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): a pid-enumeration throw is DEGRADED (caught, not propagated) while the legacy wrapper still throws (fail-closed envelope preserved)", async () => {
+  const options = linuxStatusOptions({ listProcPids: async () => { throw Object.assign(new Error("ENOENT /proc"), { code: "ENOENT" }); } });
+  const result = await listListeningSocketsWithPidStatus("linux", options);
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["proc_pid_enumeration_failed"]);
+  await assert.rejects(() => listListeningSocketsWithPid("linux", options));
+});
+
+test("listListeningSocketsWithPidStatus('linux'): a pid list at the fd-scan cap is DEGRADED (owners past the cap are unobserved)", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    listProcPids: async () => Array.from({ length: MAX_LINUX_FD_SCAN_PIDS }, (_, i) => i + 2),
+  }));
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["proc_pid_scan_truncated"]);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): raw /proc/net socket rows are bounded and overflow is DEGRADED", async () => {
+  const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+  const rows = Array.from({ length: MAX_LINUX_SOCKET_ROWS_PER_SOURCE + 1 }, (_, index) => {
+    const port = (10000 + index).toString(16).padStart(4, "0");
+    return ` ${index}: 00000000:${port} 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 ${60000 + index} 1 0000000000000000 100 0 0 10 0`;
+  }).join("\n");
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") return `${header}\n${rows}`;
+      if (file === "/proc/net/udp") return `${header}\n`;
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("proc_net_truncated"));
+  assert.equal(result.sockets.length, MAX_LINUX_SOCKET_ROWS_PER_SOURCE);
+});
+
+test("listListeningSocketsWithPidStatus: an unsupported platform is DEGRADED, never an empty ok census", async () => {
+  const result = await listListeningSocketsWithPidStatus("win32", {});
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["unsupported_platform"]);
+});
+
+test("snapshotProvenanceProcessesStatus: ok with processes on success; DEGRADED (not a silent []) when ps fails or parses empty", async () => {
+  const ok = await snapshotProvenanceProcessesStatus("darwin", {
+    runFixedExecFile: async () => ({ status: "ok", stdout: "  PID  PPID  UID  %CPU  %MEM  RSS UCOMM ARGS\n    1     0    0   0.0   0.0    0 launchd /sbin/launchd\n" }),
+  });
+  assert.equal(ok.status, "ok");
+  assert.equal(ok.processes.length, 1);
+
+  const failed = await snapshotProvenanceProcessesStatus("darwin", { runFixedExecFile: async () => ({ status: "unable" }) });
+  assert.equal(failed.status, "degraded");
+  assert.deepEqual(failed.reasons, ["ps_unavailable"]);
+  assert.deepEqual(failed.processes, []);
+
+  const empty = await snapshotProvenanceProcessesStatus("darwin", { runFixedExecFile: async () => ({ status: "ok", stdout: "  PID  PPID  UID\n" }) });
+  assert.equal(empty.status, "degraded");
+  assert.deepEqual(empty.reasons, ["ps_empty"]);
 });
 
 // ---------------------------------------------------------------------------------------------

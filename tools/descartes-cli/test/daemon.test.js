@@ -37,7 +37,7 @@ import { alertId, readAlertRecords, writeAlertRecords } from "../src/alert-store
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-baseline.js";
 import { readShadowRecords, resolveShadowStorePaths } from "../src/shadow-store.js";
 import { DELETED_EXE_RULE_ID, PUBLIC_BIND_RULE_ID } from "../src/tools/provenance-warnings.js";
-import { UNKNOWN_IDENTITY_RULE_ID, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
+import { UNKNOWN_IDENTITY_RULE_ID, loadSignatureStore, reconcileSignatures, resolveSignatureStorePaths, writeSignatureStore } from "../src/provenance-store.js";
 import { computeProvenanceIdentityCandidates } from "../src/tools/provenance-identity.js";
 import { resolvePeerSignatureStorePaths } from "../src/peer-signature-store.js";
 import {
@@ -2143,8 +2143,9 @@ test("Slice 3 MUST-FIX 4(a) store-separation: peer ticks never write signatures.
   // (3) computeProvenanceIdentityCandidates (already wired into daemon.js's extraCandidates)
   // emits zero candidates from peer-only fact-history — the day-1 gate alone guarantees this
   // (signatures.json was never bootstrapped), independent of anything peer-shaped ever appearing.
-  const identityCandidates = await computeProvenanceIdentityCandidates(paths, { now: Date.parse("2026-05-24T00:00:00.000Z") });
-  assert.deepEqual(identityCandidates, []);
+  // §8.B: the producer now returns { candidates, evaluatedAlertKeys }; unbootstrapped -> neither.
+  const identityResult = await computeProvenanceIdentityCandidates(paths, { now: Date.parse("2026-05-24T00:00:00.000Z") });
+  assert.deepEqual(identityResult, { candidates: [], evaluatedAlertKeys: [] });
 });
 
 test("Tailscale-only peer ticks never write signatures.json or peer-signatures.json", async () => {
@@ -2323,6 +2324,45 @@ test("S5 load-bearing: a fixed-rule alert and a confirmed-unknown-identity alert
   assert.equal(fixedSecond.status, "active");
   assert.ok(identitySecond, "expected the identity alert to remain active");
   assert.equal(identitySecond.status, "active");
+});
+
+// 2026-10 provenance-identity recovery coverage (plan 2026-09-20 §8, DEFERRED item): end-to-end
+// through the REAL daemon recovery gate. The identity collector is injected via the producer's own
+// DI seam (runDaemonIteration passes its options through to every producer). An aged-out identity
+// simply stopping as a candidate is never recovery authority: even a later successful empty census
+// leaves the alert frozen until the operator acknowledges it.
+test("provenance-identity coverage end-to-end: a persisted unknown_identity alert stays FROZEN across degraded and successful absence-only reconciles", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const t0 = "2026-05-24T00:00:00.000Z";
+  await seedConfirmedUnknownIdentity(paths, t0);
+  const at = (hours) => new Date(Date.parse(t0) + hours * 60 * 60 * 1000).toISOString();
+  const tick = (ts, collectIdentityObservations) => runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts,
+    now: ts,
+    collectIdentityObservations,
+  });
+
+  // Tick 1 (not due: the seeded store was reconciled at t0): the confirmed identity fires.
+  const first = await tick(t0, async () => { throw new Error("must not collect inside the reconcile interval"); });
+  const fired = first.alerts.alerts.find((a) => a.rule_id === UNKNOWN_IDENTITY_RULE_ID);
+  assert.ok(fired, "expected the confirmed-unknown identity to fire");
+  assert.equal(fired.status, "active");
+
+  // Tick 2 (due, 4h later, past the 3h presence window): the host collection DEGRADES. The identity
+  // is no longer a candidate, but nothing genuinely re-observed the host -> frozen, not recovered.
+  const degraded = await tick(at(4), async () => ({ status: "degraded", observations: [], reasons: ["lsof_unavailable"] }));
+  const frozen = degraded.alerts.alerts.find((a) => a.id === fired.id);
+  assert.equal(frozen.status, "active", "a degraded collection must never recover the identity alert (no fabricated clear)");
+  const { store: afterDegraded } = await loadSignatureStore(paths);
+  assert.equal(afterDegraded.last_reconciled_at, t0, "a degraded collection must not advance last_reconciled_at");
+
+  // Tick 3 (due again, an interval after the degraded ATTEMPT): a successful census that does not
+  // see the identity still supplies no positive same-record re-observation, so it remains frozen.
+  const recovered = await tick(at(5.1), async () => ({ status: "ok", observations: [], reasons: [] }));
+  assert.equal(recovered.alerts.alerts.find((a) => a.id === fired.id).status, "active");
 });
 
 // ---------------------------------------------------------------------------------------------

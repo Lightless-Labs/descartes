@@ -64,9 +64,9 @@ export const DEFAULT_STABLE_ITERATION_THRESHOLD = 2;
 // (daemon downtime, a slow/loaded host, a skipped tick) before an identity is ever treated as
 // gone. Once a process exits or a socket closes, its record's last_seen stops advancing (see
 // applyIdentityObservation below, which always sets last_seen := the current reconcile's own ts
-// on every fold) -- once this window elapses without a fresh observation,
-// deriveIdentityCandidates stops emitting a candidate for it, and applyAlertCandidates recovers
-// the alert on the following tick (see deriveIdentityCandidates below).
+// on every fold) -- once this window elapses without a fresh observation, deriveIdentityCandidates
+// stops emitting a candidate for it. That age-out is not recovery authority: the alert remains
+// frozen until the same identity is positively re-observed and clear, or acknowledged.
 export const DEFAULT_IDENTITY_PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 // Bounded, operator-introspection-only lists on each signature record -- never authoritative,
@@ -74,6 +74,15 @@ export const DEFAULT_IDENTITY_PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
 export const MAX_TARGET_EXAMPLES = 5;
 export const MAX_PORT_TARGET_KEYS = 5;
 export const MAX_BASELINE_SHOW_ENTRIES = 50;
+
+function normalizePortTargetKey(value) {
+  const text = String(value ?? "");
+  const separator = text.indexOf(".");
+  if (separator < 1) return text;
+  const protocol = text.slice(0, separator).toLowerCase();
+  const normalizedProtocol = protocol === "tcp4" ? "tcp" : protocol === "udp4" ? "udp" : protocol;
+  return `${normalizedProtocol}${text.slice(separator)}`;
+}
 
 // Fixed-length hash output, consistent with sanitizeDiagnostics' fixed-length-hash allowlist
 // (diagnostics-sanitizer.js's HEX_HASH_LENGTHS includes 16 -- the same length alertId() and
@@ -202,11 +211,22 @@ export function applyIdentityObservation(existingRecord, observation = {}, optio
     targetExamples = boundedPushUnique(targetExamples, observation.target, MAX_TARGET_EXAMPLES, targetExampleEqual);
   }
 
-  let portTargetKeys = existingRecord?.port_target_keys ?? [];
+  let portTargetKeys = [...new Set((existingRecord?.port_target_keys ?? []).map(normalizePortTargetKey).filter(Boolean))];
+  let portTargetKeysTruncated = existingRecord?.port_target_keys_truncated === true;
   for (const key of Array.isArray(observation.portTargetKeys) ? observation.portTargetKeys : []) {
-    if (!key) continue;
-    portTargetKeys = boundedPushUnique(portTargetKeys, key, MAX_PORT_TARGET_KEYS, stringEqual);
+    const normalizedKey = normalizePortTargetKey(key);
+    if (!normalizedKey) continue;
+    if (!portTargetKeys.includes(normalizedKey) && portTargetKeys.length >= MAX_PORT_TARGET_KEYS) portTargetKeysTruncated = true;
+    portTargetKeys = boundedPushUnique(portTargetKeys, normalizedKey, MAX_PORT_TARGET_KEYS, stringEqual);
   }
+  const currentPortTargetKeys = Object.hasOwn(options, "currentPortTargetKeys")
+    ? [...new Set((Array.isArray(options.currentPortTargetKeys) ? options.currentPortTargetKeys : []).map(normalizePortTargetKey).filter(Boolean))].slice(0, MAX_PORT_TARGET_KEYS)
+    : Array.isArray(observation.portTargetKeys)
+    ? [...new Set(observation.portTargetKeys.map(normalizePortTargetKey).filter(Boolean))].slice(0, MAX_PORT_TARGET_KEYS)
+    : (existingRecord?.current_port_target_keys ?? []).map(normalizePortTargetKey).slice(0, MAX_PORT_TARGET_KEYS);
+  const currentPortTargetKeysTruncated = options.currentPortTargetKeysTruncated === true
+    || (Array.isArray(options.currentPortTargetKeys) && new Set(options.currentPortTargetKeys.map(normalizePortTargetKey).filter(Boolean)).size > MAX_PORT_TARGET_KEYS)
+    || existingRecord?.current_port_target_keys_truncated === true;
 
   return {
     kind: "signature",
@@ -236,6 +256,9 @@ export function applyIdentityObservation(existingRecord, observation = {}, optio
     // Additive (S5 implementation detail): bounded list of "protocol.port" strings this identity
     // has been observed publicly serving -- drives new_public_bind's reverse-index lookup below.
     port_target_keys: portTargetKeys,
+    port_target_keys_truncated: portTargetKeysTruncated,
+    current_port_target_keys: currentPortTargetKeys,
+    current_port_target_keys_truncated: currentPortTargetKeysTruncated,
   };
 }
 
@@ -269,15 +292,34 @@ async function readJsonFile(file) {
   }
 }
 
+// Reconcile bookkeeping (2026-10, provenance-identity recovery coverage). `last_reconciled_at` means
+// "last SUCCESSFUL, complete host re-observation" ONLY -- it is never advanced by a degraded
+// collection. `last_reconcile_attempt_at` is the rate-limit clock (advanced on EVERY attempted
+// reconcile, so a persistently degraded host still performs bounded, hourly host I/O rather than
+// retrying lsof/ps on every fast tick). `last_reconcile_status` / `last_reconcile_degraded_reasons`
+// are operator-introspection only (fixed reason-code enum strings, bounded).
+export const RECONCILE_STATUSES = Object.freeze(["ok", "degraded"]);
+export const MAX_RECONCILE_DEGRADED_REASONS = 8;
+const RECONCILE_REASON_PATTERN = /^[a-z0-9_]{1,64}$/;
+
 export function normalizeSignatureStore(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const signatures = base.signatures && typeof base.signatures === "object" && !Array.isArray(base.signatures) ? base.signatures : {};
-  return {
+  const normalized = {
     version: SCHEMA_VERSION,
     bootstrapped_at: typeof base.bootstrapped_at === "string" ? base.bootstrapped_at : undefined,
     last_reconciled_at: typeof base.last_reconciled_at === "string" ? base.last_reconciled_at : undefined,
     signatures,
   };
+  // Additive keys are emitted ONLY when present + valid, so a legacy store normalizes unchanged.
+  if (typeof base.last_reconcile_attempt_at === "string") normalized.last_reconcile_attempt_at = base.last_reconcile_attempt_at;
+  if (RECONCILE_STATUSES.includes(base.last_reconcile_status)) normalized.last_reconcile_status = base.last_reconcile_status;
+  if (Array.isArray(base.last_reconcile_degraded_reasons)) {
+    normalized.last_reconcile_degraded_reasons = base.last_reconcile_degraded_reasons
+      .filter((reason) => typeof reason === "string" && RECONCILE_REASON_PATTERN.test(reason))
+      .slice(0, MAX_RECONCILE_DEGRADED_REASONS);
+  }
+  return normalized;
 }
 
 /**
@@ -338,13 +380,17 @@ export async function writeSignatureStore(descartesPaths, store) {
 // identityHash:undefined exactly as before S5-follow-2, preserving S5-follow-1's own
 // DEGRADE-NOT-FABRICATE contract (still tracked, still eligible to promote/fire like any other
 // identity -- degrade-to-unfingerprinted, never degrade-to-invisible).
-function isTransientStatFailureOfKnownIdentity(signatures, observation) {
-  if (observation?.identityHash !== undefined) return false;
+// Returns the identity hashes of every already-fingerprinted record an identityHash:undefined
+// observation could be (same hashed path/owner + source). Shared by the fold-time skip below and by
+// The fold-time skip treats an unverified observation as not observed; the stored identity record
+// remains untouched for this reconcile.
+function unverifiedObservationMatches(signatures, observation) {
+  if (observation?.identityHash !== undefined) return [];
   const executablePathHash = hashIdentityField(observation?.executablePath);
-  if (!executablePathHash) return false;
+  if (!executablePathHash) return [];
   const owningUserHash = hashIdentityField(observation?.owningUser);
   const sourceClassification = observation?.sourceClassification;
-  return Object.values(signatures ?? {}).some((record) => {
+  return Object.entries(signatures ?? {}).filter(([, record]) => {
     const inputs = record?.inputs_hash ?? {};
     return (
       inputs.identity_hash !== undefined
@@ -352,7 +398,11 @@ function isTransientStatFailureOfKnownIdentity(signatures, observation) {
       && inputs.owning_user_hash === owningUserHash
       && inputs.source_classification === sourceClassification
     );
-  });
+  }).map(([identityHash]) => identityHash);
+}
+
+function isTransientStatFailureOfKnownIdentity(signatures, observation) {
+  return unverifiedObservationMatches(signatures, observation).length > 0;
 }
 
 /**
@@ -365,22 +415,66 @@ function isTransientStatFailureOfKnownIdentity(signatures, observation) {
  * re-baseline" (plan section 5 safety note) actually clear a previously-firing identity_drift.
  */
 export function reconcileSignatures(store, observations = [], options = {}) {
+  return reconcileSignaturesDetailed(store, observations, options).store;
+}
+
+/**
+ * reconcileSignatures plus an honest account of what was NOT folded (2026-10, recovery coverage):
+ * `{ store, skippedObservations }`, where `skippedObservations` are the observations dropped by the
+ * S5-follow-2 transient-stat-failure guard. Such an observation means "a process matching a
+ * fingerprinted identity is running but could not be VERIFIED this reconcile" -- the matching
+ * record was NOT re-observed (its last_seen does not advance). The producer is safe-frozen, so
+ * this can never authorize a recovery key or clear any target it could be holding.
+ */
+export function reconcileSignaturesDetailed(store, observations = [], options = {}) {
   const ts = options.ts ?? new Date().toISOString();
   const iterationKey = String(options.iterationKey ?? ts);
   const signatures = { ...(store?.signatures ?? {}) };
   const seededHashes = new Set();
+  const skippedObservations = [];
+  const foldableObservations = [];
+  const currentPortsByIdentity = new Map();
 
   for (const observation of observations ?? []) {
     // S5-follow-2, Part B (see isTransientStatFailureOfKnownIdentity above): a transient stat
     // failure on an already-fingerprinted identity is skipped entirely for this reconcile, rather
     // than folded in as a differently-signatured (and therefore spuriously new/drifted) identity.
-    if (isTransientStatFailureOfKnownIdentity(signatures, observation)) continue;
+    if (isTransientStatFailureOfKnownIdentity(signatures, observation)) {
+      skippedObservations.push(observation);
+      continue;
+    }
     const identityHash = computeIdentitySignature(observation);
+    foldableObservations.push({ observation, identityHash });
+    if (Array.isArray(observation.portTargetKeys)) {
+      if (!currentPortsByIdentity.has(identityHash)) currentPortsByIdentity.set(identityHash, { keys: new Set(), truncated: false });
+      const currentPorts = currentPortsByIdentity.get(identityHash);
+      for (const portKey of observation.portTargetKeys) {
+        const normalizedKey = normalizePortTargetKey(portKey);
+        if (!normalizedKey || currentPorts.keys.has(normalizedKey)) continue;
+        if (currentPorts.keys.size >= MAX_PORT_TARGET_KEYS) {
+          currentPorts.truncated = true;
+          continue;
+        }
+        currentPorts.keys.add(normalizedKey);
+      }
+    }
+  }
+
+  for (const { observation, identityHash } of foldableObservations) {
     seededHashes.add(identityHash);
     const existing = signatures[identityHash];
+    const foldOptions = { ...options, ts, iterationKey };
+    if (currentPortsByIdentity.has(identityHash)) {
+      // One identity signature can represent several same-key PIDs in a single census. The
+      // current port set is per identity/tick, not per last folded PID; otherwise a listenerless
+      // sibling processed last would erase a live sibling's public bind.
+      const currentPorts = currentPortsByIdentity.get(identityHash);
+      foldOptions.currentPortTargetKeys = [...currentPorts.keys];
+      foldOptions.currentPortTargetKeysTruncated = currentPorts.truncated;
+    }
     signatures[identityHash] = options.seedKnownGood
-      ? seedKnownGoodIdentity(existing, observation, { ...options, ts, iterationKey })
-      : applyIdentityObservation(existing, observation, { ...options, ts, iterationKey });
+      ? seedKnownGoodIdentity(existing, observation, foldOptions)
+      : applyIdentityObservation(existing, observation, foldOptions);
   }
 
   if (options.seedKnownGood && seededHashes.size > 0) {
@@ -389,14 +483,14 @@ export function reconcileSignatures(store, observations = [], options = {}) {
       const record = signatures[identityHash];
       const processKey = record?.inputs_hash?.executable_path_hash;
       if (processKey) seededTargetKeys.add(`process.${processKey}`);
-      for (const portKey of record?.port_target_keys ?? []) seededTargetKeys.add(`port.${portKey}`);
+      for (const portKey of record?.port_target_keys ?? []) seededTargetKeys.add(`port.${normalizePortTargetKey(portKey)}`);
     }
     for (const [identityHash, record] of Object.entries(signatures)) {
       if (seededHashes.has(identityHash) || record.state !== "known_good") continue;
       const processKey = record.inputs_hash?.executable_path_hash;
       const recordKeys = [
         processKey ? `process.${processKey}` : undefined,
-        ...(record.port_target_keys ?? []).map((key) => `port.${key}`),
+        ...(record.port_target_keys ?? []).map((key) => `port.${normalizePortTargetKey(key)}`),
       ].filter(Boolean);
       if (recordKeys.some((key) => seededTargetKeys.has(key))) {
         signatures[identityHash] = { ...record, state: "retired" };
@@ -405,16 +499,36 @@ export function reconcileSignatures(store, observations = [], options = {}) {
   }
 
   return {
-    version: SCHEMA_VERSION,
-    bootstrapped_at: options.seedKnownGood ? ts : store?.bootstrapped_at,
-    last_reconciled_at: store?.last_reconciled_at,
-    signatures,
+    store: {
+      version: SCHEMA_VERSION,
+      bootstrapped_at: options.seedKnownGood ? ts : store?.bootstrapped_at,
+      last_reconciled_at: store?.last_reconciled_at,
+      signatures,
+    },
+    skippedObservations,
   };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Candidate derivation (pure -- operates only on an already-loaded store snapshot).
 // ---------------------------------------------------------------------------------------------
+
+// Fingerprint helpers: the single source of each rule's candidate fingerprint. Each returns
+// `undefined` when no safe fingerprint exists; builders then use the shared "unknown" fallback.
+export function unknownIdentityFingerprint(identityHash) {
+  return typeof identityHash === "string" && identityHash ? identityHash : undefined;
+}
+
+export function newPublicBindFingerprint(portKey) {
+  return sanitizeIdentityString(`port.${normalizePortTargetKey(portKey)}`);
+}
+
+export function identityDriftFingerprint(targetKey) {
+  const normalizedTarget = String(targetKey ?? "").startsWith("port.")
+    ? `port.${normalizePortTargetKey(String(targetKey).slice("port.".length))}`
+    : targetKey;
+  return sanitizeIdentityString(normalizedTarget);
+}
 
 function groupKnownGoodByTargetKey(signatures) {
   const groups = new Map();
@@ -426,13 +540,13 @@ function groupKnownGoodByTargetKey(signatures) {
     if (record.state !== "known_good") continue;
     const processKey = record.inputs_hash?.executable_path_hash;
     if (processKey) pushEntry(`process.${processKey}`, { identityHash, record });
-    for (const portKey of record.port_target_keys ?? []) pushEntry(`port.${portKey}`, { identityHash, record });
+    for (const portKey of record.port_target_keys ?? []) pushEntry(`port.${normalizePortTargetKey(portKey)}`, { identityHash, record });
   }
   return groups;
 }
 
 function buildUnknownIdentityCandidate(identityHash, record) {
-  const fingerprint = identityHash;
+  const fingerprint = unknownIdentityFingerprint(identityHash) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     identity_hash: identityHash,
     source_type: record.inputs_hash?.source_classification,
@@ -452,9 +566,10 @@ function buildUnknownIdentityCandidate(identityHash, record) {
 }
 
 function buildNewPublicBindCandidate(identityHash, record, portKey) {
-  const [protocol, portStr] = String(portKey).split(".");
+  const normalizedPortKey = normalizePortTargetKey(portKey);
+  const [protocol, portStr] = String(normalizedPortKey).split(".");
   const localPort = Number(portStr);
-  const fingerprint = sanitizeIdentityString(`port.${portKey}`) ?? "unknown";
+  const fingerprint = newPublicBindFingerprint(normalizedPortKey) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     identity_hash: identityHash,
     protocol,
@@ -475,7 +590,7 @@ function buildNewPublicBindCandidate(identityHash, record, portKey) {
 
 function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
   const targetKind = targetKey.startsWith("port.") ? "port" : "process";
-  const fingerprint = sanitizeIdentityString(targetKey) ?? "unknown";
+  const fingerprint = identityDriftFingerprint(targetKey) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     old_identity_hash: staleEntry.identityHash,
     new_identity_hash: currentEntry.identityHash,
@@ -527,18 +642,17 @@ function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
  * In the interim S4's deleted_exe_running rule already catches the common "FD still open to a
  * deleted inode" swap.
  *
- * RECOVERY (S5-follow-2, Codex review finding #5, Part A): a candidate is only ever emitted for a
+ * CANDIDATE PRESENCE (S5-follow-2, Codex review finding #5, Part A): a candidate is only ever emitted for a
  * record (or, for identity_drift, for EACH SIDE of the comparison) whose `last_seen` is recent --
  * within `options.presenceWindowMs` (default DEFAULT_IDENTITY_PRESENCE_WINDOW_MS, see its own doc
  * comment) of `options.now` (default Date.now()). applyIdentityObservation always refreshes
  * last_seen on every successful fold, so a still-running process/still-open socket keeps its
  * record's last_seen current every reconcile; once a process exits or a socket closes, that
  * record simply stops being observed, last_seen stops advancing, and once it falls outside the
- * presence window this function stops emitting a candidate for it -- which is what lets
- * applyAlertCandidates recover the corresponding alert on the next tick. For identity_drift
- * specifically, BOTH sides of a target-key group must be currently present for drift to fire --
- * once the stale (superseded) identity ages out of the window, drift resolves even if the current
- * identity is still very much present.
+ * presence window this function stops emitting a candidate for it. That only stops re-emission; it
+ * does not authorize alert recovery. For identity_drift specifically, BOTH sides of a target-key
+ * group must be currently present for drift to fire, but an absent or superseded side never clears
+ * the alert through evaluatedAlertKeys.
  */
 export function deriveIdentityCandidates(store, options = {}) {
   const signatures = store?.signatures ?? {};
@@ -556,8 +670,8 @@ export function deriveIdentityCandidates(store, options = {}) {
     if (record.state !== "known_good" || record.origin !== "grace_window") continue;
     if (!isPresent(record)) continue; // Recovered: unseen for longer than the presence window.
     candidates.push(buildUnknownIdentityCandidate(identityHash, record));
-    for (const portKey of record.port_target_keys ?? []) {
-      candidates.push(buildNewPublicBindCandidate(identityHash, record, portKey));
+    for (const portKey of record.current_port_target_keys ?? record.port_target_keys ?? []) {
+      candidates.push(buildNewPublicBindCandidate(identityHash, record, normalizePortTargetKey(portKey)));
     }
   }
 
@@ -572,6 +686,13 @@ export function deriveIdentityCandidates(store, options = {}) {
   }
 
   return candidates;
+}
+
+// Provenance identity recovery is deliberately safe-frozen. Keep this compatibility seam
+// fail-closed for old callers and fixtures, but do not retain any positive-clear derivation here:
+// no observation, census, sibling fold, or absence claim may produce an evaluated alert key.
+export function deriveIdentityCoverage() {
+  return [];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -630,15 +751,37 @@ async function runSnapshot(descartesPaths, args, runtime) {
     }
   }
 
-  const gather = runtime.gatherIdentityObservations
-    ?? (await import("./tools/provenance-identity.js")).gatherIdentityObservations;
-  const observations = await gather(runtime);
+  const legacyArrayInjection = Object.hasOwn(runtime, "listListeningSocketsWithPid")
+    || Object.hasOwn(runtime, "snapshotProvenanceProcesses");
+  if (legacyArrayInjection && runtime.allowLegacyArrayCensus !== true) {
+    throw new Error("Provenance snapshot refused: legacy array census injection is degraded unless explicitly opted in");
+  }
+
+  const collect = runtime.collectIdentityObservations
+    ?? (await import("./tools/provenance-identity.js")).collectIdentityObservations;
+  const collection = await collect({ ...runtime, allowLegacyArrayCensus: runtime.allowLegacyArrayCensus === true });
+  const observations = Array.isArray(collection?.observations) ? collection.observations : [];
+  if (collection?.status !== "ok" || !Array.isArray(collection?.observations)) {
+    const reasons = Array.isArray(collection?.reasons) && collection.reasons.length > 0
+      ? collection.reasons.join(",")
+      : "malformed_collection";
+    throw new Error(`Provenance snapshot refused: identity collection degraded (${reasons})`);
+  }
 
   const loadStore = runtime.loadSignatureStore ?? loadSignatureStore;
   const { store } = await loadStore(descartesPaths);
   const ts = runtime.now ? new Date(runtime.now).toISOString() : new Date().toISOString();
   const reconciled = reconcileSignatures(store, observations, { ts, iterationKey: ts, seedKnownGood: true });
-  const nextStore = { ...reconciled, bootstrapped_at: ts, last_reconciled_at: ts };
+  const preservedReconcileBookkeeping = {};
+  for (const key of ["last_reconcile_attempt_at", "last_reconcile_status", "last_reconcile_degraded_reasons"]) {
+    if (Object.hasOwn(store, key)) preservedReconcileBookkeeping[key] = store[key];
+  }
+  const nextStore = {
+    ...reconciled,
+    ...preservedReconcileBookkeeping,
+    bootstrapped_at: ts,
+    last_reconciled_at: ts,
+  };
 
   const writeStore = runtime.writeSignatureStore ?? writeSignatureStore;
   await writeStore(descartesPaths, nextStore);

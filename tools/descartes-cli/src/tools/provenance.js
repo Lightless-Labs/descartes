@@ -14,7 +14,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, readlink, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
-import { parseMacLsofListeningSockets } from "./network.js";
+import { normalizeSocketAddress, normalizeSocketProtocol, parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
 import { defaultInvokeElevatedHelper, readPtraceScopeDiagnostic, resolveElevated } from "./provenance-elevated.js";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig } from "../provenance-elevated-config.js";
@@ -27,7 +27,11 @@ const execFileAsync = promisify(execFile);
 // `ucomm` alias, so one column set works unmodified on both platforms.
 const PROVENANCE_PS_COLUMNS = "pid,ppid,uid,pcpu,pmem,rss,ucomm,args";
 const MAX_ANCESTRY_DEPTH = 16;
-const MAX_LINUX_FD_SCAN_PIDS = 4096;
+// Exported (additive, 2026-10 provenance-identity recovery coverage): the status-reporting socket
+// lister in provenance-warnings.js needs this cap to detect a TRUNCATED pid scan (owners past the
+// cap are unobserved, not absent).
+export const MAX_LINUX_FD_SCAN_PIDS = 4096;
+export const MAX_LINUX_SOCKET_ROWS_PER_SOURCE = 4096;
 
 const CRON_COMMS = new Set(["cron", "crond", "atd"]);
 const SHELL_COMMS = new Set(["bash", "zsh", "sh", "fish"]);
@@ -174,7 +178,7 @@ export function classifySourceFromAncestry(ancestryChain = []) {
 // ---------------------------------------------------------------------------------------------
 
 export function isPublicBindAddress(address) {
-  return PUBLIC_BIND_ADDRESSES.has(String(address));
+  return PUBLIC_BIND_ADDRESSES.has(normalizeSocketAddress(address));
 }
 
 // Exported (additive, S4) so callers that need to know "is this source type a recognized
@@ -263,44 +267,62 @@ export function parseProcNetLine(line, { protocol } = {}) {
   if (parts.length < 10) return undefined;
 
   const [localHex, localPortHex] = String(parts[1] ?? "").split(":");
-  if (!localHex || localPortHex === undefined) return undefined;
+  if (!localHex || !/^[0-9A-Fa-f]+$/.test(localHex) || localPortHex === undefined || !/^[0-9A-Fa-f]+$/.test(localPortHex)) return undefined;
 
   const isV6 = String(protocol ?? "").includes("6") || localHex.length === 32;
   const address = isV6 ? decodeProcNetIPv6(localHex) : decodeProcNetIPv4(localHex);
   const localPort = parseInt(localPortHex, 16);
-  if (address === undefined || Number.isNaN(localPort)) return undefined;
+  if (address === undefined || Number.isNaN(localPort) || localPort > 65535) return undefined;
 
   const stateHex = String(parts[3] ?? "").toUpperCase();
   const uid = Number(parts[7]);
   const inode = parts[9];
+  if (!/^\d+:$/.test(String(parts[0] ?? ""))
+    || !/^[0-9A-F]{2}$/.test(stateHex)
+    || !/^\d+$/.test(String(parts[7] ?? ""))
+    || !/^\d+$/.test(String(inode ?? ""))) return undefined;
 
   return {
-    protocol: protocol ?? (isV6 ? "tcp6" : "tcp"),
-    local_address: address,
+    protocol: normalizeSocketProtocol(protocol ?? (isV6 ? "tcp6" : "tcp")),
+    local_address: normalizeSocketAddress(address),
     local_port: localPort,
-    state: String(protocol ?? "").startsWith("udp") ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
+    state: normalizeSocketProtocol(protocol ?? (isV6 ? "tcp6" : "tcp")).startsWith("udp") ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
     uid: Number.isFinite(uid) ? uid : undefined,
     inode,
   };
 }
 
 export function parseProcNetContents(contents, { protocol } = {}) {
-  const lines = String(contents ?? "").split("\n").slice(1);
-  return lines.map((line) => (line.trim() ? parseProcNetLine(line, { protocol }) : undefined)).filter(Boolean);
+  return parseProcNetContentsDetailed(contents, { protocol }).entries;
+}
+
+export function parseProcNetContentsDetailed(contents, { protocol, limit = Number.MAX_SAFE_INTEGER } = {}) {
+  const lines = String(contents ?? "").split("\n").slice(1).filter((line) => line.trim());
+  const boundedLines = lines.slice(0, limit + 1);
+  const entries = [];
+  let rejected = 0;
+  for (const line of boundedLines) {
+    const entry = parseProcNetLine(line, { protocol });
+    if (entry) entries.push(entry);
+    else rejected += 1;
+  }
+  return { entries: entries.slice(0, limit), rejected, truncated: lines.length > limit };
 }
 
 // Pure inode->pid matcher over an already-performed fd scan. fdScanResults is
 // [{ pid, accessible: bool, fds?: [{ fd, target }] }, ...] — accessible:false represents an
 // EACCES (cross-UID, permission-limited) /proc/<pid>/fd readdir. Never fabricates a pid.
 export function resolvePidFromFdScanResults(targetInode, fdScanResults = []) {
+  const pids = [];
   for (const entry of fdScanResults) {
     if (entry.accessible === false) continue;
     const match = (entry.fds ?? []).find((fd) => fd.target === `socket:[${targetInode}]`);
-    if (match) return { status: "ok", pid: entry.pid, confidence: 1 };
+    if (match && Number.isInteger(entry.pid) && !pids.includes(entry.pid)) pids.push(entry.pid);
   }
+  if (pids.length > 0) return { status: "ok", pid: pids[0], pids, confidence: 1 };
   const hadInaccessible = fdScanResults.some((entry) => entry.accessible === false);
-  if (hadInaccessible) return { status: "partial", pid: undefined, confidence: 0, review_hint: "missing_permission" };
-  return { status: "unknown", pid: undefined, confidence: 0 };
+  if (hadInaccessible) return { status: "partial", pid: undefined, pids: [], confidence: 0, review_hint: "missing_permission" };
+  return { status: "unknown", pid: undefined, pids: [], confidence: 0 };
 }
 
 // Exported (additive, S4): the structural provenance-warning collector needs to enumerate all

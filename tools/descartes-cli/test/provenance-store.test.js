@@ -4,14 +4,24 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { alertId } from "../src/alert-store.js";
 import {
   DEFAULT_STABLE_ITERATION_THRESHOLD,
   DEFAULT_STABLE_SAMPLE_THRESHOLD,
+  IDENTITY_DRIFT_RULE_ID,
+  NEW_PUBLIC_BIND_RULE_ID,
+  UNKNOWN_IDENTITY_RULE_ID,
   applyIdentityObservation,
   computeIdentitySignature,
   deriveIdentityCandidates,
+  deriveIdentityCoverage,
+  identityDriftFingerprint,
   loadSignatureStore,
+  newPublicBindFingerprint,
+  normalizeSignatureStore,
   reconcileSignatures,
+  reconcileSignaturesDetailed,
+  unknownIdentityFingerprint,
   resolveSignatureStorePaths,
   runProvenanceStore,
   seedKnownGoodIdentity,
@@ -115,6 +125,11 @@ test("computeIdentitySignature changes when exactly one input (source_classifica
   const base = computeIdentitySignature(GOLDEN_FIXTURE_INPUTS);
   const differentSource = computeIdentitySignature({ ...GOLDEN_FIXTURE_INPUTS, sourceClassification: "shell" });
   assert.notEqual(base, differentSource);
+});
+
+test("public-bind and drift fingerprints preserve IPv4/IPv6 transport families", () => {
+  assert.notEqual(newPublicBindFingerprint("tcp6.8080"), newPublicBindFingerprint("tcp.8080"));
+  assert.notEqual(identityDriftFingerprint("port.udp6.5353"), identityDriftFingerprint("port.udp.5353"));
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -447,7 +462,7 @@ test("runProvenanceStore snapshot seeds known_good entries and is idempotent (ru
   const paths = await tempPaths();
   const observations = [{ executablePath: "/bin/svc", sourceClassification: "launchd", owningUser: "0" }];
   const outputs = [];
-  const runtime = { output: (line) => outputs.push(line), gatherIdentityObservations: async () => observations, now: "2026-07-10T00:00:00.000Z" };
+  const runtime = { output: (line) => outputs.push(line), collectIdentityObservations: async () => ({ status: "ok", observations, reasons: [] }), now: "2026-07-10T00:00:00.000Z" };
 
   const first = await runProvenanceStore(paths, ["snapshot"], runtime);
   assert.equal(first.seeded_identity_count, 1);
@@ -464,10 +479,58 @@ test("runProvenanceStore snapshot seeds known_good entries and is idempotent (ru
   assert.equal(record.origin, "snapshot");
 });
 
+test("runProvenanceStore snapshot uses the status collector, refuses degraded collection, and preserves reconcile bookkeeping", async () => {
+  const paths = await tempPaths();
+  const before = {
+    version: 1,
+    bootstrapped_at: "2026-07-09T00:00:00.000Z",
+    last_reconciled_at: "2026-07-10T00:00:00.000Z",
+    last_reconcile_attempt_at: "2026-07-10T01:00:00.000Z",
+    last_reconcile_status: "degraded",
+    last_reconcile_degraded_reasons: ["proc_net_unreadable"],
+    signatures: {},
+  };
+  await writeSignatureStore(paths, before);
+  await assert.rejects(
+    () => runProvenanceStore(paths, ["snapshot"], {
+      collectIdentityObservations: async () => ({ status: "degraded", observations: [], reasons: ["proc_net_unreadable"] }),
+      now: "2026-07-10T02:00:00.000Z",
+    }),
+    /degraded/i,
+  );
+  const { store } = await loadSignatureStore(paths);
+  assert.equal(store.last_reconciled_at, before.last_reconciled_at);
+  assert.equal(store.last_reconcile_attempt_at, before.last_reconcile_attempt_at);
+  assert.equal(store.last_reconcile_status, before.last_reconcile_status);
+  assert.deepEqual(store.last_reconcile_degraded_reasons, before.last_reconcile_degraded_reasons);
+
+  await runProvenanceStore(paths, ["snapshot"], {
+    collectIdentityObservations: async () => ({ status: "ok", observations: [], reasons: [] }),
+    now: "2026-07-10T03:00:00.000Z",
+  });
+  const afterSuccessfulSnapshot = await loadSignatureStore(paths);
+  assert.equal(afterSuccessfulSnapshot.store.last_reconcile_attempt_at, before.last_reconcile_attempt_at);
+  assert.equal(afterSuccessfulSnapshot.store.last_reconcile_status, before.last_reconcile_status);
+  assert.deepEqual(afterSuccessfulSnapshot.store.last_reconcile_degraded_reasons, before.last_reconcile_degraded_reasons);
+});
+
+test("runProvenanceStore snapshot treats legacy array census injections as degraded unless explicitly opted in", async () => {
+  const paths = await tempPaths();
+  await assert.rejects(
+    () => runProvenanceStore(paths, ["snapshot"], {
+      ownUid: 501,
+      listListeningSocketsWithPid: async () => [],
+      snapshotProvenanceProcesses: async () => [],
+      now: "2026-07-10T00:00:00.000Z",
+    }),
+    /degraded/i,
+  );
+});
+
 test("runProvenanceStore baseline show is bounded and redacted -- never a raw executable path in its output", async () => {
   const paths = await tempPaths();
   const observations = [{ executablePath: "/usr/local/bin/very-secret-tool", sourceClassification: "launchd", owningUser: "0" }];
-  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, gatherIdentityObservations: async () => observations, now: "2026-07-10T00:00:00.000Z" });
+  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, collectIdentityObservations: async () => ({ status: "ok", observations, reasons: [] }), now: "2026-07-10T00:00:00.000Z" });
 
   const outputs = [];
   const entries = await runProvenanceStore(paths, ["baseline", "show", "--json"], { output: (line) => outputs.push(line) });
@@ -483,11 +546,436 @@ test("runProvenanceStore baseline show supports --identity filtering", async () 
     { executablePath: "/bin/one", sourceClassification: "launchd", owningUser: "0" },
     { executablePath: "/bin/two", sourceClassification: "systemd", owningUser: "0" },
   ];
-  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, gatherIdentityObservations: async () => observations, now: "2026-07-10T00:00:00.000Z" });
+  await runProvenanceStore(paths, ["snapshot"], { output: () => {}, collectIdentityObservations: async () => ({ status: "ok", observations, reasons: [] }), now: "2026-07-10T00:00:00.000Z" });
   const { store } = await loadSignatureStore(paths);
   const [targetHash] = Object.keys(store.signatures);
 
   const filtered = await runProvenanceStore(paths, ["baseline", "show", "--identity", targetHash, "--json"], { output: () => {} });
   assert.equal(filtered.length, 1);
   assert.equal(filtered[0].identity_hash, targetHash);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10 provenance-identity recovery coverage (plan 2026-09-20 §8.B): reconcile bookkeeping that
+// separates "attempted" from "successfully reconciled", surfacing of transient-stat skips, and the
+// pure coverage derivation whose alert keys must match the candidate builders exactly.
+// ---------------------------------------------------------------------------------------------
+
+test("normalizeSignatureStore round-trips the reconcile-attempt bookkeeping (attempt ts, status, bounded reason codes) and drops malformed values", async () => {
+  const paths = await tempPaths();
+  await writeSignatureStore(paths, {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    last_reconciled_at: "2026-07-10T00:00:00.000Z",
+    last_reconcile_attempt_at: "2026-07-10T01:00:00.000Z",
+    last_reconcile_status: "degraded",
+    last_reconcile_degraded_reasons: ["lsof_unavailable", "ps_empty"],
+    signatures: {},
+  });
+  const { store } = await loadSignatureStore(paths);
+  assert.equal(store.last_reconciled_at, "2026-07-10T00:00:00.000Z");
+  assert.equal(store.last_reconcile_attempt_at, "2026-07-10T01:00:00.000Z");
+  assert.equal(store.last_reconcile_status, "degraded");
+  assert.deepEqual(store.last_reconcile_degraded_reasons, ["lsof_unavailable", "ps_empty"]);
+
+  const malformed = normalizeSignatureStore({
+    last_reconcile_attempt_at: 42,
+    last_reconcile_status: "maybe",
+    last_reconcile_degraded_reasons: ["ok_code", "/raw/path leak", 7],
+  });
+  assert.equal(malformed.last_reconcile_attempt_at, undefined);
+  assert.equal(malformed.last_reconcile_status, undefined);
+  assert.deepEqual(malformed.last_reconcile_degraded_reasons, ["ok_code"]);
+});
+
+test("normalizeSignatureStore omits the new bookkeeping keys entirely when absent (legacy stores normalize unchanged)", () => {
+  const normalized = normalizeSignatureStore({ bootstrapped_at: "2026-07-10T00:00:00.000Z", signatures: {} });
+  assert.equal(Object.hasOwn(normalized, "last_reconcile_attempt_at"), false);
+  assert.equal(Object.hasOwn(normalized, "last_reconcile_status"), false);
+  assert.equal(Object.hasOwn(normalized, "last_reconcile_degraded_reasons"), false);
+});
+
+test("reconcileSignaturesDetailed surfaces a transient-stat skip of an already-fingerprinted identity (NOT re-observed), and reconcileSignatures stays its .store", () => {
+  const fingerprinted = { executablePath: "/opt/svc/bin", identityHash: "aaaaaaaaaaaaaaaa", sourceClassification: "launchd", owningUser: "501", portTargetKeys: ["tcp.8080"] };
+  const base = reconcileSignatures({ version: 1, signatures: {} }, [fingerprinted], { ts: "2026-07-10T00:00:00.000Z", iterationKey: "t0" });
+  const statFailed = { ...fingerprinted, identityHash: undefined };
+  const fresh = { executablePath: "/opt/other/bin", identityHash: "bbbbbbbbbbbbbbbb", sourceClassification: "launchd", owningUser: "501" };
+
+  const detailed = reconcileSignaturesDetailed(base, [statFailed, fresh], { ts: "2026-07-10T01:00:00.000Z", iterationKey: "t1" });
+  assert.deepEqual(detailed.skippedObservations, [statFailed]);
+  assert.deepEqual(detailed.store, reconcileSignatures(base, [statFailed, fresh], { ts: "2026-07-10T01:00:00.000Z", iterationKey: "t1" }));
+  const originalHash = computeIdentitySignature(fingerprinted);
+  assert.equal(detailed.store.signatures[originalHash].last_seen, "2026-07-10T00:00:00.000Z", "the skipped identity's last_seen must not advance");
+});
+
+test("reconcileSignatures unions current public ports across same-key sibling observations", () => {
+  const listener = {
+    executablePath: "/opt/same/bin/worker",
+    identityHash: "same-same-same-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    target: { kind: "pid", value: 100 },
+    portTargetKeys: ["tcp.8080"],
+  };
+  const listenerlessSibling = {
+    ...listener,
+    target: { kind: "pid", value: 101 },
+    portTargetKeys: [],
+  };
+
+  const store = reconcileSignatures({ version: 1, signatures: {} }, [listener, listenerlessSibling], {
+    ts: "2026-07-10T01:00:00.000Z",
+    iterationKey: "tick-1",
+  });
+  const identityHash = computeIdentitySignature(listener);
+  assert.deepEqual(store.signatures[identityHash].current_port_target_keys, ["tcp.8080"]);
+});
+
+test("reconcileSignatures bounds the unioned current port list and marks overflow as truncated", () => {
+  const observation = {
+    executablePath: "/opt/many/bin/worker",
+    identityHash: "many-many-many-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: Array.from({ length: 6 }, (_, index) => `tcp.${8000 + index}`),
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = reconcileSignatures({ version: 1, signatures: {} }, [observation], {
+    ts: "2026-07-10T01:00:00.000Z",
+    iterationKey: "tick-1",
+  });
+  const record = store.signatures[identityHash];
+  assert.equal(record.current_port_target_keys.length, 5);
+  assert.equal(record.current_port_target_keys_truncated, true);
+  assert.equal(record.port_target_keys.length, 5);
+  assert.equal(record.port_target_keys_truncated, true);
+});
+
+function coverageStore() {
+  return {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      aaaa000000000001: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T00:00:00.000Z", // long gone
+        inputs_hash: { executable_path_hash: "e000000000000001", identity_hash: "f000000000000001", source_classification: "shell", owning_user_hash: "u000000000000001" },
+        port_target_keys: ["tcp.8080"],
+      },
+      aaaa000000000002: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T10:00:00.000Z", // present
+        inputs_hash: { executable_path_hash: "e000000000000002", identity_hash: "f000000000000002", source_classification: "shell", owning_user_hash: "u000000000000001" },
+        port_target_keys: ["tcp.9090"],
+      },
+      aaaa000000000003: {
+        state: "known_good",
+        origin: "snapshot",
+        last_seen: "2026-07-10T10:00:00.000Z",
+        inputs_hash: { executable_path_hash: "e000000000000002", identity_hash: "f000000000000003", source_classification: "shell", owning_user_hash: "u000000000000001" },
+        port_target_keys: [],
+      },
+    },
+  };
+}
+
+test("deriveIdentityCoverage reports no keys without a positive same-record observation", () => {
+  const store = coverageStore();
+  const keys = new Set(deriveIdentityCoverage(store));
+  assert.deepEqual([...keys], []);
+
+  // Parity: every candidate the builders emit for this store has its id inside the coverage set.
+  const candidates = deriveIdentityCandidates(store, { now: "2026-07-10T10:30:00.000Z" });
+  assert.deepEqual(
+    candidates.map((c) => c.rule_id).sort(),
+    [IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID, UNKNOWN_IDENTITY_RULE_ID].sort(),
+    "fixture should emit one unknown + one new_public_bind + one drift candidate",
+  );
+});
+
+test("deriveIdentityCoverage EXCLUDES every identity/target a transient-stat-skipped observation could be (not re-observed -> never evaluated-clear)", () => {
+  const store = coverageStore();
+  // The fold layer matches a skipped observation by its HASHED path/owner + source against a
+  // fingerprinted record; build that record through the real fold so the hashes line up.
+  const observation = { executablePath: "/opt/gone/bin", identityHash: undefined, sourceClassification: "shell", owningUser: "501", portTargetKeys: ["tcp.7070"] };
+  const seeded = reconcileSignatures({ version: 1, signatures: {} }, [{ ...observation, identityHash: "1111111111111111" }], { ts: "2026-07-10T00:00:00.000Z" });
+  const [seededHash] = Object.keys(seeded.signatures);
+  const seededRecord = seeded.signatures[seededHash];
+  store.signatures[seededHash] = { ...seededRecord, state: "known_good", origin: "grace_window", port_target_keys: ["tcp.8080"] };
+  // Another tracked record really does hold the skipped observation's current port. The absence
+  // of this fixture made the old assertion about tcp.7070 vacuous: nothing could have covered it.
+  store.signatures.aaaa000000000001.port_target_keys = ["tcp.8080", "tcp.7070"];
+
+  const keys = new Set(deriveIdentityCoverage(store, { skippedObservations: [observation] }));
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(seededHash))), false, "the unverified identity itself");
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080"))), false, "a port the unverified identity's record holds (shared with record 1)");
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.8080"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint(`process.${seededRecord.inputs_hash.executable_path_hash}`))), false, "the unverified identity's process target");
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7070"))), false, "a port the skipped observation currently binds");
+  // Unrelated identities are also frozen until they are positively re-observed.
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000001"))), false);
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090"))), false);
+});
+
+test("deriveIdentityCoverage excludes a currently-bound port when a bounded record evicted that port from its introspection list", () => {
+  const observation = {
+    executablePath: "/opt/current/bin",
+    identityHash: "cccccccccccccccc",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.7070"],
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = reconcileSignatures({ version: 1, signatures: {} }, [observation], { ts: "2026-07-10T10:00:00.000Z" });
+  store.bootstrapped_at = "2026-07-10T00:00:00.000Z";
+  // Model the bounded record after a later observation evicted the old port. The raw current
+  // observation still proves tcp.7070 is bound, but the persisted list cannot authorize coverage.
+  store.signatures[identityHash].port_target_keys = ["tcp.1", "tcp.2", "tcp.3", "tcp.4", "tcp.5"];
+  const keys = new Set(deriveIdentityCoverage(store, {
+    observations: [observation],
+    ts: "2026-07-10T10:00:00.000Z",
+  }));
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7070"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.7070"))), false);
+});
+
+function completeSocketCensus(sockets = []) {
+  return { status: "ok", sockets, reasons: [] };
+}
+
+test("deriveIdentityCoverage uses the complete raw socket census, including provisional and re-keyed holders, for public-bind clears", () => {
+  const oldObservation = {
+    executablePath: "/opt/old/bin/worker",
+    identityHash: "old-old-old-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.8080"],
+  };
+  const oldHash = computeIdentitySignature(oldObservation);
+  const store = {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      [oldHash]: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T01:00:00.000Z",
+        inputs_hash: { executable_path_hash: "old-path", identity_hash: "old-stat", source_classification: "shell", owning_user_hash: "old-user" },
+        port_target_keys: ["tcp.8080"],
+        current_port_target_keys: [],
+      },
+      provisional: {
+        state: "provisional",
+        origin: "grace_window",
+        last_seen: "2026-07-10T01:00:00.000Z",
+        inputs_hash: { executable_path_hash: "new-path", identity_hash: "new-stat", source_classification: "shell", owning_user_hash: "new-user" },
+        port_target_keys: ["tcp.8080"],
+      },
+    },
+  };
+  const keys = deriveIdentityCoverage(store, {
+    observations: [{ ...oldObservation, portTargetKeys: [] }],
+    ts: "2026-07-10T01:00:00.000Z",
+    socketCensus: completeSocketCensus([{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 200 }]),
+  });
+  assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080"))), false);
+});
+
+test("deriveIdentityCoverage is retired and never covers a public bind, even with a complete raw census", () => {
+  const observation = {
+    executablePath: "/opt/gone/bin/worker",
+    identityHash: "gone-gone-gone-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.8080"],
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      [identityHash]: {
+        state: "known_good",
+        origin: "snapshot",
+        last_seen: "2026-07-10T01:00:00.000Z",
+        inputs_hash: { executable_path_hash: "gone-path", identity_hash: "gone-stat", source_classification: "shell", owning_user_hash: "gone-user" },
+        port_target_keys: ["tcp.8080"],
+        current_port_target_keys: [],
+      },
+    },
+  };
+  const bindKey = alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080"));
+  const covered = deriveIdentityCoverage(store, {
+    observations: [{ ...observation, portTargetKeys: [] }],
+    ts: "2026-07-10T01:00:00.000Z",
+    socketCensus: completeSocketCensus([]),
+  });
+  assert.equal(covered.includes(bindKey), false);
+
+  const incomplete = deriveIdentityCoverage(store, {
+    observations: [{ ...observation, portTargetKeys: [] }],
+    ts: "2026-07-10T01:00:00.000Z",
+    socketCensus: { status: "degraded", sockets: [], reasons: ["lsof_truncated"] },
+  });
+  assert.equal(incomplete.includes(bindKey), false);
+});
+
+test("deriveIdentityCoverage never uses a five-key bounded port list to authorize recovery", () => {
+  const observation = {
+    executablePath: "/opt/bounded/bin/worker",
+    identityHash: "bounded-bounded-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.8080"],
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      [identityHash]: {
+        state: "known_good",
+        origin: "snapshot",
+        last_seen: "2026-07-10T01:00:00.000Z",
+        inputs_hash: { executable_path_hash: "bounded-path", identity_hash: "bounded-stat", source_classification: "shell", owning_user_hash: "bounded-user" },
+        port_target_keys: ["tcp.8080", "tcp.8081", "tcp.8082", "tcp.8083", "tcp.8084"],
+        current_port_target_keys: [],
+      },
+    },
+  };
+  const keys = deriveIdentityCoverage(store, {
+    observations: [{ ...observation, portTargetKeys: [] }],
+    ts: "2026-07-10T01:00:00.000Z",
+    socketCensus: completeSocketCensus([]),
+  });
+  assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080"))), false);
+});
+
+test("deriveIdentityCoverage keeps five previously-alerted ports frozen when five new ports are also bound", () => {
+  const oldPorts = ["tcp.8080", "tcp.8081", "tcp.8082", "tcp.8083", "tcp.8084"];
+  const newPorts = ["tcp.9000", "tcp.9001", "tcp.9002", "tcp.9003", "tcp.9004"];
+  const observation = {
+    executablePath: "/opt/ten-ports/bin/worker",
+    identityHash: "ten-ports-ten-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: [],
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      [identityHash]: {
+        state: "known_good",
+        origin: "snapshot",
+        last_seen: "2026-07-10T01:00:00.000Z",
+        inputs_hash: { executable_path_hash: "ten-ports-path", identity_hash: "ten-ports-stat", source_classification: "shell", owning_user_hash: "ten-ports-user" },
+        // This is the bounded historical storage shape after the five new ports arrived. The
+        // active alerts for the old five must not be recovered from this incomplete view.
+        port_target_keys: oldPorts,
+        current_port_target_keys: newPorts,
+      },
+    },
+  };
+  const sockets = [...oldPorts, ...newPorts].map((portTargetKey) => {
+    const [protocol, localPort] = portTargetKey.split(".");
+    return { protocol, local_address: "0.0.0.0", local_port: Number(localPort), pid: 100 };
+  });
+  const keys = deriveIdentityCoverage(store, {
+    observations: [observation],
+    ts: "2026-07-10T01:00:00.000Z",
+    socketCensus: completeSocketCensus(sockets),
+  });
+  for (const portKey of oldPorts) {
+    assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint(portKey))), false);
+  }
+});
+
+test("deriveIdentityCoverage keeps a re-keyed record frozen when a different record observed this tick shares its process target", () => {
+  const oldRecord = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T00:00:00.000Z",
+    inputs_hash: { executable_path_hash: "shared-process", identity_hash: "old", source_classification: "shell", owning_user_hash: "u" },
+    port_target_keys: ["tcp.7070"],
+  };
+  const currentRecord = {
+    state: "known_good",
+    origin: "grace_window",
+    last_seen: "2026-07-10T04:00:00.000Z",
+    inputs_hash: { executable_path_hash: "shared-process", identity_hash: "new", source_classification: "shell", owning_user_hash: "u" },
+    port_target_keys: ["tcp.7070"],
+  };
+  const store = { ...coverageStore(), signatures: { old: oldRecord, current: currentRecord } };
+  const keys = new Set(deriveIdentityCoverage(store, { ts: "2026-07-10T04:00:00.000Z" }));
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("old"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("process.shared-process"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.7070"))), false);
+});
+
+test("deriveIdentityCoverage never reports the builders' shared unknown fallback fingerprint", () => {
+  const store = {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      "": {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T00:00:00.000Z",
+        inputs_hash: {},
+        port_target_keys: [],
+      },
+    },
+  };
+  assert.equal(deriveIdentityCoverage(store).some((key) => key.endsWith("\u0000unknown")), false);
+});
+
+test("deriveIdentityCoverage applies exclusions in FINGERPRINT space: a covered target whose sanitized fingerprint collides with an excluded one is not reported", () => {
+  const store = coverageStore();
+  const observation = { executablePath: "/opt/gone/bin", identityHash: undefined, sourceClassification: "shell", owningUser: "501", portTargetKeys: [] };
+  const seeded = reconcileSignatures({ version: 1, signatures: {} }, [{ ...observation, identityHash: "1111111111111111" }], { ts: "2026-07-10T00:00:00.000Z" });
+  const [seededHash] = Object.keys(seeded.signatures);
+  // "tcp/8080" and "tcp_8080" sanitize to the SAME fingerprint (port.tcp_8080).
+  store.signatures[seededHash] = { ...seeded.signatures[seededHash], state: "known_good", origin: "grace_window", port_target_keys: ["tcp/8080"] };
+  store.signatures.aaaa000000000002.port_target_keys = ["tcp_8080"];
+  assert.equal(newPublicBindFingerprint("tcp/8080"), newPublicBindFingerprint("tcp_8080"));
+
+  const keys = deriveIdentityCoverage(store, { skippedObservations: [observation] });
+  assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp_8080"))), false);
+  assert.equal(keys.includes(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp_8080"))), false);
+});
+
+test("deriveIdentityCoverage excludes a skipped observation's own signature even when no fingerprinted sibling matches it", () => {
+  const observation = {
+    executablePath: "/opt/unfingerprinted/bin",
+    identityHash: undefined,
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.7777"],
+  };
+  const ownSignature = computeIdentitySignature(observation);
+  const store = {
+    ...coverageStore(),
+    signatures: {
+      [ownSignature]: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T00:00:00.000Z",
+        inputs_hash: { executable_path_hash: "own-path", source_classification: "shell", owning_user_hash: "own-user" },
+        port_target_keys: ["tcp.7777"],
+      },
+    },
+  };
+  const keys = new Set(deriveIdentityCoverage(store, { skippedObservations: [observation] }));
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(ownSignature))), false);
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7777"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.7777"))), false);
+});
+
+test("deriveIdentityCoverage reports nothing for a never-bootstrapped store", () => {
+  const store = { ...coverageStore(), bootstrapped_at: undefined };
+  assert.deepEqual(deriveIdentityCoverage(store), []);
 });
