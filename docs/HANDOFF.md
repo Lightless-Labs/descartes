@@ -2,12 +2,27 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — daybreak-blue fifth-gate fixes (2026-10-05)
+
+The fifth-gate findings were fixed locally on `harden/root-helper-2026-10` without push or
+merge. Finding-scoped code commits are `eae944f` (Rust final post-enumeration holder
+verification), `f486c7a` (authoritative Node refreshes plus final verification), `9a1bc43`
+(Node procfs PID-namespace guard), `ad73771` (preserved elevated-helper failure evidence), and
+`a930335` (Rust blocker clippy follow-up). They all carry the required Claude trailer. The
+handoff correction is the final commit in this round.
+
+Verification passed: `cargo fmt --check`; workspace/all-target `cargo check`; Linux-target
+`cargo check --tests` and `clippy -D warnings` for x86_64 and aarch64; host clippy; and
+`cargo test --workspace`. Fresh-XDG `npm test` ran 2,090 tests: 2,034 passed, 22 failed, and
+34 skipped. The 22 failures are sandbox/live-host environment failures (notifier/tap loopback
+`listen` EPERM and two live macOS provenance smoke tests); no fifth-gate regression test failed.
+
 ## Current session — daybreak-blue fourth-gate fixes (2026-10-05)
 
 On branch `harden/root-helper-2026-10`, the four fourth-gate findings are fixed locally and are
 not pushed or merged. The finding-scoped commits are `61e71a9` (stable Node/Rust holder
 enumeration), `b543951` (procfs namespace mismatch remains ambiguous), `39d22a1` (fd-based
-executable `fstat`, with `newfstatat` removed from seccomp), and `892bbbb` (same-UID uncertainty
+executable `fstat`, with `newfstatat` removed from seccomp), and `4cb7e52` (same-UID uncertainty
 falls through to the enabled elevated helper). All four carry the required Claude trailer.
 
 Holder attribution now re-enumerates until the PID/start-time set is stable, bounded at three
