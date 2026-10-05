@@ -64,9 +64,9 @@ export const DEFAULT_STABLE_ITERATION_THRESHOLD = 2;
 // (daemon downtime, a slow/loaded host, a skipped tick) before an identity is ever treated as
 // gone. Once a process exits or a socket closes, its record's last_seen stops advancing (see
 // applyIdentityObservation below, which always sets last_seen := the current reconcile's own ts
-// on every fold) -- once this window elapses without a fresh observation,
-// deriveIdentityCandidates stops emitting a candidate for it, and applyAlertCandidates recovers
-// the alert on the following tick (see deriveIdentityCandidates below).
+// on every fold) -- once this window elapses without a fresh observation, deriveIdentityCandidates
+// stops emitting a candidate for it. That age-out is not recovery authority: the alert remains
+// frozen until the same identity is positively re-observed and clear, or acknowledged.
 export const DEFAULT_IDENTITY_PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 // Bounded, operator-introspection-only lists on each signature record -- never authoritative,
@@ -605,18 +605,17 @@ function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
  * In the interim S4's deleted_exe_running rule already catches the common "FD still open to a
  * deleted inode" swap.
  *
- * RECOVERY (S5-follow-2, Codex review finding #5, Part A): a candidate is only ever emitted for a
+ * CANDIDATE PRESENCE (S5-follow-2, Codex review finding #5, Part A): a candidate is only ever emitted for a
  * record (or, for identity_drift, for EACH SIDE of the comparison) whose `last_seen` is recent --
  * within `options.presenceWindowMs` (default DEFAULT_IDENTITY_PRESENCE_WINDOW_MS, see its own doc
  * comment) of `options.now` (default Date.now()). applyIdentityObservation always refreshes
  * last_seen on every successful fold, so a still-running process/still-open socket keeps its
  * record's last_seen current every reconcile; once a process exits or a socket closes, that
  * record simply stops being observed, last_seen stops advancing, and once it falls outside the
- * presence window this function stops emitting a candidate for it -- which is what lets
- * applyAlertCandidates recover the corresponding alert on the next tick. For identity_drift
- * specifically, BOTH sides of a target-key group must be currently present for drift to fire --
- * once the stale (superseded) identity ages out of the window, drift resolves even if the current
- * identity is still very much present.
+ * presence window this function stops emitting a candidate for it. That only stops re-emission; it
+ * does not authorize alert recovery. For identity_drift specifically, BOTH sides of a target-key
+ * group must be currently present for drift to fire, but an absent or superseded side never clears
+ * the alert through evaluatedAlertKeys.
  */
 export function deriveIdentityCandidates(store, options = {}) {
   const signatures = store?.signatures ?? {};

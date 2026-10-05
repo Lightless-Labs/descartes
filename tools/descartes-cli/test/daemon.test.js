@@ -2328,10 +2328,10 @@ test("S5 load-bearing: a fixed-rule alert and a confirmed-unknown-identity alert
 
 // 2026-10 provenance-identity recovery coverage (plan 2026-09-20 §8, DEFERRED item): end-to-end
 // through the REAL daemon recovery gate. The identity collector is injected via the producer's own
-// DI seam (runDaemonIteration passes its options through to every producer). Pre-fix, the hourly
-// reconcile advanced last_reconciled_at even when lsof/ps silently failed, so the aged-out identity
-// simply stopped being a candidate and (pre-§8) its alert recovered with no observation.
-test("provenance-identity coverage end-to-end: a persisted unknown_identity alert stays FROZEN across a degraded reconcile (even once aged out of the presence window) and recovers only after a SUCCESSFUL collection observes its absence", async () => {
+// DI seam (runDaemonIteration passes its options through to every producer). An aged-out identity
+// simply stopping as a candidate is never recovery authority: even a later successful empty census
+// leaves the alert frozen until the operator acknowledges it.
+test("provenance-identity coverage end-to-end: a persisted unknown_identity alert stays FROZEN across degraded and successful absence-only reconciles", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const t0 = "2026-05-24T00:00:00.000Z";
@@ -2360,9 +2360,9 @@ test("provenance-identity coverage end-to-end: a persisted unknown_identity aler
   assert.equal(afterDegraded.last_reconciled_at, t0, "a degraded collection must not advance last_reconciled_at");
 
   // Tick 3 (due again, an interval after the degraded ATTEMPT): a successful census that does not
-  // see the identity -> evaluated-clear -> recovered.
+  // see the identity still supplies no positive same-record re-observation, so it remains frozen.
   const recovered = await tick(at(5.1), async () => ({ status: "ok", observations: [], reasons: [] }));
-  assert.equal(recovered.alerts.alerts.find((a) => a.id === fired.id).status, "recovered");
+  assert.equal(recovered.alerts.alerts.find((a) => a.id === fired.id).status, "active");
 });
 
 // ---------------------------------------------------------------------------------------------

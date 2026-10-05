@@ -377,6 +377,9 @@ These are the limits of the defensive layer today:
   or the cluster plane.
 - **Polling, not real-time.** Detection runs on the daemon cycle. A fast action between two
   cycles can escape. A real-time event path exists in the design, but it is not built.
+- **Provenance alerts freeze on departure.** An aged-out, absent, or superseded process or
+  provenance-identity record never auto-recovers an alert. Recovery requires positive
+  re-observation of the same identity with the condition cleared, or operator acknowledgement.
 - **On-host tamper has a bound.** The completeness ledger stops accidental loss and
   non-root, out-of-band changes. But a root attacker who rewrites both the facts and the
   ledger together defeats the on-host check. An off-host attestation and a fleet

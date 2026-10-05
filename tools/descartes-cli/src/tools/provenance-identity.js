@@ -303,10 +303,10 @@ export async function collectIdentityObservations(options = {}) {
  *   - due + collection DEGRADED (any census gap -- see collectIdentityObservations) or malformed ->
  *     no keys, `last_reconciled_at` NOT advanced, no record treated as departed; only the
  *     genuinely-resolved observations (real presence) are folded;
- *   - due + collection OK -> every identity/port/target the freshly re-observed store tracks
- *     (provenance-store.js's deriveIdentityCoverage): present -> evaluated (still fires); genuinely
- *     absent -> evaluated-clear (recovers once outside the presence window); except anything a
- *     transient-stat-skipped observation could be (running but unverified -> never clear).
+ *   - due + collection OK -> only a same-record positive re-observation whose alert condition is
+ *     clear contributes evaluatedAlertKeys (provenance-store.js's deriveIdentityCoverage). Present
+ *     and still bad stays frozen; absent, aged-out, or superseded records never contribute keys.
+ *     A departed-process alert therefore stays frozen until acknowledged.
  *
  * RECONCILE BOOKKEEPING: `last_reconciled_at` = last SUCCESSFUL complete reconcile only;
  * `last_reconcile_attempt_at` = the rate-limit clock, advanced on every attempt (so a persistently

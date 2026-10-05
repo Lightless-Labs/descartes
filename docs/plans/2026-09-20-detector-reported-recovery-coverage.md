@@ -1,7 +1,7 @@
 # Detector-Reported Recovery Coverage — Close the "empty ⇒ genuine clear" Fabrication Class at Its Root
 
 **Date:** 2026-09-20
-**Status:** PLAN — REVISED post-review (2026-09-23). See §7, which supersedes §1–§6 where they disagree. Awaiting operator confirm on §7's flagged choices before build.
+**Status:** PLAN — implementation addendum 2026-10-05 applied on `fix/provenance-identity-coverage-2026-10`; provenance-identity remains local-only pending final gate.
 **Reviewed:** 2026-09-23 (triple adversarial review: Fable code-grounded, daybreak-blue frontier-security, Astra xhigh goal-alignment) — all three NEEDS-REVISION, all three "design is right, mechanics need rewriting." Synthesis in §7.
 **Prerequisite for:** the watch-by-default default-on flip (`docs/plans/2026-09-10-watch-by-default-slice-1.md`), which is HELD until this lands (operator decision 2026-09-20: fix-before-flip).
 **Origin:** daybreak-blue re-gate round 3 of the watch-by-default gate split found a pre-existing fabrication gap the default-on flip widens to every install.
@@ -151,6 +151,12 @@ Bare-array ⇒ freeze is correct (no compat obligation at v0.0.50 — a bare arr
 - **Not closed (pre-existing, flagged):** `signatures.json` has no integrity ledger — a writer able to edit it can still mark a record retired/snapshot-origin and clear its alert at the next successful reconcile (same per-detector-store class as §1).
 
 *provenance-warning — verified, NOT converted.* A resolved warning emits an explicit `active:"false"` fact only while the entity is still observed and still checked (every socket of a resolved pid; `deleted_exe_running` only for still-narrowed pids). The dominant clear paths are ABSENCE at the collector: socket closed / process exited / pid no longer narrowed → no fact → ages out of the 3h fact window. Worse, a swallowed collector failure (lsof/ps → `[]`) produces a status-`ok` envelope with zero warnings, and a resolve failure (`deleted_exe:"unknown"`) is recorded as an explicit `deleted_exe_running active:"false"` — i.e. an inability-to-check masquerades as a cleared fact. Not clearly safe ⇒ left safe-frozen. Follow-up: the structural collector emits a census-status fact (using the new `*Status` siblings), the fast tick reports coverage only for entities whose latest fact is from an `ok`+complete census, and `deleted_exe` "unknown" must not serialize as `active:"false"`.
+
+**Addendum 2026-10-05 — operator direction / final provenance-identity recovery rule.** The third re-keying review established that absence-based recovery is unsound even after target-linkage and census hardening. Therefore an aged-out, absent, or superseded provenance-identity record **never** contributes its alert key to `evaluatedAlertKeys`; it freezes like correlation and never fabricates an auto-recovery. Departed-process alerts remain visible until acknowledged.
+
+The only evaluated-clear is positive re-observation of the **same identity record key** on a due tick with an explicitly `ok` and complete collection, where that record's alert condition no longer holds: for example, the identity is now known/trusted/promoted, its public bind is gone while the process remains observed, or drift is positively resolved. A same-UID re-key from another executable path, a port change, target sharing, supersession, or age-out does not transfer coverage. The old supersession/port-target linkage coverage heuristic is removed. Historical port keys remain only to preserve alert identity; the current observed port set determines whether a bind is still bad.
+
+Defense-in-depth requirements are part of this addendum: macOS socket census invokes both `lsof -iTCP -sTCP:LISTEN` and `lsof -iUDP`; failure or incomplete UDP visibility leaves the census degraded/partial, never `ok`. Any rejected lsof row or unparseable `/proc/net` row adds a degradation reason. Linux inode attribution returns every holder PID and the census expands every holder into identity observations.
 
 ---
 
