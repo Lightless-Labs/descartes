@@ -12,6 +12,7 @@
 // zero mocking library) -- `fakeElevatedOptions({...})` below is that same pattern.
 
 import assert from "node:assert/strict";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -615,6 +616,66 @@ test("verifyTrustBoundary rejects a group/world-writable config directory", asyn
     { statFn: async () => ({ mode: 0o777, uid: 0 }) },
   );
   assert.equal(outcome.trusted, false);
+});
+
+// 2026-10 (research finding 5): stat() followed a final symlink, so a correctly-owned TARGET
+// vouched for a link placed anywhere. The leaves are now lstat'd and a symlink is rejected.
+test("verifyTrustBoundary rejects a symlinked helper binary even when its target would pass (lstat, no final-symlink follow)", async () => {
+  const fixture = trustedHelperFixture();
+  const symlinkMode = fsConstants.S_IFLNK | 0o755; // even a non-writable-looking link mode is rejected
+  const outcome = await verifyTrustBoundary(
+    { helperPath: FIXTURE_HELPER_PATH },
+    {
+      statFn: async (p) => fixture[p] ?? fs.stat(p), // what stat() would have reported: the trusted target
+      lstatFn: async (p) => (p === FIXTURE_HELPER_PATH ? { mode: symlinkMode, uid: 0 } : fixture[p]),
+    },
+  );
+  assert.equal(outcome.trusted, false);
+  assert.equal(outcome.reason, `symlink:${FIXTURE_HELPER_PATH}`);
+});
+
+test("verifyTrustBoundary rejects a symlinked config file", async () => {
+  const outcome = await verifyTrustBoundary(
+    { configPath: "/etc/descartes/provenance.json", configDir: "/etc/descartes" },
+    {
+      statFn: async () => ({ mode: fsConstants.S_IFDIR | 0o755, uid: 0 }),
+      lstatFn: async () => ({ mode: fsConstants.S_IFLNK | 0o777, uid: 0 }),
+    },
+  );
+  assert.equal(outcome.trusted, false);
+  assert.equal(outcome.reason, "symlink:/etc/descartes/provenance.json");
+});
+
+test("verifyTrustBoundary uses the real lstat by default: a real symlink to a trusted file is rejected", async () => {
+  const paths = await tempPaths();
+  const dir = path.join(paths.stateDir, "trust-symlink");
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const target = path.join(dir, "helper-real");
+  await fs.writeFile(target, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const link = path.join(dir, "helper-link");
+  await fs.symlink(target, link);
+  const outcome = await verifyTrustBoundary({ helperPath: link });
+  assert.equal(outcome.trusted, false);
+  assert.equal(outcome.reason, `symlink:${link}`);
+});
+
+test("resolveElevated re-verifies the trust boundary immediately before the invoke (a helper swapped after the probe is never executed)", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const fixture = trustedHelperFixture();
+  let invokeCalls = 0;
+  const options = fakeElevatedOptions({
+    statOverrides: fixture,
+    probeElevatedHelper: async () => {
+      // Between probe and invoke, the helper is replaced by something group/world-writable.
+      fixture[FIXTURE_HELPER_PATH] = { mode: 0o777, uid: 0 };
+      return { available: true, mechanism: "cap_sys_ptrace" };
+    },
+    invokeElevatedHelper: async () => { invokeCalls++; return { status: "ok", stdout: validHelperStdout({ port: 8080 }) }; },
+  });
+  const result = await resolveElevated({ target: { ...SOCKET_TARGET }, paths }, options);
+  assert.equal(result, undefined);
+  assert.equal(invokeCalls, 0);
 });
 
 test("verifyTrustBoundary fails closed on a stat error anywhere in the chain", async () => {

@@ -16,7 +16,8 @@
 // `const fn = options.fn ?? defaultFn;` -- no mocking library anywhere in this repo's tests.
 
 import { execFile } from "node:child_process";
-import { readFile as fsReadFile, stat } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { readFile as fsReadFile, lstat, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig, resolveProvenanceConfigPaths } from "../provenance-elevated-config.js";
@@ -169,10 +170,15 @@ function isTrustedOwner(uid, expectedUid) {
   return expectedUid !== undefined && uid === expectedUid;
 }
 
-async function statIsTrusted(targetPath, statFn, expectedUid) {
+function isSymlinkMode(mode) {
+  return (mode & fsConstants.S_IFMT) === fsConstants.S_IFLNK;
+}
+
+async function statIsTrusted(targetPath, statFn, expectedUid, { rejectSymlink = false } = {}) {
   try {
     const info = await statFn(targetPath);
     if (!info) return { trusted: false, reason: `stat_failed:${targetPath}` };
+    if (rejectSymlink && isSymlinkMode(info.mode)) return { trusted: false, reason: `symlink:${targetPath}` };
     if (isUnsafeMode(info.mode)) return { trusted: false, reason: `group_or_world_writable:${targetPath}` };
     if (!isTrustedOwner(info.uid, expectedUid)) return { trusted: false, reason: `untrusted_owner:${targetPath}` };
     return { trusted: true };
@@ -194,18 +200,31 @@ function ancestorDirs(targetPath) {
   return dirs;
 }
 
+// 2026-10 (research finding 5, bounded part): the two LEAF paths -- the helper binary and the
+// config file -- are checked with lstat (no final-symlink follow) and a symlink there is rejected
+// outright. stat() followed a final symlink, so a root-owned, correctly-moded TARGET vouched for a
+// link whose own location the check never examined. The residual check-then-exec window (execFile
+// re-resolves the path after this check) is narrowed by re-running this check immediately before
+// the invoke as well as before the probe (see resolveElevated); closing it fully needs
+// descriptor-pinned execution or a long-lived root-owned service -- deferred, see the research doc.
 export async function verifyTrustBoundary({ configPath, configDir, helperPath } = {}, options = {}) {
   const statFn = options.statFn ?? stat;
+  // Tests that inject only statFn keep exercising their fixtures for the leaves too.
+  const lstatFn = options.lstatFn ?? options.statFn ?? lstat;
   const expectedUid = options.expectedUid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
 
-  const candidates = [
-    ...(helperPath ? [helperPath, ...ancestorDirs(helperPath)] : []),
-    ...(configPath ? [configPath] : []),
+  const leaves = [...(helperPath ? [helperPath] : []), ...(configPath ? [configPath] : [])];
+  for (const leaf of leaves) {
+    const outcome = await statIsTrusted(leaf, lstatFn, expectedUid, { rejectSymlink: true });
+    if (!outcome.trusted) return outcome;
+  }
+
+  const directories = [
+    ...(helperPath ? ancestorDirs(helperPath) : []),
     ...(configDir ? [configDir] : []),
   ];
-  const uniqueCandidates = [...new Set(candidates)];
-
-  for (const candidate of uniqueCandidates) {
+  for (const candidate of [...new Set(directories)]) {
+    if (leaves.includes(candidate)) continue;
     const outcome = await statIsTrusted(candidate, statFn, expectedUid);
     if (!outcome.trusted) return outcome;
   }
@@ -345,6 +364,12 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
   // only ever attempted when named explicitly in config.
   const attemptedMechanism = configuredMechanism === "auto" ? (probeResult.mechanism ?? "auto") : configuredMechanism;
   if (attemptedMechanism === "root_helper" && configuredMechanism !== "root_helper") return undefined;
+
+  // 2026-10 (research finding 5): re-verify immediately before the invoke rather than trusting the
+  // pre-probe check across the probe's whole lifetime (up to its timeout) -- shrinks, but does not
+  // close, the check-then-exec window; see verifyTrustBoundary's doc.
+  const trustAtInvoke = await verifyTrustBoundary({ configPath: configFile, configDir: paths.configDir, helperPath }, options);
+  if (!trustAtInvoke.trusted) return undefined;
 
   const invoke = options.invokeElevatedHelper ?? defaultInvokeElevatedHelper;
   let invokeResult;
