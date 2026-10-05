@@ -852,3 +852,23 @@ test("S4: multi-family predicates AND over each family's own completeness -- one
     assert.equal(factHistoryTrustworthy({ ...combinedOnly, family_reads: bad }).trust, false);
   }
 });
+
+// S4 sweep x I4 (external truncation stays a continuity break): the sweep now runs retention over a
+// family store with NO new points, so a facts.jsonl deleted under a ledger that had committed records
+// must not be re-certified as an empty intact store two passes later -- it is a lineage break
+// (stamped, degraded for the window), exactly like an external truncation caught by the prefix check.
+test("S4/I4: a family facts.jsonl deleted under a ledger that committed records is a continuity break on the next sweep -- never re-certified intact", async () => {
+  const paths = await tempPaths();
+  const t0 = "2026-07-10T00:00:00.000Z";
+  await appendFactPointsByFamily(paths, [servicePoint("nginx", t0), networkPoint("tcp:22", t0)], { now: t0 });
+  await appendFactPointsByFamily(paths, [], { now: t0 });
+  assert.equal((await readFactPoints(paths, { family: "network", now: t0 })).completeness.status, "intact");
+  await fs.rm(resolveFactStorePaths(paths, "network").factsFile);
+  const t1 = "2026-07-10T01:00:00.000Z";
+  await appendFactPointsByFamily(paths, [servicePoint("nginx", t1)], { now: t1 });
+  for (let pass = 0; pass < 2; pass += 1) await appendFactPointsByFamily(paths, [], { now: t1 });
+  const read = await readFactPoints(paths, { family: "network", now: t1 });
+  assert.notEqual(read.completeness.status, "intact", "deleted history is never re-certified");
+  assert.equal(read.completeness.last_continuity_break_ts, t1);
+  assert.equal((await readFactPoints(paths, { family: "service", now: t1 })).completeness.status, "intact", "the other family is unaffected");
+});

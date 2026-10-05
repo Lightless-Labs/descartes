@@ -1478,7 +1478,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           .map(([, rule]) => rule?.since_ts)
           .filter((since) => typeof since === "string" && Number.isFinite(Date.parse(since)))
           .sort()[0];
-        if (shortSince) entry.horizon_short_since = shortSince;
+        // I11: a never-created store reads "not observed (no store)", never "horizon short since X"
+        // (its rules' carried-forward entries stay on history_horizon_short itself).
+        if (shortSince && entry.store !== "absent") entry.horizon_short_since = shortSince;
       }
     }
   }

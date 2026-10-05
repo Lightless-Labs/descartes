@@ -372,6 +372,14 @@ function oldestTimestamp(records) {
 
 export function observeFactContinuity(ledger, live) {
   if (!ledger || !isValidFactIntegrityLedger(ledger)) return "unknown";
+  // S4 (fact-store capacity plan §4.3 sweep, I4): a facts.jsonl that is GONE under a ledger that
+  // committed records is an external truncation of the whole store -- "broken", not "unknown". The
+  // store only ever replaces its file by tmp+rename, never deletes it, so no honest path (crash
+  // included) leaves it missing after a non-empty commit. Before the registry-driven sweep this was
+  // only ever reached with new points appended (live count < committed -> broken anyway); the sweep
+  // now runs retention with NO new points, where "unknown" would let the next pass re-certify an
+  // empty store as intact over the deleted history.
+  if (live?.exists === false && (ledger.continuity.last_rewrite_record_count > 0 || ledger.continuity.last_rewrite_bytes > 0)) return "broken";
   if (ledger.continuity.pending_pass) return "unknown";
   if (live?.exists === false) return "unknown";
 

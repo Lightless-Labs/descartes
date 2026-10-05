@@ -204,3 +204,34 @@ test("T12 (daemon): one family's append failure is reported as storage_write_err
   assert.ok(result.structuralFacts.families.service.written_count > 0);
   assert.ok((await readFactPoints(paths, { family: "service", now: at(0) })).points.length > 0, "the service family still persisted");
 });
+
+test("status shape: the top-level keys of a clean watch-tier tick's status record are pinned (a new block must be added here deliberately)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  const result = await tick(paths, 0);
+  assert.deepEqual(Object.keys(result.status).sort(), [
+    "collector_statuses",
+    "fact_store_budgets",
+    "fact_store_completeness",
+    "integrity_level",
+    "mode",
+    "novelty_seen_sets",
+    "points_written",
+    "profile",
+    "retention",
+    "state",
+    "structural_collector_statuses",
+    "ts",
+  ]);
+});
+
+test("status: a never-created family store never shows horizon_short_since, even while a carried-forward horizon-short entry names one of its rules (I11: absent is 'not observed', not 'short')", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  const result = await tick(paths, 0, {
+    readDaemonStatus: async () => ({ ts: at(-0.5), history_horizon_short: { threshold_ms: 24 * HOUR_MS, rules: { "session.count_drop": { since_ts: at(-10) } } } }),
+  });
+  assert.equal(result.status.history_horizon_short.rules["session.count_drop"].since_ts, at(-10), "the unknown rule's entry is carried (S3b LOW-2)");
+  assert.equal(result.status.fact_store_completeness.families.session.store, "absent");
+  assert.equal(result.status.fact_store_completeness.families.session.horizon_short_since, undefined);
+});
