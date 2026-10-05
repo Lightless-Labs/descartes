@@ -388,6 +388,8 @@ struct FinalHolderEvidence {
     fd_name: String,
 }
 
+type FinalHolderObservation = (String, u32, u64, String, (u64, u64), Vec<String>, bool);
+
 fn final_holder_evidence(holder: &Holder) -> FinalHolderEvidence {
     FinalHolderEvidence {
         pid: holder.resolved.pid,
@@ -449,9 +451,7 @@ fn verify_final_holders_with<FR, FH>(
 ) -> Result<(), SocketOutcome>
 where
     FR: FnMut() -> (Option<SocketRow>, SocketTableStatus),
-    FH: FnMut(
-        &FinalHolderEvidence,
-    ) -> Result<(String, u32, u64, String, (u64, u64), Vec<String>, bool), ()>,
+    FH: FnMut(&FinalHolderEvidence) -> Result<FinalHolderObservation, ()>,
 {
     let (row, status) = read_row();
     if status == SocketTableStatus::NamespaceMismatch {
@@ -994,7 +994,7 @@ mod tests {
 
     fn stable_final_holder_read(
         holder: &FinalHolderEvidence,
-    ) -> Result<(String, u32, u64, String, (u64, u64), Vec<String>, bool), ()> {
+    ) -> Result<FinalHolderObservation, ()> {
         Ok((
             "socket:[424242]".to_string(),
             holder.tgid,
