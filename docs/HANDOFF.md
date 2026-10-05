@@ -2,9 +2,11 @@
 
 **Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity S4 + S5 built; daybreak G2 re-gate findings fixed; not pushed or merged (2026-10-05)
+## Current continuity — fact-store capacity S4 + S5 built; follow-up daybreak G2 findings fixed; not pushed or merged (2026-10-05)
 
-The follow-up G2 re-gate is complete on the current branch. Three atomic commits fix the repeated-quarantine/unreadable-boundary HIGH-1, retention recovery HIGH-2, and future-dated quarantine MEDIUM findings. Targeted regression tests are 40/40 green. Final fresh-XDG full suite: 2213 tests, 2157 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
+The follow-up G2 re-gate is complete on the current branch. Two atomic commits fix the resumed-quarantine HIGH-1 and retention-alert MEDIUM findings; the earlier future-dated quarantine medium remains fixed. Focused migration/seen-set/status tests are 57/57 green. Final fresh-XDG full suite: 2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
+
+**Follow-up commits:** `a5e87ce` resets a resumed quarantine's epoch to the resume pass and records per-item move timestamps for retention; `42cb8df` freezes unresolved retention alerts without re-emitting candidates while preserving recovery only after a successful family pass. Both carry the required Claude trailer.
 
 **G2 rework (plan §20–§21):** the G2 review's two HIGH findings and interval MEDIUM are fixed; the §20 LOW dispositions remain recorded.
 - **H1** `fb63477`: quarantine epochs/timestamps now invalidate continuous-null novelty certification after later legacy evidence.

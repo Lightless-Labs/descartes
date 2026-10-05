@@ -162,7 +162,7 @@ test("G2 HIGH-2: carried retention failure stays fixed-alert-active across fast 
   });
   const unreadableAlert = unreadableStatusFast.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
   assert.equal(unreadableAlert?.status, "active", "an unreadable prior status cannot authorize recovery");
-  assert.ok(unreadableStatusFast.alerts.candidates.some((candidate) => candidate.rule_id === alertId && candidate.fingerprint === "service"), "the active alert is carried from the alert store itself");
+  assert.equal(unreadableStatusFast.alerts.candidates.some((candidate) => candidate.rule_id === alertId && candidate.fingerprint === "service"), false, "an unresolved alert is frozen rather than re-emitted without successful evidence");
 
   await writeWatchConfig(paths, { enabled: false });
   await writeLearnedConfig(paths, { enabled: false });
@@ -176,6 +176,35 @@ test("G2 HIGH-2: carried retention failure stays fixed-alert-active across fast 
   assert.equal(recoveredAlert?.status, "recovered", "only a successful structural retention pass may recover the fixed alert");
   assert.equal(recovered.status.fact_store_budgets.families.service.retention_error, undefined);
   assert.equal(recovered.status.state, "ok");
+});
+
+test("G2 MEDIUM re-gate: an unresolved retention alert freezes without refresh while both tiers stay disabled", async () => {
+  const paths = await tempPaths();
+  const failingPersist = async (descartesPaths, points, options) => {
+    const result = await appendFactPointsByFamily(descartesPaths, points, options);
+    return {
+      ...result,
+      families: { ...result.families, service: { ...result.families.service, retention_error: "simulated persistent retention failure" } },
+      retention_error: "service: simulated persistent retention failure",
+    };
+  };
+
+  const failed = await tick(paths, 0, { appendFactPoints: failingPersist });
+  const alertId = "daemon.fact_store.retention_failing";
+  const initial = failed.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
+  assert.ok(initial);
+  const frozenFields = { last_seen: initial.last_seen, last_notified: initial.last_notified, cooldown_until: initial.cooldown_until };
+
+  await writeWatchConfig(paths, { enabled: false });
+  await writeLearnedConfig(paths, { enabled: false });
+  for (const hour of [1, 2]) {
+    const result = await tick(paths, hour);
+    const current = result.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
+    assert.deepEqual({ last_seen: current.last_seen, last_notified: current.last_notified, cooldown_until: current.cooldown_until }, frozenFields);
+    assert.equal(result.alerts.notification_due_ids.includes(current.id), false);
+    assert.equal(result.alerts.candidates.some((candidate) => candidate.rule_id === alertId && candidate.fingerprint === "service"), false);
+    assert.equal(current.status, "active");
+  }
 });
 
 test("T12: a store larger than its budget by more than one worst-case tick reads retention_failing at once", async () => {

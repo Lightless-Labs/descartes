@@ -1092,10 +1092,21 @@ The final 22 sandbox failures were 17 notifier-reuse loopback binds, 3 tap-bump 
 
 ### 21.5 Follow-up G2 re-gate findings (2026-10-05)
 
-The follow-up daybreak-blue re-gate reproduced all three requested gaps in the earlier §21 fixes. Each was repaired test-first in its own atomic commit; no push or merge was performed.
+The follow-up daybreak-blue re-gate reproduced two gaps in the earlier §21 fixes. The earlier future-timestamp medium remains fixed; the two new gaps were repaired test-first in separate atomic commits, with no push or merge.
 
-1. **HIGH-1 — repeated quarantine and unreadable/pending episodes.** A new quarantine now always stamps its own pass time. Seen-set certification compares the epoch pair `(quarantine_epoch, quarantine_epoch_ts)` and advances to the current episode. Unreadable, corrupt, and pending migration evidence is a new discard episode on every observation, with the boundary advanced to that pass. The two-quarantine `svc-C` reproduction and the corrupt-marker/pending-data reproduction are green.
-2. **HIGH-2 — retention recovery evidence.** `daemon.fact_store.retention_failing` is no longer blanket fixed-rule recovery coverage. Active retention alerts are carried from the alert store when status is missing/unreadable, the tick is fast, or both tiers are off. Recovery is authorized only for the alert's family after a genuine successful structural retention pass. The unreadable-status, both-tiers-off, and successful-structural-pass reproductions are green.
-3. **MEDIUM — future quarantine timestamps.** A future marker is advanced and stamped at the clock-correction pass. Any seen-set boundary derived from a future epoch is clamped to that pass, so the registered novelty horizon starts at the correction rather than the future date. The 2099→2026 reproduction is green.
+1. **HIGH-1 — resumed quarantine with newly discovered root data.** A resumed pass that moves at least one root item advances `quarantine_epoch` and `quarantine_epoch_ts` to that resume pass. The marker records each destination item's move timestamp, and directory deletion waits 31 days from the newest item move (old markers without per-item metadata are extended conservatively at observation). The in-progress quarantine at 2 h, `svc-C` at 60 h, resume at 60 h, and no-claim at 67 h reproduction is green; the >31-day resume retains the newly moved item until its own deadline.
+2. **MEDIUM — unresolved retention alert reassertion.** An active or acknowledged `daemon.fact_store.retention_failing` alert with no successful structural-pass evidence is frozen in the persisted alert store. It is not synthesized as a candidate, so `last_seen`, `last_notified`, cooldown, and notification eligibility do not refresh. The existing HIGH-2 recovery gate remains: only a successful family retention pass authorizes recovery. The tiers-disabled hourly reproduction and the unreadable-status guard are green.
+3. **Prior MEDIUM — future quarantine timestamps (still fixed).** A future marker is advanced and stamped at the clock-correction pass. Any seen-set boundary derived from a future epoch is clamped to that pass, so the registered novelty horizon starts at the correction rather than the future date. The 2099→2026 reproduction remains green.
 
-Targeted G2 migration/seen-set tests: **40/40 pass**. Final fresh-XDG full suite: **2213 tests, 2157 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped**. The sandbox failures are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.
+### 21.6 Follow-up implementation and verification
+
+The resumed-quarantine fix is `a5e87ce` (`fix: reset resumed quarantine epoch and retention`). The retention-alert freeze is committed separately after the fresh-XDG regression run, with the required Claude trailer. No authenticated Git command, push, or merge was performed.
+
+Each full suite uses fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` directories created with `mktemp -d`.
+
+| commit | disposition | tests | pass | product fail | sandbox fail | skipped |
+|---|---|---:|---:|---:|---:|---:|
+| `a5e87ce` | HIGH-1 fixed; sandbox-only failures | 2216 | 2160 | 0 | 22 | 34 |
+| `42cb8df` | MEDIUM fixed; sandbox-only failures | 2217 | 2161 | 0 | 22 | 34 |
+
+The sandbox failures are environment-only: 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. The focused migration, seen-set, and fact-store-status files are green, including the earlier HIGH-2 successful-pass recovery test.

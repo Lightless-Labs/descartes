@@ -406,21 +406,17 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   const successfulRetentionFamilies = options.successfulRetentionFamilies instanceof Set
     ? options.successfulRetentionFamilies
     : new Set();
-  const carriedRetentionCandidates = existing
-    .filter((alert) => alert.rule_id === RETENTION_FAILURE_RULE_ID
-      && ["active", "acknowledged"].includes(alert.status)
-      && !successfulRetentionFamilies.has(alert.fingerprint)
-      && !candidates.some((candidate) => candidate.id === alert.id))
-    .map((alert) => ({
-      id: alert.id,
-      rule_id: alert.rule_id,
-      fingerprint: alert.fingerprint,
-      severity: alert.severity,
-      title: alert.title,
-      summary: alert.summary,
-      diagnostics: alert.diagnostics,
-    }));
-  const currentCandidates = [...candidates, ...carriedRetentionCandidates];
+  const existingById = new Map(existing.map((alert) => [alert.id, alert]));
+  // An unresolved retention alert without successful-pass evidence is frozen in place. Re-emitting
+  // it as a synthetic candidate would turn stale status into fresh observation, advancing last_seen
+  // and notification eligibility on every fast tick (especially while both tiers are disabled).
+  // computeCoveredAlerts separately excludes the identity from recovery until its family reports a
+  // genuinely successful structural retention pass, so removing the candidate preserves HIGH-2.
+  const currentCandidates = candidates.filter((candidate) => {
+    if (candidate.rule_id !== RETENTION_FAILURE_RULE_ID || successfulRetentionFamilies.has(candidate.fingerprint)) return true;
+    const existingAlert = existingById.get(candidate.id);
+    return !existingAlert || !["active", "acknowledged"].includes(existingAlert.status);
+  });
   // Both sources MUST be merged into one array before the single applyAlertCandidates call below:
   // applyAlertCandidates' recovery logic marks any active alert id absent from the current candidate
   // array as "recovered", so evaluating fixed rules and extra (e.g. constraint) candidates separately
