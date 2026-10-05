@@ -2,9 +2,17 @@
 
 **Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity S3 + S3b built (2026-10-05)
+## Current continuity — fact-store capacity S4 + S5 built; awaiting daybreak G2 (2026-10-05)
 
-Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged. Plan: `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md` (§18 is the S3/S3b execution record, deviations and G2 questions).
+Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged. Plan: `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md` (§19 is the S4/S5 execution record, deviations and G2 questions; §18 is S3/S3b).
+
+- **S4 (done):** registry budgets/T8 floor/routing + session/peer clamps `f6cc436`; per-family stores (`learned/facts/<family>/`), required `family` everywhere, routed append + registry retention sweep, all 16 readers switched, per-family daemon reads/veto/horizon-short `bbb9487`; T7 `5adc7df`; `fact_store_budgets` status (`budget_below_horizon_floor`, `cap_below_tick`, `retention_failing`) `b06f3b3`; T9 read-cost guard (~2.8 s modelled, bound 5 s) `9d613a1`.
+- **S5 (done):** legacy store + pre-S4 seen-sets quarantined to `learned/facts-legacy-<iso>/`, idempotent, deleted after 31 days `031068f`; Q5 (legacy `fact_store_max_bytes` ignored, a deliberate value named as deprecated) `06509b5`; T10 (lockout clears at tick 6, count rules at tick 29) `430af54`.
+- **Finding (§19.3, fixed `708e379`):** the no-points retention sweep re-certified a family store whose `facts.jsonl` was deleted under a committed ledger as `intact`; a missing file under a non-empty commit is now a continuity break.
+- **Full suite** on `708e379` (fresh scratch `XDG_*`): 2196 tests, 2162 pass, 0 fail, 34 skipped. T4's timeout is now 300 s (I/O contention in the full suite).
+- **Next:** **daybreak G2** with the §18.5 and §19.5 questions; then S6 (CLI per-rule "would evaluate") and S7 (soak). Do not push.
+
+### Earlier on this branch — S3 + S3b (2026-10-05)
 
 - **G1 rework (done):** blocker 1 `ddbc6a6` (interim full-coverage novelty gate), blocker 2 `dc117ca` (persisted monotonic `age_floor_ts`). Q6 (first/last-seen set) was pulled into scope by the operator as **S3b** (§17).
 - **S3 (done):** `fact-families.js` registry + `certifiedHorizonOk` (valid-ledger, max of both floors) `9581332`; per-rule horizon gate in the producers `da35bc7`; miner/shadow/correlation moved off the interim gate onto `certifiedReadWindowOk` (provably identical input to a never-byte-evicted store) `2e9ffdc`; daemon per-rule horizon veto + `history_horizon_short` + fixed alert `daemon.fact_history.horizon_short` `7656cf5`; novelty diagnostics `history_certified_after_ts` `30d2b35`.
@@ -13,7 +21,7 @@ Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing h
 - **Finding recorded (§18.3):** the interim `requireFullCoverage` gate silenced novelty/correlation/miner permanently once a store was 30 days old (age floor inside the 31 d window), and shadow after any byte-cap eviction — never shipped, fixed by S3/S3b.
 - **Full suites** (fresh scratch `XDG_*`, on a `git archive` snapshot of each commit): 0 fail at every commit (one run of `2e9ffdc` had T4 cancelled at its 120 s timeout under concurrent load, not a failure; it passes in ~5 s alone); final code commit `d1f96c6`: 2137 tests, 2103 pass, 0 fail, 34 skipped. The earlier "22 sandbox-only failures" no longer reproduce on this machine (baseline 2089 / 2055 pass / 0 fail / 34 skipped).
 - **Expected before S4 (Leg D, §18.6):** on the single 5 MB store the session/peer count rules (30 h) are permanently horizon-short once eviction starts, so `daemon.fact_history.horizon_short` fires after 24 h on real hosts. S4 budgets fix it.
-- **Next:** S4 (per-family stores, per-family veto, budgets; seen-set paths move into the family dirs; S5/M3 must also quarantine legacy seen-set files), then **daybreak G2** with the §18.5 questions.
+- **Then (now done, see above):** S4 and S5.
 
 ## Current Status
 

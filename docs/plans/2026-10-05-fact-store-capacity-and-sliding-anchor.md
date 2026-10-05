@@ -4,7 +4,8 @@
 **Status:** PLAN. Awaiting operator decisions (§12) and a pre-build multi-model plan review (Fable code-grounded, daybreak-blue, Astra) per `docs/solutions/2026-09-14-multi-model-review-and-planning-playbook.md`.
 **Reviewed:** 2026-10-05 (adversarial plan review, NEEDS-REVISION(7) → folded)
 **Addendum:** 2026-10-05: S0 grounding (§15), then S1 and S2 built on `feat/fact-store-capacity-2026-10` (§16). G1 ran; Q6 pulled in as S3b (§17).
-**Addendum:** 2026-10-05: S3 (eligibility horizon) and S3b (first/last-seen set) built, plus the G1 re-gate LOWs (§18). S4 not started; the branch awaits G2 after S4.
+**Addendum:** 2026-10-05: S3 (eligibility horizon) and S3b (first/last-seen set) built, plus the G1 re-gate LOWs (§18).
+**Addendum:** 2026-10-05: S4 (per-family stores, routing, per-family veto, budgets, status) and S5 (legacy quarantine, Q5) built, with T7-T10 and T12 (§19). S6/S7 not started; the branch awaits **daybreak G2**.
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -894,3 +895,85 @@ This was never shipped (the branch is unpushed). It is fixed by deviation 3 (rea
 The final code commit is `d1f96c6`; this addendum and the HANDOFF update follow as a docs-only commit. Full suite on `d1f96c6` (snapshot, fresh scratch `XDG_*`): 2137 tests, 2103 pass, 0 fail, 34 skipped, 0 todo. T1 runtime is about 60 s on this machine both before and after S3b; the seen-set fold and read add roughly 8 %.
 
 **Expected pre-S4 behavior on the current single 5 MB store (Leg D, not a bug).** Once eviction starts (~28 h), the certified span stays near 27 h, below the 30 h horizon of `session.count_drop`, `peer.count_spike` and `peer.count_drop`. So on every real host running this branch, those three rules are permanently horizon-short: `history_horizon_short` lists them, and `daemon.fact_history.horizon_short` fires 24 h later. Novelty is NOT affected, because with a valid seen-set it measures its horizon against the set. S4's per-family budgets (T8) resolve this. Expect it in any S7 soak or status read before S4.
+
+---
+
+## 19. Addendum: S4 and S5 execution (2026-10-05)
+
+**Addendum:** 2026-10-05. S4 (R0a) and S5 (migration) are built on `feat/fact-store-capacity-2026-10`, on top of §18. Nothing is pushed. S6 (CLI consistency) and S7 (soak) are **not** started. Every test and command ran with fresh scratch `XDG_*` directories (`mktemp -d`); `~/.local/state/descartes` was never read or written. Baseline before S4 (`938e2e1`): 2137 tests in §18.6's count plus the S3b review fixes.
+
+### 19.1 Commits and full-suite totals
+
+| commit | step | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `f6cc436` | S4: registry budgets, pinned tick shapes, `familyBudgetFloorBytes` (T8 floor), `resolveFactStoreBudgets`, `requireFactFamily`, `groupFactPointsByFamily`; session/peer/Tailscale hard clamps, `MAX_JOB_LIMIT`; T8 + T12 routing/translator coverage | 2153 | 2119 | 0 | 34 |
+| `bbb9487` | S4: per-family stores, required `family`, routed append + registry sweep, multi-family reads, all 16 readers switched, per-family daemon reads/veto/horizon-short, per-family status block; tests migrated | 2161 | 2127 | 0 | 34 |
+| `5adc7df` | S4: T7 per-family veto matrix (a global-veto mutation fails 13 of 16) | 2177 | 2143 | 0 | 34 |
+| `b06f3b3` | S4: `fact_store_budgets` status, `budget_below_horizon_floor`, `cap_below_tick`, retention-failure status, watch.json `fact_store_budgets` | 2183 | 2149 | 0 | 34 |
+| `9d613a1` | S4: T9 read-cost guard incl. seen-set reads | 2184 | 2150 | 0 | 34 |
+| `031068f` | S5: M2/M3 legacy quarantine (+ daemon wiring) | 2191 | 2157 | 0 | 34 (first run: T4 hit its 120 s timeout under load, 1 fail; rerun on the same tree green) |
+| `02f11e1` | test: T4 timeout 120 s -> 300 s (see deviation 15) | covered by the next run | | | |
+| `06509b5` | S5: Q5 legacy `fact_store_max_bytes` | 2191 | 2157 | 0 | 34 |
+| `430af54` | S5: T10 already-locked-out upgrade | 2192 | 2158 | 0 | 34 |
+| `f65fdf5` | T12 daemon-level per-family append failure | 2193 | 2159 | 0 | 34 |
+| `708e379` | fix: missing `facts.jsonl` under a committed ledger is a continuity break (finding 19.3); absent store never shows `horizon_short_since`; status key set pinned | 2196 | 2162 | 0 | 34 |
+
+### 19.2 What landed
+
+**S4.**
+- **Registry (`fact-families.js`).** Per-family default budgets (the S0-revised 65 MiB), pinned worst-case tick shapes (`entityCap x maxRecordBytes + markerBytes`, §15.3), `FAMILY_HORIZON_MAX_MS`, `familyBudgetFloorBytes` (the T8 invariant, which is also the config floor), `resolveFactStoreBudgets` (rejections reported as `budget_below_horizon_floor` / `invalid`; unknown keys reported, never a family), `requireFactFamily`, `groupFactPointsByFamily` (an unregistered fact_name throws before anything is returned), and reader entries for `active_constraint` and `provenance_warning` (new coverage kind `present_only`). Module init throws if a default budget is below its own invariant.
+- **Clamps (§2).** `tools/sessions.js`, `vpn-peer-status.js`, `tailscale-status.js`: the 200 defaults are now hard upper clamps (`MAX_*`); `tools/scheduled-jobs.js` exports `MAX_JOB_LIMIT`. T8 asserts each pinned entity cap equals the live collector constant, so raising a cap without revisiting the budget fails the suite.
+- **Store.** `learned/facts/<family>/{facts.jsonl,integrity.json,seen-set.json}`. `family` is required on `readFactPoints`/`appendFactPoints`/`enforceFactRetention`/`resolveFactStorePaths`/`resolveFactIntegrityPaths`/`read|writeFactIntegrityLedger`; missing/unknown throws, with no legacy default. `appendFactPoints` refuses an unregistered fact_name or a point of another family before any write. `appendFactPointsByFamily` routes a tick, appends each family with its budget, reports per-family failures without stopping the others, and sweeps retention over every other **existing** registry family store (never the filesystem; a never-created store is not created). `readFactPoints({families})` merges independent per-family reads, with `family_reads`, a combined display completeness, `bytes` and `store_exists`. Only a novelty family's own pass folds (its own) seen-set.
+- **Predicates.** `factHistoryTrustworthy`, `certifiedHorizonOk`, `certifiedReadWindowOk` (and so `ruleEligible`) AND over each family's own read when `family_reads` is present, failing closed on a malformed one. A combined floor never gates (pinned: one family's newer age floor would mask another's byte-cap floor).
+- **Readers (all 16, §15.2).** Detectors on their own family; correlation on `peer`; active-constraint, shadow, miner and tuning on `service`+`network` via the registry; provenance-warning on `provenance`; `learned status` per family (all 8); `baseline.js` per domain.
+- **Daemon.** Per-family structural persist with `watch.json` `fact_store_budgets`; retention sweep on every completed structural tick (even with no points); one history read per family that has a dependent rule of an enabled tier (I9); `historyVetoedRuleIds` per family (unread or untrusted family vetoes its rules) and the per-rule horizon veto on each rule's own family reads, at both `computeCoveredAlerts` passes; horizon-short decided and carried forward per rule; status `fact_store_completeness` (combined + `families`) and `fact_store_budgets` (every registry family).
+- **Tests.** T7 (`fact-store-family-veto.test.js`), T8 and T12 (`fact-families.test.js`, `fact-store.test.js`, `fact-store-status.test.js`), T9 (`fact-store-read-cost.test.js`: ~2.8 s modelled worst case at default budgets, under the 5 s bound). T1 still proves routine eviction never locks out, now per family (deviation 5).
+
+**S5.**
+- **M2** needs no code: new per-family paths start at the missing-ledger bootstrap; nothing is inherited (I8).
+- **M3** (`fact-store-migration.js`): `learned/facts/facts.jsonl`, `integrity.json`, the pre-S4 `seen-sets/`, and stray `facts.jsonl.<pid>.tmp` / `integrity.json.<pid>.tmp` move to `learned/facts-legacy-<iso>/`, beside the facts tree. The marker `learned/facts-legacy.json` records the target **before** anything moves, so a half-done move resumes into the same directory; a legacy file that reappears later (downgrade, then upgrade) gets a new directory. The daemon runs it each tick while a tier is on, never fatally, and reports `fact_store_legacy` (status, moved, deleted, pending with `delete_after_ts`).
+- **Q4.** A quarantine is deleted 31 days after it was taken, only if the marker lists it and its name matches `^facts-legacy-[0-9A-Za-z-]+$`; an unparseable marker deletes nothing.
+- **Q5.** `watch.json`/`learned.json` no longer write the 5 MB default in. The written-in default and invalid values normalize to absent; a deliberate non-default value is preserved and named as deprecated/ignored (`fact_store_deprecations` on the daemon status; a line in `learned status`). The F2-Tier1 pins are rewritten with the reason in place.
+- **T10** (`fact-store-locked-out-upgrade.test.js`): legacy store with an in-window byte-cap marker on a v1 ledger, pre-S4 seen-sets, every watch-tier detector pending on a 20-day-old anchor. Result: quarantined byte-identical and unread; only registry directories under `learned/facts/`; no family ever reads `degraded`; lockout cleared at structural tick 6 (bound 8); session/peer count rules established at tick 29 (bound 32); provenance-warnings still emits `deleted_exe_running`.
+
+### 19.3 Finding: the sweep exposed a deleted-store re-certification (fixed, `708e379`)
+
+`observeFactContinuity` reported a missing `facts.jsonl` as `unknown`. Before S4 that path was only reached together with new points (live count below the committed count, so `broken`). The registry sweep runs retention with **no** new points, so a family file deleted under a ledger that had committed records was rewritten empty and, one pass later, read `intact`, over history that was lost (red test first). The store only ever replaces its file by tmp+rename, so a file gone after a non-empty commit is an external truncation: it now observes `broken` and stamps a continuity break. This touches G1-reviewed integrity code; G2 question 6.
+
+### 19.4 Deviations from the plan text
+
+1. **Status shape.** `fact_store_completeness` stays an object with the combined (worst-status) completeness at the top level, plus `families: {<family>: {..., store: "present"|"absent", bytes, budget_bytes, cap_below_tick?, retention_error?, retention_failing?, horizon_short_since?}}`, rather than a bare per-family map: existing consumers read `.status`.
+2. **A never-created store is left out of the multi-family AND and out of the combined display status.** It holds no history that could hide a counterexample or a prior sighting, and requiring it would silence the miner and shadow on every host with, say, no listening ports. A single-family read of it still reads `unknown`, so the daemon still vetoes that family's rules (T7 pins it). All families absent fails closed. This is a widening relative to §4.3's literal "trust holds only if every family is trusted".
+3. **Clamps over pinning.** Session, VPN-peer and Tailscale limits gained hard clamps equal to their defaults (200); service is pinned to `DEFAULT_SERVICE_CENSUS_CEILING` (1000), with the 5000 hard clamp left an operator choice per Q7.
+4. **Network/provenance config floor = their default budget.** They carry no history-dependent rule, so no H_max exists to derive a T8 floor; an operator value can only raise them.
+5. **T1 forces eviction through a test-only daemon seam, `options.factStoreBudgets`** (status `source: "override"`), because `watch.json` cannot go below the T8 floor and the default budgets would not evict in 40 ticks. The three novelty families are sized to fill after ~27 ticks.
+6. **The daemon's persist DI seam keeps its name `options.appendFactPoints`** but now has the routed `appendFactPointsByFamily` contract.
+7. **`cap_below_tick`, `last_tick_bytes` and the retention-error `since_ts` are carried across fast ticks from the prior status record** (display only; the record is same-UID writable, like `history_horizon_short`).
+8. **`retention_failing`** fires after `HISTORY_HORIZON_SHORT_ALERT_TICKS` (24) structural intervals of failure, or when this tick's read sees the file above budget + one worst-case tick (network/provenance: above budget). Status only; no fixed alert.
+9. **New status blocks:** `fact_store_budgets`, `fact_store_legacy`, `fact_store_deprecations`. The top-level key set of a clean watch-tier tick is now pinned by a test.
+10. **Seen-set path** is `learned/facts/<family>/seen-set.json` (S4 changed only `resolveSeenSetPaths` plus the per-family fold). A non-novelty family's pass folds nothing.
+11. **Registry reader entries** `active_constraint` and `provenance_warning` (coverage `present_only`), so every non-detector reader takes its families from the registry.
+12. **Migration is tier-gated** (no I/O when both tiers are off, so a fully disabled install keeps the legacy file until a tier is re-enabled). Stray rewrite tmp files are quarantined too.
+13. **An unparseable marker** deletes nothing, but a new quarantine then rewrites the marker, orphaning any older quarantine directory from automatic deletion (disk only, never read).
+14. **Q5 edge:** an operator value of exactly 5 MiB is indistinguishable from the written-in default and is dropped without a notice (the plan's rule). Invalid legacy values are now dropped rather than replaced by the default.
+15. **T4's timeout** is 300 s. It runs in ~15 s alone (the pre-S4 tree took ~28 s, measured back to back), but 90-120 s in the full suite since S4 added store-heavy test files beside it; one run hit 120 s.
+16. **T9 is a cost model**, not a benchmark: it captures the reads a real fast tick makes (watch + learned on, an active constraint present) and costs them at default budgets and full-size seen-sets at §15.4's ~15 ms/MiB. Its reader inventory is pinned. It runs on an empty store, so a future early return on empty points would lower the count silently.
+17. **`learned status`** reads and prints all 8 families (a never-created one as `not observed (no store)`); **`baseline status`** makes one read per domain (5 instead of 1). Both are CLI-only costs. S6's per-rule "would evaluate" rework is not started.
+
+### 19.5 G2 questions (in addition to §18.5, which remain open)
+
+1. **Absent-store exclusion** from the multi-family AND (deviation 2). Accept, or require every family to exist?
+2. **Network/provenance floor = default budget** (deviation 4), or give them an H_max (for example 3 h from the active-constraint freshness and the provenance window)?
+3. **The `options.factStoreBudgets` test seam** ships in `daemon.js`. Keep it, move it behind an env guard, or restructure T1?
+4. **Quarantine marker trust surface.** A forged old `quarantined_ts` deletes a quarantine early; an unparseable marker orphans older quarantines. Bounded to `facts-legacy-*` names and never read, but a new same-UID-writable state file.
+5. **Carried display state** (deviation 7) and `retention_failing` thresholds (deviation 8). Should `retention_failing` raise a fixed alert like `history_horizon_short`?
+6. **The I4 fix (§19.3)** changes G1-reviewed `observeFactContinuity`: a missing file under a committed non-empty ledger is now `broken`. Confirm the semantics, including the crash-with-pending-pass ordering (the check runs before the pending-pass `unknown`).
+7. **Read volume.** With learned on, one fast tick reads service 4x (veto, two detectors, active-constraint) and peer 3x; T9 models ~2.8 s worst case. Accept, or pull tail-read caching forward?
+8. **Combined display status** is over existing stores only; a store that exists but is untrusted still makes it non-intact.
+9. **Q5 exact-5 MiB edge** (deviation 14).
+10. **Clamps** (deviation 3): is a hard 200 cap on sessions and peers acceptable as a collector behavior change (the overflow marker already reports truncation)?
+11. **Per-family sweep under a clock rollback** stamps a future-fact loss in each existing family store whose records are now more than 6 h ahead (same outcome as the single store before; now per family).
+
+### 19.6 Final state
+
+Final code commit `708e379`: **2196 tests, 2162 pass, 0 fail, 34 skipped, 0 todo** (fresh scratch `XDG_*`). S4 and S5 are complete per §7; **next is daybreak G2** (scope §9: per-family `computeCoveredAlerts` veto, family registry, routing, required-`family` reader contract, non-detector reader horizons, plus the S5 quarantine and §19.3), then S6 (CLI consistency) and S7 (soak).
