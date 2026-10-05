@@ -144,13 +144,14 @@ for (const kind of ["marker", "garbled-marker", "legacy-file", "legacy-seen-sets
     await appendFactPoints(paths, serviceTick(at(0), ["a"]), { family: "service", now: at(0) });
     for (let hour = 1; hour <= 3; hour += 1) await appendFactPoints(paths, serviceTick(at(hour), ["a"]), { family: "service", now: at(hour) });
     const { set } = await readSeenSetFile(paths, "service");
-    assert.equal(set.certified_since_ts, at(0), "memory is certified only from the upgrade's first pass");
+    const expectedBoundary = kind === "marker" ? at(0) : at(3);
+    assert.equal(set.certified_since_ts, expectedBoundary, "an unreadable or pending migration is a fresh discard episode on every observed pass");
     const read = await readFactPoints(paths, { family: "service", now: at(3), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
     assert.equal(read.seen_sets.service.status, "valid");
-    assert.equal(read.seen_sets.service.scope_ts, at(0), "the claim scope never reaches back past the upgrade");
+    assert.equal(read.seen_sets.service.scope_ts, expectedBoundary, "the claim scope never reaches back past the latest observed discard");
     assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(3))), false, "horizon-short, not silently eligible");
     assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(47))), false);
-    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(48))), true, "the 48 h horizon recovers on schedule");
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(Date.parse(expectedBoundary) === Date.parse(at(0)) ? 48 : 51))), true, "the 48 h horizon recovers from the latest boundary");
   });
 }
 
@@ -195,6 +196,52 @@ test("G2 HIGH-1: a later legacy quarantine advances a continuous null seen-set b
   assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(3))), false, "svc-B cannot be claimed new before the 48 h horizon");
   const result = await computeServiceAppearanceCandidates(paths, { now: at(3) });
   assert.deepEqual(result.candidates, [], "the detector stays quiet during the quarantine horizon");
+});
+
+test("G2 HIGH-1 re-gate: every later quarantine has its own epoch timestamp, so the second discarded store cannot be claimed new", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(1), ["svc-A"]), { family: "service", now: at(1) });
+
+  const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(2), "svc-B"))}\n`);
+  await migrateLegacyFactStore(paths, { now: at(2) });
+  await appendFactPoints(paths, serviceTick(at(2), ["svc-A"]), { family: "service", now: at(2) });
+
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(60), "svc-C"))}\n`);
+  await migrateLegacyFactStore(paths, { now: at(60) });
+  const markerAfterSecond = JSON.parse(await fs.readFile(markerFile, "utf8"));
+  assert.equal(markerAfterSecond.quarantine_epoch, 2);
+  assert.equal(markerAfterSecond.quarantine_epoch_ts, at(60), "the second quarantine records its own pass time");
+
+  await appendFactPoints(paths, serviceTick(at(60), ["svc-A"]), { family: "service", now: at(60) });
+  await appendFactPoints(paths, serviceTick(at(61), ["svc-A", "svc-C"]), { family: "service", now: at(61) });
+  const set = (await readSeenSetFile(paths, "service")).set;
+  assert.equal(set.certified_since_ts, at(60), "the second quarantine advances the certification boundary");
+  const result = await computeServiceAppearanceCandidates(paths, { now: at(61) });
+  assert.deepEqual(result.candidates, [], "svc-C from the second discarded store is not claimed new at +1h");
+});
+
+test("G2 HIGH-1 re-gate: corrupted marker plus pending legacy data is a new discard episode on every observation", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });
+  const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(2), "svc-B"))}\n`);
+  await migrateLegacyFactStore(paths, { now: at(2) });
+  await appendFactPoints(paths, serviceTick(at(2), ["svc-A"]), { family: "service", now: at(2) });
+  assert.equal((await readSeenSetFile(paths, "service")).set.certified_since_ts, at(2));
+
+  await fs.writeFile(markerFile, "{not json");
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(3), "svc-C"))}\n`);
+  await appendFactPoints(paths, serviceTick(at(3), ["svc-A"]), { family: "service", now: at(3) });
+  const firstUnreadable = (await readSeenSetFile(paths, "service")).set;
+  assert.equal(firstUnreadable.certified_since_ts, at(3), "the first corrupt-marker observation advances to the pass");
+
+  await appendFactPoints(paths, serviceTick(at(4), ["svc-A"]), { family: "service", now: at(4) });
+  const secondUnreadable = (await readSeenSetFile(paths, "service")).set;
+  assert.equal(secondUnreadable.certified_since_ts, at(4), "a later corrupt-marker observation is not already handled");
 });
 
 test("fold rule: partial, unknown and markerless ticks are never folded; neither is a tick dated after the pass clock", async () => {

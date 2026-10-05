@@ -203,7 +203,9 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
   const items = await presentLegacyItems(factsRootDir);
   if (items.length > 0 || resumable) {
     const eventEpoch = resumable?.quarantine_epoch ?? (marker.quarantine_epoch + 1);
-    const eventTs = resumable?.quarantine_ts ?? (resumable ? resumable.started_ts : (marker.quarantine_epoch_ts ?? nowIso));
+    // A new quarantine is its own discard episode. Never inherit the previous marker timestamp:
+    // doing so makes later legacy evidence indistinguishable from the first quarantine.
+    const eventTs = resumable?.quarantine_ts ?? (resumable ? resumable.started_ts : nowIso);
     markerEpoch = eventEpoch;
     markerEpochTs = eventTs;
     const inProgress = resumable ?? { dir: quarantineDirName(nowIso), started_ts: nowIso, quarantine_epoch: eventEpoch, quarantine_ts: eventTs };

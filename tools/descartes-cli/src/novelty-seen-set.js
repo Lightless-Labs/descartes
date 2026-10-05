@@ -224,18 +224,15 @@ function quarantineBoundary({ priorSet, quarantineState, nowIso }) {
   const priorEpoch = priorSet?.quarantine_epoch ?? 0;
   const priorEpochTs = priorSet?.quarantine_epoch_ts ?? null;
   if (quarantineState.status === "unreadable" || quarantineState.status === "legacy_pending") {
-    // The marker/root evidence has no trusted epoch. Once this pass has recorded the conservative
-    // boundary, carrying that timestamp forward is enough; sliding it on every later pass would
-    // turn one migration fault into an unbounded permanent horizon lockout.
-    if (priorEpochTs !== null) return { certifiedSince: priorSince, epoch: priorEpoch, epochTs: priorEpochTs };
-    return { certifiedSince: laterIso(priorSince, nowIso) ?? nowIso, epoch: priorEpoch, epochTs: nowIso };
+    // The marker/root evidence has no trusted epoch. Every observation is therefore a new discard
+    // episode: retaining an older timestamp would let newly pending legacy data pass as already
+    // handled. The epoch is advanced in the seen-set itself so the next observation is distinct too.
+    return { certifiedSince: nowIso, epoch: priorEpoch + 1, epochTs: nowIso };
   }
   const currentEpoch = quarantineState.epoch ?? 0;
   const currentEpochTs = quarantineState.epoch_ts ?? null;
-  const newerEpoch = currentEpoch > priorEpoch;
-  const newerTimestamp = currentEpochTs !== null
-    && (priorEpochTs === null || Date.parse(currentEpochTs) > Date.parse(priorEpochTs));
-  if (!newerEpoch && !newerTimestamp) return { certifiedSince: priorSince, epoch: priorEpoch, epochTs: priorEpochTs };
+  const epochChanged = currentEpoch !== priorEpoch || currentEpochTs !== priorEpochTs;
+  if (!epochChanged) return { certifiedSince: priorSince, epoch: priorEpoch, epochTs: priorEpochTs };
   // A trusted quarantine event discards the old store's sightings. The boundary can only move
   // forward; it must never remain null when the set was certified before that event.
   const boundary = currentEpochTs ?? nowIso;
