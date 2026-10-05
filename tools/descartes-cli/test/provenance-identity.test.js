@@ -438,6 +438,8 @@ test("collectIdentityObservations: a complete census is status ok (other-UID pid
   assert.deepEqual(result.reasons, []);
   assert.equal(result.observations.length, 1);
   assert.equal(result.observations[0].target.value, 100);
+  assert.deepEqual(result.socketCensus.sockets, MIXED_SOCKETS);
+  assert.deepEqual(result.socketCensus.reasons, []);
 });
 
 test("collectIdentityObservations: every holder pid from one socket is independently observed", async () => {
@@ -468,7 +470,12 @@ test("collectIdentityObservations: zero listeners from a successful census is a 
       return { status: "ok", processes: MIXED_PROCESSES, reasons: [] };
     },
   }));
-  assert.deepEqual(result, { status: "ok", observations: [], reasons: [] });
+  assert.deepEqual(result, {
+    status: "ok",
+    observations: [],
+    reasons: [],
+    socketCensus: { status: "ok", sockets: [], reasons: [] },
+  });
   assert.equal(psCalled, false);
 });
 
@@ -588,7 +595,25 @@ async function seedConfirmedIdentity(paths) {
 function coverageOptions(collect) {
   return { loadLearnedConfig: async () => ({ enabled: true }), collectIdentityObservations: collect };
 }
-const okCollection = (observations) => async () => ({ status: "ok", observations, reasons: [] });
+const socketCensusForObservations = (observations) => ({
+  status: "ok",
+  sockets: (observations ?? []).flatMap((observation) => (observation.portTargetKeys ?? []).map((portTargetKey) => {
+    const [protocol, localPort] = String(portTargetKey).split(".");
+    return {
+      protocol,
+      local_address: "0.0.0.0",
+      local_port: Number(localPort),
+      pid: observation.target?.value,
+    };
+  })),
+  reasons: [],
+});
+const okCollection = (observations) => async () => ({
+  status: "ok",
+  observations,
+  reasons: [],
+  socketCensus: socketCensusForObservations(observations),
+});
 const hoursAfterT0 = (hours) => new Date(Date.parse(T0) + hours * 60 * 60 * 1000).toISOString();
 
 test("coverage: a PRESENT identity that is still bad is NOT reported evaluated", async () => {
@@ -655,8 +680,9 @@ test("coverage: the same identity observed present with its alert condition clea
   const { store } = await loadSignatureStore(paths);
   store.signatures[identityHash].origin = "snapshot";
   await writeSignatureStore(paths, store);
+  const clearedObservation = { ...CONFIRMED_OBSERVATION, portTargetKeys: [] };
   const result = await computeProvenanceIdentityCandidates(paths, {
-    ...coverageOptions(okCollection([CONFIRMED_OBSERVATION])),
+    ...coverageOptions(okCollection([clearedObservation])),
     now: hoursAfterT0(1),
   });
   assert.equal(result.candidates.some((candidate) => candidate.id === unknownKey), false);

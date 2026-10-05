@@ -189,7 +189,14 @@ export async function collectIdentityObservations(options = {}) {
   }
 
   const pids = [...new Set(sockets.flatMap(socketPids))];
-  if (pids.length === 0) return { status: reasons.length === 0 ? "ok" : "degraded", observations: [], reasons };
+  if (pids.length === 0) {
+    return {
+      status: reasons.length === 0 ? "ok" : "degraded",
+      observations: [],
+      reasons,
+      socketCensus: { ...socketCensus, sockets },
+    };
+  }
 
   const processCensus = await runCensus(
     options.snapshotProvenanceProcessesStatus,
@@ -268,7 +275,15 @@ export async function collectIdentityObservations(options = {}) {
     });
   }
 
-  return { status: reasons.length === 0 ? "ok" : "degraded", observations, reasons };
+  return {
+    status: reasons.length === 0 ? "ok" : "degraded",
+    observations,
+    reasons,
+    // Keep the raw socket census alongside per-process observations. Coverage must answer the
+    // global question "does ANY observed process still hold this public target?"; bounded,
+    // identity-keyed observation fields cannot answer that question safely.
+    socketCensus: { ...socketCensus, sockets },
+  };
 }
 
 /**
@@ -366,6 +381,7 @@ export async function computeProvenanceIdentityCandidates(descartesPaths, option
     if (collectionOk) evaluatedAlertKeys = deriveIdentityCoverage(currentStore, {
       skippedObservations,
       observations,
+      socketCensus: collection.socketCensus,
       ts,
     });
   }
