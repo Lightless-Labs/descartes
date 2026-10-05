@@ -139,9 +139,9 @@ function censusIsOk(census, field) {
  * `status:"ok"` therefore means "genuinely and completely observed (possibly nothing)", and ONLY
  * then may absence be treated as evidence. An OTHER-UID pid is an in-scope exclusion (the UID-scoping
  * invariant), not a degradation. A degraded result still carries the observations that WERE
- * genuinely resolved (real presence, safe to fold), never fabricated ones. Residual (documented, not
- * closable here): on Linux an own-UID socket whose fd-scan races its process exit is
- * indistinguishable from a cross-UID socket (both come back pid:undefined).
+ * genuinely resolved (real presence, safe to fold), never fabricated ones. On Linux, the status
+ * census also carries /proc/net's uid through an unresolved fd scan, so an own-UID socket with no
+ * pid is explicitly degraded rather than silently treated as an out-of-scope socket.
  */
 export async function collectIdentityObservations(options = {}) {
   const platform = options.platform ?? process.platform;
@@ -161,6 +161,21 @@ export async function collectIdentityObservations(options = {}) {
   }
   const sockets = Array.isArray(socketCensus?.sockets) ? socketCensus.sockets : [];
 
+  // Resolve ownership BEFORE the pid-empty early return. Linux's /proc/net uid remains available
+  // when /proc/<pid>/fd is permission-limited; losing that fact would turn an own-UID backdoor into
+  // a false status-ok empty census.
+  const ownUid = Object.hasOwn(options, "ownUid")
+    ? options.ownUid
+    : (typeof process.getuid === "function" ? process.getuid() : undefined);
+  if (sockets.length > 0 && ownUid === undefined) addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.OWN_UID_UNKNOWN);
+  if (Number.isInteger(ownUid)) {
+    for (const socket of sockets) {
+      if (socket.uid === ownUid && !Number.isInteger(socket.pid)) {
+        addReason(IDENTITY_COLLECTION_DEGRADED_REASONS.OWN_UID_SOCKET_UNATTRIBUTED);
+      }
+    }
+  }
+
   const pids = [...new Set(sockets.map((socket) => socket.pid).filter((pid) => Number.isInteger(pid)))];
   if (pids.length === 0) return { status: reasons.length === 0 ? "ok" : "degraded", observations: [], reasons };
 
@@ -177,15 +192,6 @@ export async function collectIdentityObservations(options = {}) {
   }
   const processes = Array.isArray(processCensus?.processes) ? processCensus.processes : [];
   const processByPid = new Map(processes.map((item) => [item.pid, item]));
-
-  // Object.hasOwn, not a `!== undefined` check: an EXPLICIT `ownUid: undefined` means "the uid
-  // could not be determined" and must be honored (downstream skips every pid), never silently
-  // replaced by the real process.getuid(). A `!== undefined` check made that injection
-  // impossible and left the test environment-dependent (passed on uid!=fixture hosts, failed on
-  // the uid-501 CI macOS guest).
-  const ownUid = Object.hasOwn(options, "ownUid")
-    ? options.ownUid
-    : (typeof process.getuid === "function" ? process.getuid() : undefined);
 
   const socketsByPid = new Map();
   for (const socket of sockets) {

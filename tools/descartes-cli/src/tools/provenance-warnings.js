@@ -422,6 +422,11 @@ async function listLinuxListeningSocketsDetailed(options) {
       local_address: entry.local_address,
       local_port: entry.local_port,
       pid: match.status === "ok" ? match.pid : undefined,
+      // Linux /proc/net exposes the owning uid even when /proc/<pid>/fd is EACCES. The
+      // status path carries this fact so provenance-identity can distinguish an unattributed
+      // own-UID listener from an out-of-scope cross-UID listener. The legacy wrapper below
+      // deliberately strips it to preserve its pinned array shape.
+      uid: entry.uid,
     };
   });
   return { sockets, reasons };
@@ -439,7 +444,9 @@ async function listLinuxListeningSocketsDetailed(options) {
  */
 export async function listListeningSocketsWithPid(platform, options = {}) {
   if (platform === "darwin") return (await listMacListeningSocketsDetailed(options)).sockets;
-  if (platform === "linux") return (await listLinuxListeningSocketsDetailed(options)).sockets;
+  if (platform === "linux") {
+    return (await listLinuxListeningSocketsDetailed(options)).sockets.map(({ uid: _uid, ...socket }) => socket);
+  }
   return [];
 }
 

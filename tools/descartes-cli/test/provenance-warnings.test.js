@@ -487,7 +487,16 @@ test("listListeningSocketsWithPidStatus('linux'): every v4 /proc/net source read
   const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions());
   assert.equal(result.status, "ok");
   assert.deepEqual(result.reasons, []);
-  assert.deepEqual(result.sockets, [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777 }]);
+  assert.deepEqual(result.sockets, [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, pid: 777, uid: 1000 }]);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): ENOENT on every /proc/net source is DEGRADED, including tcp", async () => {
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["proc_net_unreadable"]);
+  assert.deepEqual(result.sockets, []);
 });
 
 test("listListeningSocketsWithPidStatus('linux'): an unreadable v4 /proc/net source is DEGRADED", async () => {

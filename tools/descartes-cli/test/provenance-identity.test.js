@@ -468,6 +468,42 @@ test("collectIdentityObservations: a degraded ps snapshot is DEGRADED", async ()
   assert.deepEqual(result.observations, []);
 });
 
+test("collectIdentityObservations: an own-UID socket with an unattributed pid is DEGRADED even when the socket census says ok", async () => {
+  const result = await collectIdentityObservations({
+    ownUid: OWN_UID,
+    listListeningSocketsWithPidStatus: async () => ({
+      status: "ok",
+      sockets: [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 9443, pid: undefined, uid: OWN_UID }],
+      reasons: [],
+    }),
+    snapshotProvenanceProcessesStatus: async () => {
+      throw new Error("must not need a process census when every pid is unattributed");
+    },
+  });
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["own_uid_socket_unattributed"]);
+  assert.deepEqual(result.observations, []);
+});
+
+test("collectIdentityObservations: status ok with a null sockets field is DEGRADED", async () => {
+  const result = await collectIdentityObservations({
+    ownUid: OWN_UID,
+    listListeningSocketsWithPidStatus: async () => ({ status: "ok", sockets: null, reasons: [] }),
+  });
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.observations, []);
+  assert.deepEqual(result.reasons, ["socket_census_degraded"]);
+});
+
+test("collectIdentityObservations: legacy array census seams are degraded without an explicit compatibility opt-in", async () => {
+  const result = await collectIdentityObservations({
+    ownUid: OWN_UID,
+    listListeningSocketsWithPid: async () => [],
+  });
+  assert.equal(result.status, "degraded");
+  assert.deepEqual(result.reasons, ["legacy_array_census"]);
+});
+
 test("collectIdentityObservations: an undeterminable own uid (with listeners present) is DEGRADED", async () => {
   const result = await collectIdentityObservations(fakeCollectorOptions({ ownUid: undefined }));
   assert.equal(result.status, "degraded");
@@ -642,4 +678,19 @@ test("coverage: an identity whose observation was skipped as a transient stat fa
   assert.equal(result.candidates.some((c) => c.id === unknownKey), false, "aged past the presence window");
   assert.equal(result.evaluatedAlertKeys.includes(unknownKey), false, "running-but-unverified must never be evaluated-clear");
   assert.equal(result.evaluatedAlertKeys.includes(bindKey), false);
+});
+
+test("coverage: a malformed ok collection is degraded, reports no coverage, and preserves last_reconciled_at", async () => {
+  const paths = await tempPaths();
+  const { unknownKey } = await seedConfirmedIdentity(paths);
+  const now = hoursAfterT0(4);
+  const result = await computeProvenanceIdentityCandidates(paths, {
+    ...coverageOptions(async () => ({ status: "ok", observations: "x" })),
+    now,
+  });
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+  const { store } = await loadSignatureStore(paths);
+  assert.equal(store.last_reconciled_at, T0);
+  assert.equal(store.last_reconcile_status, "degraded");
+  assert.ok(result.candidates.some((candidate) => candidate.id === unknownKey) === false);
 });
