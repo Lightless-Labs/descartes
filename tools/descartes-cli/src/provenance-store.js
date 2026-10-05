@@ -677,6 +677,7 @@ export function deriveIdentityCoverage(store, { skippedObservations = [] } = {})
   const excludedBindFingerprints = new Set();
   const excludedDriftFingerprints = new Set();
   const excludeTarget = (targetKey) => {
+    if (typeof targetKey !== "string" || !targetKey) return;
     const driftFingerprint = identityDriftFingerprint(targetKey);
     if (driftFingerprint) excludedDriftFingerprints.add(driftFingerprint);
     if (targetKey.startsWith("port.")) {
@@ -685,6 +686,12 @@ export function deriveIdentityCoverage(store, { skippedObservations = [] } = {})
     }
   };
   for (const observation of skippedObservations ?? []) {
+    // The skipped observation's own signature is the identity_signature it would have occupied if
+    // it had been folded. This is distinct from the fingerprinted sibling matched by the fold-time
+    // guard when identity_hash is absent, so exclude it directly as well.
+    const skippedIdentityHash = computeIdentitySignature(observation);
+    excludedIdentityHashes.add(skippedIdentityHash);
+    for (const targetKey of recordTargetKeys(signatures[skippedIdentityHash])) excludeTarget(targetKey);
     const executablePathHash = hashIdentityField(observation?.executablePath);
     if (executablePathHash) excludeTarget(`process.${executablePathHash}`);
     for (const portKey of Array.isArray(observation?.portTargetKeys) ? observation.portTargetKeys : []) {

@@ -624,6 +624,9 @@ test("deriveIdentityCoverage EXCLUDES every identity/target a transient-stat-ski
   const [seededHash] = Object.keys(seeded.signatures);
   const seededRecord = seeded.signatures[seededHash];
   store.signatures[seededHash] = { ...seededRecord, state: "known_good", origin: "grace_window", port_target_keys: ["tcp.8080"] };
+  // Another tracked record really does hold the skipped observation's current port. The absence
+  // of this fixture made the old assertion about tcp.7070 vacuous: nothing could have covered it.
+  store.signatures.aaaa000000000001.port_target_keys = ["tcp.8080", "tcp.7070"];
 
   const keys = new Set(deriveIdentityCoverage(store, { skippedObservations: [observation] }));
   assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(seededHash))), false, "the unverified identity itself");
@@ -649,6 +652,33 @@ test("deriveIdentityCoverage applies exclusions in FINGERPRINT space: a covered 
   const keys = deriveIdentityCoverage(store, { skippedObservations: [observation] });
   assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp_8080"))), false);
   assert.equal(keys.includes(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp_8080"))), false);
+});
+
+test("deriveIdentityCoverage excludes a skipped observation's own signature even when no fingerprinted sibling matches it", () => {
+  const observation = {
+    executablePath: "/opt/unfingerprinted/bin",
+    identityHash: undefined,
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: ["tcp.7777"],
+  };
+  const ownSignature = computeIdentitySignature(observation);
+  const store = {
+    ...coverageStore(),
+    signatures: {
+      [ownSignature]: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T00:00:00.000Z",
+        inputs_hash: { executable_path_hash: "own-path", source_classification: "shell", owning_user_hash: "own-user" },
+        port_target_keys: ["tcp.7777"],
+      },
+    },
+  };
+  const keys = new Set(deriveIdentityCoverage(store, { skippedObservations: [observation] }));
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(ownSignature))), false);
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7777"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.7777"))), false);
 });
 
 test("deriveIdentityCoverage reports nothing for a never-bootstrapped store", () => {
