@@ -181,3 +181,26 @@ test("Q5: a deliberate legacy fact_store_max_bytes (watch.json or learned.json) 
   const quiet = await tick(defaults, 0);
   assert.equal(quiet.status.fact_store_deprecations, undefined);
 });
+
+test("T12 (daemon): one family's append failure is reported as storage_write_error (state error) while the other families persist this tick", async () => {
+  const paths = await tempPaths();
+  const { resolveFactStorePaths } = await import("../src/fact-store.js");
+  // The network store's facts.jsonl is a directory: its append fails; the service store's does not.
+  const networkFile = resolveFactStorePaths(paths, "network").factsFile;
+  await fs.mkdir(path.join(networkFile, "blocker"), { recursive: true });
+  const result = await runDaemonIteration(paths, {
+    profile: { ...structuralProfile(), structural: { interval_ms: HOUR_MS, collectors: { services: { enabled: true }, network: { enabled: true } } } },
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      ...serviceCollector(),
+      network: async () => envelope("network-basics", "collect_network", { listening_sockets: [{ protocol: "tcp", state: "LISTEN", local_address: "0.0.0.0", local_port: 8080 }] }),
+    },
+    ts: at(0),
+    now: at(0),
+  });
+  assert.match(result.status.storage_write_error, /network: /);
+  assert.equal(result.status.state, "error");
+  assert.equal(result.structuralFacts.families.network.written_count, 0);
+  assert.ok(result.structuralFacts.families.service.written_count > 0);
+  assert.ok((await readFactPoints(paths, { family: "service", now: at(0) })).points.length > 0, "the service family still persisted");
+});
