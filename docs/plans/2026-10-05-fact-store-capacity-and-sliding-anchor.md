@@ -178,6 +178,7 @@ The grounded review requires that a minimum-span floor gate **detector eligibili
   - Otherwise it requires `nowMs − floor_ms >= horizonMs`, using the raw floor (§4.1 item 3).
   - *(Review fold, Q2 consequence.)* Under "applies only once narrowing has happened", a family whose budget holds fewer ticks than its horizon is eligible on day 1, when the floor is `null` and 6 h of novelty memory exists. It becomes ineligible at its first eviction. The §4.5 config floor (budget ≥ the T8 invariant) prevents this at configured budgets. Note also that every M2-upgraded host, not only low-volume ones, starts with day-1 novelty memory of about 6 h.
   - Missing or malformed completeness, or a floor in the future, → `false`.
+  - **(LOW-2, review fold.)** `bytecap_floor_ts === null` is ambiguous on its own: it also means "no ledger at all" (`buildCompleteness` now reports `coverage: "unknown"` in that case, not `"full"` -- fixed post-S2). S3 must gate `certifiedHorizonOk` on a VALID ledger (`coverage !== "unknown"`), not merely on the floor being `null`, or a missing/invalid ledger would read as day-1-eligible instead of failing closed.
 - **Per-detector gating.** A rule is evaluable when `!coldStartPendingThisTick && certifiedHorizonOk(...)`. When it is not evaluable the detector emits no candidates for that rule and reports no `evaluatedAlertKeys` for it (`session-baseline.js:831`, `peer-baseline.js:882`, `service-baseline.js:455-475`, …). The horizon is **per rule**: `session.count_drop` (statistical) and `session.churn` (fingerprint diff) have different horizons.
 - **No cold-start re-arm.** Narrowing is not a trust loss. Data in `(floor, now]` is complete. Re-accumulation counts only points above the floor, so it is automatically conservative. A detector whose horizon recovers resumes immediately and does not need 6 more ticks. A distinct reason (`history_horizon_short`) goes to status surfaces, so they say "history horizon below minimum" rather than "still learning".
 - **A short horizon is not fail-closed for novelty rules.** *(Review fold, MEDIUM-4.)* `service.appeared` builds `historical` from every prior complete group (`service-baseline.js:837-846`); process-lineage (`process-lineage-baseline.js:291`) and persistence (`persistence-baseline.js:247`) work the same way. Suppose an entity first appears while its rule is horizon-ineligible. By the time the rule resumes, the entity is already in `historical`, so it never alerts. A sustained short horizon is therefore a **novelty-absorbing window**, like a cold-start lockout. It suppresses alerts; it does not fabricate any. Consequences:
@@ -280,11 +281,11 @@ Trust holds only if every family is trusted.
 **Formula.** `budget_f = max(31 d × typical_f × headroom, H_max(f) × worst_f × 1.25)`, then bounded by read cost. `worst_f` is the **maximum-record-size** worst case (§2, max-key column), not cap × average.
 - The second term makes "inflating volume can narrow but never blind" a **provable** property for the default configuration. T8 pins `budget_f ≥ (H_max(f)/interval) × worst_tick_bytes(f) × 1.25`.
 
-**The table below is provisional until S0** pins exact worst-case tick sizes. *(Review fold, MEDIUM-6.)* The figures were sized with the average record size. Re-checked against the ~470 B max-key estimate:
+**Superseded by S0 (§15.4; Q1/Q2 operator-accepted, §12).** The table below was provisional pending S0's measurement of exact worst-case tick sizes against pinned max-length-key record sizes (not the ~470 B estimate this section originally used) and Q2's accepted horizons (service.appeared/scheduled_job.appeared 48 h, process.lineage.novel_edge 6 d -- longer than this section's original 24 h placeholder). Re-running the T8 arithmetic with both inputs breaks three of the figures below even though the pinned max records are smaller than the ~470 B estimate, because the accepted horizons are longer. **The table's budget and H_max columns are updated to the S0-revised values** (service 18 MiB/48 h, process_lineage 10 MiB/6 d, scheduled_job 5 MiB/48 h, peer 16 MiB/72 h, session/canary/network/provenance unchanged at 4 MiB); see §15.4 for the full per-family arithmetic and the read-cost re-check (it does not trip T9's bound). The paragraphs immediately below (sized against the original 24 h/~470 B inputs) are kept for the historical record of why the original figures were picked, not as the current defaults:
 - service: 24 × ~470 KB × 1.25 ≈ 14.1 MB, under 16 MB with about 13% margin. 16 MB holds ~35 worst ticks.
 - process_lineage (~2.8 MB), scheduled_job (~2.8 MB) and canary (~0.7 MB) are comfortably inside their budgets.
 - session: 30 × ~94 KB × 1.25 ≈ 3.5 MB, under 4 MB but thin.
-- **peer fails at 12 MB.** 72 × ~188 KB × 1.25 ≈ 16.9 MB. The 3 d `H_max` comes only from correlation. S0 decides between raising the peer budget to about 18 MB, which puts the worst-case total at about 62 MB, and a shorter correlation horizon (§4.2 table).
+- **peer fails at 12 MB.** 72 × ~188 KB × 1.25 ≈ 16.9 MB. The 3 d `H_max` comes only from correlation. S0 decided 16 MiB (§15.4), below the ~18 MB estimated here, because the pinned max peer record (392 B) is smaller than this section's ~188 KB-per-tick estimate implied.
 
 **Decision rule if S0 breaks the read-cost bound.** If the pinned worst-case budgets push T9 past its bound, **stop before S4** and escalate to the operator. The options:
 1. accept the higher read cost and raise T9's bound, with the measured figure;
@@ -294,18 +295,33 @@ Trust holds only if every family is trusted.
 Do not quietly shrink a budget below the T8 invariant.
 - Inflation is also visible: injected entities trigger novelty alerts, and a census over its ceiling is marked partial (`tools/services.js:31-36`).
 
-| family | typical B/tick | worst B/tick | **default budget** | typical horizon | worst-case horizon | H_max |
-|---|---:|---:|---:|---|---|---|
-| service | 132 KB | ~254 KB | **16 MB** | ~5.3 d (127 ticks) | ~2.75 d (66 ticks) | 24 h (yes) |
-| process_lineage | 44 KB | ~50 KB | **8 MB** | ~7.9 d | ~6.9 d | 24 h (yes) |
-| scheduled_job | 2.6 KB | ~67 KB | **4 MB** | 30 d (age-limited; needs 1.9 MB) | ~2.6 d | 24 h (yes) |
-| session | ≥0.25 KB | ~51 KB | **4 MB** | 30 d up to ~22 sessions | ~3.4 d | 30 h (yes) |
-| peer | ≥0.65 KB | ~130 KB (max-key ~188 KB) | **12 MB (S0: likely ~18 MB)** | 30 d up to ~52 peers | ~4.0 d (max-key ~2.7 d) | 3 d (**no** at max-key; see above) (correlation) |
-| canary | 0 (AUTHOR off) | ~60 KB | **4 MB** | 30 d | ~2.9 d | 6 h (yes) |
-| network | 2.2 KB | S0 | **4 MB** | 30 d (needs 1.6 MB) | S0 | n/a (AUTHOR; 3 h freshness) |
-| provenance | 3.3 KB | S0 | **4 MB** | 30 d (needs 2.4 MB) | S0 | n/a |
+**Original (provisional) table, kept for the historical record.** `typical horizon`/`worst-case horizon` below were computed against the budgets in THIS table, which Q1/Q2 (§12) superseded; they are stale for the three rows the S0-revised budget/H_max columns below changed (service, process_lineage, scheduled_job), and are not recomputed here -- see §15.4 for the current per-family arithmetic instead of trusting these two columns for those three rows.
 
-**Totals (provisional).** Budgets sum to 56 MB, or about 62 MB if S0 raises peer, versus 5 MB today. Steady state on this host is about 30 MB. At typical volume, peer and session are only ever age-evicted, so they get the full 30 days. This is R0a's intent. R0b covers the adversarial case.
+| family | typical B/tick | worst B/tick | default budget (original) | typical horizon | worst-case horizon | H_max (original) |
+|---|---:|---:|---:|---|---|---|
+| service | 132 KB | ~254 KB | 16 MB | ~5.3 d (127 ticks) | ~2.75 d (66 ticks) | 24 h (yes) |
+| process_lineage | 44 KB | ~50 KB | 8 MB | ~7.9 d | ~6.9 d | 24 h (yes) |
+| scheduled_job | 2.6 KB | ~67 KB | 4 MB | 30 d (age-limited; needs 1.9 MB) | ~2.6 d | 24 h (yes) |
+| session | ≥0.25 KB | ~51 KB | 4 MB | 30 d up to ~22 sessions | ~3.4 d | 30 h (yes) |
+| peer | ≥0.65 KB | ~130 KB (max-key ~188 KB) | 12 MB (S0: likely ~18 MB) | 30 d up to ~52 peers | ~4.0 d (max-key ~2.7 d) | 3 d (**no** at max-key; see above) (correlation) |
+| canary | 0 (AUTHOR off) | ~60 KB | 4 MB | 30 d | ~2.9 d | 6 h (yes) |
+| network | 2.2 KB | S0 | 4 MB | 30 d (needs 1.6 MB) | S0 | n/a (AUTHOR; 3 h freshness) |
+| provenance | 3.3 KB | S0 | 4 MB | 30 d (needs 2.4 MB) | S0 | n/a |
+
+**S0-revised table (current defaults; §15.4, Q1/Q2 §12).** Worst B/tick is the pinned, real-translator figure (§15.3); H_max is the operator-accepted Q2 horizon. `required` is the T8 invariant, `(H_max/interval) × worst B/tick × 1.25`.
+
+| family | worst B/tick (pinned) | H_max (accepted) | required | **default budget** |
+|---|---:|---|---:|---:|
+| service | 291,251 B | 48 h | 17,475,060 B (16.7 MiB) | **18 MiB** |
+| process_lineage | 50,497 B | 6 d | 9,089,460 B (8.7 MiB) | **10 MiB** |
+| scheduled_job | 71,075 B | 48 h | 4,264,500 B (4.07 MiB) | **5 MiB** |
+| session | 67,130 B | 30 h | 2,517,375 B (2.4 MiB) | **4 MiB** |
+| peer | 157,733 B | 72 h (correlation) | 14,195,970 B (13.5 MiB) | **16 MiB** |
+| canary | 100,447 B | 6 h | 753,353 B (0.7 MiB) | **4 MiB** |
+| network | S0 (not pinned; AUTHOR-tier) | n/a | -- | **4 MiB** |
+| provenance | S0 (not pinned) | n/a | -- | **4 MiB** |
+
+**Totals.** The S0-revised budgets sum to **65 MiB** (service 18 + process_lineage 10 + scheduled_job 5 + session 4 + peer 16 + canary 4 + network 4 + provenance 4), versus the original table's 56 MB (62 MB at peer's original ~18 MB estimate), versus 5 MB today. The read-cost decision rule (above) does not trip against the S0-revised figures: §15.4 re-checks T9's bound at ~2.1 s per fast tick, well under the 5 s bound. Steady state on this host is well below every budget; at typical volume, peer and session are only ever age-evicted, so they get the full 30 days. This is R0a's intent. R0b covers the adversarial case.
 
 **Read cost per 60 s fast tick at defaults:**
 - service: 3 reads (disappearance, appearance, daemon veto) × ~235 ms ≈ 0.7 s;
@@ -567,13 +583,13 @@ The per-family stores sit in new paths. The legacy store is only quarantined (if
 
 ### Operator answers (2026-10-05)
 
-- **Q1 Budgets:** plan defaults (§4.5 as revised, so peer is about 18 MB and the total about 62 MB; still provisional until S0 measures record sizes).
-- **Q2 Novelty horizon:** the operator asked "Isn't 24 h short?". The answer given: the horizon is the *minimum* certified memory before a novelty rule may claim "new". It is not the memory length, which the budget sets. A horizon above a family's worst-case span blinds that family during volume spikes. **Proposed** (to be applied unless the operator objects):
+- **Q1 Budgets:** **superseded by the S0-revised defaults** (§15.4, measured against pinned worst-case record sizes, not the provisional ~470 B estimate): service 18 MiB, process_lineage 10 MiB, scheduled_job 5 MiB, peer 16 MiB, session 4 MiB, canary 4 MiB, network 4 MiB, provenance 4 MiB -- **65 MiB total** (versus the ~62 MB figure below, which predates S0's measurement and is kept here only for the record of what was asked). §4.5's table is updated to match. This lands in S4 (R0a); it does not block S1-S3.
+- **Q2 Novelty horizon: ACCEPTED.** The operator asked "Isn't 24 h short?". The answer given: the horizon is the *minimum* certified memory before a novelty rule may claim "new". It is not the memory length, which the budget sets. A horizon above a family's worst-case span blinds that family during volume spikes. Accepted, to be applied at S3:
   - `service.appeared`: 48 h;
   - `scheduled_job.appeared`: 48 h;
   - `process.lineage.novel_edge`: 6 d, to cover weekly runtime edges; stays below the ~6.9 d worst case.
 
-  Each stays below its family's worst-case certified span. The horizon applies only after narrowing (the default).
+  Each stays below its family's worst-case certified span (re-confirmed against the S0-revised budgets at §15.4). The horizon applies only after narrowing (the default).
 - **Q3 Migration:** fresh per-family stores. This removes M2′ and M4 (§14).
 - **Q4 Legacy store:** quarantine for 31 days, outside the facts tree, then delete.
 - **Q5–Q8:** the recommended defaults (Q5 ignore + deprecation note; Q6 defer; Q7 fixed budget + `history_horizon_short`; Q8 keep the `provenance` store).
@@ -743,6 +759,14 @@ The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48
     - "byte-cap eviction degrades completeness";
     - "missing-ledger bootstrap over a pre-existing non-empty store reaches intact".
 
+**Review-fold fixes applied before G1 (2026-10-05).** An adversarial review of S0-S2 found six items; all six are fixed on this branch before the G1 gate review runs, each its own atomic commit:
+- **MEDIUM-1.** Reclassifying byte-cap eviction as narrowing widened what the no-anchor path of `factHistoryTrustworthy` trusts. `constraint-miner.js:366`, `shadow-store.js:303` and `incident-correlation.js:323` all call it with no anchor and, on `main`, used to refuse after ANY byte-cap eviction ever (a loss); they would now accept a merely-narrowed read with no horizon of their own to bound what they mine/evaluate over. Fixed with an explicit opt-in on the shared primitive, `opts.requireFullCoverage` (`fact-store-completeness.js`), which those three readers alone pass, with reason `coverage_narrowed`. The daemon's per-family history veto (`daemon.js:1153`, called with no opts at all) and the six watch-tier detectors behind it deliberately do NOT opt in -- they rely on their own retained-union/S3-horizon semantics -- confirmed by a new `daemon.test.js` test that a genuinely NARROWED (not degraded) read still recovers a persisted `session.count_drop` alert. **This corrects §7's claim that "R0b alone is a safe state (it does not fabricate)": R0b alone, unfixed, widened these three non-detector readers' trust beyond what they could support for the span S3's horizons will eventually bound -- a real widening, not merely an "incomplete fix" in the Leg-D sense §7 meant. The six detectors and the daemon veto were never affected; §7's claim holds for them.** See G1 question 8.
+- **LOW-1/LOW-4.** The `appendedToEmptyStore` carve-out (§15.5 decision 3) could not tell a genuine first run (ENOENT) apart from an evicted-then-emptied store (every record byte-cap-evicted, floor set) whose ledger was separately deleted -- both read back as 0 bytes. The carve-out let the floor silently reset to null with no stamp in the second case, certifying the evicted history as intact/`coverage: full` within one more normal tick. Fixed by dropping the carve-out's emptiness clause entirely (`fact-store-integrity.js`'s `missingLedgerOverExistingStore` now requires only `live.exists === true`, with no exception) and having `appendFactPoints` run one retention pass against the TRUE pre-append state whenever the ledger is missing, so the check is never contaminated by the same call's own new data.
+- **LOW-2.** `buildCompleteness` reported `coverage: "full"` whenever there was no ledger at all (missing/unreadable/invalid), because its fallback is a fresh ledger whose floor is always null -- over-claiming that byte-cap eviction never narrowed a store there is no ledger to vouch for either way. Fixed: `coverage: "unknown"` when `ledger === null`, scoped narrowly so a ledger with a merely-unresolvable continuity observation this read still reports its real floor.
+- **LOW-5.** `orderRetentionCandidates` (the T5 non-suffix-eviction test seam) was read straight off `options`, which `appendFactPoints` forwards into `runFactRetention` verbatim -- technically reachable from it too, even though no production caller sets it. Moved behind a separate `internal` parameter that only `enforceFactRetention` populates from its own options.
+- **LOW-6.** `certified_after_ts`'s retention-cutoff term hardcoded `DEFAULT_FACT_RETENTION_MS` rather than the read's own retentionMs. `readFactPoints` now takes a validated `options.retentionMs`, defaulting to the same constant, so every existing caller is unaffected.
+- **Operator decisions (§12).** Q1's S0-revised budgets and Q2's accepted horizons are folded into §4.5's table as the plan's current defaults (not merely a G1-question follow-up); see §4.5 and §12's updated "Operator answers".
+
 **G1 questions.**
 1. **Zero-cap or all-evicted status (§7 S2).** Today such a store reads **`unknown`** (fail-closed), not intact. This was established in code, not decided. The root cause is `observeFactContinuity`: it returns `"unknown"` whenever the committed rewrite was empty and records were appended afterwards (`expectedNewest === null`), so a store that is fully evicted on every pass never reaches `continuity_ok: true`.
    - For it to read intact with coverage `narrowed`, as the plan leans, that continuity rule must change. The argument for changing it: an empty committed prefix makes all live content a pure append.
@@ -753,3 +777,4 @@ The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48
 5. **The first-run carve-out**, and its consequence: a crash between the very first append and the first retention pass reads as a 31-day lineage break.
 6. **Removing canary's independent re-arm copy** (deviation 9).
 7. **For the operator (Q1 follow-up):** the S0 budget revision. Service 18, process_lineage 10, scheduled_job 5 and peer 16 MiB, so 65 MiB in total (§15.4). This lands in S4.
+8. **MEDIUM-1's interim full-coverage gate shape.** Is `requireFullCoverage` (opt-in on `factHistoryTrustworthy`, consumed only by the miner, shadow evaluator and correlation) the right INTERIM shape for S2-S3, or should S3's per-reader horizons for those three specifically be pulled forward rather than shipping a blunter gate first? The gate has no anchor-relative carve-out and no horizon of its own: it refuses outright on ANY narrowing, which is strictly more conservative than any per-reader horizon S3 would set (a reader could still be refused long after its own horizon would have cleared it). The six watch-tier detectors and the daemon's per-family history veto are unaffected either way -- they never called `factHistoryTrustworthy` with an anchor-equivalent widening problem in the first place, since their own re-arm/coverage logic already gates on the loss channels directly, not on this generic check's coverage field.

@@ -320,7 +320,12 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   // fact-store read on every call. Omit anchorTs because the correlation joins two observations
   // from the current read window; the helper's stateless path therefore requires an intact
   // completeness status while excluding future loss timestamps relative to this injected nowMs.
-  if (!factHistoryTrustworthy(readResult, { nowMs }).trust) {
+  // MEDIUM-1 (review fold): requireFullCoverage opts into the interim fail-closed gate on a
+  // narrowed store too -- correlation has no per-rule horizon of its own and recomputes trust
+  // from the FULL read on every call, joining observations across the whole window, so a narrowed
+  // window can hide the same counterexamples an outright loss could. S3 replaces this with
+  // correlation's own horizon entry (fact-families.js).
+  if (!factHistoryTrustworthy(readResult, { nowMs, requireFullCoverage: true }).trust) {
     return { candidates: [], evaluatedAlertKeys: [] };
   }
 

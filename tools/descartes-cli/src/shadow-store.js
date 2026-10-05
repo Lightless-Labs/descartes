@@ -300,7 +300,11 @@ export async function evaluateAndLogShadowConstraints(descartesPaths, options = 
   const readResult = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
   // Missing historical exercises can make a shadow candidate look falsely safe. Do not
   // evaluate or append a soak record until this fact-history read is trustworthy.
-  if (!factHistoryTrustworthy(readResult, { nowMs }).trust) {
+  // MEDIUM-1 (review fold): requireFullCoverage opts into the interim fail-closed gate on a
+  // narrowed store too -- the shadow evaluator has no per-rule horizon of its own, so a narrowed
+  // soak window can hide the same missing exercises an outright loss could. S3 replaces this with
+  // the same horizon as the constraint it shadows (fact-families.js).
+  if (!factHistoryTrustworthy(readResult, { nowMs, requireFullCoverage: true }).trust) {
     return { evaluated_count: shadowConstraints.length, fired_count: 0, appended_count: 0 };
   }
   const { points } = readResult;

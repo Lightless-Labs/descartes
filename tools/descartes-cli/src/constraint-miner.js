@@ -363,7 +363,11 @@ export async function runLearned(descartesPaths, args, runtime = {}) {
   const nowMs = runtime.now !== undefined ? new Date(runtime.now).getTime() : Date.now();
   // A truncated or otherwise untrustworthy history can hide counterexamples and mint an
   // over-strong draft. Degrade to zero mining for this pass; drafts remain human-gated.
-  const candidates = factHistoryTrustworthy(readResult, { nowMs }).trust
+  // MEDIUM-1 (review fold): requireFullCoverage opts into the interim fail-closed gate on a
+  // narrowed (byte-cap-evicted) store too -- the miner has no per-rule horizon of its own, so a
+  // narrowed window can hide the same counterexamples an outright loss could. S3 replaces this
+  // with the miner's own mining-span horizon entry (fact-families.js).
+  const candidates = factHistoryTrustworthy(readResult, { nowMs, requireFullCoverage: true }).trust
     ? mineConstraintCandidates(readResult.points, [], { now: nowMs, ...runtime.mineOptions })
     : [];
   const { constraints: existing } = await loadConstraints(descartesPaths);

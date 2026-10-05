@@ -100,6 +100,21 @@ export function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
 /**
  * Makes the one central, fail-closed trust decision for fact-history consumers.
  * Pure: it performs no I/O and never mutates either input.
+ *
+ * MEDIUM-1 interim guard (fact-store capacity plan review fold, 2026-10-05): R0b reclassified
+ * byte-cap eviction from a loss to coverage narrowing (fact-store-integrity.js), so a narrowed
+ * store now reaches this function as plain `status: "intact"` -- correct for the daemon's
+ * per-family history veto (daemon.js:1153, called with NO opts at all) and the six watch-tier
+ * detectors behind it: they rely on their own retained-union / S3 per-rule horizon semantics, and
+ * must keep trusting a narrowed store exactly as before. It is NOT correct for a reader with no
+ * horizon of its own that mines or evaluates against the FULL accumulated window: the constraint
+ * miner (`constraint-miner.js` -- "a truncated or otherwise untrustworthy history can hide
+ * counterexamples and mint an over-strong draft"), the shadow evaluator (`shadow-store.js` --
+ * "missing historical exercises can make a shadow candidate look falsely safe"), and correlation
+ * (`incident-correlation.js` -- stateless, recomputed from the full read on every call). Those
+ * three pass `opts.requireFullCoverage: true` to opt into a blunter, INTERIM fail-closed gate with
+ * no anchor-relative carve-out, until S3 gives each its own per-reader horizon (fact-families.js).
+ * Every other caller (the daemon veto, the detectors) omits it and is byte-for-byte unaffected.
  */
 export function factHistoryTrustworthy(readResult, opts = {}) {
   try {
@@ -121,11 +136,16 @@ export function factHistoryTrustworthy(readResult, opts = {}) {
     }
     if (completeness.status === "unknown") return { trust: false, reason: "history_unknown" };
 
+    // `!== "full"` (not `=== "narrowed"`) so any unexpected/malformed coverage value also fails
+    // closed, matching this function's existing posture everywhere else. Only consulted when
+    // opted in: coverage is ignored entirely for every other (bare) caller.
+    const requireFullCoverage = isObject(opts) && opts.requireFullCoverage === true;
+    const coverageOk = !requireFullCoverage || completeness.coverage === "full";
+
     const hasAnchor = isObject(opts) && Object.prototype.hasOwnProperty.call(opts, "anchorTs");
     if (!hasAnchor) {
-      return completeness.status === "degraded"
-        ? { trust: false, reason: "history_degraded" }
-        : { trust: true, reason: "ok" };
+      if (completeness.status === "degraded") return { trust: false, reason: "history_degraded" };
+      return coverageOk ? { trust: true, reason: "ok" } : { trust: false, reason: "coverage_narrowed" };
     }
 
     const anchorTs = opts.anchorTs;
@@ -135,7 +155,7 @@ export function factHistoryTrustworthy(readResult, opts = {}) {
       return { trust: false, reason: "history_degraded" };
     }
 
-    return { trust: true, reason: "ok" };
+    return coverageOk ? { trust: true, reason: "ok" } : { trust: false, reason: "coverage_narrowed" };
   } catch {
     return { trust: false, reason: "history_unknown" };
   }

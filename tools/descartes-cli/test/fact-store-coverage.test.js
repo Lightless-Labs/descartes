@@ -602,10 +602,26 @@ test("reclassification: routine byte-cap eviction leaves the store intact (cover
   assert.equal(read.completeness.coverage, "narrowed");
   assert.equal(read.completeness.first_degraded_ts, null, "byte-cap eviction no longer stamps first_degraded_ts");
   assert.deepEqual(read.completeness.future_loss_fields, []);
-  assert.deepEqual(factHistoryTrustworthy(read), { trust: true, reason: "ok" }, "no-anchor consumers (daemon veto, miner, shadow, correlation) trust a narrowed store");
+  // The bare, no-anchor call -- what the daemon's per-family history veto uses (daemon.js:1153,
+  // with no opts at all) -- trusts a narrowed store. This is deliberate: the six watch-tier
+  // detectors (and the veto that gates their recovery) rely on their own retained-union / S3
+  // per-rule horizon semantics, not on this generic check, so narrowing must not block them.
+  assert.deepEqual(factHistoryTrustworthy(read), { trust: true, reason: "ok" }, "no-anchor consumers with no horizon of their own (the daemon veto) trust a narrowed store");
   assert.deepEqual(factHistoryTrustworthy(read, { anchorTs: hour(1), nowMs: Date.parse(hour(5)) }), { trust: true, reason: "ok" }, "an anchor older than the eviction is not re-armed by it");
   assert.equal(hasCompletenessLossAfterAnchor(read, hour(1), Date.parse(hour(5))), false, "the detectors' re-arm check ignores byte-cap eviction");
   assert.equal(COMPLETENESS_LOSS_TIMESTAMP_FIELDS.includes("last_bytecap_evict_ts"), false);
+
+  // MEDIUM-1 (review fold): a reader with no per-rule horizon of its own -- the constraint miner,
+  // the shadow evaluator, and correlation, all of which mine/evaluate against the full
+  // accumulated window rather than a bounded per-rule span -- opts into requireFullCoverage and
+  // gets an INTERIM fail-closed refusal on a narrowed store instead, with no anchor-relative
+  // carve-out, until S3 gives each of those three its own per-reader horizon (fact-families.js).
+  assert.deepEqual(factHistoryTrustworthy(read, { requireFullCoverage: true }), { trust: false, reason: "coverage_narrowed" }, "miner/shadow/correlation's interim full-coverage gate refuses a narrowed store");
+  assert.deepEqual(
+    factHistoryTrustworthy(read, { anchorTs: hour(1), nowMs: Date.parse(hour(5)), requireFullCoverage: true }),
+    { trust: false, reason: "coverage_narrowed" },
+    "the full-coverage gate refuses even with an anchor older than the eviction",
+  );
 });
 
 // G1 QUESTION (plan §7 S2), pinned as the CURRENT fail-closed behavior, not decided here: a store

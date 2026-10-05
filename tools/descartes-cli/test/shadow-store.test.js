@@ -193,11 +193,16 @@ test("evaluateAndLogShadowConstraints appends exactly one record per shadow cons
   assert.equal(records[0].actual, "false");
 });
 
-test("evaluateAndLogShadowConstraints skips untrustworthy history (degraded, unknown, or corrupt) without advancing a candidate", async () => {
+test("evaluateAndLogShadowConstraints skips untrustworthy history (degraded, unknown, corrupt, or narrowed) without advancing a candidate", async () => {
   const cases = [
     ["degraded", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded" } }],
     ["unknown", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "unknown" } }],
     ["corrupt", { corrupt_count: 1, schema_invalid_count: 0, completeness: { status: "intact" } }],
+    // MEDIUM-1 (review fold): the shadow evaluator's interim requireFullCoverage gate refuses a
+    // narrowed (byte-cap-evicted) store even though its status is "intact" -- a missing
+    // historical exercise can look falsely safe just as an outright loss could. S3 replaces this
+    // with the same horizon as the constraint it shadows.
+    ["narrowed coverage", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "narrowed" } }],
   ];
 
   for (const [label, readResult] of cases) {
@@ -235,6 +240,10 @@ test("evaluateAndLogShadowConstraints keeps normal behavior for intact history a
       schema_invalid_count: 0,
       completeness: {
         status: "intact",
+        // MEDIUM-1 (review fold): evaluateAndLogShadowConstraints now requires full coverage, not
+        // just an intact status (requireFullCoverage). This fixture is testing future-loss
+        // tolerance, not narrowing, so it stays "full".
+        coverage: "full",
         last_corrupt_ts: new Date(nowMs + 1).toISOString(),
       },
     }),

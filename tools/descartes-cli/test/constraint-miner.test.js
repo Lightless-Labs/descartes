@@ -496,11 +496,16 @@ test("descartes learned mine --json prints a machine-readable summary", async ()
   assert.equal(payload.learned_mine.updated_drafts, 0);
 });
 
-test("descartes learned mine mints zero drafts when fact-history is degraded, unknown, or corrupt", async () => {
+test("descartes learned mine mints zero drafts when fact-history is degraded, unknown, corrupt, or narrowed", async () => {
   const cases = [
     ["degraded", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded" } }],
     ["unknown", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "unknown" } }],
     ["corrupt", { corrupt_count: 1, schema_invalid_count: 0, completeness: { status: "intact" } }],
+    // MEDIUM-1 (review fold): the miner's interim requireFullCoverage gate refuses a narrowed
+    // (byte-cap-evicted) store even though its status is "intact" -- a truncated history can hide
+    // counterexamples just as an outright loss could. S3 replaces this with the miner's own
+    // mining-span horizon.
+    ["narrowed coverage", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "narrowed" } }],
   ];
 
   for (const [label, readResult] of cases) {
@@ -531,6 +536,10 @@ test("descartes learned mine keeps normal behavior for intact history and ignore
       schema_invalid_count: 0,
       completeness: {
         status: "intact",
+        // MEDIUM-1 (review fold): runLearned's mining path now requires full coverage, not just
+        // an intact status (requireFullCoverage). This fixture is testing future-loss tolerance,
+        // not narrowing, so it stays "full".
+        coverage: "full",
         last_corrupt_ts: new Date(nowMs + 1).toISOString(),
       },
     }),

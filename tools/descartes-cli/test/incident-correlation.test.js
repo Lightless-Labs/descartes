@@ -153,6 +153,11 @@ function completeFactReadResult(points, { status = "intact", corruptCount = 0, s
       last_schema_invalid_ts: null,
       last_bytecap_evict_ts: null,
       last_continuity_break_ts: null,
+      // MEDIUM-1 (review fold): computeCorrelationCandidates now requires full coverage, not just
+      // an intact status (fact-store-completeness.js's requireFullCoverage). Default every fixture
+      // here to "full" so existing positive-path tests are unaffected; a test for the narrowed case
+      // overrides this explicitly.
+      coverage: "full",
       ...completeness,
     },
   };
@@ -266,11 +271,16 @@ test("Slice 6 positive fixture (motivating incident shape): odd-hour, low-prior-
   }
 });
 
-test("Slice 8: degraded, unknown, or this-tick-corrupt fact-history suppresses an otherwise qualifying correlation", async () => {
+test("Slice 8: degraded, unknown, this-tick-corrupt, or narrowed fact-history suppresses an otherwise qualifying correlation", async () => {
   const cases = [
     ["degraded completeness", completeFactReadResult([], { status: "degraded" })],
     ["unknown completeness", completeFactReadResult([], { status: "unknown" })],
     ["corrupt facts this tick", completeFactReadResult([], { corruptCount: 1 })],
+    // MEDIUM-1 (review fold): correlation's interim requireFullCoverage gate refuses a narrowed
+    // (byte-cap-evicted) store even though its status is "intact" -- it recomputes trust from the
+    // full read on every call, joining observations across the whole window. S3 replaces this
+    // with correlation's own horizon entry.
+    ["narrowed coverage", completeFactReadResult([], { coverage: "narrowed" })],
   ];
 
   for (const [label, readResultTemplate] of cases) {

@@ -4557,6 +4557,40 @@ test("Fix 3 control (detector-reported coverage §8): a detector that REPORTS it
   assert.equal(canaryAlert.status, "recovered");
 });
 
+test("MEDIUM-1 confirmation (fact-store capacity plan review fold): the daemon's per-family history veto still recovers through NARROWED (coverage: 'narrowed') history -- the six watch-tier detectors and the daemon veto deliberately do NOT opt into the interim requireFullCoverage gate that the miner/shadow/correlation now use (fact-store-coverage.test.js)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  const earlier = new Date(Date.parse(now) - 60 * 60 * 1000).toISOString();
+
+  // Force a real byte-cap eviction, so this is an actual narrowed read (not a hand-built stub):
+  // an earlier point, then a cap that only leaves room for the later one.
+  const earlierPoint = { ts: earlier, fact_name: "service.presence", entity_key: "svc-old", attributes: {} };
+  const laterPoint = { ts: now, fact_name: "service.presence", entity_key: "svc-new", attributes: {} };
+  const capBytes = Buffer.byteLength(`${JSON.stringify(laterPoint)}\n`);
+  await appendFactPoints(paths, [earlierPoint], { now: earlier, maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, [laterPoint], { now, maxBytes: capBytes });
+  const setupRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(setupRead.completeness.status, "intact", "setup: eviction alone must not degrade status");
+  assert.equal(setupRead.completeness.coverage, "narrowed", "setup: the store genuinely narrowed");
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] }),
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionAlert.status, "recovered", "narrowed coverage alone must not veto the daemon's history trust -- only a real loss (degraded/unknown) does");
+});
+
 // ---------------------------------------------------------------------------------------------
 // Detector-reported recovery coverage (§8) — CORE acceptance: freeze-by-default, FIXED exempt,
 // owner-scoped acceptance, and the §7.7 intersection (a report cannot override a global veto).
