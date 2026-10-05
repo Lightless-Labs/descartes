@@ -299,6 +299,7 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   const command = redaction.value;
 
   const out = { pid, uid, executable_path: executablePath, command };
+  Object.defineProperty(out, "argv", { value: resolved.argv, enumerable: false });
   Object.defineProperty(out, "args_redaction", {
     value: argvTruncated
       ? { ...redaction, truncated: true, reason: "cmdline_truncated" }
@@ -420,6 +421,7 @@ export async function resolveElevated({ target, paths } = {}, options = {}) {
     ...(parsed.argv_truncated === true ? { argv_truncated: true } : {}),
     mechanism: attemptedMechanism,
   };
+  Object.defineProperty(success, "argv", { value: parsed.argv, enumerable: false });
   if (parsed.holders !== undefined) success.holders = parsed.holders;
   return success;
 }

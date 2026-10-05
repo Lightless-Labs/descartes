@@ -2,6 +2,22 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — daybreak-blue seventh-gate Node redaction fix (2026-10-05)
+
+The seventh-gate high redaction finding is fixed locally on `harden/root-helper-2026-10` and is
+not pushed or merged. `/proc/<pid>/cmdline` evidence now passes through the shared argv-aware
+redactor after splitting on NUL boundaries; only the terminal delimiter is removed, so a secret
+argv element containing spaces cannot leak through whitespace tokenization. Elevated helper
+responses retain their validated argv internally and use that same redaction boundary when the
+final provenance evidence is built. Regression coverage includes the shared cmdline adapter, the
+same-UID final-verification path, and the existing elevated `app --api-key` path.
+
+The source audit found no other NUL-to-space command construction. Warning/process-table paths
+consume `ps`'s whitespace-formatted `args` field, and fixed external-command records retain argv
+arrays rather than constructing sensitive command strings. Focused provenance/process tests pass;
+the full Node suite completed with 2,037 passed, 22 known sandbox/live-host failures, and 34
+skips. No Rust files were modified.
+
 ## Current session — daybreak-blue sixth-gate Node fixes (2026-10-05)
 
 The sixth-gate Node findings are fixed locally on `harden/root-helper-2026-10`; Rust was not

@@ -131,7 +131,7 @@ test("Linux port attribution returns evidence checked by the real default final 
     " sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode",
     ` 0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${uid} 0 424242 1`,
   ].join("\n");
-  const cmdline = "app\u0000--port\u00008080\u0000";
+  const cmdline = "app\u0000--api-key\u0000top secret value\u0000";
   const stat = `100 (app) S ${Array.from({ length: 18 }, () => "0").join(" ")} 10`;
   const owner = {
     pid: 100,
@@ -180,8 +180,8 @@ test("Linux port attribution returns evidence checked by the real default final 
           ppid: 1,
           executable_path: executablePath,
           executable_path_unavailable: false,
-          command: "app --port 8080",
-          args_redaction: { redacted: false, truncated: false, original_length: 16, max_length: 240 },
+          command: "app --api-key [REDACTED]",
+          args_redaction: { redacted: true, truncated: false, original_length: cmdline.length, max_length: 240 },
           user: { uid, username: undefined, username_unavailable: true },
           tgid: 100,
           start_time: "10",
@@ -197,7 +197,9 @@ test("Linux port attribution returns evidence checked by the real default final 
   assert.equal(result.result.resolved.executable_path, "/verified");
   assert.equal(result.result.resolved.executable_dev, "7");
   assert.equal(result.result.resolved.executable_ino, "8");
-  assert.equal(result.result.resolved.command, "app --port 8080");
+  assert.equal(result.result.resolved.command, "app --api-key [REDACTED]");
+  assert.equal(result.result.resolved.args_redaction.redacted, true);
+  assert(!result.result.resolved.command.includes("top secret value"));
   assert.deepEqual(result.result.resolved.process_identity, { tgid: 100, start_time: "10" });
   assert.equal(result.result.sockets[0].inode, "424242");
   assert.equal(coreCalls, 1);
@@ -641,10 +643,10 @@ test("parseIdUsernameOutput rejects malformed, multi-token, or empty stdout", ()
 
 test("parseProvenancePs redacts and bounds args using the shared processes.js redaction helper verbatim", () => {
   const stdout = "PID PPID UID %CPU %MEM RSS COMM ARGS\n"
-    + "4821  1  501  0.5  0.2  1024 postgres postgres --password=hunter2\n";
+    + "4821  1  501  0.5  0.2  1024 app app --api-key=hunter2\n";
   const processes = parseProvenancePs(stdout);
   assert.equal(processes.length, 1);
-  const expected = redactAndBoundProcessArgs("postgres --password=hunter2");
+  const expected = redactAndBoundProcessArgs("app --api-key=hunter2");
   assert.equal(processes[0].args, expected.value);
   assert.deepEqual(processes[0].args_redaction, {
     redacted: expected.redacted,

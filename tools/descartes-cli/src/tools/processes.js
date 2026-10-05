@@ -124,6 +124,17 @@ export function redactAndBoundProcessArgv(argv, options = {}) {
   };
 }
 
+export function redactAndBoundProcessCmdline(cmdline, options = {}) {
+  const original = String(cmdline ?? "");
+  const argv = original.endsWith("\0")
+    ? original.slice(0, -1).split("\0")
+    : original.split("\0");
+  return {
+    ...redactAndBoundProcessArgv(argv, options),
+    original_length: original.length,
+  };
+}
+
 export function redactAndBoundProcessArgs(args, options = {}) {
   const original = String(args ?? "");
   const maxLength = options.maxLength ?? DEFAULT_ARGS_MAX_LENGTH;

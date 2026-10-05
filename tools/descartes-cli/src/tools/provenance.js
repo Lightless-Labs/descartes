@@ -15,7 +15,7 @@ import { open, readdir, readFile, readlink, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { parseMacLsofListeningSockets } from "./network.js";
-import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
+import { buildParentTreeResult, redactAndBoundProcessArgs, redactAndBoundProcessArgv, redactAndBoundProcessCmdline } from "./processes.js";
 import { defaultInvokeElevatedHelper, readPtraceScopeDiagnostic, resolveElevated } from "./provenance-elevated.js";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig } from "../provenance-elevated-config.js";
 
@@ -1193,7 +1193,7 @@ export async function resolveCrossUidPortResult({ port, primary, sockets, ownerR
   // Bound the untrusted helper's path/command exactly like the unprivileged path (resolvePidCore
   // truncates executable_path) before either reaches the evidence envelope / triage LLM.
   const elevatedExecutablePath = truncate(upgrade.executablePath);
-  const elevatedCommandRedaction = redactAndBoundProcessArgs(upgrade.command ?? "");
+  const elevatedCommandRedaction = redactAndBoundProcessArgv(upgrade.argv ?? [upgrade.command ?? ""]);
   const elevatedCommand = elevatedCommandRedaction.value;
   const upgradedCore = {
     resolvedStatus: "ok",
@@ -1331,7 +1331,7 @@ export async function resolveByPortLinux(port, options = {}) {
         if (identitiesAgree && distinctIdentities.size === 1) {
           const { owner, core: preparedCore } = resolvedCores[0];
           const processIdentity = { tgid: owner.tgid, start_time: owner.start_time };
-          const verifiedCommand = redactAndBoundProcessArgs(String(owner.cmdline ?? "").replaceAll("\0", " ").trim());
+          const verifiedCommand = redactAndBoundProcessCmdline(owner.cmdline);
           const core = {
             ...preparedCore,
             resolved: {

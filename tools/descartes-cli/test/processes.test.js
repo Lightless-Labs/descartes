@@ -9,6 +9,7 @@ import {
   psArgsForPlatform,
   redactAndBoundProcessArgs,
   redactAndBoundProcessArgv,
+  redactAndBoundProcessCmdline,
   topProcessesBy,
 } from "../src/tools/processes.js";
 
@@ -40,6 +41,15 @@ test("redactAndBoundProcessArgv preserves argv boundaries and redacts whole secr
   assert(!redacted.value.includes("a b c"));
 });
 
+test("redactAndBoundProcessCmdline preserves NUL argv boundaries before redaction", () => {
+  const redacted = redactAndBoundProcessCmdline("app\0--api-key\0top secret value\0");
+
+  assert.equal(redacted.value, "app --api-key [REDACTED]");
+  assert.equal(redacted.redacted, true);
+  assert.equal(redacted.original_length, "app\0--api-key\0top secret value\0".length);
+  assert(!redacted.value.includes("top secret value"));
+});
+
 test("redactAndBoundProcessArgs redacts high-entropy long values and bounds output", () => {
   const secret = "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5z";
   const redacted = redactAndBoundProcessArgs(`python worker.py ${secret} --mode ingest ${"x".repeat(80)}`, { maxLength: 42, maxTokenLength: 30 });
@@ -53,17 +63,17 @@ test("redactAndBoundProcessArgs redacts high-entropy long values and bounds outp
 test("parsePs parses process rows, redacts args, and topProcessesBy sorts in-process", () => {
   const rows = parsePs(`  PID  PPID  %CPU %MEM   RSS COMM             COMMAND
     1     0   0.1  0.2 11000 systemd          /sbin/init
-   42     1  12.5  3.0 50000 node             node server.js --token abc
+   42     1  12.5  3.0 50000 app              app --api-key top-secret
    99     1   4.0  9.5 80000 postgres         postgres: writer process
 `);
 
   assert.equal(rows.length, 3);
   assert.equal(rows[1].pid, 42);
-  assert.equal(rows[1].args, "node server.js --token [REDACTED]");
+  assert.equal(rows[1].args, "app --api-key [REDACTED]");
   assert.deepEqual(rows[1].args_redaction, {
     redacted: true,
     truncated: false,
-    original_length: 26,
+    original_length: 24,
     max_length: 240,
   });
   assert.deepEqual(topProcessesBy(rows, "cpu_percent", 2).map((process) => process.pid), [42, 99]);
