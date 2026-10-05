@@ -132,11 +132,11 @@ function overflowTick(ts, activeCount, entityPrefix = "peer.ssh.e") {
   return points;
 }
 
-function tailscalePoints(ts, peers) {
+function tailscalePoints(ts, peers, { truncated = false } = {}) {
   return factPointsFromTailscaleStatusEvidence([{
     id: "tailscale-status",
     status: "ok",
-    result: { peers },
+    result: { peers, truncated },
     trace: { tool: "collect_tailscale_status" },
   }], { ts });
 }
@@ -277,7 +277,7 @@ test("groupPeerFactsByTick (R8): Tailscale peer points sharing a tick with VPN p
   assert.equal(groups[0].availabilitySignature, DEFAULT_SIGNATURE);
 });
 
-test("groupPeerFactsByTick (R8): a Tailscale overflow marker never caps the shared peer tick", () => {
+test("groupPeerFactsByTick (R8): a Tailscale overflow marker is ignored only on a VPN-scoped tick", () => {
   const ts = tickTs(0);
   const tailscaleOverflow = {
     ...overflowMarkerPoint(ts),
@@ -285,6 +285,7 @@ test("groupPeerFactsByTick (R8): a Tailscale overflow marker never caps the shar
   };
   const groups = groupPeerFactsByTick([
     ...tailscalePoints(ts, [tailscalePeer("one")]),
+    ...activeTickWithMarker(ts, 1),
     tailscaleOverflow,
   ]);
   assert.equal(groups[0].hasOverflow, false);
@@ -300,6 +301,31 @@ test("R8: Tailscale-only markerless history still establishes and fires peer.cou
   ticks.push(...tailscalePoints(tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT), Array.from({ length: 40 }, (_, i) => tailscalePeer(`burst-${i}`))));
   const { candidates } = await seedAndCompute(paths, ticks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT) });
   assert.ok(candidates.some((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID));
+});
+
+test("R8 blocker: a markerless Tailscale overflow is preserved, not folded or evaluated, and a later genuine burst still fires", async () => {
+  const paths = await tempPaths();
+  const baselineTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    baselineTicks.push(...tailscalePoints(tickTs(i), [tailscalePeer(`${i}-a`), tailscalePeer(`${i}-b`)]));
+  }
+  await seedAndCompute(paths, baselineTicks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT - 1) });
+
+  const cappedTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  const capped = tailscalePoints(cappedTs, Array.from({ length: 200 }, (_, i) => tailscalePeer(`capped-${i}`)), { truncated: true });
+  const cappedGroup = groupPeerFactsByTick(capped)[0];
+  assert.equal(cappedGroup.hasOverflow, true, "the markerless Tailscale truncation must remain visible");
+  await appendFactPoints(paths, capped, { now: cappedTs });
+  const cappedResult = await computePeerBaselineCandidates(paths, { now: cappedTs });
+  assert.equal(cappedResult.candidates.some((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "a truncated markerless count is not scored as complete");
+  assert.equal(cappedResult.evaluatedAlertKeys.includes(alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_MARKERLESS_FINGERPRINT)), false, "a truncated markerless tick cannot evaluate a clear");
+  assert.equal((await loadPeerBaselineStore(paths)).state.stats.count, DEFAULT_PEER_MIN_SAMPLE_COUNT, "the capped tick must not be folded into the baseline");
+
+  const burstTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
+  await appendFactPoints(paths, tailscalePoints(burstTs, Array.from({ length: 40 }, (_, i) => tailscalePeer(`burst-${i}`))), { now: burstTs });
+  const burstResult = await computePeerBaselineCandidates(paths, { now: burstTs });
+  assert.ok(burstResult.candidates.some((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID), "the later genuine 40-peer burst must still raise");
+  assert.equal((await loadPeerBaselineStore(paths)).state.stats.count, DEFAULT_PEER_MIN_SAMPLE_COUNT + 1, "only the genuine burst joins the baseline after the capped tick");
 });
 
 test("R8 (calibration review): tailscale-status going 'unable' (no points, no marker) under an UNCHANGED vpn-peer availability signature must NOT fabricate a peer.count_drop", async () => {

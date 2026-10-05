@@ -401,16 +401,19 @@ export function groupPeerFactsByTick(points = []) {
         vpnCount: 0,
         tailscaleCount: 0,
         hasOverflow: false,
+        hasVpnOverflow: false,
+        hasTailscaleOverflow: false,
         availabilitySignature: undefined,
         censusMarkerSeen: false,
       });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === PEER_OVERFLOW_ENTITY_KEY) {
-      // R8: Tailscale has no availability signature and its overflow describes only its own
-      // source. It must not make the whole shared tick incomplete when a VPN census is present.
-      if (point.source_envelope_id === "tailscale-status") continue;
-      group.hasOverflow = true;
+      // R8: Tailscale has no availability signature. Its overflow marker is ignored only after a
+      // valid VPN census marker proves that Tailscale is outside the counted universe; on a
+      // markerless tick the all-peer count is truncated and must remain incomplete.
+      if (point.source_envelope_id === "tailscale-status") group.hasTailscaleOverflow = true;
+      else group.hasVpnOverflow = true;
       continue;
     }
     if (point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY) {
@@ -448,6 +451,8 @@ export function groupPeerFactsByTick(points = []) {
     group.count = group.availabilitySignature !== undefined
       ? group.vpnCount
       : group.vpnCount + group.tailscaleCount;
+    group.hasOverflow = group.hasVpnOverflow
+      || (group.hasTailscaleOverflow && group.availabilitySignature === undefined);
     delete group.vpnCount;
     delete group.tailscaleCount;
   }
@@ -462,6 +467,15 @@ export function groupPeerFactsByTick(points = []) {
  */
 function tickGroupDisposition(group) {
   return group.hasOverflow ? "overflow" : "complete";
+}
+
+// A markerless Tailscale overflow truncates the counted all-peer universe. It is not a trustworthy
+// lower bound for the spike detector because the source-specific cap can hide the size of the
+// burst, so it is excluded from scoring as well as folding. A VPN-scoped tick ignores that marker
+// during grouping because Tailscale is outside the counted universe; VPN overflow retains the
+// historical score-but-never-fold behavior.
+function overflowCanBeScored(group) {
+  return !(group.hasOverflow && group.hasTailscaleOverflow);
 }
 
 // Slice 4c (§2b): deliberately NOT unified with tickGroupDisposition above. Extending that
@@ -533,6 +547,7 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
       && group.availabilitySignature === currentSignature,
   );
   const mostRecentIsOverflow = mostRecentGroup ? tickGroupDisposition(mostRecentGroup) === "overflow" : false;
+  const mostRecentIsUnscorableOverflow = mostRecentIsOverflow && !overflowCanBeScored(mostRecentGroup);
   // F6 fix: an invalid-marker most-recent tick must be excluded from SCORING too, not merely
   // folding — "exclude from the spike fold AND score (fail closed)", distinct from overflow's own
   // deliberate score-but-never-fold posture (a truncated count is still a real lower-bound
@@ -555,7 +570,7 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   }
 
   let lastObservation;
-  if (mostRecentGroup && !mostRecentIsInvalidSignature) {
+  if (mostRecentGroup && !mostRecentIsInvalidSignature && !mostRecentIsUnscorableOverflow) {
     const zScore = computeZScore(mostRecentGroup.count, preScoreStats.mean, preScoreStats.stddev, stddevFloor);
     lastObservation = {
       ts: mostRecentGroup.ts,
