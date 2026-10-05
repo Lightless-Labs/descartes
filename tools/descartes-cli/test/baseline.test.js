@@ -25,6 +25,8 @@ import {
   SERVICE_APPEARED_RULE_ID,
   writeServiceBaselineStore,
   writeServiceAppearanceBaselineStore,
+  computeServiceBaselineCandidates,
+  computeServiceAppearanceCandidates,
 } from "../src/service-baseline.js";
 import { SCHEDULED_JOB_APPEARED_RULE_ID, writePersistenceBaselineStore } from "../src/persistence-baseline.js";
 import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
@@ -433,7 +435,9 @@ test("A3 repro: an established markerless peer baseline whose only current tick 
 
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const peer = status.domains.find((domain) => domain.domain === "peer");
-  assert.equal(peer.established_count >= 0, true); // sanity: the established-count projection still runs
+  // sanity: the established-count projection still runs and reports the real value -- the two
+  // markerless Tailscale peers R8 keeps established, unaffected by the unscorable overflow tick.
+  assert.equal(peer.established_count, 2);
   assert.deepEqual(peer.watching_rules, []);
   assert.deepEqual(peer.evaluated_alert_keys, []);
   assert.equal(peer.phase.startsWith("watching"), false, `status must not claim watching coverage; got "${peer.phase}"`);
@@ -493,6 +497,107 @@ test("A3: once genuinely established and fresh, every domain (not just session/p
   assert.deepEqual(byDomain["process-lineage"].watching_rules, [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID]);
   assert.ok(byDomain["process-lineage"].evaluated_alert_keys.length > 0);
 
+  assertWatchingImpliesRules(status.domains);
+});
+
+// ---------------------------------------------------------------------------------------------
+// MEDIUM fix (2026-10 security review): service.disappeared/service.appeared are gated by TWO
+// INDEPENDENT stores (service-baseline.js/service-appearance-baseline.json). `baseline status`
+// used to compute ONE combined coldStartPending across both stores and return early (`still
+// learning — 0 of 6`, watching_rules:[], evaluated_alert_keys:[]) whenever EITHER store was
+// pending -- even with 4+ fresh complete service censuses and an ESTABLISHED other store, hiding
+// that other store's real, already-evaluated coverage (service-baseline.js's own
+// computeServiceBaselineCandidates/computeServiceAppearanceCandidates report a real evaluated key
+// for the established side regardless of the other store's state -- they are fully independent
+// detectors). Fixed by gating readiness per store/rule instead of per domain.
+// ---------------------------------------------------------------------------------------------
+
+function serviceCensusPoints(serviceKey, tickCount, a1Ts) {
+  const points = [];
+  for (let hour = 0; hour < tickCount; hour += 1) {
+    const ts = a1Ts(hour);
+    points.push(
+      { ts, fact_name: "service.presence", entity_key: serviceKey, attributes: {} },
+      { ts, fact_name: "service.census", entity_key: "service.census-marker.v1", attributes: { census_state: "complete" } },
+    );
+  }
+  return points;
+}
+
+test("MEDIUM repro: an established disappearance store does not hide behind a pending appearance store", async () => {
+  const paths = await tempPaths();
+  await writeServiceBaselineStore(paths, A1_ESTABLISHED_STORE);
+  // The appearance store is left untouched -- a fresh install, cold_start_pending:true by default.
+
+  const serviceKey = "service.example.unit";
+  const points = serviceCensusPoints(serviceKey, 4, a1Ts);
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const now = a1Ts(3.5);
+  const noWrite = async () => {};
+
+  const disappearedDetector = await computeServiceBaselineCandidates(paths, { now, readFactPoints, writeServiceBaselineStore: noWrite });
+  const appearedDetector = await computeServiceAppearanceCandidates(paths, { now, readFactPoints, writeServiceAppearanceBaselineStore: noWrite });
+  assert.ok(disappearedDetector.evaluatedAlertKeys.length > 0, "sanity: the real disappearance detector evaluates this tick");
+  assert.deepEqual(appearedDetector.evaluatedAlertKeys, [], "sanity: the real appearance detector is still cold-start pending");
+
+  const status = await buildBaselineStatus(paths, { now, readFactPoints });
+  const service = status.domains.find((domain) => domain.domain === "service");
+
+  assert.match(service.phase, /^watching \(disappeared\); appeared still learning — \d+ of 6$/, service.phase);
+  assert.deepEqual(service.watching_rules, [SERVICE_DISAPPEARED_RULE_ID]);
+  assert.deepEqual(service.evaluated_alert_keys, disappearedDetector.evaluatedAlertKeys, "status must mirror the real disappearance detector's coverage");
+  assertWatchingImpliesRules(status.domains);
+});
+
+test("MEDIUM converse: an established appearance store does not hide behind a pending disappearance store", async () => {
+  const paths = await tempPaths();
+  await writeServiceAppearanceBaselineStore(paths, A1_ESTABLISHED_STORE);
+  // The disappearance store is left untouched -- a fresh install, cold_start_pending:true by default.
+
+  const serviceKey = "service.example.unit";
+  const points = serviceCensusPoints(serviceKey, 4, a1Ts);
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const now = a1Ts(3.5);
+  const noWrite = async () => {};
+
+  const disappearedDetector = await computeServiceBaselineCandidates(paths, { now, readFactPoints, writeServiceBaselineStore: noWrite });
+  const appearedDetector = await computeServiceAppearanceCandidates(paths, { now, readFactPoints, writeServiceAppearanceBaselineStore: noWrite });
+  assert.deepEqual(disappearedDetector.evaluatedAlertKeys, [], "sanity: the real disappearance detector is still cold-start pending");
+  assert.ok(appearedDetector.evaluatedAlertKeys.length > 0, "sanity: the real appearance detector evaluates this tick");
+
+  const status = await buildBaselineStatus(paths, { now, readFactPoints });
+  const service = status.domains.find((domain) => domain.domain === "service");
+
+  assert.match(service.phase, /^watching \(appeared\); disappeared still learning — \d+ of 6$/, service.phase);
+  assert.deepEqual(service.watching_rules, [SERVICE_APPEARED_RULE_ID]);
+  assert.deepEqual(service.evaluated_alert_keys, appearedDetector.evaluatedAlertKeys, "status must mirror the real appearance detector's coverage");
+  assertWatchingImpliesRules(status.domains);
+});
+
+test("MEDIUM: the pending rule's reported progress is the real re-accumulation count, not a hardcoded 0", async () => {
+  const paths = await tempPaths();
+  await writeServiceBaselineStore(paths, A1_ESTABLISHED_STORE);
+  // Anchored mid-reaccumulation, strictly between the hour-1 and hour-2 census ticks: 2 of the 4
+  // complete ticks below (hour 2, hour 3) fall strictly after the anchor.
+  await writeServiceAppearanceBaselineStore(paths, {
+    cold_start_pending: true,
+    cold_start_reason: "history_lost",
+    cold_start_since_ts: a1Ts(1.5),
+  });
+
+  const serviceKey = "service.example.unit";
+  const points = serviceCensusPoints(serviceKey, 4, a1Ts);
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const now = a1Ts(3.5);
+
+  const status = await buildBaselineStatus(paths, { now, readFactPoints });
+  const service = status.domains.find((domain) => domain.domain === "service");
+  assert.equal(service.phase, "watching (disappeared); appeared still learning — 2 of 6");
+  // The reported progress/required must match what the phase string says -- the BLOCKED rule's
+  // own lockout re-accumulation count (2 of 6), never the domain's aggregate complete-census-tick
+  // count (4 of 4, which would silently disagree with "2 of 6" in the very same status object).
+  assert.equal(service.complete_ticks, 2);
+  assert.equal(service.required_ticks, 6);
   assertWatchingImpliesRules(status.domains);
 });
 

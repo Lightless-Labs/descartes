@@ -287,12 +287,22 @@ function dropTickGroupIsComplete(group) {
 // evaluated-alert-key sibling (computeCensusEvaluatedAlertKeys / scheduledJobEvaluatedEntityKeys /
 // computeEvaluatedProcessLineageEdgeKeys) exactly -- same complete-group filter, same
 // minCompleteGroups/freshness gates -- never a second, drifting re-derivation of readiness.
-// coldStartPendingThisTick is always passed as false here because domainPhase already returned
-// its own cold-start phase before ever calling readinessFor (see the coldStartPending branch
-// above) -- by the time this runs, this tick is genuinely not cold-start-pending.
-function serviceRuleReadiness(groups, nowMs, freshnessMs) {
+//
+// MEDIUM fix (2026-10 security review): service.disappeared/service.appeared are gated by TWO
+// INDEPENDENT stores (DOMAIN_DEFINITIONS' `stores: [loadServiceBaselineStore,
+// loadServiceAppearanceBaselineStore]`, same order as `entries` below) -- unlike session/peer,
+// whose two rules share a single store. coldStartPendingThisTick used to always be passed as
+// false here, on the (at the time correct) assumption that domainPhase's own early return already
+// caught ANY pending entry before ever calling this. That assumption no longer holds: domainPhase
+// now reaches here while exactly one of the two stores is still cold-start pending and the other
+// is established, so each call below must mirror ONLY its own store's pending state -- never the
+// other's -- exactly like the real detectors (computeServiceBaselineCandidates /
+// computeServiceAppearanceCandidates) each gate on their own store alone.
+function serviceRuleReadiness(groups, nowMs, freshnessMs, entries = []) {
+  const disappearedPendingThisTick = entries[0]?.state?.cold_start_pending !== false;
+  const appearedPendingThisTick = entries[1]?.state?.cold_start_pending !== false;
   const disappearedKeys = computeCensusEvaluatedAlertKeys(groups, {
-    coldStartPendingThisTick: false,
+    coldStartPendingThisTick: disappearedPendingThisTick,
     nowMs,
     freshnessMs,
     minCompleteGroups: 2, // detectServiceDisappearances' own gate
@@ -300,7 +310,7 @@ function serviceRuleReadiness(groups, nowMs, freshnessMs) {
     hashEntityKey: hashServiceEntityKey,
   });
   const appearedKeys = computeCensusEvaluatedAlertKeys(groups, {
-    coldStartPendingThisTick: false,
+    coldStartPendingThisTick: appearedPendingThisTick,
     nowMs,
     freshnessMs,
     minCompleteGroups: DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1, // detectServiceAppearances' own gate
@@ -364,7 +374,7 @@ function readinessFor(domain, groups, points = [], entries = [], nowMs = Date.no
     return peerRuleReadiness(groups, entries, nowMs, freshnessMs);
   }
   if (domain === "service") {
-    return serviceRuleReadiness(groups, nowMs, freshnessMs);
+    return serviceRuleReadiness(groups, nowMs, freshnessMs, entries);
   }
   if (domain === "scheduled-job") {
     return scheduledJobRuleReadiness(groups, nowMs, freshnessMs);
@@ -387,25 +397,51 @@ const DOMAIN_RULE_IDS = {
   "process-lineage": [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID],
 };
 
-function phaseForRuleReadiness(domain, readiness) {
+// Returns { phase, progress, required } (never a bare string) so progress/required ALWAYS match
+// what the phase string actually says -- e.g. "appeared still learning — 2 of 6" must report
+// progress:2/required:6 (the blocked rule's own lockout re-accumulation), NOT readiness's
+// aggregate complete-census-tick progress/required (which could read e.g. "4 of 4" on the very
+// same tick -- a reader comparing the two fields would see them disagree).
+function phaseForRuleReadiness(domain, readiness, { gated = [], groups = [], nowMs } = {}) {
   const watchingRules = readiness.watchingRules ?? [];
   if (watchingRules.length === 0) return undefined;
   const ruleIds = DOMAIN_RULE_IDS[domain] ?? [];
-  if (watchingRules.length === ruleIds.length) return "watching";
+  if (watchingRules.length === ruleIds.length) return { phase: "watching", progress: readiness.progress, required: readiness.required };
   if (domain === "session") {
     return watchingRules.includes(SESSION_CHURN_RULE_ID)
-      ? `watching (churn); count baseline still learning — ${readiness.progress} of ${readiness.required}`
-      : `watching (count); churn has no fresh evaluable pair`;
+      ? { phase: `watching (churn); count baseline still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required }
+      : { phase: `watching (count); churn has no fresh evaluable pair`, progress: readiness.progress, required: readiness.required };
   }
   if (domain === "peer") {
     return watchingRules.includes(PEER_COUNT_SPIKE_RULE_ID)
-      ? "watching (spike); drop baseline is not evaluable"
-      : "watching (drop); spike baseline is not evaluable";
+      ? { phase: "watching (spike); drop baseline is not evaluable", progress: readiness.progress, required: readiness.required }
+      : { phase: "watching (drop); spike baseline is not evaluable", progress: readiness.progress, required: readiness.required };
   }
   if (domain === "service") {
-    return watchingRules.includes(SERVICE_DISAPPEARED_RULE_ID)
-      ? "watching (disappeared); appeared baseline is not evaluable"
-      : "watching (appeared); disappeared baseline is not evaluable";
+    // MEDIUM fix (2026-10 security review): service.disappeared/service.appeared are gated by
+    // TWO INDEPENDENT stores (DOMAIN_DEFINITIONS' `stores: [loadServiceBaselineStore,
+    // loadServiceAppearanceBaselineStore]`, the SAME order `gated` is built in by domainPhase) --
+    // when only one rule is ready, the other can be unready for two DIFFERENT reasons that must
+    // be worded differently: its OWN store can still be cold-start pending (report the real
+    // re-accumulation progress, mirroring the generic "still learning — N of 6" wording this file
+    // already uses for a fully-pending domain), or its store can be established but simply lack
+    // enough fresh complete-census history yet (the older "is not evaluable" wording). `gated[i]`
+    // lines up positionally with DOMAIN_RULE_IDS.service[i] only because the two arrays are
+    // deliberately kept in that same disappearance-then-appearance order.
+    const disappearedReady = watchingRules.includes(SERVICE_DISAPPEARED_RULE_ID);
+    const readyLabel = disappearedReady ? "disappeared" : "appeared";
+    const blockedLabel = disappearedReady ? "appeared" : "disappeared";
+    const blockedIndex = disappearedReady ? 1 : 0;
+    const blockedGate = gated[blockedIndex]?.gate;
+    const blockedEntry = gated[blockedIndex]?.entry;
+    if (blockedGate?.pending) {
+      const progress = lockoutProgress(blockedEntry, blockedGate, domain, groups, nowMs);
+      const suffix = progress < STATUS_TICK_COUNT
+        ? `${progress} of ${STATUS_TICK_COUNT}`
+        : `${STATUS_TICK_COUNT} of ${STATUS_TICK_COUNT}, lockout clears on the next daemon tick`;
+      return { phase: `watching (${readyLabel}); ${blockedLabel} still learning — ${suffix}`, progress, required: STATUS_TICK_COUNT };
+    }
+    return { phase: `watching (${readyLabel}); ${blockedLabel} baseline is not evaluable`, progress: readiness.progress, required: readiness.required };
   }
   // Every currently-defined scheduled-job/process-lineage domain owns exactly one rule_id, so
   // watchingRules.length (which is > 0 here) always already equals ruleIds.length above -- this
@@ -427,7 +463,17 @@ function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, rea
     historyTrust,
   };
 
-  if (coldStartPending) {
+  // MEDIUM fix (2026-10 security review): a domain whose rules are gated by MULTIPLE
+  // independent stores (today only "service" -- see DOMAIN_DEFINITIONS' `stores` array) must not
+  // let ONE store's pending lockout hide the OTHER store's already-evaluable coverage. The whole-
+  // domain "every rule is still cold-start-blocked" early return below must only fire when ALL of
+  // the domain's entries are pending -- a single-entry domain (session/peer/scheduled-job/
+  // process-lineage) always has allEntriesPending === coldStartPending (above), so this changes
+  // nothing for them. `base.coldStartPending`/`coldStartReason` stay keyed off ANY pending entry
+  // (unchanged) -- they report "something here is still cold-starting", which remains true.
+  const allEntriesPending = gated.length > 0 && pendingEntries.length === gated.length;
+
+  if (allEntriesPending) {
     const progress = Math.min(...pendingEntries.map(({ entry, gate }) => lockoutProgress(entry, gate, domain, groups, nowMs)));
     // R2 (2026-10 calibration review): for the count rules (session/peer) the 30-sample count
     // baseline can be the BINDING requirement, not the 6-tick lockout. Each new complete tick
@@ -451,7 +497,13 @@ function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, rea
     return { ...base, phase, progress: STATUS_TICK_COUNT, required: STATUS_TICK_COUNT };
   }
 
-  if (gated.some(({ gate }) => gate.wouldArm)) {
+  // An entry that is ALREADY cold-start pending commonly also satisfies wouldArm's own anchor-
+  // missing/store-loss terms (that is just what "still pending" looks like) -- that is not a NEW
+  // trust regression, so it must not report "locked out" here; it is handled below as that rule's
+  // own still-pending coverage instead (phaseForRuleReadiness's per-rule "still learning"
+  // wording). Only an entry that is NOT currently pending but would (re-)arm its lockout THIS
+  // tick -- a genuine established-to-cold-start regression -- is the "locked out" case below.
+  if (gated.some(({ gate }) => !gate.pending && gate.wouldArm)) {
     return { ...base, phase: `locked out — fact history untrustworthy (${historyTrust})`, progress: 0, required: STATUS_TICK_COUNT };
   }
 
@@ -462,7 +514,7 @@ function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, rea
   const complete = completeGroups(domain, groups);
   const latest = complete[complete.length - 1];
   const readiness = readinessFor(domain, groups, points, entries, nowMs, freshnessMs);
-  const rulePhase = phaseForRuleReadiness(domain, readiness);
+  const rulePhase = phaseForRuleReadiness(domain, readiness, { gated, groups, nowMs });
   if (!rulePhase && (!latest || !(nowMs - new Date(latest.ts).getTime() <= freshnessMs))) {
     const phase = latest
       ? `stale — latest complete census ${latest.ts} is older than the freshness window`
@@ -471,7 +523,7 @@ function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, rea
   }
 
   if (rulePhase) {
-    return { ...base, phase: rulePhase, progress: readiness.progress, required: readiness.required, watchingRules: readiness.watchingRules, evaluatedAlertKeys: readiness.evaluatedAlertKeys };
+    return { ...base, phase: rulePhase.phase, progress: rulePhase.progress, required: rulePhase.required, watchingRules: readiness.watchingRules, evaluatedAlertKeys: readiness.evaluatedAlertKeys };
   }
   if (!readiness.established) {
     return { ...base, phase: `still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required };
