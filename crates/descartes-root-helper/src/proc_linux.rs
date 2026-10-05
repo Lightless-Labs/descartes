@@ -67,6 +67,10 @@ const MAX_FDS_PER_PROCESS: usize = 4096;
 /// run unbounded.
 const MAX_PROCESSES_SCANNED: usize = 65536;
 
+/// A bounded stable-enumeration proof may need another full `/proc` pass when a new process or a
+/// reused PID appears between the holder scan and its selected-owner recheck.
+const MAX_HOLDER_STABILITY_PASSES: usize = 3;
+
 /// Resolves a single pid to its real uid, executable path, and command line. `None` on ANY
 /// failure (no such pid, unreadable status/exe/cmdline) -- see the module doc for why this is
 /// intentionally all-or-nothing. A blank cmdline is retained when exe is readable.
@@ -162,7 +166,8 @@ struct ProcessIdentity {
 
 /// See `socket.rs` for the contract. Sequence: admit the live row for the exact inode -> collect
 /// every holder (pin-then-verify) -> select (or ambiguous) -> consistency re-check of BOTH the
-/// chosen holder's fd link and the socket row against what was admitted.
+/// chosen holder's fd link and the socket row against what was admitted -> re-enumerate `/proc`
+/// until the PID set is stable. A non-converging set is ambiguous, never a sole-owner answer.
 pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
     resolve_with_one_generation_retry(|| resolve_socket_once(target))
 }
@@ -200,59 +205,93 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
         return SocketOutcome::NotFound;
     }
 
-    let scan = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
-    if scan.generation_changed {
-        return SocketOutcome::GenerationChanged;
-    }
-    if scan.ambiguous {
-        return SocketOutcome::Ambiguous;
-    }
-    if scan_requires_truncated_outcome(scan.truncated, scan.holder_count) {
-        return SocketOutcome::Truncated;
-    }
-    let Some(holder) = scan.selected else {
-        return if scan.truncated {
-            SocketOutcome::Truncated
-        } else {
-            SocketOutcome::NotFound
+    let mut scan = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
+    for pass in 0..MAX_HOLDER_STABILITY_PASSES {
+        if scan.generation_changed {
+            return SocketOutcome::GenerationChanged;
+        }
+        if scan.ambiguous {
+            return SocketOutcome::Ambiguous;
+        }
+        if scan_requires_truncated_outcome(scan.truncated, scan.holder_count) {
+            return SocketOutcome::Truncated;
+        }
+        let Some(holder) = scan.selected.as_ref() else {
+            return if scan.truncated {
+                SocketOutcome::Truncated
+            } else {
+                SocketOutcome::NotFound
+            };
         };
-    };
-    let holders = scan.holder_count;
 
-    // Consistency ("generation") re-check: the chosen holder must STILL hold this exact socket
-    // (a close/handoff since the scan would otherwise be reported as current), and the socket row
-    // must be unchanged (same address/port/state/uid) -- a rebind of the port to a new socket
-    // gives a new inode and fails the row lookup; a state change fails the equality.
-    let still_held = procfs::read_link_at(holder.fd_dir.as_fd(), &holder.fd_name)
-        .ok()
-        .is_some_and(|link| link.to_str() == Some(target.fd_link().as_str()));
-    if !still_held {
-        return SocketOutcome::GenerationChanged;
-    }
-    let (row_again, row_again_status) = read_socket_row(target);
-    if row_again_status == SocketTableStatus::NamespaceMismatch {
-        return SocketOutcome::ProcfsNamespaceMismatch;
-    }
-    if row_again.as_ref() != Some(&row) {
-        return SocketOutcome::NotFound;
-    }
-    // Final executable-generation check closes the window between the holder identity read and
-    // the fd/socket recheck. A changed path retries once, then becomes ambiguous.
-    if procfs::read_link_at(holder._pid_dir.as_fd(), "exe")
-        .ok()
-        .is_none_or(|link| link.to_string_lossy() != holder.resolved.executable_path)
-        || procfs::stat_at(holder._pid_dir.as_fd(), "exe")
+        // Consistency ("generation") re-check: the chosen holder must STILL hold this exact
+        // socket (a close/handoff since the scan would otherwise be reported as current), and the
+        // socket row must be unchanged (same address/port/state/uid). A rebind of the port to a
+        // new socket gives a new inode and fails the row lookup; a state change fails equality.
+        let still_held = procfs::read_link_at(holder.fd_dir.as_fd(), &holder.fd_name)
             .ok()
-            .map(|identity| (identity.device, identity.inode))
-            != Some(holder.resolved.executable_identity)
-    {
-        return SocketOutcome::GenerationChanged;
-    }
+            .is_some_and(|link| link.to_str() == Some(target.fd_link().as_str()));
+        if !still_held {
+            return SocketOutcome::GenerationChanged;
+        }
+        let (row_again, row_again_status) = read_socket_row(target);
+        if row_again_status == SocketTableStatus::NamespaceMismatch {
+            return SocketOutcome::ProcfsNamespaceMismatch;
+        }
+        if row_again.as_ref() != Some(&row) {
+            return SocketOutcome::NotFound;
+        }
+        // Final executable-generation check closes the window between the holder identity read
+        // and the fd/socket recheck. A changed path retries once, then becomes ambiguous.
+        if procfs::read_link_at(holder._pid_dir.as_fd(), "exe")
+            .ok()
+            .is_none_or(|link| link.to_string_lossy() != holder.resolved.executable_path)
+            || procfs::stat_at(holder._pid_dir.as_fd(), "exe")
+                .ok()
+                .map(|identity| (identity.device, identity.inode))
+                != Some(holder.resolved.executable_identity)
+        {
+            return SocketOutcome::GenerationChanged;
+        }
 
-    SocketOutcome::Resolved {
-        resolved: holder.resolved,
-        holders,
+        let mut refreshed = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
+        if refreshed.generation_changed {
+            return SocketOutcome::GenerationChanged;
+        }
+        if crate::scan::snapshot_has_new_or_reused_pid(&scan.snapshot, &refreshed.snapshot) {
+            if pass + 1 == MAX_HOLDER_STABILITY_PASSES {
+                return SocketOutcome::Ambiguous;
+            }
+            scan = refreshed;
+            continue;
+        }
+
+        // The final holder count comes from the stable enumeration, not the pre-recheck scan.
+        if refreshed.ambiguous {
+            return SocketOutcome::Ambiguous;
+        }
+        if scan_requires_truncated_outcome(refreshed.truncated, refreshed.holder_count) {
+            return SocketOutcome::Truncated;
+        }
+        let Some(final_holder) = refreshed.selected.take() else {
+            return if refreshed.truncated {
+                SocketOutcome::Truncated
+            } else {
+                SocketOutcome::NotFound
+            };
+        };
+        if procfs::read_link_at(final_holder.fd_dir.as_fd(), &final_holder.fd_name)
+            .ok()
+            .is_none_or(|link| link.to_str() != Some(target.fd_link().as_str()))
+        {
+            return SocketOutcome::GenerationChanged;
+        }
+        return SocketOutcome::Resolved {
+            resolved: final_holder.resolved,
+            holders: refreshed.holder_count,
+        };
     }
+    SocketOutcome::Ambiguous
 }
 
 /// Reads ONLY `/proc/<helper-pid>/net/<target.protocol>` and returns the row whose inode is exactly
@@ -299,6 +338,7 @@ struct HolderScan {
     first_identity: Option<ProcessIdentity>,
     ambiguous: bool,
     generation_changed: bool,
+    snapshot: Vec<crate::scan::ProcessSnapshot>,
     /// A bound was hit on a NON-holder (or on the `/proc` listing): another holder may be unseen.
     truncated: bool,
 }
@@ -365,6 +405,7 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
         first_identity: None,
         ambiguous: false,
         generation_changed: false,
+        snapshot: Vec::new(),
         truncated: false,
     };
     // The listing cap counts every `/proc` entry (a few dozen non-pid names included).
@@ -399,6 +440,15 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
                 continue;
             }
         };
+        let Some(start_time) = read_process_start_time(pid_dir.as_fd()) else {
+            scan.truncated = true;
+            continue;
+        };
+        scan.snapshot.push(crate::scan::ProcessSnapshot {
+            pid,
+            tgid: pid,
+            start_time,
+        });
         let (fd_dir, fd_names) =
             match procfs::read_dir_entries_at(pid_dir.as_fd(), "fd", MAX_FDS_PER_PROCESS) {
                 Ok(result) => result,
@@ -706,6 +756,7 @@ mod tests {
             first_identity: None,
             ambiguous: false,
             generation_changed: false,
+            snapshot: Vec::new(),
             truncated: false,
         };
         scan.record_fd_link_failure();

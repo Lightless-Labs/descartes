@@ -26,6 +26,33 @@ pub fn fd_scan_truncated(entries_seen: usize, cap: usize) -> bool {
     cap != 0 && entries_seen >= cap
 }
 
+/// The point-in-time identity of one PID-directory entry. A numeric PID is reusable, so a
+/// subsequent enumeration must treat either a new PID or a changed `(tgid, start_time)` tuple as
+/// a new process that has to be included in the holder proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    pub tgid: u32,
+    pub start_time: u64,
+}
+
+/// Returns whether `current` contains a PID that was not in `previous`, or a reused PID whose
+/// process identity changed. Removed PIDs do not require another pass: they cannot introduce a
+/// holder into the current point-in-time result.
+pub fn snapshot_has_new_or_reused_pid(
+    previous: &[ProcessSnapshot],
+    current: &[ProcessSnapshot],
+) -> bool {
+    current.iter().any(|candidate| {
+        previous
+            .iter()
+            .find(|observed| observed.pid == candidate.pid)
+            .is_none_or(|observed| {
+                observed.tgid != candidate.tgid || observed.start_time != candidate.start_time
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +79,75 @@ mod tests {
     fn a_zero_cap_disables_the_bound_never_truncated() {
         assert!(!fd_scan_truncated(0, 0));
         assert!(!fd_scan_truncated(1_000_000, 0));
+    }
+
+    #[test]
+    fn a_new_fork_is_a_new_snapshot_even_when_the_original_pid_is_still_present() {
+        let original = [ProcessSnapshot {
+            pid: 100,
+            tgid: 100,
+            start_time: 10,
+        }];
+        let after_fork = [
+            original[0],
+            ProcessSnapshot {
+                pid: 200,
+                tgid: 200,
+                start_time: 20,
+            },
+        ];
+        assert!(snapshot_has_new_or_reused_pid(&original, &after_fork));
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_is_stable() {
+        let snapshot = [ProcessSnapshot {
+            pid: 100,
+            tgid: 100,
+            start_time: 10,
+        }];
+        assert!(!snapshot_has_new_or_reused_pid(&snapshot, &snapshot));
+    }
+
+    #[test]
+    fn a_reused_pid_is_a_new_snapshot() {
+        let before = [ProcessSnapshot {
+            pid: 100,
+            tgid: 100,
+            start_time: 10,
+        }];
+        let after_reuse = [ProcessSnapshot {
+            pid: 100,
+            tgid: 100,
+            start_time: 11,
+        }];
+        assert!(snapshot_has_new_or_reused_pid(&before, &after_reuse));
+    }
+
+    #[test]
+    fn a_churning_snapshot_never_converges_within_the_bound() {
+        let mut previous = vec![ProcessSnapshot {
+            pid: 100,
+            tgid: 100,
+            start_time: 10,
+        }];
+        let mut converged = false;
+        for pid in [200, 300, 400] {
+            let mut current = previous.clone();
+            current.push(ProcessSnapshot {
+                pid,
+                tgid: pid,
+                start_time: u64::from(pid),
+            });
+            if !snapshot_has_new_or_reused_pid(&previous, &current) {
+                converged = true;
+                break;
+            }
+            previous = current;
+        }
+        assert!(
+            !converged,
+            "continuous fork churn must remain ambiguous at the bound"
+        );
     }
 }

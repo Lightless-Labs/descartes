@@ -390,23 +390,81 @@ async function verifyProcFdHolder(targetInode, owner) {
   }
 }
 
+const MAX_OWNER_STABILITY_PASSES = 3;
+
+function scanResultEntries(scan) {
+  return Array.isArray(scan) ? scan : (Array.isArray(scan?.results) ? scan.results : []);
+}
+
+function processIdentityKey(entry) {
+  if (!entry || entry.accessible === false || !Number.isInteger(entry.tgid) || typeof entry.start_time !== "string") return undefined;
+  return `${entry.tgid}:${entry.start_time}`;
+}
+
+function scanHasNewOrReusedPids(previousScan, nextScan) {
+  const previous = new Map(scanResultEntries(previousScan).map((entry) => [entry.pid, processIdentityKey(entry)]));
+  return scanResultEntries(nextScan).some((entry) => {
+    if (!Number.isInteger(entry?.pid)) return false;
+    const previousIdentity = previous.get(entry.pid);
+    if (previousIdentity === undefined) return !previous.has(entry.pid);
+    const nextIdentity = processIdentityKey(entry);
+    return nextIdentity !== undefined && nextIdentity !== previousIdentity;
+  });
+}
+
+function scanHasReusedHolder(targetInode, previousScan, nextScan) {
+  const previous = new Map(scanResultEntries(previousScan).map((entry) => [entry.pid, processIdentityKey(entry)]));
+  return scanResultEntries(nextScan).some((entry) => {
+    if (!Number.isInteger(entry?.pid)) return false;
+    const previousIdentity = previous.get(entry.pid);
+    const nextIdentity = processIdentityKey(entry);
+    const changed = previousIdentity !== undefined && nextIdentity !== undefined && previousIdentity !== nextIdentity;
+    const holds = (entry.fds ?? []).some((fd) => fd.target === `socket:[${targetInode}]`);
+    return changed && holds;
+  });
+}
+
+function mergeScanResults(previousScan, nextScan) {
+  if (Array.isArray(nextScan)) return nextScan;
+  const merged = new Map(scanResultEntries(previousScan).map((entry) => [entry.pid, entry]));
+  for (const entry of scanResultEntries(nextScan)) merged.set(entry.pid, entry);
+  return {
+    results: [...merged.values()],
+    truncated: (previousScan?.truncated === true) || (nextScan?.truncated === true),
+    uncertain: (previousScan?.uncertain === true) || (nextScan?.uncertain === true),
+  };
+}
+
 // A scan snapshot is not itself a current ownership proof. Once a sole owner is selected, verify
-// both its identity and the exact socket link again. A handoff or identity change gets one fresh
-// scan; if the second verification still cannot prove the same owner, fail closed.
+// both its identity and the exact socket link again, then enumerate and scan the PID set again.
+// Newly-created PIDs and reused numeric PIDs are part of the proof obligation even when the first
+// selected owner still passes its recheck. Three consecutive additions are a bounded
+// non-converging scan, not permission to report the first owner.
 export async function resolveVerifiedPidFromFdScanResults(targetInode, fdScanResults, { scanAgain, verifyHolder } = {}) {
   const verify = verifyHolder ?? verifyProcFdHolder;
   let currentScan = fdScanResults;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let pass = 0; pass < MAX_OWNER_STABILITY_PASSES; pass += 1) {
     const match = resolvePidFromFdScanResults(targetInode, currentScan);
     if (match.status !== "ok") return match;
     const owner = (match.owners ?? [{ pid: match.pid }])[0];
     const verification = await verify(targetInode, owner);
-    if (verification.status === "ok") return match;
-    if (attempt === 0 && scanAgain) {
-      currentScan = await scanAgain();
-      continue;
+    if (verification.status !== "ok") {
+      if (pass < MAX_OWNER_STABILITY_PASSES - 1 && scanAgain) {
+        currentScan = await scanAgain();
+        continue;
+      }
+      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: verification.reason };
     }
-    return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: verification.reason };
+    if (!scanAgain) return match;
+
+    const refreshedScan = await scanAgain();
+    if (scanHasReusedHolder(targetInode, currentScan, refreshedScan)) {
+      return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_identity_changed" };
+    }
+    if (!scanHasNewOrReusedPids(currentScan, refreshedScan)) {
+      return resolvePidFromFdScanResults(targetInode, mergeScanResults(currentScan, refreshedScan));
+    }
+    currentScan = mergeScanResults(currentScan, refreshedScan);
   }
   return { status: "ambiguous", pid: undefined, confidence: 0, review_hint: "ambiguous", reason: "owner_recheck_exhausted" };
 }

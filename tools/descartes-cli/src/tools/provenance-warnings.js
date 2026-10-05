@@ -382,7 +382,13 @@ async function listLinuxListeningSockets(options) {
 
   return Promise.all(listening.map(async (entry) => {
     const match = await resolveVerifiedPidFromFdScanResults(entry.inode, fdScanResults, {
-      scanAgain: async () => scanFds(candidatePids),
+      scanAgain: async () => {
+        const refreshedListing = await listPids();
+        const refreshedPids = Array.isArray(refreshedListing) ? refreshedListing : refreshedListing.pids;
+        return scanFds(refreshedPids, {
+          listingTruncated: !Array.isArray(refreshedListing) && refreshedListing.truncated,
+        });
+      },
       verifyHolder: options.verifyProcFdHolder,
     });
     return {

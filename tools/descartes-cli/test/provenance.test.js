@@ -147,9 +147,67 @@ test("resolveVerifiedPidFromFdScanResults refreshes once after a stale holder re
     },
     verifyHolder: async (_inode, owner) => owner.pid === 200 ? { status: "ok" } : { status: "ambiguous", reason: "owner_fd_recheck_failed" },
   });
-  assert.equal(refreshes, 1);
+  assert.equal(refreshes, 2);
   assert.equal(result.status, "ok");
   assert.equal(result.pid, 200);
+});
+
+test("resolveVerifiedPidFromFdScanResults treats a forked inherited holder as ambiguous", async () => {
+  const first = [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] }];
+  const afterFork = [
+    ...first,
+    { pid: 200, tgid: 200, start_time: "20", accessible: true, fds: [{ fd: "4", target: "socket:[12345]" }] },
+  ];
+  const result = await resolveVerifiedPidFromFdScanResults("12345", first, {
+    scanAgain: async () => afterFork,
+    verifyHolder: async () => ({ status: "ok" }),
+  });
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.reason, "owner_ambiguous");
+});
+
+test("resolveVerifiedPidFromFdScanResults requires a stable PID set before returning the sole holder", async () => {
+  const stable = [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] }];
+  let enumerations = 0;
+  const result = await resolveVerifiedPidFromFdScanResults("12345", stable, {
+    scanAgain: async () => {
+      enumerations += 1;
+      return stable;
+    },
+    verifyHolder: async () => ({ status: "ok" }),
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(result.pid, 100);
+  assert.equal(enumerations, 1, "a stable result stops after the first confirming enumeration");
+});
+
+test("resolveVerifiedPidFromFdScanResults treats PID churn that never converges as ambiguous", async () => {
+  const owner = (pid, startTime) => ({ pid, tgid: pid, start_time: String(startTime), accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] });
+  const unrelated = (pid, startTime) => ({ pid, tgid: pid, start_time: String(startTime), accessible: true, fds: [{ fd: "4", target: "/dev/null" }] });
+  const scans = [
+    [owner(100, 10), unrelated(200, 20)],
+    [owner(100, 10), unrelated(200, 20), unrelated(300, 30)],
+    [owner(100, 10), unrelated(200, 20), unrelated(300, 30), unrelated(400, 40)],
+  ];
+  let enumerations = 0;
+  const result = await resolveVerifiedPidFromFdScanResults("12345", [owner(100, 10)], {
+    scanAgain: async () => scans[enumerations++],
+    verifyHolder: async () => ({ status: "ok" }),
+  });
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.reason, "owner_recheck_exhausted");
+  assert.equal(enumerations, 3);
+});
+
+test("resolveVerifiedPidFromFdScanResults treats a reused PID as a new process", async () => {
+  const first = [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] }];
+  const reused = [{ pid: 100, tgid: 100, start_time: "11", accessible: true, fds: [{ fd: "3", target: "socket:[12345]" }] }];
+  const result = await resolveVerifiedPidFromFdScanResults("12345", first, {
+    scanAgain: async () => reused,
+    verifyHolder: async () => ({ status: "ok" }),
+  });
+  assert.equal(result.status, "ambiguous");
+  assert.equal(result.reason, "owner_identity_changed");
 });
 
 test("same-port socket attribution is ambiguous when inodes map to different executables or any row is unresolved", () => {
