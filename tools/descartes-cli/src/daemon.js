@@ -5,7 +5,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
+import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
@@ -838,7 +838,7 @@ function ruleIdsForFailedLabel(label, persistedRuleIds) {
 // the pre-fix code already did whenever any restriction applied. Only called when
 // options.evaluateAlerts !== false, so the "no I/O when disabled" invariant (no detector/alert I/O
 // on a disabled tick) is preserved by the caller, unchanged.
-async function computeCoveredAlerts(descartesPaths, options, { historyVetoedRuleIds, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel, horizonVetoedRuleIds = new Set() }) {
+async function computeCoveredAlerts(descartesPaths, options, { historyVetoedRuleIds, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel, horizonVetoedRuleIds = new Set(), successfulRetentionFamilies = new Set() }) {
   // S4 (§4.4, I6): the per-family history veto. Fail closed: a caller that passes no set vetoes every
   // history-dependent rule.
   const historyVetoed = historyVetoedRuleIds instanceof Set ? historyVetoedRuleIds : HISTORY_DEPENDENT_ALERT_RULE_IDS;
@@ -874,6 +874,10 @@ async function computeCoveredAlerts(descartesPaths, options, { historyVetoedRule
   const covered = fixedAlertIds();
   for (const alert of persistedAlerts) {
     if (vetoedRuleIds.has(alert.rule_id)) continue; // §7.7 veto -> frozen
+    if (alert.rule_id === RETENTION_FAILURE_RULE_ID) {
+      if (successfulRetentionFamilies.has(alert.fingerprint)) covered.add(alert.id);
+      continue; // a fast tick, failed pass, or unreadable status never authorizes recovery
+    }
     if (FIXED_ALERT_RULE_IDS.has(alert.rule_id)) { covered.add(alert.id); continue; } // exempt
     const owner = SECURITY_RULE_OWNERSHIP.get(alert.rule_id);
     if (owner) {
@@ -1594,6 +1598,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // exactly the phase-appropriate boundary: containment's own failure cannot retroactively affect
   // a persistence pass that already happened.
   const failedDetectorLabels = new Set();
+  const successfulRetentionFamilies = new Set(
+    Object.entries(structuralFacts?.families ?? {})
+      .filter(([, result]) => result && typeof result === "object" && !Array.isArray(result)
+        && Object.prototype.hasOwnProperty.call(result, "retention")
+        && result.append_error === undefined)
+      .map(([family]) => family),
+  );
   if (options.evaluateAlerts !== false) {
     // Per-detector DI seams (mirrors the file's existing options.<fn> ?? <fn> pattern, e.g.
     // loadLearnedConfig/readFactPoints/adjudicateAlertNotifications above) so a single detector
@@ -1723,6 +1734,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
       horizonVetoedRuleIds,
+      successfulRetentionFamilies,
       alwaysExcludedRuleIds: [
         ...(learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : []),
         ...tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
@@ -1737,6 +1749,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
         extraCandidates: mainExtraCandidates,
+        successfulRetentionFamilies,
         // Detector-reported recovery coverage (§8.A): identity-keyed covered set. Freeze-by-default
         // for every coverage-subject family (recover only what a producer reported evaluated this
         // tick), intersected with the §7.7 vetoes (history-untrusted, failed-detector, and this
@@ -1797,6 +1810,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
       horizonVetoedRuleIds,
+      successfulRetentionFamilies,
       alwaysExcludedRuleIds: tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
     });
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
@@ -1805,6 +1819,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historySummary: mainAlerts.history_summary,
       windowMs: options.alertWindowMs,
       extraCandidates: [...mainAlerts.candidates, ...mainExtraCandidates, ...containmentCandidates],
+      successfulRetentionFamilies,
       // Detector-reported recovery coverage (§8.A), containment pass: same identity-keyed
       // freeze-by-default covered set as the main call, sharing the SAME evaluatedByLabel report (so
       // the detector families re-persisted here keep their coverage), but WITHOUT the main call's

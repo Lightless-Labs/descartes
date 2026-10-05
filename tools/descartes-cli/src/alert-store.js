@@ -5,6 +5,7 @@ import { buildHistorySummary, readDaemonStatus } from "./history-store.js";
 
 export const DEFAULT_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
+export const RETENTION_FAILURE_RULE_ID = "daemon.fact_store.retention_failing";
 
 export function resolveAlertStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "alerts");
@@ -73,7 +74,6 @@ export const FIXED_ALERT_RULE_IDS = new Set([
   // Fact-store capacity plan §4.2/I12 (step S3): HISTORY_HORIZON_SHORT_RULE_ID (fact-families.js),
   // kept as a literal here like its siblings; alert-store.test.js pins the two equal.
   "daemon.fact_history.horizon_short",
-  "daemon.fact_store.retention_failing",
 ]);
 
 // Detector-reported recovery coverage (§8.A): coverage is now keyed on alert IDENTITY
@@ -190,7 +190,7 @@ export function evaluateAlertRules(historySummary, daemonStatus, options = {}) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
       if (!(typeof entry.retention_error === "string" && entry.retention_error) && entry.retention_failing !== true) continue;
       pushCandidate(candidates, {
-        rule_id: "daemon.fact_store.retention_failing",
+        rule_id: RETENTION_FAILURE_RULE_ID,
         fingerprint: family,
         severity: "warning",
         title: "Fact-store retention is failing",
@@ -403,6 +403,24 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   ]);
   const candidates = evaluateAlertRules(historySummary, daemonStatus, { now, thresholds: options.thresholds });
   const extraCandidates = Array.isArray(options.extraCandidates) ? options.extraCandidates : [];
+  const successfulRetentionFamilies = options.successfulRetentionFamilies instanceof Set
+    ? options.successfulRetentionFamilies
+    : new Set();
+  const carriedRetentionCandidates = existing
+    .filter((alert) => alert.rule_id === RETENTION_FAILURE_RULE_ID
+      && ["active", "acknowledged"].includes(alert.status)
+      && !successfulRetentionFamilies.has(alert.fingerprint)
+      && !candidates.some((candidate) => candidate.id === alert.id))
+    .map((alert) => ({
+      id: alert.id,
+      rule_id: alert.rule_id,
+      fingerprint: alert.fingerprint,
+      severity: alert.severity,
+      title: alert.title,
+      summary: alert.summary,
+      diagnostics: alert.diagnostics,
+    }));
+  const currentCandidates = [...candidates, ...carriedRetentionCandidates];
   // Both sources MUST be merged into one array before the single applyAlertCandidates call below:
   // applyAlertCandidates' recovery logic marks any active alert id absent from the current candidate
   // array as "recovered", so evaluating fixed rules and extra (e.g. constraint) candidates separately
@@ -410,11 +428,11 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   // candidate already carries an `id` (set by pushCandidate); defensively assign the same alertId()
   // to any extraCandidates entry missing one, so a source that forgets to set `id` cannot desync
   // applyAlertCandidates' recovery-detection set from the ids it actually persists under.
-  const mergedCandidates = [...candidates, ...extraCandidates].map((candidate) =>
+  const mergedCandidates = [...currentCandidates, ...extraCandidates].map((candidate) =>
     candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
   );
   const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
-  return { alerts: applied.alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
+  return { alerts: applied.alerts, candidates: currentCandidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
 }
 
 export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {

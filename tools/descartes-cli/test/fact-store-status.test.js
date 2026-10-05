@@ -157,6 +157,20 @@ test("G2 HIGH-2: carried retention failure stays fixed-alert-active across fast 
   assert.equal(carriedAlert.status, "active");
   assert.equal(fast.status.state, "error", "carried retention failure must not fabricate daemon health ok");
 
+  const unreadableStatusFast = await tick(paths, 0.75, {
+    readDaemonStatus: async () => { throw new Error("status unreadable"); },
+  });
+  const unreadableAlert = unreadableStatusFast.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
+  assert.equal(unreadableAlert?.status, "active", "an unreadable prior status cannot authorize recovery");
+  assert.ok(unreadableStatusFast.alerts.candidates.some((candidate) => candidate.rule_id === alertId && candidate.fingerprint === "service"), "the active alert is carried from the alert store itself");
+
+  await writeWatchConfig(paths, { enabled: false });
+  await writeLearnedConfig(paths, { enabled: false });
+  const bothOff = await tick(paths, 0.9);
+  const bothOffAlert = bothOff.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
+  assert.equal(bothOffAlert?.status, "active", "both tiers off provides no successful retention pass");
+
+  await writeWatchConfig(paths, { enabled: true });
   const recovered = await tick(paths, 1);
   const recoveredAlert = recovered.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
   assert.equal(recoveredAlert?.status, "recovered", "only a successful structural retention pass may recover the fixed alert");
