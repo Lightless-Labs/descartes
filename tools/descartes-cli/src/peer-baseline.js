@@ -25,7 +25,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, computeZScore, emptyWelfordStats, foldWelford, updateEwma } from "./welford-stats.js";
 
@@ -857,7 +857,16 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // (re)armed this tick, or history is untrusted), this detector evaluated NOTHING it can vouch
   // for -- report empty coverage so any persisted peer.count_spike/peer.count_drop alert FREEZES
   // (never fabricate a recovery), exactly as it already emits zero candidates.
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
+  if (coldStartPendingThisTick) {
+    return {
+      candidates: [],
+      evaluatedAlertKeys: [],
+      ruleEvaluations: {
+        [PEER_COUNT_SPIKE_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick }),
+        [PEER_COUNT_DROP_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick }),
+      },
+    };
+  }
 
   // Re-emission every tick (load-bearing, mirrors session-baseline.js's own Decision 3): built
   // fresh from `windowed`/`windowedDrop` on EVERY call — including ticks where nothing new was
@@ -909,12 +918,25 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     too few marker-complete ticks have re-accumulated since the cold-start anchor (a
   //     count_drop-only warm-up the spike direction does not share), so gating drop on
   //     windowedDrop.confidence_state alone would fabricate a recovery.
-  const evaluatedAlertKeys = [];
-  if (windowed.confidence_state === "established" && spikeHorizonOk) {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, "global"));
-  }
-  if (windowedDrop.confidence_state === "established" && dropRecoveryReady && dropHorizonOk) {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, "global"));
-  }
-  return { candidates, evaluatedAlertKeys };
+  const spikeKeys = windowed.confidence_state === "established" && spikeHorizonOk ? [alertId(PEER_COUNT_SPIKE_RULE_ID, "global")] : [];
+  const dropKeys = windowedDrop.confidence_state === "established" && dropRecoveryReady && dropHorizonOk ? [alertId(PEER_COUNT_DROP_RULE_ID, "global")] : [];
+  const evaluatedAlertKeys = [...spikeKeys, ...dropKeys];
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [PEER_COUNT_SPIKE_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk: spikeHorizonOk,
+      readinessGate: windowed.confidence_state === "established" ? "ok" : "baseline_warming_up",
+      evaluatedAlertKeys: spikeKeys,
+    }),
+    [PEER_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk: dropHorizonOk,
+      readinessGate: windowedDrop.confidence_state !== "established" ? "baseline_warming_up" : dropRecoveryReady ? "ok" : "drop_history_not_ready",
+      evaluatedAlertKeys: dropKeys,
+    }),
+  };
+  return { candidates, evaluatedAlertKeys, ruleEvaluations };
 }

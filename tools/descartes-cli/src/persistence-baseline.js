@@ -23,7 +23,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
@@ -249,18 +249,27 @@ function hashScheduledJobEntityKey(entityKey) {
 // census knowledge of this tick" the recipe names; latest-only entities MUST be included because a
 // candidate's own identity is required in the evaluated set (§8.B). Returns [] if any gate fails
 // (the coldStartPendingThisTick short-circuit is applied by the caller, above and beyond this).
-function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
+// S6 (I11): the readiness gates above, factored out unchanged so the per-rule status report names
+// WHICH gate stopped the rule (a ready window with zero jobs still evaluates).
+function scheduledJobEvaluationReadiness(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_SCHEDULED_JOB_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minHistoryTickCount + 1) return [];
+  if (completeGroups.length < minHistoryTickCount + 1) return { gate: "insufficient_complete_history" };
 
   const latest = completeGroups[completeGroups.length - 1];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return [];
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale" };
+  return { gate: "ok", completeGroups };
+}
+
+function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
+  const readiness = scheduledJobEvaluationReadiness(groups, options);
+  if (readiness.gate !== "ok") return [];
+  const { completeGroups } = readiness;
 
   const evaluated = new Set();
   for (const group of completeGroups) {
@@ -434,5 +443,15 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildScheduledJobAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SCHEDULED_JOB_APPEARED_RULE_ID) }), evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [SCHEDULED_JOB_APPEARED_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      readinessGate: scheduledJobEvaluationReadiness(currentGroups, detectionOptions).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  return { candidates: buildScheduledJobAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SCHEDULED_JOB_APPEARED_RULE_ID) }), evaluatedAlertKeys, ruleEvaluations };
 }

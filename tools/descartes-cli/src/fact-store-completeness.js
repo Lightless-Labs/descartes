@@ -268,6 +268,36 @@ export function ruleEligible(readResult, ruleId, nowMs, { readWindowMs } = {}) {
 }
 
 /**
+ * S6 (fact-store capacity plan §7 S6, I11): one rule's "would evaluate" report, built by each
+ * watch-tier detector from the values its own evaluation already computed, so `baseline status`
+ * (which runs the detectors read-only) reports exactly what the detector does on the same state --
+ * never a re-derivation. The gates are checked in the detector's own order, and the FIRST one that
+ * stops the rule is reported:
+ *   1. "history_untrusted"     -- factHistoryTrustworthy(...).trust is false (reason attached);
+ *   2. "cold_start_pending"    -- the persistent lockout is pending, or (re)arms this tick;
+ *   3. "history_horizon_short" -- the rule's eligibility horizon (ruleHorizonOk / noveltyHorizonOk);
+ *   4. the detector's readiness gate (`readinessGate`), e.g. too few complete census ticks, a stale
+ *      latest complete census, or a statistical baseline still warming up; "ok" when ready.
+ * `evaluable` is true exactly when no gate stopped the rule. A rule can be evaluable with ZERO
+ * evaluated keys (no sessions, no jobs): that still evaluates, and still reads "watching" (I11).
+ * `evaluatedAlertKeys` are the keys the detector reported for THIS rule, copied verbatim. Display
+ * and status only: no trust decision reads this.
+ */
+export function buildRuleEvaluation({ historyTrust, coldStartPendingThisTick, horizonOk, readinessGate = "ok", evaluatedAlertKeys = [] } = {}) {
+  let gate;
+  if (historyTrust?.trust !== true) gate = "history_untrusted";
+  else if (coldStartPendingThisTick) gate = "cold_start_pending";
+  else if (horizonOk !== true) gate = "history_horizon_short";
+  else gate = typeof readinessGate === "string" && readinessGate.length > 0 ? readinessGate : "ok";
+  return {
+    evaluable: gate === "ok",
+    gate,
+    ...(gate === "history_untrusted" ? { history_reason: typeof historyTrust?.reason === "string" ? historyTrust.reason : "history_unknown" } : {}),
+    evaluatedAlertKeys: [...evaluatedAlertKeys],
+  };
+}
+
+/**
  * The scope of a novelty claim decided against this read's retained window (§4.2, §5 point 4): the
  * certified boundary when the store is narrowed, else the oldest point the read returned (the store
  * has held everything since then). undefined when neither is known. Display only.

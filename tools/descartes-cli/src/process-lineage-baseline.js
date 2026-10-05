@@ -9,7 +9,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
@@ -240,18 +240,24 @@ export function groupProcessLineageFactsByTick(points = []) {
 // undefined when it is not (too little complete history, or a stale latest complete census) --
 // exactly the two cases where detection itself returns []. No detection-logic change: this is the
 // same filter/length/freshness test that was inline before.
-function readyLineageCompleteGroups(groups = [], options = {}) {
+// S6 (I11): the same gates, naming WHICH one stopped the rule for the per-rule status report.
+function lineageEvaluationReadiness(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_LINEAGE_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minHistoryTickCount + 1) return undefined;
+  if (completeGroups.length < minHistoryTickCount + 1) return { gate: "insufficient_complete_history" };
   const latest = completeGroups[completeGroups.length - 1];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return undefined;
-  return completeGroups;
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale" };
+  return { gate: "ok", completeGroups };
+}
+
+function readyLineageCompleteGroups(groups = [], options = {}) {
+  const readiness = lineageEvaluationReadiness(groups, options);
+  return readiness.gate === "ok" ? readiness.completeGroups : undefined;
 }
 
 export function detectNovelProcessLineageEdges(groups = [], options = {}) {
@@ -492,5 +498,15 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildNovelEdgeCandidates(novel, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID) }), evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      readinessGate: lineageEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minHistoryTickCount }).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  return { candidates: buildNovelEdgeCandidates(novel, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID) }), evaluatedAlertKeys, ruleEvaluations };
 }

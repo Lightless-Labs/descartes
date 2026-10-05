@@ -31,7 +31,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 // Slice 4b (observed-incident collectors plan), Decision 4 / Fable review MUST-FIX 5: the four
 // pure Welford/EWMA/z-score primitives + DEFAULT_BASELINE_FACT_WINDOW_MS were extracted into
@@ -465,7 +465,9 @@ const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16
 function evaluateSessionChurn(points = []) {
   const groups = groupSessionFactsByTick(points);
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [] };
+  // `ready` (S6, I11): churn evaluates whenever at least one complete census tick exists -- with zero
+  // tracked sessions it evaluates and finds nothing, which is still "watching".
+  if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [], ready: false };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
 
@@ -564,7 +566,7 @@ function evaluateSessionChurn(points = []) {
       churnEntries.push({ entity_key: entityKey, prior_fingerprint: older.fingerprint, current_fingerprint: newer.fingerprint });
     }
   }
-  return { churnEntries, evaluatedEntityKeys };
+  return { churnEntries, evaluatedEntityKeys, ready: true };
 }
 
 /**
@@ -806,7 +808,16 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // Detector-reported recovery coverage (§8.C, session recipe): the whole-fn coldStartPendingThisTick
   // gate freezes BOTH rules -- nothing was evaluated this tick, so report an empty coverage set (the
   // daemon then freezes every owned session identity, never fabricating a recovery).
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
+  if (coldStartPendingThisTick) {
+    return {
+      candidates: [],
+      evaluatedAlertKeys: [],
+      ruleEvaluations: {
+        [SESSION_COUNT_DROP_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick }),
+        [SESSION_CHURN_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick }),
+      },
+    };
+  }
 
   // Eligibility horizon (fact-store capacity plan §4.2, step S3): PER RULE -- count_drop is
   // statistical (30 h) and churn a fingerprint diff (6 h). A horizon-short rule emits no candidate
@@ -836,7 +847,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
-  if (dropEvaluated && dropHorizonOk) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
+  const dropKeys = dropEvaluated && dropHorizonOk ? [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] : [];
+  evaluatedAlertKeys.push(...dropKeys);
 
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
   const currentPoints = points.filter((point) => currentGroupTimestamps.has(point.ts));
@@ -845,11 +857,25 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // evaluateSessionChurn. Each evaluated key (whether it churned or was clear) is reported so the
   // daemon can recover a now-stable session's persisted churn alert; skipped/stale/ambiguous entities
   // are absent, so their alerts freeze.
+  let churnReady = false;
+  const churnKeys = [];
   if (churnHorizonOk) {
-    const { churnEntries, evaluatedEntityKeys } = evaluateSessionChurn(currentPoints);
+    const { churnEntries, evaluatedEntityKeys, ready } = evaluateSessionChurn(currentPoints);
+    churnReady = ready;
     candidates.push(...buildChurnCandidates(churnEntries));
-    for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+    for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
   }
+  evaluatedAlertKeys.push(...churnKeys);
 
-  return { candidates, evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, built from the gates
+  // above (display only; the daemon reads only candidates/evaluatedAlertKeys).
+  const ruleEvaluations = {
+    [SESSION_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
+      historyTrust, coldStartPendingThisTick, horizonOk: dropHorizonOk, readinessGate: dropEvaluated ? "ok" : "baseline_warming_up", evaluatedAlertKeys: dropKeys,
+    }),
+    [SESSION_CHURN_RULE_ID]: buildRuleEvaluation({
+      historyTrust, coldStartPendingThisTick, horizonOk: churnHorizonOk, readinessGate: churnReady ? "ok" : "no_complete_census", evaluatedAlertKeys: churnKeys,
+    }),
+  };
+  return { candidates, evaluatedAlertKeys, ruleEvaluations };
 }

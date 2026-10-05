@@ -39,7 +39,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
@@ -431,6 +431,19 @@ export function buildDisappearedCandidates(entries = []) {
 // fabricated recovery). When the tick was NOT evaluable (cold-start / too few complete groups /
 // stale latest census), NOTHING is reported, so every owned identity freezes rather than clearing
 // itself from silence.
+// S6 (I11): the readiness half of the predicate below, factored out unchanged so the per-rule status
+// report names WHICH gate stopped the rule (and so a ready window with zero services still reads as
+// evaluating). "ok" | "insufficient_complete_history" | "latest_census_stale".
+function censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups }) {
+  // Same filter detect* uses ("the" notion of a complete tick for this detector).
+  const completeGroups = currentGroups.filter((group) => group.censusState === "complete");
+  if (completeGroups.length < minCompleteGroups) return { gate: "insufficient_complete_history" }; // detect*'s >=complete-count gate
+  const latest = completeGroups[completeGroups.length - 1];
+  const latestMs = new Date(latest.ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale" }; // detect*'s freshness gate
+  return { gate: "ok", completeGroups };
+}
+
 function computeCensusEvaluatedAlertKeys(currentGroups, {
   coldStartPendingThisTick,
   nowMs,
@@ -440,12 +453,9 @@ function computeCensusEvaluatedAlertKeys(currentGroups, {
   hashEntityKey,
 }) {
   if (coldStartPendingThisTick) return [];
-  // Same filter detect* uses ("the" notion of a complete tick for this detector).
-  const completeGroups = currentGroups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minCompleteGroups) return []; // detect*'s >=complete-count gate
-  const latest = completeGroups[completeGroups.length - 1];
-  const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return []; // detect*'s freshness gate
+  const readiness = censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups });
+  if (readiness.gate !== "ok") return [];
+  const { completeGroups } = readiness;
   const union = new Set();
   for (const group of completeGroups) {
     for (const entityKey of group.entityKeys) union.add(entityKey);
@@ -666,12 +676,22 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
     })
     : [];
 
-  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [SERVICE_DISAPPEARED_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      readinessGate: censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups: 2 }).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys, ruleEvaluations };
 
   // Re-emission every tick (load-bearing, mirrors session/peer's own "re-emission every tick"
   // behavior): built fresh from `disappearances` on EVERY call — never dependent on whether a store
   // write happened that tick.
-  return { candidates: buildDisappearedCandidates(disappearances), evaluatedAlertKeys };
+  return { candidates: buildDisappearedCandidates(disappearances), evaluatedAlertKeys, ruleEvaluations };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1031,7 +1051,17 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
     })
     : [];
 
-  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [SERVICE_APPEARED_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      readinessGate: censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups: establishedMinCensusCount + 1 }).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys, ruleEvaluations };
 
-  return { candidates: buildAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SERVICE_APPEARED_RULE_ID) }), evaluatedAlertKeys };
+  return { candidates: buildAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SERVICE_APPEARED_RULE_ID) }), evaluatedAlertKeys, ruleEvaluations };
 }
