@@ -1,8 +1,8 @@
 # Detector-Reported Recovery Coverage — Close the "empty ⇒ genuine clear" Fabrication Class at Its Root
 
 **Date:** 2026-09-20
-**Status:** PLAN — implementation addenda 2026-10-05 applied on `fix/provenance-identity-coverage-2026-10`; provenance-identity remains local-only pending final gate.
-**Reviewed:** 2026-10-05 (implementation addendum: daybreak-blue re-gate blockers 1–3 addressed with global raw-census port absence, same-key current-port union, and bounded-list fail-closed coverage). Earlier review: 2026-09-23 (triple adversarial review: Fable code-grounded, daybreak-blue frontier-security, Astra xhigh goal-alignment) — all three NEEDS-REVISION, all three "design is right, mechanics need rewriting." Synthesis in §7.
+**Status:** PLAN — implementation addenda 2026-10-05 applied on `fix/provenance-identity-coverage-2026-10`; provenance-identity recovery is now intentionally deferred safe-frozen and remains local-only pending final gate.
+**Reviewed:** 2026-10-05 (operator direction after four daybreak rounds: provenance-identity keeps the producer shape but reports no coverage; detection correctness fixes include IPv6/protocol normalization, valid UDP `*:*` handling, and bounded socket/port processing). Earlier review: 2026-09-23 (triple adversarial review: Fable code-grounded, daybreak-blue frontier-security, Astra xhigh goal-alignment) — all three NEEDS-REVISION, all three "design is right, mechanics need rewriting." Synthesis in §7.
 **Prerequisite for:** the watch-by-default default-on flip (`docs/plans/2026-09-10-watch-by-default-slice-1.md`), which is HELD until this lands (operator decision 2026-09-20: fix-before-flip).
 **Origin:** daybreak-blue re-gate round 3 of the watch-by-default gate split found a pre-existing fabrication gap the default-on flip widens to every install.
 
@@ -166,6 +166,12 @@ Defense-in-depth requirements are part of this addendum: macOS socket census inv
 - **Sibling folding is fail-closed for identity/drift coverage too.** Coverage groups all observations sharing an identity key and requires every sibling to be clear before reporting its `unknown_identity` or `identity_drift` key; last-observation-wins is not a recovery authority.
 
 Regression coverage now includes the listenerless sibling-last reproduction, the re-keyed provisional holder plus same-key decoy, five-plus-five live ports, complete-census true absence, and incomplete-census no-clear behavior. The focused provenance-store/identity gate is 80/80 locally. Fresh-XDG full `npm test` completed at 2,046 pass / 22 sandbox-environment failures / 34 skip / 2,102 total; the final daybreak re-gate remains pending.
+
+**Addendum 2026-10-05 — provenance-identity deferred safe-frozen.** After four daybreak rounds, positive-clear coverage for `unknown_identity`, `identity_drift`, and `new_public_bind` is deferred. The producer keeps `{ candidates, evaluatedAlertKeys }`, but `evaluatedAlertKeys` is **always `[]` on every path**, including a successful complete reconcile and a same-record condition that appears clear. Alerts remain active until acknowledged; no absence or partial presence observation can fabricate recovery.
+
+The four re-gate reproductions are regression-tested as no-coverage cases: macOS `[::]`/`::` wildcard spelling; Linux `tcp6`/`udp6` transport re-keying; unprivileged cross-UID/cross-netns absence; and a transient-stat-skipped sibling. Detection correctness remains in scope: IPv6 wildcard addresses and v4/v6 transport keys are canonicalized, valid macOS UDP `*:*` rows are skipped without degrading the census, genuinely unparseable rows still degrade it, unioned `current_port_target_keys` is bounded and marked on overflow, and raw Linux `/proc/net` processing is bounded and degrades on overflow. The positive-clear implementation is retired to a fail-closed compatibility seam.
+
+Revisit only when `harden/root-helper-2026-10` supplies an elevated root-helper census that is complete machine-wide across UIDs and network namespaces. The required future design is positive global absence over that complete privileged census, with same-key folding that includes skipped siblings.
 
 ---
 
