@@ -1253,18 +1253,34 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // it recovers), so the FIXED daemon.fact_history.horizon_short alert (alert-store.js) can fire once a
   // rule has been short for HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals. Time-based, not a
   // tick counter (S3 deviation): a fast tick re-reads the same history, so wall time since the rule
-  // first went short is the faithful measure of "N consecutive structural ticks". A prior status that
-  // is missing/unreadable, or a since_ts in the future (clock rollback), restarts the clock at now --
-  // that can only DELAY the signal, never raise it early, and never suppresses the status entry.
+  // first went short is the faithful measure of "N consecutive structural ticks". The clock carries
+  // ONLY from a prior status written at most one structural interval ago (S3b review LOW-1): wall
+  // time is a faithful measure only while the daemon was actually ticking, so after downtime (or a
+  // status that cannot be dated) the gap is unobserved and the clock restarts. A prior status that is
+  // missing/unreadable/undated/stale/future-dated, or a since_ts in the future (clock rollback),
+  // restarts the clock at now -- that only DELAYS the signal, and never suppresses the status entry.
+  // Bounded imprecision, stated: a single not-short tick whose own status write failed (and no other
+  // gap) is not seen, so a <= one-interval recovery inside a short run can be bridged.
+  // Read lazily (and at most once): only a tick that actually reports horizon state touches the prior
+  // status, so the tiers-off "no I/O when disabled" path is unchanged.
+  let priorStatusPromise;
+  const readPriorStatusOnce = () => {
+    priorStatusPromise ??= (async () => {
+      try {
+        const readPriorStatus = options.readDaemonStatus ?? readDaemonStatus;
+        return await readPriorStatus(descartesPaths);
+      } catch {
+        return undefined;
+      }
+    })();
+    return priorStatusPromise;
+  };
   let historyHorizonShort;
   if (horizonShortRuleIds.size > 0) {
-    let priorRules;
-    try {
-      const readPriorStatus = options.readDaemonStatus ?? readDaemonStatus;
-      priorRules = (await readPriorStatus(descartesPaths))?.history_horizon_short?.rules;
-    } catch {
-      priorRules = undefined;
-    }
+    const priorStatus = await readPriorStatusOnce();
+    const priorStatusMs = typeof priorStatus?.ts === "string" ? Date.parse(priorStatus.ts) : Number.NaN;
+    const priorContinuous = Number.isFinite(priorStatusMs) && priorStatusMs <= nowMs && nowMs - priorStatusMs <= structuralIntervalMs;
+    const priorRules = priorContinuous ? priorStatus?.history_horizon_short?.rules : undefined;
     const nowIsoForHorizon = new Date(nowMs).toISOString();
     const rules = {};
     for (const ruleId of [...horizonShortRuleIds].sort()) {

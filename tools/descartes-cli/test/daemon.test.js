@@ -4652,8 +4652,16 @@ test("S3 horizon-short signal (I12): since_ts carries forward across ticks, and 
   assert.equal(first.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
   assert.equal(first.alerts.alerts.some((alert) => alert.rule_id === "daemon.fact_history.horizon_short"), false, "not yet: short for 0 h");
 
-  const later = new Date(Date.parse(now) + thresholdMs).toISOString();
-  const second = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: later, now: later });
+  // S3b review LOW-1: the clock carries only across CONSECUTIVE ticks (a prior status at most one
+  // structural interval old), so the daemon really ticks through the threshold, hour by hour.
+  let second;
+  for (let hour = 1; hour * 60 * 60 * 1000 <= thresholdMs; hour += 1) {
+    const tickTs = new Date(Date.parse(now) + hour * 60 * 60 * 1000).toISOString();
+    second = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: tickTs, now: tickTs });
+    if (hour * 60 * 60 * 1000 < thresholdMs) {
+      assert.equal(second.alerts.alerts.some((alert) => alert.rule_id === "daemon.fact_history.horizon_short"), false, `not yet at ${hour} h`);
+    }
+  }
   assert.equal(second.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now, "since_ts is carried forward while the rule stays short");
   const signal = second.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
   assert.ok(signal, "short for N intervals: the fixed signal fires");
@@ -4708,6 +4716,38 @@ test("S3b review LOW-3: the horizon-short list names only rules whose tier is ru
   assert.ok(listed.includes(SESSION_COUNT_DROP_RULE_ID), "a short watch-tier rule is still reported");
   assert.equal(listed.includes(CORRELATION_RULE_ID), false, "correlation is not running with learned off");
   assert.equal(listed.includes(CANARY_TAMPERED_RULE_ID), false, "canary.tampered is not running with learned off");
+});
+
+test("S3b review LOW-1: since_ts carries only from a prior status at most one structural interval old -- after downtime the clock restarts and the fixed alert does not fire at once", async () => {
+  const now = S_LIVE_1_TICK_TS;
+  const nowMs = Date.parse(now);
+  const longAgo = new Date(nowMs - 3 * 24 * 60 * 60 * 1000).toISOString();
+  const run = async (priorTs) => {
+    const paths = await tempPaths();
+    await writeLearnedConfig(paths, { enabled: true });
+    await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+    return runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      readDaemonStatus: async () => ({ ts: priorTs, history_horizon_short: { rules: { [SESSION_COUNT_DROP_RULE_ID]: { since_ts: longAgo } } } }),
+    });
+  };
+  const horizonAlert = (result) => result.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+  // Control: the previous tick ran 30 min ago -> continuous, the clock carries and the alert fires.
+  const continuous = await run(new Date(nowMs - 30 * 60 * 1000).toISOString());
+  assert.equal(continuous.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, longAgo);
+  assert.ok(horizonAlert(continuous), "control: a continuously-short rule past the threshold raises the signal");
+  // The daemon was down for 3 days with "short since S" on disk: the gap is unobserved, so restart.
+  const afterDowntime = await run(longAgo);
+  assert.equal(afterDowntime.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+  assert.equal(horizonAlert(afterDowntime), undefined, "never raised early off an unobserved gap");
+  // A prior status with no (or an unparseable, or a future) ts cannot vouch for continuity either.
+  for (const badTs of [undefined, "garbage", new Date(nowMs + 60 * 60 * 1000).toISOString()]) {
+    const result = await run(badTs);
+    assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now, `prior ts ${String(badTs)}`);
+  }
 });
 
 test("S3 horizon-short signal: no fact read (both tiers off) and an un-narrowed store report nothing", async () => {
