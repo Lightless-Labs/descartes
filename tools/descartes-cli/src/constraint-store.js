@@ -218,16 +218,23 @@ export async function writeConstraints(descartesPaths, constraints) {
 // instead of naming it via the round-tripped, always-present field below). Zero is deliberately
 // NOT accepted here (unlike enforceFactRetention's own >= 0) -- a configured cap must be a
 // genuine byte budget, not a way to silently zero out capacity through this surface.
-function normalizeFactStoreMaxBytes(value) {
-  const num = Number(value);
-  return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
+//
+// DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5): the per-family stores ignore
+// this key (watch-by-default slice 1 had already moved the live cap to watch.json). Every pre-S4 write
+// filled in DEFAULT_FACT_MAX_BYTES, so that value (and any invalid one) normalizes to ABSENT and is
+// never written in again; a deliberate, non-default operator value is preserved so status can name
+// it as deprecated/ignored. Mirrors watch-store.js's twin.
+function normalizeLegacyFactStoreMaxBytes(value) {
+  const num = typeof value === "number" ? value : Number.NaN;
+  return Number.isFinite(num) && num > 0 && num !== DEFAULT_FACT_MAX_BYTES ? num : undefined;
 }
 
 export function normalizeLearnedConfig(config = {}) {
+  const legacyMaxBytes = normalizeLegacyFactStoreMaxBytes(config.fact_store_max_bytes);
   return {
     enabled: config.enabled === true,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
-    fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
+    ...(legacyMaxBytes !== undefined ? { fact_store_max_bytes: legacyMaxBytes } : {}),
   };
 }
 
@@ -297,6 +304,10 @@ function renderLearnedConfigStatus(config, configFile) {
   const lines = [`Learned emission: ${config.enabled ? "enabled" : "disabled"}`];
   lines.push(`Config path: ${configFile}`);
   if (config.updated_at) lines.push(`Last updated: ${config.updated_at}`);
+  // Q5 (fact-store capacity plan §4.5 Config): a deliberate legacy cap is named, never silently dropped.
+  if (typeof config.fact_store_max_bytes === "number") {
+    lines.push(`fact_store_max_bytes: ${config.fact_store_max_bytes} (deprecated, ignored -- per-family fact_store_budgets in watch.json size the fact stores)`);
+  }
   return lines.join("\n");
 }
 

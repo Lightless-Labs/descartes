@@ -156,3 +156,28 @@ test("status: a family store that was never created is `absent` (not observed), 
   assert.equal(families.session.store, "absent");
   assert.equal(result.status.fact_store_completeness.status, families.service.status, "the combined status is over the stores that exist");
 });
+
+// Q5 (fact-store capacity plan §4.5 Config, §12): the legacy single-store cap is IGNORED by the
+// per-family stores, and a deliberate operator value is named in status (never silently dropped);
+// the written-in 5 MB default is not an operator choice and reports nothing.
+test("Q5: a deliberate legacy fact_store_max_bytes (watch.json or learned.json) is reported as deprecated and ignored; the written-in default reports nothing", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true, fact_store_max_bytes: 64 * 1024 * 1024 });
+  await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: 1024 });
+  const result = await tick(paths, 0);
+  assert.deepEqual(result.status.fact_store_deprecations.map(({ key, source, configured_bytes: bytes, status }) => [key, source, bytes, status]), [
+    ["fact_store_max_bytes", "watch.json", 64 * 1024 * 1024, "ignored"],
+    ["fact_store_max_bytes", "learned.json", 1024, "ignored"],
+  ]);
+  assert.match(result.status.fact_store_deprecations[0].note, /fact_store_budgets/);
+  // Ignored: the service store still gets its per-family default budget, not 1 KiB or 64 MiB.
+  assert.equal(result.status.fact_store_budgets.families.service.budget_bytes, FAMILY_DEFAULT_BUDGET_BYTES.get("service"));
+
+  const defaults = await tempPaths();
+  // A pre-S4 watch.json with the written-in default, exactly as every old write left it.
+  const { resolveWatchStorePaths } = await import("../src/watch-store.js");
+  await fs.mkdir(path.dirname(resolveWatchStorePaths(defaults).configFile), { recursive: true });
+  await fs.writeFile(resolveWatchStorePaths(defaults).configFile, JSON.stringify({ enabled: true, fact_store_max_bytes: 5 * 1024 * 1024 }));
+  const quiet = await tick(defaults, 0);
+  assert.equal(quiet.status.fact_store_deprecations, undefined);
+});

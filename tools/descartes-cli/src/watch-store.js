@@ -34,13 +34,16 @@ function normalizeIso(ts, field = "timestamp") {
   return date.toISOString();
 }
 
-// Mirrors constraint-store.js's own normalizeFactStoreMaxBytes exactly (fail closed to
-// DEFAULT_FACT_MAX_BYTES on anything that is not a finite, positive number) -- kept as an
-// independent copy rather than a shared import so watch.json and learned.json stay two fully
-// independent files, per this module's own header note above.
-function normalizeFactStoreMaxBytes(value) {
-  const num = Number(value);
-  return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
+// DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5): the single shared-store cap
+// is replaced by per-family `fact_store_budgets` and is IGNORED by the store. Every pre-S4 write
+// filled in DEFAULT_FACT_MAX_BYTES, so that exact value is the written-in default, not an operator
+// choice: it (and any invalid value) normalizes to ABSENT -- never written in again -- while a
+// deliberate, non-default operator value is preserved so status can name it as deprecated/ignored
+// instead of silently discarding the operator's decision. Independent copy of constraint-store.js's
+// learned.json twin, per this module's header note.
+function normalizeLegacyFactStoreMaxBytes(value) {
+  const num = typeof value === "number" ? value : Number.NaN;
+  return Number.isFinite(num) && num > 0 && num !== DEFAULT_FACT_MAX_BYTES ? num : undefined;
 }
 
 // S4 (fact-store capacity plan §4.5 Config): the per-family budget map. Only its SHAPE is normalized
@@ -65,7 +68,7 @@ export function normalizeWatchConfig(config = {}) {
     // any other junk value all normalize to `true`.
     enabled: config.enabled !== false,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
-    fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
+    ...(normalizeLegacyFactStoreMaxBytes(config.fact_store_max_bytes) !== undefined ? { fact_store_max_bytes: normalizeLegacyFactStoreMaxBytes(config.fact_store_max_bytes) } : {}),
     ...(normalizeFactStoreBudgetsConfig(config.fact_store_budgets) ? { fact_store_budgets: normalizeFactStoreBudgetsConfig(config.fact_store_budgets) } : {}),
   };
 }

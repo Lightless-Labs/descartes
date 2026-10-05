@@ -381,44 +381,37 @@ test("loadLearnedConfig fails closed to disabled (does not throw) when learned.j
   assert.equal(config.enabled, false);
 });
 
-// --- Finding F2-Tier1: configurable fact-store byte cap (fact_store_max_bytes) ---
-// Mirrors enforceFactRetention's existing BLOCKER #1 finite/non-negative validation pattern
-// (fact-store.js:216-221): a bad configured value must never silently disable capping, so
-// normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES on anything that is not a
-// finite, positive number, rather than passing the bad value through or leaving it unset.
+// --- fact_store_max_bytes: DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5);
+// mirrors watch-store.test.js. learned.json's copy never reached the store after watch-by-default
+// slice 1; it is now dropped when it is the written-in 5 MB default (or invalid) and preserved only
+// as a deliberate operator value, which status names as deprecated/ignored. (Replaces the F2-Tier1
+// "fail closed to DEFAULT_FACT_MAX_BYTES" pins.) ---
 
-test("normalizeLearnedConfig accepts a valid finite positive fact_store_max_bytes override", () => {
-  const config = normalizeLearnedConfig({ fact_store_max_bytes: 1024 });
-  assert.equal(config.fact_store_max_bytes, 1024);
+test("normalizeLearnedConfig preserves a deliberate (non-default) operator fact_store_max_bytes so status can name it as deprecated", () => {
+  assert.equal(normalizeLearnedConfig({ fact_store_max_bytes: 1024 }).fact_store_max_bytes, 1024);
 });
 
-test("normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES when fact_store_max_bytes is missing", () => {
-  const config = normalizeLearnedConfig({});
-  assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+test("normalizeLearnedConfig no longer writes in a fact_store_max_bytes default, and drops the written-in 5 MB default", () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizeLearnedConfig({}), "fact_store_max_bytes"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizeLearnedConfig({ fact_store_max_bytes: DEFAULT_FACT_MAX_BYTES }), "fact_store_max_bytes"), false);
 });
 
 for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, "garbage", null]) {
-  test(`normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES on invalid fact_store_max_bytes: ${String(badValue)}`, () => {
-    const config = normalizeLearnedConfig({ fact_store_max_bytes: badValue });
-    assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  test(`normalizeLearnedConfig drops an invalid legacy fact_store_max_bytes: ${String(badValue)}`, () => {
+    assert.equal(Object.prototype.hasOwnProperty.call(normalizeLearnedConfig({ fact_store_max_bytes: badValue }), "fact_store_max_bytes"), false);
   });
 }
 
-test("writeLearnedConfig/loadLearnedConfig round-trip a valid fact_store_max_bytes override", async () => {
+test("writeLearnedConfig/loadLearnedConfig round-trip a deliberate operator fact_store_max_bytes; a written-in default or invalid value is not written back", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: 2048 });
-
-  const reread = await loadLearnedConfig(paths);
-  assert.equal(reread.fact_store_max_bytes, 2048);
-});
-
-test("writeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES when given an invalid fact_store_max_bytes", async () => {
-  const paths = await tempPaths();
-  const written = await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: -5 });
-  assert.equal(written.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
-
-  const reread = await loadLearnedConfig(paths);
-  assert.equal(reread.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  assert.equal((await loadLearnedConfig(paths)).fact_store_max_bytes, 2048);
+  const other = await tempPaths();
+  for (const value of [DEFAULT_FACT_MAX_BYTES, -5]) {
+    const written = await writeLearnedConfig(other, { enabled: true, fact_store_max_bytes: value });
+    assert.equal(Object.prototype.hasOwnProperty.call(written, "fact_store_max_bytes"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(await loadLearnedConfig(other), "fact_store_max_bytes"), false);
+  }
 });
 
 // --- descartes learned enable | disable | status (CLI) — the kill switch is operationally
@@ -1141,4 +1134,17 @@ test("G1 LOW: learned status reports the age floor and names each narrowing caus
   const bothLines = [];
   await runLearnedConfigCommand(both, "status", [], { output: (line) => bothLines.push(line) });
   assert.match(bothLines.join("\n"), /narrowed by byte-cap eviction \(floor .*\) and age retention \(floor /);
+});
+
+test("Q5: descartes learned status names a deliberate legacy fact_store_max_bytes as deprecated and ignored (and says nothing when it is absent)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: 2048 });
+  const lines = [];
+  await runLearnedConfigCommand(paths, "status", [], { output: (line) => lines.push(line) });
+  assert.match(lines[0], /fact_store_max_bytes: 2048 \(deprecated, ignored/);
+  const quiet = await tempPaths();
+  await writeLearnedConfig(quiet, { enabled: true });
+  const quietLines = [];
+  await runLearnedConfigCommand(quiet, "status", [], { output: (line) => quietLines.push(line) });
+  assert.doesNotMatch(quietLines[0], /fact_store_max_bytes/);
 });

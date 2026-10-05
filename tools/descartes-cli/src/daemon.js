@@ -1399,6 +1399,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   //     saw it) exceeds its budget by more than one worst-case tick -- a retention pass that keeps
   //     failing lets the file, and the read cost, grow without bound (appendFactPoints treats a
   //     retention throw as non-fatal).
+  // Q5 (fact-store capacity plan §4.5 Config, §12): the legacy single-store cap is IGNORED; a
+  // deliberate operator value (normalization already dropped the written-in 5 MB default and invalid
+  // values) is named here so the operator's decision is never silently discarded.
+  const factStoreDeprecations = [["watch.json", watchConfigForHistory], ["learned.json", learnedConfigForHistory]]
+    .filter(([, config]) => typeof config?.fact_store_max_bytes === "number")
+    .map(([source, config]) => ({
+      key: "fact_store_max_bytes",
+      source,
+      configured_bytes: config.fact_store_max_bytes,
+      status: "ignored",
+      note: "the single fact-store cap is replaced by per-family budgets (watch.json fact_store_budgets, each at or above its horizon floor); this value no longer sizes any store",
+    }));
   let factStoreBudgetsStatus;
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const priorFamilies = (await readPriorStatusOnce())?.fact_store_budgets?.families;
@@ -1489,6 +1501,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
     ...(factStoreBudgetsStatus ? { fact_store_budgets: factStoreBudgetsStatus } : {}),
     ...(factStoreLegacy ? { fact_store_legacy: factStoreLegacy } : {}),
+    ...(factStoreDeprecations.length > 0 ? { fact_store_deprecations: factStoreDeprecations } : {}),
     ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
     ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
