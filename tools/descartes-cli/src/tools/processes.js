@@ -65,6 +65,65 @@ function boundToken(token, maxTokenLength) {
   return { value: `${token.slice(0, maxTokenLength)}…`, truncated: true };
 }
 
+function redactArgvElement(token, { redactNextValue, maxTokenLength, firstElement }) {
+  if (redactNextValue) return { value: "[REDACTED]", redacted: true, truncated: false };
+
+  const assignmentPrefix = token.match(/^((?:--?)?[A-Za-z0-9_.-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|key|access[_-]?token|refresh[_-]?token|auth|authorization|credential|session|bearer|jwt|private[_-]?key)[A-Za-z0-9_.-]*)(=|:)/i);
+  if (assignmentPrefix) {
+    return { value: `${assignmentPrefix[1]}${assignmentPrefix[2]}[REDACTED]`, redacted: true, truncated: false };
+  }
+
+  const assignment = redactSecretAssignments(token);
+  let value = assignment.value;
+  let redacted = assignment.redacted;
+  let truncated = false;
+  if (!firstElement && !redacted && looksHighEntropy(value)) {
+    value = "[REDACTED]";
+    redacted = true;
+  } else {
+    const bounded = boundToken(value, maxTokenLength);
+    value = bounded.value;
+    truncated = bounded.truncated;
+  }
+  return { value, redacted, truncated };
+}
+
+export function redactAndBoundProcessArgv(argv, options = {}) {
+  const originalArgv = Array.isArray(argv) ? argv.map((arg) => String(arg ?? "")) : [];
+  const maxLength = options.maxLength ?? DEFAULT_ARGS_MAX_LENGTH;
+  const maxTokenLength = options.maxTokenLength ?? DEFAULT_TOKEN_MAX_LENGTH;
+  const output = [];
+  let redacted = false;
+  let truncated = false;
+  let redactNextValue = false;
+
+  for (let index = 0; index < originalArgv.length; index += 1) {
+    const part = originalArgv[index];
+    const result = redactArgvElement(part, {
+      redactNextValue,
+      maxTokenLength,
+      firstElement: index === 0,
+    });
+    output.push(result.value);
+    redacted ||= result.redacted;
+    truncated ||= result.truncated;
+    redactNextValue = isSecretFlag(part);
+  }
+
+  let value = output.join(" ");
+  if (value.length > maxLength) {
+    value = `${value.slice(0, maxLength)}…`;
+    truncated = true;
+  }
+  return {
+    value,
+    redacted,
+    truncated,
+    original_length: originalArgv.join("\0").length,
+    max_length: maxLength,
+  };
+}
+
 export function redactAndBoundProcessArgs(args, options = {}) {
   const original = String(args ?? "");
   const maxLength = options.maxLength ?? DEFAULT_ARGS_MAX_LENGTH;

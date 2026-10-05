@@ -8,6 +8,7 @@ import {
   parsePs,
   psArgsForPlatform,
   redactAndBoundProcessArgs,
+  redactAndBoundProcessArgv,
   topProcessesBy,
 } from "../src/tools/processes.js";
 
@@ -27,6 +28,16 @@ test("redactAndBoundProcessArgs redacts obvious secret assignments and following
   assert.equal(redacted.redacted, true);
   assert.equal(redacted.truncated, false);
   assert.equal(redacted.original_length, 78);
+});
+
+test("redactAndBoundProcessArgv preserves argv boundaries and redacts whole secret values", () => {
+  const redacted = redactAndBoundProcessArgv(["app", "--api-key", "top secret value", "--token=a b c"]);
+
+  assert.equal(redacted.value, "app --api-key [REDACTED] --token=[REDACTED]");
+  assert.equal(redacted.redacted, true);
+  assert.equal(redacted.original_length, "app\0--api-key\0top secret value\0--token=a b c".length);
+  assert(!redacted.value.includes("top secret value"));
+  assert(!redacted.value.includes("a b c"));
 });
 
 test("redactAndBoundProcessArgs redacts high-entropy long values and bounds output", () => {

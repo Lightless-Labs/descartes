@@ -21,6 +21,7 @@ import { readFile as fsReadFile, lstat, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig, resolveProvenanceConfigPaths } from "../provenance-elevated-config.js";
+import { redactAndBoundProcessArgv } from "./processes.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -289,9 +290,12 @@ export function parseAndVerifyHelperResponse(rawStdout, requestedTarget) {
   const startTime = Number.isSafeInteger(resolved.start_time) && resolved.start_time >= 0 ? String(resolved.start_time) : undefined;
   if (tgid === undefined || startTime === undefined) return undefined;
   const executablePath = typeof resolved.executable_path === "string" ? resolved.executable_path : undefined;
-  const command = typeof resolved.command === "string" ? resolved.command : undefined;
+  if (!Array.isArray(resolved.argv) || resolved.argv.some((arg) => typeof arg !== "string")) return undefined;
+  const redaction = redactAndBoundProcessArgv(resolved.argv);
+  const command = redaction.value;
 
   const out = { pid, uid, executable_path: executablePath, command };
+  Object.defineProperty(out, "args_redaction", { value: redaction, enumerable: false });
   Object.defineProperties(out, {
     tgid: { value: tgid, enumerable: false },
     start_time: { value: startTime, enumerable: false },

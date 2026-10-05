@@ -5,7 +5,7 @@
 //!
 //! The emitted shape is the authoritative contract Node's `parseAndVerifyHelperResponse`
 //! (tools/descartes-cli/src/tools/provenance-elevated.js) expects:
-//!   pid:    {"requested":{"pid":N},"resolved":{"pid":N,"uid":U,"executable_path":"...","command":"..."}}
+//!   pid:    {"requested":{"pid":N},"resolved":{"pid":N,"uid":U,"executable_path":"...","argv":["..."]}}
 //!   socket: {"requested":{"protocol":"tcp","port":N,"inode":"I"},"resolved":{...,"holders":H}}
 //! Key order and exact formatting are pinned by the shared golden fixture test below.
 //!
@@ -47,7 +47,7 @@ pub struct Resolved {
     pub start_time: u64,
     pub uid: u32,
     pub executable_path: String,
-    pub command: String,
+    pub argv: Vec<String>,
 }
 
 /// Escapes `input` for embedding inside a JSON string literal (the literal's surrounding quotes
@@ -105,9 +105,19 @@ pub fn emit_response(requested: Requested, resolved: &Resolved, holders: Option<
     let holders_field = holders.map_or(String::new(), |n| format!(",\"holders\":{n}"));
     let executable_path =
         escape_json_string(&truncate_bytes(&resolved.executable_path, MAX_FIELD_BYTES));
-    let command = escape_json_string(&truncate_bytes(&resolved.command, MAX_FIELD_BYTES));
+    let argv = resolved
+        .argv
+        .iter()
+        .map(|arg| {
+            format!(
+                "\"{}\"",
+                escape_json_string(&truncate_bytes(arg, MAX_FIELD_BYTES))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"tgid\":{},\"start_time\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"command\":\"{command}\"{holders_field}}}}}",
+        "{{\"requested\":{{{requested_field}}},\"resolved\":{{\"pid\":{},\"tgid\":{},\"start_time\":{},\"uid\":{},\"executable_path\":\"{executable_path}\",\"argv\":[{argv}]{holders_field}}}}}",
         resolved.pid, resolved.tgid, resolved.start_time, resolved.uid,
     )
 }
@@ -195,7 +205,7 @@ mod tests {
             start_time: 123,
             uid: 997,
             executable_path: "/opt/svc/bin/app".to_string(),
-            command: "app --serve".to_string(),
+            argv: vec!["app".to_string(), "--serve".to_string()],
         };
         let target = crate::socket::SocketTarget {
             protocol: crate::socket::Protocol::Tcp,
@@ -218,7 +228,10 @@ mod tests {
         assert_eq!(parsed["resolved"]["start_time"], 123);
         assert_eq!(parsed["resolved"]["uid"], 997);
         assert_eq!(parsed["resolved"]["executable_path"], "/opt/svc/bin/app");
-        assert_eq!(parsed["resolved"]["command"], "app --serve");
+        assert_eq!(
+            parsed["resolved"]["argv"],
+            serde_json::json!(["app", "--serve"])
+        );
         assert_eq!(parsed["resolved"]["holders"], 1);
         // The requested object contains ONLY the three bound-identity keys.
         assert_eq!(parsed["requested"].as_object().unwrap().len(), 3);
@@ -232,7 +245,7 @@ mod tests {
             start_time: 1,
             uid: 0,
             executable_path: "/x".to_string(),
-            command: "x".to_string(),
+            argv: vec!["x".to_string()],
         };
         let target = crate::socket::SocketTarget {
             protocol: crate::socket::Protocol::Udp6,
@@ -254,7 +267,7 @@ mod tests {
             start_time: 1,
             uid: 0,
             executable_path: "/bin/sh".to_string(),
-            command: "sh".to_string(),
+            argv: vec!["sh".to_string()],
         };
         let emitted = emit_response(Requested::Pid(99), &resolved, None);
         let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();

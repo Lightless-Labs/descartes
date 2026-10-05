@@ -88,10 +88,10 @@ function fakeElevatedOptions({ statOverrides = trustedHelperFixture(), helperPat
 const SOCKET_TARGET = Object.freeze({ kind: "socket", protocol: "tcp", port: 8080, inode: "424242", uid: 1000 });
 const PRIMARY = Object.freeze({ uid: 1000, protocol: "tcp", inode: "424242" });
 
-function validHelperStdout({ port, protocol = "tcp", inode = "424242", holders = 1, pid = 4242, tgid = pid, startTime = 123, uid = 1000, executablePath = "/opt/svc/bin/app", command = "app" } = {}) {
+function validHelperStdout({ port, protocol = "tcp", inode = "424242", holders = 1, pid = 4242, tgid = pid, startTime = 123, uid = 1000, executablePath = "/opt/svc/bin/app", command = "app", argv } = {}) {
   return JSON.stringify({
     requested: { protocol, port, inode },
-    resolved: { pid, tgid, start_time: startTime, uid, executable_path: executablePath, command, holders },
+    resolved: { pid, tgid, start_time: startTime, uid, executable_path: executablePath, argv: argv ?? command.split(" "), holders },
   });
 }
 
@@ -207,17 +207,18 @@ test("resolveCrossUidPortResult upgrades the partial/0.4 baseline to a resolved 
 test("resolveCrossUidPortResult redacts elevated command arguments before resolved or source fields reach the envelope", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
-  const secret = "sk-test-secret-value";
+  const secret = "top secret value";
   const sockets = [{ protocol: "tcp", local_address: "0.0.0.0", local_port: 8080, state: "LISTEN", public_bind: true }];
   const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, fakeElevatedOptions({
     paths,
     probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
-    invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, command: `app --api-key ${secret}` }) }),
+    invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, argv: ["app", "--api-key", secret, "--token=a b c"] }) }),
   }));
   assert.equal(outcome.resolvedStatus, "ok");
   assert.equal(outcome.result.resolved.command.includes(secret), false);
+  assert.equal(outcome.result.resolved.command.includes("a b c"), false);
   assert.equal(outcome.result.source.name.includes(secret), false);
-  assert.equal(outcome.result.resolved.command, "app --api-key [REDACTED]");
+  assert.equal(outcome.result.resolved.command, "app --api-key [REDACTED] --token=[REDACTED]");
   assert.equal(outcome.result.resolved.args_redaction.redacted, true);
 });
 
@@ -266,7 +267,7 @@ test("parseAndVerifyHelperResponse rejects a response for a different protocol, 
 test("parseAndVerifyHelperResponse binds a PID response to the requested pid: echoing the request while resolving another pid is rejected (research finding 6)", () => {
   const response = (requestedPid, resolvedPid) => JSON.stringify({
     requested: { pid: requestedPid },
-      resolved: { pid: resolvedPid, tgid: resolvedPid, start_time: 123, uid: 1000, executable_path: "/bin/app", command: "app" },
+    resolved: { pid: resolvedPid, tgid: resolvedPid, start_time: 123, uid: 1000, executable_path: "/bin/app", argv: ["app"] },
   });
   assert.deepEqual(
     parseAndVerifyHelperResponse(response(4242, 4242), { kind: "pid", value: 4242 }),
@@ -283,7 +284,7 @@ test("resolveElevated never returns a different pid than a PID request asked for
     probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
     invokeElevatedHelper: async () => ({
       status: "ok",
-      stdout: JSON.stringify({ requested: { pid: 9999 }, resolved: { pid: 1, tgid: 1, start_time: 1, uid: 0, executable_path: "/sbin/init", command: "init" } }),
+      stdout: JSON.stringify({ requested: { pid: 9999 }, resolved: { pid: 1, tgid: 1, start_time: 1, uid: 0, executable_path: "/sbin/init", argv: ["init"] } }),
     }),
   });
   const result = await resolveElevated({ target: { kind: "pid", value: 9999 }, paths }, options);

@@ -97,7 +97,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     let uid = read_uid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let start_time = read_process_start_time(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let executable_path = read_exe(pid_dir).ok_or(IdentityFailure::UnreadableExe)?;
-    let command = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
+    let argv = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
     // Bind the command line to the executable generation observed before it. A process can exec
     // while retaining its pid and socket; the second exe-link read catches that change before the
     // identity is admitted. Socket resolution retries the whole attempt once.
@@ -110,7 +110,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
         start_time,
         uid,
         executable_path,
-        command,
+        argv,
     })
 }
 
@@ -464,22 +464,20 @@ fn read_exe(pid_dir: BorrowedFd<'_>) -> Option<String> {
     Some(target.to_string_lossy().into_owned())
 }
 
-/// Reads `/proc/<pid>/cmdline` (NUL-separated argv, lossily decoded) and space-joins it into a
-/// single display string. An empty cmdline (blanked argv, a kernel thread, or a zombie mid-reap)
-/// is a valid identity component when the executable link is readable; holders are compared by
-/// executable path. Reads relative to `pid_dir` -- see the module doc.
-fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<String> {
+/// Reads `/proc/<pid>/cmdline` as NUL-separated argv elements. An empty cmdline (blanked argv, a
+/// kernel thread, or a zombie mid-reap) is a valid identity component when the executable link is
+/// readable. The JSON boundary preserves these elements so downstream redaction cannot mistake
+/// spaces inside one argument for separate argv values. Reads relative to `pid_dir`.
+fn read_cmdline(pid_dir: BorrowedFd<'_>) -> Option<Vec<String>> {
     let raw = procfs::read_file_at(pid_dir, "cmdline").ok()?;
     Some(decode_cmdline(&raw))
 }
 
-fn decode_cmdline(raw: &[u8]) -> String {
-    let parts: Vec<String> = raw
-        .split(|&b| b == 0)
+fn decode_cmdline(raw: &[u8]) -> Vec<String> {
+    raw.split(|&b| b == 0)
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
-    parts.join(" ")
+        .collect()
 }
 
 #[cfg(test)]
@@ -531,13 +529,13 @@ mod tests {
         let self_uid = read_uid(pid_dir.as_fd()).expect("self status must be readable");
         assert_eq!(resolved.uid, self_uid);
         assert!(!resolved.executable_path.is_empty());
-        assert!(!resolved.command.is_empty());
+        assert!(!resolved.argv.is_empty());
     }
 
     #[test]
     fn blank_cmdline_is_not_an_identity_read_failure_when_exe_is_available() {
-        assert_eq!(decode_cmdline(b"\0\0"), "");
-        assert_eq!(decode_cmdline(b"app\0--serve\0"), "app --serve");
+        assert_eq!(decode_cmdline(b"\0\0"), Vec::<String>::new());
+        assert_eq!(decode_cmdline(b"app\0--serve\0"), vec!["app", "--serve"]);
     }
 
     #[test]
