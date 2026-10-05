@@ -370,13 +370,52 @@ test("T6/HIGH-1: a missing ledger over an absent store (first run) bootstraps cl
   assert.equal((await readFactPoints(paths, { now: hour(1) })).completeness.status, "intact");
 });
 
-test("T6/HIGH-1: a missing ledger over an existing EMPTY store bootstraps clean", async () => {
+test("T6/HIGH-1 (LOW-1 review fold, supersedes the old size-based carve-out): a missing ledger over an EXISTING empty store is a lineage break, never a clean bootstrap -- only genuine absence (ENOENT) still bootstraps clean", async () => {
+  // appendFactPoints only ever creates facts.jsonl via fs.appendFile (on the first write with
+  // data) or via the retention rewrite's tmp+rename -- and the rewrite always writes a ledger
+  // alongside it. So an EXISTING facts.jsonl with no ledger, even one that reads back as 0 bytes,
+  // can only be the product of our own code: either the crash-mid-first-run shape already covered
+  // below, or a store that byte-cap-evicted down to empty and then had its ledger deleted (LOW-1).
+  // Neither is a genuine first run, which never writes facts.jsonl at all before its first ledger
+  // exists. Treating "exists but empty" as clean (the old appendedToEmptyStore carve-out) let that
+  // second shape reset the floor with no stamp; see the LOW-1 test below for the full sequence.
   const paths = await tempPaths();
   const { dir, factsFile } = resolveFactStorePaths(paths);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, "");
   await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
-  assert.equal((await readRawLedger(paths)).last_continuity_break_ts, null);
+  assert.notEqual((await readRawLedger(paths)).last_continuity_break_ts, null, "an existing (even 0-byte) facts.jsonl with no ledger is a lineage break, with no size exception");
+  assert.notEqual((await readFactPoints(paths, { now: hour(0) })).completeness.status, "intact");
+});
+
+test("LOW-1 (review fold): an evicted-then-emptied store whose ledger is deleted stamps a loss on the very next append -- the floor never resets silently", async () => {
+  const paths = await tempPaths();
+  // Evict everything (maxBytes: 0): the store is now empty, but the ledger still remembers a
+  // non-null floor -- real, certified-nothing history, not a fresh install.
+  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
+  const beforeDelete = await readRawLedger(paths);
+  assert.notEqual(beforeDelete.bytecap_floor_ts, null, "setup: the store evicted and recorded a floor");
+  assert.equal(beforeDelete.continuity.last_rewrite_record_count, 0, "setup: the store is now empty");
+  // Delete the ledger -- the only place the floor F ever lived.
+  await fs.unlink(resolveFactIntegrityPaths(paths).integrityFile);
+  // An older append (its ts predates the lost floor) lands on the now ledger-less, empty store.
+  await appendFactPoints(paths, serviceTick(hour(-1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  const after = await readRawLedger(paths);
+  // The old floor F itself is unrecoverable once its only record (the ledger) is deleted -- that is
+  // an accepted, same-UID-privileged residual (Fix 1's doc comment makes the same acceptance
+  // elsewhere). What this pins is that the transition is never SILENT: a missing ledger over an
+  // existing store -- empty or not -- is always a stamped lineage break, so the older record can
+  // never quietly become part of an "intact, coverage: full" history with no trace anything was
+  // ever lost.
+  assert.notEqual(after.last_continuity_break_ts, null, "a missing ledger over an existing (even emptied-by-eviction) store must stamp a loss");
+  // No windowMs: an unbounded read, so this catches the stamp regardless of the 31-day default.
+  assert.notEqual((await readFactPoints(paths, { now: hour(1) })).completeness.status, "intact");
+  // The stamp must not be a one-tick blip: a further NORMAL append must not silently wash it away
+  // before it ages out of the retention window (this is exactly where the old carve-out failed --
+  // two passes later it read fully intact with coverage "full").
+  await appendFactPoints(paths, serviceTick(hour(2)), { now: hour(2), maxBytes: Number.MAX_SAFE_INTEGER });
+  const read = await readFactPoints(paths, { now: hour(2) });
+  assert.notEqual(read.completeness.status, "intact", "the stamped loss must still degrade a read one normal tick later");
 });
 
 test("T6/HIGH-1: a crash between the very first append and the first retention pass reads as a lineage break, never a clean bootstrap", async () => {

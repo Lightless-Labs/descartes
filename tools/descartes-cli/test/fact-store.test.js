@@ -357,6 +357,16 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
   const storePaths = resolveFactStorePaths(paths);
   await fs.mkdir(storePaths.dir, { recursive: true });
 
+  const ts = "2026-07-10T00:00:00.000Z";
+  // LOW-1/LOW-4 (review fold): a missing ledger now also runs a retention pass BEFORE
+  // appendFactPoints' own append (fact-store.js), so this store must already have an established
+  // ledger before the EISDIR trap is set up below -- otherwise the trap would catch that pre-pass
+  // instead, and the whole call would throw before any append happens at all (a different,
+  // separately-covered failure mode: no append means no fabricated written_count to guard
+  // against). A no-op append (empty factPoints) is enough to run one clean retention pass and
+  // establish a valid ledger with nothing in it.
+  await appendFactPoints(paths, [], { ts, now: ts });
+
   // enforceFactRetention's own fs.writeFile(tmpFile, ...) (fact-store.js:~309-310) runs BEFORE it
   // ever touches the integrity ledger -- so pre-creating a DIRECTORY at that exact
   // `${factsFile}.${process.pid}.tmp` path forces a genuine EISDIR right there, with no torn
@@ -364,7 +374,6 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
   const retentionTmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
   await fs.mkdir(retentionTmpFile);
 
-  const ts = "2026-07-10T00:00:00.000Z";
   const factPoints = [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
     { fact_name: "service.presence", entity_key: "postgres.service", attributes: { running: "true" } },
@@ -401,6 +410,12 @@ test("F4-B2 empty-message edge: a retention failure with NO message still surfac
   const storePaths = resolveFactStorePaths(paths);
   await fs.mkdir(storePaths.dir, { recursive: true });
 
+  const ts = "2026-07-10T00:00:00.000Z";
+  // LOW-1/LOW-4 (review fold): establish a valid ledger first -- see the identical comment in the
+  // EISDIR test above. Otherwise the mock below would also fail appendFactPoints' own pre-append
+  // pass (ledger still missing at this point), and the whole call would throw before any append.
+  await appendFactPoints(paths, [], { ts, now: ts });
+
   const retentionTmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
   const originalWriteFile = fs.writeFile.bind(fs);
   t.mock.method(fs, "writeFile", async (file, data, opts) => {
@@ -408,7 +423,6 @@ test("F4-B2 empty-message edge: a retention failure with NO message still surfac
     return originalWriteFile(file, data, opts);
   });
 
-  const ts = "2026-07-10T00:00:00.000Z";
   const factPoints = [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
     { fact_name: "service.presence", entity_key: "postgres.service", attributes: { running: "true" } },

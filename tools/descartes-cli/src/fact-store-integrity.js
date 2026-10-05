@@ -391,11 +391,6 @@ export function prepareFactIntegrityLedger({
   counts,
   // R0b: the newest ts this pass byte-evicted (including below-floor records), or null.
   bytecapEvictedNewestTs = null,
-  // R0b/HIGH-1 first-run carve-out: true only when appendFactPoints itself observed, BEFORE its
-  // own append, that the ledger was missing and facts.jsonl was absent or empty -- i.e. every
-  // record now in the store was appended by this very call. Never settable through the exported
-  // enforceFactRetention.
-  appendedToEmptyStore = false,
 }) {
   // daybreak-blue re-gate (2026-09-04) HIGH (residual): a ledger whose last_committed_pass_id
   // (or a still-pending pass_id) sits exactly at Number.MAX_SAFE_INTEGER is itself perfectly
@@ -429,18 +424,33 @@ export function prepareFactIntegrityLedger({
   // the retention window -- the same bounded-recovery design already used for a real
   // continuity break (see lossAtOrAfter).
   //
-  // R0b / review fold HIGH-1 (fact-store capacity plan §4.1 item 2): a MISSING ledger over a
-  // NON-EMPTY store is a lineage break too, not a first run. Under R0b the ledger carries the
+  // R0b / review fold HIGH-1 (fact-store capacity plan §4.1 item 2): a MISSING ledger over an
+  // EXISTING store is a lineage break too, not a first run. Under R0b the ledger carries the
   // byte-cap floor; bootstrapping clean over a surviving facts.jsonl (operator cleanup, partial
   // restore, half-done migration) would reset the floor to null and re-certify history the store
   // already evicted -- and, pre-R0b, let a truncated store re-certify itself by deleting its ledger.
-  // A missing ledger over an absent/empty store (first run, a fresh per-family store) still
-  // bootstraps clean; so does the genuine first append (appendedToEmptyStore, see the parameter).
-  const missingLedgerOverNonEmptyStore = ledgerReason === "missing" &&
-    live?.exists === true && (live.bytes > 0 || live.record_count > 0) &&
-    !appendedToEmptyStore;
+  // Only a GENUINELY ABSENT store (ENOENT, `live.exists === false`) still bootstraps clean --
+  // first run, or a fresh per-family store.
+  //
+  // LOW-1/LOW-4 (review fold, 2026-10-05): this used to also carve out `live.exists === true` when
+  // the store read back as 0 bytes/0 records (the `appendedToEmptyStore` parameter, now removed),
+  // reasoning that an empty store was always a genuine first run. That reasoning does not hold: the
+  // ONLY ways facts.jsonl ever comes to exist are (a) appendFactPoints's fs.appendFile, which is
+  // never called with zero bytes to write, and (b) the retention rewrite's tmp+rename, which always
+  // writes a ledger alongside it. So an EXISTING facts.jsonl with no ledger -- at any byte count,
+  // including 0 -- can only be our own prior output whose ledger was separately lost; a genuine
+  // first run never gets as far as writing facts.jsonl before its first ledger exists. The 0-byte
+  // case is exactly what an evicted-then-emptied store (every record byte-cap-evicted, floor set)
+  // looks like after its ledger is deleted: the carve-out let that reset the floor to null with no
+  // stamp, and a later normal append would silently re-certify as "intact, coverage: full" with no
+  // trace the floor ever existed. Dropping the size clause closes that: every missing-ledger-
+  // over-an-existing-store case now stamps, with NO exception left in this rule. callers that
+  // append fresh data over a GENUINELY missing ledger (appendFactPoints) resolve this by running a
+  // retention pass against the PRE-append store first (see appendFactPoints), so this check always
+  // sees the true prior state, never one contaminated by the same call's own new data.
+  const missingLedgerOverExistingStore = ledgerReason === "missing" && live?.exists === true;
   const invalidLedgerBootstrap = bootstrap && (
-    ledgerReason === "invalid" || ledgerReason === "unreadable" || passIdExhausted || missingLedgerOverNonEmptyStore
+    ledgerReason === "invalid" || ledgerReason === "unreadable" || passIdExhausted || missingLedgerOverExistingStore
   );
   const priorPending = next.continuity.pending_pass;
   const passId = Math.max(next.continuity.last_committed_pass_id, priorPending?.pass_id ?? 0) + 1;

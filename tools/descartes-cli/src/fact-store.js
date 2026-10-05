@@ -228,13 +228,10 @@ export function assertSuffixEviction(evicted, kept) {
  * than a dropped metric point.
  */
 export async function enforceFactRetention(descartesPaths, options = {}) {
-  // The exported entry point can never assert the first-run carve-out (see runFactRetention).
-  return runFactRetention(descartesPaths, options, {});
+  return runFactRetention(descartesPaths, options);
 }
 
-// `internal.appendedToEmptyStore` is passed only by appendFactPoints, which observed it BEFORE its
-// own append (fact-store capacity plan §15.5 decision 3); it is deliberately not an `options` key.
-async function runFactRetention(descartesPaths, options, internal) {
+async function runFactRetention(descartesPaths, options) {
   const storePaths = resolveFactStorePaths(descartesPaths);
   const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
@@ -387,7 +384,6 @@ async function runFactRetention(descartesPaths, options, internal) {
     outputDigest,
     counts,
     bytecapEvictedNewestTs,
-    appendedToEmptyStore: internal.appendedToEmptyStore === true,
   });
   await ensureFactDir(descartesPaths);
   const tmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
@@ -418,22 +414,27 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   await ensureFactDir(descartesPaths);
   const storePaths = resolveFactStorePaths(descartesPaths);
   const normalized = factPoints.map((point) => normalizeFactPoint(point, { ts: options.ts ?? options.now }));
-  // R0b / HIGH-1 first-run carve-out (fact-store capacity plan §15.5 decision 3): the very first
-  // append writes facts.jsonl BEFORE the first retention pass creates the ledger, so "missing
-  // ledger over a non-empty store" -- otherwise a lineage break -- is also the shape of a genuine
-  // first run. Observe, BEFORE appending, whether the ledger is missing and the store absent or
-  // empty; only then is every record the retention pass will see one this call appended. A crash
-  // between this append and the retention pass below leaves exactly that shape with no ledger, and
-  // the next call then (correctly, fail-closed) reads it as a lineage break.
-  let appendedToEmptyStore = false;
+  // R0b / HIGH-1 (fact-store capacity plan §15.5 decision 3; LOW-1/LOW-4 review fold, 2026-10-05):
+  // a missing ledger must always be resolved against the PRE-append store, never the post-append
+  // one -- otherwise this call's own new data could answer, for itself, the very question
+  // (`fact-store-integrity.js`'s missingLedgerOverExistingStore) of whether the ledger loss is a
+  // genuine first run or a real loss over an existing store. The old design instead stat()ed the
+  // file before appending and threaded an `appendedToEmptyStore` carve-out through to the single
+  // post-append pass; that carve-out could not tell a genuine first run apart from an
+  // evicted-then-emptied store (0 bytes either way) whose ledger was separately deleted, so it
+  // silently let the floor reset with no stamp in the second case (LOW-1).
+  //
+  // Instead: whenever the ledger is missing, run one retention pass against whatever is on disk
+  // RIGHT NOW, strictly before this call's own append. That pass's own `live.exists` check decides
+  // clean-bootstrap-vs-lineage-break with no further exception -- a genuine first run (ENOENT)
+  // still bootstraps clean, while an EXISTING (even 0-byte) ledger-less facts.jsonl now always
+  // stamps. No append has happened yet at this point, so a thrown error here propagates: there is
+  // nothing to misreport, unlike the real append/retention pass below (Finding F4-B2), where
+  // records have already reached disk.
   if (normalized.length > 0) {
     const ledgerBefore = await readFactIntegrityLedger(descartesPaths);
     if (ledgerBefore.reason === "missing") {
-      const sizeBefore = await fs.stat(storePaths.factsFile).then((stat) => stat.size, (error) => {
-        if (error?.code === "ENOENT") return 0;
-        throw error;
-      });
-      appendedToEmptyStore = sizeBefore === 0;
+      await runFactRetention(descartesPaths, options);
     }
     await fs.appendFile(storePaths.factsFile, normalized.map(encodeJsonLine).join(""), { mode: 0o600 });
   }
@@ -443,11 +444,12 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   // `written_count: 0` even though `normalized.length` records genuinely reached disk, and would
   // discard the retention error entirely. Retention is now non-fatal: report the real count and,
   // if retention failed, an honestly-named `retention_error` alongside it. This function now
-  // throws only when the append itself failed (records genuinely never persisted).
+  // throws only when the append itself failed (records genuinely never persisted), or when the
+  // pre-append pass above failed (in which case no append happened either).
   let retention;
   let retentionError;
   try {
-    retention = await runFactRetention(descartesPaths, options, { appendedToEmptyStore });
+    retention = await runFactRetention(descartesPaths, options);
   } catch (error) {
     retentionError = (error instanceof Error ? error.message : String(error)) || "unknown retention error";
   }
