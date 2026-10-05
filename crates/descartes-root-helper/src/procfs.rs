@@ -38,15 +38,15 @@
 //!
 //! Every public function here returns an owned, safe value (`OwnedFd`, `Vec<u8>`, `OsString`) --
 //! never a raw fd or pointer -- so callers in `proc_linux.rs` never touch `unsafe` themselves.
-//! Syscalls issued in this file: `openat`, `read`, `readlinkat`, `newfstatat`, `getdents64` (plus `close`, and --
+//! Syscalls issued in this file: `openat`, `read`, `readlinkat`, `fstat`, `getdents64` (plus `close`, and --
 //! in debug-assertions builds only -- `fcntl(F_GETFD)`, both via `OwnedFd`'s `Drop` impl in std).
 //! All are admitted by `seccomp_policy::helper_policy`; this module issues no syscall (and no
-//! open flag) that isn't already admitted there. No `lseek`/`pread`/`*stat*`: reads are a plain
+//! open flag) that isn't already admitted there. No `lseek`/`pread`/pathname-stat: reads are a plain
 //! sequential `read` loop from offset 0.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
-use std::mem::{offset_of, MaybeUninit};
+use std::mem::offset_of;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 
@@ -100,9 +100,8 @@ pub fn open_pid_dir(pid: u32) -> io::Result<OwnedFd> {
 /// Opens `/proc` itself as a directory fd (2026-10). Used for the top-level pid listing
 /// (`read_dir_entries_at(root, ".")`) and the `net/<protocol>` socket tables
 /// (`open_proc_net()` then `read_file_at_bounded(net, "tcp", ..)`) so `proc_linux.rs`
-/// needs no `std::fs` at all:
-/// std's `read_to_string`/`read_dir` paths issue statx/fstat (and glibc's opendir an O_NONBLOCK
-/// open), none of which the tightened seccomp policy admits.
+/// needs no `std::fs` at all: std's `read_to_string`/`read_dir` paths issue pathname-stat calls
+/// (and glibc's opendir an O_NONBLOCK open), none of which the tightened seccomp policy admits.
 pub fn open_proc_root() -> io::Result<OwnedFd> {
     open_absolute_dir("/proc")
 }
@@ -138,20 +137,40 @@ fn proc_self_target_matches_pid(target: &OsStr, pid: u32) -> bool {
     target.to_str().and_then(|value| value.parse::<u32>().ok()) == Some(pid)
 }
 
-/// Follows a fixed relative proc entry and returns the mapped file's device/inode identity. The
-/// production caller passes the literal `"exe"` below a pinned `/proc/<pid>` dirfd, so this
-/// follows the process's current executable rather than merely statting the procfs symlink.
-pub fn stat_at(dirfd: BorrowedFd<'_>, name: &str) -> io::Result<FileIdentity> {
-    let path = cpath(name)?;
-    let mut metadata = MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: `dirfd` is live for the call, `path` is a valid NUL-terminated string, and
-    // `metadata` points to writable storage for the kernel's complete stat result.
-    let result =
-        unsafe { libc::fstatat(dirfd.as_raw_fd(), path.as_ptr(), metadata.as_mut_ptr(), 0) };
+/// Opens the fixed `/proc/<pid>/exe` entry relative to a pinned pid directory. Unlike every
+/// other helper open, this one intentionally follows procfs's magic `exe` link: `fstat` must see
+/// the mapped executable, not the procfs link itself. The caller supplies no path and the helper's
+/// seccomp policy admits this exact read-only, CLOEXEC flag shape in addition to its normal
+/// O_NOFOLLOW opens.
+pub fn open_exe_at(dirfd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    let path = cpath("exe")?;
+    // SAFETY: `dirfd` is a live, valid directory fd for the whole call and `path` is a fixed,
+    // NUL-terminated string. The returned fd is wrapped immediately below.
+    let fd = unsafe {
+        libc::openat(
+            dirfd.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was freshly returned by openat and is transferred to this OwnedFd exactly once.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Returns the device/inode identity of an already-open file descriptor. `fstat` has no pathname
+/// argument and therefore cannot become a path metadata oracle under a compromised control flow.
+pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<FileIdentity> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fd` is live for the call and `metadata` points to writable storage for the kernel's
+    // complete stat result.
+    let result = unsafe { libc::fstat(fd.as_raw_fd(), metadata.as_mut_ptr()) };
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: fstatat returned success, so the kernel initialized the stat structure.
+    // SAFETY: fstat returned success, so the kernel initialized the stat structure.
     let metadata = unsafe { metadata.assume_init() };
     Ok(FileIdentity {
         device: metadata.st_dev,
@@ -461,29 +480,33 @@ mod tests {
     }
 
     #[test]
-    fn stat_at_follows_our_own_exe_to_a_stable_device_and_inode() {
+    fn fstat_on_an_opened_exe_reaches_a_stable_device_and_inode() {
         let pid_dir = open_pid_dir(std::process::id()).expect("must open our own /proc/<pid> dir");
-        let first = stat_at(pid_dir.as_fd(), "exe").expect("exe target must be stat-able");
-        let second = stat_at(pid_dir.as_fd(), "exe").expect("exe target must be stat-able twice");
+        let first_fd = open_exe_at(pid_dir.as_fd()).expect("exe target must open");
+        let second_fd = open_exe_at(pid_dir.as_fd()).expect("exe target must open twice");
+        let first = fstat(first_fd.as_fd()).expect("opened exe must be stat-able");
+        let second = fstat(second_fd.as_fd()).expect("opened exe must be stat-able twice");
         assert_eq!(first, second);
         assert_ne!(first.inode, 0);
     }
 
     #[test]
-    fn stat_at_detects_an_atomically_replaced_same_path_binary() {
+    fn fstat_on_separate_open_fds_detects_an_atomically_replaced_binary() {
         let root = std::env::temp_dir().join(format!(
             "descartes-root-helper-stat-generation-{}",
             std::process::id()
         ));
         std::fs::create_dir(&root).expect("test directory must be new");
-        let path = root.join("app");
-        let replacement = root.join("app.replacement");
+        let path = root.join("exe");
+        let replacement = root.join("exe.replacement");
         std::fs::write(&path, b"generation-one").expect("initial file must be writable");
         std::fs::write(&replacement, b"generation-two").expect("replacement must be writable");
         let dir = std::fs::File::open(&root).expect("test directory must open");
-        let first = stat_at(dir.as_fd(), "app").expect("initial file must be stat-able");
+        let first_fd = open_exe_at(dir.as_fd()).expect("initial file must open");
+        let first = fstat(first_fd.as_fd()).expect("initial file must be stat-able");
         std::fs::rename(&replacement, &path).expect("replacement must be atomic");
-        let second = stat_at(dir.as_fd(), "app").expect("replacement must be stat-able");
+        let second_fd = open_exe_at(dir.as_fd()).expect("replacement must open");
+        let second = fstat(second_fd.as_fd()).expect("replacement must be stat-able");
         assert_ne!(
             first, second,
             "same path must not imply same executable generation"

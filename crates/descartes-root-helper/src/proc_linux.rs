@@ -45,8 +45,9 @@ use crate::socket::{self, SocketRow, SocketTarget};
 // 2026-10: this file uses NO `std::fs` and NO `HashSet`. Every read -- the global
 // `/proc/net/<protocol>` socket table and the top-level `/proc` pid listing included, not just
 // the per-pid identity files -- goes through `procfs`'s raw `openat`/`read`/`getdents64`/
-// `readlinkat` primitives, because the tightened seccomp policy (`seccomp_policy.rs`) no longer
-// admits the statx/fstat/lseek that std's `read_to_string`/`read_dir` issue, nor the getrandom
+// `readlinkat`/`fstat` primitives, because the tightened seccomp policy (`seccomp_policy.rs`) no
+// longer admits pathname-stat/newfstatat/lseek calls that std's `read_to_string`/`read_dir` issue,
+// nor the getrandom
 // that `HashSet`'s RandomState seed draws. A future refactor back to `std::fs` here would
 // self-SIGSYS under the live filter (caught by the CI live-filter tests in tests/hardening.rs and
 // tests/linux_resolution.rs).
@@ -101,7 +102,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     let uid = read_uid(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let start_time = read_process_start_time(pid_dir).ok_or(IdentityFailure::UnreadableUid)?;
     let executable_path = read_exe(pid_dir).ok_or(IdentityFailure::UnreadableExe)?;
-    let executable_identity = procfs::stat_at(pid_dir, "exe")
+    let exe_identity = executable_identity(pid_dir)
         .map(|identity| (identity.device, identity.inode))
         .map_err(|_| IdentityFailure::UnreadableExe)?;
     let (argv, argv_truncated) = read_cmdline(pid_dir).ok_or(IdentityFailure::UnreadableCommand)?;
@@ -110,10 +111,10 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
     // check catches an atomically replaced binary at the same path. Socket resolution retries the
     // whole attempt once.
     if read_exe(pid_dir).as_deref() != Some(executable_path.as_str())
-        || procfs::stat_at(pid_dir, "exe")
+        || executable_identity(pid_dir)
             .ok()
             .map(|identity| (identity.device, identity.inode))
-            != Some(executable_identity)
+            != Some(exe_identity)
     {
         return Err(IdentityFailure::GenerationChanged);
     }
@@ -121,7 +122,7 @@ fn resolve_from_pid_dir(pid: u32, pid_dir: BorrowedFd<'_>) -> Result<Resolved, I
         pid,
         tgid: pid,
         start_time,
-        executable_identity,
+        executable_identity: exe_identity,
         uid,
         executable_path,
         argv,
@@ -246,7 +247,7 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
         if procfs::read_link_at(holder._pid_dir.as_fd(), "exe")
             .ok()
             .is_none_or(|link| link.to_string_lossy() != holder.resolved.executable_path)
-            || procfs::stat_at(holder._pid_dir.as_fd(), "exe")
+            || executable_identity(holder._pid_dir.as_fd())
                 .ok()
                 .map(|identity| (identity.device, identity.inode))
                 != Some(holder.resolved.executable_identity)
@@ -550,6 +551,14 @@ fn read_exe(pid_dir: BorrowedFd<'_>) -> Option<String> {
     // Non-UTF-8 path bytes are lossily replaced with U+FFFD -- documented here rather than
     // rejecting the whole resolution over an unusual filename.
     Some(target.to_string_lossy().into_owned())
+}
+
+/// Opens the fixed procfs `exe` entry and obtains its mapped file identity from the already-open
+/// descriptor. This deliberately avoids pathname-based metadata (`newfstatat`); the descriptor is
+/// tied to the pinned `/proc/<pid>` directory and `fstat` has no path argument.
+fn executable_identity(pid_dir: BorrowedFd<'_>) -> std::io::Result<procfs::FileIdentity> {
+    let exe = procfs::open_exe_at(pid_dir)?;
+    procfs::fstat(exe.as_fd())
 }
 
 /// Reads `/proc/<pid>/cmdline` as NUL-separated argv elements. An empty cmdline (blanked argv, a

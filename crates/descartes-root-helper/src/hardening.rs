@@ -115,7 +115,7 @@ mod linux {
             fcntl: libc::SYS_fcntl as u32,
             getdents64: libc::SYS_getdents64 as u32,
             readlinkat: libc::SYS_readlinkat as u32,
-            newfstatat: libc::SYS_newfstatat as u32,
+            fstat: libc::SYS_fstat as u32,
             mmap: libc::SYS_mmap as u32,
             mprotect: libc::SYS_mprotect as u32,
             munmap: libc::SYS_munmap as u32,

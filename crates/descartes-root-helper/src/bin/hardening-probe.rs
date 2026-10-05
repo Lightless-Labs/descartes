@@ -324,7 +324,7 @@ mod linux_probe {
     /// Reads our own `/proc/<pid>/status` and returns the whitespace-split fields on the first line
     /// whose label matches `label` exactly (e.g. `"NoNewPrivs:"`). Goes through the SAME raw
     /// `procfs` primitives as the production binary (2026-10): `std::fs::read_to_string` issues
-    /// statx/fstat, which the tightened policy kills -- so this read also proves, under the live
+    /// statx/newfstatat, which the tightened policy kills -- so this read also proves, under the live
     /// filter, that the helper's real read path is still admitted.
     fn status_fields(label: &str) -> Vec<String> {
         let pid_dir = procfs::open_pid_dir(std::process::id()).expect("must open our own pid dir");

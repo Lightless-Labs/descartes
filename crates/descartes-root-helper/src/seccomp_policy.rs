@@ -12,14 +12,16 @@
 //!
 //!   CLOSED by this policy, even under arbitrary code execution inside the helper:
 //!     - any write to any file (`openat` access mode must be O_RDONLY; O_CREAT/O_TRUNC/O_APPEND/
-//!       O_TMPFILE/O_PATH and every other flag outside the four the helper uses are killed; every
-//!       admitted open must also set O_NOFOLLOW);
+//!       O_TMPFILE/O_PATH and every other flag outside the four the helper uses are killed; all
+//!       ordinary helper opens request O_NOFOLLOW, while the fixed executable open follows procfs's
+//!       magic `exe` link before using `fstat`);
 //!     - writing another process's memory via `/proc/<pid>/mem` (needs O_RDWR/O_WRONLY);
 //!     - READING another process's memory via `/proc/<pid>/mem`: `lseek`, `pread64`, `preadv*`
 //!       are absent, so a `read` can only ever start at offset 0 (never a mapped address);
 //!     - `ptrace`, `process_vm_readv/writev`, `pidfd_getfd`, `open_by_handle_at`, `openat2`,
-//!       `execve*`, `socket*`, and unrestricted stat syscalls (metadata oracle over DAC-protected
-//!       paths); `newfstatat` is admitted only for a non-AT_FDCWD dirfd with flags == 0;
+//!       `execve*`, `socket*`, and pathname-based stat syscalls (metadata oracle over
+//!       DAC-protected paths); `fstat` is allowed only because it accepts an already-open fd and
+//!       has no pathname argument;
 //!     - writes to anything but stdout/stderr (fds 1, 2);
 //!     - new executable memory (`PROT_EXEC` via mmap/mprotect) and file-backed mmaps;
 //!     - every `prctl` except clearing the ambient capability set; `tgkill` of any other process;
@@ -59,7 +61,7 @@ pub struct SyscallTable {
     pub fcntl: u32,
     pub getdents64: u32,
     pub readlinkat: u32,
-    pub newfstatat: u32,
+    pub fstat: u32,
     pub mmap: u32,
     pub mprotect: u32,
     pub munmap: u32,
@@ -101,14 +103,14 @@ pub const STDERR_FD: u32 = 2;
 /// fork/clone is allowlisted, so it can never change afterwards).
 ///
 /// Call-site justification for every rule (see the module doc for what each restriction closes):
-///   - openat [O_NOFOLLOW required; flags ⊆ CLOEXEC|DIRECTORY|NOFOLLOW|LARGEFILE, so access mode = O_RDONLY]:
-///     `procfs::{open_proc_root, open_pid_dir, open_dir_at, read_file_at*}` -- the ONLY opens
-///     after `engage()` (`proc_linux.rs` no longer uses `std::fs`, whose `read_to_string`/
-///     `read_dir` paths needed statx/fstat; `newfstatat` is used only for the fixed executable
-///     generation check).
+///   - openat [flags ⊆ CLOEXEC|DIRECTORY|NOFOLLOW|LARGEFILE, so access mode = O_RDONLY; ordinary
+///     callers request O_NOFOLLOW, while the fixed `procfs::open_exe_at` call follows `exe`]:
+///     `procfs::{open_proc_root, open_pid_dir, open_dir_at, read_file_at*}` plus the one
+///     already-pinned `/proc/<pid>/exe` open.
 ///   - read: `procfs::read_file_at*`'s bounded raw `read` loop.
 ///   - getdents64: `procfs::read_dir_entries_at` (`/proc` and `/proc/<pid>/fd` listings).
 ///   - readlinkat: `procfs::read_link_at` (`exe`, fd symlinks).
+///   - fstat: `procfs::fstat` on the already-open executable fd (no pathname oracle).
 ///   - close: `OwnedFd` drop.
 ///   - fcntl [cmd == F_GETFD]: std's debug-assertions-only `OwnedFd` drop validity probe.
 ///   - write, writev [fd ∈ {1, 2}]: `println!`/`eprintln!` (stdout may use writev).
@@ -124,9 +126,7 @@ pub const STDERR_FD: u32 = 2;
 ///   - clock_gettime: normally vDSO-served; allowlisted because strace under-reports vDSO calls.
 ///
 /// REMOVED relative to the pre-2026-10 allowlist: lseek (the `/proc/<pid>/mem` read primitive),
-/// statx/fstat (unrestricted metadata oracles; the admitted newfstatat is limited by policy to a
-/// non-AT_FDCWD dirfd with flags == 0, and by code to the fixed `exe` entry below a pinned proc
-/// dirfd), getrandom (the policy model
+/// statx/newfstatat (pathname metadata oracles), getrandom (the policy model
 /// currently has only ALLOW/KILL actions, so it remains KILL rather than using SECCOMP_RET_ERRNO;
 /// the helper no longer needs it), readlink (x86_64 path-based variant; only std::fs::read_link
 /// needed it).
@@ -144,37 +144,16 @@ pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
     let rules = vec![
         Rule::when(
             t.openat,
-            vec![
-                ArgCheck::Low32BitsClear {
-                    arg: 2,
-                    mask: !allowed_open_flags,
-                },
-                ArgCheck::Low32BitsSet {
-                    arg: 2,
-                    mask: t.o_nofollow,
-                },
-            ],
+            vec![ArgCheck::Low32BitsClear {
+                arg: 2,
+                mask: !allowed_open_flags,
+            }],
         ),
         Rule::allow(t.read),
         Rule::allow(t.getdents64),
         Rule::allow(t.readlinkat),
-        // The helper uses this only to follow the fixed "exe" entry below a pinned /proc/<pid>
-        // dirfd and compare the mapped binary's dev+ino across the cmdline/final checks. The
-        // syscall cannot escape to the current working directory and cannot use AT_EMPTY_PATH or
-        // AT_SYMLINK_NOFOLLOW; pathname selection remains constrained by the pinned dirfd/code.
-        Rule::when(
-            t.newfstatat,
-            vec![
-                ArgCheck::Low32NotEqual {
-                    arg: 0,
-                    value: (-100i32) as u32, // AT_FDCWD
-                },
-                ArgCheck::Low32OneOf {
-                    arg: 3,
-                    values: vec![0], // flags == 0
-                },
-            ],
-        ),
+        // fstat has no pathname or dirfd and is safe for the helper's already-open fd checks.
+        Rule::allow(t.fstat),
         Rule::allow(t.close),
         Rule::when(
             t.fcntl,
@@ -268,7 +247,7 @@ pub const fn same_table(a: &SyscallTable, b: &SyscallTable) -> bool {
         && a.fcntl == b.fcntl
         && a.getdents64 == b.getdents64
         && a.readlinkat == b.readlinkat
-        && a.newfstatat == b.newfstatat
+        && a.fstat == b.fstat
         && a.mmap == b.mmap
         && a.mprotect == b.mprotect
         && a.munmap == b.munmap
@@ -315,7 +294,7 @@ pub const fn pinned_x86_64() -> SyscallTable {
         fcntl: 72,
         getdents64: 217,
         readlinkat: 267,
-        newfstatat: 262,
+        fstat: 5,
         mmap: 9,
         mprotect: 10,
         munmap: 11,
@@ -361,7 +340,7 @@ pub const fn pinned_aarch64() -> SyscallTable {
         fcntl: 25,
         getdents64: 61,
         readlinkat: 78,
-        newfstatat: 79,
+        fstat: 80,
         mmap: 222,
         mprotect: 226,
         munmap: 215,
@@ -410,7 +389,7 @@ mod tests {
         ("pread64", 17, Some(67)),
         ("preadv", 295, Some(69)),
         ("preadv2", 327, Some(286)),
-        ("fstat", 5, Some(80)),
+        ("newfstatat", 262, Some(79)),
         ("statx", 332, Some(291)),
         ("getrandom", 318, Some(278)),
         ("readlink", 89, None),
@@ -503,26 +482,24 @@ mod tests {
     }
 
     #[test]
-    fn every_openat_must_request_no_follow() {
+    fn openat_allows_only_the_readonly_helper_flag_subset() {
         for (t, _) in both_arches() {
             let h = Harness::new(t.clone());
             let directory = u64::from(t.o_directory | t.o_cloexec);
             let file = u64::from(t.o_cloexec);
-            assert!(h.killed(t.openat, [3, 0, directory, 0, 0, 0]));
-            assert!(h.killed(t.openat, [3, 0, file, 0, 0, 0]));
+            assert!(h.allowed(t.openat, [3, 0, directory, 0, 0, 0]));
+            assert!(h.allowed(t.openat, [3, 0, file, 0, 0, 0]));
             assert!(h.allowed(t.openat, [3, 0, file | u64::from(t.o_nofollow), 0, 0, 0]));
         }
     }
 
     #[test]
-    fn newfstatat_is_limited_to_a_pinned_dirfd_and_zero_flags() {
-        for (t, _) in both_arches() {
+    fn fstat_is_allowed_on_an_already_open_fd_and_newfstatat_is_killed() {
+        for (t, is_x86) in both_arches() {
             let h = Harness::new(t.clone());
-            let at_fdcwd = (-100i64) as u64;
-            assert!(h.allowed(t.newfstatat, [3, 0, 0, 0, 0, 0]));
-            assert!(h.killed(t.newfstatat, [at_fdcwd, 0, 0, 0, 0, 0]));
-            assert!(h.killed(t.newfstatat, [3, 0, 0, 0x1000, 0, 0])); // AT_EMPTY_PATH
-            assert!(h.killed(t.newfstatat, [3, 0, 0, 0x100, 0, 0])); // AT_SYMLINK_NOFOLLOW
+            assert!(h.allowed(t.fstat, [3, 0, 0, 0, 0, 0]));
+            let newfstatat = if is_x86 { 262 } else { 79 };
+            assert!(h.killed(newfstatat, [3, 0, 0, 0, 0, 0]));
         }
     }
 
