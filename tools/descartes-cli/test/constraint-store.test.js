@@ -23,6 +23,7 @@ import {
   resolveConstraintStorePaths,
   retireActiveConstraint,
   runLearnedConfigCommand,
+  selectFactStoreCompleteness,
   validateConstraint,
   writeConstraints,
   writeLearnedConfig,
@@ -511,8 +512,11 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   // Fact-store capacity plan (2026-10-05, §4.1 item 6): continuity_oldest_ts is REPLACED by the R0b
   // coverage fields (bytecap_floor_ts, certified_after_ts, oldest_certified_ts, coverage) -- it only
   // ever moved older and could predate the retained facts, so it over-claimed retained history.
+  // G1 re-gate LOW (fact-store capacity plan §18): ADDITIVE -- age_floor_ts is no longer stripped
+  // (the age floor narrows coverage too; G1 Blocker 2).
   assert.deepEqual(Object.keys(completeness).sort(), [
     "age_evicted_total",
+    "age_floor_ts",
     "bytecap_evicted_total",
     "bytecap_floor_ts",
     "certified_after_ts",
@@ -541,6 +545,7 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   assert.equal(completeness.continuity_ok, true);
   assert.equal(completeness.last_bytecap_evict_ts, null);
   assert.equal(completeness.bytecap_floor_ts, null);
+  assert.equal(completeness.age_floor_ts, null);
   assert.equal(completeness.certified_after_ts, null);
   assert.equal(completeness.coverage, "full");
   assert.equal(completeness.last_corrupt_ts, null);
@@ -1091,4 +1096,41 @@ test("retireActiveConstraint/applyApprovedRetune: the only call site in src/ is 
   // to reference the call form is tuning-authority.js's dispatch.
   const nonDefinitionCallers = callers.filter((file) => file !== "constraint-store.js");
   assert.deepEqual(nonDefinitionCallers, ["tuning-authority.js"], `expected the only external caller to be tuning-authority.js, found: ${JSON.stringify(callers)}`);
+});
+
+// G1 re-gate LOW (fact-store capacity plan §18): the learned-status surface reports age_floor_ts and
+// names the ACTUAL narrowing cause(s), instead of stripping the age floor and labeling every
+// narrowing "byte-cap".
+test("G1 LOW: learned status reports the age floor and names each narrowing cause (age retention, byte-cap, or both)", async () => {
+  const base = { status: "intact", coverage: "narrowed", certified_after_ts: "2026-09-05T00:00:00.000Z", last_bytecap_evict_ts: null, bytecap_floor_ts: null, age_floor_ts: null };
+  assert.equal(selectFactStoreCompleteness({ ...base, age_floor_ts: "2026-09-04T00:00:00.000Z" }).age_floor_ts, "2026-09-04T00:00:00.000Z");
+  assert.equal(selectFactStoreCompleteness({ ...base, age_floor_ts: "garbage" }).age_floor_ts, null);
+
+  // A real store older than the retention window: the oldest record is AGE-evicted (never byte-cap),
+  // and the learned-status read (31 d window, wall clock) sees that age floor inside its window.
+  const day = 24 * 60 * 60 * 1000;
+  const nowMs = Date.now();
+  const oldTs = new Date(nowMs - 30.5 * day).toISOString();
+  const newTs = new Date(nowMs).toISOString();
+  const ageOnly = await tempPaths();
+  await appendFactPoints(ageOnly, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
+  await appendFactPoints(ageOnly, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs });
+  await appendFactPoints(ageOnly, [], { now: newTs });
+  const lines = [];
+  const result = await runLearnedConfigCommand(ageOnly, "status", [], { output: (line) => lines.push(line) });
+  assert.equal(result.fact_store_completeness.age_floor_ts, oldTs);
+  assert.equal(result.fact_store_completeness.bytecap_floor_ts, null);
+  const text = lines.join("\n");
+  assert.match(text, /Coverage: narrowed by age retention \(floor /, "an age-only narrowing is attributed to age retention");
+  assert.doesNotMatch(text, /byte-cap eviction/, "and never mislabeled as byte-cap");
+
+  // Both causes at once are both named.
+  const both = await tempPaths();
+  await appendFactPoints(both, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
+  const midTs = new Date(nowMs - day).toISOString();
+  await appendFactPoints(both, [{ ts: midTs, fact_name: "service.presence", entity_key: "mid", attributes: {} }], { now: midTs });
+  await appendFactPoints(both, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs, maxBytes: 150 });
+  const bothLines = [];
+  await runLearnedConfigCommand(both, "status", [], { output: (line) => bothLines.push(line) });
+  assert.match(bothLines.join("\n"), /narrowed by byte-cap eviction \(floor .*\) and age retention \(floor /);
 });

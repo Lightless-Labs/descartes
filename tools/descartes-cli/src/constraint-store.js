@@ -328,6 +328,9 @@ function unknownFactStoreCompleteness() {
     // continuity_oldest_ts, which only ever moved older and could predate the retained facts (an
     // over-claim). Display only; no trust-decision path consults these here.
     bytecap_floor_ts: null,
+    // G1 re-gate LOW (fact-store capacity plan §18): the age floor narrows coverage too (G1
+    // Blocker 2 fix), so it is reported alongside the byte-cap floor rather than stripped.
+    age_floor_ts: null,
     certified_after_ts: null,
     oldest_certified_ts: null,
     coverage: "unknown",
@@ -364,6 +367,7 @@ export function selectFactStoreCompleteness(completeness) {
     continuity_ok: [true, false, null].includes(completeness.continuity_ok) ? completeness.continuity_ok : null,
     last_bytecap_evict_ts: isNullableTimestampString(completeness.last_bytecap_evict_ts) ? completeness.last_bytecap_evict_ts : null,
     bytecap_floor_ts: isNullableTimestampString(completeness.bytecap_floor_ts) ? completeness.bytecap_floor_ts : null,
+    age_floor_ts: isNullableTimestampString(completeness.age_floor_ts) ? completeness.age_floor_ts : null,
     certified_after_ts: isNullableTimestampString(completeness.certified_after_ts) ? completeness.certified_after_ts : null,
     oldest_certified_ts: isNullableTimestampString(completeness.oldest_certified_ts) ? completeness.oldest_certified_ts : null,
     coverage: COVERAGE_VALUES.includes(completeness.coverage) ? completeness.coverage : "unknown",
@@ -471,7 +475,16 @@ function renderFactStoreCompletenessText(completeness) {
     }
   }
   if (completeness.coverage === "narrowed") {
-    lines.push(`  Coverage: narrowed by byte-cap eviction (certified after ${completeness.certified_after_ts}; last eviction ${completeness.last_bytecap_evict_ts})`);
+    // G1 re-gate LOW (fact-store capacity plan §18): name the ACTUAL cause(s). Coverage narrows by
+    // byte-cap eviction (bytecap_floor_ts) and/or by age retention whose floor falls inside the
+    // read window (age_floor_ts) -- labeling every narrowing "byte-cap" misdirected an operator
+    // whose store was merely older than the retention window.
+    const causes = [];
+    if (completeness.bytecap_floor_ts !== null) {
+      causes.push(`byte-cap eviction (floor ${completeness.bytecap_floor_ts}; last eviction ${completeness.last_bytecap_evict_ts})`);
+    }
+    if (completeness.age_floor_ts !== null) causes.push(`age retention (floor ${completeness.age_floor_ts})`);
+    lines.push(`  Coverage: narrowed by ${causes.length > 0 ? causes.join(" and ") : "an unreported cause"} (certified after ${completeness.certified_after_ts})`);
   }
   return lines.join("\n");
 }
