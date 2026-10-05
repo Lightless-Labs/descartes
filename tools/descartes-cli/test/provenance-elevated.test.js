@@ -364,6 +364,45 @@ function tcpListeningFixture({ port = 8080, uid = process.getuid?.() ?? 1000, in
   ].join("\n");
 }
 
+function tcpListeningRowsFixture({ port = 8080, uid = process.getuid?.() ?? 1000, inodes = ["424242"] } = {}) {
+  return [
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+    ...inodes.map((inode, index) => ` ${index}: 0100007F:${port.toString(16).padStart(4, "0")} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  ${uid}        0 ${inode} 1 0000000000000000 100 0 0 10 0`),
+  ].join("\n");
+}
+
+test("same-port multi-row aggregation preserves every row reason and elevated privilege marker", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const currentUid = process.getuid?.() ?? 1000;
+  const outcome = await resolveByPortLinux(8080, fakeElevatedOptions({
+    paths,
+    readFile: async (filePath) => filePath === "/proc/net/tcp"
+      ? tcpListeningRowsFixture({ uid: currentUid, inodes: ["424242", "424243"] })
+      : "1\n",
+    listProcPids: async () => ({ pids: [100], truncated: false }),
+    verifyProcfsPidNamespace: async () => true,
+    scanProcFdForInode: async () => ({
+      results: [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [] }],
+      truncated: false,
+      uncertain: true,
+    }),
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({
+      status: "unable",
+      fd_scan_uncertain: true,
+      helper_hardening_failure: true,
+      stdout: "",
+      stderr: "",
+    }),
+  }));
+
+  assert.equal(outcome.resolvedStatus, "ambiguous");
+  assert.deepEqual(outcome.result.resolved.reasons, ["fd_scan_uncertain", "helper_hardening_failure"]);
+  assert.equal(outcome.result.privilege.helper_hardening_failure, true);
+  assert.equal(outcome.result.privilege.elevated_available, false);
+});
+
 test("same-UID uncertain fd attribution falls through to the enabled elevated exhaustive scan", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });

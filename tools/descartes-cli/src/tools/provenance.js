@@ -579,10 +579,30 @@ export function summarizeSocketAttributions(attributions = []) {
   }
   const identities = new Set();
   const reasons = [];
+  const privilege = {};
+  let hasPrivilegeEvidence = false;
   for (const attribution of attributions) {
+    const attributionReasons = Array.isArray(attribution?.reasons)
+      ? attribution.reasons
+      : [attribution?.reason];
+    for (const reason of attributionReasons) {
+      if (typeof reason === "string" && !reasons.includes(reason)) reasons.push(reason);
+    }
+    if (attribution?.privilege && typeof attribution.privilege === "object") {
+      hasPrivilegeEvidence = true;
+      for (const [key, value] of Object.entries(attribution.privilege)) {
+        if (typeof value === "boolean" && typeof privilege[key] === "boolean") {
+          privilege[key] ||= value;
+        } else {
+          privilege[key] = value;
+        }
+      }
+    }
     if (attribution?.resolved !== true) {
-      const reason = attribution?.reason ?? "socket_attribution_unresolved";
-      if (!reasons.includes(reason)) reasons.push(reason);
+      if (attributionReasons.every((reason) => typeof reason !== "string")) {
+        const reason = "socket_attribution_unresolved";
+        if (!reasons.includes(reason)) reasons.push(reason);
+      }
       continue;
     }
     const identity = attribution.processIdentity;
@@ -599,7 +619,13 @@ export function summarizeSocketAttributions(attributions = []) {
       : classifications.some((classification) => classification.status === "truncated")
         ? "truncated"
         : classifications.find((classification) => classification.status === "partial")?.status ?? "partial";
-    return { status, executablePath: undefined, reason: reasons[0], reasons };
+    return {
+      status,
+      executablePath: undefined,
+      reason: reasons[0],
+      reasons,
+      ...(hasPrivilegeEvidence ? { privilege } : {}),
+    };
   }
   if (identities.size !== 1) {
     return { status: "ambiguous", executablePath: undefined, reason: "owner_ambiguous", reasons: ["owner_ambiguous"] };
@@ -1413,7 +1439,7 @@ export async function resolveByPortLinux(port, options = {}) {
         ancestry: [],
         source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: summary.reason, ...(summary.reasons ? { reasons: summary.reasons } : {}), socket_count: matches.length } },
       };
-      return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+      return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets, privilege: summary.privilege });
     }
     if (outcomes.length !== matches.length) {
       const core = {
