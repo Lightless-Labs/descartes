@@ -9,6 +9,11 @@ import {
   groupServiceFactsByTick,
   loadServiceAppearanceBaselineStore,
   loadServiceBaselineStore,
+  SERVICE_DISAPPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  computeCensusEvaluatedAlertKeys,
+  hashServiceEntityKey,
+  hashServiceAppearedEntityKey,
 } from "./service-baseline.js";
 import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import {
@@ -38,11 +43,16 @@ import {
   DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
   groupScheduledJobFactsByTick,
   loadPersistenceBaselineStore,
+  SCHEDULED_JOB_APPEARED_RULE_ID,
+  scheduledJobEvaluatedEntityKeys,
+  hashScheduledJobEntityKey,
 } from "./persistence-baseline.js";
 import {
   DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
   groupProcessLineageFactsByTick,
   loadProcessLineageBaselineStore,
+  PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+  computeEvaluatedProcessLineageEdgeKeys,
 } from "./process-lineage-baseline.js";
 import {
   loadWatchConfig,
@@ -269,6 +279,83 @@ function dropTickGroupIsComplete(group) {
   return !group.hasOverflow && group.availabilitySignature !== undefined && group.availabilitySignature !== PEER_SIGNATURE_INVALID;
 }
 
+// A3 (2026-10 fabrication review): census domains (service/scheduled-job/process-lineage) carry
+// the SAME "established-by-tick-count is not the same as evaluable-by-the-detector" gap peer/
+// session do -- e.g. a census domain can accumulate enough raw complete-tick history while the
+// detector's own entity-union is empty (nothing ever tracked) or its freshness/cold-start gate
+// would zero the real evaluatedAlertKeys. These three helpers mirror each detector's own
+// evaluated-alert-key sibling (computeCensusEvaluatedAlertKeys / scheduledJobEvaluatedEntityKeys /
+// computeEvaluatedProcessLineageEdgeKeys) exactly -- same complete-group filter, same
+// minCompleteGroups/freshness gates -- never a second, drifting re-derivation of readiness.
+// coldStartPendingThisTick is always passed as false here because domainPhase already returned
+// its own cold-start phase before ever calling readinessFor (see the coldStartPending branch
+// above) -- by the time this runs, this tick is genuinely not cold-start-pending.
+function serviceRuleReadiness(groups, nowMs, freshnessMs) {
+  const disappearedKeys = computeCensusEvaluatedAlertKeys(groups, {
+    coldStartPendingThisTick: false,
+    nowMs,
+    freshnessMs,
+    minCompleteGroups: 2, // detectServiceDisappearances' own gate
+    ruleId: SERVICE_DISAPPEARED_RULE_ID,
+    hashEntityKey: hashServiceEntityKey,
+  });
+  const appearedKeys = computeCensusEvaluatedAlertKeys(groups, {
+    coldStartPendingThisTick: false,
+    nowMs,
+    freshnessMs,
+    minCompleteGroups: DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1, // detectServiceAppearances' own gate
+    ruleId: SERVICE_APPEARED_RULE_ID,
+    hashEntityKey: hashServiceAppearedEntityKey,
+  });
+  const required = DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1; // the stricter of disappearance (2) and appearance (3 + 1)
+  const progress = completeGroups("service", groups).length;
+  return {
+    progress,
+    required,
+    established: progress >= required,
+    watchingRules: [
+      ...(disappearedKeys.length > 0 ? [SERVICE_DISAPPEARED_RULE_ID] : []),
+      ...(appearedKeys.length > 0 ? [SERVICE_APPEARED_RULE_ID] : []),
+    ],
+    evaluatedAlertKeys: [...disappearedKeys, ...appearedKeys],
+  };
+}
+
+function scheduledJobRuleReadiness(groups, nowMs, freshnessMs) {
+  const entityKeys = scheduledJobEvaluatedEntityKeys(groups, {
+    nowMs,
+    freshnessMs,
+    minHistoryTickCount: DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
+  });
+  const evaluatedAlertKeys = entityKeys.map((entityKey) => alertId(SCHEDULED_JOB_APPEARED_RULE_ID, hashScheduledJobEntityKey(entityKey)));
+  const required = DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT + 1;
+  const progress = completeGroups("scheduled-job", groups).length;
+  return {
+    progress,
+    required,
+    established: progress >= required,
+    watchingRules: evaluatedAlertKeys.length > 0 ? [SCHEDULED_JOB_APPEARED_RULE_ID] : [],
+    evaluatedAlertKeys,
+  };
+}
+
+function lineageRuleReadiness(groups, nowMs, freshnessMs) {
+  const evaluatedAlertKeys = computeEvaluatedProcessLineageEdgeKeys(groups, {
+    nowMs,
+    freshnessMs,
+    minHistoryTickCount: DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
+  });
+  const required = DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT + 1;
+  const progress = completeGroups("process-lineage", groups).length;
+  return {
+    progress,
+    required,
+    established: progress >= required,
+    watchingRules: evaluatedAlertKeys.length > 0 ? [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID] : [],
+    evaluatedAlertKeys,
+  };
+}
+
 function readinessFor(domain, groups, points = [], entries = [], nowMs = Date.now(), freshnessMs = DEFAULT_STATUS_FRESHNESS_MS) {
   if (domain === "session") {
     return sessionRuleReadiness(groups, points, nowMs, freshnessMs);
@@ -276,26 +363,55 @@ function readinessFor(domain, groups, points = [], entries = [], nowMs = Date.no
   if (domain === "peer") {
     return peerRuleReadiness(groups, entries, nowMs, freshnessMs);
   }
-  const required = domain === "service"
-    ? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1 // the stricter of disappearance (2) and appearance (3 + 1)
-    : domain === "scheduled-job"
-      ? DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT + 1
-      : DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT + 1;
-  const progress = completeGroups(domain, groups).length;
-  return { progress, required, established: progress >= required };
+  if (domain === "service") {
+    return serviceRuleReadiness(groups, nowMs, freshnessMs);
+  }
+  if (domain === "scheduled-job") {
+    return scheduledJobRuleReadiness(groups, nowMs, freshnessMs);
+  }
+  return lineageRuleReadiness(groups, nowMs, freshnessMs);
 }
 
+// The full set of rule_ids each domain's status can ever report as "watching" -- used below only
+// to decide bare "watching" (every rule the domain owns is ready) vs. a partial-coverage phase
+// (some, but not all). NOT a second gating mechanism: readiness.watchingRules (computed above,
+// mirroring each detector's own evaluated-alert-key sibling) already decides WHICH rules are
+// ready; this list only sizes that set per domain so a 1-rule domain (scheduled-job,
+// process-lineage) can reach bare "watching" without being compared against session/peer's
+// hardcoded 2-rule count.
+const DOMAIN_RULE_IDS = {
+  session: [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID],
+  peer: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID],
+  service: [SERVICE_DISAPPEARED_RULE_ID, SERVICE_APPEARED_RULE_ID],
+  "scheduled-job": [SCHEDULED_JOB_APPEARED_RULE_ID],
+  "process-lineage": [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID],
+};
+
 function phaseForRuleReadiness(domain, readiness) {
-  if (readiness.watchingRules?.length > 0) {
-    if (readiness.watchingRules.length === (domain === "session" ? 2 : 2)) return "watching";
-    if (domain === "session" && readiness.watchingRules.includes(SESSION_CHURN_RULE_ID)) {
-      return `watching (churn); count baseline still learning — ${readiness.progress} of ${readiness.required}`;
-    }
-    if (domain === "session") return `watching (count); churn has no fresh evaluable pair`;
-    if (readiness.watchingRules.includes(PEER_COUNT_SPIKE_RULE_ID)) return "watching (spike); drop baseline is not evaluable";
-    return "watching (drop); spike baseline is not evaluable";
+  const watchingRules = readiness.watchingRules ?? [];
+  if (watchingRules.length === 0) return undefined;
+  const ruleIds = DOMAIN_RULE_IDS[domain] ?? [];
+  if (watchingRules.length === ruleIds.length) return "watching";
+  if (domain === "session") {
+    return watchingRules.includes(SESSION_CHURN_RULE_ID)
+      ? `watching (churn); count baseline still learning — ${readiness.progress} of ${readiness.required}`
+      : `watching (count); churn has no fresh evaluable pair`;
   }
-  return undefined;
+  if (domain === "peer") {
+    return watchingRules.includes(PEER_COUNT_SPIKE_RULE_ID)
+      ? "watching (spike); drop baseline is not evaluable"
+      : "watching (drop); spike baseline is not evaluable";
+  }
+  if (domain === "service") {
+    return watchingRules.includes(SERVICE_DISAPPEARED_RULE_ID)
+      ? "watching (disappeared); appeared baseline is not evaluable"
+      : "watching (appeared); disappeared baseline is not evaluable";
+  }
+  // Every currently-defined scheduled-job/process-lineage domain owns exactly one rule_id, so
+  // watchingRules.length (which is > 0 here) always already equals ruleIds.length above -- this
+  // is unreachable today, kept only so a future second rule on these domains fails loud (a new
+  // string to design) rather than silently reusing an unrelated domain's partial-coverage wording.
+  throw new Error(`phaseForRuleReadiness: domain '${domain}' has partial rule coverage with no defined wording`);
 }
 
 function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, readResult, freshnessMs = DEFAULT_STATUS_FRESHNESS_MS }) {
@@ -360,7 +476,16 @@ function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, rea
   if (!readiness.established) {
     return { ...base, phase: `still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required };
   }
-  return { ...base, phase: "watching", progress: readiness.required, required: readiness.required, watchingRules: readiness.watchingRules ?? [], evaluatedAlertKeys: readiness.evaluatedAlertKeys ?? [] };
+  // A1/A3 (2026-10 calibration + fabrication review): `established` only means enough raw
+  // complete-tick history has accumulated -- it is NOT the detector's own per-rule readiness
+  // (rulePhase, computed above). `rulePhase` is guaranteed falsy here (the `if (rulePhase)` branch
+  // above already returned otherwise), so a domain can reach this point established with every one
+  // of its rules still unevaluable this tick (e.g. peer's spike/drop both lacking a fresh scorable
+  // observation because the only current tick is an unscorable Tailscale-overflow truncation --
+  // see the repro test). Never fabricate "watching" (or any watching_rules) in that case: report
+  // the SAME "not evaluating" vocabulary used elsewhere for a degraded-input tick, so this state is
+  // never confused with genuine, rule-backed coverage.
+  return { ...base, phase: "not evaluating — established, but no rule has a fresh evaluable observation this tick", progress: readiness.progress, required: readiness.required, watchingRules: [], evaluatedAlertKeys: [] };
 }
 
 function serviceEstablished(groups) {

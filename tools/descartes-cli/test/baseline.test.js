@@ -20,6 +20,37 @@ import {
   PEER_COUNT_SPIKE_RULE_ID,
   PEER_COUNT_VPN_FINGERPRINT,
 } from "../src/peer-baseline.js";
+import {
+  SERVICE_DISAPPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  writeServiceBaselineStore,
+  writeServiceAppearanceBaselineStore,
+} from "../src/service-baseline.js";
+import { SCHEDULED_JOB_APPEARED_RULE_ID, writePersistenceBaselineStore } from "../src/persistence-baseline.js";
+import { PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, writeProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
+import {
+  buildLineageEntityKey,
+  buildScheduledJobEntityKey,
+  PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
+  PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY,
+  PROCESS_LINEAGE_EDGE_FACT_NAME,
+  SCHEDULED_JOB_CENSUS_FACT_NAME,
+  SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY,
+  SCHEDULED_JOB_PRESENCE_FACT_NAME,
+} from "../src/fact-translators.js";
+
+// A3 (2026-10 fabrication review): the SAME "watching claims coverage it doesn't have" invariant
+// A1's own loop already checks for session/peer, generalized to every domain in a status report --
+// phase "watching" (or any partial-coverage "watching (...)" variant) must never be reported with
+// an empty watching_rules; that combination means a rule claims to be scoring/evaluating while
+// reporting nothing it actually evaluated.
+function assertWatchingImpliesRules(domains, label = "") {
+  for (const domain of domains) {
+    if (domain.phase.startsWith("watching")) {
+      assert.ok(domain.watching_rules.length > 0, `${label}${domain.domain}: phase "${domain.phase}" claims watching coverage with an empty watching_rules`);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------------------------
 // A1 (2026-10 calibration review) fixtures: status-vs-detector consistency. `baseline status` must
@@ -322,6 +353,7 @@ for (const scenario of A1_SCENARIOS) {
     const now = new Date(A1_BASE_MS + scenario.nowHour * A1_HOUR_MS).toISOString();
 
     const status = await buildBaselineStatus(paths, { now, readFactPoints });
+    assertWatchingImpliesRules(status.domains, `${scenario.name}: `);
     const noWrite = async () => {};
     const detectors = {
       session: await computeSessionBaselineCandidates(paths, { now, readFactPoints, writeSessionBaselineStore: noWrite }),
@@ -357,6 +389,112 @@ for (const scenario of A1_SCENARIOS) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// A3 (2026-10 fabrication review): the security-review finding this slice fixes. An established
+// peer-count baseline (30 markerless-Tailscale ticks at 2 peers) whose only CURRENT tick is a
+// truncated 200-peer Tailscale overflow is unscorable (computeWindowedPeerStats cannot score an
+// unscorable overflow tick — peer-baseline.js's own MUST-FIX-3 posture — and markerless ticks can
+// never satisfy peer.count_drop's own "complete" disposition either): the real detector reports
+// NO candidates and NO coverage. `baseline status` used to report "watching" anyway (the
+// established-state fallback counted raw complete-tick history alone, ignoring that neither rule
+// actually reached a fresh, scorable observation this tick).
+// ---------------------------------------------------------------------------------------------
+test("A3 repro: an established markerless peer baseline whose only current tick is an unscorable Tailscale-overflow truncation never says watching", async () => {
+  const paths = await tempPaths();
+  await writePeerBaselineStore(paths, A1_ESTABLISHED_STORE);
+
+  const points = [];
+  for (let hour = 0; hour < 30; hour += 1) {
+    const ts = a1Ts(hour);
+    points.push(
+      { ts, fact_name: "peer.presence", entity_key: "peer.tailscale.aaaaaaaaaaaaaaaa", attributes: { source_type: "tailscale", presence_state: "observed_active" } },
+      { ts, fact_name: "peer.presence", entity_key: "peer.tailscale.bbbbbbbbbbbbbbbb", attributes: { source_type: "tailscale", presence_state: "observed_active" } },
+    );
+  }
+  const overflowTs = a1Ts(30);
+  for (let index = 0; index < 200; index += 1) {
+    points.push({ ts: overflowTs, fact_name: "peer.presence", entity_key: `peer.tailscale.c${index}`, attributes: { source_type: "tailscale", presence_state: "observed_active" } });
+  }
+  // Tailscale-sourced overflow marker (source_envelope_id "tailscale-status", mirroring the
+  // "markerless Tailscale overflow truncates the counted all-peer universe" comment in
+  // peer-baseline.js) -- the SCORE-BUT-NEVER-FOLD exemption only covers an overflow whose capped
+  // count is still a trustworthy lower bound; a Tailscale-sourced truncation is explicitly carved
+  // out of that exemption (overflowCanBeScored), so this tick is unscorable, not merely unfolded.
+  points.push({ ts: overflowTs, fact_name: "peer.presence", entity_key: "peer.overflow-marker.v1", source_envelope_id: "tailscale-status", attributes: { overflow: "true" } });
+
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const now = a1Ts(30.5);
+  const noWrite = async () => {};
+
+  const detector = await computePeerBaselineCandidates(paths, { now, readFactPoints, writePeerBaselineStore: noWrite });
+  assert.deepEqual(detector.candidates, [], "sanity: the real detector fires nothing on the truncated overflow tick");
+  assert.deepEqual(detector.evaluatedAlertKeys, [], "sanity: the real detector reports no coverage on the truncated overflow tick");
+
+  const status = await buildBaselineStatus(paths, { now, readFactPoints });
+  const peer = status.domains.find((domain) => domain.domain === "peer");
+  assert.equal(peer.established_count >= 0, true); // sanity: the established-count projection still runs
+  assert.deepEqual(peer.watching_rules, []);
+  assert.deepEqual(peer.evaluated_alert_keys, []);
+  assert.equal(peer.phase.startsWith("watching"), false, `status must not claim watching coverage; got "${peer.phase}"`);
+  assert.match(peer.phase, /^not evaluating — /, "status must give an explicit, honest reason instead of fabricating watching");
+  assertWatchingImpliesRules(status.domains);
+});
+
+// A3: the generic fix applies uniformly to the three census domains (service/scheduled-job/
+// process-lineage) too, not only session/peer — with enough genuinely-complete, fresh history and
+// at least one tracked entity per domain, every domain's status now shows REAL per-rule coverage
+// (watching_rules/evaluated_alert_keys mirroring each detector's own evaluated-alert-key sibling),
+// never the bare, rule-blind "watching" the old fallback always reported once `established` alone
+// was true.
+test("A3: once genuinely established and fresh, every domain (not just session/peer) reports real per-rule watching coverage", async () => {
+  const paths = await tempPaths();
+  await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writePeerBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writeServiceBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writeServiceAppearanceBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writePersistenceBaselineStore(paths, A1_ESTABLISHED_STORE);
+  await writeProcessLineageBaselineStore(paths, A1_ESTABLISHED_STORE);
+
+  const serviceKey = "service.example.unit";
+  const scheduledJobKey = buildScheduledJobEntityKey("cron", "cron_d", "digest-a");
+  const lineageKey = buildLineageEntityKey("shell", "node");
+
+  const points = [...a1Points(31)];
+  for (let hour = 0; hour < 31; hour += 1) {
+    const ts = a1Ts(hour);
+    points.push(
+      { ts, fact_name: "service.presence", entity_key: serviceKey, attributes: {} },
+      { ts, fact_name: "service.census", entity_key: "service.census-marker.v1", attributes: { census_state: "complete" } },
+      { ts, fact_name: SCHEDULED_JOB_PRESENCE_FACT_NAME, entity_key: scheduledJobKey, attributes: { kind: "cron", source: "cron_d" } },
+      { ts, fact_name: SCHEDULED_JOB_CENSUS_FACT_NAME, entity_key: SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY, attributes: { census_state: "complete" } },
+      { ts, fact_name: PROCESS_LINEAGE_EDGE_FACT_NAME, entity_key: lineageKey, attributes: {} },
+      { ts, fact_name: PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME, entity_key: PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY, attributes: { census_state: "complete" } },
+    );
+  }
+
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const status = await buildBaselineStatus(paths, { now: a1Ts(30.5), readFactPoints });
+  const byDomain = Object.fromEntries(status.domains.map((domain) => [domain.domain, domain]));
+
+  assert.equal(byDomain.session.phase, "watching");
+  assert.equal(byDomain.peer.phase, "watching");
+
+  assert.equal(byDomain.service.phase, "watching", byDomain.service.phase);
+  assert.ok(byDomain.service.watching_rules.includes(SERVICE_DISAPPEARED_RULE_ID));
+  assert.ok(byDomain.service.watching_rules.includes(SERVICE_APPEARED_RULE_ID));
+  assert.ok(byDomain.service.evaluated_alert_keys.length > 0);
+
+  assert.equal(byDomain["scheduled-job"].phase, "watching", byDomain["scheduled-job"].phase);
+  assert.deepEqual(byDomain["scheduled-job"].watching_rules, [SCHEDULED_JOB_APPEARED_RULE_ID]);
+  assert.ok(byDomain["scheduled-job"].evaluated_alert_keys.length > 0);
+
+  assert.equal(byDomain["process-lineage"].phase, "watching", byDomain["process-lineage"].phase);
+  assert.deepEqual(byDomain["process-lineage"].watching_rules, [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID]);
+  assert.ok(byDomain["process-lineage"].evaluated_alert_keys.length > 0);
+
+  assertWatchingImpliesRules(status.domains);
+});
 
 test("A1: a still-pending lockout that has accumulated its post-anchor ticks says so honestly, with the cold-start reason", async () => {
   const paths = await tempPaths();
