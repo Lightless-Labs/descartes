@@ -193,6 +193,39 @@ test("re-seed boundary: a set lost over a NARROWED store re-seeds with certified
   assert.equal(afterBreak.certified_since_ts, at(4));
 });
 
+test("MEDIUM-1 (S3b review): a non-continuous re-seed keeps the prior set's entries (memory that can only suppress) while certified_since stays at the re-seed boundary", async () => {
+  const paths = await tempPaths();
+  const ticks = [0, 1, 2, 3, 4].map((hour) => serviceTick(at(hour), hour === 0 ? ["base", "returner"] : ["base"]));
+  const budget = tickBytes(ticks[1]) * 2 + 10;
+  const { file } = resolveSeenSetPaths(paths, "service");
+  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
+  const afterP2 = await fs.readFile(file, "utf8");
+  assert.ok(JSON.parse(afterP2).entries.returner, "the returner was folded while its tick was retained");
+  await appendFactPoints(paths, ticks[3], { now: at(3), maxBytes: budget });
+  await fs.writeFile(file, afterP2); // pass 3's fold write is "lost": the set no longer matches the ledger
+  const floorBefore = (await readFactPoints(paths, { now: at(3), windowMs: 31 * DAY })).completeness.bytecap_floor_ts;
+  await appendFactPoints(paths, ticks[4], { now: at(4), maxBytes: budget });
+  const read = await readFactPoints(paths, { now: at(4), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  assert.ok(!read.points.some((point) => point.entity_key === "returner"), "tick 0 is long evicted from the store");
+  assert.equal(read.seen_sets.service.status, "valid", "re-seeded");
+  assert.deepEqual(read.seen_sets.service.entries.get("returner"), { firstMs: Date.parse(at(0)), lastMs: Date.parse(at(0)) }, "the prior set's memory survives the re-seed");
+  assert.equal(seenBeforeTick(read.seen_sets.service.entries, "returner", at(60)), true, "so the returner never reads as new");
+  assert.equal(read.seen_sets.service.certified_since_ts, floorBefore, "the certified boundary is still the re-seed boundary, never the prior set's");
+  assert.notEqual(floorBefore, null);
+});
+
+test("MEDIUM-1 (S3b review): a merged re-seed that would overflow retries bare before declaring overflow", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(at(0), ["a", "b"]), { now: at(0), seenSetMaxEntries: 2 });
+  const { file } = resolveSeenSetPaths(paths, "service");
+  const stale = await fs.readFile(file, "utf8");
+  await appendFactPoints(paths, serviceTick(at(1), ["a"]), { now: at(1), seenSetMaxEntries: 2 });
+  await fs.writeFile(file, stale.replace("\"a\":", "\"x\":")); // stale + different memory: merged it would be 3 > 2
+  const outcome = await enforceFactRetention(paths, { now: at(1), seenSetMaxEntries: 2 });
+  assert.equal(outcome.seen_set_fold.service.status, "reseeded");
+  assert.deepEqual(Object.keys(await seenEntries(paths)).sort(), ["a", "b"], "bare re-seed from the store's candidates, never a silent truncation");
+});
+
 test("LOW-4 (S3b review): a complete tick appended at or below the byte-cap floor after a small clock rollback is still folded -- memory only ever suppresses a claim", async () => {
   const paths = await tempPaths();
   const ticks = [0, 1, 2].map((hour) => serviceTick(at(hour), ["base"]));

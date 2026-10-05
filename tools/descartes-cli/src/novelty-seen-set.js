@@ -28,6 +28,9 @@
 //     not certified: max(prior byte-cap floor, prior age floor, every loss marker) when this pass's
 //     continuity observation is ok, else the pass time. null ONLY for a genuine first run (ENOENT
 //     store) or a lineage that never evicted or lost anything -- "complete since the lineage began".
+//     When the prior file still parses as a valid, non-overflow set for the family, its entries are
+//     carried into the re-seed (S3b review MEDIUM-1: memory that can only suppress a claim), but
+//     never its certified_since_ts; if carrying them would overflow, the re-seed retries bare.
 //   - BOUNDED: at most maxEntries entries. Overflow never silently drops an entry: the set is written
 //     as {overflow: true, entries: {}}, which reads as not-valid (novelty ineligible, status reason
 //     "overflow"), and every later pass retries a fresh re-seed.
@@ -244,14 +247,22 @@ export async function foldNoveltySeenSets(descartesPaths, {
         && prior.set.ledger_pass_id === priorLedger.continuity.last_committed_pass_id,
       );
       const reseedSince = genuineFirstRun ? null : reseedCertifiedSince({ priorLedger, nextLedger, nowIso });
-      let map = continuous ? entriesToMap(prior.set.entries) : new Map();
+      // S3b review MEDIUM-1: a NON-continuous re-seed still starts from the prior file's entries when
+      // it parses as a valid, non-overflow set for this family (readSeenSetFile enforces both) --
+      // e.g. a lost fold write, or a daemon death between the ledger finalize and the set rename.
+      // Those entries are real observations; added memory can only SUPPRESS a novelty claim, never
+      // create one. The certified boundary is NOT taken from it: certified_since stays the re-seed
+      // boundary, because continuity between that file and this ledger is exactly what is unproven.
+      const carriesPrior = Boolean(prior.set && !prior.set.overflow);
+      let map = carriesPrior ? entriesToMap(prior.set.entries) : new Map();
       let certifiedSince = continuous ? prior.set.certified_since_ts : reseedSince;
       let status = continuous ? "folded" : "reseeded";
       let foldedThroughMs = foldTicks(map, records, family, nowMs);
       expire(map, nowMs, retentionMs);
-      if (map.size > maxEntries && continuous) {
-        // Overflow of a continuous set: retry as a fresh re-seed from this pass's certified candidates
-        // (older memory is discarded, so the boundary moves up to the re-seed boundary).
+      if (map.size > maxEntries && carriesPrior) {
+        // Overflow of a set that carried prior memory (continuous, or a merged re-seed): retry as a
+        // bare re-seed from this pass's certified candidates (older memory is discarded, so the
+        // boundary moves up to the re-seed boundary).
         map = new Map();
         certifiedSince = reseedSince;
         status = "reseeded";
