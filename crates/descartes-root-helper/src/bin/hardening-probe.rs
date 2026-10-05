@@ -106,12 +106,18 @@ mod linux_probe {
             "--do-lseek-proc-mem" => || {
                 // Opening /proc/self/mem READ-ONLY is admitted (openat can't see paths); reading
                 // anything meaningful from it needs a seek to a mapped address -- killed here.
-                let fd = raw_openat(c"/proc/self/mem", libc::O_RDONLY | libc::O_CLOEXEC);
+                let fd = raw_openat(
+                    c"/proc/self/mem",
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                );
                 // SAFETY: plain lseek on an fd we own (or -1 if the open failed).
                 unsafe { libc::syscall(libc::SYS_lseek, fd, 4096i64, libc::SEEK_SET) };
             },
             "--do-pread" => || {
-                let fd = raw_openat(c"/proc/self/status", libc::O_RDONLY | libc::O_CLOEXEC);
+                let fd = raw_openat(
+                    c"/proc/self/status",
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                );
                 let mut buf = [0u8; 8];
                 // SAFETY: `buf` is a valid writable 8-byte buffer for the duration of the call.
                 unsafe {
@@ -119,7 +125,10 @@ mod linux_probe {
                 };
             },
             "--do-write-non-stdio-fd" => || {
-                let fd = raw_openat(c"/proc/self/status", libc::O_RDONLY | libc::O_CLOEXEC);
+                let fd = raw_openat(
+                    c"/proc/self/status",
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                );
                 let byte = [0u8; 1];
                 // SAFETY: `byte` is a valid 1-byte buffer.
                 unsafe { libc::syscall(libc::SYS_write, fd, byte.as_ptr(), 1usize) };
@@ -182,7 +191,9 @@ mod linux_probe {
             },
             "--do-getrandom" => || {
                 let mut buf = [0u8; 8];
-                // SAFETY: `buf` is a valid writable 8-byte buffer.
+                // The policy compiler has no per-syscall ERRNO action; getrandom therefore stays
+                // a deliberate default-action SIGSYS probe rather than an ENOSYS compatibility
+                // fallback. SAFETY: `buf` is a valid writable 8-byte buffer.
                 unsafe { libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr(), buf.len(), 0) };
             },
             "--do-prctl-dumpable" => || {
@@ -249,7 +260,11 @@ mod linux_probe {
                 .unwrap_or("0")
                 .to_string();
             let _target = procfs::read_link_at(fd_dir.as_fd(), &first_fd)?;
-            Ok(listed && !status.is_empty() && !cmdline.is_empty() && !exe.is_empty())
+            Ok(listed
+                && !status.is_empty()
+                && !cmdline.is_empty()
+                && !exe.is_empty()
+                && exercise_live_memory_paths())
         })();
         match ok {
             Ok(true) => {
@@ -259,6 +274,64 @@ mod linux_probe {
             }
             _ => 1,
         }
+    }
+
+    /// Positive controls for the allocator predicates while the filter is live. The large
+    /// malloc/realloc path is intentionally several MiB so glibc normally moves it through the
+    /// anonymous-mapping growth path (`realloc` -> `mremap`), and the second mapping exercises the
+    /// raw anonymous RW `mmap`/`munmap` predicates directly.
+    fn exercise_live_memory_paths() -> bool {
+        const INITIAL_BYTES: usize = 4096;
+        const GROWN_BYTES: usize = 8 * 1024 * 1024;
+        const PAGE_BYTES: usize = 4096;
+
+        // SAFETY: libc malloc/realloc/free receive valid sizes and the returned allocations are
+        // touched only within their live allocation bounds. A failed realloc leaves `allocation`
+        // valid and is freed on the failure path.
+        let mut allocation = unsafe { libc::malloc(INITIAL_BYTES) };
+        if allocation.is_null() {
+            return false;
+        }
+        unsafe {
+            for offset in (0..INITIAL_BYTES).step_by(PAGE_BYTES) {
+                ptr::write(allocation.cast::<u8>().add(offset), 0xA5);
+            }
+        }
+        let grown = unsafe { libc::realloc(allocation, GROWN_BYTES) };
+        if grown.is_null() {
+            unsafe { libc::free(allocation) };
+            return false;
+        }
+        allocation = grown;
+        unsafe {
+            for offset in (0..GROWN_BYTES).step_by(PAGE_BYTES) {
+                ptr::write(allocation.cast::<u8>().add(offset), 0x5A);
+            }
+            libc::free(allocation);
+        }
+
+        // SAFETY: this is a private anonymous RW mapping with a valid length; the returned
+        // address is checked before touching it and munmap receives the exact same range.
+        let map_len = 3 * 1024 * 1024;
+        let mapping = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return false;
+        }
+        unsafe {
+            for offset in (0..map_len).step_by(PAGE_BYTES) {
+                ptr::write(mapping.cast::<u8>().add(offset), 0x3C);
+            }
+        }
+        unsafe { libc::munmap(mapping, map_len) == 0 }
     }
 
     /// Reads our own `/proc/<pid>/status` and returns the whitespace-split fields on the first line

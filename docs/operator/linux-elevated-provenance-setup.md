@@ -71,6 +71,10 @@ install -D -m 0750 -o root -g descartes-provenance \
   /usr/local/libexec/descartes/descartes-root-helper
 ```
 
+The destination must be a regular file, not a symlink. The configured
+`configDir/provenance.json` must also be a regular file, not a symlink; the runtime trust check
+and the verifier reject either symlink so an attacker cannot redirect the privileged boundary.
+
 **This exact path — `/usr/local/libexec/descartes/descartes-root-helper` — is not a suggestion.**
 It is the literal value of `DEFAULT_HELPER_PATH` in
 `tools/descartes-cli/src/tools/provenance-elevated.js`, and it is where the daemon will actually
@@ -158,6 +162,13 @@ the exact path resolution — `configDir` follows the daemon's normal XDG config
 This is the **second, independent** opt-in condition. Both this and Steps 1–5 above must be true;
 either alone leaves the feature inert.
 
+Keep `configDir/provenance.json` as a root-owned/current-user-owned regular file with no
+group/world write bits. Do not replace it with a symlink to another configuration file.
+
+The Linux helper and Node caller both restrict UDP provenance to `/proc/net/udp[6]` state `07`
+(bound/unconnected UDP). Connected UDP rows are intentionally outside this listener-resolution
+contract; no additional helper-group visibility is granted for them.
+
 ## Re-run after every upgrade
 
 **After every helper binary upgrade, re-run Step 4 (`setcap`) and `verify-install.sh`.** A
@@ -202,7 +213,7 @@ crates/descartes-root-helper/scripts/verify-install.sh \
 Run this after the initial setup, after every upgrade (see above), and any time you want to
 confirm the grant is still correctly scoped. It is entirely read-only — it never mutates
 anything — and exits nonzero with a specific, operator-facing message on the first thing that's
-wrong: missing/symlinked binary, wrong owner/group, wrong mode, a writable or symlinked ancestor
+wrong: missing/symlinked/non-regular binary, symlinked config file, wrong owner/group, wrong mode, a writable or symlinked ancestor
 directory anywhere in the path (a classic local-privesc "dir-hijack" vector — an attacker who can
 write to `/usr/local/libexec` or `/usr/local/libexec/descartes`, even with the binary itself
 correctly locked down, could otherwise swap in their own binary), missing `getcap`, wrong/broader
