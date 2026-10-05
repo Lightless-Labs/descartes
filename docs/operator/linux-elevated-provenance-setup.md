@@ -109,7 +109,7 @@ setcap "cap_sys_ptrace,cap_dac_read_search=ep" /usr/local/libexec/descartes/desc
 
 This is the **primary** mechanism, and it is a **union of two capabilities, both required**. A
 real privileged CI run (2026-07-12) proved `cap_sys_ptrace` **alone is insufficient** for cross-UID
-**port** resolution: `--resolve-port` enumerates `/proc/<pid>/fd` (mode `0500`, owner = the target
+**port** resolution: `--resolve-socket` (formerly `--resolve-port`) enumerates `/proc/<pid>/fd` (mode `0500`, owner = the target
 uid) to match a listening socket's inode to its owning pid. The fd **directory's** kernel
 permission check (`proc_fd_permission`) is DAC/same-thread-group gated — **not**
 `ptrace_may_access` — so *enumerating* another user's fd table needs `cap_dac_read_search`;
