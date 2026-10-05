@@ -9,7 +9,7 @@ import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS,
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
-import { appendFactPointsByFamily, readFactPoints } from "./fact-store.js";
+import { appendFactPointsByFamily, factStoreFileBytes, readFactPoints } from "./fact-store.js";
 import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.js";
 import { combineFamilyCompleteness } from "./fact-store-integrity.js";
 import { migrateLegacyFactStore } from "./fact-store-migration.js";
@@ -1396,7 +1396,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   //   - retention_error with retention_error_since_ts (carried while it keeps failing, cleared by a
   //     clean structural pass), and `retention_failing` once it has failed for
   //     HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals, or once the store (as this tick's read
-  //     saw it) exceeds its budget by more than one worst-case tick -- a retention pass that keeps
+  //     saw it, or a stat of its file for a family with no history read) exceeds its budget by more
+  //     than one worst-case tick (network/provenance: none pinned) -- a retention pass that keeps
   //     failing lets the file, and the read cost, grow without bound (appendFactPoints treats a
   //     retention throw as non-fatal).
   // Q5 (fact-store capacity plan §4.5 Config, §12): the legacy single-store cap is IGNORED; a
@@ -1451,7 +1452,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         entry.last_tick_bytes = lastTickBytes;
         if (lastTickBytes > budgetBytes) entry.cap_below_tick = true;
       }
-      const readBytes = familyHistoryReads.get(family)?.bytes;
+      // G2 L1: a family the daemon made no history read of this tick (network and provenance carry no
+      // history-dependent rule, so they are never read here) is sized by a stat of its file instead,
+      // so the oversize check below runs for every family, not only the history-read ones.
+      let readBytes = familyHistoryReads.get(family)?.bytes;
+      if (!Number.isSafeInteger(readBytes)) readBytes = await factStoreFileBytes(descartesPaths, family);
       if (Number.isSafeInteger(readBytes)) entry.bytes = readBytes;
       if (retentionError !== undefined) {
         entry.retention_error = retentionError;

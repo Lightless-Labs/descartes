@@ -146,6 +146,32 @@ test("T12: a store larger than its budget by more than one worst-case tick reads
   assert.equal(result.status.fact_store_completeness.families.service.retention_failing, true);
 });
 
+// G2 L1: network and provenance carry no history-dependent rule, so the daemon never makes a history
+// read of them and had no `bytes` to compare with the budget -- the oversize path of deviation 8 never
+// ran for them. Their size now comes from a stat of the store file (no parse, tier-on only).
+test("G2 L1: a network or provenance store above its budget reads retention_failing at once and reports its bytes, though the daemon makes no history read of it", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: false });
+  const { resolveFactStorePaths } = await import("../src/fact-store.js");
+  const sizes = { network: FAMILY_DEFAULT_BUDGET_BYTES.get("network") + 1, provenance: 1234 };
+  await tick(paths, 0);
+  // Grown between structural ticks (as a retention pass that keeps failing would leave them).
+  for (const [family, size] of Object.entries(sizes)) {
+    const file = resolveFactStorePaths(paths, family).factsFile;
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, "");
+    await fs.truncate(file, size);
+  }
+  const fast = await tick(paths, 0.5);
+  assert.equal(fast.structuralFacts, undefined, "a fast tick: no retention pass ran");
+  const { families } = fast.status.fact_store_budgets;
+  assert.equal(families.network.bytes, sizes.network);
+  assert.equal(families.network.retention_failing, true, "above budget (network has no pinned worst tick)");
+  assert.equal(families.provenance.bytes, sizes.provenance);
+  assert.equal(families.provenance.retention_failing, undefined, "within budget");
+  assert.equal(families.canary.bytes, undefined, "a never-created store the daemon does not read (canary: learned off) reports no size");
+});
+
 test("status: a family store that was never created is `absent` (not observed), never 'unknown'", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: false });

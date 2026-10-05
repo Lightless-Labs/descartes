@@ -580,6 +580,22 @@ export async function factStoreExists(descartesPaths, family) {
 }
 
 /**
+ * G2 L1: the on-disk size of a family's facts.jsonl from a stat (no read, no parse), for the status
+ * block's oversize check on families the daemon makes no history read of (network, provenance).
+ * undefined when the file is absent or cannot be stat'ed -- display only, consulted by no trust
+ * decision, so an unknown size reports nothing rather than failing the tick.
+ */
+export async function factStoreFileBytes(descartesPaths, family) {
+  const { factsFile } = resolveFactStorePaths(descartesPaths, family);
+  try {
+    const stat = await fs.stat(factsFile);
+    return stat.isFile() ? stat.size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * S4 daemon write path (§4.3): route a structural tick's fact points to their family stores and run
  * the registry-driven retention sweep.
  *   - Grouping happens FIRST and throws on any unregistered fact_name, so a bad batch writes nothing
