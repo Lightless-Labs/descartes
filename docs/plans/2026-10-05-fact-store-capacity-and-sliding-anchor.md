@@ -638,3 +638,74 @@ The per-family stores sit in new paths. The legacy store is only quarantined (if
 - **Q7:** "fail-closed" was wrong.
 - **Q5:** added that the 5 MB default is written into every `watch.json`.
 - **Q1:** added that budgets are provisional, peer is about 18 MB, and service-presence mining is lost.
+
+---
+
+## 15. Addendum: S0 grounding (2026-10-05)
+
+**Addendum:** 2026-10-05. Step S0 run on branch `feat/fact-store-capacity-2026-10` (base `b951cb7`, which differs from `134e811` only in `docs/`, so every `src` line reference above still holds). Everything below was derived from the code and from §2's already-measured host numbers. No live host measurement was taken; every test and command ran with scratch `XDG_*` directories.
+
+### 15.1 Line references
+
+Re-verified against the branch base: `fact-store.js` (`:19`, `:27`, `:37`, `:44-47`, `:265-270`, `:272-285`, `:290-292`, `:331-333`, `:351-373`, `:380-427`, `:406`), `fact-store-integrity.js` (`:100-118`, `:170-209`, `:179-180`, `:222-223`, `:237-247`, `:276-290`, `:318-323`, `:337`, `:356-359`, `:361-366`, `:393-404`, `:439`, `:445`, `:476`, `:505-511`, `:545`, `:588`), `fact-store-completeness.js` (`:1-16`, `:69-70`, `:83-84`), the six detector loss-list and `hasCompletenessLossAfterAnchor` copies (§3 Leg B), and `daemon.js` (`:984-988`, `:1004-1058`, `:1053`, `:1136-1171`, `:1144`, `:1151`, `:1196-1211`). All hold. One correction: the `readFactPoints` call itself is one line below several of the `readFacts =` seam lines cited in §4.3 (for example `shadow-store.js:300` is the call, `:282` the seam). The inventory below cites the call lines.
+
+### 15.2 Inventory (`grep -a`; plain `grep` misses `canary-baseline.js`, confirmed: it reports `canary-baseline.js` as binary and drops its `readFacts(` call at `:537`)
+
+- **`last_bytecap_evict_ts`, `src` (9 files, 22 lines):**
+  - `fact-store-integrity.js`: `LEDGER_KEYS` `:16`, `createFactIntegrityLedger` `:80`, validation `:182`, `:205`, `clampForward` `:401`, stamp `:439`, comment `:443`, `LOSS_CHANNEL_FIELDS` `:509`, `commonCompletenessFields` `:532`;
+  - `fact-store-completeness.js:4` (`LOSS_TIMESTAMP_FIELDS`);
+  - detector copies: session `:149`, peer `:150`, service `:123`, process-lineage `:93`, persistence `:110`, canary `:86`;
+  - `constraint-store.js`: `LOSS_TS_FIELD_NAMES` `:302`, `unknownFactStoreCompleteness` `:317`, `selectFactStoreCompleteness` `:350`, `renderFactStoreCompletenessText` `:450`.
+- **`last_bytecap_evict_ts`, `test` (12 files):** `fact-store-completeness.test.js` (`:26` loss-channel list, `:106`/`:111` anchor fixtures, `:186-194` "byte-cap eviction degrades completeness"), `constraint-store.test.js` (6 lines, incl. `:566-590`), `fact-store-integrity.test.js:613`, and one `degradedReadResult`-style fixture each in the session, peer, service, process-lineage, persistence, canary, shadow, miner and correlation tests (they use the field as a generic loss marker).
+- **`continuity_oldest_ts`:** `src`: `fact-store-integrity.js:545`, `constraint-store.js:318`, `:351`, `daemon.js:170` (comment). `test`: `fact-store-integrity.test.js:90-128`, `constraint-store.test.js:515-590`, `daemon.test.js:691` (comment). No trust path reads it.
+- **`readFactPoints` call sites, `src` (16), checked against the §4.3 reader list (complete; nothing missing, nothing extra):** session `:694`, peer `:730`, service `:518` and `:916`, process-lineage `:361`, persistence/scheduled-job `:339`, canary `:537`, correlation `incident-correlation.js:313`, active-constraint `daemon.js:524`, daemon history veto `daemon.js:1144`, shadow `shadow-store.js:300`, miner `constraint-miner.js:362`, provenance-warning `tools/provenance-warnings.js:332`, tuning `tuning-store.js:631`, learned status `constraint-store.js:380`, `baseline.js:239`.
+- **`readFactPoints` direct calls, `test`:** `daemon.test.js` 35, `fact-store-integrity.test.js` 30, `fact-store.test.js` 20, `fact-store-completeness.test.js` 17, and one each in the miner, peer, service and session tests.
+- **`appendFactPoints`:** one `src` writer, `daemon.js:1043`/`:1053`. `test`: 263 direct calls across 13 files (`daemon.test.js` 111).
+- **`enforceFactRetention`:** one `src` caller, `fact-store.js:368` (inside `appendFactPoints`). `test`: 74 direct calls across 7 files.
+
+### 15.3 Worst-case tick bytes (pinned)
+
+Computed by running the **real translators** and `normalizeFactPoint` on maximum-length inputs (scratch script, not committed). The ~470 B estimate in §2 was too pessimistic for most families, because the translators bound entity keys well below `MAX_FACT_ENTITY_KEY_LENGTH = 256`: `sanitizeIdentityString` truncates to `MAX_STRING_LENGTH = 64` (`diagnostics-sanitizer.js:23`), and the lineage, session, peer and scheduled-job keys are fixed-length hashes. Canary is the exception: its stat attributes make it the largest record.
+
+| family | max record (B) | markers per tick (B) | entity cap used | **worst B/tick** |
+|---|---:|---:|---:|---:|
+| service | 291 | 251 | 1000 (ceiling; hard clamp 5000 gives 1,455,251) | **291,251** |
+| process_lineage | 251 | 297 | 200 | **50,497** |
+| scheduled_job | 354 | 275 | 200 (clamp) | **71,075** |
+| session | 333 | 530 (census + overflow) | 200 (default, unclamped) | **67,130** |
+| peer | 392 | 933 (VPN census + VPN overflow + Tailscale overflow) | 400 (200 VPN + 200 Tailscale defaults, unclamped) | **157,733** |
+| canary | 501 | 247 | 200 | **100,447** |
+
+Session and peer still use the unclamped defaults (§2); S4 must clamp them or pin these values in T8.
+
+### 15.4 T8 arithmetic, re-run with the pinned values and the Q2 horizons
+
+`required = (H_max / 1 h) × worst B/tick × 1.25`, with `H_max` per family from §12 Q2 (service 48 h, scheduled_job 48 h, process_lineage 6 d) and §4.2 (session 30 h, peer 72 h from correlation, canary 6 h):
+
+| family | H_max | required | §4.5 budget | verdict | minimum MiB-rounded budget |
+|---|---|---:|---:|---|---:|
+| service | 48 h | 17,475,060 B (16.7 MiB) | 16 MiB | **fails** | 18 MiB |
+| process_lineage | 6 d (144 ticks) | 9,089,460 B (8.7 MiB) | 8 MiB | **fails** | 10 MiB |
+| scheduled_job | 48 h | 4,264,500 B (4.07 MiB) | 4 MiB | **fails** (just) | 5 MiB |
+| session | 30 h | 2,517,375 B (2.4 MiB) | 4 MiB | passes | 4 MiB |
+| peer | 72 h | 14,195,970 B (13.5 MiB) | 12 MiB (~18 MiB proposed) | fails at 12, passes at 14+ | 16 MiB |
+| canary | 6 h | 753,353 B (0.7 MiB) | 4 MiB | passes | 4 MiB |
+
+The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48 h, 6 d) break T8 for service, process_lineage and scheduled_job, even though the measured max record is smaller than the estimate. Peer needs less than the ~18 MiB proposed. **Revised defaults for S4:** service 18, process_lineage 10, scheduled_job 5, session 4, peer 16, canary 4, network 4, provenance 4: **65 MiB** in total (versus ~62 MiB in Q1). This is an operator item (Q1 follow-up), surfaced at G1; it does not block S1-S3.
+
+**Read-cost decision rule (§4.5).** It does not trip. Worst case with every family at its revised budget, interpolating §2's measurements at ~15 ms/MiB: service 3 reads × 18 MiB ≈ 0.8 s, peer 3 reads (detector, correlation, veto) × 16 MiB ≈ 0.7 s, lineage 2 × 10 MiB ≈ 0.3 s, the rest under 0.3 s, for ~2.1 s per fast tick. That is under T9's 5 s bound. At typical volume most families sit far below budget.
+
+**Linux volume** (§4.6 M2 cost note) is not confirmed: no Linux host is available to this run, and the hard rule forbids live measurement. It stays an estimate.
+
+### 15.5 Decisions
+
+1. **Empty-store floor bound (§4.1 item 2, S0/G1 item).** No new ledger field. Two layers instead:
+   - write side: the future-floor clamp runs on **every** retention pass (prior floor `> nowIso + FUTURE_FACT_TOLERANCE_MS` → `nowIso`, plus `last_continuity_break_ts = nowIso` in the same pass), so a forged far-future floor on an empty store survives at most until the next pass, which stamps a loss;
+   - read side: `buildCompleteness` reports `status: "unknown"` (`degraded_reason: "future_floor"`) whenever the floor is more than `FUTURE_FACT_TOLERANCE_MS` ahead of the read's `nowMs`. That fails closed between the forgery and the next pass.
+   - The non-empty case keeps the in-ledger check (`floor < last_rewrite_newest_ts`, else `invalid`).
+2. **Below-floor records are evicted physically (refinement of §4.1 items 1 and 3).** After a clock rollback, a retention pass can see candidates with `ts <= floor` (appended after the eviction that set the floor). Keeping them would make "every kept record is above the floor" false. A store whose only records are below the floor would then fail the `floor < last_rewrite_newest_ts` validation inside `writeFactIntegrityLedger`, and retention would fail on every pass from then on. So each pass evicts every candidate with `ts <= prior floor` (after the clamp) and counts it as byte-cap eviction. The read filter already hides these records, so dropping them changes no trust outcome. It also makes the floor bound, the suffix assertion and the validation hold by construction.
+3. **Missing ledger over a non-empty store (HIGH-1): first-run carve-out.** `appendFactPoints` writes `facts.jsonl` **before** the first retention pass creates the ledger, so on a genuine first run the ledger is missing while the store is non-empty. Read literally, HIGH-1 would stamp a continuity break on every fresh install. The rule is therefore "missing ledger **and** the store held bytes **before this call's own append**". `appendFactPoints` observes that (ledger missing and `facts.jsonl` absent or empty before appending) and passes it to its internal retention pass. The exported `enforceFactRetention` cannot assert it. A crash between the first append and the first retention pass therefore reads as a lineage break (fail-closed, 31 days degraded), never as a clean bootstrap.
+4. **Q3 = fresh per-family stores, so M4 and M2′ do not apply.** S2 implements no floor derivation for legacy ledgers. The schema bump still goes through `migrateLedgerShape`:
+   - a v1 ledger with `bytecap_evicted_total === 0` → v2 with `bytecap_floor_ts: null` (reads intact; T6);
+   - a v1 ledger with `bytecap_evicted_total > 0` is **not** migrated. It stays v1, fails validation as `invalid`, and takes the existing continuity-break bootstrap: never intact, never a clean `floor: null`. In the shipped slice S5 quarantines the legacy store before any v2 code reads it, so this only ever governs the never-shipped S2 interim state and tests. **G1 question.**
+5. **T1 on HEAD.** `test/fact-store-lockout-e2e.test.js` drives `runDaemonIteration` for 40 hourly structural ticks, plus half-hour fast ticks from tick 26, using the seeded real-volume generator (`test/fixtures/real-volume-tick.js`: 714 records and ~191 KB per tick, against the real 722 records and 185 KB; it omits `provenance.warning`). The 5 MB store starts evicting at tick index 27, the 28th tick. From tick 28 on, it reports all three legs: every structural and fast history read is `degraded` (Leg A); the service, lineage and persistence anchors re-arm on every tick (Leg B); none of them reports coverage (Leg C). It is committed as `todo` (red) in S0 and flips to a normal test in S2. Runtime is about 29 s.
