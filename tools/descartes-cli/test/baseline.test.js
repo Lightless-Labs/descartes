@@ -11,6 +11,91 @@ import {
   runBaseline,
 } from "../src/baseline.js";
 import { loadWatchConfig, resolveWatchStorePaths, writeWatchConfig } from "../src/watch-store.js";
+import { computeSessionBaselineCandidates, writeSessionBaselineStore } from "../src/session-baseline.js";
+import { computePeerBaselineCandidates, writePeerBaselineStore } from "../src/peer-baseline.js";
+
+// ---------------------------------------------------------------------------------------------
+// A1 (2026-10 calibration review) fixtures: status-vs-detector consistency. `baseline status` must
+// never say "watching" for a domain whose detector, run over the SAME fact-history, store and
+// clock, reports no coverage (evaluatedAlertKeys = []).
+// ---------------------------------------------------------------------------------------------
+
+const A1_BASE_MS = Date.parse("2026-09-01T00:00:00.000Z");
+const A1_HOUR_MS = 60 * 60 * 1000;
+const a1Ts = (hour) => new Date(A1_BASE_MS + hour * A1_HOUR_MS).toISOString();
+
+function a1SessionTick(hour, count) {
+  const ts = a1Ts(hour);
+  const points = [];
+  for (let i = 0; i < count; i += 1) {
+    points.push({ ts, fact_name: "session.presence", entity_key: `session.tmux.e-${i}`, attributes: { created_at_fingerprint: "unknown" } });
+  }
+  points.push({ ts, fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } });
+  return points;
+}
+
+function a1PeerTick(hour, count) {
+  const ts = a1Ts(hour);
+  const points = [];
+  for (let i = 0; i < count; i += 1) {
+    points.push({ ts, fact_name: "peer.presence", entity_key: `peer.ssh.e-${i}`, attributes: { source_type: "ssh", presence_state: "observed_active" } });
+  }
+  points.push({ ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } });
+  return points;
+}
+
+function a1Points(tickCount) {
+  const points = [];
+  for (let hour = 0; hour < tickCount; hour += 1) points.push(...a1SessionTick(hour, 5), ...a1PeerTick(hour, 5));
+  return points;
+}
+
+const A1_ESTABLISHED_STORE = { cold_start_pending: false, last_folded_ts: a1Ts(-1) };
+
+const A1_SCENARIOS = [
+  {
+    // The reported bug: a still-pending lockout with >= 6 post-anchor complete ticks read as
+    // "watching" while the detector (gating on the pre-update store) evaluates nothing.
+    name: "cold start still pending, 7 complete ticks after the anchor",
+    store: { cold_start_pending: true, cold_start_reason: "history_lost", cold_start_since_ts: new Date(A1_BASE_MS + 23 * A1_HOUR_MS + 1).toISOString(), last_folded_ts: a1Ts(30) },
+    tickCount: 31,
+    nowHour: 30.5,
+    completeness: { status: "intact" },
+    expectWatching: false,
+  },
+  {
+    name: "established store but fact history degraded (detector would re-arm the lockout)",
+    store: A1_ESTABLISHED_STORE,
+    tickCount: 31,
+    nowHour: 30.5,
+    completeness: { status: "degraded", last_bytecap_evict_ts: a1Ts(29) },
+    expectWatching: false,
+  },
+  {
+    name: "established store but the latest complete census is stale (structural ticks failing)",
+    store: A1_ESTABLISHED_STORE,
+    tickCount: 31,
+    nowHour: 34,
+    completeness: { status: "intact" },
+    expectWatching: false,
+  },
+  {
+    name: "established store, fresh and trusted, but the count baseline is still provisional (10 of 30)",
+    store: A1_ESTABLISHED_STORE,
+    tickCount: 10,
+    nowHour: 9.5,
+    completeness: { status: "intact" },
+    expectWatching: false,
+  },
+  {
+    name: "established, fresh, trusted, count baseline established (positive control)",
+    store: A1_ESTABLISHED_STORE,
+    tickCount: 31,
+    nowHour: 30.5,
+    completeness: { status: "intact" },
+    expectWatching: true,
+  },
+];
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-baseline-test-"));
@@ -119,6 +204,69 @@ test("baseline inspect (R8): tailscale peers are not listed as established for t
   const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
   const result = await buildBaselineInspect(paths, { now: "2026-09-27T07:00:00.000Z", readFactPoints, domain: "peer" });
   assert.deepEqual(result.domains[0].established, ["peer.ssh.aaaaaaaaaaaaaaaa"]);
+});
+
+for (const scenario of A1_SCENARIOS) {
+  test(`A1 status-vs-detector consistency (${scenario.name}): status says "watching" iff the detector reports coverage`, async () => {
+    const paths = await tempPaths();
+    await writeSessionBaselineStore(paths, scenario.store);
+    await writePeerBaselineStore(paths, scenario.store);
+    const points = a1Points(scenario.tickCount);
+    const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: scenario.completeness });
+    const now = new Date(A1_BASE_MS + scenario.nowHour * A1_HOUR_MS).toISOString();
+
+    const status = await buildBaselineStatus(paths, { now, readFactPoints });
+    const noWrite = async () => {};
+    const detectors = {
+      session: await computeSessionBaselineCandidates(paths, { now, readFactPoints, writeSessionBaselineStore: noWrite }),
+      peer: await computePeerBaselineCandidates(paths, { now, readFactPoints, writePeerBaselineStore: noWrite }),
+    };
+    for (const domain of ["session", "peer"]) {
+      const reported = status.domains.find((entry) => entry.domain === domain);
+      const covered = detectors[domain].evaluatedAlertKeys.length > 0;
+      assert.equal(covered, scenario.expectWatching, `sanity: ${domain} detector coverage for this scenario`);
+      assert.equal(
+        reported.phase === "watching",
+        covered,
+        `${domain}: status phase "${reported.phase}" must not claim watching while the detector reports evaluatedAlertKeys=${JSON.stringify(detectors[domain].evaluatedAlertKeys)}`,
+      );
+      if (!covered) assert.notEqual(reported.phase, "watching");
+    }
+  });
+}
+
+test("A1: a still-pending lockout that has accumulated its post-anchor ticks says so honestly, with the cold-start reason", async () => {
+  const paths = await tempPaths();
+  const [scenario] = A1_SCENARIOS;
+  await writeSessionBaselineStore(paths, scenario.store);
+  const points = a1Points(scenario.tickCount);
+  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: scenario.completeness });
+  const status = await buildBaselineStatus(paths, { now: new Date(A1_BASE_MS + scenario.nowHour * A1_HOUR_MS).toISOString(), readFactPoints });
+  const session = status.domains.find((entry) => entry.domain === "session");
+  assert.equal(session.cold_start_pending, true);
+  assert.equal(session.cold_start_reason, "history_lost");
+  assert.match(session.phase, /^still learning — 6 of 6, lockout clears on the next daemon tick$/);
+});
+
+test("A1: untrustworthy history and a stale census each report their own reason, never 'watching'", async () => {
+  const degradedPaths = await tempPaths();
+  await writeSessionBaselineStore(degradedPaths, A1_ESTABLISHED_STORE);
+  const points = a1Points(31);
+  const degraded = await buildBaselineStatus(degradedPaths, {
+    now: a1Ts(30.5),
+    readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded", last_bytecap_evict_ts: a1Ts(29) } }),
+  });
+  const degradedSession = degraded.domains.find((entry) => entry.domain === "session");
+  assert.equal(degradedSession.phase, "locked out — fact history untrustworthy (history_degraded)");
+  assert.equal(degradedSession.history_trust, "history_degraded");
+
+  const stalePaths = await tempPaths();
+  await writeSessionBaselineStore(stalePaths, A1_ESTABLISHED_STORE);
+  const stale = await buildBaselineStatus(stalePaths, {
+    now: a1Ts(34),
+    readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } }),
+  });
+  assert.match(stale.domains.find((entry) => entry.domain === "session").phase, /^stale — /);
 });
 
 test("baseline enable and disable write only watch.json", async () => {

@@ -300,6 +300,18 @@ descartes baseline disable               # disable structural watching
 `baseline inspect` recomputes its answer from the fact-history window. Its answer can differ
 slightly from the daemon's last tick. `descartes alerts watch` remains the live alert tail.
 
+`baseline status` says a domain is `watching` only when its detector would really evaluate on
+the next tick. That means the cold-start lockout has cleared, the fact history is trusted, the
+latest census is complete and fresh, and the detector's own baseline is ready. Otherwise it
+reports one of these, with the reason:
+
+- `still learning — N of M`
+- `locked out — fact history untrustworthy (…)`
+- `cannot establish — census incomplete`
+- `stale — …`
+
+Freshness uses the default 3-hour window (3× the hourly structural interval).
+
 The authoring commands remain separate:
 
 ```bash
