@@ -30,7 +30,7 @@
 // is still a continuity break (prefix-digest check), and the corrupt, schema-invalid, continuity
 // and future-fact channels keep their trust semantics (I4). last_bytecap_evict_ts and
 // bytecap_evicted_total stay as informational fields.
-import { noveltyFamilyForRule, ruleHorizonMs } from "./fact-families.js";
+import { RULE_HORIZONS, noveltyFamilyForRule, ruleHorizonMs } from "./fact-families.js";
 
 export const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = Object.freeze([
   "last_future_fact_ts",
@@ -205,6 +205,29 @@ export function noveltyHorizonOk(readResult, ruleId, nowMs) {
 export function noveltyRuleEligible(readResult, ruleId, nowMs) {
   if (validNoveltySeenSet(readResult, ruleId)) return noveltyHorizonOk(readResult, ruleId, nowMs);
   return readResult?.completeness?.coverage === "full" && ruleHorizonOk(readResult, ruleId, nowMs);
+}
+
+/**
+ * THE per-rule eligibility decision for a read (S3b review MEDIUM-2), shared by the detectors' own
+ * gates and the daemon's independent veto + horizon-short signal (I12), dispatching on the rule's
+ * registered kind so the two can never disagree on the referent:
+ *   - "novelty": noveltyRuleEligible (seen-set horizon, or full coverage + the fact-floor horizon);
+ *   - "correlation": its registered 3 d horizon AND certifiedReadWindowOk over the detector's whole
+ *     read window (`readWindowMs`, required -- fails closed without it). The detector's "unattributed-
+ *     looking" test is a novelty proxy over that whole window, so a byte-cap floor anywhere inside
+ *     it silences correlation even when the 3 d horizon is met; the signal must see that silence;
+ *   - every other kind: ruleHorizonOk.
+ * An unregistered rule fails closed. Status/loss trust is NOT decided here (factHistoryTrustworthy).
+ */
+export function ruleEligible(readResult, ruleId, nowMs, { readWindowMs } = {}) {
+  const rule = RULE_HORIZONS.get(ruleId);
+  if (!rule) return false;
+  if (rule.kind === "novelty") return noveltyRuleEligible(readResult, ruleId, nowMs);
+  if (rule.kind === "correlation") {
+    if (!Number.isFinite(readWindowMs)) return false;
+    return ruleHorizonOk(readResult, ruleId, nowMs) && certifiedReadWindowOk(readResult, { nowMs, windowMs: readWindowMs });
+  }
+  return ruleHorizonOk(readResult, ruleId, nowMs);
 }
 
 /**

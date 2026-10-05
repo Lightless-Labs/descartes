@@ -13,7 +13,7 @@ import {
   RULE_HORIZONS,
   ruleHorizonMs,
 } from "../src/fact-families.js";
-import { certifiedHorizonOk, certifiedReadWindowOk } from "../src/fact-store-completeness.js";
+import { certifiedHorizonOk, certifiedReadWindowOk, ruleEligible, ruleHorizonOk } from "../src/fact-store-completeness.js";
 import { HISTORY_DEPENDENT_ALERT_RULE_IDS } from "../src/daemon.js";
 
 const HOUR = 60 * 60 * 1000;
@@ -154,6 +154,21 @@ test("certifiedReadWindowOk: fails closed with no valid ledger, malformed comple
   assert.equal(certifiedReadWindowOk(completeness({ bytecap_floor_ts: "garbage", coverage: "narrowed" }), { nowMs: NOW_MS, windowMs: HOUR }), false);
   assert.equal(certifiedReadWindowOk(completeness(), { nowMs: Number.NaN, windowMs: HOUR }), false);
   assert.equal(certifiedReadWindowOk(completeness(), { nowMs: NOW_MS, windowMs: -1 }), false);
+});
+
+test("ruleEligible (S3b review MEDIUM-2): correlation is eligible only when its whole read window is certified, not merely its 3 d horizon -- the daemon signal/veto and the detector share this one predicate", () => {
+  const CORRELATION = "correlation.login_kill_proximity";
+  const tenDaysBack = completeness({ coverage: "narrowed", bytecap_floor_ts: iso(NOW_MS - 10 * DAY) });
+  assert.equal(ruleHorizonOk(tenDaysBack, CORRELATION, NOW_MS), true, "discriminating fixture: the 3 d horizon alone is met");
+  assert.equal(certifiedReadWindowOk(tenDaysBack, { nowMs: NOW_MS, windowMs: 31 * DAY }), false, "but the 31 d read window sees the narrowing");
+  assert.equal(ruleEligible(tenDaysBack, CORRELATION, NOW_MS, { readWindowMs: 31 * DAY }), false);
+  assert.equal(ruleEligible(tenDaysBack, CORRELATION, NOW_MS), false, "fails closed without a read window");
+  const fortyDaysBack = completeness({ coverage: "narrowed", bytecap_floor_ts: iso(NOW_MS - 40 * DAY) });
+  assert.equal(ruleEligible(fortyDaysBack, CORRELATION, NOW_MS, { readWindowMs: 31 * DAY }), true, "a floor older than the read window is invisible to it");
+  // Non-correlation rules keep their registered horizon; an unknown rule fails closed.
+  assert.equal(ruleEligible(tenDaysBack, "session.count_drop", NOW_MS), true);
+  assert.equal(ruleEligible(completeness({ coverage: "narrowed", bytecap_floor_ts: iso(NOW_MS - 2 * HOUR) }), "session.count_drop", NOW_MS), false);
+  assert.equal(ruleEligible(tenDaysBack, "not.a.rule", NOW_MS, { readWindowMs: 31 * DAY }), false);
 });
 
 function servicePoint(ts, name) {

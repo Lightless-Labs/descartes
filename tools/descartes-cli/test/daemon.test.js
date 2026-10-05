@@ -52,6 +52,7 @@ import {
 } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
+import { certifiedReadWindowOk, ruleHorizonOk } from "../src/fact-store-completeness.js";
 import { readContainmentRecommendConfig, writeContainmentRecommendConfig } from "../src/containment-recommend.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID, loadServiceAppearanceBaselineStore, loadServiceBaselineStore, writeServiceAppearanceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
@@ -4682,6 +4683,18 @@ test("S3 horizon-short signal: a corrupt prior status or a future since_ts resta
     readDaemonStatus: async () => { throw new Error("corrupt"); },
   });
   assert.equal(corrupt.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+});
+
+test("S3b review MEDIUM-2: correlation silenced by a byte-cap floor inside its 31 d read window (but outside its 3 d horizon) is reported horizon-short, matching the detector's own refusal", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 10 * 24);
+  const read = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(ruleHorizonOk(read, CORRELATION_RULE_ID, Date.parse(now)), true, "discriminating: the 3 d horizon alone is met");
+  assert.equal(certifiedReadWindowOk(read, { nowMs: Date.parse(now), windowMs: 31 * 24 * 60 * 60 * 1000 }), false, "the detector refuses on this read");
+  const result = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  assert.deepEqual(Object.keys(result.status.history_horizon_short?.rules ?? {}), [CORRELATION_RULE_ID], "the silent detector is reported, never silently");
 });
 
 test("S3 horizon-short signal: no fact read (both tiers off) and an un-narrowed store report nothing", async () => {

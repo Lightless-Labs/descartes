@@ -33,7 +33,7 @@ import { alertId, readAlertRecords } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { certifiedReadWindowOk, factHistoryTrustworthy, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_PEER_PRESENCE_WINDOW_MS } from "./peer-signature-store.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "./session-baseline.js";
@@ -327,10 +327,11 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
   // horizon, which is also required (ruleHorizonOk; it can bind on a rolled-back age floor).
   // Replaces the interim requireFullCoverage gate (MEDIUM-1), which also refused on the age floor
   // inside this 31 d window -- i.e. permanently, once a store was 30 days old.
+  // S3b review MEDIUM-2: the read-window + horizon check is the shared ruleEligible predicate, the
+  // same one the daemon's veto and horizon-short signal use, so a silence here is always reported.
   if (
     !factHistoryTrustworthy(readResult, { nowMs }).trust
-    || !certifiedReadWindowOk(readResult, { nowMs, windowMs: factWindowMs })
-    || !ruleHorizonOk(readResult, CORRELATION_RULE_ID, nowMs)
+    || !ruleEligible(readResult, CORRELATION_RULE_ID, nowMs, { readWindowMs: factWindowMs })
   ) {
     return { candidates: [], evaluatedAlertKeys: [] };
   }

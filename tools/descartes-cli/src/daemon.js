@@ -10,7 +10,7 @@ import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, noveltyRuleEligible, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.js";
 import { HISTORY_HORIZON_SHORT_ALERT_TICKS, NOVELTY_FAMILIES, RULE_HORIZONS } from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
@@ -1182,9 +1182,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
     // Novelty rules (S3b): the SAME predicate the detectors use -- a valid seen-set and its horizon,
     // or (without one) full coverage plus the fact-floor horizon. Every other rule: the fact floor.
-    horizonVetoedRuleIds = new Set([...RULE_HORIZONS.keys()].filter((ruleId) => (RULE_HORIZONS.get(ruleId).kind === "novelty"
-      ? !noveltyRuleEligible(factHistoryReadResult, ruleId, nowMs)
-      : !ruleHorizonOk(factHistoryReadResult, ruleId, nowMs))));
+    // S3b review MEDIUM-2: correlation's referent is its whole 31 d read window (the same window and
+    // predicate the detector uses -- ruleEligible), not only its 3 d horizon, so a correlation the
+    // detector silenced is vetoed AND reported horizon-short here.
+    horizonVetoedRuleIds = new Set([...RULE_HORIZONS.keys()].filter((ruleId) => !ruleEligible(factHistoryReadResult, ruleId, nowMs, { readWindowMs: DEFAULT_BASELINE_FACT_WINDOW_MS })));
     // Display-only per-family seen-set state (the overflow / lineage-mismatch "status reason").
     if (factHistoryReadResult?.seen_sets && typeof factHistoryReadResult.seen_sets === "object") {
       noveltySeenSets = Object.fromEntries(Object.entries(factHistoryReadResult.seen_sets).map(([family, set]) => [family, {

@@ -70,9 +70,11 @@ export function factFamilyForName(factName) {
   return FACT_FAMILY_BY_NAME.get(factName);
 }
 
-// kind is descriptive (status/diagnostics); the gate itself is the same predicate for every kind,
+// kind selects the eligibility predicate (fact-store-completeness.js ruleEligible, shared by the
+// detectors and the daemon's veto/horizon-short signal): the fact-floor horizon for every kind,
 // except that "novelty" rules measure their horizon against the S3b seen-set's certified span
-// rather than the fact store's floor (see fact-store-completeness.js / novelty-seen-set.js).
+// rather than the fact store's floor (see novelty-seen-set.js), and "correlation" additionally
+// requires its whole read window to be certified (S3b review MEDIUM-2).
 const RULE_HORIZON_ENTRIES = [
   // Set-diff over the retained window: established >= 3 sightings plus the 6-tick lockout
   // (DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT, service-baseline.js).
