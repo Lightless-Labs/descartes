@@ -31,7 +31,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildBaselineStatus, BASELINE_STATUS_RULE_IDS } from "../src/baseline.js";
+// A namespace import, so this file still loads against a baseline.js that predates the rule-id export
+// (the Leg E regression below must fail on its assertion against the pre-S6 status, not at import).
+import * as baselineModule from "../src/baseline.js";
 import { runDaemonIteration } from "../src/daemon.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { appendFactPoints, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
@@ -57,6 +59,7 @@ import { computeSessionBaselineCandidates, loadSessionBaselineStore, SESSION_CHU
 import { computePeerBaselineCandidates, loadPeerBaselineStore, PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, writePeerBaselineStore } from "../src/peer-baseline.js";
 import { realVolumeStructuralCollectors } from "./fixtures/real-volume-tick.js";
 
+const { buildBaselineStatus } = baselineModule;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const BASE_MS = Date.parse("2026-10-06T00:00:00.000Z");
@@ -472,7 +475,7 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
   // always empty.
   assert.ok(coverage.zeroKeyWatching.has(SESSION_CHURN_RULE_ID), "session.churn watches an empty session census");
   assert.ok(coverage.checkpoints >= 20, `checkpoints: ${coverage.checkpoints}`);
-  assert.deepEqual([...BASELINE_STATUS_RULE_IDS].sort(), [...RULES.keys()].sort(), "status covers exactly the watch-tier rules");
+  assert.deepEqual([...(baselineModule.BASELINE_STATUS_RULE_IDS ?? [])].sort(), [...RULES.keys()].sort(), "status covers exactly the watch-tier rules");
 });
 
 test("Leg E regression: a domain whose lockout cleared but whose count rule is still warming up is not reported as watching", { timeout: 120_000 }, async () => {
