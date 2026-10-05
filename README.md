@@ -310,7 +310,16 @@ reports one of these, with the reason:
 - `cannot establish — census incomplete`
 - `stale — …`
 
-Freshness uses the default 3-hour window (3× the hourly structural interval).
+Freshness uses the default 3-hour window (3× the hourly structural interval), or 3× the
+structural interval recorded in the daemon's last status when that cadence is configured.
+Session status can report `watching (churn)` while the count baseline is still learning because
+churn is evaluated from a fresh pair of complete observations and has no 30-sample count warm-up.
+
+Peer-count watching has one deliberate source boundary: on hosts where `vpn-peer-status` supplies
+the census marker, Tailscale peers are not counted because that marker does not cover tailnet
+membership. Consequently, tailnet-membership bursts are not tracked by the mixed-source peer-count
+baseline. On Tailscale-only hosts, Tailscale peers remain countable and `peer.count_spike` still
+has coverage; `peer.count_drop` still requires the VPN census marker.
 
 The authoring commands remain separate:
 
