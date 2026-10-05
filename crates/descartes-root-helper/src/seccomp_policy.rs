@@ -18,7 +18,8 @@
 //!     - READING another process's memory via `/proc/<pid>/mem`: `lseek`, `pread64`, `preadv*`
 //!       are absent, so a `read` can only ever start at offset 0 (never a mapped address);
 //!     - `ptrace`, `process_vm_readv/writev`, `pidfd_getfd`, `open_by_handle_at`, `openat2`,
-//!       `execve*`, `socket*`, every `*stat*` (metadata oracle over DAC-protected paths);
+//!       `execve*`, `socket*`, and unrestricted stat syscalls (metadata oracle over DAC-protected
+//!       paths); `newfstatat` is admitted only for a non-AT_FDCWD dirfd with flags == 0;
 //!     - writes to anything but stdout/stderr (fds 1, 2);
 //!     - new executable memory (`PROT_EXEC` via mmap/mprotect) and file-backed mmaps;
 //!     - every `prctl` except clearing the ambient capability set; `tgkill` of any other process;
@@ -123,8 +124,9 @@ pub const STDERR_FD: u32 = 2;
 ///   - clock_gettime: normally vDSO-served; allowlisted because strace under-reports vDSO calls.
 ///
 /// REMOVED relative to the pre-2026-10 allowlist: lseek (the `/proc/<pid>/mem` read primitive),
-/// statx/fstat (metadata oracle; the admitted newfstatat is limited by code to the fixed `exe`
-/// entry below a pinned proc dirfd), getrandom (the policy model
+/// statx/fstat (unrestricted metadata oracles; the admitted newfstatat is limited by policy to a
+/// non-AT_FDCWD dirfd with flags == 0, and by code to the fixed `exe` entry below a pinned proc
+/// dirfd), getrandom (the policy model
 /// currently has only ALLOW/KILL actions, so it remains KILL rather than using SECCOMP_RET_ERRNO;
 /// the helper no longer needs it), readlink (x86_64 path-based variant; only std::fs::read_link
 /// needed it).
@@ -157,8 +159,22 @@ pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
         Rule::allow(t.getdents64),
         Rule::allow(t.readlinkat),
         // The helper uses this only to follow the fixed "exe" entry below a pinned /proc/<pid>
-        // dirfd and compare the mapped binary's dev+ino across the cmdline/final checks.
-        Rule::allow(t.newfstatat),
+        // dirfd and compare the mapped binary's dev+ino across the cmdline/final checks. The
+        // syscall cannot escape to the current working directory and cannot use AT_EMPTY_PATH or
+        // AT_SYMLINK_NOFOLLOW; pathname selection remains constrained by the pinned dirfd/code.
+        Rule::when(
+            t.newfstatat,
+            vec![
+                ArgCheck::Low32NotEqual {
+                    arg: 0,
+                    value: (-100i32) as u32, // AT_FDCWD
+                },
+                ArgCheck::Low32OneOf {
+                    arg: 3,
+                    values: vec![0], // flags == 0
+                },
+            ],
+        ),
         Rule::allow(t.close),
         Rule::when(
             t.fcntl,
@@ -495,6 +511,18 @@ mod tests {
             assert!(h.killed(t.openat, [3, 0, directory, 0, 0, 0]));
             assert!(h.killed(t.openat, [3, 0, file, 0, 0, 0]));
             assert!(h.allowed(t.openat, [3, 0, file | u64::from(t.o_nofollow), 0, 0, 0]));
+        }
+    }
+
+    #[test]
+    fn newfstatat_is_limited_to_a_pinned_dirfd_and_zero_flags() {
+        for (t, _) in both_arches() {
+            let h = Harness::new(t.clone());
+            let at_fdcwd = (-100i64) as u64;
+            assert!(h.allowed(t.newfstatat, [3, 0, 0, 0, 0, 0]));
+            assert!(h.killed(t.newfstatat, [at_fdcwd, 0, 0, 0, 0, 0]));
+            assert!(h.killed(t.newfstatat, [3, 0, 0, 0x1000, 0, 0])); // AT_EMPTY_PATH
+            assert!(h.killed(t.newfstatat, [3, 0, 0, 0x100, 0, 0])); // AT_SYMLINK_NOFOLLOW
         }
     }
 

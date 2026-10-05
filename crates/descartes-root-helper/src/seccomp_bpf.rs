@@ -116,6 +116,8 @@ pub enum ArgCheck {
     Low32BitsClear { arg: u8, mask: u32 },
     /// Every bit of `mask` must be SET in the low 32 bits of `args[arg]`.
     Low32BitsSet { arg: u8, mask: u32 },
+    /// The low 32 bits of `args[arg]` must not equal `value`.
+    Low32NotEqual { arg: u8, value: u32 },
 }
 
 /// Allow syscall `nr` iff every check passes; a failing check KILLS (see the module doc).
@@ -178,7 +180,8 @@ fn compile_block(rule: &Rule) -> Result<Vec<Insn>, CompileError> {
             ArgCheck::Low32OneOf { arg, .. }
             | ArgCheck::U64OneOf { arg, .. }
             | ArgCheck::Low32BitsClear { arg, .. }
-            | ArgCheck::Low32BitsSet { arg, .. } => *arg,
+            | ArgCheck::Low32BitsSet { arg, .. }
+            | ArgCheck::Low32NotEqual { arg, .. } => *arg,
         };
         if arg >= MAX_ARGS {
             return Err(CompileError::ArgIndexOutOfRange(rule.nr));
@@ -223,6 +226,11 @@ fn compile_block(rule: &Rule) -> Result<Vec<Insn>, CompileError> {
                 body.push(stmt(BPF_ALU | BPF_AND | BPF_K, *mask));
                 kill_jumps.push((body.len(), KillSlot::False));
                 body.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *mask, 0, 0));
+            }
+            ArgCheck::Low32NotEqual { value, .. } => {
+                body.push(load(arg_low_offset(arg)));
+                kill_jumps.push((body.len(), KillSlot::True));
+                body.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *value, 0, 0));
             }
         }
     }
@@ -472,6 +480,23 @@ mod tests {
         );
         assert_eq!(
             evaluate(&program, &data(9, [0, 0, 0x3, 0x02, 0, 0])),
+            SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[test]
+    fn low32_not_equal_kills_only_the_forbidden_value() {
+        let program = compile(&policy(vec![Rule::when(
+            99,
+            vec![ArgCheck::Low32NotEqual { arg: 0, value: 7 }],
+        )]))
+        .unwrap();
+        assert_eq!(
+            evaluate(&program, &data(99, [6, 0, 0, 0, 0, 0])),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            evaluate(&program, &data(99, [7, 0, 0, 0, 0, 0])),
             SECCOMP_RET_KILL_PROCESS
         );
     }
