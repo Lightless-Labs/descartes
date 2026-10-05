@@ -348,18 +348,33 @@ for (const family of FACT_FAMILY_IDS) {
   }
 }
 
+// G2 L4: the upper bound on a configured budget. Every whole-file read of a family's store costs in
+// proportion to its size, every fast tick (service is read four times per tick with learned on), and
+// T9's read-cost bound is modelled at the DEFAULTS -- so an unbounded same-UID watch.json value would
+// leave both the file and the per-tick read cost unbounded, and make the oversize check (relative to
+// the budget) meaningless. 4x the default bounds read cost at 4x the T9 model, and is exactly enough
+// to restore the T8 invariant down to a 15-minute structural interval (G2 L3) for every family.
+export const BUDGET_CEILING_MULTIPLIER = 4;
+
+export function familyBudgetCeilingBytes(family) {
+  requireFactFamily(family);
+  return BUDGET_CEILING_MULTIPLIER * FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+}
+
 /**
  * Effective per-family budgets from watch.json's `fact_store_budgets` map (§4.5 Config). A missing,
  * non-finite, non-integer, or too-small value falls back to the family default; "too small" means
  * below the T8 invariant (familyBudgetFloorBytes), never merely below one tick, because a budget
  * between one tick and the invariant would leave the family permanently horizon-short (a
  * novelty-absorbing window, §4.2). Rejected values are reported (status reason
- * `budget_below_horizon_floor` / `invalid`), never silently applied. Keys that are not registry
+ * `budget_below_horizon_floor` / `invalid`), never silently applied. A value above the ceiling
+ * (familyBudgetCeilingBytes, G2 L4) is clamped to it and reported (`budget_above_ceiling`). Keys that are not registry
  * families are ignored (and reported). Pure.
  */
 export function resolveFactStoreBudgets(configured) {
   const budgets = {};
   const rejected = {};
+  const clamped = {};
   const source = {};
   const map = configured && typeof configured === "object" && !Array.isArray(configured) ? configured : {};
   for (const family of FACT_FAMILY_IDS) {
@@ -379,13 +394,20 @@ export function resolveFactStoreBudgets(configured) {
       budgets[family] = fallback;
       source[family] = "default";
       rejected[family] = { reason: "budget_below_horizon_floor", configured_bytes: value, floor_bytes: floor };
+    } else if (value > familyBudgetCeilingBytes(family)) {
+      // G2 L4: clamped (not refused -- the operator asked for MORE than the ceiling, so the ceiling is
+      // the closest bounded value) and reported.
+      const ceiling = familyBudgetCeilingBytes(family);
+      budgets[family] = ceiling;
+      source[family] = "configured";
+      clamped[family] = { reason: "budget_above_ceiling", configured_bytes: value, ceiling_bytes: ceiling };
     } else {
       budgets[family] = value;
       source[family] = "configured";
     }
   }
   const unknownKeys = Object.keys(map).filter((key) => !KNOWN_FAMILIES.has(key)).sort();
-  return { budgets, source, rejected, ...(unknownKeys.length > 0 ? { unknown_families: unknownKeys } : {}) };
+  return { budgets, source, rejected, clamped, ...(unknownKeys.length > 0 ? { unknown_families: unknownKeys } : {}) };
 }
 
 // The horizon-short signal (§4.2, §4.4, I12): a rule horizon-ineligible for more than

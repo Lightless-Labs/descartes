@@ -1021,3 +1021,40 @@ Final code commit `708e379`: **2196 tests, 2162 pass, 0 fail, 34 skipped, 0 todo
 
 The operator restores the invariant by raising `fact_store_budgets`. Tests cover the floor at 15 minutes, 1 h and 2 h and on invalid input (`fact-families.test.js` "G2 L3"), and the status entry at 1 h, at 15 minutes, and after a raise (`fact-store-status.test.js` "G2 L3"). Auto-scaling is left as G2 question 2 (§20.7).
 
+### 20.5 L4: no upper bound on a configured budget (fixed)
+
+**Confirmed.** `resolveFactStoreBudgets` accepted any safe integer at or above the floor. A same-UID `watch.json` with `service: 1e12` left the file, and its four whole-file reads per fast tick, without bound. The oversize check is relative to the budget, so it could never fire either.
+
+**Fix.** `familyBudgetCeilingBytes(family)` is `BUDGET_CEILING_MULTIPLIER` (4) times the family default:
+- service 72 MiB, process_lineage 40 MiB, scheduled_job 20 MiB, peer 64 MiB, and 16 MiB for each of session, canary, network and provenance;
+- a value above the ceiling is clamped to it, keeps `source: "configured"`, and is reported as `clamped: {reason: "budget_above_ceiling", configured_bytes, ceiling_bytes}`;
+- each status entry also carries `ceiling_bytes`.
+
+The value is clamped rather than refused because the operator asked for more, and the ceiling is the closest bounded value. Why 4x:
+- Read cost is bounded at 4x the T9 model. T9 itself still models only the defaults.
+- It is exactly enough to restore the T8 invariant down to a 15-minute structural interval for every family with a horizon (L3), which a test pins.
+
+Tests: `fact-families.test.js` "G2 L4" covers clamping per family, the ceiling being accepted as is, and the coherence with L3. `fact-store-status.test.js` "G2 L4" covers the status entry and an oversize store measured against the clamped budget.
+
+### 20.6 L5: the `options.factStoreBudgets` seam (rejected as a defect; G2 question stays open)
+
+**Not a defect.** The seam is real and does bypass the T8 floor. But `runDaemonIteration`'s only production caller, `runForegroundDaemonLoop`, passes exactly `{ mode: "foreground" }`. Like the roughly 100 other injection keys on `runDaemonIteration` (`readFactPoints`, `appendFactPoints`, `migrateLegacyFactStore`, ...), it is reachable from neither `watch.json`, `learned.json` nor the CLI. Removing it would not close anything: an injected `appendFactPoints` bypasses the floor in exactly the same way. Restructuring T1 or adding an env guard is a test-architecture choice, so §19.5 question 3 stays open for the operator. No new seam was added by this rework; L1's `stat` is called directly.
+
+### 20.7 G2 questions raised by this rework
+
+1. **Post-upgrade horizon-short signal (H1).** Every upgraded host now raises `daemon.fact_history.horizon_short` after 24 structural intervals and holds it for about 1 d (service, scheduled_job) and about 5 d (lineage). Accept it as the honest signal of a discarded history, or suppress the fixed alert for a short-since that equals the upgrade tick? Suppressing would hide a real novelty-absorbing window.
+2. **Auto-scaling budgets to the structural interval (L3).** Keep it report-only (`horizon_invariant_unmet`), or scale the defaults to the interval up to the L4 ceiling, accepting up to 4x read cost?
+3. **Ceiling factor (L4).** Is 4x the default right? It keeps T9's model within 4x and admits a 15-minute interval.
+
+### 20.8 Commits and full-suite totals
+
+Every run used fresh scratch `XDG_*` directories (`mktemp -d`). Baseline before the rework (`1ec2325`): 2196 tests, 2162 pass, 0 fail, 34 skipped.
+
+| commit | finding | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `ae282c8` | H1 | 2203 | 2169 | 0 | 34 |
+| `d8fd52d` | L2 | 2203 | 2169 | 0 | 34 |
+| `cb654c0` | L1 | 2204 | 2170 | 0 | 34 |
+| `d5f38de` | L3 | 2206 | 2172 | 0 | 34 |
+| (L4, this commit) | L4 + §20.5-§20.8 | see the final state in HANDOFF | | | |
+

@@ -12,7 +12,7 @@ import { runDaemonIteration } from "../src/daemon.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { loadWatchConfig, normalizeWatchConfig, writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPointsByFamily, readFactPoints } from "../src/fact-store.js";
-import { FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES, FAMILY_TICK_SHAPES, familyBudgetFloorBytes } from "../src/fact-families.js";
+import { FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES, FAMILY_TICK_SHAPES, familyBudgetCeilingBytes, familyBudgetFloorBytes } from "../src/fact-families.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -191,6 +191,26 @@ test("G2 L3: a budget below the T8 invariant at the configured structural interv
   assert.equal(families.peer.horizon_invariant_unmet, undefined, "raised to the 15-minute floor: met");
   assert.equal(families.network.horizon_invariant_unmet, undefined, "no horizon, no invariant");
   assert.equal(result.status.fact_store_completeness.families.service.horizon_invariant_unmet, true, "carried on the completeness entry");
+});
+
+// G2 L4: a same-UID watch.json cannot size a store (and its whole-file reads every fast tick) without
+// bound; the oversize check is relative to the budget, so it needs the bound too.
+test("G2 L4: a configured budget above the ceiling is clamped and reported; the store's oversize check uses the clamped budget", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true, fact_store_budgets: { service: 1e12 } });
+  const result = await tick(paths, 0);
+  const service = result.status.fact_store_budgets.families.service;
+  assert.equal(service.budget_bytes, familyBudgetCeilingBytes("service"));
+  assert.equal(service.source, "configured");
+  assert.equal(service.ceiling_bytes, familyBudgetCeilingBytes("service"));
+  assert.deepEqual(service.clamped, { reason: "budget_above_ceiling", configured_bytes: 1e12, ceiling_bytes: familyBudgetCeilingBytes("service") });
+  const oversize = await tick(paths, 0.5, {
+    readFactPoints: async (descartesPaths, options) => {
+      const read = await readFactPoints(descartesPaths, options);
+      return options.family === "service" ? { ...read, bytes: familyBudgetCeilingBytes("service") + FAMILY_TICK_SHAPES.get("service").worstTickBytes + 1 } : read;
+    },
+  });
+  assert.equal(oversize.status.fact_store_budgets.families.service.retention_failing, true);
 });
 
 test("status: a family store that was never created is `absent` (not observed), never 'unknown'", async () => {

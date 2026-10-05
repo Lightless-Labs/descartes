@@ -17,6 +17,7 @@ import {
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
   FAMILY_TICK_SHAPES,
+  familyBudgetCeilingBytes,
   familyBudgetFloorBytes,
   HISTORY_HORIZON_SHORT_ALERT_TICKS,
   NOVELTY_FAMILIES,
@@ -1389,8 +1390,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // S4 (fact-store capacity plan §4.3-§4.5): the per-family budget/retention status block, for EVERY
   // registry family (display only; consulted by no trust decision). Computed only when a tier is on
   // (no I/O otherwise). Per family:
-  //   - budget_bytes / source / floor_bytes, and `rejected` ({reason: budget_below_horizon_floor |
-  //     invalid}) when watch.json's value was refused;
+  //   - budget_bytes / source / floor_bytes / ceiling_bytes, `rejected` ({reason:
+  //     budget_below_horizon_floor | invalid}) when watch.json's value was refused, and `clamped`
+  //     ({reason: budget_above_ceiling}) when it was above the ceiling (G2 L4);
   //   - `horizon_invariant_unmet` ({required_bytes, structural_interval_ms}) when the effective budget is
   //     below the T8 invariant at this tick's structural interval (G2 L3: below 1 h it scales up);
   //   - last_tick_bytes and `cap_below_tick` (live per-tick volume above the effective budget: the
@@ -1429,7 +1431,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         budget_bytes: budgetBytes,
         source: options.factStoreBudgets ? "override" : budgetResolution.source[family],
         floor_bytes: familyBudgetFloorBytes(family),
+        ceiling_bytes: familyBudgetCeilingBytes(family),
         ...(budgetResolution.rejected[family] ? { rejected: budgetResolution.rejected[family] } : {}),
+        ...(budgetResolution.clamped?.[family] ? { clamped: budgetResolution.clamped[family] } : {}),
       };
       // G2 L3: the T8 invariant at THIS tick's structural interval (operator-settable). Below 1 h the
       // same bytes hold fewer hours, so a budget sized at 1 h can leave the family permanently

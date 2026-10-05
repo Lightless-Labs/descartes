@@ -11,6 +11,7 @@ import {
   FAMILY_DEFAULT_BUDGET_BYTES,
   FAMILY_HORIZON_MAX_MS,
   FAMILY_TICK_SHAPES,
+  familyBudgetCeilingBytes,
   familyBudgetFloorBytes,
   groupFactPointsByFamily,
   requireFactFamily,
@@ -324,6 +325,29 @@ test("G2 L3: the T8 floor is computed at the structural interval -- scaled up be
   assert.ok(FAMILY_DEFAULT_BUDGET_BYTES.get("peer") < familyBudgetFloorBytes("peer", { structuralIntervalMs: 15 * MIN }));
   // network/provenance have no horizon: their floor stays the default at any interval.
   assert.equal(familyBudgetFloorBytes("network", { structuralIntervalMs: MIN }), FAMILY_DEFAULT_BUDGET_BYTES.get("network"));
+});
+
+// G2 L4: a configured budget has an upper bound -- the file, and its whole-file reads every fast tick,
+// stay bounded (T9 is modelled at the defaults; read cost scales linearly up to this ceiling).
+test("G2 L4: a configured budget above the per-family ceiling (4x the default) is clamped to it and reported as budget_above_ceiling", () => {
+  for (const family of FACT_FAMILY_IDS) {
+    const ceiling = familyBudgetCeilingBytes(family);
+    assert.equal(ceiling, 4 * FAMILY_DEFAULT_BUDGET_BYTES.get(family));
+    const huge = resolveFactStoreBudgets({ [family]: 1e12 });
+    assert.equal(huge.budgets[family], ceiling);
+    assert.equal(huge.source[family], "configured");
+    assert.deepEqual(huge.clamped[family], { reason: "budget_above_ceiling", configured_bytes: 1e12, ceiling_bytes: ceiling });
+    assert.equal(huge.rejected[family], undefined);
+    const atCeiling = resolveFactStoreBudgets({ [family]: ceiling });
+    assert.equal(atCeiling.budgets[family], ceiling);
+    assert.equal(atCeiling.clamped[family], undefined);
+  }
+  // Coherence with L3: the ceiling admits a budget that restores the invariant down to a 15-minute
+  // structural interval for every family with a horizon.
+  for (const family of FAMILY_HORIZON_MAX_MS.keys()) {
+    assert.ok(familyBudgetCeilingBytes(family) >= familyBudgetFloorBytes(family, { structuralIntervalMs: 15 * 60 * 1000 }), family);
+  }
+  assert.deepEqual(resolveFactStoreBudgets(undefined).clamped, {});
 });
 
 test("T12 routing: groupFactPointsByFamily routes by fact_name and THROWS on an unregistered name (whole batch, before anything is returned)", () => {
