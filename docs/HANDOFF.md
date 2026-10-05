@@ -1,6 +1,6 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-05 (evening)
 
 ## Review-fix update — 2026-10-05
 
@@ -22,6 +22,13 @@ raises and clears). Full `npm test` after this change reports 2074 tests / 2018 
 34 skip; the same 20 sandbox loopback and 2 live-process provenance environment failures remain.
 
 ## Current Status
+
+> **RESUME HERE (2026-10-05, evening) — 4 parallel tracks; local `main` has 2 merges + plan docs, NOT pushed (awaiting operator push confirmation).**
+> - **Merged to local `main`:** `fix/provenance-identity-coverage-2026-10` (honest reconcile clocks + census honesty; IPv6 `[::]` public + address-family-preserving keys; macOS UDP `*:*` tolerated; **identity recovery coverage DEFERRED SAFE-FROZEN** after 4 daybreak rounds — unprivileged census can't prove cross-UID/netns absence; follow-up `todos/2026-10-05-provenance-identity-recovery-coverage.md`, revisit once the root-helper cross-UID census lands) — daybreak **READY**. `fix/watch-fabrication-2026-10` (calibration fabrication fixes: tailscale-unable/overflow, freshness gates, bounded churn, `v2:vpn`/`v2:markerless` peer identities with legacy `global` frozen, honest per-rule `baseline status`) — daybreak 0 blockers; last two status-only MEDIUMs fixed (`65595c9`, `ca216bb`). Merged suite **2113/0/34**.
+> - **`harden/root-helper-2026-10` (worktree `.claude/worktrees/wf_cdc95c7b-4c0-1`)** — daybreak **READY after 9 rounds** (exhaustive stable holder enumeration + single post-enumeration final verification; process identity = (tgid,start_time); argv-preserving redaction on every path; fd-based exe generation pin; procfs pid-ns guard; newfstatat removed; seccomp sequential-read residual documented/accepted). Local 2062/0/34 + Rust tests. **NOT merged: Linux-only tests have never executed** → needs operator OK to push the branch for Linux CI, then merge (HANDOFF conflict: keep both).
+> - **`feat/fact-store-capacity-2026-10` (worktree `.claude/worktrees/wf_fff34f30-56c-1`)** — R0 plan `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md`. S0–S2 **G1 daybreak READY**; S3 (per-rule certified horizons, horizon-short fixed alert) + **S3b first/last-seen novelty set** (operator pulled Q6 into scope after G1 showed narrowed-window novelty fabrication) built + reviewed + fixed; **S4 (per-family stores, 65 MiB budgets) + S5 (fresh stores, 31-day legacy quarantine) workflow in progress** → then **daybreak G2**, S6 CLI, S7 soak on a COPY of state, G3, push. Branch must ship whole (S3 alone fires horizon_short on real hosts until S4).
+> - Operator decisions today: budgets 65 MiB; horizons 48 h service/scheduled-job, 6 d lineage (only after narrowing); fresh per-family stores; quarantine legacy 31 d; Q6 seen-set in R0.
+> - Still to present: calibration tuning items R3–R7 (notify-once, stddev floor + mass-kill guard, 14-day window, reboot notice, session critical guards).
 
 > **2026-10-05 PROVENANCE-IDENTITY FAMILY FIX — branch `fix/provenance-identity-coverage-2026-10`, local only.** Fixed daybreak-blue's remaining blocker: IPv4 keeps the legacy `tcp.*`/`udp.*` target-key spelling while IPv6 keeps `tcp6.*`/`udp6.*`; macOS lsof's IPv4/IPv6 column and address form now align with Linux `/proc/net/*[6]`. Dual-stack owners no longer produce false `identity_drift` or colliding `new_public_bind` IDs, and all provenance-identity `evaluatedAlertKeys` paths remain `[]`. Affected suites: **166 pass / 1 known sandbox live-macOS-smoke fail**. Fresh-XDG full `npm test`: **2055 pass / 22 sandbox-environment failures / 34 skip / 2111 total**; failures are 20 loopback-listen `EPERM` tests and 2 live macOS provenance/ps smokes returning `unknown` instead of `ok`. Committed locally; no push or merge.
 
