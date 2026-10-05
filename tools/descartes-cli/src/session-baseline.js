@@ -91,6 +91,20 @@ export const DEFAULT_MIN_SAMPLE_COUNT = 30;
 // DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT value exactly.
 export const DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT = 6;
 
+// A2 (2026-10 calibration review): freshness gate, mirroring service-baseline.js's
+// DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS exactly (locally defined -- importing daemon.js's
+// ACTIVE_FRESHNESS_MULTIPLE back would create an import cycle). Only a fallback for direct/unit
+// invocation: daemon.js threads the SAME per-tick activeFreshnessMs (3x the structural interval) it
+// gives the service/lineage/scheduled-job producers. When the latest complete tick-group is older
+// than this, structural collection has been failing; re-scoring that old tick as "now" every fast
+// tick would re-notify a days-old state, so both rules freeze instead (no candidate, no coverage).
+export const DEFAULT_SESSION_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
+
+function isFreshTs(ts, nowMs, freshnessMs) {
+  const tsMs = typeof ts === "string" ? new Date(ts).getTime() : NaN;
+  return nowMs - tsMs <= freshnessMs; // NaN-safe: an unparseable ts is never fresh
+}
+
 // A reasonable, undramatic smoothing constant for the persisted (but not v0-trigger-consuming,
 // see Decision 3's "EWMA's role, scoped explicitly") ewma/ewma_variance fields — not part of the
 // trigger math, so not flagged PROVISIONAL alongside the three sigma/floor constants above.
@@ -349,6 +363,13 @@ export function groupSessionFactsByTick(points = []) {
   return [...byTs.values()].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
 }
 
+// Churn can use markerless legacy observations, but must exclude any tick whose census explicitly
+// says partial or whose marker is malformed/unknown. Keep this predicate shared with baseline
+// status so its coverage claim cannot diverge from the real detector's observation universe.
+export function isSessionChurnObservationGroup(group) {
+  return group?.censusState !== "partial" && group?.censusState !== "unknown";
+}
+
 /**
  * Disposition of a tick-group for the WINDOWED WELFORD RECOMPUTE (Decision 3):
  *   - "overflow": excluded entirely from the recompute (an inexact/bucketed count must never
@@ -434,6 +455,18 @@ export function computeWindowedSessionStats(groups, { stddevFloor = DEFAULT_STDD
 // upgrade, a documented behavioral invariant this fix must not touch.
 const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16}$/;
 
+// A3 (2026-10 calibration review): bounded churn LOOKBACK. The OLDER side of a churn pair must lie
+// within the last K complete tick-groups before the latest one (i.e. at or after the ts of the
+// K-th complete tick-group preceding the latest). Without this bound, a same-named session absent
+// for days and then recreated with a new creation fingerprint fired session.churn against an
+// observation of any age in the 31-day window -- a session being started again, not the
+// kill-then-resurrect this rule exists for (that incident shape resurrects within hours: the older
+// observation is 1..K complete ticks back). An entity whose only earlier observation is outside the
+// bound is UNEVALUABLE (no fresh pair): not a churn entry and not reported as evaluated, so any
+// persisted churn alert for it freezes rather than falsely recovering.
+export const DEFAULT_SESSION_CHURN_LOOKBACK_TICKS = 3;
+export const DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
+
 /**
  * Must-fix 4 (recency bound, hard requirement): for each entity_key with two or more
  * session.presence points in the pool, compares the two most recent points' created_at_fingerprint.
@@ -478,18 +511,37 @@ const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16
  *     an entity is "evaluated" iff it had >=2 observations across DISTINCT ticks, was unambiguous
  *     on both the newest and the chosen-earlier tick, had both created_at_fingerprints defined and
  *     neither "unknown", is RECENCY-FRESH (its newest observation is in the latest complete
- *     tick-group), and carries a CONFORMING (in-contract) hashed entity_key. Entities skipped as
+ *     tick-group), carries a CONFORMING (in-contract) hashed entity_key, and whose chosen earlier
+ *     observation lies within the A3 lookback bound (DEFAULT_SESSION_CHURN_LOOKBACK_TICKS complete
+ *     ticks before the latest) AND the corresponding wall-clock bound ((K+1) structural intervals).
+ *     Entities skipped as
  *     <2-obs / same-tick-ambiguous / missing-or-unknown-fingerprint (per §8.C's named skip
  *     reasons), and additionally as STALE or OUT-OF-CONTRACT (per the recovery-coverage contract's
  *     "excluding entities it skipped as ... stale / unevaluable"), are NOT reported — so the daemon
  *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
  */
-function evaluateSessionChurn(points = []) {
+export function evaluateSessionChurn(points = [], {
+  lookbackTicks = DEFAULT_SESSION_CHURN_LOOKBACK_TICKS,
+  structuralIntervalMs = DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS,
+  activeFreshnessMs,
+  maxObservationAgeMs,
+} = {}) {
   const groups = groupSessionFactsByTick(points);
   const completeGroups = groups.filter((group) => group.censusState === "complete");
   if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [] };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
+  const resolvedStructuralIntervalMs = Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
+    ? structuralIntervalMs
+    : Number.isFinite(activeFreshnessMs) && activeFreshnessMs > 0
+      ? activeFreshnessMs / 3
+      : DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS;
+  const resolvedMaxObservationAgeMs = maxObservationAgeMs
+    ?? (lookbackTicks + 1) * resolvedStructuralIntervalMs;
+  // A3 lookback bound: the earliest instant an OLDER observation may carry -- the ts of the K-th
+  // complete tick-group before the latest (or the earliest complete tick-group when fewer exist).
+  // Compared by parsed instant, like every other ts comparison in this function.
+  const lookbackBoundMs = new Date(completeGroups[Math.max(0, completeGroups.length - 1 - lookbackTicks)].ts).getTime();
 
   const byEntity = new Map();
   for (const group of groups) {
@@ -499,7 +551,7 @@ function evaluateSessionChurn(points = []) {
     // total headcount, and a flood/mass-resurrection tick is exactly the incident shape churn
     // exists to catch. This intentionally differs from the count-drop fold, which excludes both
     // partial AND overflow groups.
-    if (group.censusState === "partial" || group.censusState === "unknown") continue; // must-fix 2 + unknown-disposition hardening
+    if (!isSessionChurnObservationGroup(group)) continue; // must-fix 2 + unknown-disposition hardening
     for (const point of group.points) {
       const fingerprint = point.attributes?.created_at_fingerprint;
       const list = byEntity.get(point.entity_key) ?? [];
@@ -578,6 +630,8 @@ function evaluateSessionChurn(points = []) {
     // re-gate).
     if (newerMs !== latestCompleteMs) continue; // must-fix 4 recency bound (K=1) -- STALE pair, unevaluable
     if (!SESSION_CHURN_ENTITY_KEY_PATTERN.test(entityKey)) continue; // F7: nonconforming entity_key shape -- unevaluable, never republished
+    if (!(olderMs >= lookbackBoundMs)) continue; // A3 lookback bound -- prior observation too old, unevaluable (freeze)
+    if (latestCompleteMs - olderMs > resolvedMaxObservationAgeMs) continue; // A3 wall-clock bound -- tick count alone cannot span a host outage
 
     // Fresh + conforming + unambiguous + both fingerprints known: a definitive verdict either way,
     // so this identity WAS genuinely evaluated (whether it churned or is clear) and is reported.
@@ -595,8 +649,8 @@ function evaluateSessionChurn(points = []) {
  * which now ALSO computes which entity_keys were genuinely evaluated; see its doc comment). Every
  * existing caller and test that reads a bare churn-entry array keeps working through this wrapper.
  */
-export function detectSessionChurn(points = []) {
-  return evaluateSessionChurn(points).churnEntries;
+export function detectSessionChurn(points = [], options = {}) {
+  return evaluateSessionChurn(points, options).churnEntries;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,6 +740,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   const ewmaAlpha = options.ewmaAlpha ?? DEFAULT_EWMA_ALPHA;
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT;
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SESSION_FRESHNESS_FALLBACK_MS;
+  const structuralIntervalMs = options.structuralIntervalMs ?? freshnessMs / 3;
 
   // Fact-store completeness hardening (Slice 4): the FULL read result is captured (not just
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
@@ -832,13 +888,18 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
 
   const candidates = [];
   const evaluatedAlertKeys = [];
+  // A2 freshness gate: count_drop scores windowed.last_observation (the latest complete tick-group);
+  // if that tick is older than freshnessMs it is not "now" -- emit nothing and report nothing.
+  const dropFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
   // — including ticks where nothing new was folded — so applyAlertCandidates never spuriously
   // "recovers" an active session.count_drop just because this source skipped a redundant write.
-  const dropCandidate = buildCountDropCandidate(
-    { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-    { deviationSigma, criticalSigma },
-  );
+  const dropCandidate = dropFresh
+    ? buildCountDropCandidate(
+      { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
+      { deviationSigma, criticalSigma },
+    )
+    : undefined;
   if (dropCandidate) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
@@ -846,7 +907,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // requires before it can fire OR find-clear. A provisional (warm-up) window reaches no verdict, so
   // "global" is NOT reported and any persisted count_drop freezes rather than falsely recovering.
   const dropObservation = windowed.last_observation;
-  const dropEvaluated = windowed.confidence_state === "established"
+  const dropEvaluated = dropFresh
+    && windowed.confidence_state === "established"
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
@@ -859,7 +921,14 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // evaluateSessionChurn. Each evaluated key (whether it churned or was clear) is reported so the
   // daemon can recover a now-stable session's persisted churn alert; skipped/stale/ambiguous entities
   // are absent, so their alerts freeze.
-  const { churnEntries, evaluatedEntityKeys } = evaluateSessionChurn(currentPoints);
+  // A2 freshness gate for churn: evaluateSessionChurn anchors on the latest complete tick-group (by
+  // the same censusState === "complete" filter it uses); when that tick is stale, churn freezes.
+  const churnCompleteGroups = currentGroups.filter((group) => group.censusState === "complete");
+  const churnFresh = churnCompleteGroups.length > 0
+    && isFreshTs(churnCompleteGroups[churnCompleteGroups.length - 1].ts, nowMs, freshnessMs);
+  const { churnEntries, evaluatedEntityKeys } = churnFresh
+    ? evaluateSessionChurn(currentPoints, { structuralIntervalMs, activeFreshnessMs: freshnessMs })
+    : { churnEntries: [], evaluatedEntityKeys: [] };
   candidates.push(...buildChurnCandidates(churnEntries));
   for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
 

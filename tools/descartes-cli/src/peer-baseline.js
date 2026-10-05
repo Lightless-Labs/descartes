@@ -47,6 +47,19 @@ export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
 // Slice 4c (observed-incident collectors plan) — the sign-flipped mirror of PEER_COUNT_SPIKE_RULE_ID.
 export const PEER_COUNT_DROP_RULE_ID = "peer.count_drop";
 
+// R8 identity migration: the count input is no longer one undifferentiated global peer universe.
+// Marker-backed ticks are signed by the VPN census and therefore count only VPN-source peers;
+// markerless ticks retain the legacy all-peer count. Version both identities so a persisted alert
+// created under the old global semantics can never be recovered by a differently-scoped detector.
+export const PEER_COUNT_VPN_FINGERPRINT = "v2:vpn";
+export const PEER_COUNT_MARKERLESS_FINGERPRINT = "v2:markerless";
+
+export function peerCountFingerprintForAvailabilitySignature(availabilitySignature) {
+  return availabilitySignature === undefined
+    ? PEER_COUNT_MARKERLESS_FINGERPRINT
+    : PEER_COUNT_VPN_FINGERPRINT;
+}
+
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
 // chosen to unblock shipping v0, NOT tuned values; peer-count variance dynamics are a fresh,
 // untuned surface. Independently named (NOT imported from session-baseline.js), even though the
@@ -78,6 +91,19 @@ const DEFAULT_PEER_EWMA_ALPHA = 2 / (DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
 // DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT exactly -- independently defined, not imported, per each
 // detector owning its own re-establishment tuning.
 export const DEFAULT_PEER_MIN_HISTORY_TICK_COUNT = 6;
+
+// A2 (2026-10 calibration review): freshness gate, mirroring service-baseline.js's
+// DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS (locally defined to avoid a daemon.js import cycle). Only a
+// fallback for direct/unit invocation: daemon.js threads the SAME per-tick activeFreshnessMs (3x the
+// structural interval) it gives the service/lineage/scheduled-job producers. A scored tick older
+// than this is not "now" -- each direction freezes (no candidate, no coverage) rather than
+// re-scoring and re-notifying a possibly days-old tick every fast tick.
+export const DEFAULT_PEER_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
+
+function isFreshTs(ts, nowMs, freshnessMs) {
+  const tsMs = typeof ts === "string" ? new Date(ts).getTime() : NaN;
+  return nowMs - tsMs <= freshnessMs; // NaN-safe: an unparseable/absent ts is never fresh
+}
 
 // ---------------------------------------------------------------------------------------------
 // Store I/O (atomic tmp+rename 0o600, corrupt-tolerant — mirrors session-baseline.js's own
@@ -335,7 +361,9 @@ export async function writePeerBaselineStore(descartesPaths, state) {
  *   - `count` is the number of NON-overflow, non-marker peer.presence points in this tick-group
  *     whose attributes.presence_state is NOT "observed_historical" — i.e. every point that is
  *     "observed_active" OR carries an unrecognized/missing presence_state (matching
- *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)).
+ *     fact-translators.js's buildPeerFactPoint ternary default exactly — nice-to-have (i)). On a
+ *     tick with a VPN census marker, Tailscale points are excluded because that marker cannot vouch
+ *     for them; on a markerless Tailscale-only tick they remain part of the legacy count.
  *   - `hasOverflow` is true iff this tick-group carries the PEER_OVERFLOW_ENTITY_KEY marker.
  *   - `availabilitySignature` (Slice 4c) is the string carried by this tick-group's
  *     PEER_CENSUS_MARKER_ENTITY_KEY point's `attributes.availability_signature`, or `undefined`
@@ -367,11 +395,25 @@ export function groupPeerFactsByTick(points = []) {
   for (const point of points ?? []) {
     if (!point || point.fact_name !== PEER_FACT_NAME || typeof point.ts !== "string") continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, availabilitySignature: undefined, censusMarkerSeen: false });
+      byTs.set(point.ts, {
+        ts: point.ts,
+        count: 0,
+        vpnCount: 0,
+        tailscaleCount: 0,
+        hasOverflow: false,
+        hasVpnOverflow: false,
+        hasTailscaleOverflow: false,
+        availabilitySignature: undefined,
+        censusMarkerSeen: false,
+      });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === PEER_OVERFLOW_ENTITY_KEY) {
-      group.hasOverflow = true;
+      // R8: Tailscale has no availability signature. Its overflow marker is ignored only after a
+      // valid VPN census marker proves that Tailscale is outside the counted universe; on a
+      // markerless tick the all-peer count is truncated and must remain incomplete.
+      if (point.source_envelope_id === "tailscale-status") group.hasTailscaleOverflow = true;
+      else group.hasVpnOverflow = true;
       continue;
     }
     if (point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY) {
@@ -398,9 +440,21 @@ export function groupPeerFactsByTick(points = []) {
       group.censusMarkerSeen = true;
       continue;
     }
-    if (point.attributes?.presence_state !== "observed_historical") {
-      group.count += 1;
-    }
+    if (point.attributes?.presence_state === "observed_historical") continue;
+    if (point.attributes?.source_type === "tailscale") group.tailscaleCount += 1;
+    else group.vpnCount += 1;
+  }
+  for (const group of byTs.values()) {
+    // The marker may arrive after Tailscale points in facts.jsonl. Choose only after the complete
+    // group has been assembled, keeping Tailscale on markerless/legacy hosts and excluding it from
+    // the VPN-signed regime.
+    group.count = group.availabilitySignature !== undefined
+      ? group.vpnCount
+      : group.vpnCount + group.tailscaleCount;
+    group.hasOverflow = group.hasVpnOverflow
+      || (group.hasTailscaleOverflow && group.availabilitySignature === undefined);
+    delete group.vpnCount;
+    delete group.tailscaleCount;
   }
   return [...byTs.values()].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
 }
@@ -413,6 +467,15 @@ export function groupPeerFactsByTick(points = []) {
  */
 function tickGroupDisposition(group) {
   return group.hasOverflow ? "overflow" : "complete";
+}
+
+// A markerless Tailscale overflow truncates the counted all-peer universe. It is not a trustworthy
+// lower bound for the spike detector because the source-specific cap can hide the size of the
+// burst, so it is excluded from scoring as well as folding. A VPN-scoped tick ignores that marker
+// during grouping because Tailscale is outside the counted universe; VPN overflow retains the
+// historical score-but-never-fold behavior.
+function overflowCanBeScored(group) {
+  return !(group.hasOverflow && group.hasTailscaleOverflow);
 }
 
 // Slice 4c (§2b): deliberately NOT unified with tickGroupDisposition above. Extending that
@@ -484,6 +547,7 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
       && group.availabilitySignature === currentSignature,
   );
   const mostRecentIsOverflow = mostRecentGroup ? tickGroupDisposition(mostRecentGroup) === "overflow" : false;
+  const mostRecentIsUnscorableOverflow = mostRecentIsOverflow && !overflowCanBeScored(mostRecentGroup);
   // F6 fix: an invalid-marker most-recent tick must be excluded from SCORING too, not merely
   // folding — "exclude from the spike fold AND score (fail closed)", distinct from overflow's own
   // deliberate score-but-never-fold posture (a truncated count is still a real lower-bound
@@ -506,7 +570,7 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   }
 
   let lastObservation;
-  if (mostRecentGroup && !mostRecentIsInvalidSignature) {
+  if (mostRecentGroup && !mostRecentIsInvalidSignature && !mostRecentIsUnscorableOverflow) {
     const zScore = computeZScore(mostRecentGroup.count, preScoreStats.mean, preScoreStats.stddev, stddevFloor);
     lastObservation = {
       ts: mostRecentGroup.ts,
@@ -616,7 +680,7 @@ export function computeWindowedPeerDropStats(groups, { stddevFloor = DEFAULT_PEE
  * constant exists only as a named placeholder for a future critical tier, to be tuned alongside the
  * other PROVISIONAL constants (and gated behind a min-absolute-spike guard) if v0's data warrants.
  */
-export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA } = {}) {
+export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA, fingerprint = PEER_COUNT_MARKERLESS_FINGERPRINT } = {}) {
   if (state?.confidence_state !== "established") return undefined;
   const obs = state.last_observation;
   if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
@@ -631,9 +695,9 @@ export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_
     confidence_state: state.confidence_state,
   });
   return {
-    id: alertId(PEER_COUNT_SPIKE_RULE_ID, "global"),
+    id: alertId(PEER_COUNT_SPIKE_RULE_ID, fingerprint),
     rule_id: PEER_COUNT_SPIKE_RULE_ID,
-    fingerprint: "global",
+    fingerprint,
     // MUST-FIX 1: capped at "warning" unconditionally — never "critical" in v0.
     severity: "warning",
     title: "Peer count deviation",
@@ -656,7 +720,7 @@ export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_
  * DEFAULT_PEER_CRITICAL_SIGMA (already inert for peer.count_spike) is reused as the same
  * future-facing placeholder here too.
  */
-export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA } = {}) {
+export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_DEVIATION_SIGMA, fingerprint = PEER_COUNT_MARKERLESS_FINGERPRINT } = {}) {
   if (state?.confidence_state !== "established") return undefined;
   const obs = state.last_observation;
   if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
@@ -671,9 +735,9 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_D
     confidence_state: state.confidence_state,
   });
   return {
-    id: alertId(PEER_COUNT_DROP_RULE_ID, "global"),
+    id: alertId(PEER_COUNT_DROP_RULE_ID, fingerprint),
     rule_id: PEER_COUNT_DROP_RULE_ID,
-    fingerprint: "global",
+    fingerprint,
     // Decision 0 (plan pinned), mirrors peer.count_spike's own MUST-FIX-1 cap: severity is
     // HARDCODED "warning" -- never escalates to "critical" in v0, regardless of z magnitude.
     // Peer-count variance dynamics remain an untuned PROVISIONAL surface for BOTH directions.
@@ -721,6 +785,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const ewmaAlpha = options.ewmaAlpha ?? DEFAULT_PEER_EWMA_ALPHA;
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_PEER_MIN_HISTORY_TICK_COUNT;
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_PEER_FRESHNESS_FALLBACK_MS;
 
   // Fact-store completeness hardening (Slice 5): the FULL read result is captured (not just
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
@@ -886,15 +951,25 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // folded — so applyAlertCandidates never spuriously "recovers" an active peer.count_spike/
   // peer.count_drop just because this source skipped a redundant write.
   const candidates = [];
-  const spikeCandidate = buildCountSpikeCandidate(
-    { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-    { deviationSigma },
-  );
+  // A2 freshness gate, per direction, on the tick each direction actually SCORES: spike scores the
+  // most recent tick-group (overflow included -- score-but-never-fold); drop scores the latest
+  // marker-complete one. A stale scored tick freezes that direction (no candidate, no coverage).
+  const spikeFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
+  const dropFresh = isFreshTs(windowedDrop.last_observation?.ts, nowMs, freshnessMs);
+  const currentFingerprint = peerCountFingerprintForAvailabilitySignature(currentGroups.at(-1)?.availabilitySignature);
+  const spikeCandidate = spikeFresh
+    ? buildCountSpikeCandidate(
+      { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
+      { deviationSigma, fingerprint: currentFingerprint },
+    )
+    : undefined;
   if (spikeCandidate) candidates.push(spikeCandidate);
-  const dropCandidate = buildCountDropCandidate(
-    { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
-    { deviationSigma },
-  );
+  const dropCandidate = dropFresh
+    ? buildCountDropCandidate(
+      { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
+      { deviationSigma, fingerprint: currentFingerprint },
+    )
+    : undefined;
   // count_drop needs marker-complete history, unlike count_spike. BASE-complete markerless
   // ticks intentionally clear the shared lockout so spike detection can recover in Tailscale-only
   // environments, but those same ticks cannot prove that the drop history is complete. Recompute
@@ -918,7 +993,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // -- EXCLUDING anything it could not evaluate (cold-start already returned above; per-direction
   // warm-up / drop-readiness gated off here). The daemon freezes any owned identity NOT reported
   // (never fabricates a recovery) and recovers a genuinely-cleared one that IS reported. Both
-  // directions are singletons keyed on fingerprint "global".
+  // directions are keyed on the current source universe, never on the legacy "global" identity.
   //   - spike: evaluated iff its windowed baseline is "established" (Welford warm-up satisfied for
   //     the current regime). Reported regardless of whether the spike candidate fired.
   //   - drop: evaluated iff its OWN windowed baseline is "established" AND dropRecoveryReady --
@@ -927,11 +1002,12 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     count_drop-only warm-up the spike direction does not share), so gating drop on
   //     windowedDrop.confidence_state alone would fabricate a recovery.
   const evaluatedAlertKeys = [];
-  if (windowed.confidence_state === "established") {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, "global"));
+  //   - both: additionally only when the scored tick is FRESH (A2) -- a stale tick is not evaluated.
+  if (spikeFresh && windowed.confidence_state === "established") {
+    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint));
   }
-  if (windowedDrop.confidence_state === "established" && dropRecoveryReady) {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, "global"));
+  if (dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady) {
+    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint));
   }
   return { candidates, evaluatedAlertKeys };
 }

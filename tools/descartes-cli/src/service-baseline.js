@@ -387,7 +387,7 @@ export function detectServiceDisappearances(groups = [], options = {}) {
 // constraint-store.js/alert-store.js each hash their own domain-prefixed string with
 // crypto.createHash("sha256")...slice(0, 16)), so this adds a small local hash helper following the
 // SAME convention: a domain-prefixed sha256, truncated to 16 hex chars.
-function hashServiceEntityKey(entityKey) {
+export function hashServiceEntityKey(entityKey) {
   return createHash("sha256").update(`service.disappeared:${entityKey}`).digest("hex").slice(0, 16);
 }
 
@@ -452,7 +452,7 @@ export function buildDisappearedCandidates(entries = []) {
 // fabricated recovery). When the tick was NOT evaluable (cold-start / too few complete groups /
 // stale latest census), NOTHING is reported, so every owned identity freezes rather than clearing
 // itself from silence.
-function computeCensusEvaluatedAlertKeys(currentGroups, {
+export function computeCensusEvaluatedAlertKeys(currentGroups, {
   coldStartPendingThisTick,
   nowMs,
   freshnessMs,
@@ -858,7 +858,7 @@ export function detectServiceAppearances(groups = [], options = {}) {
 // service.appeared's fingerprints from ever coinciding with service.disappeared's for the same
 // entity_key, mirroring hashLineageEdgeEntityKey's/hashScheduledJobEntityKey's own per-rule_id
 // domain-separation convention.
-function hashServiceAppearedEntityKey(entityKey) {
+export function hashServiceAppearedEntityKey(entityKey) {
   return createHash("sha256").update(`${SERVICE_APPEARED_RULE_ID}:${entityKey}`).digest("hex").slice(0, 16);
 }
 

@@ -277,7 +277,12 @@ domain-separated SHA-256 hash of the node public key; persisted attributes are c
 bucketed only: source type, presence state, login hour, handshake age, and exit-node role
 (`in_use`, `advertised_unused`, `none`, or `n/a`). No raw public key, IP, hostname, tailnet, or
 user identity reaches fact-history. This collector emits no new alert rule and no census marker;
-existing deterministic peer-count/correlation paths consume the shared stream, never an LLM path.
+existing deterministic peer-count/correlation paths consume the shared stream, never an LLM path. On
+a host where `vpn-peer-status` also emits its census marker, Tailscale peers are deliberately excluded
+from the peer-count baseline because the VPN availability signature does not cover tailnet membership;
+tailnet-membership bursts are therefore not tracked by that mixed-source count. On a Tailscale-only
+host, markerless Tailscale peers remain countable and `peer.count_spike` can still establish and fire,
+while `peer.count_drop` requires the VPN census.
 
 Operator dependency: `peer.count_drop` (peer drop-to-zero detection) requires the
 `vpn-peer-status` collector to also be enabled. A Tailscale-only configuration gets

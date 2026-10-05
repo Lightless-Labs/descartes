@@ -249,7 +249,7 @@ export function detectScheduledJobAppearances(groups = [], options = {}) {
   return appearances;
 }
 
-function hashScheduledJobEntityKey(entityKey) {
+export function hashScheduledJobEntityKey(entityKey) {
   return crypto.createHash("sha256")
     .update(`${SCHEDULED_JOB_APPEARED_RULE_ID}:${entityKey}`)
     .digest("hex")
@@ -268,7 +268,7 @@ function hashScheduledJobEntityKey(entityKey) {
 // census knowledge of this tick" the recipe names; latest-only entities MUST be included because a
 // candidate's own identity is required in the evaluated set (§8.B). Returns [] if any gate fails
 // (the coldStartPendingThisTick short-circuit is applied by the caller, above and beyond this).
-function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
+export function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_SCHEDULED_JOB_FRESHNESS_FALLBACK_MS,

@@ -71,12 +71,12 @@ function hashReference(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 16);
 }
 
-// No entity-level identity exists for a peer-count spike (peer-baseline.js's
-// buildCountSpikeCandidate always stores fingerprint:"global"; its diagnostics carry only
-// counts/z-scores, never a per-peer key) -- the recommendation's target is the whole
-// currently-observed peer population, not one peer. A fixed, non-hashed, closed-enum literal
-// (mirrors PEER_CENSUS_MARKER_ENTITY_KEY/SESSION_OVERFLOW_ENTITY_KEY's own "no identity to hash"
-// convention elsewhere in this codebase).
+// No entity-level identity exists for a peer-count spike (peer-baseline.js's candidate fingerprint
+// scopes the source universe, not an individual peer; its diagnostics carry only counts/z-scores,
+// never a per-peer key) -- the recommendation's target is the whole currently-observed peer
+// population, not one peer. A fixed, non-hashed, closed-enum literal (mirrors
+// PEER_CENSUS_MARKER_ENTITY_KEY/SESSION_OVERFLOW_ENTITY_KEY's own "no identity to hash" convention
+// elsewhere in this codebase).
 const GLOBAL_TARGET_REPR = "global";
 
 // Slice 7.2.a, P3/P6: extracts the target this recommendation names, reusing ONLY the

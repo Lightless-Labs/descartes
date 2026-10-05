@@ -1,4 +1,5 @@
 import { readFactPoints } from "./fact-store.js";
+import { alertId } from "./alert-store.js";
 import {
   DEFAULT_BASELINE_FACT_WINDOW_MS,
 } from "./welford-stats.js";
@@ -8,30 +9,50 @@ import {
   groupServiceFactsByTick,
   loadServiceAppearanceBaselineStore,
   loadServiceBaselineStore,
+  SERVICE_DISAPPEARED_RULE_ID,
+  SERVICE_APPEARED_RULE_ID,
+  computeCensusEvaluatedAlertKeys,
+  hashServiceEntityKey,
+  hashServiceAppearedEntityKey,
 } from "./service-baseline.js";
+import { factHistoryTrustworthy } from "./fact-store-completeness.js";
 import {
+  DEFAULT_MIN_SAMPLE_COUNT,
   DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT,
   computeWindowedSessionStats,
+  evaluateSessionChurn,
   groupSessionFactsByTick,
+  isSessionChurnObservationGroup,
+  SESSION_CHURN_RULE_ID,
+  SESSION_COUNT_DROP_RULE_ID,
   loadSessionBaselineStore,
 } from "./session-baseline.js";
 import {
   DEFAULT_PEER_MIN_HISTORY_TICK_COUNT,
+  DEFAULT_PEER_MIN_SAMPLE_COUNT,
   PEER_SIGNATURE_INVALID,
   computeWindowedPeerDropStats,
   computeWindowedPeerStats,
   groupPeerFactsByTick,
+  PEER_COUNT_DROP_RULE_ID,
+  peerCountFingerprintForAvailabilitySignature,
+  PEER_COUNT_SPIKE_RULE_ID,
   loadPeerBaselineStore,
 } from "./peer-baseline.js";
 import {
   DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
   groupScheduledJobFactsByTick,
   loadPersistenceBaselineStore,
+  SCHEDULED_JOB_APPEARED_RULE_ID,
+  scheduledJobEvaluatedEntityKeys,
+  hashScheduledJobEntityKey,
 } from "./persistence-baseline.js";
 import {
   DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
   groupProcessLineageFactsByTick,
   loadProcessLineageBaselineStore,
+  PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+  computeEvaluatedProcessLineageEdgeKeys,
 } from "./process-lineage-baseline.js";
 import {
   loadWatchConfig,
@@ -39,6 +60,7 @@ import {
   writeWatchConfig,
 } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
+import { readDaemonStatus } from "./history-store.js";
 
 const STATUS_TICK_COUNT = 6;
 const LIVE_RECOMPUTE_NOTE = "Answers are recomputed live from the fact-history window; they can differ slightly from the daemon's last tick.";
@@ -102,41 +124,420 @@ function hasIncompleteLatest(domain, groups) {
 }
 
 function stateReason(entry, groups) {
+  const storeLossThisTick = Boolean(entry.missing || entry.corrupt);
+  // A1: a genuinely-read pending store carries its OWN recorded reason -- coldStartEntryReason is
+  // the label chosen when a NEW entry is armed, and for a non-store-loss arming it always answers
+  // "corrupt_facts", which would misreport e.g. a persisted "history_lost" lockout.
+  if (!storeLossThisTick && typeof entry.state?.cold_start_reason === "string") return entry.state.cold_start_reason;
   return coldStartEntryReason({
-    storeLossThisTick: Boolean(entry.missing || entry.corrupt),
+    storeLossThisTick,
     persistedReason: entry.state?.cold_start_reason,
     currentGroups: groups,
   });
 }
 
-function progressForState(entry, groups, nowMs) {
-  if (!entry.state?.cold_start_pending) return STATUS_TICK_COUNT;
-  const anchor = entry.state.cold_start_since_ts ? new Date(entry.state.cold_start_since_ts).getTime() : undefined;
-  if (!Number.isFinite(anchor)) return 0;
-  return Math.min(STATUS_TICK_COUNT, completeGroups(entry.domain, groups)
-    .filter((group) => new Date(group.ts).getTime() > anchor && new Date(group.ts).getTime() <= nowMs)
-    .length);
+// A1 (2026-10 calibration review): `baseline status` used to report "watching" by counting
+// post-anchor ticks alone, ignoring the gates the detectors actually apply -- e.g. session
+// phase:"watching" with cold_start_pending:true while the detector reported evaluatedAlertKeys=[].
+// The helpers below MIRROR (never alter) each detector's own gates, from the same fact-history
+// window, stores and clock, so a domain says "watching" only when its detector would genuinely
+// evaluate this tick: persisted lockout cleared, no lockout (re-)arming term, trustworthy history,
+// fresh evidence, and the detector's own per-rule readiness.
+
+// Mirrors the detectors' DEFAULT_*_FRESHNESS_FALLBACK_MS (3x the default 1h structural interval)
+// when no daemon status record exists. A live daemon's persisted profile overrides this below.
+export const DEFAULT_STATUS_FRESHNESS_MS = 3 * 60 * 60 * 1000;
+
+const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
+  "last_corrupt_ts",
+  "last_schema_invalid_ts",
+  "last_bytecap_evict_ts",
+  "last_continuity_break_ts",
+  "last_future_fact_ts",
+];
+
+function isValidIsoTimestamp(value) {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-function domainPhase({ enabled, entries, domain, groups, nowMs }) {
-  if (!enabled) return { phase: "disabled", progress: 0, coldStartPending: false, coldStartReason: undefined };
-  const pendingEntries = entries.filter((entry) => entry.state?.cold_start_pending);
-  const primary = pendingEntries[0] ?? entries[0];
-  const progress = pendingEntries.length === 0
-    ? STATUS_TICK_COUNT
-    : Math.min(...pendingEntries.map((entry) => progressForState({ ...entry, domain }, groups, nowMs)));
-  const incomplete = hasIncompleteLatest(domain, groups);
-  const phase = incomplete
-    ? "cannot establish — census incomplete"
-    : progress >= STATUS_TICK_COUNT
-      ? "watching"
-      : `still learning — ${progress} of ${STATUS_TICK_COUNT}`;
+// Same predicate every detector carries as hasCompletenessLossAfterAnchor.
+function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
+  const completeness = readResult?.completeness;
+  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
+  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
+  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
+  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
+    const timestamp = completeness[field];
+    if (timestamp === undefined || timestamp === null) return false;
+    const timestampMs = new Date(timestamp).getTime();
+    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
+  });
+}
+
+// Mirrors the detectors' enteringColdStart / coldStartPendingThisTick terms for one store entry.
+function detectorGate(entry, readResult, nowMs) {
+  const state = entry.state ?? {};
+  const pending = state.cold_start_pending !== false;
+  const trust = factHistoryTrustworthy(readResult, { anchorTs: state.cold_start_since_ts, nowMs });
+  const anchorMissingOrFuture = (pending && !isValidIsoTimestamp(state.cold_start_since_ts))
+    || (isValidIsoTimestamp(state.cold_start_since_ts) && new Date(state.cold_start_since_ts).getTime() > nowMs);
+  const lastFoldedWasFuture = isValidIsoTimestamp(state.last_folded_ts) && new Date(state.last_folded_ts).getTime() > nowMs;
+  const factsCorrupt = Boolean(readResult?.corrupt_count);
+  const storeLoss = entry.missing === true || entry.corrupt === true;
+  const lossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, state.cold_start_since_ts, nowMs);
+  const wouldArm = factsCorrupt || storeLoss || anchorMissingOrFuture || lossAfterAnchor || lastFoldedWasFuture
+    || (!pending && !trust.trust);
+  let blockedReason;
+  if (factsCorrupt) blockedReason = "corrupt_facts_this_tick";
+  else if (lastFoldedWasFuture || (isValidIsoTimestamp(state.cold_start_since_ts) && new Date(state.cold_start_since_ts).getTime() > nowMs)) blockedReason = "clock_rollback";
+  else if (!trust.trust) blockedReason = trust.reason;
+  else if (lossAfterAnchor) blockedReason = "history_degraded";
+  return { pending, wouldArm, trust, blockedReason };
+}
+
+// Live re-accumulation progress of a pending lockout: complete ticks strictly after its anchor
+// (what the detector itself counts). A lockout the detector would re-arm this tick restarts at 0.
+function lockoutProgress(entry, gate, domain, groups, nowMs) {
+  if (gate.wouldArm) return 0;
+  const anchor = new Date(entry.state.cold_start_since_ts).getTime();
+  return completeGroups(domain, groups)
+    .filter((group) => new Date(group.ts).getTime() > anchor && new Date(group.ts).getTime() <= nowMs)
+    .length;
+}
+
+// The detector's own post-lockout readiness requirement, as { progress, required }.
+function isFiniteFreshObservation(observation, nowMs, freshnessMs) {
+  return Boolean(observation)
+    && Number.isFinite(observation.z_score)
+    && Number.isFinite(observation.mean_before)
+    && isValidIsoTimestamp(observation.ts)
+    && nowMs - new Date(observation.ts).getTime() <= freshnessMs;
+}
+
+function sessionRuleReadiness(groups, points, nowMs, freshnessMs) {
+  const baseline = computeWindowedSessionStats(groups);
+  const countReady = baseline.confidence_state === "established"
+    && isFiniteFreshObservation(baseline.last_observation, nowMs, freshnessMs);
+  const completeGroupsForChurn = groups.filter((group) => group.censusState === "complete");
+  const latestChurnGroup = completeGroupsForChurn.at(-1);
+  const churnFresh = completeGroupsForChurn.length >= 2
+    && latestChurnGroup
+    && nowMs - new Date(latestChurnGroup.ts).getTime() <= freshnessMs;
+  const churnObservationTimestamps = new Set(groups.filter(isSessionChurnObservationGroup).map((group) => group.ts));
+  const churnPoints = points.filter((point) => churnObservationTimestamps.has(point.ts));
+  const churn = churnFresh
+    ? evaluateSessionChurn(churnPoints, { structuralIntervalMs: freshnessMs / 3, activeFreshnessMs: freshnessMs })
+    : { evaluatedEntityKeys: [] };
+  const evaluatedAlertKeys = [];
+  if (countReady) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
+  for (const entityKey of churn.evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
   return {
-    phase,
-    progress,
-    coldStartPending: pendingEntries.length > 0,
-    coldStartReason: pendingEntries.length > 0 ? stateReason(primary, groups) : undefined,
+    progress: baseline.stats.count,
+    required: DEFAULT_MIN_SAMPLE_COUNT,
+    established: baseline.confidence_state === "established",
+    watchingRules: [
+      ...(countReady ? [SESSION_COUNT_DROP_RULE_ID] : []),
+      ...(churn.evaluatedEntityKeys.length > 0 ? [SESSION_CHURN_RULE_ID] : []),
+    ],
+    evaluatedAlertKeys,
   };
+}
+
+function peerRuleReadiness(groups, entries, nowMs, freshnessMs) {
+  const spike = computeWindowedPeerStats(groups);
+  const drop = computeWindowedPeerDropStats(groups);
+  const currentFingerprint = peerCountFingerprintForAvailabilitySignature(groups.at(-1)?.availabilitySignature);
+  const spikeReady = spike.confidence_state === "established" && isFiniteFreshObservation(spike.last_observation, nowMs, freshnessMs);
+  const dropObservation = drop.last_observation;
+  const anchorTs = entries[0]?.state?.cold_start_since_ts;
+  const dropRecoveryReady = !isValidIsoTimestamp(anchorTs)
+    || (isValidIsoTimestamp(dropObservation?.ts) && completeGroups("peer", groups).filter((group) => {
+      const groupMs = new Date(group.ts).getTime();
+      return dropTickGroupIsComplete(group)
+        && groupMs > new Date(anchorTs).getTime()
+        && groupMs < new Date(dropObservation.ts).getTime();
+    }).length >= DEFAULT_PEER_MIN_HISTORY_TICK_COUNT);
+  const dropReady = drop.confidence_state === "established"
+    && dropRecoveryReady
+    && isFiniteFreshObservation(dropObservation, nowMs, freshnessMs);
+  return {
+    progress: spike.stats.count,
+    required: DEFAULT_PEER_MIN_SAMPLE_COUNT,
+    established: spike.confidence_state === "established",
+    watchingRules: [
+      ...(spikeReady ? [PEER_COUNT_SPIKE_RULE_ID] : []),
+      ...(dropReady ? [PEER_COUNT_DROP_RULE_ID] : []),
+    ],
+    evaluatedAlertKeys: [
+      ...(spikeReady ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : []),
+      ...(dropReady ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : []),
+    ],
+  };
+}
+
+function dropTickGroupIsComplete(group) {
+  return !group.hasOverflow && group.availabilitySignature !== undefined && group.availabilitySignature !== PEER_SIGNATURE_INVALID;
+}
+
+// A3 (2026-10 fabrication review): census domains (service/scheduled-job/process-lineage) carry
+// the SAME "established-by-tick-count is not the same as evaluable-by-the-detector" gap peer/
+// session do -- e.g. a census domain can accumulate enough raw complete-tick history while the
+// detector's own entity-union is empty (nothing ever tracked) or its freshness/cold-start gate
+// would zero the real evaluatedAlertKeys. These three helpers mirror each detector's own
+// evaluated-alert-key sibling (computeCensusEvaluatedAlertKeys / scheduledJobEvaluatedEntityKeys /
+// computeEvaluatedProcessLineageEdgeKeys) exactly -- same complete-group filter, same
+// minCompleteGroups/freshness gates -- never a second, drifting re-derivation of readiness.
+//
+// MEDIUM fix (2026-10 security review): service.disappeared/service.appeared are gated by TWO
+// INDEPENDENT stores (DOMAIN_DEFINITIONS' `stores: [loadServiceBaselineStore,
+// loadServiceAppearanceBaselineStore]`, same order as `entries` below) -- unlike session/peer,
+// whose two rules share a single store. coldStartPendingThisTick used to always be passed as
+// false here, on the (at the time correct) assumption that domainPhase's own early return already
+// caught ANY pending entry before ever calling this. That assumption no longer holds: domainPhase
+// now reaches here while exactly one of the two stores is still cold-start pending and the other
+// is established, so each call below must mirror ONLY its own store's pending state -- never the
+// other's -- exactly like the real detectors (computeServiceBaselineCandidates /
+// computeServiceAppearanceCandidates) each gate on their own store alone.
+function serviceRuleReadiness(groups, nowMs, freshnessMs, entries = []) {
+  const disappearedPendingThisTick = entries[0]?.state?.cold_start_pending !== false;
+  const appearedPendingThisTick = entries[1]?.state?.cold_start_pending !== false;
+  const disappearedKeys = computeCensusEvaluatedAlertKeys(groups, {
+    coldStartPendingThisTick: disappearedPendingThisTick,
+    nowMs,
+    freshnessMs,
+    minCompleteGroups: 2, // detectServiceDisappearances' own gate
+    ruleId: SERVICE_DISAPPEARED_RULE_ID,
+    hashEntityKey: hashServiceEntityKey,
+  });
+  const appearedKeys = computeCensusEvaluatedAlertKeys(groups, {
+    coldStartPendingThisTick: appearedPendingThisTick,
+    nowMs,
+    freshnessMs,
+    minCompleteGroups: DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1, // detectServiceAppearances' own gate
+    ruleId: SERVICE_APPEARED_RULE_ID,
+    hashEntityKey: hashServiceAppearedEntityKey,
+  });
+  const required = DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT + 1; // the stricter of disappearance (2) and appearance (3 + 1)
+  const progress = completeGroups("service", groups).length;
+  return {
+    progress,
+    required,
+    established: progress >= required,
+    watchingRules: [
+      ...(disappearedKeys.length > 0 ? [SERVICE_DISAPPEARED_RULE_ID] : []),
+      ...(appearedKeys.length > 0 ? [SERVICE_APPEARED_RULE_ID] : []),
+    ],
+    evaluatedAlertKeys: [...disappearedKeys, ...appearedKeys],
+  };
+}
+
+function scheduledJobRuleReadiness(groups, nowMs, freshnessMs) {
+  const entityKeys = scheduledJobEvaluatedEntityKeys(groups, {
+    nowMs,
+    freshnessMs,
+    minHistoryTickCount: DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
+  });
+  const evaluatedAlertKeys = entityKeys.map((entityKey) => alertId(SCHEDULED_JOB_APPEARED_RULE_ID, hashScheduledJobEntityKey(entityKey)));
+  const required = DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT + 1;
+  const progress = completeGroups("scheduled-job", groups).length;
+  return {
+    progress,
+    required,
+    established: progress >= required,
+    watchingRules: evaluatedAlertKeys.length > 0 ? [SCHEDULED_JOB_APPEARED_RULE_ID] : [],
+    evaluatedAlertKeys,
+  };
+}
+
+function lineageRuleReadiness(groups, nowMs, freshnessMs) {
+  const evaluatedAlertKeys = computeEvaluatedProcessLineageEdgeKeys(groups, {
+    nowMs,
+    freshnessMs,
+    minHistoryTickCount: DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
+  });
+  const required = DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT + 1;
+  const progress = completeGroups("process-lineage", groups).length;
+  return {
+    progress,
+    required,
+    established: progress >= required,
+    watchingRules: evaluatedAlertKeys.length > 0 ? [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID] : [],
+    evaluatedAlertKeys,
+  };
+}
+
+function readinessFor(domain, groups, points = [], entries = [], nowMs = Date.now(), freshnessMs = DEFAULT_STATUS_FRESHNESS_MS) {
+  if (domain === "session") {
+    return sessionRuleReadiness(groups, points, nowMs, freshnessMs);
+  }
+  if (domain === "peer") {
+    return peerRuleReadiness(groups, entries, nowMs, freshnessMs);
+  }
+  if (domain === "service") {
+    return serviceRuleReadiness(groups, nowMs, freshnessMs, entries);
+  }
+  if (domain === "scheduled-job") {
+    return scheduledJobRuleReadiness(groups, nowMs, freshnessMs);
+  }
+  return lineageRuleReadiness(groups, nowMs, freshnessMs);
+}
+
+// The full set of rule_ids each domain's status can ever report as "watching" -- used below only
+// to decide bare "watching" (every rule the domain owns is ready) vs. a partial-coverage phase
+// (some, but not all). NOT a second gating mechanism: readiness.watchingRules (computed above,
+// mirroring each detector's own evaluated-alert-key sibling) already decides WHICH rules are
+// ready; this list only sizes that set per domain so a 1-rule domain (scheduled-job,
+// process-lineage) can reach bare "watching" without being compared against session/peer's
+// hardcoded 2-rule count.
+const DOMAIN_RULE_IDS = {
+  session: [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID],
+  peer: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID],
+  service: [SERVICE_DISAPPEARED_RULE_ID, SERVICE_APPEARED_RULE_ID],
+  "scheduled-job": [SCHEDULED_JOB_APPEARED_RULE_ID],
+  "process-lineage": [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID],
+};
+
+// Returns { phase, progress, required } (never a bare string) so progress/required ALWAYS match
+// what the phase string actually says -- e.g. "appeared still learning — 2 of 6" must report
+// progress:2/required:6 (the blocked rule's own lockout re-accumulation), NOT readiness's
+// aggregate complete-census-tick progress/required (which could read e.g. "4 of 4" on the very
+// same tick -- a reader comparing the two fields would see them disagree).
+function phaseForRuleReadiness(domain, readiness, { gated = [], groups = [], nowMs } = {}) {
+  const watchingRules = readiness.watchingRules ?? [];
+  if (watchingRules.length === 0) return undefined;
+  const ruleIds = DOMAIN_RULE_IDS[domain] ?? [];
+  if (watchingRules.length === ruleIds.length) return { phase: "watching", progress: readiness.progress, required: readiness.required };
+  if (domain === "session") {
+    return watchingRules.includes(SESSION_CHURN_RULE_ID)
+      ? { phase: `watching (churn); count baseline still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required }
+      : { phase: `watching (count); churn has no fresh evaluable pair`, progress: readiness.progress, required: readiness.required };
+  }
+  if (domain === "peer") {
+    return watchingRules.includes(PEER_COUNT_SPIKE_RULE_ID)
+      ? { phase: "watching (spike); drop baseline is not evaluable", progress: readiness.progress, required: readiness.required }
+      : { phase: "watching (drop); spike baseline is not evaluable", progress: readiness.progress, required: readiness.required };
+  }
+  if (domain === "service") {
+    // MEDIUM fix (2026-10 security review): service.disappeared/service.appeared are gated by
+    // TWO INDEPENDENT stores (DOMAIN_DEFINITIONS' `stores: [loadServiceBaselineStore,
+    // loadServiceAppearanceBaselineStore]`, the SAME order `gated` is built in by domainPhase) --
+    // when only one rule is ready, the other can be unready for two DIFFERENT reasons that must
+    // be worded differently: its OWN store can still be cold-start pending (report the real
+    // re-accumulation progress, mirroring the generic "still learning — N of 6" wording this file
+    // already uses for a fully-pending domain), or its store can be established but simply lack
+    // enough fresh complete-census history yet (the older "is not evaluable" wording). `gated[i]`
+    // lines up positionally with DOMAIN_RULE_IDS.service[i] only because the two arrays are
+    // deliberately kept in that same disappearance-then-appearance order.
+    const disappearedReady = watchingRules.includes(SERVICE_DISAPPEARED_RULE_ID);
+    const readyLabel = disappearedReady ? "disappeared" : "appeared";
+    const blockedLabel = disappearedReady ? "appeared" : "disappeared";
+    const blockedIndex = disappearedReady ? 1 : 0;
+    const blockedGate = gated[blockedIndex]?.gate;
+    const blockedEntry = gated[blockedIndex]?.entry;
+    if (blockedGate?.pending) {
+      const progress = lockoutProgress(blockedEntry, blockedGate, domain, groups, nowMs);
+      const suffix = progress < STATUS_TICK_COUNT
+        ? `${progress} of ${STATUS_TICK_COUNT}`
+        : `${STATUS_TICK_COUNT} of ${STATUS_TICK_COUNT}, lockout clears on the next daemon tick`;
+      return { phase: `watching (${readyLabel}); ${blockedLabel} still learning — ${suffix}`, progress, required: STATUS_TICK_COUNT };
+    }
+    return { phase: `watching (${readyLabel}); ${blockedLabel} baseline is not evaluable`, progress: readiness.progress, required: readiness.required };
+  }
+  // Every currently-defined scheduled-job/process-lineage domain owns exactly one rule_id, so
+  // watchingRules.length (which is > 0 here) always already equals ruleIds.length above -- this
+  // is unreachable today, kept only so a future second rule on these domains fails loud (a new
+  // string to design) rather than silently reusing an unrelated domain's partial-coverage wording.
+  throw new Error(`phaseForRuleReadiness: domain '${domain}' has partial rule coverage with no defined wording`);
+}
+
+function domainPhase({ enabled, entries, domain, groups, points = [], nowMs, readResult, freshnessMs = DEFAULT_STATUS_FRESHNESS_MS }) {
+  if (!enabled) return { phase: "disabled", progress: 0, required: STATUS_TICK_COUNT, coldStartPending: false, coldStartReason: undefined, watchingRules: [], evaluatedAlertKeys: [] };
+  const gated = entries.map((entry) => ({ entry, gate: detectorGate(entry, readResult, nowMs) }));
+  const pendingEntries = gated.filter(({ gate }) => gate.pending);
+  const coldStartPending = pendingEntries.length > 0;
+  const blocked = gated.find(({ gate }) => gate.blockedReason !== undefined);
+  const historyTrust = blocked ? blocked.gate.blockedReason : "ok";
+  const base = {
+    coldStartPending,
+    coldStartReason: coldStartPending ? stateReason(pendingEntries[0].entry, groups) : undefined,
+    historyTrust,
+  };
+
+  // MEDIUM fix (2026-10 security review): a domain whose rules are gated by MULTIPLE
+  // independent stores (today only "service" -- see DOMAIN_DEFINITIONS' `stores` array) must not
+  // let ONE store's pending lockout hide the OTHER store's already-evaluable coverage. The whole-
+  // domain "every rule is still cold-start-blocked" early return below must only fire when ALL of
+  // the domain's entries are pending -- a single-entry domain (session/peer/scheduled-job/
+  // process-lineage) always has allEntriesPending === coldStartPending (above), so this changes
+  // nothing for them. `base.coldStartPending`/`coldStartReason` stay keyed off ANY pending entry
+  // (unchanged) -- they report "something here is still cold-starting", which remains true.
+  const allEntriesPending = gated.length > 0 && pendingEntries.length === gated.length;
+
+  if (allEntriesPending) {
+    const progress = Math.min(...pendingEntries.map(({ entry, gate }) => lockoutProgress(entry, gate, domain, groups, nowMs)));
+    // R2 (2026-10 calibration review): for the count rules (session/peer) the 30-sample count
+    // baseline can be the BINDING requirement, not the 6-tick lockout. Each new complete tick
+    // advances both, so show whichever has more ticks remaining (ties go to the lockout).
+    if (domain === "session" || domain === "peer") {
+      const readiness = readinessFor(domain, groups, points, entries, nowMs, freshnessMs);
+      const countRemaining = readiness.required - readiness.progress;
+      const lockoutRemaining = Math.max(0, STATUS_TICK_COUNT - progress);
+      if (!readiness.established && countRemaining > lockoutRemaining) {
+        return { ...base, phase: `still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required };
+      }
+    }
+    if (progress < STATUS_TICK_COUNT) {
+      return { ...base, phase: `still learning — ${progress} of ${STATUS_TICK_COUNT}`, progress, required: STATUS_TICK_COUNT };
+    }
+    // Enough post-anchor ticks, but the detector gates on the PRE-update store: the lockout clears
+    // on its next tick and only the tick after that evaluates. Never "watching" while pending.
+    const phase = historyTrust === "ok"
+      ? `still learning — ${STATUS_TICK_COUNT} of ${STATUS_TICK_COUNT}, lockout clears on the next daemon tick`
+      : `still learning — ${STATUS_TICK_COUNT} of ${STATUS_TICK_COUNT}, waiting for trustworthy fact history (${historyTrust})`;
+    return { ...base, phase, progress: STATUS_TICK_COUNT, required: STATUS_TICK_COUNT };
+  }
+
+  // An entry that is ALREADY cold-start pending commonly also satisfies wouldArm's own anchor-
+  // missing/store-loss terms (that is just what "still pending" looks like) -- that is not a NEW
+  // trust regression, so it must not report "locked out" here; it is handled below as that rule's
+  // own still-pending coverage instead (phaseForRuleReadiness's per-rule "still learning"
+  // wording). Only an entry that is NOT currently pending but would (re-)arm its lockout THIS
+  // tick -- a genuine established-to-cold-start regression -- is the "locked out" case below.
+  if (gated.some(({ gate }) => !gate.pending && gate.wouldArm)) {
+    return { ...base, phase: `locked out — fact history untrustworthy (${historyTrust})`, progress: 0, required: STATUS_TICK_COUNT };
+  }
+
+  if (domain !== "session" && domain !== "peer" && hasIncompleteLatest(domain, groups)) {
+    return { ...base, phase: "cannot establish — census incomplete", progress: 0, required: STATUS_TICK_COUNT };
+  }
+
+  const complete = completeGroups(domain, groups);
+  const latest = complete[complete.length - 1];
+  const readiness = readinessFor(domain, groups, points, entries, nowMs, freshnessMs);
+  const rulePhase = phaseForRuleReadiness(domain, readiness, { gated, groups, nowMs });
+  if (!rulePhase && (!latest || !(nowMs - new Date(latest.ts).getTime() <= freshnessMs))) {
+    const phase = latest
+      ? `stale — latest complete census ${latest.ts} is older than the freshness window`
+      : "stale — no complete census in the fact-history window";
+    return { ...base, phase, progress: 0, required: STATUS_TICK_COUNT };
+  }
+
+  if (rulePhase) {
+    return { ...base, phase: rulePhase.phase, progress: rulePhase.progress, required: rulePhase.required, watchingRules: readiness.watchingRules, evaluatedAlertKeys: readiness.evaluatedAlertKeys };
+  }
+  if (!readiness.established) {
+    return { ...base, phase: `still learning — ${readiness.progress} of ${readiness.required}`, progress: readiness.progress, required: readiness.required };
+  }
+  // A1/A3 (2026-10 calibration + fabrication review): `established` only means enough raw
+  // complete-tick history has accumulated -- it is NOT the detector's own per-rule readiness
+  // (rulePhase, computed above). `rulePhase` is guaranteed falsy here (the `if (rulePhase)` branch
+  // above already returned otherwise), so a domain can reach this point established with every one
+  // of its rules still unevaluable this tick (e.g. peer's spike/drop both lacking a fresh scorable
+  // observation because the only current tick is an unscorable Tailscale-overflow truncation --
+  // see the repro test). Never fabricate "watching" (or any watching_rules) in that case: report
+  // the SAME "not evaluating" vocabulary used elsewhere for a degraded-input tick, so this state is
+  // never confused with genuine, rule-backed coverage.
+  return { ...base, phase: "not evaluating — established, but no rule has a fresh evaluable observation this tick", progress: readiness.progress, required: readiness.required, watchingRules: [], evaluatedAlertKeys: [] };
 }
 
 function serviceEstablished(groups) {
@@ -165,10 +566,13 @@ function sessionEntities(groups) {
 }
 
 function peerEntities(points, groups) {
-  const completeTimestamps = new Set(completeGroups("peer", groups).map((group) => group.ts));
+  const completeByTimestamp = new Map(completeGroups("peer", groups).map((group) => [group.ts, group]));
   return [...new Set(points
-    .filter((point) => point?.fact_name === "peer.presence" && completeTimestamps.has(point.ts))
+    .filter((point) => point?.fact_name === "peer.presence" && completeByTimestamp.has(point.ts))
     .filter((point) => !String(point.entity_key).includes("census-marker") && !String(point.entity_key).includes("overflow-marker"))
+    // R8: Tailscale is excluded only when the tick carries the VPN census marker that cannot vouch
+    // for it. Markerless Tailscale-only hosts are part of the legacy peer-count baseline.
+    .filter((point) => point.attributes?.source_type !== "tailscale" || completeByTimestamp.get(point.ts).availabilitySignature === undefined)
     .map((point) => point.entity_key))].sort();
 }
 
@@ -253,24 +657,50 @@ async function readBaselineInputs(descartesPaths, options) {
   return { config, points, readResult, domains, nowMs };
 }
 
+function domainPhaseFor(inputs, { definition, groups, entries }, options) {
+  return domainPhase({
+    enabled: inputs.config.enabled,
+    entries,
+    domain: definition.domain,
+    groups,
+    points: inputs.points,
+    nowMs: inputs.nowMs,
+    readResult: inputs.readResult,
+    freshnessMs: options.activeFreshnessMs ?? DEFAULT_STATUS_FRESHNESS_MS,
+  });
+}
+
+async function resolveStatusFreshnessMs(descartesPaths, options) {
+  if (options.activeFreshnessMs !== undefined) return options.activeFreshnessMs;
+  const status = await (options.readDaemonStatus ?? readDaemonStatus)(descartesPaths);
+  const structuralIntervalMs = status?.profile?.structural?.interval_ms;
+  return Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
+    ? 3 * structuralIntervalMs
+    : DEFAULT_STATUS_FRESHNESS_MS;
+}
+
 function configPayload(config, descartesPaths) {
   return { ...config, config_path: resolveWatchStorePaths(descartesPaths).configFile };
 }
 
 export async function buildBaselineStatus(descartesPaths, options = {}) {
-  const inputs = await readBaselineInputs(descartesPaths, options);
+  const freshnessMs = await resolveStatusFreshnessMs(descartesPaths, options);
+  const inputs = await readBaselineInputs(descartesPaths, { ...options, activeFreshnessMs: freshnessMs });
   return {
     watch_config: configPayload(inputs.config, descartesPaths),
     domains: inputs.domains.map(({ definition, groups, entries }) => {
-      const phase = domainPhase({ enabled: inputs.config.enabled, entries, domain: definition.domain, groups, nowMs: inputs.nowMs });
+      const phase = domainPhaseFor(inputs, { definition, groups, entries }, { ...options, activeFreshnessMs: freshnessMs });
       return {
         domain: definition.domain,
         phase: phase.phase,
         cold_start_pending: phase.coldStartPending,
         cold_start_reason: phase.coldStartReason,
+        history_trust: phase.historyTrust,
         complete_ticks: phase.progress,
-        required_ticks: STATUS_TICK_COUNT,
+        required_ticks: phase.required,
         established_count: establishedForDomain(definition.domain, inputs.points, groups).length,
+        watching_rules: phase.watchingRules ?? [],
+        evaluated_alert_keys: phase.evaluatedAlertKeys ?? [],
       };
     }),
     fact_history_window_ms: options.windowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS,
@@ -279,14 +709,15 @@ export async function buildBaselineStatus(descartesPaths, options = {}) {
 }
 
 export async function buildBaselineInspect(descartesPaths, options = {}) {
-  const inputs = await readBaselineInputs(descartesPaths, options);
+  const freshnessMs = await resolveStatusFreshnessMs(descartesPaths, options);
+  const inputs = await readBaselineInputs(descartesPaths, { ...options, activeFreshnessMs: freshnessMs });
   const requested = options.domain ? normalizeDomainName(options.domain) : undefined;
   if (requested && !DOMAIN_DEFINITIONS.some((definition) => definition.domain === requested)) {
     throw new Error(`Unknown baseline domain: ${options.domain}\n\n${usage()}`);
   }
   const selected = inputs.domains.filter(({ definition }) => !requested || definition.domain === requested);
   const domains = selected.map(({ definition, groups, entries }) => {
-    const phase = domainPhase({ enabled: inputs.config.enabled, entries, domain: definition.domain, groups, nowMs: inputs.nowMs });
+    const phase = domainPhaseFor(inputs, { definition, groups, entries }, { ...options, activeFreshnessMs: freshnessMs });
     const report = {
       domain: definition.domain,
       phase: phase.phase,
@@ -311,7 +742,7 @@ export async function buildBaselineInspect(descartesPaths, options = {}) {
 function renderStatus(report) {
   const lines = [`Structural watching: ${report.watch_config.enabled ? "enabled" : "disabled"}`];
   for (const domain of report.domains) {
-    const reason = domain.cold_start_reason ? ` (${domain.cold_start_reason})` : "";
+    const reason = domain.cold_start_reason && !domain.phase.includes(`(${domain.cold_start_reason})`) ? ` (${domain.cold_start_reason})` : "";
     lines.push(`- ${domain.domain}: ${domain.phase}${reason}`);
   }
   lines.push(`Config path: ${report.watch_config.config_path}`);

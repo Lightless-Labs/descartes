@@ -2,6 +2,25 @@
 
 **Last updated:** 2026-10-05
 
+## Review-fix update — 2026-10-05
+
+On branch `fix/watch-fabrication-2026-10`, the watch-fabrication review fixes are committed
+locally and are **not pushed or merged**: `98203b9` (rule-aware baseline status and persisted
+daemon freshness), `ae86a46` (session churn wall-clock bound threaded from the daemon), `6f99887`
+(R8 peer source/overflow handling), and `bdcb9f9` (R8 tradeoff documentation). The focused
+baseline, peer-baseline, session-baseline, and daemon tests are green. Full `npm test` reports
+2073 tests / 2017 pass / 22 fail / 34 skip; all 22 failures are sandbox/live-host environment
+failures (20 loopback `listen EPERM`, 2 live-process provenance checks returning `unknown`), with
+no failures in the changed behavior.
+
+The follow-up R8 identity migration is now complete in the worktree: marker-backed VPN-only peer
+counts use `v2:vpn`, markerless all-peer counts use `v2:markerless`, and neither peer producer nor
+`baseline status` reports the legacy `global` identity. Legacy global peer alerts therefore freeze
+until acknowledged, while new source-scoped alerts can raise and recover normally. The focused
+peer-baseline upgrade scenario passes (legacy global active + VPN-only stable; new scoped spike
+raises and clears). Full `npm test` after this change reports 2074 tests / 2018 pass / 22 fail /
+34 skip; the same 20 sandbox loopback and 2 live-process provenance environment failures remain.
+
 ## Current Status
 
 > **2026-10-05 PROVENANCE-IDENTITY FAMILY FIX — branch `fix/provenance-identity-coverage-2026-10`, local only.** Fixed daybreak-blue's remaining blocker: IPv4 keeps the legacy `tcp.*`/`udp.*` target-key spelling while IPv6 keeps `tcp6.*`/`udp6.*`; macOS lsof's IPv4/IPv6 column and address form now align with Linux `/proc/net/*[6]`. Dual-stack owners no longer produce false `identity_drift` or colliding `new_public_bind` IDs, and all provenance-identity `evaluatedAlertKeys` paths remain `[]`. Affected suites: **166 pass / 1 known sandbox live-macOS-smoke fail**. Fresh-XDG full `npm test`: **2055 pass / 22 sandbox-environment failures / 34 skip / 2111 total**; failures are 20 loopback-listen `EPERM` tests and 2 live macOS provenance/ps smokes returning `unknown` instead of `ok`. Committed locally; no push or merge.

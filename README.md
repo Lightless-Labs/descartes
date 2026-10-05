@@ -300,6 +300,28 @@ descartes baseline disable               # disable structural watching
 `baseline inspect` recomputes its answer from the fact-history window. Its answer can differ
 slightly from the daemon's last tick. `descartes alerts watch` remains the live alert tail.
 
+`baseline status` says a domain is `watching` only when its detector would really evaluate on
+the next tick. That means the cold-start lockout has cleared, the fact history is trusted, the
+rule-specific evidence is complete and fresh, and that rule's own baseline is ready. Overflow
+ticks are handled per rule: churn and peer spikes can still evaluate a capped tick, while the
+affected count baseline remains learning. Otherwise it reports one of these, with the reason:
+
+- `still learning — N of M`
+- `locked out — fact history untrustworthy (…)`
+- `cannot establish — census incomplete`
+- `stale — …`
+
+Freshness uses the default 3-hour window (3× the hourly structural interval), or 3× the
+structural interval recorded in the daemon's last status when that cadence is configured.
+Session status can report `watching (churn)` while the count baseline is still learning because
+churn is evaluated from a fresh pair of complete observations and has no 30-sample count warm-up.
+
+Peer-count watching has one deliberate source boundary: on hosts where `vpn-peer-status` supplies
+the census marker, Tailscale peers are not counted because that marker does not cover tailnet
+membership. Consequently, tailnet-membership bursts are not tracked by the mixed-source peer-count
+baseline. On Tailscale-only hosts, Tailscale peers remain countable and `peer.count_spike` still
+has coverage; `peer.count_drop` still requires the VPN census marker.
+
 The authoring commands remain separate:
 
 ```bash
