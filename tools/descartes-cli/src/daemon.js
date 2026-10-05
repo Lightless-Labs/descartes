@@ -1197,7 +1197,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // Horizon-SHORT is reported only over a valid ledger's coverage report: a missing/invalid ledger
     // or failed read is an untrusted-history condition (reported as such), not a short horizon.
     const coverage = factHistoryReadResult?.completeness?.coverage;
-    if (coverage === "full" || coverage === "narrowed") horizonShortRuleIds = horizonVetoedRuleIds;
+    // S3b review LOW-3: only rules whose owning tier is running -- a detector that is not evaluating
+    // because its tier is off is not "horizon-short", and must not raise the fixed alert. (The
+    // recovery veto above is unchanged; the tier veto freezes those rules at both passes anyway.)
+    if (coverage === "full" || coverage === "narrowed") {
+      const tierOff = new Set(tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }));
+      horizonShortRuleIds = new Set([...horizonVetoedRuleIds].filter((ruleId) => !tierOff.has(ruleId)));
+    }
   } else {
     // BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf): when NEITHER tier is
     // enabled, we cannot vouch for fact-history without a fact read we must not do when disabled

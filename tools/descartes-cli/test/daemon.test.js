@@ -4697,6 +4697,19 @@ test("S3b review MEDIUM-2: correlation silenced by a byte-cap floor inside its 3
   assert.deepEqual(Object.keys(result.status.history_horizon_short?.rules ?? {}), [CORRELATION_RULE_ID], "the silent detector is reported, never silently");
 });
 
+test("S3b review LOW-3: the horizon-short list names only rules whose tier is running -- learned off never lists correlation or canary.tampered", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeLearnedConfig(paths, { enabled: false });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+  const result = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  const listed = Object.keys(result.status.history_horizon_short?.rules ?? {});
+  assert.ok(listed.includes(SESSION_COUNT_DROP_RULE_ID), "a short watch-tier rule is still reported");
+  assert.equal(listed.includes(CORRELATION_RULE_ID), false, "correlation is not running with learned off");
+  assert.equal(listed.includes(CANARY_TAMPERED_RULE_ID), false, "canary.tampered is not running with learned off");
+});
+
 test("S3 horizon-short signal: no fact read (both tiers off) and an un-narrowed store report nothing", async () => {
   const offPaths = await tempPaths();
   await writeWatchConfig(offPaths, { enabled: false });
