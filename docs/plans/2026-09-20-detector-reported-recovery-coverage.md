@@ -1,8 +1,8 @@
 # Detector-Reported Recovery Coverage — Close the "empty ⇒ genuine clear" Fabrication Class at Its Root
 
 **Date:** 2026-09-20
-**Status:** PLAN — implementation addendum 2026-10-05 applied on `fix/provenance-identity-coverage-2026-10`; provenance-identity remains local-only pending final gate.
-**Reviewed:** 2026-09-23 (triple adversarial review: Fable code-grounded, daybreak-blue frontier-security, Astra xhigh goal-alignment) — all three NEEDS-REVISION, all three "design is right, mechanics need rewriting." Synthesis in §7.
+**Status:** PLAN — implementation addenda 2026-10-05 applied on `fix/provenance-identity-coverage-2026-10`; provenance-identity remains local-only pending final gate.
+**Reviewed:** 2026-10-05 (implementation addendum: daybreak-blue re-gate blockers 1–3 addressed with global raw-census port absence, same-key current-port union, and bounded-list fail-closed coverage). Earlier review: 2026-09-23 (triple adversarial review: Fable code-grounded, daybreak-blue frontier-security, Astra xhigh goal-alignment) — all three NEEDS-REVISION, all three "design is right, mechanics need rewriting." Synthesis in §7.
 **Prerequisite for:** the watch-by-default default-on flip (`docs/plans/2026-09-10-watch-by-default-slice-1.md`), which is HELD until this lands (operator decision 2026-09-20: fix-before-flip).
 **Origin:** daybreak-blue re-gate round 3 of the watch-by-default gate split found a pre-existing fabrication gap the default-on flip widens to every install.
 
@@ -157,6 +157,15 @@ Bare-array ⇒ freeze is correct (no compat obligation at v0.0.50 — a bare arr
 The only evaluated-clear is positive re-observation of the **same identity record key** on a due tick with an explicitly `ok` and complete collection, where that record's alert condition no longer holds: for example, the identity is now known/trusted/promoted, its public bind is gone while the process remains observed, or drift is positively resolved. A same-UID re-key from another executable path, a port change, target sharing, supersession, or age-out does not transfer coverage. The old supersession/port-target linkage coverage heuristic is removed. Historical port keys remain only to preserve alert identity; the current observed port set determines whether a bind is still bad.
 
 Defense-in-depth requirements are part of this addendum: macOS socket census invokes both `lsof -iTCP -sTCP:LISTEN` and `lsof -iUDP`; failure or incomplete UDP visibility leaves the census degraded/partial, never `ok`. Any rejected lsof row or unparseable `/proc/net` row adds a degradation reason. Linux inode attribution returns every holder PID and the census expands every holder into identity observations.
+
+**Addendum 2026-10-05 — daybreak-blue re-gate blockers fixed (local, not yet re-gated).** The first re-gate found three false-clear paths in `deriveIdentityCoverage`; this addendum supersedes the earlier per-record/current-list port wording above:
+
+- **Global port absence is the only positive port clear.** `collectIdentityObservations` now carries the raw socket census into the coverage call. A `new_public_bind` key may be reported only on a due tick with an explicitly complete socket census (`status:"ok"`, no truncation/parse-loss reason) and only when no raw public socket has the target's protocol/port key. The test is global across UIDs, process identities, provisional records, re-keyed records, and same-key siblings; it never consults one record's current-port list to prove absence.
+- **Same-key PID observations are unioned.** Reconciliation aggregates all `portTargetKeys` for one identity signature for the current tick before folding, so a listenerless sibling cannot overwrite a listener sibling. The raw census remains authoritative for port recovery even when the identity record is re-keyed or a provisional holder is not candidate-producing.
+- **Bounded storage cannot authorize recovery.** The five-entry `port_target_keys`/`current_port_target_keys` fields remain introspection/candidate inputs only. Coverage does not use `current_port_target_keys`, and a historical list at the five-entry bound is treated as potentially truncated and cannot yield port recovery keys. Five old plus five new live ports therefore remain frozen rather than falsely recovering.
+- **Sibling folding is fail-closed for identity/drift coverage too.** Coverage groups all observations sharing an identity key and requires every sibling to be clear before reporting its `unknown_identity` or `identity_drift` key; last-observation-wins is not a recovery authority.
+
+Regression coverage now includes the listenerless sibling-last reproduction, the re-keyed provisional holder plus same-key decoy, five-plus-five live ports, complete-census true absence, and incomplete-census no-clear behavior. The focused provenance-store/identity gate is 80/80 locally; the required fresh-XDG full `npm test` remains the final gate.
 
 ---
 
