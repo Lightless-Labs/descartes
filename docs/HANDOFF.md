@@ -2,24 +2,28 @@
 
 **Last updated:** 2026-10-05
 
-## Current session — daybreak-blue re-gate fixes (2026-10-05)
+## Current session — daybreak-blue fourth-gate fixes (2026-10-05)
 
-On branch `harden/root-helper-2026-10`, the six third-gate findings are fixed locally and are not
-pushed. The finding-scoped commits are `5b5b4ba` (exhaustive same-UID holder scans and socket
-re-verification), `b0d7752` (monotonic owner ambiguity), `f1e7f06` (PID-namespace guard before
-every proc resolution), `bf1d2c1` (argument-filtered `newfstatat`), `3916fbc` (cmdline truncation
-evidence), and `27992a5` (UTF-8 byte response bound). All six carry the required Claude trailer.
-Holder scans now collect every candidate, surface caps/read failures, and recheck the selected
-socket holder and `(tgid,start_time)` once before returning confidence 1. Owner-dependent warnings
-are suppressed for every classified ambiguous/truncated/identity-unavailable reason. The helper
-guards `/proc/self` before `--resolve-pid` and socket resolution; `newfstatat` requires a pinned
-non-`AT_FDCWD` dirfd and zero flags; cmdline truncation is explicit in Rust and Node evidence.
+On branch `harden/root-helper-2026-10`, the four fourth-gate findings are fixed locally and are
+not pushed or merged. The finding-scoped commits are `61e71a9` (stable Node/Rust holder
+enumeration), `b543951` (procfs namespace mismatch remains ambiguous), `39d22a1` (fd-based
+executable `fstat`, with `newfstatat` removed from seccomp), and `892bbbb` (same-UID uncertainty
+falls through to the enabled elevated helper). All four carry the required Claude trailer.
 
-Host Rust formatting/check/test/clippy and both Linux-target test-check/clippy commands pass.
-Escalated fresh-XDG `npm test` is green at 2,045 passed, 0 failed, and 34 skipped. The sandboxed
-fresh-XDG run had 2,023 passed, 22 environment-only failures, and 34 skipped: localhost `listen`
-EPERM in notifier/tap tests plus live process-inspection denials in provenance smoke tests. Linux
-runtime tests remain CI-only on this macOS host. No push or merge was performed.
+Holder attribution now re-enumerates until the PID/start-time set is stable, bounded at three
+passes; new or reused PIDs and non-convergence remain ambiguous, and Rust reports the final holder
+count. The elevated failure path delegates status selection to the centralized ambiguity
+classifier. Executable identity opens `/proc/<pid>/exe` through the existing procfd path and uses
+`fstat`; pathname `newfstatat` is not allowed. An uncertain same-UID result tries the configured
+elevated helper while preserving the more conservative status if elevation cannot resolve it.
+
+Checks passed: `cargo fmt --check`; workspace/all-target `cargo check`; Linux-target test-check and
+`clippy -D warnings` for x86_64 and aarch64; workspace tests; host clippy; and targeted Node tests
+for holder stability, namespace ambiguity, fd-fstat, and same-UID fallback. Fresh-XDG `npm test`
+ran 2,085 tests: 2,029 passed, 22 failed, and 34 skipped. The 22 failures are sandbox-only
+environment failures (loopback `listen` EPERM in notifier/tap tests and two live process-
+inspection smoke tests returning `unknown`); no fourth-gate regression test failed. Linux runtime
+and privileged helper behavior remain CI-only on this macOS host. No push or merge was performed.
 
 ## Current session — daybreak-blue root-helper findings (2026-10-05)
 

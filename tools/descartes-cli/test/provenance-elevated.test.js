@@ -22,6 +22,7 @@ import { writeProvenanceConfig } from "../src/provenance-elevated-config.js";
 import {
   computeProvenanceEnvelopeFields,
   resolveCrossUidPortResult,
+  resolveByPortLinux,
 } from "../src/tools/provenance.js";
 import {
   buildHelperArgv,
@@ -354,6 +355,58 @@ test("resolveCrossUidPortResult never invokes the helper when the observed socke
   const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { uid: 1000, protocol: "tcp", inode: "0" }, sockets }, options);
   assert.equal(invoked, false);
   assert.equal(outcome.resolvedStatus, "partial");
+});
+
+function tcpListeningFixture({ port = 8080, uid = process.getuid?.() ?? 1000, inode = "424242" } = {}) {
+  return [
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+    ` 0: 0100007F:${port.toString(16).padStart(4, "0")} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  ${uid}        0 ${inode} 1 0000000000000000 100 0 0 10 0`,
+  ].join("\n");
+}
+
+test("same-UID uncertain fd attribution falls through to the enabled elevated exhaustive scan", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const currentUid = process.getuid?.() ?? 1000;
+  const options = fakeElevatedOptions({
+    paths,
+    readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcpListeningFixture({ uid: currentUid }) : "1\n",
+    listProcPids: async () => ({ pids: [100], truncated: false }),
+    scanProcFdForInode: async () => ({
+      results: [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [] }],
+      truncated: false,
+      uncertain: true,
+    }),
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "ok", stdout: validHelperStdout({ port: 8080, uid: currentUid }) }),
+  });
+
+  const outcome = await resolveByPortLinux(8080, options);
+  assert.equal(outcome.resolvedStatus, "ok");
+  assert.equal(outcome.result.resolved.pid, 4242);
+  assert.equal(outcome.result.privilege.elevated_used, true);
+});
+
+test("same-UID ambiguity stays ambiguous when the enabled elevated helper also cannot resolve it", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const currentUid = process.getuid?.() ?? 1000;
+  const outcome = await resolveByPortLinux(8080, fakeElevatedOptions({
+    paths,
+    readFile: async (filePath) => filePath === "/proc/net/tcp" ? tcpListeningFixture({ uid: currentUid }) : "1\n",
+    listProcPids: async () => ({ pids: [100], truncated: false }),
+    scanProcFdForInode: async () => ({
+      results: [{ pid: 100, tgid: 100, start_time: "10", accessible: true, fds: [] }],
+      truncated: false,
+      uncertain: true,
+    }),
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async () => ({ status: "unable", owner_ambiguous: true, stdout: "", stderr: "" }),
+  }));
+
+  assert.equal(outcome.resolvedStatus, "ambiguous");
+  assert.equal(outcome.result.resolved.reason, "elevated_owner_ambiguous");
+  assert.equal(outcome.result.resolved.pid, undefined);
 });
 
 test("defaultInvokeElevatedHelper maps the helper's EXIT_OWNER_AMBIGUOUS (5) to owner_ambiguous:true, and resolveCrossUidPortResult surfaces it while degrading (real subprocess)", async () => {

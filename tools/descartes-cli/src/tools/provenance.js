@@ -1101,7 +1101,11 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   }));
 }
 
-async function resolveByPortLinux(port, options = {}) {
+export async function resolveByPortLinux(port, options = {}) {
+  const readFileFn = options.readFile ?? readFile;
+  const listProcPidsFn = options.listProcPids ?? listProcPids;
+  const scanProcFdForInodeFn = options.scanProcFdForInode ?? scanProcFdForInode;
+  const resolvePidCoreFn = options.resolvePidCore ?? resolvePidCore;
   const sources = [
     ["tcp", "/proc/net/tcp"],
     ["tcp6", "/proc/net/tcp6"],
@@ -1111,7 +1115,7 @@ async function resolveByPortLinux(port, options = {}) {
   const entries = [];
   for (const [protocol, filePath] of sources) {
     try {
-      const contents = await readFile(filePath, "utf8");
+      const contents = await readFileFn(filePath, "utf8");
       entries.push(...parseProcNetContents(contents, { protocol }));
     } catch {
       // This /proc source is unavailable on this host; continue with the others.
@@ -1125,11 +1129,11 @@ async function resolveByPortLinux(port, options = {}) {
 
   const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
   const pidListing = currentUid !== undefined && matches.some((entry) => entry.uid === currentUid)
-    ? await listProcPids()
+    ? await listProcPidsFn()
     : { pids: [], truncated: false };
   const candidatePids = Array.isArray(pidListing) ? pidListing : pidListing.pids;
   const fdScanResults = candidatePids.length > 0
-    ? await scanProcFdForInode(candidatePids, { listingTruncated: !Array.isArray(pidListing) && pidListing.truncated })
+    ? await scanProcFdForInodeFn(candidatePids, { listingTruncated: !Array.isArray(pidListing) && pidListing.truncated })
     : { results: [], truncated: false, uncertain: false };
   const attributions = [];
   const outcomes = [];
@@ -1138,9 +1142,9 @@ async function resolveByPortLinux(port, options = {}) {
     if (currentUid !== undefined && entry.uid === currentUid) {
       const matchResult = await resolveVerifiedPidFromFdScanResults(entry.inode, fdScanResults, {
         scanAgain: async () => {
-          const refreshedListing = await listProcPids();
+          const refreshedListing = await listProcPidsFn();
           const refreshedPids = Array.isArray(refreshedListing) ? refreshedListing : refreshedListing.pids;
-          return scanProcFdForInode(refreshedPids, {
+          return scanProcFdForInodeFn(refreshedPids, {
             listingTruncated: !Array.isArray(refreshedListing) && refreshedListing.truncated,
           });
         },
@@ -1148,7 +1152,7 @@ async function resolveByPortLinux(port, options = {}) {
       if (matchResult.status === "ok") {
         const cores = await Promise.all((matchResult.owners ?? [{ pid: matchResult.pid }]).map(async (owner) => ({
           owner,
-          core: await resolvePidCore(owner.pid),
+          core: await resolvePidCoreFn(owner.pid),
         })));
         const resolvedCores = cores.filter(({ core }) => core.resolvedStatus === "ok");
         const identitiesAgree = resolvedCores.length === cores.length
@@ -1168,7 +1172,24 @@ async function resolveByPortLinux(port, options = {}) {
         attributions.push({ resolved: false, reason: distinctIdentities.size > 1 ? "owner_ambiguous" : "owner_identity_unavailable" });
         continue;
       }
-      attributions.push({ resolved: false, reason: matchResult.reason ?? "socket_attribution_unresolved" });
+      const originalReason = matchResult.reason ?? "socket_attribution_unresolved";
+      if (options.paths) {
+        const elevatedOutcome = await resolveCrossUidPortResult({ port, primary: entry, sockets: [socket] }, options);
+        if (elevatedOutcome.resolvedStatus === "ok") {
+          attributions.push({ resolved: true, executablePath: elevatedOutcome.result.resolved.executable_path, processIdentity: elevatedOutcome.result.resolved.process_identity });
+          outcomes.push(elevatedOutcome);
+          continue;
+        }
+        const originalClass = classifyOwnerAmbiguityReason(originalReason);
+        const elevatedReason = elevatedOutcome.result.resolved.reason;
+        const elevatedClass = classifyOwnerAmbiguityReason(elevatedReason);
+        const rank = { unknown: 0, partial: 1, truncated: 2, ambiguous: 3 };
+        const originalRank = rank[originalClass?.status ?? "partial"];
+        const elevatedRank = rank[elevatedClass?.status ?? "partial"];
+        attributions.push({ resolved: false, reason: elevatedRank >= originalRank ? elevatedReason : originalReason });
+        continue;
+      }
+      attributions.push({ resolved: false, reason: originalReason });
       continue;
     } else if (options.paths) {
       const outcome = await resolveCrossUidPortResult({ port, primary: entry, sockets: [socket] }, options);
