@@ -208,11 +208,62 @@ pub fn helper_policy(t: &SyscallTable, own_pid: u32) -> Policy {
     }
 }
 
+/// Field-by-field equality usable in a `const` context. `hardening.rs` uses it in a COMPILE-TIME
+/// assertion that the libc-derived native table equals the pinned table for the target arch, so a
+/// plain `cargo check --target {x86_64,aarch64}-unknown-linux-gnu` verifies both pinned tables
+/// (and therefore the policy the host tests interpret) against the real constants -- including
+/// x86_64, which no CI runner executes.
+pub const fn same_table(a: &SyscallTable, b: &SyscallTable) -> bool {
+    let x32_same = match (a.x32_syscall_bit, b.x32_syscall_bit) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => true,
+        _ => false,
+    };
+    x32_same
+        && a.audit_arch == b.audit_arch
+        && a.read == b.read
+        && a.write == b.write
+        && a.writev == b.writev
+        && a.openat == b.openat
+        && a.close == b.close
+        && a.fcntl == b.fcntl
+        && a.getdents64 == b.getdents64
+        && a.readlinkat == b.readlinkat
+        && a.mmap == b.mmap
+        && a.mprotect == b.mprotect
+        && a.munmap == b.munmap
+        && a.brk == b.brk
+        && a.mremap == b.mremap
+        && a.madvise == b.madvise
+        && a.exit == b.exit
+        && a.exit_group == b.exit_group
+        && a.futex == b.futex
+        && a.capget == b.capget
+        && a.capset == b.capset
+        && a.prctl == b.prctl
+        && a.rt_sigreturn == b.rt_sigreturn
+        && a.rt_sigaction == b.rt_sigaction
+        && a.rt_sigprocmask == b.rt_sigprocmask
+        && a.sigaltstack == b.sigaltstack
+        && a.clock_gettime == b.clock_gettime
+        && a.getpid == b.getpid
+        && a.gettid == b.gettid
+        && a.tgkill == b.tgkill
+        && a.o_cloexec == b.o_cloexec
+        && a.o_directory == b.o_directory
+        && a.o_nofollow == b.o_nofollow
+        && a.o_largefile == b.o_largefile
+        && a.f_getfd == b.f_getfd
+        && a.pr_cap_ambient == b.pr_cap_ambient
+        && a.pr_cap_ambient_clear_all == b.pr_cap_ambient_clear_all
+        && a.prot_exec == b.prot_exec
+        && a.map_anonymous == b.map_anonymous
+}
+
 /// Hand-pinned Linux x86_64 table (arch/x86/entry/syscalls/syscall_64.tbl + x86 uapi fcntl/mman).
-/// Test-only on non-Linux hosts; on Linux x86_64, `hardening.rs` asserts the libc-derived native
-/// table equals this exactly.
-#[cfg(test)]
-pub(crate) fn pinned_x86_64() -> SyscallTable {
+/// Host tests interpret the real policy against it; on an x86_64 Linux target `hardening.rs`
+/// asserts at COMPILE TIME that the libc-derived native table equals it exactly.
+pub const fn pinned_x86_64() -> SyscallTable {
     SyscallTable {
         audit_arch: 0xC000_003E,
         x32_syscall_bit: Some(0x4000_0000),
@@ -257,8 +308,7 @@ pub(crate) fn pinned_x86_64() -> SyscallTable {
 }
 
 /// Hand-pinned Linux aarch64 table (asm-generic unistd.h + arm64 uapi fcntl). See `pinned_x86_64`.
-#[cfg(test)]
-pub(crate) fn pinned_aarch64() -> SyscallTable {
+pub const fn pinned_aarch64() -> SyscallTable {
     SyscallTable {
         audit_arch: 0xC000_00B7,
         x32_syscall_bit: None,

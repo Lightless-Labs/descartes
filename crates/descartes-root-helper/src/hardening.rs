@@ -90,10 +90,11 @@ mod linux {
 
     /// The native table the policy (`seccomp_policy::helper_policy`) is written against, from
     /// `libc`'s arch-correct `SYS_*` numbers. The KERNEL-visible `O_LARGEFILE` bit is hand-defined
-    /// per arch because glibc (and so the `libc` crate) defines it as 0 on 64-bit targets. A
-    /// Linux-only test below pins this table equal to `seccomp_policy`'s hand-written table for the
-    /// running arch, so the host-tested policy and the installed one cannot drift.
-    pub(super) fn native_table() -> SyscallTable {
+    /// per arch because glibc (and so the `libc` crate) defines it as 0 on 64-bit targets. The
+    /// `const` assertion right below pins this table equal to `seccomp_policy`'s hand-written table
+    /// for the target arch AT COMPILE TIME, so the host-tested policy and the installed one cannot
+    /// drift -- and a cross-target `cargo check` verifies it for an arch no CI runner executes.
+    pub(super) const fn native_table() -> SyscallTable {
         #[cfg(target_arch = "x86_64")]
         const KERNEL_O_LARGEFILE: u32 = 0o100000;
         #[cfg(target_arch = "aarch64")]
@@ -103,50 +104,62 @@ mod linux {
         #[cfg(target_arch = "aarch64")]
         const X32: Option<u32> = None;
 
-        let nr = |n: libc::c_long| n as u32;
-        let flag = |f: libc::c_int| f as u32;
         SyscallTable {
             audit_arch: NATIVE_AUDIT_ARCH,
             x32_syscall_bit: X32,
-            read: nr(libc::SYS_read),
-            write: nr(libc::SYS_write),
-            writev: nr(libc::SYS_writev),
-            openat: nr(libc::SYS_openat),
-            close: nr(libc::SYS_close),
-            fcntl: nr(libc::SYS_fcntl),
-            getdents64: nr(libc::SYS_getdents64),
-            readlinkat: nr(libc::SYS_readlinkat),
-            mmap: nr(libc::SYS_mmap),
-            mprotect: nr(libc::SYS_mprotect),
-            munmap: nr(libc::SYS_munmap),
-            brk: nr(libc::SYS_brk),
-            mremap: nr(libc::SYS_mremap),
-            madvise: nr(libc::SYS_madvise),
-            exit: nr(libc::SYS_exit),
-            exit_group: nr(libc::SYS_exit_group),
-            futex: nr(libc::SYS_futex),
-            capget: nr(libc::SYS_capget),
-            capset: nr(libc::SYS_capset),
-            prctl: nr(libc::SYS_prctl),
-            rt_sigreturn: nr(libc::SYS_rt_sigreturn),
-            rt_sigaction: nr(libc::SYS_rt_sigaction),
-            rt_sigprocmask: nr(libc::SYS_rt_sigprocmask),
-            sigaltstack: nr(libc::SYS_sigaltstack),
-            clock_gettime: nr(libc::SYS_clock_gettime),
-            getpid: nr(libc::SYS_getpid),
-            gettid: nr(libc::SYS_gettid),
-            tgkill: nr(libc::SYS_tgkill),
-            o_cloexec: flag(libc::O_CLOEXEC),
-            o_directory: flag(libc::O_DIRECTORY),
-            o_nofollow: flag(libc::O_NOFOLLOW),
+            read: libc::SYS_read as u32,
+            write: libc::SYS_write as u32,
+            writev: libc::SYS_writev as u32,
+            openat: libc::SYS_openat as u32,
+            close: libc::SYS_close as u32,
+            fcntl: libc::SYS_fcntl as u32,
+            getdents64: libc::SYS_getdents64 as u32,
+            readlinkat: libc::SYS_readlinkat as u32,
+            mmap: libc::SYS_mmap as u32,
+            mprotect: libc::SYS_mprotect as u32,
+            munmap: libc::SYS_munmap as u32,
+            brk: libc::SYS_brk as u32,
+            mremap: libc::SYS_mremap as u32,
+            madvise: libc::SYS_madvise as u32,
+            exit: libc::SYS_exit as u32,
+            exit_group: libc::SYS_exit_group as u32,
+            futex: libc::SYS_futex as u32,
+            capget: libc::SYS_capget as u32,
+            capset: libc::SYS_capset as u32,
+            prctl: libc::SYS_prctl as u32,
+            rt_sigreturn: libc::SYS_rt_sigreturn as u32,
+            rt_sigaction: libc::SYS_rt_sigaction as u32,
+            rt_sigprocmask: libc::SYS_rt_sigprocmask as u32,
+            sigaltstack: libc::SYS_sigaltstack as u32,
+            clock_gettime: libc::SYS_clock_gettime as u32,
+            getpid: libc::SYS_getpid as u32,
+            gettid: libc::SYS_gettid as u32,
+            tgkill: libc::SYS_tgkill as u32,
+            o_cloexec: libc::O_CLOEXEC as u32,
+            o_directory: libc::O_DIRECTORY as u32,
+            o_nofollow: libc::O_NOFOLLOW as u32,
             o_largefile: KERNEL_O_LARGEFILE,
-            f_getfd: flag(libc::F_GETFD),
-            pr_cap_ambient: flag(libc::PR_CAP_AMBIENT),
-            pr_cap_ambient_clear_all: flag(libc::PR_CAP_AMBIENT_CLEAR_ALL),
-            prot_exec: flag(libc::PROT_EXEC),
-            map_anonymous: flag(libc::MAP_ANONYMOUS),
+            f_getfd: libc::F_GETFD as u32,
+            pr_cap_ambient: libc::PR_CAP_AMBIENT as u32,
+            pr_cap_ambient_clear_all: libc::PR_CAP_AMBIENT_CLEAR_ALL as u32,
+            prot_exec: libc::PROT_EXEC as u32,
+            map_anonymous: libc::MAP_ANONYMOUS as u32,
         }
     }
+
+    #[cfg(target_arch = "x86_64")]
+    const _: () = assert!(
+        crate::seccomp_policy::same_table(&native_table(), &crate::seccomp_policy::pinned_x86_64()),
+        "libc's x86_64 syscall table drifted from seccomp_policy::pinned_x86_64"
+    );
+    #[cfg(target_arch = "aarch64")]
+    const _: () = assert!(
+        crate::seccomp_policy::same_table(
+            &native_table(),
+            &crate::seccomp_policy::pinned_aarch64()
+        ),
+        "libc's aarch64 syscall table drifted from seccomp_policy::pinned_aarch64"
+    );
 
     /// Compiles the policy for THIS process (its pid is baked into the tgkill rule) into the
     /// kernel's `sock_filter` representation. See `seccomp_bpf` for the program shape.
