@@ -166,9 +166,11 @@ struct ProcessIdentity {
 }
 
 /// See `socket.rs` for the contract. Sequence: admit the live row for the exact inode -> collect
-/// every holder (pin-then-verify) -> select (or ambiguous) -> consistency re-check of BOTH the
-/// chosen holder's fd link and the socket row against what was admitted -> re-enumerate `/proc`
-/// until the PID set is stable. A non-converging set is ambiguous, never a sole-owner answer.
+/// every holder (pin-then-verify) -> re-enumerate `/proc` until the complete holder/PID snapshot
+/// is stable -> run ONE final verification phase over every selected holder. The final phase is
+/// deliberately after the last enumeration and is the only place a confident result is emitted.
+/// A non-converging set or any final-generation change is ambiguous after one whole-resolution
+/// retry, never a sole-owner answer.
 pub fn resolve_socket(target: &SocketTarget) -> SocketOutcome {
     resolve_with_one_generation_retry(|| resolve_socket_once(target))
 }
@@ -217,49 +219,21 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
         if scan_requires_truncated_outcome(scan.truncated, scan.holder_count) {
             return SocketOutcome::Truncated;
         }
-        let Some(holder) = scan.selected.as_ref() else {
+        if scan.selected_index.is_none() {
             return if scan.truncated {
                 SocketOutcome::Truncated
             } else {
                 SocketOutcome::NotFound
             };
-        };
-
-        // Consistency ("generation") re-check: the chosen holder must STILL hold this exact
-        // socket (a close/handoff since the scan would otherwise be reported as current), and the
-        // socket row must be unchanged (same address/port/state/uid). A rebind of the port to a
-        // new socket gives a new inode and fails the row lookup; a state change fails equality.
-        let still_held = procfs::read_link_at(holder.fd_dir.as_fd(), &holder.fd_name)
-            .ok()
-            .is_some_and(|link| link.to_str() == Some(target.fd_link().as_str()));
-        if !still_held {
-            return SocketOutcome::GenerationChanged;
         }
-        let (row_again, row_again_status) = read_socket_row(target);
-        if row_again_status == SocketTableStatus::NamespaceMismatch {
-            return SocketOutcome::ProcfsNamespaceMismatch;
-        }
-        if row_again.as_ref() != Some(&row) {
-            return SocketOutcome::NotFound;
-        }
-        // Final executable-generation check closes the window between the holder identity read
-        // and the fd/socket recheck. A changed path retries once, then becomes ambiguous.
-        if procfs::read_link_at(holder._pid_dir.as_fd(), "exe")
-            .ok()
-            .is_none_or(|link| link.to_string_lossy() != holder.resolved.executable_path)
-            || executable_identity(holder._pid_dir.as_fd())
-                .ok()
-                .map(|identity| (identity.device, identity.inode))
-                != Some(holder.resolved.executable_identity)
-        {
-            return SocketOutcome::GenerationChanged;
-        }
-
-        let mut refreshed = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
+        let refreshed = scan_holders(proc_root.as_fd(), &target.fd_link(), row.uid);
         if refreshed.generation_changed {
             return SocketOutcome::GenerationChanged;
         }
-        if crate::scan::snapshot_has_new_or_reused_pid(&scan.snapshot, &refreshed.snapshot) {
+        let holder_set_changed = holder_set_changed(&scan, &refreshed);
+        if crate::scan::snapshot_has_new_or_reused_pid(&scan.snapshot, &refreshed.snapshot)
+            || holder_set_changed
+        {
             if pass + 1 == MAX_HOLDER_STABILITY_PASSES {
                 return SocketOutcome::Ambiguous;
             }
@@ -274,22 +248,28 @@ fn resolve_socket_once(target: &SocketTarget) -> SocketOutcome {
         if scan_requires_truncated_outcome(refreshed.truncated, refreshed.holder_count) {
             return SocketOutcome::Truncated;
         }
-        let Some(final_holder) = refreshed.selected.take() else {
+        let Some(selected_index) = refreshed.selected_index else {
             return if refreshed.truncated {
                 SocketOutcome::Truncated
             } else {
                 SocketOutcome::NotFound
             };
         };
-        if procfs::read_link_at(final_holder.fd_dir.as_fd(), &final_holder.fd_name)
-            .ok()
-            .is_none_or(|link| link.to_str() != Some(target.fd_link().as_str()))
-        {
-            return SocketOutcome::GenerationChanged;
+        // INVARIANT: this is the single final verification phase, and it runs strictly after the
+        // last complete enumeration. It rechecks every fact used by the claim for every holder;
+        // any change returns GenerationChanged so the outer resolver retries the whole proof once.
+        if let Err(outcome) = verify_final_holders(target, &row, &refreshed.holders) {
+            return outcome;
         }
+        let holder_count = refreshed.holders.len();
+        let final_holder = refreshed
+            .holders
+            .into_iter()
+            .nth(selected_index)
+            .expect("selected holder index");
         return SocketOutcome::Resolved {
             resolved: final_holder.resolved,
-            holders: refreshed.holder_count,
+            holders: holder_count,
         };
     }
     SocketOutcome::Ambiguous
@@ -334,7 +314,8 @@ fn read_socket_row(target: &SocketTarget) -> (Option<SocketRow>, SocketTableStat
 }
 
 struct HolderScan {
-    selected: Option<Holder>,
+    holders: Vec<Holder>,
+    selected_index: Option<usize>,
     holder_count: usize,
     first_identity: Option<ProcessIdentity>,
     ambiguous: bool,
@@ -365,6 +346,149 @@ impl HolderScan {
             }
         }
     }
+}
+
+fn holder_set_changed(previous: &HolderScan, current: &HolderScan) -> bool {
+    let mut previous_ids = previous
+        .holders
+        .iter()
+        .map(|holder| {
+            (
+                holder.resolved.pid,
+                holder.resolved.tgid,
+                holder.resolved.start_time,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current_ids = current
+        .holders
+        .iter()
+        .map(|holder| {
+            (
+                holder.resolved.pid,
+                holder.resolved.tgid,
+                holder.resolved.start_time,
+            )
+        })
+        .collect::<Vec<_>>();
+    previous_ids.sort_unstable();
+    current_ids.sort_unstable();
+    previous_ids != current_ids
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FinalHolderEvidence {
+    pid: u32,
+    tgid: u32,
+    start_time: u64,
+    executable_path: String,
+    executable_identity: (u64, u64),
+    argv: Vec<String>,
+    argv_truncated: bool,
+    fd_name: String,
+}
+
+fn final_holder_evidence(holder: &Holder) -> FinalHolderEvidence {
+    FinalHolderEvidence {
+        pid: holder.resolved.pid,
+        tgid: holder.resolved.tgid,
+        start_time: holder.resolved.start_time,
+        executable_path: holder.resolved.executable_path.clone(),
+        executable_identity: holder.resolved.executable_identity,
+        argv: holder.resolved.argv.clone(),
+        argv_truncated: holder.resolved.argv_truncated,
+        fd_name: holder.fd_name.clone(),
+    }
+}
+
+fn verify_final_holders(
+    target: &SocketTarget,
+    expected_row: &SocketRow,
+    holders: &[Holder],
+) -> Result<(), SocketOutcome> {
+    let evidence = holders
+        .iter()
+        .map(final_holder_evidence)
+        .collect::<Vec<_>>();
+    verify_final_holders_with(
+        target,
+        expected_row,
+        &evidence,
+        || read_socket_row(target),
+        |holder| {
+            let pinned = holders
+                .iter()
+                .find(|candidate| candidate.resolved.pid == holder.pid)
+                .ok_or(())?;
+            let link =
+                procfs::read_link_at(pinned.fd_dir.as_fd(), &holder.fd_name).map_err(|_| ())?;
+            let start_time = read_process_start_time(pinned._pid_dir.as_fd()).ok_or(())?;
+            let executable_path = read_exe(pinned._pid_dir.as_fd()).ok_or(())?;
+            let executable_identity =
+                executable_identity(pinned._pid_dir.as_fd()).map_err(|_| ())?;
+            let (argv, argv_truncated) = read_cmdline(pinned._pid_dir.as_fd()).ok_or(())?;
+            Ok((
+                link.to_string_lossy().into_owned(),
+                holder.tgid,
+                start_time,
+                executable_path,
+                (executable_identity.device, executable_identity.inode),
+                argv,
+                argv_truncated,
+            ))
+        },
+    )
+}
+
+fn verify_final_holders_with<FR, FH>(
+    target: &SocketTarget,
+    expected_row: &SocketRow,
+    holders: &[FinalHolderEvidence],
+    mut read_row: FR,
+    mut read_holder: FH,
+) -> Result<(), SocketOutcome>
+where
+    FR: FnMut() -> (Option<SocketRow>, SocketTableStatus),
+    FH: FnMut(
+        &FinalHolderEvidence,
+    ) -> Result<(String, u32, u64, String, (u64, u64), Vec<String>, bool), ()>,
+{
+    let (row, status) = read_row();
+    if status == SocketTableStatus::NamespaceMismatch {
+        return Err(SocketOutcome::ProcfsNamespaceMismatch);
+    }
+    if row.as_ref() != Some(expected_row)
+        || !row
+            .as_ref()
+            .is_some_and(|row| socket::row_admits(row, target))
+    {
+        return Err(SocketOutcome::GenerationChanged);
+    }
+    for holder in holders {
+        let Ok((
+            fd_link,
+            tgid,
+            start_time,
+            executable_path,
+            executable_identity,
+            argv,
+            argv_truncated,
+        )) = read_holder(holder)
+        else {
+            return Err(SocketOutcome::GenerationChanged);
+        };
+        if fd_link != target.fd_link()
+            || tgid != holder.tgid
+            || start_time != holder.start_time
+            || executable_path != holder.executable_path
+            || executable_identity != holder.executable_identity
+            || argv != holder.argv
+            || argv_truncated != holder.argv_truncated
+        {
+            return Err(SocketOutcome::GenerationChanged);
+        }
+    }
+    Ok(())
 }
 
 fn is_vanished_proc_error(error: &std::io::Error) -> bool {
@@ -401,7 +525,8 @@ fn scan_requires_truncated_outcome(truncated: bool, holder_count: usize) -> bool
 /// executable is explicitly ambiguous; a blank cmdline is compared by executable path.
 fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> HolderScan {
     let mut scan = HolderScan {
-        selected: None,
+        holders: Vec::new(),
+        selected_index: None,
         holder_count: 0,
         first_identity: None,
         ambiguous: false,
@@ -478,34 +603,35 @@ fn scan_holders(proc_root: BorrowedFd<'_>, needle: &str, socket_uid: u32) -> Hol
         }
 
         match matched_fd {
-            Some(fd_name) => {
-                match resolve_from_pid_dir(pid, pid_dir.as_fd()) {
-                    Ok(resolved) => {
-                        scan.holder_count += 1;
-                        let identity = ProcessIdentity {
-                            tgid: resolved.tgid,
-                            start_time: resolved.start_time,
-                        };
-                        match scan.first_identity {
-                            Some(first) if first != identity => scan.ambiguous = true,
-                            None => scan.first_identity = Some(identity),
-                            _ => {}
-                        }
-                        let candidate = Holder {
-                            resolved,
-                            _pid_dir: pid_dir,
-                            fd_dir,
-                            fd_name,
-                        };
-                        if scan.selected.as_ref().is_none_or(|current| {
-                            candidate_is_better(&candidate, current, socket_uid)
-                        }) {
-                            scan.selected = Some(candidate);
-                        }
+            Some(fd_name) => match resolve_from_pid_dir(pid, pid_dir.as_fd()) {
+                Ok(resolved) => {
+                    scan.holder_count += 1;
+                    let identity = ProcessIdentity {
+                        tgid: resolved.tgid,
+                        start_time: resolved.start_time,
+                    };
+                    match scan.first_identity {
+                        Some(first) if first != identity => scan.ambiguous = true,
+                        None => scan.first_identity = Some(identity),
+                        _ => {}
                     }
-                    Err(failure) => scan.record_identity_failure(failure),
+                    let candidate = Holder {
+                        resolved,
+                        _pid_dir: pid_dir,
+                        fd_dir,
+                        fd_name,
+                    };
+                    let candidate_index = scan.holders.len();
+                    let should_select = scan.selected_index.is_none_or(|current_index| {
+                        candidate_is_better(&candidate, &scan.holders[current_index], socket_uid)
+                    });
+                    scan.holders.push(candidate);
+                    if should_select {
+                        scan.selected_index = Some(candidate_index);
+                    }
                 }
-            }
+                Err(failure) => scan.record_identity_failure(failure),
+            },
             None => {
                 // This candidate did not show the socket; if its fd table was capped, it may hold
                 // it beyond the fds enumerated.
@@ -760,7 +886,8 @@ mod tests {
     #[test]
     fn matched_holder_read_failures_are_never_silently_dropped() {
         let mut scan = HolderScan {
-            selected: None,
+            holders: Vec::new(),
+            selected_index: None,
             holder_count: 0,
             first_identity: None,
             ambiguous: false,
@@ -837,5 +964,79 @@ mod tests {
         });
         assert_eq!(outcome, SocketOutcome::NotFound);
         assert_eq!(calls, 2);
+    }
+
+    fn final_evidence() -> FinalHolderEvidence {
+        FinalHolderEvidence {
+            pid: 100,
+            tgid: 100,
+            start_time: 10,
+            executable_path: "/old".to_string(),
+            executable_identity: (1, 2),
+            argv: vec!["old".to_string()],
+            argv_truncated: false,
+            fd_name: "3".to_string(),
+        }
+    }
+
+    fn final_row(state: &str) -> SocketRow {
+        SocketRow {
+            local_address: "0100007F:1F90".to_string(),
+            port: 8080,
+            state: state.to_string(),
+            uid: 1000,
+        }
+    }
+
+    fn final_target() -> SocketTarget {
+        target(Protocol::Udp, 8080, 424242)
+    }
+
+    fn stable_final_holder_read(
+        holder: &FinalHolderEvidence,
+    ) -> Result<(String, u32, u64, String, (u64, u64), Vec<String>, bool), ()> {
+        Ok((
+            "socket:[424242]".to_string(),
+            holder.tgid,
+            holder.start_time,
+            holder.executable_path.clone(),
+            holder.executable_identity,
+            holder.argv.clone(),
+            holder.argv_truncated,
+        ))
+    }
+
+    #[test]
+    fn final_verification_catches_exec_during_the_final_enumeration() {
+        let holder = final_evidence();
+        let mut reads = 0;
+        let result = verify_final_holders_with(
+            &final_target(),
+            &final_row("07"),
+            &[holder],
+            || (Some(final_row("07")), SocketTableStatus::Complete),
+            |expected| {
+                reads += 1;
+                let mut observed = stable_final_holder_read(expected)?;
+                if reads == 1 {
+                    observed.3 = "/new".to_string();
+                    observed.4 = (3, 4);
+                }
+                Ok(observed)
+            },
+        );
+        assert_eq!(result, Err(SocketOutcome::GenerationChanged));
+    }
+
+    #[test]
+    fn final_verification_catches_udp_state_change_during_the_final_enumeration() {
+        let result = verify_final_holders_with(
+            &final_target(),
+            &final_row("07"),
+            &[final_evidence()],
+            || (Some(final_row("01")), SocketTableStatus::Complete),
+            stable_final_holder_read,
+        );
+        assert_eq!(result, Err(SocketOutcome::GenerationChanged));
     }
 }
