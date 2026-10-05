@@ -269,15 +269,34 @@ async function readJsonFile(file) {
   }
 }
 
+// Reconcile bookkeeping (2026-10, provenance-identity recovery coverage). `last_reconciled_at` means
+// "last SUCCESSFUL, complete host re-observation" ONLY -- it is never advanced by a degraded
+// collection. `last_reconcile_attempt_at` is the rate-limit clock (advanced on EVERY attempted
+// reconcile, so a persistently degraded host still performs bounded, hourly host I/O rather than
+// retrying lsof/ps on every fast tick). `last_reconcile_status` / `last_reconcile_degraded_reasons`
+// are operator-introspection only (fixed reason-code enum strings, bounded).
+export const RECONCILE_STATUSES = Object.freeze(["ok", "degraded"]);
+export const MAX_RECONCILE_DEGRADED_REASONS = 8;
+const RECONCILE_REASON_PATTERN = /^[a-z0-9_]{1,64}$/;
+
 export function normalizeSignatureStore(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const signatures = base.signatures && typeof base.signatures === "object" && !Array.isArray(base.signatures) ? base.signatures : {};
-  return {
+  const normalized = {
     version: SCHEMA_VERSION,
     bootstrapped_at: typeof base.bootstrapped_at === "string" ? base.bootstrapped_at : undefined,
     last_reconciled_at: typeof base.last_reconciled_at === "string" ? base.last_reconciled_at : undefined,
     signatures,
   };
+  // Additive keys are emitted ONLY when present + valid, so a legacy store normalizes unchanged.
+  if (typeof base.last_reconcile_attempt_at === "string") normalized.last_reconcile_attempt_at = base.last_reconcile_attempt_at;
+  if (RECONCILE_STATUSES.includes(base.last_reconcile_status)) normalized.last_reconcile_status = base.last_reconcile_status;
+  if (Array.isArray(base.last_reconcile_degraded_reasons)) {
+    normalized.last_reconcile_degraded_reasons = base.last_reconcile_degraded_reasons
+      .filter((reason) => typeof reason === "string" && RECONCILE_REASON_PATTERN.test(reason))
+      .slice(0, MAX_RECONCILE_DEGRADED_REASONS);
+  }
+  return normalized;
 }
 
 /**
@@ -338,13 +357,16 @@ export async function writeSignatureStore(descartesPaths, store) {
 // identityHash:undefined exactly as before S5-follow-2, preserving S5-follow-1's own
 // DEGRADE-NOT-FABRICATE contract (still tracked, still eligible to promote/fire like any other
 // identity -- degrade-to-unfingerprinted, never degrade-to-invisible).
-function isTransientStatFailureOfKnownIdentity(signatures, observation) {
-  if (observation?.identityHash !== undefined) return false;
+// Returns the identity hashes of every already-fingerprinted record an identityHash:undefined
+// observation could be (same hashed path/owner + source). Shared by the fold-time skip below and by
+// deriveIdentityCoverage's exclusion of unverified identities (2026-10), so both use one matcher.
+function unverifiedObservationMatches(signatures, observation) {
+  if (observation?.identityHash !== undefined) return [];
   const executablePathHash = hashIdentityField(observation?.executablePath);
-  if (!executablePathHash) return false;
+  if (!executablePathHash) return [];
   const owningUserHash = hashIdentityField(observation?.owningUser);
   const sourceClassification = observation?.sourceClassification;
-  return Object.values(signatures ?? {}).some((record) => {
+  return Object.entries(signatures ?? {}).filter(([, record]) => {
     const inputs = record?.inputs_hash ?? {};
     return (
       inputs.identity_hash !== undefined
@@ -352,7 +374,11 @@ function isTransientStatFailureOfKnownIdentity(signatures, observation) {
       && inputs.owning_user_hash === owningUserHash
       && inputs.source_classification === sourceClassification
     );
-  });
+  }).map(([identityHash]) => identityHash);
+}
+
+function isTransientStatFailureOfKnownIdentity(signatures, observation) {
+  return unverifiedObservationMatches(signatures, observation).length > 0;
 }
 
 /**
@@ -365,16 +391,33 @@ function isTransientStatFailureOfKnownIdentity(signatures, observation) {
  * re-baseline" (plan section 5 safety note) actually clear a previously-firing identity_drift.
  */
 export function reconcileSignatures(store, observations = [], options = {}) {
+  return reconcileSignaturesDetailed(store, observations, options).store;
+}
+
+/**
+ * reconcileSignatures plus an honest account of what was NOT folded (2026-10, recovery coverage):
+ * `{ store, skippedObservations }`, where `skippedObservations` are the observations dropped by the
+ * S5-follow-2 transient-stat-failure guard. Such an observation means "a process matching a
+ * fingerprinted identity is running but could not be VERIFIED this reconcile" -- the matching
+ * record was NOT re-observed (its last_seen does not advance), so the coverage derivation
+ * (deriveIdentityCoverage) must never report it, or any target it could be holding, as
+ * evaluated-clear.
+ */
+export function reconcileSignaturesDetailed(store, observations = [], options = {}) {
   const ts = options.ts ?? new Date().toISOString();
   const iterationKey = String(options.iterationKey ?? ts);
   const signatures = { ...(store?.signatures ?? {}) };
   const seededHashes = new Set();
+  const skippedObservations = [];
 
   for (const observation of observations ?? []) {
     // S5-follow-2, Part B (see isTransientStatFailureOfKnownIdentity above): a transient stat
     // failure on an already-fingerprinted identity is skipped entirely for this reconcile, rather
     // than folded in as a differently-signatured (and therefore spuriously new/drifted) identity.
-    if (isTransientStatFailureOfKnownIdentity(signatures, observation)) continue;
+    if (isTransientStatFailureOfKnownIdentity(signatures, observation)) {
+      skippedObservations.push(observation);
+      continue;
+    }
     const identityHash = computeIdentitySignature(observation);
     seededHashes.add(identityHash);
     const existing = signatures[identityHash];
@@ -405,16 +448,47 @@ export function reconcileSignatures(store, observations = [], options = {}) {
   }
 
   return {
-    version: SCHEMA_VERSION,
-    bootstrapped_at: options.seedKnownGood ? ts : store?.bootstrapped_at,
-    last_reconciled_at: store?.last_reconciled_at,
-    signatures,
+    store: {
+      version: SCHEMA_VERSION,
+      bootstrapped_at: options.seedKnownGood ? ts : store?.bootstrapped_at,
+      last_reconciled_at: store?.last_reconciled_at,
+      signatures,
+    },
+    skippedObservations,
   };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Candidate derivation (pure -- operates only on an already-loaded store snapshot).
 // ---------------------------------------------------------------------------------------------
+
+// Fingerprint helpers (2026-10, recovery coverage): the SINGLE source of each rule's fingerprint,
+// used by both the candidate builders below and deriveIdentityCoverage, so a reported coverage key
+// is always exactly alertId(rule_id, <the fingerprint the builder emits>). Each returns `undefined`
+// when no safe fingerprint exists; the builders then fall back to the shared literal "unknown"
+// (unchanged behavior), which coverage NEVER reports -- distinct targets collapse onto it, so
+// reporting it would let one target's evaluation recover another's alert.
+export function unknownIdentityFingerprint(identityHash) {
+  return typeof identityHash === "string" && identityHash ? identityHash : undefined;
+}
+
+export function newPublicBindFingerprint(portKey) {
+  return sanitizeIdentityString(`port.${portKey}`);
+}
+
+export function identityDriftFingerprint(targetKey) {
+  return sanitizeIdentityString(targetKey);
+}
+
+// Every target key (identity_drift grouping key) a record participates in -- the same keys
+// groupKnownGoodByTargetKey indexes, independent of the record's state.
+function recordTargetKeys(record) {
+  const keys = [];
+  const processKey = record?.inputs_hash?.executable_path_hash;
+  if (processKey) keys.push(`process.${processKey}`);
+  for (const portKey of record?.port_target_keys ?? []) keys.push(`port.${portKey}`);
+  return keys;
+}
 
 function groupKnownGoodByTargetKey(signatures) {
   const groups = new Map();
@@ -432,7 +506,7 @@ function groupKnownGoodByTargetKey(signatures) {
 }
 
 function buildUnknownIdentityCandidate(identityHash, record) {
-  const fingerprint = identityHash;
+  const fingerprint = unknownIdentityFingerprint(identityHash) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     identity_hash: identityHash,
     source_type: record.inputs_hash?.source_classification,
@@ -454,7 +528,7 @@ function buildUnknownIdentityCandidate(identityHash, record) {
 function buildNewPublicBindCandidate(identityHash, record, portKey) {
   const [protocol, portStr] = String(portKey).split(".");
   const localPort = Number(portStr);
-  const fingerprint = sanitizeIdentityString(`port.${portKey}`) ?? "unknown";
+  const fingerprint = newPublicBindFingerprint(portKey) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     identity_hash: identityHash,
     protocol,
@@ -475,7 +549,7 @@ function buildNewPublicBindCandidate(identityHash, record, portKey) {
 
 function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
   const targetKind = targetKey.startsWith("port.") ? "port" : "process";
-  const fingerprint = sanitizeIdentityString(targetKey) ?? "unknown";
+  const fingerprint = identityDriftFingerprint(targetKey) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     old_identity_hash: staleEntry.identityHash,
     new_identity_hash: currentEntry.identityHash,
@@ -572,6 +646,72 @@ export function deriveIdentityCandidates(store, options = {}) {
   }
 
   return candidates;
+}
+
+/**
+ * Detector-reported recovery coverage (plan 2026-09-20 §8.B, 2026-10 provenance-identity
+ * conversion) -- PURE: the alert identities (alertId(rule_id, fingerprint)) whose state
+ * deriveIdentityCandidates genuinely evaluated against a store that was JUST reconciled from a
+ * SUCCESSFUL, COMPLETE host re-observation. The CALLER owns that precondition
+ * (tools/provenance-identity.js only calls this on a due tick whose collection status is "ok");
+ * this function only answers "given a freshly re-observed store, which identities can it speak
+ * for?":
+ *   - every tracked record's unknown_identity key -- present (re-observed this tick -> fresh
+ *     last_seen) or genuinely absent (successfully looked for and not found; the presence window
+ *     then decides whether it still fires);
+ *   - every tracked record's public-port new_public_bind key;
+ *   - every target key's (process.<exe_path_hash> / port.<proto.port>) identity_drift key.
+ * EXCLUDED (never evaluated-clear): every record a transient-stat-skipped observation could be
+ * (the process is running but its identity was not verified, so its last_seen did not advance),
+ * every target such a record holds, and the skipped observation's own process/port targets.
+ * Exclusions are applied in FINGERPRINT space, so a covered target whose sanitized fingerprint
+ * collides with an excluded one is excluded too. A persisted alert whose identity has no record in
+ * the store is never reported (stays frozen). A fingerprint with no safe value (the builders'
+ * shared "unknown" fallback) is never reported.
+ */
+export function deriveIdentityCoverage(store, { skippedObservations = [] } = {}) {
+  if (!store?.bootstrapped_at) return [];
+  const signatures = store.signatures ?? {};
+
+  const excludedIdentityHashes = new Set();
+  const excludedBindFingerprints = new Set();
+  const excludedDriftFingerprints = new Set();
+  const excludeTarget = (targetKey) => {
+    const driftFingerprint = identityDriftFingerprint(targetKey);
+    if (driftFingerprint) excludedDriftFingerprints.add(driftFingerprint);
+    if (targetKey.startsWith("port.")) {
+      const bindFingerprint = newPublicBindFingerprint(targetKey.slice("port.".length));
+      if (bindFingerprint) excludedBindFingerprints.add(bindFingerprint);
+    }
+  };
+  for (const observation of skippedObservations ?? []) {
+    const executablePathHash = hashIdentityField(observation?.executablePath);
+    if (executablePathHash) excludeTarget(`process.${executablePathHash}`);
+    for (const portKey of Array.isArray(observation?.portTargetKeys) ? observation.portTargetKeys : []) {
+      if (portKey) excludeTarget(`port.${portKey}`);
+    }
+    for (const identityHash of unverifiedObservationMatches(signatures, observation)) {
+      excludedIdentityHashes.add(identityHash);
+      for (const targetKey of recordTargetKeys(signatures[identityHash])) excludeTarget(targetKey);
+    }
+  }
+
+  const keys = new Set();
+  for (const [identityHash, record] of Object.entries(signatures)) {
+    if (!excludedIdentityHashes.has(identityHash)) {
+      const fingerprint = unknownIdentityFingerprint(identityHash);
+      if (fingerprint) keys.add(alertId(UNKNOWN_IDENTITY_RULE_ID, fingerprint));
+    }
+    for (const portKey of record?.port_target_keys ?? []) {
+      const fingerprint = newPublicBindFingerprint(portKey);
+      if (fingerprint && !excludedBindFingerprints.has(fingerprint)) keys.add(alertId(NEW_PUBLIC_BIND_RULE_ID, fingerprint));
+    }
+    for (const targetKey of recordTargetKeys(record)) {
+      const fingerprint = identityDriftFingerprint(targetKey);
+      if (fingerprint && !excludedDriftFingerprints.has(fingerprint)) keys.add(alertId(IDENTITY_DRIFT_RULE_ID, fingerprint));
+    }
+  }
+  return [...keys];
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -4,14 +4,24 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { alertId } from "../src/alert-store.js";
 import {
   DEFAULT_STABLE_ITERATION_THRESHOLD,
   DEFAULT_STABLE_SAMPLE_THRESHOLD,
+  IDENTITY_DRIFT_RULE_ID,
+  NEW_PUBLIC_BIND_RULE_ID,
+  UNKNOWN_IDENTITY_RULE_ID,
   applyIdentityObservation,
   computeIdentitySignature,
   deriveIdentityCandidates,
+  deriveIdentityCoverage,
+  identityDriftFingerprint,
   loadSignatureStore,
+  newPublicBindFingerprint,
+  normalizeSignatureStore,
   reconcileSignatures,
+  reconcileSignaturesDetailed,
+  unknownIdentityFingerprint,
   resolveSignatureStorePaths,
   runProvenanceStore,
   seedKnownGoodIdentity,
@@ -490,4 +500,158 @@ test("runProvenanceStore baseline show supports --identity filtering", async () 
   const filtered = await runProvenanceStore(paths, ["baseline", "show", "--identity", targetHash, "--json"], { output: () => {} });
   assert.equal(filtered.length, 1);
   assert.equal(filtered[0].identity_hash, targetHash);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10 provenance-identity recovery coverage (plan 2026-09-20 §8.B): reconcile bookkeeping that
+// separates "attempted" from "successfully reconciled", surfacing of transient-stat skips, and the
+// pure coverage derivation whose alert keys must match the candidate builders exactly.
+// ---------------------------------------------------------------------------------------------
+
+test("normalizeSignatureStore round-trips the reconcile-attempt bookkeeping (attempt ts, status, bounded reason codes) and drops malformed values", async () => {
+  const paths = await tempPaths();
+  await writeSignatureStore(paths, {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    last_reconciled_at: "2026-07-10T00:00:00.000Z",
+    last_reconcile_attempt_at: "2026-07-10T01:00:00.000Z",
+    last_reconcile_status: "degraded",
+    last_reconcile_degraded_reasons: ["lsof_unavailable", "ps_empty"],
+    signatures: {},
+  });
+  const { store } = await loadSignatureStore(paths);
+  assert.equal(store.last_reconciled_at, "2026-07-10T00:00:00.000Z");
+  assert.equal(store.last_reconcile_attempt_at, "2026-07-10T01:00:00.000Z");
+  assert.equal(store.last_reconcile_status, "degraded");
+  assert.deepEqual(store.last_reconcile_degraded_reasons, ["lsof_unavailable", "ps_empty"]);
+
+  const malformed = normalizeSignatureStore({
+    last_reconcile_attempt_at: 42,
+    last_reconcile_status: "maybe",
+    last_reconcile_degraded_reasons: ["ok_code", "/raw/path leak", 7],
+  });
+  assert.equal(malformed.last_reconcile_attempt_at, undefined);
+  assert.equal(malformed.last_reconcile_status, undefined);
+  assert.deepEqual(malformed.last_reconcile_degraded_reasons, ["ok_code"]);
+});
+
+test("normalizeSignatureStore omits the new bookkeeping keys entirely when absent (legacy stores normalize unchanged)", () => {
+  const normalized = normalizeSignatureStore({ bootstrapped_at: "2026-07-10T00:00:00.000Z", signatures: {} });
+  assert.equal(Object.hasOwn(normalized, "last_reconcile_attempt_at"), false);
+  assert.equal(Object.hasOwn(normalized, "last_reconcile_status"), false);
+  assert.equal(Object.hasOwn(normalized, "last_reconcile_degraded_reasons"), false);
+});
+
+test("reconcileSignaturesDetailed surfaces a transient-stat skip of an already-fingerprinted identity (NOT re-observed), and reconcileSignatures stays its .store", () => {
+  const fingerprinted = { executablePath: "/opt/svc/bin", identityHash: "aaaaaaaaaaaaaaaa", sourceClassification: "launchd", owningUser: "501", portTargetKeys: ["tcp.8080"] };
+  const base = reconcileSignatures({ version: 1, signatures: {} }, [fingerprinted], { ts: "2026-07-10T00:00:00.000Z", iterationKey: "t0" });
+  const statFailed = { ...fingerprinted, identityHash: undefined };
+  const fresh = { executablePath: "/opt/other/bin", identityHash: "bbbbbbbbbbbbbbbb", sourceClassification: "launchd", owningUser: "501" };
+
+  const detailed = reconcileSignaturesDetailed(base, [statFailed, fresh], { ts: "2026-07-10T01:00:00.000Z", iterationKey: "t1" });
+  assert.deepEqual(detailed.skippedObservations, [statFailed]);
+  assert.deepEqual(detailed.store, reconcileSignatures(base, [statFailed, fresh], { ts: "2026-07-10T01:00:00.000Z", iterationKey: "t1" }));
+  const originalHash = computeIdentitySignature(fingerprinted);
+  assert.equal(detailed.store.signatures[originalHash].last_seen, "2026-07-10T00:00:00.000Z", "the skipped identity's last_seen must not advance");
+});
+
+function coverageStore() {
+  return {
+    version: 1,
+    bootstrapped_at: "2026-07-10T00:00:00.000Z",
+    signatures: {
+      aaaa000000000001: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T00:00:00.000Z", // long gone
+        inputs_hash: { executable_path_hash: "e000000000000001", identity_hash: "f000000000000001", source_classification: "shell", owning_user_hash: "u000000000000001" },
+        port_target_keys: ["tcp.8080"],
+      },
+      aaaa000000000002: {
+        state: "known_good",
+        origin: "grace_window",
+        last_seen: "2026-07-10T10:00:00.000Z", // present
+        inputs_hash: { executable_path_hash: "e000000000000002", identity_hash: "f000000000000002", source_classification: "shell", owning_user_hash: "u000000000000001" },
+        port_target_keys: ["tcp.9090"],
+      },
+      aaaa000000000003: {
+        state: "known_good",
+        origin: "snapshot",
+        last_seen: "2026-07-10T10:00:00.000Z",
+        inputs_hash: { executable_path_hash: "e000000000000002", identity_hash: "f000000000000003", source_classification: "shell", owning_user_hash: "u000000000000001" },
+        port_target_keys: [],
+      },
+    },
+  };
+}
+
+test("deriveIdentityCoverage reports every tracked identity's alert keys (present AND genuinely-absent), computed with the SAME fingerprints the candidate builders emit", () => {
+  const store = coverageStore();
+  const keys = new Set(deriveIdentityCoverage(store));
+
+  const expected = [
+    alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000001")),
+    alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000002")),
+    alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000003")),
+    alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080")),
+    alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090")),
+    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("process.e000000000000001")),
+    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("process.e000000000000002")),
+    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.8080")),
+    alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.9090")),
+  ];
+  assert.deepEqual([...keys].sort(), [...expected].sort());
+
+  // Parity: every candidate the builders emit for this store has its id inside the coverage set.
+  const candidates = deriveIdentityCandidates(store, { now: "2026-07-10T10:30:00.000Z" });
+  assert.deepEqual(
+    candidates.map((c) => c.rule_id).sort(),
+    [IDENTITY_DRIFT_RULE_ID, NEW_PUBLIC_BIND_RULE_ID, UNKNOWN_IDENTITY_RULE_ID].sort(),
+    "fixture should emit one unknown + one new_public_bind + one drift candidate",
+  );
+  for (const candidate of candidates) {
+    assert.equal(candidate.id, alertId(candidate.rule_id, candidate.fingerprint));
+    assert.ok(keys.has(candidate.id), `coverage must include emitted candidate ${candidate.rule_id}/${candidate.fingerprint}`);
+  }
+});
+
+test("deriveIdentityCoverage EXCLUDES every identity/target a transient-stat-skipped observation could be (not re-observed -> never evaluated-clear)", () => {
+  const store = coverageStore();
+  // The fold layer matches a skipped observation by its HASHED path/owner + source against a
+  // fingerprinted record; build that record through the real fold so the hashes line up.
+  const observation = { executablePath: "/opt/gone/bin", identityHash: undefined, sourceClassification: "shell", owningUser: "501", portTargetKeys: ["tcp.7070"] };
+  const seeded = reconcileSignatures({ version: 1, signatures: {} }, [{ ...observation, identityHash: "1111111111111111" }], { ts: "2026-07-10T00:00:00.000Z" });
+  const [seededHash] = Object.keys(seeded.signatures);
+  const seededRecord = seeded.signatures[seededHash];
+  store.signatures[seededHash] = { ...seededRecord, state: "known_good", origin: "grace_window", port_target_keys: ["tcp.8080"] };
+
+  const keys = new Set(deriveIdentityCoverage(store, { skippedObservations: [observation] }));
+  assert.equal(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(seededHash))), false, "the unverified identity itself");
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080"))), false, "a port the unverified identity's record holds (shared with record 1)");
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp.8080"))), false);
+  assert.equal(keys.has(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint(`process.${seededRecord.inputs_hash.executable_path_hash}`))), false, "the unverified identity's process target");
+  assert.equal(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.7070"))), false, "a port the skipped observation currently binds");
+  // Unrelated identities are still covered.
+  assert.ok(keys.has(alertId(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint("aaaa000000000001"))));
+  assert.ok(keys.has(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.9090"))));
+});
+
+test("deriveIdentityCoverage applies exclusions in FINGERPRINT space: a covered target whose sanitized fingerprint collides with an excluded one is not reported", () => {
+  const store = coverageStore();
+  const observation = { executablePath: "/opt/gone/bin", identityHash: undefined, sourceClassification: "shell", owningUser: "501", portTargetKeys: [] };
+  const seeded = reconcileSignatures({ version: 1, signatures: {} }, [{ ...observation, identityHash: "1111111111111111" }], { ts: "2026-07-10T00:00:00.000Z" });
+  const [seededHash] = Object.keys(seeded.signatures);
+  // "tcp/8080" and "tcp_8080" sanitize to the SAME fingerprint (port.tcp_8080).
+  store.signatures[seededHash] = { ...seeded.signatures[seededHash], state: "known_good", origin: "grace_window", port_target_keys: ["tcp/8080"] };
+  store.signatures.aaaa000000000002.port_target_keys = ["tcp_8080"];
+  assert.equal(newPublicBindFingerprint("tcp/8080"), newPublicBindFingerprint("tcp_8080"));
+
+  const keys = deriveIdentityCoverage(store, { skippedObservations: [observation] });
+  assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp_8080"))), false);
+  assert.equal(keys.includes(alertId(IDENTITY_DRIFT_RULE_ID, identityDriftFingerprint("port.tcp_8080"))), false);
+});
+
+test("deriveIdentityCoverage reports nothing for a never-bootstrapped store", () => {
+  const store = { ...coverageStore(), bootstrapped_at: undefined };
+  assert.deepEqual(deriveIdentityCoverage(store), []);
 });
