@@ -255,6 +255,39 @@ test("G2 HIGH-1 re-gate: a resumed quarantine with root data is a new discard ep
   assert.deepEqual(result.candidates, [], "svc-C from a resumed quarantine is not claimed new at +7h");
 });
 
+test("G2 HIGH-1 re-gate: a crash after rename with an empty root still advances the resume epoch and suppresses svc-C at +7h", async () => {
+  const paths = await tempPaths();
+  await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(1), ["svc-A"]), { family: "service", now: at(1) });
+
+  const { factsRootDir, learnedDir, markerFile } = resolveLegacyFactStorePaths(paths);
+  const dir = "facts-legacy-2026-10-01T02-00-00-000Z";
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.mkdir(path.join(learnedDir, dir), { recursive: true });
+  // Simulate the pre-fix crash: the item was renamed at 60h, but the marker still describes the
+  // 2h episode and has no complete per-item metadata because finalize never ran.
+  await fs.writeFile(path.join(learnedDir, dir, "facts.jsonl"), `${JSON.stringify(presence(at(60), "svc-C"))}\n`);
+  await fs.writeFile(markerFile, JSON.stringify({
+    schema_version: 2,
+    in_progress: { dir, started_ts: at(2), quarantine_epoch: 1, quarantine_ts: at(2) },
+    quarantines: [],
+    quarantine_epoch: 1,
+    quarantine_epoch_ts: at(2),
+  }));
+
+  await migrateLegacyFactStore(paths, { now: at(60) });
+  const markerAfterResume = JSON.parse(await fs.readFile(markerFile, "utf8"));
+  assert.equal(markerAfterResume.quarantine_epoch, 2);
+  assert.equal(markerAfterResume.quarantine_epoch_ts, at(60));
+
+  for (let hour = 60; hour <= 66; hour += 1) {
+    await appendFactPoints(paths, serviceTick(at(hour), ["svc-A"]), { family: "service", now: at(hour) });
+  }
+  await appendFactPoints(paths, serviceTick(at(67), ["svc-A", "svc-C"]), { family: "service", now: at(67) });
+  const result = await computeServiceAppearanceCandidates(paths, { now: at(67) });
+  assert.deepEqual(result.candidates, [], "svc-C moved before the crash is not claimed new at +7h");
+});
+
 test("G2 HIGH-1 re-gate: corrupted marker plus pending legacy data is a new discard episode on every observation", async () => {
   const paths = await tempPaths();
   await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });

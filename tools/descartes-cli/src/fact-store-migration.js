@@ -245,12 +245,13 @@ export async function migrateLegacyFactStore(descartesPaths, { now } = {}) {
     });
   }
   if (items.length > 0 || resumable) {
-    // A pass that moves root data is a new discard episode, even when it resumes an existing
-    // quarantine directory. Seen-sets use this pair as their novelty boundary; retaining the old
-    // pair would let data discovered during downtime become eligible immediately after resume.
-    const movesRootItems = items.length > 0;
-    const eventEpoch = movesRootItems ? markerEpoch + 1 : (resumable?.quarantine_epoch ?? (markerEpoch + 1));
-    const eventTs = movesRootItems ? nowIso : (resumable?.quarantine_ts ?? resumable?.started_ts ?? nowIso);
+    // Every quarantine pass is a new discard episode, including any resume. A crash after rename
+    // can leave the root empty, and an old in-progress marker can lack complete per-item metadata;
+    // retaining that marker's epoch would let discarded data become eligible immediately after
+    // resume. Seen-sets use this pair as their novelty boundary, so advance and stamp it at every
+    // pass that finds resumable work.
+    const eventEpoch = markerEpoch + 1;
+    const eventTs = nowIso;
     markerEpoch = eventEpoch;
     markerEpochTs = eventTs;
     const movedItems = normalizeMovedItems(resumable?.moved_items);

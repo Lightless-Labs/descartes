@@ -4,7 +4,7 @@
 
 ## Current continuity — fact-store capacity S4 + S5 built; follow-up daybreak G2 findings fixed; not pushed or merged (2026-10-05)
 
-The follow-up G2 re-gate is complete on the current branch. Two atomic commits fix the resumed-quarantine HIGH-1 and retention-alert MEDIUM findings; the earlier future-dated quarantine medium remains fixed. Focused migration/seen-set/status tests are 57/57 green. Final fresh-XDG full suite: 2216 tests, 2160 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
+The follow-up G2 re-gate is complete on the current branch. The resumed-quarantine HIGH-1 and retention-alert MEDIUM findings are fixed; the earlier future-dated quarantine medium remains fixed. The final conservative resume correction also covers a crash after rename with an empty root and incomplete per-item metadata. Focused migration/seen-set/status tests are green. Final fresh-XDG full suite: 2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
 
 **Follow-up commits:** `a5e87ce` resets a resumed quarantine's epoch to the resume pass and records per-item move timestamps for retention; `55c0103` freezes unresolved retention alerts without re-emitting candidates while preserving recovery only after a successful family pass. Both carry the required Claude trailer.
 

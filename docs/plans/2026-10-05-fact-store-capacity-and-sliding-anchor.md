@@ -1110,3 +1110,9 @@ Each full suite uses fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
 | `55c0103` | MEDIUM fixed; sandbox-only failures | 2216 | 2160 | 0 | 22 | 34 |
 
 The sandbox failures are environment-only: 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. The focused migration, seen-set, and fact-store-status files are green, including the earlier HIGH-2 successful-pass recovery test.
+
+### 21.7 Final HIGH-1 correction: every resume is a new discard episode (2026-10-05)
+
+The resume path now advances `quarantine_epoch` and stamps `quarantine_epoch_ts` at the resume pass even when the legacy root is empty. An in-progress marker without complete per-item metadata is therefore treated as unproven. The crash-after-rename reproduction (quarantine at 2 h, `svc-C` moved at 60 h, resume with empty root, detector check at 67 h) is green: the epoch advances to 60 h and `svc-C` is not claimed new.
+
+Fresh-XDG full-suite verification after this correction: **2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped**. The 22 environment failures are 17 notifier-reuse loopback-bind tests, 3 tap-bump loopback-bind tests, and 2 live-host provenance tests (`unknown` instead of `ok`).
