@@ -309,6 +309,13 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   const priorFloorMs = priorFloor.floorTs === null ? Number.NEGATIVE_INFINITY : Date.parse(priorFloor.floorTs);
   const belowFloor = sortedCandidates.filter(({ tsMs }) => tsMs <= priorFloorMs);
   const aboveFloor = sortedCandidates.filter(({ tsMs }) => tsMs > priorFloorMs);
+  const priorAgeFloorTs = existingIntegrity.ledger?.age_floor_ts ?? null;
+  const priorAgeFloorMs = priorAgeFloorTs === null ? Number.NEGATIVE_INFINITY : Date.parse(priorAgeFloorTs);
+  // A rollback can make records at or below the persisted age floor appear in the current
+  // retention window again. They were already physically evicted in this lineage, so keep them
+  // out of the byte-cap candidate suffix and continue counting them as age eviction.
+  const ageFloorRecovered = aboveFloor.filter(({ tsMs }) => tsMs <= priorAgeFloorMs);
+  const aboveAgeFloor = aboveFloor.filter(({ tsMs }) => tsMs > priorAgeFloorMs);
   // Test-only seam (fact-store capacity plan T5): lets a test force a non-suffix order through the
   // keep loop below to prove assertSuffixEviction refuses it. Read from `internal`, never
   // `options` (LOW-5, review fold): `enforceFactRetention` is the only caller that threads its own
@@ -316,8 +323,8 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   // that exported, explicitly test-only entry point -- never through appendFactPoints, no matter
   // what a caller passes in its options.
   const candidates = typeof internal.orderRetentionCandidates === "function"
-    ? internal.orderRetentionCandidates(aboveFloor)
-    : aboveFloor;
+    ? internal.orderRetentionCandidates(aboveAgeFloor)
+    : aboveAgeFloor;
 
   // Byte-cap selection: keep the newest records that fit, walking newest-first and stopping at the
   // FIRST record that does not fit (never skipping one to fit an older one) -- so the kept set is a
@@ -349,6 +356,10 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   let bytecapEvictedNewestMs = Number.NEGATIVE_INFINITY;
   for (const { tsMs } of evictedCandidates) if (tsMs > bytecapEvictedNewestMs) bytecapEvictedNewestMs = tsMs;
   const bytecapEvictedNewestTs = evictedCandidates.length > 0 ? new Date(bytecapEvictedNewestMs).toISOString() : null;
+  const allAgeEvicted = [...ageEvicted, ...ageFloorRecovered];
+  let ageEvictedNewestMs = Number.NEGATIVE_INFINITY;
+  for (const { tsMs } of allAgeEvicted) if (tsMs > ageEvictedNewestMs) ageEvictedNewestMs = tsMs;
+  const ageEvictedNewestTs = allAgeEvicted.length > 0 ? new Date(ageEvictedNewestMs).toISOString() : null;
 
   const keptLines = keptCandidates.map(({ record }) => encodeJsonLine(record));
   const usedBytes = keptLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
@@ -358,13 +369,13 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   // be either kept or counted as an observable eviction (age/bytecap) -- no valid record may
   // silently vanish from the accounting. This is a defense-in-depth backstop against this bug
   // and any future silent-drop class, regardless of which input caused it.
-  if (keptRecords.length + ageEvicted.length + bytecapEvicted + futureDropped.length !== validRecords.length) {
+  if (keptRecords.length + allAgeEvicted.length + bytecapEvicted + futureDropped.length !== validRecords.length) {
     throw new Error("enforceFactRetention accounting mismatch: kept + evicted counts do not sum to the valid record count");
   }
   const counts = {
     corrupt_count: corruptBefore,
     schema_invalid_count: schemaInvalid.length,
-    age_evicted_count: ageEvicted.length,
+    age_evicted_count: allAgeEvicted.length,
     bytecap_evicted_count: bytecapEvicted,
     future_fact_count: futureDropped.length,
   };
@@ -393,6 +404,7 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     outputDigest,
     counts,
     bytecapEvictedNewestTs,
+    ageEvictedNewestTs,
   });
   await ensureFactDir(descartesPaths);
   const tmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
@@ -405,10 +417,10 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   await writeFactIntegrityLedger(descartesPaths, finalizeFactIntegrityLedger(prepared.ledger, prepared.passId, { allowRecovery: prepared.recoverPending }));
   return {
     kept_count: keptLines.length,
-    dropped_count: schemaInvalid.length + ageEvicted.length + bytecapEvicted + futureDropped.length,
+    dropped_count: schemaInvalid.length + allAgeEvicted.length + bytecapEvicted + futureDropped.length,
     corrupt_dropped_count: corruptBefore,
     schema_invalid_dropped_count: schemaInvalid.length,
-    age_evicted_count: ageEvicted.length,
+    age_evicted_count: allAgeEvicted.length,
     bytecap_evicted_count: bytecapEvicted,
     future_fact_dropped_count: futureDropped.length,
     bytes: usedBytes,
@@ -503,7 +515,9 @@ export async function readFactPoints(descartesPaths, options = {}) {
   // second layer that also covers records appended with ts <= floor after a clock rollback and not
   // yet evicted by the next pass. A missing/invalid ledger carries no floor, but then completeness
   // is unknown/degraded and nothing downstream trusts the points.
-  const floorMs = integrity.ledger?.bytecap_floor_ts ? Date.parse(integrity.ledger.bytecap_floor_ts) : Number.NEGATIVE_INFINITY;
+  const bytecapFloorMs = integrity.ledger?.bytecap_floor_ts ? Date.parse(integrity.ledger.bytecap_floor_ts) : Number.NEGATIVE_INFINITY;
+  const ageFloorMs = integrity.ledger?.age_floor_ts ? Date.parse(integrity.ledger.age_floor_ts) : Number.NEGATIVE_INFINITY;
+  const floorMs = Math.max(bytecapFloorMs, ageFloorMs);
   let schemaInvalidCount = 0;
   const points = records
     .map((record) => {
@@ -535,6 +549,7 @@ export async function readFactPoints(descartesPaths, options = {}) {
     nowMs,
     {
       retentionCutoffMs: nowMs - retentionMs,
+      readWindowStartMs: sinceMs,
       oldestCertifiedTs: points.length > 0 ? points[0].ts : null,
     },
   );

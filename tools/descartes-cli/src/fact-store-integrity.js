@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
 
-// v2 (fact-store capacity plan 2026-10-05, R0b §4.1 item 2): adds `bytecap_floor_ts`.
+// v2 (fact-store capacity plan 2026-10-05, R0b §4.1 item 2): adds the byte-cap and age floors.
 export const FACT_INTEGRITY_SCHEMA_VERSION = 2;
 
 // Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact continuity wedge.
@@ -40,6 +40,8 @@ const LEDGER_KEYS = [
   // only moves forward; the two backwards moves (a ledger re-bootstrap over a non-empty store, the
   // future-floor clamp) each stamp an in-window loss in the same pass (invariant I2).
   "bytecap_floor_ts",
+  // G1 Blocker 2: newest timestamp ever removed by age retention in this lineage.
+  "age_floor_ts",
 ];
 const CONTINUITY_KEYS = [
   "record_count_hwm",
@@ -102,6 +104,7 @@ export function createFactIntegrityLedger() {
     future_fact_dropped_total: 0,
     last_future_fact_ts: null,
     bytecap_floor_ts: null,
+    age_floor_ts: null,
   };
 }
 
@@ -148,10 +151,22 @@ function migrateLedgerShape(raw) {
   if (
     migrated.schema_version === 1 &&
     !Object.prototype.hasOwnProperty.call(migrated, "bytecap_floor_ts") &&
-    migrated.bytecap_evicted_total === 0
+    migrated.bytecap_evicted_total === 0 &&
+    migrated.age_evicted_total === 0
   ) {
     migrated.schema_version = 2;
     migrated.bytecap_floor_ts = null;
+    migrated.age_floor_ts = null;
+  }
+  // v2 ledgers written before the age-floor fix can be migrated only when no age eviction has
+  // ever been recorded. A non-zero age total without its floor cannot be reconstructed from the
+  // retained facts, so that ledger remains invalid and is handled fail-closed.
+  if (
+    migrated.schema_version === 2 &&
+    !Object.prototype.hasOwnProperty.call(migrated, "age_floor_ts") &&
+    migrated.age_evicted_total === 0
+  ) {
+    migrated.age_floor_ts = null;
   }
   return migrated;
 }
@@ -258,6 +273,13 @@ export function isValidFactIntegrityLedger(value) {
     value.bytecap_floor_ts !== null &&
     continuity.last_rewrite_record_count > 0 &&
     !(Date.parse(value.bytecap_floor_ts) < Date.parse(continuity.last_rewrite_newest_ts))
+  ) return false;
+  if (!isNullableTimestamp(value.age_floor_ts)) return false;
+  if ((value.age_evicted_total > 0) !== (value.age_floor_ts !== null)) return false;
+  if (
+    value.age_floor_ts !== null &&
+    continuity.last_rewrite_record_count > 0 &&
+    !(Date.parse(value.age_floor_ts) < Date.parse(continuity.last_rewrite_newest_ts))
   ) return false;
   return true;
 }
@@ -391,6 +413,8 @@ export function prepareFactIntegrityLedger({
   counts,
   // R0b: the newest ts this pass byte-evicted (including below-floor records), or null.
   bytecapEvictedNewestTs = null,
+  // G1 Blocker 2: the newest ts this pass age-evicted, or null.
+  ageEvictedNewestTs = null,
 }) {
   // daybreak-blue re-gate (2026-09-04) HIGH (residual): a ledger whose last_committed_pass_id
   // (or a still-pending pass_id) sits exactly at Number.MAX_SAFE_INTEGER is itself perfectly
@@ -529,6 +553,9 @@ export function prepareFactIntegrityLedger({
   const priorFloor = resolvePriorBytecapFloor(next.bytecap_floor_ts, nowIso);
   next.bytecap_floor_ts = laterTimestamp(priorFloor.floorTs, bytecapEvictedNewestTs);
   const floorClampedBackwards = priorFloor.clamped;
+  // Age eviction is also monotonic, but is deliberately not clamped to wall-clock time: a
+  // rollback must not make already-evicted history appear certified again.
+  next.age_floor_ts = laterTimestamp(next.age_floor_ts, ageEvictedNewestTs);
 
   // daybreak-blue re-gate HIGH #2: a total already at Number.MAX_SAFE_INTEGER is itself a
   // valid, safe integer, but `total + delta` (delta > 0) overflows into an UNSAFE integer --
@@ -651,9 +678,11 @@ function futureLossFields(base, nowMs) {
 // R0b coverage reporting (fact-store capacity plan §4.1 items 3, 5, 6). Byte-cap narrowing is
 // reported ONLY through these fields -- never as a fourth `status` value (factHistoryTrustworthy
 // maps any unknown status to history_unknown, which would recreate the lockout):
-//   - bytecap_floor_ts: the raw exclusive floor; what the coverage oracle and the S3 eligibility
-//     horizon use.
-//   - certified_after_ts: max(floor, retention cutoff), or null when the floor is null; what status
+//   - bytecap_floor_ts: the raw exclusive byte-cap floor; what the coverage oracle and the S3
+//     eligibility horizon use.
+//   - age_floor_ts: the raw exclusive age-retention floor, monotonic across wall-clock rollback.
+//   - certified_after_ts: max(byte-cap floor, age floor, retention cutoff), or null when no floor
+//     relevant to this read exists; what status surfaces display.
 //     surfaces display. The range between the floor and now - 30 d has been age-evicted, so
 //     reporting the bare floor there would over-claim.
 //   - oldest_certified_ts: the oldest point this read actually returned.
@@ -662,19 +691,28 @@ function futureLossFields(base, nowMs) {
 // and can predate the retained facts, so it is NOT a coverage boundary and no trust or operator
 // path may read it (pinned by fact-store-coverage.test.js).
 function coverageFields(base, nowMs, extras) {
-  const floorTs = base.bytecap_floor_ts ?? null;
+  const bytecapFloorTs = base.bytecap_floor_ts ?? null;
+  const ageFloorTs = base.age_floor_ts ?? null;
+  const bytecapFloorMs = bytecapFloorTs === null ? Number.NEGATIVE_INFINITY : Date.parse(bytecapFloorTs);
+  const ageFloorMs = ageFloorTs === null ? Number.NEGATIVE_INFINITY : Date.parse(ageFloorTs);
+  const readWindowStartMs = Number.isFinite(extras?.readWindowStartMs)
+    ? extras.readWindowStartMs
+    : Number.NEGATIVE_INFINITY;
+  const ageFloorRelevant = ageFloorTs !== null && ageFloorMs >= readWindowStartMs;
+  const narrowed = bytecapFloorTs !== null || ageFloorRelevant;
+  const floorMs = Math.max(bytecapFloorMs, ageFloorRelevant ? ageFloorMs : Number.NEGATIVE_INFINITY);
   let certifiedAfterTs = null;
-  if (floorTs !== null) {
+  if (narrowed) {
     const cutoffMs = extras?.retentionCutoffMs;
-    certifiedAfterTs = Number.isFinite(cutoffMs) && cutoffMs > Date.parse(floorTs)
-      ? new Date(cutoffMs).toISOString()
-      : floorTs;
+    const certifiedMs = Math.max(floorMs, Number.isFinite(cutoffMs) ? cutoffMs : Number.NEGATIVE_INFINITY);
+    certifiedAfterTs = Number.isFinite(certifiedMs) ? new Date(certifiedMs).toISOString() : null;
   }
   return {
-    bytecap_floor_ts: floorTs,
+    bytecap_floor_ts: bytecapFloorTs,
+    age_floor_ts: ageFloorTs,
     certified_after_ts: certifiedAfterTs,
     oldest_certified_ts: typeof extras?.oldestCertifiedTs === "string" ? extras.oldestCertifiedTs : null,
-    coverage: floorTs === null ? "full" : "narrowed",
+    coverage: narrowed ? "narrowed" : "full",
   };
 }
 

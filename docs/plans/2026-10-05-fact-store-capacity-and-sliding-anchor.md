@@ -731,9 +731,9 @@ The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48
 
 ---
 
-## 16. Addendum: S1 and S2 executed (2026-10-05)
+## 16. Addendum: S1, S2, and G1 blocker rework (2026-10-05)
 
-**Addendum:** 2026-10-05. S1 and S2 are built on `feat/fact-store-capacity-2026-10`. Nothing is pushed. Following §7, the branch stops before S3 and **awaits daybreak gate G1**. The full suite passes after every commit (scratch `XDG_*`): 2079 tests, 2045 pass, 0 fail, 34 skipped (the pre-existing platform skips), 0 todo.
+**Addendum:** 2026-10-05. S1 and S2 are built on `feat/fact-store-capacity-2026-10`, and the two daybreak G1 blockers are being closed on this branch. Nothing is pushed or merged. Full-suite runs use fresh scratch `XDG_*` directories. After the amended blocker-1 commit: 2088 tests, 2032 pass, 22 fail, 34 skipped, 0 todo; the 22 failures are sandbox-only (17 notifier loopback-listen `EPERM`, 3 tap-token loopback-listen `EPERM`, and 2 live-host provenance checks returning `unknown`).
 
 **Commits.**
 - `4d5eea1`: S0, plus T1 committed as `todo`.
@@ -743,11 +743,13 @@ The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48
 - `0d1fb80`: read-side exclusion, coverage fields, the F2-Tier1 fold-in, and the T4 oracle.
 - `9f3f510`: byte-cap reclassification. T1 turns green.
 
-**T1 after S2.** It passes. From tick 28 on, the 5 MB store evicts on every structural tick. Even so, the daemon's history read is `intact` on both structural and fast ticks, the service, lineage and persistence detectors stay established with no anchor re-arm, and service, service-appearance, process-lineage and scheduled-job report coverage on every tick. Leg D (count rules can't reach 30 samples at 5 MB) still stands, as expected. T2 covers it after S4.
+**T1 after S2/G1 blocker 1.** It passes. From tick 28 on, the 5 MB store evicts on every structural tick. The daemon's history read remains `intact` on structural and fast ticks, and the ordinary service baseline stays established. The three retained-window novelty paths deliberately report no evaluated keys and re-arm through their existing cold-start state under narrowed coverage; this is the safe pre-S3 behavior. Leg D (count rules can't reach 30 samples at 5 MB) still stands, as expected. T2 covers it after S4.
 
 **G1 Blocker 1 disposition (interim S2).** The three retained-window novelty producers now call `factHistoryTrustworthy` with `requireFullCoverage: true`: `service.appeared`, `scheduled_job.appeared`, and `process.lineage.novel_edge`. A narrowed store therefore emits no novelty candidate and re-arms an established detector through its existing cold-start path, matching the pre-S2 byte-cap-loss behavior. The regression is pinned for the daybreak reproduction: an entity present at t0, absent at t1–t3, and present again at t4 must not be called first-seen when t0 is evicted. The inventory found no additional detector that makes this same retained-window first-seen claim; miner, shadow, and correlation already use the interim full-coverage gate, while disappearance/churn/count/deviation paths have different recent-evidence semantics.
 
 This is intentionally an **interim S2** gate. **S3 must not simply lift it by adding a horizon.** G2 must decide whether novelty over a narrowed window may still re-flag an entity whose last sighting was before the floor. The proper durable fix is the §5.4 first/last-seen set (Q6), and that operator decision remains open; a horizon alone cannot recover the missing first/last-seen fact.
+
+**G1 Blocker 2 disposition.** Ledger v2 now persists `age_floor_ts`, the monotonic newest timestamp removed by age retention. Validation requires the floor exactly when `age_evicted_total > 0`, rejects implausible floors against a non-empty committed rewrite, and migrates older v2/v1 shapes only when no age floor is needed; a legacy ledger with recorded age eviction but no recoverable floor fails closed. Retention carries the maximum age floor forward and classifies records reintroduced at or below it after a wall-clock rollback as already age-evicted. Reads exclude both the byte-cap and age floors. Completeness exposes both raw floors and reports `coverage: "narrowed"` with `certified_after_ts = max(bytecap floor, age floor, retention cutoff)` whenever the relevant floor intersects the read window. The two-hour rollback regression pins t0 evicted at t4, then read at t2: t0 remains absent and the result is never `intact`/`full`.
 
 **Deviations from the plan text (each also stated in code comments and commit messages).**
 1. **Below-floor eviction** (§15.5 decision 2): records with `ts <= floor` are evicted physically and counted as byte-cap. The plan only filtered them on read.

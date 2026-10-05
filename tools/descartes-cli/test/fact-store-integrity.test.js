@@ -84,12 +84,55 @@ test("age eviction alone leaves completeness intact", async () => {
   const read = await readFactPoints(paths, { now: NOW });
   assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.age_evicted_total, 1);
+  assert.equal(read.completeness.age_floor_ts, "2026-08-20T00:00:00.000Z");
   assert.equal(read.completeness.first_degraded_ts, null);
-  // Fact-store capacity plan (2026-10-05, §4.1 item 6): the F2-Tier1 continuity_oldest_ts field
-  // is replaced by the R0b coverage fields. Age eviction is not byte-cap narrowing: coverage stays
-  // "full", and oldest_certified_ts is the oldest point actually returned.
-  assert.equal(read.completeness.coverage, "full");
+  // Age eviction narrows coverage for an unrestricted read too: a later wall-clock rollback must
+  // not re-certify the physically removed prefix.
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.equal(read.completeness.certified_after_ts, "2026-08-20T00:00:00.000Z");
   assert.equal(read.completeness.oldest_certified_ts, NOW);
+});
+
+test("the age floor survives a two-hour retention rollback and prevents full certification over the evicted prefix", async () => {
+  const paths = await tempPaths();
+  const retentionMs = 2 * 60 * 60 * 1000;
+  const t0 = "2026-08-21T00:00:00.000Z";
+  const t2 = "2026-08-21T02:00:00.000Z";
+  const t4 = "2026-08-21T04:00:00.000Z";
+
+  await appendFactPoints(paths, [{ ts: t0, fact_name: "service.presence", entity_key: "old", attributes: {} }], {
+    now: t0,
+    retentionMs,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  });
+  const retention = await appendFactPoints(paths, [{ ts: t4, fact_name: "service.presence", entity_key: "new", attributes: {} }], {
+    now: t4,
+    retentionMs,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(retention.retention.age_evicted_count, 1);
+
+  const afterEviction = await readLedger(paths);
+  assert.equal(afterEviction.age_evicted_total, 1);
+  assert.equal(afterEviction.age_floor_ts, t0);
+
+  const rolledBack = await readFactPoints(paths, { now: t2, retentionMs, windowMs: 4 * 60 * 60 * 1000 });
+  assert.equal(rolledBack.points.some((point) => point.entity_key === "old"), false);
+  assert.equal(rolledBack.completeness.status, "intact");
+  assert.equal(rolledBack.completeness.coverage, "narrowed");
+  assert.equal(rolledBack.completeness.age_floor_ts, t0);
+  assert.equal(rolledBack.completeness.certified_after_ts, t0);
+  assert.notDeepEqual(
+    { status: rolledBack.completeness.status, coverage: rolledBack.completeness.coverage },
+    { status: "intact", coverage: "full" },
+  );
+
+  await appendFactPoints(paths, [{ ts: "2026-08-21T01:00:00.000Z", fact_name: "service.presence", entity_key: "rollback", attributes: {} }], {
+    now: t2,
+    retentionMs,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal((await readLedger(paths)).age_floor_ts, t0);
 });
 
 // --- Finding F2-Tier1, superseded by the fact-store capacity plan (2026-10-05, §4.1 item 6): these
@@ -547,6 +590,7 @@ test("readFactIntegrityLedger migrates a pre-fix0 ledger missing future_fact_dro
   const preFix0 = createFactIntegrityLedger();
   delete preFix0.future_fact_dropped_total;
   delete preFix0.last_future_fact_ts;
+  delete preFix0.age_floor_ts;
   assert.equal(Object.prototype.hasOwnProperty.call(preFix0, "future_fact_dropped_total"), false);
   await fs.writeFile(integrityFile, JSON.stringify(preFix0));
 
@@ -554,6 +598,7 @@ test("readFactIntegrityLedger migrates a pre-fix0 ledger missing future_fact_dro
   assert.equal(read.reason, null, "a merely old-shaped (pre-fix0) ledger must migrate, not fail closed as invalid");
   assert.equal(read.ledger.future_fact_dropped_total, 0);
   assert.equal(read.ledger.last_future_fact_ts, null);
+  assert.equal(read.ledger.age_floor_ts, null);
 
   // A subsequent retention pass over the migrated ledger must NOT itself be treated as a
   // continuity break (which the "invalid"/"unreadable" bootstrap path WOULD stamp -- see
