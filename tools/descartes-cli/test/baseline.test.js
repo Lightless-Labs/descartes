@@ -28,7 +28,11 @@ function capture() {
   return { values, output: (value) => values.push(value) };
 }
 
-test("baseline status on a fresh install is watch-on and reports every domain still learning", async () => {
+// S6 (fact-store capacity plan §4.4, I11): rewritten. A fresh install has never created any family
+// store, so every domain (and every rule in it) reads "not observed (no store)", not "still learning
+// -- 0 of 6": nothing has been observed for it to learn from, and its detectors evaluate nothing. The
+// cold-start reason is still reported from the (fresh, pending) detector stores.
+test("baseline status on a fresh install is watch-on and reports every domain not observed (no store)", async () => {
   const paths = await tempPaths();
   const result = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z" });
 
@@ -41,9 +45,16 @@ test("baseline status on a fresh install is watch-on and reports every domain st
     "process-lineage",
   ]);
   for (const domain of result.domains) {
-    assert.equal(domain.phase, "still learning — 0 of 6");
+    assert.equal(domain.phase, "not observed (no store)");
     assert.equal(domain.cold_start_reason, "initial_baseline");
+    for (const rule of domain.rules) {
+      assert.equal(rule.phase, "not observed (no store)");
+      assert.equal(rule.watching, false);
+      assert.ok(rule.reasons.includes("not_observed_no_store"));
+    }
   }
+  assert.deepEqual(Object.keys(result.families).sort(), ["peer", "process_lineage", "scheduled_job", "service", "session"]);
+  for (const family of Object.values(result.families)) assert.equal(family.store, "absent");
 });
 
 test("baseline status renders human and JSON forms", async () => {
@@ -51,14 +62,15 @@ test("baseline status renders human and JSON forms", async () => {
   const human = capture();
   await runBaseline(paths, ["status"], { output: human.output, now: "2026-09-27T12:00:00.000Z" });
   assert.match(human.values[0], /Structural watching: enabled/);
-  assert.match(human.values[0], /service: still learning — 0 of 6/);
-  assert.match(human.values[0], /process-lineage: still learning — 0 of 6/);
+  assert.match(human.values[0], /service: not observed \(no store\)/);
+  assert.match(human.values[0], /service\.disappeared: not observed \(no store\)/);
+  assert.match(human.values[0], /process-lineage: not observed \(no store\)/);
 
   const json = capture();
   await runBaseline(paths, ["status", "--json"], { output: json.output, now: "2026-09-27T12:00:00.000Z" });
   const parsed = JSON.parse(json.values[0]);
   assert.equal(parsed.watch_config.enabled, true);
-  assert.equal(parsed.domains[0].phase, "still learning — 0 of 6");
+  assert.equal(parsed.domains[0].phase, "not observed (no store)");
 });
 
 test("baseline inspect is live, supports a domain filter, and exposes the recomputation note", async () => {
@@ -130,5 +142,19 @@ test("an explicit learned disable does not disable default-on watch", async () =
 
   const status = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z" });
   assert.equal(status.watch_config.enabled, true);
-  assert.match(status.domains[0].phase, /^still learning/);
+  // S6: no store exists yet (nothing was observed), but the domain is NOT "disabled".
+  assert.equal(status.domains[0].phase, "not observed (no store)");
+});
+
+test("baseline status with watch disabled reports every rule disabled and reads no fact store", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: false }, { now: "2026-09-27T11:00:00.000Z" });
+  const status = await buildBaselineStatus(paths, {
+    now: "2026-09-27T12:00:00.000Z",
+    readFactPoints: async () => { throw new Error("a disabled watch tier must not read fact history"); },
+  });
+  for (const domain of status.domains) {
+    assert.equal(domain.phase, "disabled");
+    for (const rule of domain.rules) assert.equal(rule.phase, "disabled");
+  }
 });
