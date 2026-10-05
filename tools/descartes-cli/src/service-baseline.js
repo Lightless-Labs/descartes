@@ -39,7 +39,8 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { seenBeforeTick } from "./novelty-seen-set.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
@@ -817,6 +818,9 @@ export function detectServiceAppearances(groups = [], options = {}) {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT,
+    // S3b (§17): the family's valid seen-set entries, when the caller has one. Novelty is then
+    // latest \ (window-historical ∪ seen-before): the union can only suppress a claim.
+    seenEntries,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
   if (completeGroups.length < minHistoryTickCount + 1) return [];
@@ -833,6 +837,7 @@ export function detectServiceAppearances(groups = [], options = {}) {
   const appearances = [];
   for (const entityKey of latest.entityKeys) {
     if (historical.has(entityKey)) continue;
+    if (seenBeforeTick(seenEntries, entityKey, latest.ts)) continue;
     appearances.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return appearances;
@@ -903,7 +908,8 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   const establishedMinCensusCount = options.establishedMinCensusCount ?? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT;
 
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  // S3b (§17): also read the service seen-set, validated against this same read's ledger.
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now, seenSetFamilies: ["service"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupServiceFactsByTick(points);
 
@@ -923,14 +929,17 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  // Interim S2 guard (daybreak G1 blocker): service.appeared claims an entity was never seen in
-  // the host's prior history. A narrowed byte-cap window can hide that prior sighting and turn a
-  // return into a fabricated first-seen claim, so narrowing reuses the existing cold-start/re-arm
-  // path until S3's certified horizon/first-last-seen design is available.
+  // Novelty over a narrowed window (daybreak G1 blocker 1): service.appeared claims an entity was
+  // never seen before. With a VALID seen-set (S3b, §17) that memory survives byte-cap eviction (I13)
+  // and novelty is decided against it, so narrowing is no longer a trust loss here. WITHOUT one
+  // (missing, invalid, lineage mismatch, pending pass, overflow, or an injected read that carries
+  // none), the interim S2 gate stays: a narrowed window is untrusted and re-arms the lockout through
+  // the existing cold-start path (I14: a seen-set that cannot prove continuity yields no claim).
+  const seenSet = validNoveltySeenSet(readResult, SERVICE_APPEARED_RULE_ID);
   const historyTrust = factHistoryTrustworthy(readResult, {
     anchorTs: persistedState.cold_start_since_ts,
     nowMs,
-    requireFullCoverage: true,
+    requireFullCoverage: !seenSet,
   });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
@@ -971,12 +980,13 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
     }
   }
 
-  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h). Never an input
-  // to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
-  const horizonOk = ruleHorizonOk(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h), measured against
+  // the seen-set's certified span when it decides novelty (S3b), else the fact store's floor. Never an
+  // input to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = noveltyHorizonOk(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
   const appearances = coldStartPendingThisTick || !horizonOk
     ? []
-    : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount });
+    : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount, seenEntries: seenSet?.entries });
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
   // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
@@ -1023,5 +1033,5 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
 
   if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys };
 
-  return { candidates: buildAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult) }), evaluatedAlertKeys };
+  return { candidates: buildAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SERVICE_APPEARED_RULE_ID) }), evaluatedAlertKeys };
 }

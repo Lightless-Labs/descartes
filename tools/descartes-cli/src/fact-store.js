@@ -10,6 +10,7 @@ import {
   resolvePriorBytecapFloor,
   writeFactIntegrityLedger,
 } from "./fact-store-integrity.js";
+import { foldNoveltySeenSets, readNoveltySeenSet } from "./novelty-seen-set.js";
 
 // Categorical fact-point store — distinct from history-store.js's numeric metric-point
 // schema (whose normalizeMetricPoint throws on !Number.isFinite(value)). Structural facts
@@ -394,6 +395,9 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
       .filter((date) => Number.isFinite(date.getTime()))
       .sort((left, right) => right.getTime() - left.getTime())[0]?.toISOString() ?? null,
   };
+  // prepareFactIntegrityLedger updates a valid prior ledger IN PLACE (floors, loss markers); the
+  // seen-set fold below needs the ledger as it stood at the START of this pass.
+  const priorLedgerSnapshot = existingIntegrity.ledger === null ? null : structuredClone(existingIntegrity.ledger);
   const prepared = prepareFactIntegrityLedger({
     ledger: existingIntegrity.ledger,
     ledgerReason: existingIntegrity.reason,
@@ -414,7 +418,26 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   if (options.beforeFactsRename) await options.beforeFactsRename();
   await fs.rename(tmpFile, storePaths.factsFile);
   if (options.afterFactsRename) await options.afterFactsRename();
-  await writeFactIntegrityLedger(descartesPaths, finalizeFactIntegrityLedger(prepared.ledger, prepared.passId, { allowRecovery: prepared.recoverPending }));
+  const finalizedLedger = finalizeFactIntegrityLedger(prepared.ledger, prepared.passId, { allowRecovery: prepared.recoverPending });
+  await writeFactIntegrityLedger(descartesPaths, finalizedLedger);
+  // S3b (fact-store capacity plan §17): fold this pass's certified candidates into the novelty
+  // seen-sets, in the SAME pass as the append, stamped with the ledger this pass just committed.
+  // `aboveAgeFloor` is every non-future candidate above the prior pass's floors, BEFORE this pass's
+  // byte-cap eviction (see novelty-seen-set.js for why the pre-eviction set; the fold itself keeps
+  // only complete ticks at or before nowMs). Never throws: a failed fold leaves the old file, which
+  // no longer matches the ledger's committed pass id and therefore reads as not valid (no novelty
+  // claim under narrowing) until the next pass re-seeds it.
+  const seenSetFold = await foldNoveltySeenSets(descartesPaths, {
+    priorLedger: priorLedgerSnapshot,
+    priorLedgerReason: existingIntegrity.reason,
+    liveExists,
+    nextLedger: finalizedLedger,
+    passId: prepared.passId,
+    records: aboveAgeFloor.map(({ record }) => record),
+    nowMs,
+    retentionMs,
+    ...(options.seenSetMaxEntries !== undefined ? { maxEntries: options.seenSetMaxEntries } : {}),
+  });
   return {
     kept_count: keptLines.length,
     dropped_count: schemaInvalid.length + allAgeEvicted.length + bytecapEvicted + futureDropped.length,
@@ -424,6 +447,7 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     bytecap_evicted_count: bytecapEvicted,
     future_fact_dropped_count: futureDropped.length,
     bytes: usedBytes,
+    seen_set_fold: seenSetFold,
   };
 }
 
@@ -541,6 +565,21 @@ export async function readFactPoints(descartesPaths, options = {}) {
       .filter((date) => Number.isFinite(date.getTime()))
       .sort((left, right) => right.getTime() - left.getTime())[0]?.toISOString() ?? null,
   };
+  // S3b (§17): the novelty seen-sets the caller asked for, validated against THIS read's ledger
+  // (generation, committed pass id, no pending pass) so the pair can never desync. Only a "valid"
+  // set carries entries.
+  let seenSets;
+  if (Array.isArray(options.seenSetFamilies) && options.seenSetFamilies.length > 0) {
+    seenSets = {};
+    for (const family of options.seenSetFamilies) {
+      seenSets[family] = await readNoveltySeenSet(descartesPaths, family, {
+        ledger: integrity.ledger,
+        nowMs,
+        retentionMs,
+        ...(options.seenSetMaxEntries !== undefined ? { maxEntries: options.seenSetMaxEntries } : {}),
+      });
+    }
+  }
   const completeness = buildCompleteness(
     integrity.ledger,
     live,
@@ -553,5 +592,5 @@ export async function readFactPoints(descartesPaths, options = {}) {
       oldestCertifiedTs: points.length > 0 ? points[0].ts : null,
     },
   );
-  return { points, corrupt_count, schema_invalid_count: schemaInvalidCount, completeness };
+  return { points, corrupt_count, schema_invalid_count: schemaInvalidCount, completeness, ...(seenSets ? { seen_sets: seenSets } : {}) };
 }

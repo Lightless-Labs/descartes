@@ -2,10 +2,11 @@
 // real per-tick volume, on the real daemon path (runDaemonIteration -> real translators -> real
 // fact store at its 5 MB default -> real detectors -> computeCoveredAlerts).
 //
-// The daemon's own history read remains usable when byte-cap eviction narrows coverage, while
-// novelty-only producers fail closed until a full-history read is available. This test keeps the
-// routine-volume lockout contract explicit: ordinary baseline evaluation continues, but the three
-// novelty paths re-arm exactly as they did before byte-cap coverage was reported separately.
+// The daemon's own history read remains usable when byte-cap eviction narrows coverage. Since S3b
+// (plan §17) the three novelty paths decide against their first/last-seen set, which the same
+// retention pass folds and which eviction never touches (I13): with the set valid they keep
+// evaluating through routine eviction instead of re-arming (the S2-interim behavior this test pinned
+// before S3b: re-arm on every narrowed structural read, no evaluated keys).
 //
 // Scope: Leg A/B/C only. The count rules (session.count_drop, peer.count_*) cannot reach
 // MIN_SAMPLE_COUNT=30 in a 5 MB shared store at this volume (Leg D); that is T2's job once the
@@ -93,6 +94,7 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
       bytecapEvicted: structural.structuralFacts?.retention?.bytecap_evicted_count ?? 0,
       written: structural.structuralFacts?.written_count ?? 0,
       status: structural.status.fact_store_completeness?.status,
+      seenSets: structural.status.novelty_seen_sets,
       coverage: Object.fromEntries(coverage),
       anchors: Object.fromEntries(Object.entries(anchors).map(([key, state]) => [key, { pending: state.cold_start_pending, since: state.cold_start_since_ts }])),
     };
@@ -103,6 +105,7 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
       const fast = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), structuralCollectors: collectors, ts: fastTs, now: fastTs, ...observers });
       assert.equal(fast.structuralFacts, undefined, "the half-hour tick must not be a structural tick");
       tick.fastStatus = fast.status.fact_store_completeness?.status;
+      tick.fastSeenSets = fast.status.novelty_seen_sets;
     }
     ticks.push(tick);
   }
@@ -126,26 +129,25 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
     if (tick.status !== "intact") problems.push(`Leg A: tick ${tick.index} daemon fact-history read is ${tick.status}`);
     if (tick.fastStatus !== undefined && tick.fastStatus !== "intact") problems.push(`Leg A: tick ${tick.index}+30m fast-tick history read is ${tick.fastStatus}`);
   }
-  // Leg B: the ordinary service baseline remains established. The three novelty paths are gated
-  // on full coverage, so their stores re-arm on every narrowed structural read.
+  // Leg B: no detector re-arms on byte-cap eviction -- the ordinary service baseline AND (S3b) the
+  // novelty paths, whose seen-sets stay valid through eviction.
   const last = ticks[ticks.length - 1];
-  if (last.anchors.service.pending !== false) problems.push(`Leg B: service baseline unexpectedly cold-start pending at tick ${last.index} (anchor ${last.anchors.service.since})`);
-  for (const family of ["lineage", "persistence"]) {
-    const anchor = last.anchors[family];
-    if (anchor.pending !== true) problems.push(`Leg B: ${family} novelty detector did not re-arm at tick ${last.index}`);
+  for (const [family, anchor] of Object.entries(last.anchors)) {
+    if (anchor.pending !== false) problems.push(`Leg B: ${family} detector unexpectedly cold-start pending at tick ${last.index} (anchor ${anchor.since})`);
   }
   for (const tick of afterEviction) {
     for (const [family, anchor] of Object.entries(tick.anchors)) {
-      const novelty = family === "lineage" || family === "persistence";
-      if (!novelty && anchor.since === tick.ts) problems.push(`Leg B: ${family} baseline anchor re-armed to tick ${tick.index} after a byte-cap eviction`);
+      if (anchor.since === tick.ts) problems.push(`Leg B: ${family} anchor re-armed to tick ${tick.index} after a byte-cap eviction`);
+    }
+    for (const family of ["service", "process_lineage", "scheduled_job"]) {
+      if (tick.seenSets?.[family]?.status !== "valid") problems.push(`Leg B: tick ${tick.index} ${family} seen-set is ${tick.seenSets?.[family]?.status}`);
+      if (tick.fastSeenSets !== undefined && tick.fastSeenSets?.[family]?.status !== "valid") problems.push(`Leg B: tick ${tick.index}+30m ${family} seen-set is ${tick.fastSeenSets?.[family]?.status}`);
     }
   }
-  // Leg C: the ordinary baseline keeps evaluating; novelty producers deliberately emit no
-  // evaluated keys because the narrowed window cannot prove first-seen history.
+  // Leg C: every converted watch-tier producer keeps reporting coverage through routine eviction.
   for (const tick of afterEviction) {
-    if (!((tick.coverage.service ?? 0) > 0)) problems.push(`Leg C: tick ${tick.index} service baseline reported no evaluated alert keys`);
-    for (const label of ["service-appearance", "process-lineage", "scheduled-job"]) {
-      if ((tick.coverage[label] ?? 0) !== 0) problems.push(`Leg C: tick ${tick.index} ${label} evaluated narrowed novelty history`);
+    for (const label of ["service", "service-appearance", "process-lineage", "scheduled-job"]) {
+      if (!((tick.coverage[label] ?? 0) > 0)) problems.push(`Leg C: tick ${tick.index} ${label} reported no evaluated alert keys`);
     }
   }
   assert.deepEqual(problems, [], `watch-tier lockout under routine byte-cap eviction:\n${problems.join("\n")}`);

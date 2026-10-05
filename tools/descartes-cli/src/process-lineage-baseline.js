@@ -9,7 +9,8 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
@@ -266,6 +267,8 @@ export function detectNovelProcessLineageEdges(groups = [], options = {}) {
   const novel = [];
   for (const entityKey of latest.entityKeys) {
     if (historical.has(entityKey)) continue;
+    // S3b (§17): a valid seen-set's prior sighting suppresses the claim (union only suppresses).
+    if (seenBeforeTick(options.seenEntries, entityKey, latest.ts)) continue;
     novel.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return novel;
@@ -341,7 +344,7 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now, seenSetFamilies: ["process_lineage"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupProcessLineageFactsByTick(points);
 
@@ -388,14 +391,16 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  // Interim S2 guard (daybreak G1 blocker): novel_edge claims an edge was never seen in the
-  // host's prior history. A narrowed byte-cap window can hide that prior sighting and turn a
-  // return into a fabricated first-seen claim, so narrowing reuses cold-start/re-arm until S3's
-  // certified horizon/first-last-seen design is available.
+  // Novelty over a narrowed window (daybreak G1 blocker 1): with a VALID seen-set (S3b, §17) the
+  // memory survives byte-cap eviction (I13) and novelty is decided against it, so narrowing is no
+  // longer a trust loss here. WITHOUT one (missing, invalid, lineage mismatch, pending pass,
+  // overflow, or an injected read that carries none) the interim S2 gate stays: a narrowed window is
+  // untrusted and re-arms through the existing cold-start path (I14: no claim without continuity).
+  const seenSet = validNoveltySeenSet(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID);
   const historyTrust = factHistoryTrustworthy(readResult, {
     anchorTs: persistedState.cold_start_since_ts,
     nowMs,
-    requireFullCoverage: true,
+    requireFullCoverage: !seenSet,
   });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
@@ -451,9 +456,9 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
 
   // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 6 d). Never an input to
   // the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
-  const horizonOk = ruleHorizonOk(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, nowMs);
+  const horizonOk = noveltyHorizonOk(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, nowMs);
   const evaluable = !coldStartPendingThisTick && horizonOk;
-  const novel = evaluable ? detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount }) : [];
+  const novel = evaluable ? detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount, seenEntries: seenSet?.entries }) : [];
   // §8.B/§8.C coverage: reported from the SAME state the detector already computed (currentGroups +
   // the readiness predicate), zeroed under coldStartPendingThisTick exactly as `novel` is -- never a
   // change to detection logic, cold-start lockout, or completeness gates.
@@ -487,5 +492,5 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildNovelEdgeCandidates(novel, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult) }), evaluatedAlertKeys };
+  return { candidates: buildNovelEdgeCandidates(novel, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID) }), evaluatedAlertKeys };
 }

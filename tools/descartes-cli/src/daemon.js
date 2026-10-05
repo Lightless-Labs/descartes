@@ -10,8 +10,8 @@ import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
 import { appendFactPoints, readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, ruleHorizonOk } from "./fact-store-completeness.js";
-import { HISTORY_HORIZON_SHORT_ALERT_TICKS, RULE_HORIZONS } from "./fact-families.js";
+import { factHistoryTrustworthy, noveltyRuleEligible, ruleHorizonOk } from "./fact-store-completeness.js";
+import { HISTORY_HORIZON_SHORT_ALERT_TICKS, NOVELTY_FAMILIES, RULE_HORIZONS } from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
   factPointsFromNetworkEvidence,
@@ -1165,11 +1165,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // self-contained.
   let horizonVetoedRuleIds = new Set(RULE_HORIZONS.keys());
   let horizonShortRuleIds = new Set();
+  let noveltySeenSets;
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
     let factHistoryReadResult;
     try {
-      factHistoryReadResult = await readFactsForHistory(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS, now: nowMs });
+      // S3b: the novelty seen-sets too, validated against this same read's ledger, so the daemon's
+      // novelty-rule veto uses the same referent as the detectors (noveltyRuleEligible).
+      factHistoryReadResult = await readFactsForHistory(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS, now: nowMs, seenSetFamilies: [...NOVELTY_FAMILIES.keys()] });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[daemon] fact-history read failed this tick (${message}); degrading to unknown completeness, not fabricating trust`);
@@ -1177,7 +1180,19 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
     factStoreCompleteness = selectFactStoreCompleteness(factHistoryReadResult?.completeness);
     historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
-    horizonVetoedRuleIds = new Set([...RULE_HORIZONS.keys()].filter((ruleId) => !ruleHorizonOk(factHistoryReadResult, ruleId, nowMs)));
+    // Novelty rules (S3b): the SAME predicate the detectors use -- a valid seen-set and its horizon,
+    // or (without one) full coverage plus the fact-floor horizon. Every other rule: the fact floor.
+    horizonVetoedRuleIds = new Set([...RULE_HORIZONS.keys()].filter((ruleId) => (RULE_HORIZONS.get(ruleId).kind === "novelty"
+      ? !noveltyRuleEligible(factHistoryReadResult, ruleId, nowMs)
+      : !ruleHorizonOk(factHistoryReadResult, ruleId, nowMs))));
+    // Display-only per-family seen-set state (the overflow / lineage-mismatch "status reason").
+    if (factHistoryReadResult?.seen_sets && typeof factHistoryReadResult.seen_sets === "object") {
+      noveltySeenSets = Object.fromEntries(Object.entries(factHistoryReadResult.seen_sets).map(([family, set]) => [family, {
+        status: typeof set?.status === "string" ? set.status : "unknown",
+        entry_count: Number.isSafeInteger(set?.entry_count) ? set.entry_count : 0,
+        certified_since_ts: typeof set?.certified_since_ts === "string" ? set.certified_since_ts : null,
+      }]));
+    }
     // Horizon-SHORT is reported only over a valid ledger's coverage report: a missing/invalid ledger
     // or failed read is an untrusted-history condition (reported as such), not a short horizon.
     const coverage = factHistoryReadResult?.completeness?.coverage;
@@ -1270,6 +1285,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
     ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
+    ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
     // property, so it is unconditional here (unlike the ...(x ? {...} : {}) spreads above, which
     // are conditional on genuinely-computed-this-tick evidence). Display/disclosure only -- see

@@ -23,7 +23,8 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
   SCHEDULED_JOB_PRESENCE_FACT_NAME,
@@ -222,6 +223,8 @@ export function detectScheduledJobAppearances(groups = [], options = {}) {
   const appearances = [];
   for (const entityKey of latest.entityKeys) {
     if (historical.has(entityKey)) continue;
+    // S3b (§17): a valid seen-set's prior sighting suppresses the claim (union only suppresses).
+    if (seenBeforeTick(options.seenEntries, entityKey, latest.ts)) continue;
     appearances.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return appearances;
@@ -319,7 +322,7 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT;
 
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now, seenSetFamilies: ["scheduled_job"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupScheduledJobFactsByTick(points);
 
@@ -338,14 +341,16 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  // Interim S2 guard (daybreak G1 blocker): scheduled_job.appeared claims an entity was never
-  // seen in the host's prior history. A narrowed byte-cap window can hide that prior sighting and
-  // turn a return into a fabricated first-seen claim, so narrowing reuses cold-start/re-arm until
-  // S3's certified horizon/first-last-seen design is available.
+  // Novelty over a narrowed window (daybreak G1 blocker 1): with a VALID seen-set (S3b, §17) the
+  // memory survives byte-cap eviction (I13) and novelty is decided against it, so narrowing is no
+  // longer a trust loss here. WITHOUT one (missing, invalid, lineage mismatch, pending pass,
+  // overflow, or an injected read that carries none) the interim S2 gate stays: a narrowed window is
+  // untrusted and re-arms through the existing cold-start path (I14: no claim without continuity).
+  const seenSet = validNoveltySeenSet(readResult, SCHEDULED_JOB_APPEARED_RULE_ID);
   const historyTrust = factHistoryTrustworthy(readResult, {
     anchorTs: persistedState.cold_start_since_ts,
     nowMs,
-    requireFullCoverage: true,
+    requireFullCoverage: !seenSet,
   });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
@@ -389,9 +394,9 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   const detectionOptions = { nowMs, freshnessMs, minHistoryTickCount };
   // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h). Never an input
   // to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
-  const horizonOk = ruleHorizonOk(readResult, SCHEDULED_JOB_APPEARED_RULE_ID, nowMs);
+  const horizonOk = noveltyHorizonOk(readResult, SCHEDULED_JOB_APPEARED_RULE_ID, nowMs);
   const evaluable = !coldStartPendingThisTick && horizonOk;
-  const appearances = evaluable ? detectScheduledJobAppearances(currentGroups, detectionOptions) : [];
+  const appearances = evaluable ? detectScheduledJobAppearances(currentGroups, { ...detectionOptions, seenEntries: seenSet?.entries }) : [];
 
   // Detector-reported recovery coverage (§8.B/§8.C): the alert identities this detector genuinely
   // evaluated this tick. Gated by the SAME coldStartPendingThisTick short-circuit that zeroes
@@ -429,5 +434,5 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildScheduledJobAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult) }), evaluatedAlertKeys };
+  return { candidates: buildScheduledJobAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SCHEDULED_JOB_APPEARED_RULE_ID) }), evaluatedAlertKeys };
 }

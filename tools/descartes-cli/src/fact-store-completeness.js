@@ -30,7 +30,7 @@
 // is still a continuity break (prefix-digest check), and the corrupt, schema-invalid, continuity
 // and future-fact channels keep their trust semantics (I4). last_bytecap_evict_ts and
 // bytecap_evicted_total stay as informational fields.
-import { ruleHorizonMs } from "./fact-families.js";
+import { noveltyFamilyForRule, ruleHorizonMs } from "./fact-families.js";
 
 export const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = Object.freeze([
   "last_future_fact_ts",
@@ -168,11 +168,54 @@ export function ruleHorizonOk(readResult, ruleId, nowMs) {
 }
 
 /**
+ * S3b (§17): the read's seen-set for a novelty rule's family, when (and only when) it is valid --
+ * validated by readFactPoints against the same ledger it read. undefined otherwise.
+ */
+export function validNoveltySeenSet(readResult, ruleId) {
+  const family = noveltyFamilyForRule(ruleId);
+  if (family === undefined) return undefined;
+  const set = readResult?.seen_sets?.[family];
+  return isObject(set) && set.status === "valid" && set.entries instanceof Map ? set : undefined;
+}
+
+/**
+ * The horizon referent for a NOVELTY rule (S3b, plan §18): with a valid seen-set the rule decides
+ * novelty against the set, so its minimum-memory horizon (Q2: 48 h / 48 h / 6 d) is measured against
+ * the set's certified_since_ts -- null (memory complete since the lineage began) is eligible, exactly
+ * like a store that never narrowed. Without a valid set it falls back to the fact store's floor
+ * (ruleHorizonOk); the caller ALSO keeps the interim full-coverage gate in that case.
+ */
+export function noveltyHorizonOk(readResult, ruleId, nowMs) {
+  const set = validNoveltySeenSet(readResult, ruleId);
+  if (!set) return ruleHorizonOk(readResult, ruleId, nowMs);
+  const horizonMs = ruleHorizonMs(ruleId);
+  if (horizonMs === undefined || !Number.isFinite(nowMs)) return false;
+  if (set.certified_since_ts === null) return true;
+  if (!isValidTimestamp(set.certified_since_ts)) return false;
+  const sinceMs = Date.parse(set.certified_since_ts);
+  if (sinceMs > nowMs) return false;
+  return nowMs - sinceMs >= horizonMs;
+}
+
+/**
+ * The full eligibility decision for a novelty rule, shared by the detectors' gate and the daemon's
+ * independent veto so the two can never disagree on the referent: a valid seen-set and its horizon;
+ * or, without one, the interim S2 rule -- full (un-narrowed) coverage AND the fact-floor horizon.
+ */
+export function noveltyRuleEligible(readResult, ruleId, nowMs) {
+  if (validNoveltySeenSet(readResult, ruleId)) return noveltyHorizonOk(readResult, ruleId, nowMs);
+  return readResult?.completeness?.coverage === "full" && ruleHorizonOk(readResult, ruleId, nowMs);
+}
+
+/**
  * The scope of a novelty claim decided against this read's retained window (§4.2, §5 point 4): the
  * certified boundary when the store is narrowed, else the oldest point the read returned (the store
  * has held everything since then). undefined when neither is known. Display only.
  */
-export function noveltyHistoryScopeTs(readResult) {
+export function noveltyHistoryScopeTs(readResult, ruleId) {
+  // S3b: decided against a valid seen-set -> its scope (max(certified_since, now - retention)).
+  const set = ruleId === undefined ? undefined : validNoveltySeenSet(readResult, ruleId);
+  if (set && isValidTimestamp(set.scope_ts)) return set.scope_ts;
   const completeness = readResult?.completeness;
   if (!isObject(completeness)) return undefined;
   if (isValidTimestamp(completeness.certified_after_ts)) return completeness.certified_after_ts;
