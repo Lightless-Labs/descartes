@@ -494,7 +494,7 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   // exactly what process-lineage-baseline.js/session-baseline.js/peer-baseline.js do for their own
   // candidate computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "service", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupServiceFactsByTick(points);
 
@@ -909,7 +909,7 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
 
   const readFacts = options.readFactPoints ?? readFactPoints;
   // S3b (§17): also read the service seen-set, validated against this same read's ledger.
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now, seenSetFamilies: ["service"] });
+  const readResult = await readFacts(descartesPaths, { family: "service", windowMs, now: options.now, seenSetFamilies: ["service"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupServiceFactsByTick(points);
 

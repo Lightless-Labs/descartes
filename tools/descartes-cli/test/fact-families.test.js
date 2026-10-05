@@ -192,14 +192,14 @@ test("certifiedReadWindowOk is PROVABLY no weaker than 'no byte-cap narrowing': 
     const ts = iso(nowMs);
     const points = [servicePoint(ts, `svc-a-${tick % 3}`), servicePoint(ts, `svc-b-${tick}`)];
     // A small cap forces routine byte-cap eviction on one store; the reference never evicts.
-    await appendFactPoints(evicted, points, { now: ts, maxBytes: 1200 });
-    await appendFactPoints(reference, points, { now: ts, maxBytes: 10 * 1024 * 1024 });
+    await appendFactPoints(evicted, points, { family: "service", now: ts, maxBytes: 1200 });
+    await appendFactPoints(reference, points, { family: "service", now: ts, maxBytes: 10 * 1024 * 1024 });
   }
   let passes = 0;
   for (const windowMs of [HOUR, 2 * HOUR, 3 * HOUR, 5 * HOUR, 8 * HOUR, 11 * HOUR, 30 * DAY]) {
     const readOptions = { windowMs, now: iso(nowMs) };
-    const narrowed = await readFactPoints(evicted, readOptions);
-    const full = await readFactPoints(reference, readOptions);
+    const narrowed = await readFactPoints(evicted, { family: "service", ...(readOptions) });
+    const full = await readFactPoints(reference, { family: "service", ...(readOptions) });
     assert.equal(narrowed.completeness.coverage, "narrowed", "the evicting store really was narrowed");
     if (certifiedReadWindowOk(narrowed, { nowMs, windowMs })) {
       passes += 1;
@@ -215,9 +215,9 @@ test("T5 (deferred from S2): maxBytes 0 and a single tick over the cap leave an 
   for (const maxBytes of [0, 50]) {
     const paths = await tempPaths();
     const ts = "2026-10-05T00:00:00.000Z";
-    await appendFactPoints(paths, [servicePoint(ts, "svc-a"), servicePoint(ts, "svc-b")], { now: ts, maxBytes });
-    await enforceFactRetention(paths, { now: ts, maxBytes });
-    const read = await readFactPoints(paths, { windowMs: 31 * DAY, now: ts });
+    await appendFactPoints(paths, [servicePoint(ts, "svc-a"), servicePoint(ts, "svc-b")], { family: "service", now: ts, maxBytes });
+    await enforceFactRetention(paths, { family: "service", now: ts, maxBytes });
+    const read = await readFactPoints(paths, { family: "service", windowMs: 31 * DAY, now: ts });
     assert.deepEqual(read.points, []);
     assert.equal(read.completeness.coverage, "narrowed");
     assert.equal(certifiedHorizonOk(read, { nowMs: Date.parse(ts), horizonMs: HOUR }), false);

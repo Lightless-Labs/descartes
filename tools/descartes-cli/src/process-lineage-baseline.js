@@ -344,7 +344,7 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now, seenSetFamilies: ["process_lineage"] });
+  const readResult = await readFacts(descartesPaths, { family: "process_lineage", windowMs, now: options.now, seenSetFamilies: ["process_lineage"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupProcessLineageFactsByTick(points);
 

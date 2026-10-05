@@ -7,7 +7,7 @@ import test from "node:test";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { alertId } from "../src/alert-store.js";
 import { isFixedLengthHexHash, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
-import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
+import { readFactPoints, appendFactPointsByFamily } from "../src/fact-store.js";
 import { factPointsFromServiceEvidence, SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
@@ -171,8 +171,8 @@ async function seedAndCompute(paths, points, options = {}) {
   const firstTs = points.reduce((min, p) => Math.min(min, new Date(p.ts).getTime()), Infinity);
   const establishedAnchor = Number.isFinite(firstTs) ? new Date(firstTs - 1).toISOString() : now;
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: establishedAnchor });
-  await appendFactPoints(paths, points, { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, points, { now });
+  await appendFactPointsByFamily(paths, [], { now });
   return computeServiceBaselineCandidates(paths, { now, ...options });
 }
 
@@ -521,8 +521,8 @@ test("computeServiceBaselineCandidates: store write is skipped on a tick with ze
   // is about the write-skip/at-most-one-write convention, not the lockout, which has its own
   // dedicated coverage further down) and confirm the shared integrity ledger to 'intact'.
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, flatten(ticks), { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, flatten(ticks), { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   let writeCount = 0;
   const countingWrite = async (descartesPaths, state) => {
@@ -550,8 +550,8 @@ test("fold-time-only counter increment (Stage 1 review must-fix 3): disappearanc
   // is about the fold-time-only counter convention, not the lockout) and confirm the shared
   // integrity ledger to 'intact'.
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, flatten(ticks), { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, flatten(ticks), { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
 
@@ -566,7 +566,7 @@ test("fold-time-only counter increment (Stage 1 review must-fix 3): disappearanc
   // Advance the window by one new complete tick-group (svc-a stays absent) -- must NOT increment
   // again for the same already-counted event.
   const laterTs = tickTs(4);
-  await appendFactPoints(paths, completeTick(laterTs, []), { now: laterTs });
+  await appendFactPointsByFamily(paths, completeTick(laterTs, []), { now: laterTs });
   await computeServiceBaselineCandidates(paths, { ...commonOptions, now: laterTs });
   const { state: afterAdvance } = await loadServiceBaselineStore(paths);
   assert.equal(afterAdvance.disappearance_event_count, 1, "the already-counted event must not be recounted once last_folded_ts advances past it");
@@ -581,8 +581,8 @@ test("fold-time-only counter increment: skipped_partial_tick_count increments ex
   // the shared integrity ledger to 'intact' (see the "disappearance_event_count" fold-time test
   // above for the identical rationale).
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, flatten(ticks), { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, flatten(ticks), { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
   for (let i = 0; i < 4; i += 1) {
@@ -601,8 +601,8 @@ test("re-emission every call: candidate list is rebuilt fresh from the current w
   // the shared integrity ledger to 'intact' (see the fold-time tests above for the identical
   // rationale) — this test is about re-emission, not the lockout.
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, flatten(ticks), { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, flatten(ticks), { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   const commonOptions = { now, freshnessMs: HOUR_MS, establishedMinCensusCount: 3 };
   const first = await computeServiceBaselineCandidates(paths, commonOptions);
@@ -633,10 +633,10 @@ test("computeServiceBaselineCandidates end-to-end: an established service disapp
 test("computeServiceBaselineCandidates: readFactPoints window bound is threaded through (regression: fact points outside baselineFactWindowMs are excluded)", async () => {
   const paths = await tempPaths();
   await writeWatchConfig(paths, { enabled: true });
-  await appendFactPoints(paths, completeTick(tickTs(0), ["svc-a"]), { now: tickTs(0) });
+  await appendFactPointsByFamily(paths, completeTick(tickTs(0), ["svc-a"]), { now: tickTs(0) });
   // A direct readFactPoints call with a tiny window relative to `now` should see nothing.
   const now = tickTs(1000);
-  const { points } = await readFactPoints(paths, { windowMs: HOUR_MS, now });
+  const { points } = await readFactPoints(paths, { family: "service", windowMs: HOUR_MS, now });
   assert.deepEqual(points, []);
 });
 
@@ -862,8 +862,8 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
   await fs.writeFile(storeFile, JSON.stringify(legacyState, null, 2), { mode: 0o600 });
 
   const ticks = flatten(establishedTicks(["svc-a"], 5)); // ticks 0-4: svc-a established
-  await appendFactPoints(paths, ticks, { now: tickTs(4) });
-  await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, ticks, { now: tickTs(4) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
 
   // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
   // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
@@ -883,7 +883,7 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
   let hour = 5;
   for (let i = 0; i < minHistoryTickCount; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, completeTick(ts, ["svc-a"]), { now: ts });
+    await appendFactPointsByFamily(paths, completeTick(ts, ["svc-a"]), { now: ts });
     await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
     hour += 1;
   }
@@ -895,7 +895,7 @@ test("migration: a pre-Slice-6 store with no cold_start_* fields at all cold-sta
 
   // And service.disappeared novelty genuinely resumes afterward.
   const ts = tickTs(hour);
-  await appendFactPoints(paths, completeTick(ts, []), { now: ts }); // svc-a genuinely vanishes
+  await appendFactPointsByFamily(paths, completeTick(ts, []), { now: ts }); // svc-a genuinely vanishes
   const resumed = await computeServiceBaselineCandidates(paths, { now: ts, minHistoryTickCount, establishedMinCensusCount: 3, freshnessMs: HOUR_MS });
   assert.equal(resumed.candidates.filter((c) => c.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1);
 });
@@ -1202,8 +1202,8 @@ test("computeServiceAppearanceCandidates folds counters once and emits an appear
   ]);
   await writeWatchConfig(paths, { enabled: true });
   await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, points, { now: tickTs(2) });
-  await appendFactPoints(paths, [], { now: tickTs(2) });
+  await appendFactPointsByFamily(paths, points, { now: tickTs(2) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(2) });
   const first = await computeServiceAppearanceCandidates(paths, { now: tickTs(2), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS });
   assert.equal(first.candidates.length, 1);
   assert.equal(first.candidates[0].diagnostics.entity_key_hash, expectedAppearedHash("svc-new"));
@@ -1225,8 +1225,8 @@ test("co-existence: a service that disappears then reappears exercises BOTH dete
     completeTick(tickTs(3), []),
     completeTick(tickTs(4), ["svc-a"]),
   ]);
-  await appendFactPoints(paths, points, { now: tickTs(4) });
-  await appendFactPoints(paths, [], { now: tickTs(4) });
+  await appendFactPointsByFamily(paths, points, { now: tickTs(4) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(4) });
 
   const opts = { now: tickTs(4), minHistoryTickCount: 2, establishedMinCensusCount: 2, activeFreshnessMs: HOUR_MS };
   const disappeared = await computeServiceBaselineCandidates(paths, opts);
@@ -1283,7 +1283,7 @@ test("computeServiceAppearanceCandidates fails closed end-to-end when the persis
     completeTick(tickTs(1), ["svc-a"]),
     completeTick(tickTs(2), ["svc-a", "svc-new"]),
   ]);
-  await appendFactPoints(paths, points, { now: tickTs(2) });
+  await appendFactPointsByFamily(paths, points, { now: tickTs(2) });
 
   const { dir, storeFile } = resolveServiceAppearanceBaselineStorePaths(paths);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });

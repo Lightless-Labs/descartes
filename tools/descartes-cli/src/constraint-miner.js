@@ -14,6 +14,7 @@ import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { certifiedReadWindowOk, factHistoryTrustworthy } from "./fact-store-completeness.js";
 import { parseDurationMs } from "./history-store.js";
 import { readFactPoints } from "./fact-store.js";
+import { readerFamilies } from "./fact-families.js";
 
 // Reserved id namespace (plan §4, §0.1): every mined id starts with this prefix, making
 // mined provenance structurally distinguishable from hand-authored SEED_CONSTRAINTS ids by
@@ -359,7 +360,7 @@ export async function runLearned(descartesPaths, args, runtime = {}) {
   }
 
   const readFacts = runtime.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs: options.windowMs, now: runtime.now });
+  const readResult = await readFacts(descartesPaths, { families: readerFamilies("constraint_miner"), windowMs: options.windowMs, now: runtime.now });
   const nowMs = runtime.now !== undefined ? new Date(runtime.now).getTime() : Date.now();
   // A truncated or otherwise untrustworthy history can hide counterexamples and mint an
   // over-strong draft. Degrade to zero mining for this pass; drafts remain human-gated.

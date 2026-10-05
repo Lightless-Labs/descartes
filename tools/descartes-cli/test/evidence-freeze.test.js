@@ -371,7 +371,7 @@ test("evidence bundles are never touched by fact-store.js's retention mechanism"
 
   // Deliberately aggressive retention sweep (0 retention window, 0 byte budget) against
   // fact-store.js's own, entirely disjoint store — must not reach stateDir/evidence/ at all.
-  await enforceFactRetention(paths, { retentionMs: 0, maxBytes: 0, now: FIXED_NOW });
+  await enforceFactRetention(paths, { family: "service", retentionMs: 0, maxBytes: 0, now: FIXED_NOW });
 
   const stillThere = await readEvidenceBundle(paths, result.filename);
   assert.equal(stillThere.missing, false);

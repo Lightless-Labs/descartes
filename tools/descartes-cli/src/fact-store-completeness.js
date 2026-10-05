@@ -54,6 +54,39 @@ function isValidTimestamp(value) {
 }
 
 /**
+ * S4 (fact-store capacity plan §4.3): a multi-family readFactPoints result carries each family's own
+ * read under `family_reads`, and every predicate below ANDs over them -- trust, horizon and
+ * read-window coverage hold only if they hold for EVERY family read. A combined floor is never used to
+ * gate (one family's newer age floor could mask another family's byte-cap floor). Returns the list
+ * of reads to evaluate: [readResult] for a single-family read, the per-family reads otherwise, or null
+ * when `family_reads` is present but malformed (callers fail closed).
+ */
+//
+// A family store that was NEVER CREATED (`store_exists === false`: no facts.jsonl and no ledger)
+// contributes no points and is left out of the AND: it holds no history that could hide a
+// counterexample or a prior sighting, and requiring it would silence a multi-family reader (the
+// miner, shadow) on every host where one of its families simply has nothing to observe (e.g. no
+// listening ports). A single-family read of such a store still reads `unknown` (untrusted), so the
+// daemon's per-family veto still freezes that family's rules. If EVERY family read is absent, there
+// is nothing to vouch for: fail closed.
+function perFamilyReads(readResult) {
+  if (!isObject(readResult) || !Object.prototype.hasOwnProperty.call(readResult, "family_reads")) return [readResult];
+  const familyReads = readResult.family_reads;
+  if (!isObject(familyReads)) return null;
+  const entries = Object.values(familyReads);
+  if (entries.length === 0) return null;
+  if (entries.some((entry) => !isObject(entry) || Object.prototype.hasOwnProperty.call(entry, "family_reads"))) return null;
+  const present = entries.filter((entry) => entry.store_exists !== false);
+  return present.length > 0 ? present : null;
+}
+
+function everyFamilyRead(readResult, predicate) {
+  const reads = perFamilyReads(readResult);
+  if (!reads) return false;
+  return reads.every((read) => predicate(read));
+}
+
+/**
  * Returns true when a recorded loss event is strictly newer than anchorTs.
  * This is deliberately the only timestamp comparison used by the trust decision.
  * Missing/null event timestamps mean that channel has no recorded event. A malformed
@@ -140,7 +173,11 @@ function validLedgerFloors(readResult) {
  * I5: this only ever REMOVES an evaluation. It is never an input to the cold-start re-arm, never
  * extends certified_after_ts, never adds points.
  */
-export function certifiedHorizonOk(readResult, { nowMs, horizonMs } = {}) {
+export function certifiedHorizonOk(readResult, options = {}) {
+  return everyFamilyRead(readResult, (read) => singleFamilyCertifiedHorizonOk(read, options));
+}
+
+function singleFamilyCertifiedHorizonOk(readResult, { nowMs, horizonMs } = {}) {
   try {
     if (!Number.isFinite(nowMs) || !Number.isFinite(horizonMs) || horizonMs < 0) return false;
     const floors = validLedgerFloors(readResult);
@@ -264,7 +301,11 @@ export function noveltyHistoryScopeTs(readResult, ruleId) {
  * Fails closed on no valid ledger, malformed completeness/floors, or bad inputs. Status/loss trust
  * is NOT decided here -- callers still require factHistoryTrustworthy(...).trust.
  */
-export function certifiedReadWindowOk(readResult, { nowMs, windowMs } = {}) {
+export function certifiedReadWindowOk(readResult, options = {}) {
+  return everyFamilyRead(readResult, (read) => singleFamilyCertifiedReadWindowOk(read, options));
+}
+
+function singleFamilyCertifiedReadWindowOk(readResult, { nowMs, windowMs } = {}) {
   try {
     if (!Number.isFinite(nowMs)) return false;
     if (windowMs !== undefined && (!Number.isFinite(windowMs) || windowMs < 0)) return false;
@@ -300,6 +341,19 @@ export function certifiedReadWindowOk(readResult, { nowMs, windowMs } = {}) {
  * Every other caller (the daemon veto, the detectors) omits it and is byte-for-byte unaffected.
  */
 export function factHistoryTrustworthy(readResult, opts = {}) {
+  // S4: a multi-family read is trusted only if EVERY family's own read is (§4.3: "Trust holds only
+  // if every family is trusted"); the first failing family's reason is returned. A malformed
+  // family_reads fails closed.
+  const reads = perFamilyReads(readResult);
+  if (!reads) return { trust: false, reason: "history_unknown" };
+  for (const read of reads) {
+    const result = singleFamilyFactHistoryTrustworthy(read, opts);
+    if (!result.trust) return result;
+  }
+  return { trust: true, reason: "ok" };
+}
+
+function singleFamilyFactHistoryTrustworthy(readResult, opts = {}) {
   try {
     if (!isObject(readResult) || !Object.prototype.hasOwnProperty.call(readResult, "completeness")) {
       return { trust: false, reason: "history_unknown" };

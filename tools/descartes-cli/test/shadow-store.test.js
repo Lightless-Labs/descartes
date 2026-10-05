@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints, enforceFactRetention } from "../src/fact-store.js";
+import { enforceFactRetention, appendFactPointsByFamily } from "../src/fact-store.js";
 import { buildConstraintTarget, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import { evaluateConstraints } from "../src/constraint-eval.js";
 import {
@@ -163,7 +163,7 @@ test("evaluateAndLogShadowConstraints ignores non-shadow constraints (draft/acti
     shadowConstraint({ id: "c.review-ready", status: "review-ready" }),
     shadowConstraint({ id: "c.retired", status: "retired" }),
   ]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } },
   ], { now: "2026-07-10T00:00:00.000Z" });
 
@@ -176,10 +176,10 @@ test("evaluateAndLogShadowConstraints appends exactly one record per shadow cons
   const paths = await tempPaths();
   const now = "2026-07-10T00:00:00.000Z";
   await writeConstraints(paths, [shadowConstraint()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } },
   ], { now });
-  await enforceFactRetention(paths, { now });
+  await enforceFactRetention(paths, { family: "service", now });
 
   const result = await evaluateAndLogShadowConstraints(paths, { now });
   assert.equal(result.evaluated_count, 1);
@@ -263,7 +263,7 @@ test("evaluateAndLogShadowConstraints excludes degraded facts (owner_known:\"fal
     expected: { comparator: "eq", value: "postgres" },
   });
   await writeConstraints(paths, [portConstraint]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     {
       fact_name: "network.listening_port.owner",
       entity_key: "tcp:0.0.0.0:5432",
@@ -281,7 +281,7 @@ test("evaluateAndLogShadowConstraints never writes to constraints.json (read-onl
   const paths = await tempPaths();
   const now = "2026-07-10T00:00:00.000Z";
   await writeConstraints(paths, [shadowConstraint()]);
-  await appendFactPoints(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }], { now });
+  await appendFactPointsByFamily(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }], { now });
 
   await evaluateAndLogShadowConstraints(paths, { now });
 
@@ -451,10 +451,10 @@ test("Slice B: evaluateAndLogShadowConstraints (the SHADOW-SOAK path) applies th
   const paths = await tempPaths();
   const factTs = "2026-07-10T00:00:00.000Z";
   await writeConstraints(paths, [shadowConstraint()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } }, // would FIRE (expected "true") if fresh
   ], { ts: factTs, now: factTs }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
-  await enforceFactRetention(paths, { now: factTs });
+  await enforceFactRetention(paths, { family: "service", now: factTs });
 
   const staleNow = new Date(Date.parse(factTs) + 4 * 60 * 60 * 1000).toISOString(); // 4h later
   const freshnessMs = 3 * 60 * 60 * 1000;

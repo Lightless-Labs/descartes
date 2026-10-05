@@ -4,6 +4,7 @@ import path from "node:path";
 import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { DEFAULT_FACT_MAX_BYTES, readFactPoints } from "./fact-store.js";
 import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
+import { FACT_FAMILY_IDS } from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
 export const SCHEMA_VERSION = 1;
@@ -397,13 +398,40 @@ export function selectFactStoreCompleteness(completeness) {
 // windowed status (selectFactStoreCompleteness above) so an out-of-window or future-dated loss
 // stays visible even when the windowed status itself reads "intact" -- windowing alone would
 // hide old losses from view, and surfacing alone would leave the windowed status meaningless.
+//
+// S4 (fact-store capacity plan §4.3/§4.4): every registry family store is read (each against its
+// own ledger) and reported PER FAMILY under `families`, alongside the combined (worst-status)
+// summary at the top level. A family store that was never created reports `store: "absent"`
+// (rendered "not observed (no store)"), never "unknown"/"still learning".
 async function readFactStoreCompleteness(descartesPaths) {
   try {
-    const readResult = await readFactPoints(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS });
-    return selectFactStoreCompleteness(readResult?.completeness);
+    const readResult = await readFactPoints(descartesPaths, { families: [...FACT_FAMILY_IDS], windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS });
+    return selectFamilyFactStoreCompleteness(readResult);
   } catch {
     return unknownFactStoreCompleteness();
   }
+}
+
+/**
+ * S4: the per-family status shape shared by `descartes learned status` and the daemon status record:
+ * the combined completeness (selectFactStoreCompleteness of the multi-family read's combined
+ * completeness) plus `families: {<family>: {...selected completeness, store: "present"|"absent",
+ * bytes}}` for each family read. Display only.
+ */
+export function selectFamilyFactStoreCompleteness(readResult) {
+  const combined = selectFactStoreCompleteness(readResult?.completeness);
+  const familyReads = readResult?.family_reads && typeof readResult.family_reads === "object" && !Array.isArray(readResult.family_reads)
+    ? readResult.family_reads
+    : readResult?.family ? { [readResult.family]: readResult } : {};
+  const families = {};
+  for (const [family, read] of Object.entries(familyReads)) {
+    families[family] = {
+      ...selectFactStoreCompleteness(read?.completeness),
+      store: read?.store_exists === false ? "absent" : "present",
+      bytes: Number.isSafeInteger(read?.bytes) ? read.bytes : 0,
+    };
+  }
+  return { ...combined, families };
 }
 
 /**
@@ -463,7 +491,18 @@ export async function runLearnedConfigCommand(descartesPaths, subcommand, args, 
 // (selectFactStoreCompleteness, above) is still the primary/complete surface, this is a
 // human-readable summary of the same fields, shown only when there is something to explain.
 function renderFactStoreCompletenessText(completeness) {
-  const lines = [`Fact-store completeness: ${completeness.status}`];
+  const lines = [renderFamilyCompletenessText("Fact-store completeness", completeness)];
+  // S4: one block per family store; a never-created store is "not observed (no store)".
+  for (const [family, entry] of Object.entries(completeness.families ?? {})) {
+    lines.push(entry.store === "absent"
+      ? `  ${family}: not observed (no store)`
+      : renderFamilyCompletenessText(`  ${family}`, entry).split("\n").map((line, index) => (index === 0 ? line : `  ${line}`)).join("\n"));
+  }
+  return lines.join("\n");
+}
+
+function renderFamilyCompletenessText(label, completeness) {
+  const lines = [`${label}: ${completeness.status}`];
   if (completeness.status !== "intact") {
     lines.push(`  Reason: ${completeness.degraded_reason}`);
     if (completeness.future_loss_fields.length > 0) {

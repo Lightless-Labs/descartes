@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints, DEFAULT_FACT_MAX_BYTES, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, DEFAULT_FACT_MAX_BYTES, resolveFactStorePaths, appendFactPointsByFamily } from "../src/fact-store.js";
 import { isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import {
   DEFAULT_SOAK_DAYS,
@@ -491,13 +491,13 @@ test("descartes learned enable/disable/status --json print machine-readable payl
 test("descartes learned status --json includes counts-and-timestamps-only fact-store completeness", async () => {
   const paths = await tempPaths();
   const now = "2026-07-11T00:00:00.000Z";
-  await appendFactPoints(paths, [{
+  await appendFactPointsByFamily(paths, [{
     ts: now,
     fact_name: "service.presence",
     entity_key: "nginx",
     attributes: {},
   }], { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   const lines = [];
   await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => lines.push(line) });
@@ -514,6 +514,8 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   // ever moved older and could predate the retained facts, so it over-claimed retained history.
   // G1 re-gate LOW (fact-store capacity plan §18): ADDITIVE -- age_floor_ts is no longer stripped
   // (the age floor narrows coverage too; G1 Blocker 2).
+  // S4 (fact-store capacity plan §4.3/§4.4): ADDITIVE -- `families` carries the same fields per family
+  // store (plus store present/absent and bytes); the top level is the combined summary.
   assert.deepEqual(Object.keys(completeness).sort(), [
     "age_evicted_total",
     "age_floor_ts",
@@ -524,6 +526,7 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
     "corrupt_dropped_total",
     "coverage",
     "degraded_reason",
+    "families",
     "first_degraded_ts",
     "future_fact_dropped_total",
     "future_loss_fields",
@@ -591,10 +594,10 @@ test("descartes learned status --json surfaces last_bytecap_evict_ts and the byt
   // Tiny (but not zero) maxBytes forces routine bytecap eviction while still keeping room for
   // exactly the single newest record (a maxBytes too small to keep even one record would evict
   // everything -- not the sustained-but-nonempty pressure this finding is about).
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: day1, fact_name: "service.presence", entity_key: "one", attributes: {} },
   ], { now: day1, maxBytes: 150 });
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: day2, fact_name: "service.presence", entity_key: "two", attributes: {} },
   ], { now: day2, maxBytes: 150 });
 
@@ -621,11 +624,11 @@ test("descartes learned status (non-JSON) explains a degraded status with its re
   // window regardless of when this test runs (a fixed past date, e.g. "2026-07-11", would fall
   // outside a 31-day real-clock window and the read would resolve "intact" instead).
   const now = new Date().toISOString();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, "not-json\n");
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now }); // second clean pass -> continuity_ok:true, status: degraded (not unknown)
+  await appendFactPointsByFamily(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now }); // second clean pass -> continuity_ok:true, status: degraded (not unknown)
 
   const lines = [];
   await runLearnedConfigCommand(paths, "status", [], { output: (line) => lines.push(line) });
@@ -641,15 +644,20 @@ test("descartes learned status (non-JSON) explains a degraded status with its re
   // (which includes "unknown", not just "degraded" -- a fresh/never-written store benefits from
   // the same explanation).
   const intactPaths = await tempPaths();
-  await appendFactPoints(intactPaths, [
+  await appendFactPointsByFamily(intactPaths, [
     { ts: now, fact_name: "service.presence", entity_key: "one", attributes: {} },
   ], { now });
-  await appendFactPoints(intactPaths, [], { now }); // second clean pass -> continuity_ok:true, intact
+  await appendFactPointsByFamily(intactPaths, [], { now }); // second clean pass -> continuity_ok:true, intact
   const intactLines = [];
   await runLearnedConfigCommand(intactPaths, "status", [], { output: (line) => intactLines.push(line) });
   assert.equal(intactLines.length, 1);
-  assert.ok(intactLines[0].endsWith("Fact-store completeness: intact"), intactLines[0]);
-  assert.equal(intactLines[0].split("Fact-store completeness:").length, 2, "no extra 'Reason:'/last_*_ts lines when the status needs no explanation");
+  // S4 (fact-store capacity plan §4.3/§4.4): the combined line is followed by one line per family
+  // store -- the populated one intact, every never-created one "not observed (no store)" (I11) --
+  // and still no 'Reason:'/last_*_ts explanation when nothing needs explaining.
+  assert.match(intactLines[0], /Fact-store completeness: intact\n  service: intact\n/);
+  assert.match(intactLines[0], /  peer: not observed \(no store\)/);
+  assert.equal(intactLines[0].split("Fact-store completeness:").length, 2);
+  assert.doesNotMatch(intactLines[0], /Reason:|last_[a-z_]+_ts:/, "no extra 'Reason:'/last_*_ts lines when the status needs no explanation");
 });
 
 test("descartes learned status never mutates learned.json (read-only)", async () => {
@@ -1113,9 +1121,9 @@ test("G1 LOW: learned status reports the age floor and names each narrowing caus
   const oldTs = new Date(nowMs - 30.5 * day).toISOString();
   const newTs = new Date(nowMs).toISOString();
   const ageOnly = await tempPaths();
-  await appendFactPoints(ageOnly, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
-  await appendFactPoints(ageOnly, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs });
-  await appendFactPoints(ageOnly, [], { now: newTs });
+  await appendFactPointsByFamily(ageOnly, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
+  await appendFactPointsByFamily(ageOnly, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs });
+  await appendFactPointsByFamily(ageOnly, [], { now: newTs });
   const lines = [];
   const result = await runLearnedConfigCommand(ageOnly, "status", [], { output: (line) => lines.push(line) });
   assert.equal(result.fact_store_completeness.age_floor_ts, oldTs);
@@ -1126,10 +1134,10 @@ test("G1 LOW: learned status reports the age floor and names each narrowing caus
 
   // Both causes at once are both named.
   const both = await tempPaths();
-  await appendFactPoints(both, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
+  await appendFactPointsByFamily(both, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
   const midTs = new Date(nowMs - day).toISOString();
-  await appendFactPoints(both, [{ ts: midTs, fact_name: "service.presence", entity_key: "mid", attributes: {} }], { now: midTs });
-  await appendFactPoints(both, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs, maxBytes: 150 });
+  await appendFactPointsByFamily(both, [{ ts: midTs, fact_name: "service.presence", entity_key: "mid", attributes: {} }], { now: midTs });
+  await appendFactPointsByFamily(both, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs, maxBytes: 150 });
   const bothLines = [];
   await runLearnedConfigCommand(both, "status", [], { output: (line) => bothLines.push(line) });
   assert.match(bothLines.join("\n"), /narrowed by byte-cap eviction \(floor .*\) and age retention \(floor /);

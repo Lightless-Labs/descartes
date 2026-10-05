@@ -40,6 +40,7 @@ import {
 } from "./constraint-store.js";
 import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
+import { readerFamilies } from "./fact-families.js";
 import { parseDurationMs } from "./history-store.js";
 import { readNotificationDeliveryAudit } from "./notification-delivery.js";
 import { buildShadowFactLookup, readShadowRecords } from "./shadow-store.js";
@@ -628,7 +629,7 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
     safeReadSignal(() => readShadow(descartesPaths), "shadow-violations.jsonl"),
     safeReadSignal(() => readIntelligenceConfig(descartesPaths), "alert-intelligence.json"),
     safeReadSignal(() => loadConstraintsFn(descartesPaths), "constraints.json"),
-    safeReadSignal(() => readFacts(descartesPaths, { windowMs: options.windowMs, now: runtime.now }), "facts.jsonl"),
+    safeReadSignal(() => readFacts(descartesPaths, { families: readerFamilies("tuning_miner"), windowMs: options.windowMs, now: runtime.now }), "facts.jsonl"),
   ]);
 
   const calibrationReport = computeCalibrationReport(alerts, auditRecords, deliveryRecords, shadowResult?.records, {

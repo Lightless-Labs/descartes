@@ -705,7 +705,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // exactly what process-lineage-baseline.js/session-baseline.js do for their own candidate
   // computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "peer", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupPeerFactsByTick(points);
 

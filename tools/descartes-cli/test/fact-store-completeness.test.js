@@ -152,7 +152,7 @@ test("factHistoryTrustworthy ignores future loss timestamps for the current roll
 
 test("retention records corrupt-line loss durably and the next read is degraded", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, [
     JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }),
@@ -160,11 +160,11 @@ test("retention records corrupt-line loss durably and the next read is degraded"
     "",
   ].join("\n"));
 
-  const retention = await enforceFactRetention(paths, { now: NOW });
+  const retention = await enforceFactRetention(paths, { family: "service", now: NOW });
   assert.equal(retention.corrupt_dropped_count, 1);
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "unknown");
-  await enforceFactRetention(paths, { now: NOW });
-  const read = await readFactPoints(paths, { now: NOW });
+  assert.equal((await readFactPoints(paths, { family: "service", now: NOW })).completeness.status, "unknown");
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.equal(read.corrupt_count, 0);
   assert.equal(read.completeness.status, "degraded");
   assert.equal(read.completeness.corrupt_dropped_total, 1);
@@ -173,14 +173,14 @@ test("retention records corrupt-line loss durably and the next read is degraded"
 
 test("retention classifies parseable schema-invalid records and read reports this-read schema loss", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, JSON.stringify({ ts: NOW, fact_name: "service.presence", attributes: {} }) + "\n");
 
-  await enforceFactRetention(paths, { now: NOW });
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "unknown");
-  await enforceFactRetention(paths, { now: NOW });
-  const read = await readFactPoints(paths, { now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  assert.equal((await readFactPoints(paths, { family: "service", now: NOW })).completeness.status, "unknown");
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.deepEqual(read.points, []);
   assert.equal(read.corrupt_count, 0);
   assert.equal(read.schema_invalid_count, 0);
@@ -200,12 +200,12 @@ test("retention classifies byte-cap eviction separately and reports it as covera
   const paths = await tempPaths();
   const ticks = [NOW, "2026-08-21T00:00:01.000Z", "2026-08-21T00:00:02.000Z"];
   for (const [index, ts] of ticks.entries()) {
-    await appendFactPoints(paths, [{ ts, fact_name: "service.presence", entity_key: `svc-${index}`, attributes: {} }], { now: ts, maxBytes: Number.MAX_SAFE_INTEGER });
+    await appendFactPoints(paths, [{ ts, fact_name: "service.presence", entity_key: `svc-${index}`, attributes: {} }], { family: "service", now: ts, maxBytes: Number.MAX_SAFE_INTEGER });
   }
-  const retention = await enforceFactRetention(paths, { now: ticks[2], maxBytes: 200 });
+  const retention = await enforceFactRetention(paths, { family: "service", now: ticks[2], maxBytes: 200 });
   assert.equal(retention.bytecap_evicted_count, 2);
   assert.equal(retention.kept_count, 1);
-  const read = await readFactPoints(paths, { now: ticks[2] });
+  const read = await readFactPoints(paths, { family: "service", now: ticks[2] });
   assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.bytecap_evicted_total, 2);
   assert.equal(read.completeness.last_bytecap_evict_ts, ticks[2]);
@@ -216,16 +216,16 @@ test("retention classifies byte-cap eviction separately and reports it as covera
 
 test("retention classifies an invalid timestamp as schema-invalid, not age-evicted", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, JSON.stringify({ ts: "not-a-timestamp", fact_name: "service.presence", entity_key: "bad", attributes: {} }) + "\n");
 
-  const retention = await enforceFactRetention(paths, { now: NOW });
+  const retention = await enforceFactRetention(paths, { family: "service", now: NOW });
   assert.equal(retention.dropped_count, 1);
   assert.equal(retention.corrupt_dropped_count, 0);
   assert.equal(retention.schema_invalid_dropped_count, 1);
   assert.equal(retention.age_evicted_count, 0);
-  const read = await readFactPoints(paths, { now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.equal(read.completeness.schema_invalid_dropped_total, 1);
 });
 
@@ -239,22 +239,22 @@ test("retention classifies an invalid timestamp as schema-invalid, not age-evict
 // clean: unknown, then intact.
 test("missing-ledger bootstrap: over a pre-existing non-empty store it is a lineage break (never intact); a genuine first append stays clean", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }) + "\n");
 
-  await enforceFactRetention(paths, { now: NOW });
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "unknown");
-  await enforceFactRetention(paths, { now: NOW });
-  const read = await readFactPoints(paths, { now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  assert.equal((await readFactPoints(paths, { family: "service", now: NOW })).completeness.status, "unknown");
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.equal(read.completeness.status, "degraded");
   assert.equal(read.completeness.last_continuity_break_ts, NOW);
 
   const firstRun = await tempPaths();
-  await appendFactPoints(firstRun, [{ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }], { now: NOW });
-  assert.equal((await readFactPoints(firstRun, { now: NOW })).completeness.status, "unknown");
-  await enforceFactRetention(firstRun, { now: NOW });
-  assert.equal((await readFactPoints(firstRun, { now: NOW })).completeness.status, "intact");
+  await appendFactPoints(firstRun, [{ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }], { family: "service", now: NOW });
+  assert.equal((await readFactPoints(firstRun, { family: "service", now: NOW })).completeness.status, "unknown");
+  await enforceFactRetention(firstRun, { family: "service", now: NOW });
+  assert.equal((await readFactPoints(firstRun, { family: "service", now: NOW })).completeness.status, "intact");
 });
 
 test("this-read corruption cannot be reported as intact against a clean committed ledger", async () => {
@@ -264,12 +264,12 @@ test("this-read corruption cannot be reported as intact against a clean committe
   ];
   for (const [, line, field] of cases) {
     const paths = await tempPaths();
-    await fs.mkdir(resolveFactStorePaths(paths).dir, { recursive: true });
-    await fs.writeFile(resolveFactStorePaths(paths).factsFile, JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }) + "\n");
-    await enforceFactRetention(paths, { now: NOW });
-    await enforceFactRetention(paths, { now: NOW });
-    await fs.appendFile(resolveFactStorePaths(paths).factsFile, `${line}\n`);
-    const read = await readFactPoints(paths, { now: NOW });
+    await fs.mkdir(resolveFactStorePaths(paths, "service").dir, { recursive: true });
+    await fs.writeFile(resolveFactStorePaths(paths, "service").factsFile, JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }) + "\n");
+    await enforceFactRetention(paths, { family: "service", now: NOW });
+    await enforceFactRetention(paths, { family: "service", now: NOW });
+    await fs.appendFile(resolveFactStorePaths(paths, "service").factsFile, `${line}\n`);
+    const read = await readFactPoints(paths, { family: "service", now: NOW });
     assert.equal(read[field], 1);
     assert.notEqual(read.completeness.status, "intact");
   }
@@ -277,59 +277,59 @@ test("this-read corruption cannot be reported as intact against a clean committe
 
 test("same-count same-newest byte replacement breaks continuity", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }) + "\n");
-  await enforceFactRetention(paths, { now: NOW });
-  await enforceFactRetention(paths, { now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
   await fs.writeFile(storePaths.factsFile, JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: { changed: "bytes" } }) + "\n");
-  const read = await readFactPoints(paths, { now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.notEqual(read.completeness.status, "intact");
   assert.equal(read.completeness.continuity_ok, null);
 });
 
 test("same-count same-size content replacement is not intact", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   const committed = JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }) + "\n";
   const replacement = JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "mysql", attributes: {} }) + "\n";
   assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(committed));
   await fs.writeFile(storePaths.factsFile, committed);
-  await enforceFactRetention(paths, { now: NOW });
-  await enforceFactRetention(paths, { now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
   await fs.writeFile(storePaths.factsFile, replacement);
 
-  const read = await readFactPoints(paths, { now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.notEqual(read.completeness.status, "intact");
 });
 
 test("replacement of the committed prefix plus an appended record is not intact", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   const committed = JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "nginx", attributes: {} }) + "\n";
   const replacement = JSON.stringify({ ts: NOW, fact_name: "service.presence", entity_key: "mysql", attributes: {} }) + "\n";
   const appended = JSON.stringify({ ts: "2026-08-21T00:00:01.000Z", fact_name: "service.presence", entity_key: "redis", attributes: {} }) + "\n";
   await fs.writeFile(storePaths.factsFile, committed);
-  await enforceFactRetention(paths, { now: NOW });
-  await enforceFactRetention(paths, { now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
   await fs.writeFile(storePaths.factsFile, replacement + appended);
 
-  const read = await readFactPoints(paths, { now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   assert.notEqual(read.completeness.status, "intact");
 });
 
 test("missing and null stored timestamps are schema-invalid and never become ledger timestamps", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, [
     JSON.stringify({ fact_name: "service.presence", entity_key: "missing", attributes: {} }),
     JSON.stringify({ ts: null, fact_name: "service.presence", entity_key: "null", attributes: {} }),
     "",
   ].join("\n"));
-  const retention = await enforceFactRetention(paths, { now: NOW });
+  const retention = await enforceFactRetention(paths, { family: "service", now: NOW });
   assert.equal(retention.schema_invalid_dropped_count, 2);
   const ledgerBytes = await fs.readFile(path.join(storePaths.dir, "integrity.json"), "utf8");
   const ledger = JSON.parse(ledgerBytes);
@@ -340,29 +340,29 @@ test("missing and null stored timestamps are schema-invalid and never become led
 
 test("a missing committed empty facts file is unknown, while a present empty file is intact", async () => {
   const paths = await tempPaths();
-  const { factsFile } = resolveFactStorePaths(paths);
+  const { factsFile } = resolveFactStorePaths(paths, "service");
 
-  await enforceFactRetention(paths, { now: NOW });
-  await enforceFactRetention(paths, { now: NOW });
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "intact");
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  assert.equal((await readFactPoints(paths, { family: "service", now: NOW })).completeness.status, "intact");
 
   await fs.unlink(factsFile);
-  assert.equal((await readFactPoints(paths, { now: NOW })).completeness.status, "unknown");
+  assert.equal((await readFactPoints(paths, { family: "service", now: NOW })).completeness.status, "unknown");
 });
 
 test("a truncated history suppresses a novelty-style absence claim", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, [
     JSON.stringify({ ts: NOW, fact_name: "peer.seen", entity_key: "known-peer", attributes: {} }),
     JSON.stringify({ ts: "2026-08-21T00:00:01.000Z", fact_name: "peer.seen", entity_key: "other-peer", attributes: {} }),
     "",
   ].join("\n"));
-  await enforceFactRetention(paths, { now: NOW });
-  await enforceFactRetention(paths, { now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
+  await enforceFactRetention(paths, { family: "service", now: NOW });
   await fs.writeFile(storePaths.factsFile, JSON.stringify({ ts: NOW, fact_name: "peer.seen", entity_key: "known-peer", attributes: {} }) + "\n");
-  const read = await readFactPoints(paths, { now: NOW });
+  const read = await readFactPoints(paths, { family: "service", now: NOW });
   const noveltyGate = (candidate) => read.completeness.status === "intact" && !read.points.some((point) => point.entity_key === candidate);
   assert.equal(noveltyGate("missing-peer"), false);
 });
@@ -389,11 +389,11 @@ test("BLOCKER 2: a future-fact loss whose marker aged out of the read window sti
   // claimed future ts).
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: lossNow },
-  ], { now: lossNow });
-  await enforceFactRetention(paths, { now: lossNow });
+  ], { family: "service", now: lossNow });
+  await enforceFactRetention(paths, { family: "service", now: lossNow });
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "future", attributes: {}, ts: future },
-  ], { now: lossNow });
+  ], { family: "service", now: lossNow });
 
   // Read a month later with a 31-day window: the loss marker (lossNow) is now older than the
   // read window's lower bound, so buildCompleteness's window-relative lossAtOrAfter(asOfMs) no
@@ -401,7 +401,7 @@ test("BLOCKER 2: a future-fact loss whose marker aged out of the read window sti
   // exact repro shape: status:intact, yet a genuine future-fact loss actually occurred.
   const readNow = "2026-02-02T00:00:00.000Z";
   const windowMs = 31 * 24 * 60 * 60 * 1000;
-  const read = await readFactPoints(paths, { now: readNow, windowMs });
+  const read = await readFactPoints(paths, { family: "service", now: readNow, windowMs });
   assert.equal(read.completeness.status, "intact", "the loss marker must have genuinely aged out of the read window for this to be the real repro");
   assert.equal(read.completeness.last_future_fact_ts, lossNow, "the raw marker itself is still carried on every read regardless of window aging");
 

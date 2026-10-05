@@ -6,7 +6,8 @@ import test from "node:test";
 import { evaluateConstraints } from "../src/constraint-eval.js";
 import { SEED_CONSTRAINTS, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import { isFixedLengthHexHash, isSafeEnumString } from "../src/diagnostics-sanitizer.js";
-import { appendFactPoints, enforceFactRetention, readFactPoints } from "../src/fact-store.js";
+import { enforceFactRetention, readFactPoints, appendFactPointsByFamily } from "../src/fact-store.js";
+import { FACT_FAMILY_IDS } from "../src/fact-families.js";
 import {
   MINED_FAMILIES,
   MINED_ID_PREFIX,
@@ -463,8 +464,8 @@ test("constraint-miner.js never imports the pi-harness/alert-intelligence LLM to
 test("descartes learned mine writes drafts to constraints.json, preserves existing SEED_CONSTRAINTS, and prints a summary", async () => {
   const paths = await tempPaths();
   await writeConstraints(paths, SEED_CONSTRAINTS);
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { family: "service", now: BASE_TS + 8 * DAY_MS });
 
   const lines = [];
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: (line) => lines.push(line) });
@@ -483,8 +484,8 @@ test("descartes learned mine writes drafts to constraints.json, preserves existi
 
 test("descartes learned mine --json prints a machine-readable summary", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { family: "service", now: BASE_TS + 8 * DAY_MS });
 
   const lines = [];
   await runLearned(paths, ["mine", "--json"], { now: BASE_TS + 8 * DAY_MS, output: (line) => lines.push(line) });
@@ -553,8 +554,8 @@ test("descartes learned mine keeps normal behavior for intact history and ignore
 
 test("descartes learned mine re-run does not duplicate drafts (idempotent CLI round-trip)", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { family: "service", now: BASE_TS + 8 * DAY_MS });
 
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: () => {} });
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: () => {} });
@@ -567,8 +568,8 @@ test("descartes learned mine re-run does not duplicate drafts (idempotent CLI ro
 test("descartes learned mine reads facts via readFactPoints and honors --window", async () => {
   const paths = await tempPaths();
   // A fact-history window explicitly narrower than the mined span should exclude the older samples.
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  const { points } = await readFactPoints(paths, { now: BASE_TS + 8 * DAY_MS, windowMs: DAY_MS }); // only ~last day
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now: BASE_TS + 8 * DAY_MS, windowMs: DAY_MS }); // only ~last day
   assert(points.length < 3);
 });
 

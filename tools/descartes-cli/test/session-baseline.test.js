@@ -6,7 +6,7 @@ import test from "node:test";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { alertId } from "../src/alert-store.js";
 import { isFixedLengthHexHash, isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
-import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
+import { appendFactPoints, readFactPoints, appendFactPointsByFamily } from "../src/fact-store.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
@@ -157,8 +157,8 @@ async function seedAndCompute(paths, points, options = {}) {
   const firstTs = points.reduce((min, p) => Math.min(min, new Date(p.ts).getTime()), Infinity);
   const establishedAnchor = Number.isFinite(firstTs) ? new Date(firstTs - 1).toISOString() : now;
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: establishedAnchor });
-  await appendFactPoints(paths, points, { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, points, { now });
+  await appendFactPointsByFamily(paths, [], { now });
   return computeSessionBaselineCandidates(paths, { now, ...options });
 }
 
@@ -438,7 +438,7 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 session/day o
       hour += 1;
     }
     const now = tickTs(hour - 1);
-    await appendFactPoints(paths, dayPoints, { now });
+    await appendFactPointsByFamily(paths, dayPoints, { now });
     const { candidates } = await computeSessionBaselineCandidates(paths, { now });
     const dropCandidates = candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
     assert.equal(dropCandidates.length, 0, `unexpected session.count_drop candidate on day ${day} (count=${count}): ${JSON.stringify(dropCandidates)}`);
@@ -456,8 +456,8 @@ test("regime-change fixture: a sustained, legitimate shift from N to M<N eventua
   const M = 5;
   const baselineTicks = [];
   for (let i = 0; i < 40; i += 1) baselineTicks.push(...completeTick(tickTs(i), N));
-  await appendFactPoints(paths, baselineTicks, { now: tickTs(39) });
-  await appendFactPoints(paths, [], { now: tickTs(39) }); // confirm the integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, baselineTicks, { now: tickTs(39) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(39) }); // confirm the integrity ledger to 'intact'
 
   let hour = 40;
   let firedImmediatelyAfterShift = false;
@@ -465,7 +465,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M<N eventua
   const MAX_ADDITIONAL_TICKS = 20; // hand-verified: this bimodal-variance mix recovers within ~6 ticks
   for (let i = 0; i < MAX_ADDITIONAL_TICKS; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, completeTick(ts, M), { now: ts });
+    await appendFactPointsByFamily(paths, completeTick(ts, M), { now: ts });
     const { candidates } = await computeSessionBaselineCandidates(paths, { now: ts });
     const fired = candidates.some((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID);
     if (i === 0) firedImmediatelyAfterShift = fired;
@@ -479,7 +479,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M<N eventua
   // Confirm the recovery is SUSTAINED, not a single flukey non-fire tick.
   for (let i = 0; i < 3; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, completeTick(ts, M), { now: ts });
+    await appendFactPointsByFamily(paths, completeTick(ts, M), { now: ts });
     const { candidates } = await computeSessionBaselineCandidates(paths, { now: ts });
     assert.equal(candidates.some((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID), false, `expected sustained recovery, but session.count_drop re-fired at hour ${hour}`);
     hour += 1;
@@ -501,8 +501,8 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   // Slice 4: pre-establish the cold-start lockout (see seedAndCompute's comment above) -- this
   // fixture drives appendFactPoints/computeSessionBaselineCandidates directly.
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, points, { now });
-  await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, points, { now });
+  await appendFactPointsByFamily(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
   const { candidates: first } = await computeSessionBaselineCandidates(paths, { now });
   const { candidates: second } = await computeSessionBaselineCandidates(paths, { now }); // no new fact-history written in between
@@ -524,7 +524,7 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   for (let i = 0; i < 5; i += 1) ticks.push(completeTick(tickTs(i), 10));
   const now = tickTs(4);
   await writeWatchConfig(paths, { enabled: true });
-  await appendFactPoints(paths, flatten(ticks), { now });
+  await appendFactPointsByFamily(paths, flatten(ticks), { now });
   // Slice 4: confirm the integrity ledger to 'intact' before the repeated-call phase below -- a
   // fresh ledger's first retention pass reads 'unknown' (bootstrap), which would otherwise keep
   // factHistoryTrustworthy returning false and the cold-start lockout re-arming (and rewriting the
@@ -532,7 +532,7 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   // very idempotency this test checks. (The store itself is left un-pre-seeded/day-1 on purpose:
   // this test only asserts on write-count and state equality, not on candidates, so day-1
   // suppression on the first call doesn't affect it.)
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   let writeCount = 0;
   const countingWrite = async (descartesPaths, state) => {
@@ -1052,8 +1052,8 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
 
   const ticks = [];
   for (let i = 0; i < 5; i += 1) ticks.push(sessionPoint(tickTs(i), "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(tickTs(i), "complete"));
-  await appendFactPoints(paths, ticks, { now: tickTs(4) });
-  await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, ticks, { now: tickTs(4) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
 
   // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
   // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
@@ -1074,7 +1074,7 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
   let hour = 5;
   for (let i = 0; i < minHistoryTickCount; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(ts, "complete")], { now: ts });
+    await appendFactPointsByFamily(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp1"), censusMarkerPoint(ts, "complete")], { now: ts });
     await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
     hour += 1;
   }
@@ -1086,7 +1086,7 @@ test("migration: a pre-Slice-4 store with no cold_start_* fields at all cold-sta
 
   // And session.* novelty genuinely resumes afterward.
   const ts = tickTs(hour);
-  await appendFactPoints(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp-changed"), censusMarkerPoint(ts, "complete")], { now: ts });
+  await appendFactPointsByFamily(paths, [sessionPoint(ts, "session.tmux.aaaaaaaaaaaaaaaa", "fp-changed"), censusMarkerPoint(ts, "complete")], { now: ts });
   const { candidates: resumed } = await computeSessionBaselineCandidates(paths, { now: ts, minHistoryTickCount });
   assert.equal(resumed.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 1);
 });
@@ -1235,7 +1235,7 @@ test("computeSessionBaselineCandidates calls the real (default) loadWatchConfig 
   const paths = await tempPaths();
   let readCalled = false;
   const result = await computeSessionBaselineCandidates(paths, {
-    readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args, { family: "session" }); },
   });
   assert.deepEqual(result.candidates, []);
   assert.deepEqual(result.evaluatedAlertKeys, [], "a day-1 cold-start (fresh state dir) reaches I/O but reports zero coverage -- nothing evaluated yet");
@@ -1332,7 +1332,7 @@ test("recovery coverage (ii) — UNEVALUATED identities are NOT reported (so a p
 
 function narrowedSessionReader(floorTs) {
   return async (paths, options) => {
-    const read = await readFactPoints(paths, options);
+    const read = await readFactPoints(paths, { family: "session", ...(options) });
     return { ...read, completeness: { ...read.completeness, coverage: "narrowed", bytecap_floor_ts: floorTs, age_floor_ts: null } };
   };
 }

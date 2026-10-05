@@ -105,17 +105,17 @@ for (const [family, buildTick] of [["service", serviceTick], ["session", session
     const newer = buildTick(hour(1));
     // Keep everything from the newer tick + all but the FIRST record of the older tick.
     const cap = [...newer, ...older.slice(1)].reduce((sum, point) => sum + lineBytes(point), 0) + 1;
-    await appendFactPoints(paths, older, { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
-    await appendFactPoints(paths, newer, { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
-    const retention = await enforceFactRetention(paths, { now: hour(1), maxBytes: cap });
+    await appendFactPoints(paths, older, { family, now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+    await appendFactPoints(paths, newer, { family, now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+    const retention = await enforceFactRetention(paths, { family, now: hour(1), maxBytes: cap });
 
     // The whole older tick is evicted (tick alignment), not just its first record.
     assert.equal(retention.bytecap_evicted_count, older.length, "tick-aligned: the entire split tick is evicted");
     assert.equal(retention.kept_count, newer.length);
-    const raw = (await fs.readFile(resolveFactStorePaths(paths).factsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const raw = (await fs.readFile(resolveFactStorePaths(paths, family).factsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(raw.some((record) => record.ts === hour(0)), false, "no record of the split tick is physically kept");
 
-    const read = await readFactPoints(paths, { now: hour(1) });
+    const read = await readFactPoints(paths, { family, now: hour(1) });
     const groups = groupByTs(read.points);
     assert.deepEqual([...groups.keys()], [hour(1)]);
     assert.deepEqual(groups.get(hour(1)), groupByTs(newer.map((point) => ({ ...point }))).get(hour(1)));
@@ -128,11 +128,12 @@ for (const [family, buildTick] of [["service", serviceTick], ["session", session
 
 test("T5: a non-suffix eviction (forced through the candidate-order seam) throws before anything is written", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, [...serviceTick(hour(0)), ...serviceTick(hour(1)), ...serviceTick(hour(2))], { now: hour(2), maxBytes: Number.MAX_SAFE_INTEGER });
-  const before = await fs.readFile(resolveFactStorePaths(paths).factsFile);
+  await appendFactPoints(paths, [...serviceTick(hour(0)), ...serviceTick(hour(1)), ...serviceTick(hour(2))], { family: "service", now: hour(2), maxBytes: Number.MAX_SAFE_INTEGER });
+  const before = await fs.readFile(resolveFactStorePaths(paths, "service").factsFile);
   const oneTick = serviceTick(hour(2)).reduce((sum, point) => sum + lineBytes(point), 0);
   await assert.rejects(
     () => enforceFactRetention(paths, {
+      family: "service",
       now: hour(2),
       maxBytes: oneTick,
       // Stub the sort: newest-first, so the newest-first keep loop would keep the OLDEST tick.
@@ -140,34 +141,35 @@ test("T5: a non-suffix eviction (forced through the candidate-order seam) throws
     }),
     /suffix/,
   );
-  const after = await fs.readFile(resolveFactStorePaths(paths).factsFile);
+  const after = await fs.readFile(resolveFactStorePaths(paths, "service").factsFile);
   assert.deepEqual(after, before, "a refused pass must not rewrite the store");
 });
 
 test("LOW-5 (review fold): orderRetentionCandidates is an enforceFactRetention-only test seam -- appendFactPoints never reaches it even if a caller sets it in options", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, [...serviceTick(hour(0)), ...serviceTick(hour(1))], { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, [...serviceTick(hour(0)), ...serviceTick(hour(1))], { family: "service", now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
   const oneTick = serviceTick(hour(1)).reduce((sum, point) => sum + lineBytes(point), 0);
   // Were this option honored through appendFactPoints, the newest-first keep loop would try to
   // keep the OLDEST tick (see the sibling enforceFactRetention test above) and the suffix
   // assertion would throw. It must instead be silently ignored.
   const result = await appendFactPoints(paths, [], {
+    family: "service",
     now: hour(1),
     maxBytes: oneTick,
     orderRetentionCandidates: (candidates) => [...candidates].reverse(),
   });
   assert.equal(result.retention_error, undefined, "appendFactPoints must not honor orderRetentionCandidates from its own options");
-  const read = await readFactPoints(paths, { now: hour(1) });
+  const read = await readFactPoints(paths, { family: "service", now: hour(1) });
   assert.deepEqual([...groupByTs(read.points).keys()], [hour(1)], "the NEWEST tick is kept -- the correct suffix eviction, proving the option was ignored");
 });
 
 test("T5: the accounting sum holds with tick-aligned eviction counted as byte-cap", async () => {
   const paths = await tempPaths();
   const ticks = [0, 1, 2, 3].map((index) => serviceTick(hour(index)));
-  await appendFactPoints(paths, ticks.flat(), { now: hour(3), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, ticks.flat(), { family: "service", now: hour(3), maxBytes: Number.MAX_SAFE_INTEGER });
   // Room for 2.5 ticks: tick alignment must drop the half tick too.
   const tickBytes = ticks[0].reduce((sum, point) => sum + lineBytes(point), 0);
-  const retention = await enforceFactRetention(paths, { now: hour(3), maxBytes: Math.floor(tickBytes * 2.5) });
+  const retention = await enforceFactRetention(paths, { family: "service", now: hour(3), maxBytes: Math.floor(tickBytes * 2.5) });
   assert.equal(retention.kept_count, ticks[0].length * 2);
   assert.equal(retention.bytecap_evicted_count, ticks[0].length * 2);
   assert.equal(retention.kept_count + retention.age_evicted_count + retention.bytecap_evicted_count + retention.future_fact_dropped_count, ticks.flat().length);
@@ -180,11 +182,11 @@ test("T5: the accounting sum holds with tick-aligned eviction counted as byte-ca
 const tickBytes = (tick) => tick.reduce((sum, point) => sum + lineBytes(point), 0);
 
 async function readRawLedger(paths) {
-  return JSON.parse(await fs.readFile(resolveFactIntegrityPaths(paths).integrityFile, "utf8"));
+  return JSON.parse(await fs.readFile(resolveFactIntegrityPaths(paths, "service").integrityFile, "utf8"));
 }
 
 async function writeRawLedger(paths, ledger) {
-  await fs.writeFile(resolveFactIntegrityPaths(paths).integrityFile, `${JSON.stringify(ledger, null, 2)}\n`);
+  await fs.writeFile(resolveFactIntegrityPaths(paths, "service").integrityFile, `${JSON.stringify(ledger, null, 2)}\n`);
 }
 
 // Appends `count` hourly service ticks (hour(0)..hour(count-1)), each through appendFactPoints
@@ -192,7 +194,7 @@ async function writeRawLedger(paths, ledger) {
 async function appendHourlyTicks(paths, { from = 0, count, maxBytes }) {
   const results = [];
   for (let index = from; index < from + count; index += 1) {
-    results.push(await appendFactPoints(paths, serviceTick(hour(index)), { now: hour(index), maxBytes }));
+    results.push(await appendFactPoints(paths, serviceTick(hour(index)), { family: "service", now: hour(index), maxBytes }));
   }
   return results;
 }
@@ -219,25 +221,25 @@ test("T5: the floor is the newest evicted ts, is exclusive (every kept record is
   assert.equal((await readRawLedger(paths)).bytecap_floor_ts, null, "nothing evicted yet");
   let previousFloorMs = Number.NEGATIVE_INFINITY;
   for (let index = 3; index < 9; index += 1) {
-    await appendFactPoints(paths, serviceTick(hour(index)), { now: hour(index), maxBytes: cap });
+    await appendFactPoints(paths, serviceTick(hour(index)), { family: "service", now: hour(index), maxBytes: cap });
     const ledger = await readRawLedger(paths);
     assert.equal(ledger.bytecap_floor_ts, hour(index - 3), `after tick ${index} the floor is the newest evicted tick`);
     assert.ok(Date.parse(ledger.bytecap_floor_ts) >= previousFloorMs, "the floor never decreases");
     previousFloorMs = Date.parse(ledger.bytecap_floor_ts);
-    const raw = (await fs.readFile(resolveFactStorePaths(paths).factsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const raw = (await fs.readFile(resolveFactStorePaths(paths, "service").factsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.ok(raw.every((record) => Date.parse(record.ts) > previousFloorMs), "every kept record is strictly above the floor");
     assert.equal(isValidFactIntegrityLedger(ledger), true);
   }
   // A pass that evicts nothing (budget raised) keeps the floor.
-  await enforceFactRetention(paths, { now: hour(9), maxBytes: Number.MAX_SAFE_INTEGER });
+  await enforceFactRetention(paths, { family: "service", now: hour(9), maxBytes: Number.MAX_SAFE_INTEGER });
   assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(5));
 });
 
 test("T5: maxBytes 0 and a single tick over the cap both leave an empty store with a set floor and a valid ledger", async () => {
   for (const maxBytes of [0, 50]) {
     const paths = await tempPaths();
-    await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
-    const retention = await enforceFactRetention(paths, { now: hour(0), maxBytes });
+    await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
+    const retention = await enforceFactRetention(paths, { family: "service", now: hour(0), maxBytes });
     assert.equal(retention.kept_count, 0, `maxBytes ${maxBytes}`);
     const ledger = await readRawLedger(paths);
     assert.equal(ledger.bytecap_floor_ts, hour(0), `maxBytes ${maxBytes}: floor = the evicted tick`);
@@ -256,8 +258,8 @@ test("T5: floor plausibility -- a non-empty store's floor at or above last_rewri
   assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_floor_ts: hour(3) }), false, "floor equal to the newest kept record");
   assert.equal(isValidFactIntegrityLedger({ ...ledger, bytecap_floor_ts: "2027-01-01T00:00:00.000Z" }), false, "far-future forged floor");
   await writeRawLedger(paths, { ...ledger, bytecap_floor_ts: "2027-01-01T00:00:00.000Z" });
-  assert.equal((await readFactIntegrityLedger(paths)).reason, "invalid");
-  assert.notEqual((await readFactPoints(paths, { now: hour(3) })).completeness.status, "intact");
+  assert.equal((await readFactIntegrityLedger(paths, "service")).reason, "invalid");
+  assert.notEqual((await readFactPoints(paths, { family: "service", now: hour(3) })).completeness.status, "intact");
 });
 
 test("T5: crash between the ledger write and the rename, then retry, leaves the floor exactly where one clean pass would (idempotent)", async () => {
@@ -266,9 +268,9 @@ test("T5: crash between the ledger write and the rename, then retry, leaves the 
     const crashed = await tempPaths();
     const cap = tickBytes(serviceTick(hour(0))) * 2;
     for (const paths of [reference, crashed]) await appendHourlyTicks(paths, { count: 3, maxBytes: Number.MAX_SAFE_INTEGER });
-    await enforceFactRetention(reference, { now: hour(3), maxBytes: cap });
-    await assert.rejects(() => enforceFactRetention(crashed, { now: hour(3), maxBytes: cap, [window]: async () => { throw new Error("simulated crash"); } }), /simulated crash/);
-    await enforceFactRetention(crashed, { now: hour(3), maxBytes: cap });
+    await enforceFactRetention(reference, { family: "service", now: hour(3), maxBytes: cap });
+    await assert.rejects(() => enforceFactRetention(crashed, { family: "service", now: hour(3), maxBytes: cap, [window]: async () => { throw new Error("simulated crash"); } }), /simulated crash/);
+    await enforceFactRetention(crashed, { family: "service", now: hour(3), maxBytes: cap });
     const [ref, got] = [await readRawLedger(reference), await readRawLedger(crashed)];
     assert.equal(got.bytecap_floor_ts, hour(0), window);
     assert.equal(got.bytecap_floor_ts, ref.bytecap_floor_ts, window);
@@ -283,23 +285,23 @@ test("I2/MEDIUM-3: a floor more than FUTURE_FACT_TOLERANCE_MS ahead of the pass 
   const fast = (index) => new Date(BASE_MS + fastMs + index * HOUR_MS).toISOString();
   const cap = tickBytes(serviceTick(hour(0))) * 2;
   for (let index = 0; index < 4; index += 1) {
-    await appendFactPoints(paths, serviceTick(fast(index)), { now: fast(index), maxBytes: cap });
+    await appendFactPoints(paths, serviceTick(fast(index)), { family: "service", now: fast(index), maxBytes: cap });
   }
   assert.equal((await readRawLedger(paths)).bytecap_floor_ts, fast(1));
   // Clock corrected: the real time is hour(4), five days before the floor.
-  await appendFactPoints(paths, serviceTick(hour(4)), { now: hour(4), maxBytes: cap });
+  await appendFactPoints(paths, serviceTick(hour(4)), { family: "service", now: hour(4), maxBytes: cap });
   const ledger = await readRawLedger(paths);
   assert.ok(Date.parse(ledger.bytecap_floor_ts) <= Date.parse(hour(4)) + FUTURE_FACT_TOLERANCE_MS, `floor ${ledger.bytecap_floor_ts} was not clamped`);
   assert.equal(ledger.last_continuity_break_ts, hour(4), "the backwards move of the floor must stamp a loss in the same pass");
   assert.equal(isValidFactIntegrityLedger(ledger), true);
   // The family reads degraded (never intact) while that loss is in the window...
-  await enforceFactRetention(paths, { now: hour(5), maxBytes: cap });
-  assert.equal((await readFactPoints(paths, { now: hour(5), windowMs: 31 * 24 * HOUR_MS })).completeness.status, "degraded");
+  await enforceFactRetention(paths, { family: "service", now: hour(5), maxBytes: cap });
+  assert.equal((await readFactPoints(paths, { family: "service", now: hour(5), windowMs: 31 * 24 * HOUR_MS })).completeness.status, "degraded");
   // ...and the blind is bounded: once the loss ages out of the 31-day window it reads intact again.
   const later = new Date(BASE_MS + 32 * 24 * HOUR_MS).toISOString();
-  await appendFactPoints(paths, serviceTick(later), { now: later, maxBytes: cap });
-  await enforceFactRetention(paths, { now: later, maxBytes: cap });
-  assert.equal((await readFactPoints(paths, { now: later, windowMs: 31 * 24 * HOUR_MS })).completeness.status, "intact");
+  await appendFactPoints(paths, serviceTick(later), { family: "service", now: later, maxBytes: cap });
+  await enforceFactRetention(paths, { family: "service", now: later, maxBytes: cap });
+  assert.equal((await readFactPoints(paths, { family: "service", now: later, windowMs: 31 * 24 * HOUR_MS })).completeness.status, "intact");
 });
 
 test("below-floor records (appended after a clock rollback) are evicted at the next pass instead of wedging the ledger's plausibility check", async () => {
@@ -308,10 +310,10 @@ test("below-floor records (appended after a clock rollback) are evicted at the n
   await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
   assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(1));
   // Evict everything, then roll the clock back below the floor (within the future tolerance).
-  await enforceFactRetention(paths, { now: hour(3), maxBytes: 0 });
+  await enforceFactRetention(paths, { family: "service", now: hour(3), maxBytes: 0 });
   assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(3));
   const rolledBack = new Date(BASE_MS + 2.5 * HOUR_MS).toISOString();
-  const result = await appendFactPoints(paths, serviceTick(rolledBack), { now: rolledBack, maxBytes: cap });
+  const result = await appendFactPoints(paths, serviceTick(rolledBack), { family: "service", now: rolledBack, maxBytes: cap });
   assert.equal(result.retention_error, undefined, "retention must not fail on a store whose records all sit below the floor");
   assert.equal(result.retention.kept_count, 0, "records at or below the floor are evicted");
   assert.equal(result.retention.bytecap_evicted_count, serviceTick(rolledBack).length);
@@ -326,16 +328,16 @@ test("T6: a valid v1 ledger with no evictions upgrades to v2 (floor null) and re
   const v2 = await readRawLedger(paths);
   const { bytecap_floor_ts: _floor, ...v1 } = { ...v2, schema_version: 1 };
   await writeRawLedger(paths, v1);
-  const read = await readFactIntegrityLedger(paths);
+  const read = await readFactIntegrityLedger(paths, "service");
   assert.equal(read.reason, null);
   assert.equal(read.ledger.schema_version, 2);
   assert.equal(read.ledger.bytecap_floor_ts, null);
-  assert.equal((await readFactPoints(paths, { now: hour(2) })).completeness.status, "intact");
-  await appendFactPoints(paths, serviceTick(hour(3)), { now: hour(3), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readFactPoints(paths, { family: "service", now: hour(2) })).completeness.status, "intact");
+  await appendFactPoints(paths, serviceTick(hour(3)), { family: "service", now: hour(3), maxBytes: Number.MAX_SAFE_INTEGER });
   const after = await readRawLedger(paths);
   assert.equal(after.schema_version, 2);
   assert.equal(after.last_continuity_break_ts, null);
-  assert.equal((await readFactPoints(paths, { now: hour(3) })).completeness.status, "intact");
+  assert.equal((await readFactPoints(paths, { family: "service", now: hour(3) })).completeness.status, "intact");
 });
 
 test("T6 (Q3 = fresh per-family stores, so no M4 floor derivation): a v1 ledger that has byte-evicted is never certified -- it takes the continuity-break bootstrap, never a clean floor:null", async () => {
@@ -346,13 +348,13 @@ test("T6 (Q3 = fresh per-family stores, so no M4 floor derivation): a v1 ledger 
   assert.ok(v2.bytecap_evicted_total > 0);
   const { bytecap_floor_ts: _floor, ...v1 } = { ...v2, schema_version: 1 };
   await writeRawLedger(paths, v1);
-  assert.equal((await readFactIntegrityLedger(paths)).reason, "invalid");
-  assert.notEqual((await readFactPoints(paths, { now: hour(3) })).completeness.status, "intact");
-  await appendFactPoints(paths, serviceTick(hour(4)), { now: hour(4), maxBytes: cap });
-  await appendFactPoints(paths, serviceTick(hour(5)), { now: hour(5), maxBytes: cap });
+  assert.equal((await readFactIntegrityLedger(paths, "service")).reason, "invalid");
+  assert.notEqual((await readFactPoints(paths, { family: "service", now: hour(3) })).completeness.status, "intact");
+  await appendFactPoints(paths, serviceTick(hour(4)), { family: "service", now: hour(4), maxBytes: cap });
+  await appendFactPoints(paths, serviceTick(hour(5)), { family: "service", now: hour(5), maxBytes: cap });
   const ledger = await readRawLedger(paths);
   assert.equal(ledger.last_continuity_break_ts, hour(4), "lineage break stamped");
-  assert.equal((await readFactPoints(paths, { now: hour(5) })).completeness.status, "degraded");
+  assert.equal((await readFactPoints(paths, { family: "service", now: hour(5) })).completeness.status, "degraded");
 });
 
 test("T6: an already-v2 ledger round-trips unchanged through read and a no-op-eviction pass", async () => {
@@ -360,7 +362,7 @@ test("T6: an already-v2 ledger round-trips unchanged through read and a no-op-ev
   const cap = tickBytes(serviceTick(hour(0))) * 2;
   await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
   const before = await readRawLedger(paths);
-  const read = await readFactIntegrityLedger(paths);
+  const read = await readFactIntegrityLedger(paths, "service");
   assert.deepEqual(read.ledger, before);
 });
 
@@ -368,23 +370,23 @@ test("T6/HIGH-1: a missing integrity.json over a surviving non-empty facts.jsonl
   const paths = await tempPaths();
   const cap = tickBytes(serviceTick(hour(0))) * 2;
   await appendHourlyTicks(paths, { count: 4, maxBytes: cap });
-  await fs.unlink(resolveFactIntegrityPaths(paths).integrityFile);
-  await appendFactPoints(paths, serviceTick(hour(4)), { now: hour(4), maxBytes: cap });
+  await fs.unlink(resolveFactIntegrityPaths(paths, "service").integrityFile);
+  await appendFactPoints(paths, serviceTick(hour(4)), { family: "service", now: hour(4), maxBytes: cap });
   const ledger = await readRawLedger(paths);
   assert.equal(ledger.last_continuity_break_ts, hour(4));
   for (let index = 5; index < 8; index += 1) {
-    await appendFactPoints(paths, serviceTick(hour(index)), { now: hour(index), maxBytes: cap });
-    assert.notEqual((await readFactPoints(paths, { now: hour(index) })).completeness.status, "intact", `tick ${index}`);
+    await appendFactPoints(paths, serviceTick(hour(index)), { family: "service", now: hour(index), maxBytes: cap });
+    assert.notEqual((await readFactPoints(paths, { family: "service", now: hour(index) })).completeness.status, "intact", `tick ${index}`);
   }
 });
 
 test("T6/HIGH-1: a missing ledger over an absent store (first run) bootstraps clean: unknown, then intact", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
   assert.equal((await readRawLedger(paths)).last_continuity_break_ts, null);
-  assert.equal((await readFactPoints(paths, { now: hour(0) })).completeness.status, "unknown");
-  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
-  assert.equal((await readFactPoints(paths, { now: hour(1) })).completeness.status, "intact");
+  assert.equal((await readFactPoints(paths, { family: "service", now: hour(0) })).completeness.status, "unknown");
+  await appendFactPoints(paths, serviceTick(hour(1)), { family: "service", now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  assert.equal((await readFactPoints(paths, { family: "service", now: hour(1) })).completeness.status, "intact");
 });
 
 test("T6/HIGH-1 (LOW-1 review fold, supersedes the old size-based carve-out): a missing ledger over an EXISTING empty store is a lineage break, never a clean bootstrap -- only genuine absence (ENOENT) still bootstraps clean", async () => {
@@ -397,26 +399,26 @@ test("T6/HIGH-1 (LOW-1 review fold, supersedes the old size-based carve-out): a 
   // exists. Treating "exists but empty" as clean (the old appendedToEmptyStore carve-out) let that
   // second shape reset the floor with no stamp; see the LOW-1 test below for the full sequence.
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, "");
-  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: Number.MAX_SAFE_INTEGER });
   assert.notEqual((await readRawLedger(paths)).last_continuity_break_ts, null, "an existing (even 0-byte) facts.jsonl with no ledger is a lineage break, with no size exception");
-  assert.notEqual((await readFactPoints(paths, { now: hour(0) })).completeness.status, "intact");
+  assert.notEqual((await readFactPoints(paths, { family: "service", now: hour(0) })).completeness.status, "intact");
 });
 
 test("LOW-1 (review fold): an evicted-then-emptied store whose ledger is deleted stamps a loss on the very next append -- the floor never resets silently", async () => {
   const paths = await tempPaths();
   // Evict everything (maxBytes: 0): the store is now empty, but the ledger still remembers a
   // non-null floor -- real, certified-nothing history, not a fresh install.
-  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: 0 });
   const beforeDelete = await readRawLedger(paths);
   assert.notEqual(beforeDelete.bytecap_floor_ts, null, "setup: the store evicted and recorded a floor");
   assert.equal(beforeDelete.continuity.last_rewrite_record_count, 0, "setup: the store is now empty");
   // Delete the ledger -- the only place the floor F ever lived.
-  await fs.unlink(resolveFactIntegrityPaths(paths).integrityFile);
+  await fs.unlink(resolveFactIntegrityPaths(paths, "service").integrityFile);
   // An older append (its ts predates the lost floor) lands on the now ledger-less, empty store.
-  await appendFactPoints(paths, serviceTick(hour(-1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, serviceTick(hour(-1)), { family: "service", now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
   const after = await readRawLedger(paths);
   // The old floor F itself is unrecoverable once its only record (the ledger) is deleted -- that is
   // an accepted, same-UID-privileged residual (Fix 1's doc comment makes the same acceptance
@@ -426,28 +428,28 @@ test("LOW-1 (review fold): an evicted-then-emptied store whose ledger is deleted
   // ever lost.
   assert.notEqual(after.last_continuity_break_ts, null, "a missing ledger over an existing (even emptied-by-eviction) store must stamp a loss");
   // No windowMs: an unbounded read, so this catches the stamp regardless of the 31-day default.
-  assert.notEqual((await readFactPoints(paths, { now: hour(1) })).completeness.status, "intact");
+  assert.notEqual((await readFactPoints(paths, { family: "service", now: hour(1) })).completeness.status, "intact");
   // The stamp must not be a one-tick blip: a further NORMAL append must not silently wash it away
   // before it ages out of the retention window (this is exactly where the old carve-out failed --
   // two passes later it read fully intact with coverage "full").
-  await appendFactPoints(paths, serviceTick(hour(2)), { now: hour(2), maxBytes: Number.MAX_SAFE_INTEGER });
-  const read = await readFactPoints(paths, { now: hour(2) });
+  await appendFactPoints(paths, serviceTick(hour(2)), { family: "service", now: hour(2), maxBytes: Number.MAX_SAFE_INTEGER });
+  const read = await readFactPoints(paths, { family: "service", now: hour(2) });
   assert.notEqual(read.completeness.status, "intact", "the stamped loss must still degrade a read one normal tick later");
 });
 
 test("T6/HIGH-1: a crash between the very first append and the first retention pass reads as a lineage break, never a clean bootstrap", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   // The first append reached disk but its retention pass never ran (no ledger).
   await fs.writeFile(factsFile, serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n") + "\n");
-  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, serviceTick(hour(1)), { family: "service", now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
   assert.equal((await readRawLedger(paths)).last_continuity_break_ts, hour(1));
   // Direct retention over a ledger-less non-empty store is the same case.
   const direct = await tempPaths();
-  await fs.mkdir(resolveFactStorePaths(direct).dir, { recursive: true });
-  await fs.writeFile(resolveFactStorePaths(direct).factsFile, serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n") + "\n");
-  await enforceFactRetention(direct, { now: hour(0) });
+  await fs.mkdir(resolveFactStorePaths(direct, "service").dir, { recursive: true });
+  await fs.writeFile(resolveFactStorePaths(direct, "service").factsFile, serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n") + "\n");
+  await enforceFactRetention(direct, { family: "service", now: hour(0) });
   assert.equal((await readRawLedger(direct)).last_continuity_break_ts, hour(0));
 });
 
@@ -465,8 +467,8 @@ test("I1: readFactPoints never returns a point at or below bytecap_floor_ts, eve
   assert.equal((await readRawLedger(paths)).bytecap_floor_ts, hour(1));
   // A record below the floor appended WITHOUT a retention pass (rollback, before the next pass
   // evicts it physically): the read must still hide it.
-  await fs.appendFile(resolveFactStorePaths(paths).factsFile, `${JSON.stringify(serviceTick(hour(1))[0])}\n${JSON.stringify(serviceTick(hour(0.5))[0])}\n`);
-  const read = await readFactPoints(paths, { now: hour(3), windowMs: MONTH_WINDOW_MS });
+  await fs.appendFile(resolveFactStorePaths(paths, "service").factsFile, `${JSON.stringify(serviceTick(hour(1))[0])}\n${JSON.stringify(serviceTick(hour(0.5))[0])}\n`);
+  const read = await readFactPoints(paths, { family: "service", now: hour(3), windowMs: MONTH_WINDOW_MS });
   assert.ok(read.points.length > 0);
   assert.ok(read.points.every((point) => Date.parse(point.ts) > Date.parse(hour(1))), "no point at or below the floor");
   assert.deepEqual([...groupByTs(read.points).keys()], [hour(2), hour(3)]);
@@ -475,15 +477,15 @@ test("I1: readFactPoints never returns a point at or below bytecap_floor_ts, eve
 test("completeness reports the raw floor, certified_after_ts = max(floor, retention cutoff), oldest_certified_ts and coverage", async () => {
   const paths = await tempPaths();
   await appendHourlyTicks(paths, { count: 3, maxBytes: Number.MAX_SAFE_INTEGER });
-  const full = (await readFactPoints(paths, { now: hour(2), windowMs: MONTH_WINDOW_MS })).completeness;
+  const full = (await readFactPoints(paths, { family: "service", now: hour(2), windowMs: MONTH_WINDOW_MS })).completeness;
   assert.equal(full.bytecap_floor_ts, null);
   assert.equal(full.certified_after_ts, null);
   assert.equal(full.coverage, "full");
   assert.equal(full.oldest_certified_ts, hour(0));
 
   const cap = tickBytes(serviceTick(hour(0))) * 2;
-  await appendFactPoints(paths, serviceTick(hour(3)), { now: hour(3), maxBytes: cap });
-  const narrowed = (await readFactPoints(paths, { now: hour(3), windowMs: MONTH_WINDOW_MS })).completeness;
+  await appendFactPoints(paths, serviceTick(hour(3)), { family: "service", now: hour(3), maxBytes: cap });
+  const narrowed = (await readFactPoints(paths, { family: "service", now: hour(3), windowMs: MONTH_WINDOW_MS })).completeness;
   assert.equal(narrowed.bytecap_floor_ts, hour(1));
   assert.equal(narrowed.certified_after_ts, hour(1));
   assert.equal(narrowed.coverage, "narrowed");
@@ -493,7 +495,7 @@ test("completeness reports the raw floor, certified_after_ts = max(floor, retent
   // range between the floor and now - 30 d has been age-evicted; reporting the floor would
   // over-claim). The raw floor is unchanged.
   const later = new Date(Date.parse(hour(1)) + RETENTION_MS + 5 * HOUR_MS).toISOString();
-  const aged = (await readFactPoints(paths, { now: later, windowMs: MONTH_WINDOW_MS })).completeness;
+  const aged = (await readFactPoints(paths, { family: "service", now: later, windowMs: MONTH_WINDOW_MS })).completeness;
   assert.equal(aged.bytecap_floor_ts, hour(1));
   assert.equal(aged.certified_after_ts, new Date(Date.parse(later) - RETENTION_MS).toISOString());
 });
@@ -508,14 +510,14 @@ test("LOW-6 (review fold): certified_after_ts = max(floor, retention cutoff) use
   // With the (hardcoded) 30-day default, the cutoff is far earlier than the floor, so the floor
   // itself wins -- this is the existing, already-pinned "aged" case above, just at a much shorter
   // horizon so the distinction below is unambiguous.
-  const withDefault = (await readFactPoints(paths, { now, windowMs: MONTH_WINDOW_MS })).completeness;
+  const withDefault = (await readFactPoints(paths, { family: "service", now, windowMs: MONTH_WINDOW_MS })).completeness;
   assert.equal(withDefault.certified_after_ts, hour(1));
 
   // A caller whose actual retention pass uses a short custom retentionMs (2h) must see a read-side
   // certified_after_ts that reflects THAT cutoff, not the module default -- otherwise this surface
   // over-claims certified history the caller's own (shorter) retention window never kept.
   const customRetentionMs = 2 * HOUR_MS;
-  const withCustom = (await readFactPoints(paths, { now, retentionMs: customRetentionMs, windowMs: MONTH_WINDOW_MS })).completeness;
+  const withCustom = (await readFactPoints(paths, { family: "service", now, retentionMs: customRetentionMs, windowMs: MONTH_WINDOW_MS })).completeness;
   assert.equal(withCustom.bytecap_floor_ts, hour(1), "the raw floor itself is unaffected by retentionMs");
   assert.equal(
     withCustom.certified_after_ts,
@@ -527,9 +529,9 @@ test("LOW-6 (review fold): certified_after_ts = max(floor, retention cutoff) use
 
 test("a zero-cap / all-evicted store reports coverage narrowed, the evicted floor and an empty certified span", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
-  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: 0 });
-  const read = await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS });
+  await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(1)), { family: "service", now: hour(1), maxBytes: 0 });
+  const read = await readFactPoints(paths, { family: "service", now: hour(1), windowMs: MONTH_WINDOW_MS });
   assert.deepEqual(read.points, []);
   assert.equal(read.completeness.coverage, "narrowed");
   assert.equal(read.completeness.bytecap_floor_ts, hour(1));
@@ -538,32 +540,32 @@ test("a zero-cap / all-evicted store reports coverage narrowed, the evicted floo
 
 test("a floor more than FUTURE_FACT_TOLERANCE_MS ahead of the read fails closed (status unknown, degraded_reason future_floor) -- the empty-store forged-floor bound", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
-  await enforceFactRetention(paths, { now: hour(0), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: 0 });
+  await enforceFactRetention(paths, { family: "service", now: hour(0), maxBytes: 0 });
   const ledger = await readRawLedger(paths);
   assert.equal(ledger.continuity.last_rewrite_record_count, 0);
   const forged = { ...ledger, bytecap_floor_ts: "2030-01-01T00:00:00.000Z" };
   assert.equal(isValidFactIntegrityLedger(forged), true, "an empty store has no in-ledger plausibility referent");
   await writeRawLedger(paths, forged);
-  const read = await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS });
+  const read = await readFactPoints(paths, { family: "service", now: hour(1), windowMs: MONTH_WINDOW_MS });
   assert.equal(read.completeness.status, "unknown");
   assert.equal(read.completeness.degraded_reason, "future_floor");
   // ...and the next pass clamps it with a loss stamp (MEDIUM-3), never certifying anything.
-  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPoints(paths, serviceTick(hour(1)), { family: "service", now: hour(1), maxBytes: Number.MAX_SAFE_INTEGER });
   const after = await readRawLedger(paths);
   assert.equal(after.last_continuity_break_ts, hour(1));
   assert.ok(Date.parse(after.bytecap_floor_ts) <= Date.parse(hour(1)));
-  assert.notEqual((await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS })).completeness.status, "intact");
+  assert.notEqual((await readFactPoints(paths, { family: "service", now: hour(1), windowMs: MONTH_WINDOW_MS })).completeness.status, "intact");
 });
 
 test("LOW-2 (review fold): when there is no ledger at all (missing/unreadable/invalid), completeness reports coverage 'unknown', never the over-claimed 'full' -- a fresh/default ledger's floor is always null, so coverageFields alone cannot tell 'no ledger to support the claim' apart from 'never narrowed'", async () => {
   const paths = await tempPaths();
-  const { dir, factsFile } = resolveFactStorePaths(paths);
+  const { dir, factsFile } = resolveFactStorePaths(paths, "service");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(factsFile, `${serviceTick(hour(0)).map((point) => JSON.stringify(point)).join("\n")}\n`);
   await writeRawLedger(paths, { not: "a valid ledger" });
-  assert.equal((await readFactIntegrityLedger(paths)).ledger, null, "setup: the ledger does not parse as valid");
-  const read = await readFactPoints(paths, { now: hour(0), windowMs: MONTH_WINDOW_MS });
+  assert.equal((await readFactIntegrityLedger(paths, "service")).ledger, null, "setup: the ledger does not parse as valid");
+  const read = await readFactPoints(paths, { family: "service", now: hour(0), windowMs: MONTH_WINDOW_MS });
   assert.notEqual(read.completeness.status, "intact");
   assert.equal(read.completeness.coverage, "unknown", "no ledger means coverage is itself unknown, not an over-claimed 'full'");
   assert.equal(read.completeness.bytecap_floor_ts, null);
@@ -573,7 +575,7 @@ test("LOW-2 (review fold): when there is no ledger at all (missing/unreadable/in
 test("F2-Tier1 fold-in: continuity.oldest_ts is not a coverage boundary -- completeness reports certified fields instead, and no trust path reads oldest_ts", async () => {
   const paths = await tempPaths();
   await appendHourlyTicks(paths, { count: 2, maxBytes: Number.MAX_SAFE_INTEGER });
-  const read = await readFactPoints(paths, { now: hour(1), windowMs: MONTH_WINDOW_MS });
+  const read = await readFactPoints(paths, { family: "service", now: hour(1), windowMs: MONTH_WINDOW_MS });
   assert.equal("continuity_oldest_ts" in read.completeness, false);
   for (const field of ["bytecap_floor_ts", "certified_after_ts", "oldest_certified_ts", "coverage"]) {
     assert.ok(field in read.completeness, `${field} missing`);
@@ -595,7 +597,7 @@ test("reclassification: routine byte-cap eviction leaves the store intact (cover
   const paths = await tempPaths();
   const cap = tickBytes(serviceTick(hour(0))) * 2;
   await appendHourlyTicks(paths, { count: 6, maxBytes: cap });
-  const read = await readFactPoints(paths, { now: hour(5), windowMs: MONTH_WINDOW_MS });
+  const read = await readFactPoints(paths, { family: "service", now: hour(5), windowMs: MONTH_WINDOW_MS });
   assert.ok(read.completeness.bytecap_evicted_total > 0);
   assert.equal(read.completeness.last_bytecap_evict_ts, hour(5), "kept as an informational field");
   assert.equal(read.completeness.status, "intact", "narrowing alone keeps the three-valued status intact (no fourth status value)");
@@ -636,10 +638,10 @@ test("reclassification: routine byte-cap eviction leaves the store intact (cover
 // floor keeps default budgets far above one worst-case tick.
 test("reclassification: a zero-cap / all-evicted store reads unknown (fail-closed), coverage narrowed, empty certified span -- G1 question", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(hour(0)), { now: hour(0), maxBytes: 0 });
-  await appendFactPoints(paths, serviceTick(hour(1)), { now: hour(1), maxBytes: 0 });
-  await appendFactPoints(paths, serviceTick(hour(2)), { now: hour(2), maxBytes: 0 });
-  const read = await readFactPoints(paths, { now: hour(2), windowMs: MONTH_WINDOW_MS });
+  await appendFactPoints(paths, serviceTick(hour(0)), { family: "service", now: hour(0), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(1)), { family: "service", now: hour(1), maxBytes: 0 });
+  await appendFactPoints(paths, serviceTick(hour(2)), { family: "service", now: hour(2), maxBytes: 0 });
+  const read = await readFactPoints(paths, { family: "service", now: hour(2), windowMs: MONTH_WINDOW_MS });
   assert.equal(read.completeness.status, "unknown");
   assert.equal(read.completeness.degraded_reason, "continuity_unknown");
   assert.equal(read.completeness.coverage, "narrowed");
@@ -650,21 +652,21 @@ test("reclassification: a zero-cap / all-evicted store reads unknown (fail-close
 
 test("reclassification does not weaken the other loss channels (I4): corrupt, schema-invalid, continuity-break and future-fact losses still degrade and re-arm", async () => {
   const cases = [
-    ["corrupt", (paths) => fs.appendFile(resolveFactStorePaths(paths).factsFile, "not-json\n"), "last_corrupt_ts"],
-    ["schema-invalid", (paths) => fs.appendFile(resolveFactStorePaths(paths).factsFile, `${JSON.stringify({ ts: hour(4), fact_name: "service.presence", attributes: {} })}\n`), "last_schema_invalid_ts"],
-    ["future-fact", (paths) => appendFactPoints(paths, serviceTick(hour(20)), { now: hour(4), maxBytes: Number.MAX_SAFE_INTEGER }), "last_future_fact_ts"],
+    ["corrupt", (paths) => fs.appendFile(resolveFactStorePaths(paths, "service").factsFile, "not-json\n"), "last_corrupt_ts"],
+    ["schema-invalid", (paths) => fs.appendFile(resolveFactStorePaths(paths, "service").factsFile, `${JSON.stringify({ ts: hour(4), fact_name: "service.presence", attributes: {} })}\n`), "last_schema_invalid_ts"],
+    ["future-fact", (paths) => appendFactPoints(paths, serviceTick(hour(20)), { family: "service", now: hour(4), maxBytes: Number.MAX_SAFE_INTEGER }), "last_future_fact_ts"],
     ["truncation", async (paths) => {
-      const lines = (await fs.readFile(resolveFactStorePaths(paths).factsFile, "utf8")).split("\n").filter(Boolean);
-      await fs.writeFile(resolveFactStorePaths(paths).factsFile, `${lines.slice(0, 3).join("\n")}\n`);
+      const lines = (await fs.readFile(resolveFactStorePaths(paths, "service").factsFile, "utf8")).split("\n").filter(Boolean);
+      await fs.writeFile(resolveFactStorePaths(paths, "service").factsFile, `${lines.slice(0, 3).join("\n")}\n`);
     }, "last_continuity_break_ts"],
   ];
   for (const [name, inflict, field] of cases) {
     const paths = await tempPaths();
     await appendHourlyTicks(paths, { count: 4, maxBytes: Number.MAX_SAFE_INTEGER });
     await inflict(paths);
-    await enforceFactRetention(paths, { now: hour(4), maxBytes: Number.MAX_SAFE_INTEGER });
-    await enforceFactRetention(paths, { now: hour(5), maxBytes: Number.MAX_SAFE_INTEGER });
-    const read = await readFactPoints(paths, { now: hour(5), windowMs: MONTH_WINDOW_MS });
+    await enforceFactRetention(paths, { family: "service", now: hour(4), maxBytes: Number.MAX_SAFE_INTEGER });
+    await enforceFactRetention(paths, { family: "service", now: hour(5), maxBytes: Number.MAX_SAFE_INTEGER });
+    const read = await readFactPoints(paths, { family: "service", now: hour(5), windowMs: MONTH_WINDOW_MS });
     assert.equal(read.completeness.status, "degraded", name);
     assert.notEqual(read.completeness[field], null, `${name} stamps ${field}`);
     assert.equal(hasCompletenessLossAfterAnchor(read, hour(1), Date.parse(hour(5))), true, `${name} still re-arms an older anchor`);
@@ -723,7 +725,7 @@ test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }
   for (let seed = 1; seed <= 30; seed += 1) {
     const random = mulberry32(seed);
     const paths = await tempPaths();
-    const { dir: factsDir, factsFile } = resolveFactStorePaths(paths);
+    const { dir: factsDir, factsFile } = resolveFactStorePaths(paths, "service");
     await fs.mkdir(factsDir, { recursive: true });
     const model = new Map(); // ts -> { keys: sorted string[], alive: boolean }
     let nowMs = BASE_MS;
@@ -737,7 +739,7 @@ test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }
       const ts = new Date(tsMs + Math.floor(random() * 900) + 1).toISOString();
       const tick = oracleTick(ts, count, `${seed}-${salt}`);
       model.set(ts, { keys: tick.map((point) => `${point.fact_name}|${point.entity_key}`).sort(), alive: true });
-      await appendFactPoints(paths, tick, { now: new Date(nowMs).toISOString(), maxBytes: cap });
+      await appendFactPoints(paths, tick, { family: "service", now: new Date(nowMs).toISOString(), maxBytes: cap });
       markFutureDropped();
     };
     const markFutureDropped = () => {
@@ -767,13 +769,13 @@ test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }
         case "crash": {
           nowMs += HOUR_MS;
           const hook = random() < 0.5 ? "beforeFactsRename" : "afterFactsRename";
-          await enforceFactRetention(paths, { now: new Date(nowMs).toISOString(), maxBytes: budget, [hook]: async () => { throw new Error("crash"); } }).catch(() => {});
+          await enforceFactRetention(paths, { family: "service", now: new Date(nowMs).toISOString(), maxBytes: budget, [hook]: async () => { throw new Error("crash"); } }).catch(() => {});
           break;
         }
-        case "ledgerDelete": await fs.unlink(resolveFactIntegrityPaths(paths).integrityFile).catch(() => {}); break;
+        case "ledgerDelete": await fs.unlink(resolveFactIntegrityPaths(paths, "service").integrityFile).catch(() => {}); break;
         case "forgeFloor": {
-          const raw = await fs.readFile(resolveFactIntegrityPaths(paths).integrityFile, "utf8").catch(() => undefined);
-          if (raw) await fs.writeFile(resolveFactIntegrityPaths(paths).integrityFile, JSON.stringify({ ...JSON.parse(raw), bytecap_floor_ts: "2030-01-01T00:00:00.000Z", bytecap_evicted_total: 1, last_bytecap_evict_ts: new Date(nowMs).toISOString() }));
+          const raw = await fs.readFile(resolveFactIntegrityPaths(paths, "service").integrityFile, "utf8").catch(() => undefined);
+          if (raw) await fs.writeFile(resolveFactIntegrityPaths(paths, "service").integrityFile, JSON.stringify({ ...JSON.parse(raw), bytecap_floor_ts: "2030-01-01T00:00:00.000Z", bytecap_evicted_total: 1, last_bytecap_evict_ts: new Date(nowMs).toISOString() }));
           break;
         }
         case "truncate": {
@@ -781,7 +783,7 @@ test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }
           await fs.writeFile(factsFile, lines.slice(0, Math.floor(lines.length / 2)).map((line) => `${line}\n`).join(""));
           break;
         }
-        case "noopPass": await enforceFactRetention(paths, { now: new Date(nowMs).toISOString(), maxBytes: budget }); markFutureDropped(); break;
+        case "noopPass": await enforceFactRetention(paths, { family: "service", now: new Date(nowMs).toISOString(), maxBytes: budget }); markFutureDropped(); break;
         default: break;
       }
 
@@ -789,13 +791,13 @@ test("T4: coverage oracle over seeded operation sequences", { timeout: 120_000 }
       // re-bootstrap over a NON-empty store stamps a loss (HIGH-1, pinned by the T6 tests and by the
       // floor-backwards check below); one over an empty store is a fresh store. Either way, ticks
       // appended before the new lineage began are no longer part of what it can justify.
-      const generation = await fs.readFile(resolveFactIntegrityPaths(paths).integrityFile, "utf8")
+      const generation = await fs.readFile(resolveFactIntegrityPaths(paths, "service").integrityFile, "utf8")
         .then((raw) => JSON.parse(raw).generation, () => undefined);
       if (generation !== undefined && currentGeneration !== undefined && generation !== currentGeneration) {
         for (const entry of model.values()) entry.alive = false;
       }
       if (generation !== undefined) currentGeneration = generation;
-      const read = await readFactPoints(paths, { now: nowMs, windowMs: MONTH_WINDOW_MS });
+      const read = await readFactPoints(paths, { family: "service", now: nowMs, windowMs: MONTH_WINDOW_MS });
       const { completeness } = read;
       const floorMs = completeness.bytecap_floor_ts === null ? Number.NEGATIVE_INFINITY : Date.parse(completeness.bytecap_floor_ts);
       const where = `seed ${seed} step ${step} (${log.join(",")})`;

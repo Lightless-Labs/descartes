@@ -199,30 +199,35 @@ function establishedForDomain(domain, points, groups) {
 const DOMAIN_DEFINITIONS = [
   {
     domain: "service",
+    family: "service",
     group: groupServiceFactsByTick,
     stores: [loadServiceBaselineStore, loadServiceAppearanceBaselineStore],
     required: DEFAULT_SERVICE_MIN_HISTORY_TICK_COUNT,
   },
   {
     domain: "session",
+    family: "session",
     group: groupSessionFactsByTick,
     stores: [loadSessionBaselineStore],
     required: DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT,
   },
   {
     domain: "peer",
+    family: "peer",
     group: groupPeerFactsByTick,
     stores: [loadPeerBaselineStore],
     required: DEFAULT_PEER_MIN_HISTORY_TICK_COUNT,
   },
   {
     domain: "scheduled-job",
+    family: "scheduled_job",
     group: groupScheduledJobFactsByTick,
     stores: [loadPersistenceBaselineStore],
     required: DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
   },
   {
     domain: "process-lineage",
+    family: "process_lineage",
     group: groupProcessLineageFactsByTick,
     stores: [loadProcessLineageBaselineStore],
     required: DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
@@ -236,21 +241,26 @@ function normalizeDomainName(value) {
 async function readBaselineInputs(descartesPaths, options) {
   const nowMs = nowMsOf(options);
   const read = options.readFactPoints ?? readFactPoints;
-  const readResult = await read(descartesPaths, {
-    windowMs: options.windowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS,
-    now: options.now,
-  });
-  const points = readResult?.points ?? [];
+  // S4 (fact-store capacity plan §4.3): each domain reads its OWN family store.
+  const readResults = new Map();
+  for (const definition of DOMAIN_DEFINITIONS) {
+    readResults.set(definition.domain, await read(descartesPaths, {
+      family: definition.family,
+      windowMs: options.windowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS,
+      now: options.now,
+    }));
+  }
   const config = await (options.loadWatchConfig ?? loadWatchConfig)(descartesPaths);
   const domains = await Promise.all(DOMAIN_DEFINITIONS.map(async (definition) => {
+    const points = readResults.get(definition.domain)?.points ?? [];
     const groups = currentGroups(definition.group, points, nowMs);
     const entries = await Promise.all(definition.stores.map(async (loadStore) => ({
       ...(await loadStore(descartesPaths)),
       domain: definition.domain,
     })));
-    return { definition, groups, entries };
+    return { definition, groups, entries, points };
   }));
-  return { config, points, readResult, domains, nowMs };
+  return { config, readResults, domains, nowMs };
 }
 
 function configPayload(config, descartesPaths) {
@@ -261,7 +271,7 @@ export async function buildBaselineStatus(descartesPaths, options = {}) {
   const inputs = await readBaselineInputs(descartesPaths, options);
   return {
     watch_config: configPayload(inputs.config, descartesPaths),
-    domains: inputs.domains.map(({ definition, groups, entries }) => {
+    domains: inputs.domains.map(({ definition, groups, entries, points }) => {
       const phase = domainPhase({ enabled: inputs.config.enabled, entries, domain: definition.domain, groups, nowMs: inputs.nowMs });
       return {
         domain: definition.domain,
@@ -270,7 +280,7 @@ export async function buildBaselineStatus(descartesPaths, options = {}) {
         cold_start_reason: phase.coldStartReason,
         complete_ticks: phase.progress,
         required_ticks: STATUS_TICK_COUNT,
-        established_count: establishedForDomain(definition.domain, inputs.points, groups).length,
+        established_count: establishedForDomain(definition.domain, points, groups).length,
       };
     }),
     fact_history_window_ms: options.windowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS,
@@ -285,13 +295,13 @@ export async function buildBaselineInspect(descartesPaths, options = {}) {
     throw new Error(`Unknown baseline domain: ${options.domain}\n\n${usage()}`);
   }
   const selected = inputs.domains.filter(({ definition }) => !requested || definition.domain === requested);
-  const domains = selected.map(({ definition, groups, entries }) => {
+  const domains = selected.map(({ definition, groups, entries, points }) => {
     const phase = domainPhase({ enabled: inputs.config.enabled, entries, domain: definition.domain, groups, nowMs: inputs.nowMs });
     const report = {
       domain: definition.domain,
       phase: phase.phase,
-      established: inputs.config.enabled ? establishedForDomain(definition.domain, inputs.points, groups) : [],
-      established_count: inputs.config.enabled ? establishedForDomain(definition.domain, inputs.points, groups).length : 0,
+      established: inputs.config.enabled ? establishedForDomain(definition.domain, points, groups) : [],
+      established_count: inputs.config.enabled ? establishedForDomain(definition.domain, points, groups).length : 0,
       complete_ticks: completeGroups(definition.domain, groups).length,
     };
     if (definition.domain === "session" || definition.domain === "peer") {

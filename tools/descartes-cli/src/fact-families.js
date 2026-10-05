@@ -161,6 +161,9 @@ export function ruleHorizonMs(ruleId) {
 //     inside the read window and on a byte-cap floor far older than the window.
 //   - "report_only": no correctness gate (makes no absence or novelty claim); reports the
 //     certified boundary alongside its output.
+//   - "present_only" (S4): no narrowing gate at all -- the reader only ever acts on facts that are
+//     PRESENT ("no fact, no claim"), so a narrowed window can only remove a claim. Registered so its
+//     families come from the registry like every other reader's.
 const READER_COVERAGE_ENTRIES = [
   // constraint-miner.js: DEFAULT_MIN_OBSERVATION_DAYS = 7 is its mining span; the read-window
   // criterion is stricter than a 7-day horizon (S3 deviation, plan §18).
@@ -168,6 +171,11 @@ const READER_COVERAGE_ENTRIES = [
   ["shadow_evaluator", { families: ["service", "network"], coverage: "read_window" }],
   ["correlation", { families: ["peer"], coverage: "read_window" }],
   ["tuning_miner", { families: ["service", "network"], coverage: "report_only" }],
+  // S4 (§4.3 reader list): the daemon's live active-constraint evaluation reads the constraint-target
+  // families; provenance-warning reads only its own family (deleted_exe_running /
+  // public_bind_no_supervisor, every fast tick when learned is on).
+  ["active_constraint", { families: ["service", "network"], coverage: "present_only" }],
+  ["provenance_warning", { families: ["provenance"], coverage: "present_only" }],
 ];
 
 function buildReaderCoverage(entries) {
@@ -175,13 +183,20 @@ function buildReaderCoverage(entries) {
   for (const [reader, entry] of entries) {
     if (map.has(reader)) throw new Error(`fact-families: reader ${reader} is registered twice`);
     validateFamilies(`reader ${reader}`, entry.families);
-    if (!["read_window", "report_only"].includes(entry.coverage)) throw new Error(`fact-families: reader ${reader} has an unknown coverage policy`);
+    if (!["read_window", "report_only", "present_only"].includes(entry.coverage)) throw new Error(`fact-families: reader ${reader} has an unknown coverage policy`);
     map.set(reader, Object.freeze({ ...entry, families: Object.freeze([...entry.families]) }));
   }
   return map;
 }
 
 export const READER_COVERAGE = buildReaderCoverage(READER_COVERAGE_ENTRIES);
+
+// The families a registered non-detector reader reads (S4). Throws on an unregistered reader.
+export function readerFamilies(reader) {
+  const entry = READER_COVERAGE.get(reader);
+  if (!entry) throw new Error(`fact-families: unregistered reader ${reader}`);
+  return [...entry.families];
+}
 
 // S3b (§17): the three novelty families whose first/last-seen set the fact-store pass folds. The
 // census shape (presence fact_name + census fact_name carrying attributes.census_state) mirrors the

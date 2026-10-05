@@ -98,14 +98,19 @@ test("seenBeforeTick: an entry whose only observation is the latest tick is nove
 
 test("day 1: a genuine first run (absent store) seeds a VALID set with certified_since null, folded in the same pass as the append", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(at(0), ["a", "b"]), { now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(0), ["a", "b"]), { family: "service", now: at(0) });
   const { set } = await readSeenSetFile(paths, "service");
   assert.equal(set.certified_since_ts, null);
   assert.deepEqual(Object.keys(set.entries).sort(), ["a", "b"]);
-  const read = await readFactPoints(paths, { now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service", "process_lineage", "scheduled_job"] });
+  const read = await readFactPoints(paths, { family: "service", now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.equal(read.seen_sets.service.status, "valid");
-  assert.equal(read.seen_sets.process_lineage.status, "valid", "every novelty family's set is maintained, even with no facts");
-  assert.equal(read.seen_sets.process_lineage.entry_count, 0);
+  // S4: each novelty family's set lives in, and is folded by, its OWN family store -- a family whose
+  // store was never created has no set (and no claim), never a borrowed one.
+  const lineage = await readFactPoints(paths, { family: "process_lineage", now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["process_lineage"] });
+  assert.equal(lineage.store_exists, false);
+  assert.equal(lineage.seen_sets.process_lineage.status, "missing");
+  // A seen-set is only ever validated against its own family's ledger.
+  await assert.rejects(() => readFactPoints(paths, { family: "service", now: at(0), seenSetFamilies: ["process_lineage"] }), /not one of the families read/);
 });
 
 test("fold rule: partial, unknown and markerless ticks are never folded; neither is a tick dated after the pass clock", async () => {
@@ -116,7 +121,7 @@ test("fold rule: partial, unknown and markerless ticks are never folded; neither
     ...serviceTick(at(2), ["unknown-only"], "garbled"),
     presence(at(3), "markerless-only"),
     ...serviceTick(at(5), ["future-only"]), // within the 6 h future tolerance, so the store keeps it
-  ], { now: at(3) });
+  ], { family: "service", now: at(3) });
   assert.deepEqual(Object.keys(await seenEntries(paths)), ["complete-one"]);
 });
 
@@ -125,10 +130,10 @@ test("I13: eviction from the fact store never changes a seen-set answer -- the s
   const tiny = await tempPaths();
   for (let hour = 0; hour < 10; hour += 1) {
     const tick = serviceTick(at(hour), [`steady`, `rotating-${hour % 4}`, `once-${hour}`]);
-    await appendFactPoints(big, tick, { now: at(hour), maxBytes: 10 * 1024 * 1024 });
-    await appendFactPoints(tiny, tick, { now: at(hour), maxBytes: tickBytes(tick) + 10 });
+    await appendFactPoints(big, tick, { family: "service", now: at(hour), maxBytes: 10 * 1024 * 1024 });
+    await appendFactPoints(tiny, tick, { family: "service", now: at(hour), maxBytes: tickBytes(tick) + 10 });
   }
-  const tinyRead = await readFactPoints(tiny, { now: at(9), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const tinyRead = await readFactPoints(tiny, { family: "service", now: at(9), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.equal(tinyRead.completeness.coverage, "narrowed", "the tiny store really evicted");
   const bigSet = (await readSeenSetFile(big, "service")).set;
   const tinySet = (await readSeenSetFile(tiny, "service")).set;
@@ -139,11 +144,11 @@ test("I13: eviction from the fact store never changes a seen-set answer -- the s
 
 test("read validation: the set is valid only against the SAME ledger lineage and committed pass; a stale pass id, another generation, or a missing set is not", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(at(0), ["a"]), { now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(0), ["a"]), { family: "service", now: at(0) });
   const { file } = resolveSeenSetPaths(paths, "service");
   const stale = await fs.readFile(file, "utf8");
-  await appendFactPoints(paths, serviceTick(at(1), ["a"]), { now: at(1) });
-  const read = (now) => readFactPoints(paths, { now, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  await appendFactPoints(paths, serviceTick(at(1), ["a"]), { family: "service", now: at(1) });
+  const read = (now) => readFactPoints(paths, { family: "service", now, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.equal((await read(at(1))).seen_sets.service.status, "valid");
   await fs.writeFile(file, stale);
   assert.equal((await read(at(1))).seen_sets.service.status, "lineage_mismatch", "a set from an older pass (e.g. its write was lost) is not valid");
@@ -159,13 +164,13 @@ test("crash/lost fold: a tick kept at pass P whose fold write is lost, then byte
   const ticks = [0, 1, 2, 3, 4].map((hour) => serviceTick(at(hour), hour === 1 ? ["base", "returner"] : ["base"]));
   const budget = tickBytes(ticks[2]) + tickBytes(ticks[3]) + 10;
   const { file } = resolveSeenSetPaths(paths, "service");
-  await appendFactPoints(paths, ticks[0], { now: at(0), maxBytes: budget });
+  await appendFactPoints(paths, ticks[0], { family: "service", now: at(0), maxBytes: budget });
   const beforeP = await fs.readFile(file, "utf8");
-  await appendFactPoints(paths, ticks[1], { now: at(1), maxBytes: budget }); // pass P keeps tick 1
+  await appendFactPoints(paths, ticks[1], { family: "service", now: at(1), maxBytes: budget }); // pass P keeps tick 1
   await fs.writeFile(file, beforeP); // ...but its fold write is "lost"
-  await appendFactPoints(paths, ticks[2], { now: at(2), maxBytes: budget });
-  await appendFactPoints(paths, ticks[3], { now: at(3), maxBytes: budget }); // tick 1 is evicted by now
-  const read = await readFactPoints(paths, { now: at(3), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  await appendFactPoints(paths, ticks[2], { family: "service", now: at(2), maxBytes: budget });
+  await appendFactPoints(paths, ticks[3], { family: "service", now: at(3), maxBytes: budget }); // tick 1 is evicted by now
+  const read = await readFactPoints(paths, { family: "service", now: at(3), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.ok(!read.points.some((point) => point.entity_key === "returner"), "tick 1 really was evicted");
   assert.equal(read.seen_sets.service.status, "valid", "the next pass re-seeded the set");
   assert.ok(read.seen_sets.service.entries.has("returner"), "the returner observed only in the lost-fold tick is still remembered");
@@ -176,19 +181,19 @@ test("re-seed boundary: a set lost over a NARROWED store re-seeds with certified
   const paths = await tempPaths();
   const ticks = [0, 1, 2, 3].map((hour) => serviceTick(at(hour), ["base"]));
   const budget = tickBytes(ticks[0]) * 2 + 10;
-  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
-  const before = await readFactPoints(paths, { now: at(2), windowMs: 31 * DAY });
+  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { family: "service", now: at(hour), maxBytes: budget });
+  const before = await readFactPoints(paths, { family: "service", now: at(2), windowMs: 31 * DAY });
   const floor = before.completeness.bytecap_floor_ts;
   assert.equal(floor, at(0));
   await fs.rm(resolveSeenSetPaths(paths, "service").file);
-  await appendFactPoints(paths, ticks[3], { now: at(3), maxBytes: budget });
+  await appendFactPoints(paths, ticks[3], { family: "service", now: at(3), maxBytes: budget });
   const reseeded = (await readSeenSetFile(paths, "service")).set;
   assert.equal(reseeded.certified_since_ts, floor, "never null over a narrowed store: memory before the floor is gone");
 
   // Ledger deleted over a surviving store: the lineage breaks (HIGH-1), the set's generation no longer
   // matches, and the re-seed certifies nothing before the pass that re-bootstrapped.
-  await fs.rm(resolveFactIntegrityPaths(paths).integrityFile);
-  await appendFactPoints(paths, serviceTick(at(4), ["base"]), { now: at(4), maxBytes: budget });
+  await fs.rm(resolveFactIntegrityPaths(paths, "service").integrityFile);
+  await appendFactPoints(paths, serviceTick(at(4), ["base"]), { family: "service", now: at(4), maxBytes: budget });
   const afterBreak = (await readSeenSetFile(paths, "service")).set;
   assert.equal(afterBreak.certified_since_ts, at(4));
 });
@@ -198,14 +203,14 @@ test("MEDIUM-1 (S3b review): a non-continuous re-seed keeps the prior set's entr
   const ticks = [0, 1, 2, 3, 4].map((hour) => serviceTick(at(hour), hour === 0 ? ["base", "returner"] : ["base"]));
   const budget = tickBytes(ticks[1]) * 2 + 10;
   const { file } = resolveSeenSetPaths(paths, "service");
-  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
+  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { family: "service", now: at(hour), maxBytes: budget });
   const afterP2 = await fs.readFile(file, "utf8");
   assert.ok(JSON.parse(afterP2).entries.returner, "the returner was folded while its tick was retained");
-  await appendFactPoints(paths, ticks[3], { now: at(3), maxBytes: budget });
+  await appendFactPoints(paths, ticks[3], { family: "service", now: at(3), maxBytes: budget });
   await fs.writeFile(file, afterP2); // pass 3's fold write is "lost": the set no longer matches the ledger
-  const floorBefore = (await readFactPoints(paths, { now: at(3), windowMs: 31 * DAY })).completeness.bytecap_floor_ts;
-  await appendFactPoints(paths, ticks[4], { now: at(4), maxBytes: budget });
-  const read = await readFactPoints(paths, { now: at(4), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const floorBefore = (await readFactPoints(paths, { family: "service", now: at(3), windowMs: 31 * DAY })).completeness.bytecap_floor_ts;
+  await appendFactPoints(paths, ticks[4], { family: "service", now: at(4), maxBytes: budget });
+  const read = await readFactPoints(paths, { family: "service", now: at(4), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.ok(!read.points.some((point) => point.entity_key === "returner"), "tick 0 is long evicted from the store");
   assert.equal(read.seen_sets.service.status, "valid", "re-seeded");
   assert.deepEqual(read.seen_sets.service.entries.get("returner"), { firstMs: Date.parse(at(0)), lastMs: Date.parse(at(0)) }, "the prior set's memory survives the re-seed");
@@ -216,12 +221,12 @@ test("MEDIUM-1 (S3b review): a non-continuous re-seed keeps the prior set's entr
 
 test("MEDIUM-1 (S3b review): a merged re-seed that would overflow retries bare before declaring overflow", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(at(0), ["a", "b"]), { now: at(0), seenSetMaxEntries: 2 });
+  await appendFactPoints(paths, serviceTick(at(0), ["a", "b"]), { family: "service", now: at(0), seenSetMaxEntries: 2 });
   const { file } = resolveSeenSetPaths(paths, "service");
   const stale = await fs.readFile(file, "utf8");
-  await appendFactPoints(paths, serviceTick(at(1), ["a"]), { now: at(1), seenSetMaxEntries: 2 });
+  await appendFactPoints(paths, serviceTick(at(1), ["a"]), { family: "service", now: at(1), seenSetMaxEntries: 2 });
   await fs.writeFile(file, stale.replace("\"a\":", "\"x\":")); // stale + different memory: merged it would be 3 > 2
-  const outcome = await enforceFactRetention(paths, { now: at(1), seenSetMaxEntries: 2 });
+  const outcome = await enforceFactRetention(paths, { family: "service", now: at(1), seenSetMaxEntries: 2 });
   assert.equal(outcome.seen_set_fold.service.status, "reseeded");
   assert.deepEqual(Object.keys(await seenEntries(paths)).sort(), ["a", "b"], "bare re-seed from the store's candidates, never a silent truncation");
 });
@@ -230,29 +235,29 @@ test("LOW-4 (S3b review): a complete tick appended at or below the byte-cap floo
   const paths = await tempPaths();
   const ticks = [0, 1, 2].map((hour) => serviceTick(at(hour), ["base"]));
   const budget = tickBytes(ticks[0]) * 2 + 10;
-  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
-  const floor = (await readFactPoints(paths, { now: at(2), windowMs: 31 * DAY })).completeness.bytecap_floor_ts;
+  for (let hour = 0; hour < 3; hour += 1) await appendFactPoints(paths, ticks[hour], { family: "service", now: at(hour), maxBytes: budget });
+  const floor = (await readFactPoints(paths, { family: "service", now: at(2), windowMs: 31 * DAY })).completeness.bytecap_floor_ts;
   assert.equal(floor, at(0));
   // The clock steps back below the floor (within the future tolerance, so no loss is stamped) and a
   // complete tick lands there: the store evicts it physically (below-floor), but it was observed.
   const rolledBack = new Date(Date.parse(at(0)) - HOUR / 2).toISOString();
-  await appendFactPoints(paths, serviceTick(rolledBack, ["rb-only"]), { now: at(0), maxBytes: budget });
+  await appendFactPoints(paths, serviceTick(rolledBack, ["rb-only"]), { family: "service", now: at(0), maxBytes: budget });
   const entries = await seenEntries(paths);
   assert.deepEqual(entries["rb-only"], [rolledBack, rolledBack], "the below-floor tick's observation is remembered");
 });
 
 test("overflow: a set past its cap is never silently truncated -- it reads as overflow (novelty ineligible), and a later pass whose seed fits recovers it", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(at(0), ["a", "b", "c"]), { now: at(0), seenSetMaxEntries: 2 });
-  const overflowed = await readFactPoints(paths, { now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service"], seenSetMaxEntries: 2 });
+  await appendFactPoints(paths, serviceTick(at(0), ["a", "b", "c"]), { family: "service", now: at(0), seenSetMaxEntries: 2 });
+  const overflowed = await readFactPoints(paths, { family: "service", now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service"], seenSetMaxEntries: 2 });
   assert.equal(overflowed.seen_sets.service.status, "overflow");
   assert.equal(overflowed.seen_sets.service.entries, undefined);
   assert.equal(noveltyRuleEligible({ ...overflowed, completeness: { ...overflowed.completeness, coverage: "narrowed", bytecap_floor_ts: at(-100) } }, SERVICE_APPEARED_RULE_ID, Date.parse(at(0))), false, "overflow under narrowing: ineligible");
 
   // The store ages the three-entity tick out; the next pass's seed fits under the cap again.
   const later = new Date(Date.parse(at(0)) + 31 * DAY).toISOString();
-  await appendFactPoints(paths, serviceTick(later, ["a"]), { now: later, seenSetMaxEntries: 2 });
-  const recovered = await readFactPoints(paths, { now: later, windowMs: 31 * DAY, seenSetFamilies: ["service"], seenSetMaxEntries: 2 });
+  await appendFactPoints(paths, serviceTick(later, ["a"]), { family: "service", now: later, seenSetMaxEntries: 2 });
+  const recovered = await readFactPoints(paths, { family: "service", now: later, windowMs: 31 * DAY, seenSetFamilies: ["service"], seenSetMaxEntries: 2 });
   assert.equal(recovered.seen_sets.service.status, "valid");
   assert.deepEqual([...recovered.seen_sets.service.entries.keys()], ["a"]);
   // The recovery is a RE-SEED from the store's certified candidates, so its boundary is the re-seed
@@ -263,10 +268,10 @@ test("overflow: a set past its cap is never silently truncated -- it reads as ov
 
 test("expiry: an entry is dropped 30 days past its last sighting, and the claim scope never reaches further back than the retention", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(at(0), ["old", "keep"]), { now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(0), ["old", "keep"]), { family: "service", now: at(0) });
   const later = new Date(BASE + 31 * DAY).toISOString();
-  await appendFactPoints(paths, serviceTick(later, ["keep"]), { now: later });
-  const read = await readFactPoints(paths, { now: later, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  await appendFactPoints(paths, serviceTick(later, ["keep"]), { family: "service", now: later });
+  const read = await readFactPoints(paths, { family: "service", now: later, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.deepEqual([...read.seen_sets.service.entries.keys()], ["keep"]);
   assert.equal(read.seen_sets.service.scope_ts, new Date(BASE + DAY).toISOString(), "scope = max(certified_since, now - 30 d)");
 });
@@ -288,13 +293,13 @@ async function g1Store() {
   ];
   // Room for exactly t1..t4: t0 is byte-evicted when t4 lands.
   const budget = ticks.slice(1).reduce((sum, tick) => sum + tickBytes(tick), 0);
-  for (let hour = 0; hour < 5; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
+  for (let hour = 0; hour < 5; hour += 1) await appendFactPoints(paths, ticks[hour], { family: "service", now: at(hour), maxBytes: budget });
   return paths;
 }
 
 test("G1 reproduction (S3b): returner at t0, absent t1-t3, back at t4 with t0 byte-evicted -> NO first-seen claim, while the gate is LIFTED (the detector evaluated and stayed established)", async () => {
   const paths = await g1Store();
-  const read = await readFactPoints(paths, { now: at(4), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const read = await readFactPoints(paths, { family: "service", now: at(4), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.equal(read.completeness.coverage, "narrowed");
   assert.equal(read.completeness.bytecap_floor_ts, at(0), "t0 really was evicted");
   assert.ok(!read.points.some((point) => point.ts === at(0)));
@@ -324,7 +329,7 @@ test("S3b: a genuinely NEW service still alerts through the seen-set (the set su
   const ticks = [0, 1, 2, 3].map((hour) => serviceTick(at(hour), ["base"]));
   ticks.push(serviceTick(at(4), ["base", "brand-new"]));
   const budget = ticks.slice(1).reduce((sum, tick) => sum + tickBytes(tick), 0);
-  for (let hour = 0; hour < 5; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
+  for (let hour = 0; hour < 5; hour += 1) await appendFactPoints(paths, ticks[hour], { family: "service", now: at(hour), maxBytes: budget });
   const result = await computeServiceAppearanceCandidates(paths, { now: at(4) });
   assert.deepEqual(result.candidates.map((candidate) => candidate.rule_id), [SERVICE_APPEARED_RULE_ID]);
   assert.equal(result.candidates[0].diagnostics.history_certified_after_ts, new Date(Date.parse(at(4)) - 30 * DAY).toISOString(), "scope: the seen-set's memory (max(certified_since, now - 30 d))");
@@ -334,14 +339,14 @@ test("S3b: a store older than the 30-day retention (age floor inside the 31 d de
   const paths = await tempPaths();
   await writeWatchConfig(paths, { enabled: true });
   await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: at(-1) });
-  await appendFactPoints(paths, serviceTick(at(0), ["base"]), { now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(0), ["base"]), { family: "service", now: at(0) });
   const start = BASE + 30 * DAY + HOUR;
   for (let hour = 0; hour < 5; hour += 1) {
     const ts = new Date(start + hour * HOUR).toISOString();
-    await appendFactPoints(paths, serviceTick(ts, ["base"]), { now: ts });
+    await appendFactPoints(paths, serviceTick(ts, ["base"]), { family: "service", now: ts });
   }
   const now = new Date(start + 4 * HOUR).toISOString();
-  const read = await readFactPoints(paths, { now, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const read = await readFactPoints(paths, { family: "service", now, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.equal(read.completeness.coverage, "narrowed", "the age floor sits inside the 31 d window");
   assert.equal(read.completeness.bytecap_floor_ts, null, "no byte-cap eviction at all");
   const result = await computeServiceAppearanceCandidates(paths, { now });
@@ -388,17 +393,19 @@ test("S3b daemon referent: on a narrowed store, a valid seen-set lets a covered 
 
 test("enforceFactRetention reports the fold outcome per family, and a fold failure is non-fatal to retention", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, serviceTick(at(0), ["a"]), { now: at(0) });
-  const ok = await enforceFactRetention(paths, { now: at(0) });
+  await appendFactPoints(paths, serviceTick(at(0), ["a"]), { family: "service", now: at(0) });
+  const ok = await enforceFactRetention(paths, { family: "service", now: at(0) });
   assert.equal(ok.seen_set_fold.service.status, "folded");
-  // Make the seen-set directory unwritable by replacing it with a file.
-  const { dir } = resolveSeenSetPaths(paths, "service");
-  await fs.rm(dir, { recursive: true });
-  await fs.writeFile(dir, "not a directory");
-  const failed = await enforceFactRetention(paths, { now: at(0) });
+  // Make the seen-set file unwritable by replacing it with a (non-empty) directory: the fold's
+  // tmp+rename then fails. (S4: the set lives inside the family store directory, so the store
+  // directory itself must stay intact.)
+  const { file } = resolveSeenSetPaths(paths, "service");
+  await fs.rm(file);
+  await fs.mkdir(path.join(file, "blocker"), { recursive: true });
+  const failed = await enforceFactRetention(paths, { family: "service", now: at(0) });
   assert.equal(failed.seen_set_fold.service.status, "error");
   assert.equal(failed.kept_count, 2, "retention itself still committed");
-  const read = await readFactPoints(paths, { now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const read = await readFactPoints(paths, { family: "service", now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
   assert.notEqual(read.seen_sets.service.status, "valid", "an unwritten fold is never read as valid");
 });
 
@@ -416,8 +423,8 @@ test("G1 reproduction (S3b) for process.lineage.novel_edge and scheduled_job.app
     const tick = (hour, keys) => [...keys.map((key) => presence(at(hour), key, presenceName)), marker(at(hour), "complete", censusName)];
     const ticks = [tick(0, ["base", "returner"]), tick(1, ["base"]), tick(2, ["base"]), tick(3, ["base"]), tick(4, ["base", "returner"])];
     const budget = ticks.slice(1).reduce((sum, points) => sum + tickBytes(points), 0);
-    for (let hour = 0; hour < 5; hour += 1) await appendFactPoints(paths, ticks[hour], { now: at(hour), maxBytes: budget });
-    const read = await readFactPoints(paths, { now: at(4), windowMs: 31 * DAY, seenSetFamilies: [family] });
+    for (let hour = 0; hour < 5; hour += 1) await appendFactPoints(paths, ticks[hour], { family, now: at(hour), maxBytes: budget });
+    const read = await readFactPoints(paths, { family, now: at(4), windowMs: 31 * DAY, seenSetFamilies: [family] });
     assert.equal(read.completeness.bytecap_floor_ts, at(0), `${family}: t0 evicted`);
     const result = await compute(paths, { now: at(4), minHistoryTickCount: 3, activeFreshnessMs: HOUR });
     assert.deepEqual(result.candidates, [], `${family}: no fabricated first-seen claim`);

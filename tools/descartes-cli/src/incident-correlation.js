@@ -310,7 +310,7 @@ export async function computeCorrelationCandidates(descartesPaths, options = {})
 
   const [alertRecords, readResult] = await Promise.all([
     readAlerts(descartesPaths),
-    readFacts(descartesPaths, { now, windowMs: factWindowMs }),
+    readFacts(descartesPaths, { family: "peer", now, windowMs: factWindowMs }),
   ]);
 
   const anchors = findKillSideAnchors(alertRecords, { now, lookbackMs });

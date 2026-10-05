@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
+import { requireFactFamily } from "./fact-families.js";
 
 // v2 (fact-store capacity plan 2026-10-05, R0b §4.1 item 2): adds the byte-cap and age floors.
 export const FACT_INTEGRITY_SCHEMA_VERSION = 2;
@@ -68,8 +69,12 @@ const PENDING_PASS_KEYS = [
   "future_fact_count",
 ];
 
-export function resolveFactIntegrityPaths(descartesPaths) {
-  const dir = path.join(descartesPaths.stateDir, "learned", "facts");
+// S4 (fact-store capacity plan §4.3): one ledger per family store, next to that family's facts.jsonl
+// (learned/facts/<family>/integrity.json). `family` is REQUIRED and must be a registry family
+// (requireFactFamily throws otherwise) -- there is no legacy single-ledger default, so a caller that
+// forgot its family fails loudly, and a family id can never carry a path segment.
+export function resolveFactIntegrityPaths(descartesPaths, family) {
+  const dir = path.join(descartesPaths.stateDir, "learned", "facts", requireFactFamily(family));
   return { dir, integrityFile: path.join(dir, "integrity.json") };
 }
 
@@ -308,8 +313,8 @@ function laterTimestamp(left, right) {
   return Date.parse(right) > Date.parse(left) ? right : left;
 }
 
-export async function readFactIntegrityLedger(descartesPaths) {
-  const { integrityFile } = resolveFactIntegrityPaths(descartesPaths);
+export async function readFactIntegrityLedger(descartesPaths, family) {
+  const { integrityFile } = resolveFactIntegrityPaths(descartesPaths, family);
   let contents;
   try {
     contents = await fs.readFile(integrityFile, "utf8");
@@ -328,9 +333,9 @@ export async function readFactIntegrityLedger(descartesPaths) {
   }
 }
 
-export async function writeFactIntegrityLedger(descartesPaths, ledger) {
+export async function writeFactIntegrityLedger(descartesPaths, family, ledger) {
+  const { dir, integrityFile } = resolveFactIntegrityPaths(descartesPaths, family);
   if (!isValidFactIntegrityLedger(ledger)) throw new Error("Invalid fact-store integrity ledger");
-  const { dir, integrityFile } = resolveFactIntegrityPaths(descartesPaths);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   await fs.chmod(dir, 0o700);
   const tmpFile = `${integrityFile}.${process.pid}.tmp`;
@@ -814,5 +819,75 @@ export function buildCompleteness(ledger, live, asOfMs = Number.NEGATIVE_INFINIT
     ...commonCompletenessFields(base, nowMs, extras),
     continuity_ok: base.continuity.continuity_ok,
     degraded_reason: degradedReason,
+  };
+}
+
+function laterOf(values) {
+  let best = null;
+  for (const value of values) best = laterTimestamp(best, value ?? null);
+  return best;
+}
+
+function earlierOf(values) {
+  let best = null;
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    if (best === null || Date.parse(value) < Date.parse(best)) best = value;
+  }
+  return best;
+}
+
+/**
+ * S4 (fact-store capacity plan §4.3): the COMBINED completeness of a multi-family read, for display
+ * and as a conservative summary. Worst status (unknown > degraded > intact; its degraded_reason comes
+ * from the first family at that status), the latest of each loss timestamp, summed totals (saturating),
+ * the newest of each floor, the latest certified_after_ts, coverage unknown > narrowed > full, and
+ * continuity_ok false > null > true. Pure.
+ *
+ * NOT a gate on its own: the predicates in fact-store-completeness.js evaluate each family's own
+ * completeness (readResult.family_reads) and AND the results -- combining floors across families is
+ * unsound for a coverage decision (one family's newer age floor can mask another family's byte-cap
+ * floor in certifiedReadWindowOk's "byte-cap floor at or below the age floor" case).
+ */
+export function combineFamilyCompleteness(completenesses, { oldestCertifiedTs = null } = {}) {
+  const list = completenesses.filter((entry) => entry && typeof entry === "object");
+  const statusRank = { unknown: 2, degraded: 1, intact: 0 };
+  const rank = (status) => statusRank[status] ?? 2;
+  let worst = list[0];
+  for (const entry of list) if (rank(entry.status) > rank(worst.status)) worst = entry;
+  const coverageRank = { unknown: 2, narrowed: 1, full: 0 };
+  let coverage = "full";
+  for (const entry of list) if ((coverageRank[entry.coverage] ?? 2) > coverageRank[coverage]) coverage = coverageRank[entry.coverage] === undefined ? "unknown" : entry.coverage;
+  const sum = (key) => {
+    let total = 0;
+    for (const entry of list) {
+      const value = Number.isSafeInteger(entry[key]) ? entry[key] : 0;
+      total = Number.isSafeInteger(total + value) ? total + value : Number.MAX_SAFE_INTEGER;
+    }
+    return total;
+  };
+  const continuityValues = list.map((entry) => entry.continuity_ok);
+  const continuityOk = continuityValues.includes(false) ? false : continuityValues.every((value) => value === true) && list.length > 0 ? true : null;
+  return {
+    status: list.length === 0 ? "unknown" : worst.status,
+    last_corrupt_ts: laterOf(list.map((entry) => entry.last_corrupt_ts)),
+    last_schema_invalid_ts: laterOf(list.map((entry) => entry.last_schema_invalid_ts)),
+    last_bytecap_evict_ts: laterOf(list.map((entry) => entry.last_bytecap_evict_ts)),
+    last_continuity_break_ts: laterOf(list.map((entry) => entry.last_continuity_break_ts)),
+    last_future_fact_ts: laterOf(list.map((entry) => entry.last_future_fact_ts)),
+    corrupt_dropped_total: sum("corrupt_dropped_total"),
+    schema_invalid_dropped_total: sum("schema_invalid_dropped_total"),
+    bytecap_evicted_total: sum("bytecap_evicted_total"),
+    age_evicted_total: sum("age_evicted_total"),
+    future_fact_dropped_total: sum("future_fact_dropped_total"),
+    first_degraded_ts: earlierOf(list.map((entry) => entry.first_degraded_ts)),
+    bytecap_floor_ts: laterOf(list.map((entry) => entry.bytecap_floor_ts)),
+    age_floor_ts: laterOf(list.map((entry) => entry.age_floor_ts)),
+    certified_after_ts: laterOf(list.map((entry) => entry.certified_after_ts)),
+    oldest_certified_ts: oldestCertifiedTs,
+    coverage: list.length === 0 ? "unknown" : coverage,
+    future_loss_fields: [...new Set(list.flatMap((entry) => (Array.isArray(entry.future_loss_fields) ? entry.future_loss_fields : [])))],
+    continuity_ok: continuityOk,
+    degraded_reason: list.length === 0 ? "continuity_unknown" : worst.degraded_reason,
   };
 }

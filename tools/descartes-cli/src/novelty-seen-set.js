@@ -35,8 +35,12 @@
 //     as {overflow: true, entries: {}}, which reads as not-valid (novelty ineligible, status reason
 //     "overflow"), and every later pass retries a fresh re-seed.
 //
-// S4-ready: every entry point is keyed by family; S4 changes resolveSeenSetPaths (and which ledger
-// the fold/read pair with), nothing else.
+// S4 (fact-store capacity plan §4.3): every entry point is keyed by family. Each novelty family's set
+// lives INSIDE its own family store directory (learned/facts/<family>/seen-set.json) and pairs with
+// THAT family's ledger: the family's own retention pass folds it, and a read validates it against
+// the same family ledger readFactPoints just read. The pre-S4 location (learned/facts/seen-sets/)
+// is legacy; S5 quarantines it with the legacy facts.jsonl so nothing under learned/facts/ is a
+// directory the registry does not name.
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -70,8 +74,8 @@ function requireNoveltyFamily(family) {
 
 export function resolveSeenSetPaths(descartesPaths, family) {
   requireNoveltyFamily(family);
-  const dir = path.join(descartesPaths.stateDir, "learned", "facts", "seen-sets");
-  return { dir, file: path.join(dir, `${family}.json`) };
+  const dir = path.join(descartesPaths.stateDir, "learned", "facts", family);
+  return { dir, file: path.join(dir, "seen-set.json") };
 }
 
 function isIsoTimestamp(value) {
@@ -209,8 +213,9 @@ function reseedCertifiedSince({ priorLedger, nextLedger, nowIso }) {
 }
 
 /**
- * Folds this retention pass's certified candidates into every novelty family's seen-set. Called by
- * fact-store.js after the ledger finalize, with:
+ * Folds this retention pass's certified candidates into `family`'s seen-set (S4: the novelty
+ * family's OWN store pass folds it; a non-novelty family has no set). Called by fact-store.js after
+ * the ledger finalize, with:
  *   priorLedger / priorLedgerReason: the ledger as read at the START of the pass (null + reason when
  *     missing/invalid/unreadable);
  *   liveExists: whether facts.jsonl existed at the start of the pass (genuine first run detection);
@@ -221,6 +226,7 @@ function reseedCertifiedSince({ priorLedger, nextLedger, nowIso }) {
  * whose pass id then mismatches the ledger -> not valid on read, re-seeded next pass.
  */
 export async function foldNoveltySeenSets(descartesPaths, {
+  family: storeFamily,
   priorLedger,
   priorLedgerReason,
   liveExists,
@@ -235,6 +241,7 @@ export async function foldNoveltySeenSets(descartesPaths, {
   const nowIso = new Date(nowMs).toISOString();
   const genuineFirstRun = priorLedgerReason === "missing" && liveExists === false;
   for (const family of NOVELTY_FAMILIES.keys()) {
+    if (family !== storeFamily) continue;
     try {
       const prior = await readSeenSetFile(descartesPaths, family, { maxEntries });
       const continuous = Boolean(

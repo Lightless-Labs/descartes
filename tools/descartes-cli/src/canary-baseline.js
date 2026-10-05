@@ -507,7 +507,7 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   // exactly what process-lineage-baseline.js/session-baseline.js/peer-baseline.js/
   // service-baseline.js do for their own candidate computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "canary", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupCanaryFactsByTick(points);
 

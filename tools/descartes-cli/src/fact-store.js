@@ -6,11 +6,21 @@ import {
   finalizeFactIntegrityLedger,
   FUTURE_FACT_TOLERANCE_MS,
   prepareFactIntegrityLedger,
+  combineFamilyCompleteness,
   readFactIntegrityLedger,
+  resolveFactIntegrityPaths,
   resolvePriorBytecapFloor,
   writeFactIntegrityLedger,
 } from "./fact-store-integrity.js";
 import { foldNoveltySeenSets, readNoveltySeenSet } from "./novelty-seen-set.js";
+import {
+  FACT_FAMILY_IDS,
+  FAMILY_DEFAULT_BUDGET_BYTES,
+  factFamilyForName,
+  groupFactPointsByFamily,
+  NOVELTY_FAMILIES,
+  requireFactFamily,
+} from "./fact-families.js";
 
 // Categorical fact-point store — distinct from history-store.js's numeric metric-point
 // schema (whose normalizeMetricPoint throws on !Number.isFinite(value)). Structural facts
@@ -19,6 +29,10 @@ import { foldNoveltySeenSets, readNoveltySeenSet } from "./novelty-seen-set.js";
 // conventions (atomic tmp+rename writes for anything read back to make a decision,
 // corrupt-tolerant per-line reads) — see plan §1/§3.
 export const DEFAULT_FACT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+// The pre-S4 single shared store's cap. S4 (fact-store capacity plan §4.3/§4.5) replaces it with
+// per-family budgets (fact-families.js FAMILY_DEFAULT_BUDGET_BYTES; watch.json fact_store_budgets);
+// it survives only as the value watch.json/learned.json used to write in by default, so the Q5
+// deprecation check can tell that written-in default apart from a deliberate operator value.
 export const DEFAULT_FACT_MAX_BYTES = 5 * 1024 * 1024; // 5MB
 
 // Fix 0 (trusted-state step-1 revision, "R1 made signable"): the future-fact tolerance. Defined in
@@ -41,13 +55,29 @@ export const MAX_FACT_SOURCE_LENGTH = 256;
 // free-form value -- cap it like the other fields so it can't be built unbounded either.
 export const MAX_FACT_SENSITIVITY_LENGTH = 64;
 
-export function resolveFactStorePaths(descartesPaths) {
-  const dir = path.join(descartesPaths.stateDir, "learned", "facts");
+/**
+ * S4 (fact-store capacity plan §4.3, I7): one store per fact family, at
+ * learned/facts/<family>/facts.jsonl (with its own integrity.json ledger, and for a novelty family
+ * its seen-set.json, beside it). `family` is REQUIRED and must be a registry family: there is no
+ * legacy single-file default, so a caller that was not migrated throws instead of silently reading
+ * an empty store (which, after S5 quarantines the legacy facts.jsonl, would silently lose
+ * detection). Every reader, the retention sweep and the status surfaces iterate the closed
+ * registry (fact-families.js FACT_FAMILY_IDS), never the filesystem: a directory under
+ * learned/facts/ is NOT a family because it exists.
+ */
+export function resolveFactStorePaths(descartesPaths, family) {
+  const dir = path.join(resolveFactsRootDir(descartesPaths), requireFactFamily(family));
   return { dir, factsFile: path.join(dir, "facts.jsonl") };
 }
 
-async function ensureFactDir(descartesPaths) {
-  await fs.mkdir(resolveFactStorePaths(descartesPaths).dir, { recursive: true, mode: 0o700 });
+// The parent of every family store directory. Never iterated to discover families (see above);
+// exported for the S5 legacy-store quarantine, which moves the pre-S4 files out of it.
+export function resolveFactsRootDir(descartesPaths) {
+  return path.join(descartesPaths.stateDir, "learned", "facts");
+}
+
+async function ensureFactDir(descartesPaths, family) {
+  await fs.mkdir(resolveFactStorePaths(descartesPaths, family).dir, { recursive: true, mode: 0o700 });
 }
 
 // daybreak-blue security sweep, fact-store HIGH #4: the raw supplied ts value must never be
@@ -229,6 +259,7 @@ export function assertSuffixEviction(evicted, kept) {
  * than a dropped metric point.
  */
 export async function enforceFactRetention(descartesPaths, options = {}) {
+  requireFactFamily(options.family);
   // LOW-5 (review fold): `orderRetentionCandidates` (T5's non-suffix-eviction seam) is read from
   // `internal`, never from `options` directly -- see runFactRetention below. Routing it through
   // here, explicitly, is what makes it reachable ONLY via this exported, test-only entry point:
@@ -238,7 +269,8 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
 }
 
 async function runFactRetention(descartesPaths, options, internal = {}) {
-  const storePaths = resolveFactStorePaths(descartesPaths);
+  const family = requireFactFamily(options.family);
+  const storePaths = resolveFactStorePaths(descartesPaths, family);
   const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
   // daybreak-blue security sweep, fact-store BLOCKER #1: a non-finite retentionMs (e.g.
@@ -305,7 +337,7 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   // pass's own output (which would fail retention on every pass from then on), and the suffix
   // assertion below covers it too. The prior floor is resolved exactly as prepareFactIntegrityLedger
   // resolves it (including the future-floor clamp), so the two can never disagree.
-  const existingIntegrity = await readFactIntegrityLedger(descartesPaths);
+  const existingIntegrity = await readFactIntegrityLedger(descartesPaths, family);
   const priorFloor = resolvePriorBytecapFloor(existingIntegrity.ledger?.bytecap_floor_ts ?? null, nowIso);
   const priorFloorMs = priorFloor.floorTs === null ? Number.NEGATIVE_INFINITY : Date.parse(priorFloor.floorTs);
   const belowFloor = sortedCandidates.filter(({ tsMs }) => tsMs <= priorFloorMs);
@@ -410,16 +442,16 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     bytecapEvictedNewestTs,
     ageEvictedNewestTs,
   });
-  await ensureFactDir(descartesPaths);
+  await ensureFactDir(descartesPaths, family);
   const tmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
   await fs.writeFile(tmpFile, outputRawBytes, { mode: 0o600 });
   await fs.chmod(tmpFile, 0o600);
-  await writeFactIntegrityLedger(descartesPaths, prepared.ledger);
+  await writeFactIntegrityLedger(descartesPaths, family, prepared.ledger);
   if (options.beforeFactsRename) await options.beforeFactsRename();
   await fs.rename(tmpFile, storePaths.factsFile);
   if (options.afterFactsRename) await options.afterFactsRename();
   const finalizedLedger = finalizeFactIntegrityLedger(prepared.ledger, prepared.passId, { allowRecovery: prepared.recoverPending });
-  await writeFactIntegrityLedger(descartesPaths, finalizedLedger);
+  await writeFactIntegrityLedger(descartesPaths, family, finalizedLedger);
   // S3b (fact-store capacity plan §17): fold this pass's certified candidates into the novelty
   // seen-sets, in the SAME pass as the append, stamped with the ledger this pass just committed.
   // `sortedCandidates` is every in-retention, non-dropped candidate, BEFORE this pass's byte-cap
@@ -429,7 +461,9 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
   // observed, and added memory can only suppress a novelty claim. Never throws: a failed fold leaves the old file, which
   // no longer matches the ledger's committed pass id and therefore reads as not valid (no novelty
   // claim under narrowing) until the next pass re-seeds it.
-  const seenSetFold = await foldNoveltySeenSets(descartesPaths, {
+  // S4: only a novelty family's own store pass folds (its own) seen-set.
+  const seenSetFold = !NOVELTY_FAMILIES.has(family) ? {} : await foldNoveltySeenSets(descartesPaths, {
+    family,
     priorLedger: priorLedgerSnapshot,
     priorLedgerReason: existingIntegrity.reason,
     liveExists,
@@ -458,9 +492,19 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
  * per-point catch) -> single fs.appendFile of all encoded lines -> enforce retention.
  */
 export async function appendFactPoints(descartesPaths, factPoints, options = {}) {
-  await ensureFactDir(descartesPaths);
-  const storePaths = resolveFactStorePaths(descartesPaths);
+  const family = requireFactFamily(options.family);
+  // S4 routing (§4.3, I7): every point must belong to THIS family's store. An unregistered fact_name,
+  // or one routed to another family, throws BEFORE anything is written (never misrouted, never
+  // silently dropped). Multi-family batches go through appendFactPointsByFamily.
   const normalized = factPoints.map((point) => normalizeFactPoint(point, { ts: options.ts ?? options.now }));
+  for (const point of normalized) {
+    const pointFamily = factFamilyForName(point.fact_name);
+    if (pointFamily === undefined) throw new Error("fact-store: unregistered fact_name (no fact family); refusing the batch before any write");
+    if (pointFamily !== family) throw new Error(`fact-store: a ${pointFamily} fact cannot be appended to the ${family} store; refusing the batch before any write`);
+  }
+  await ensureFactDir(descartesPaths, family);
+  const storePaths = resolveFactStorePaths(descartesPaths, family);
+  const encoded = normalized.map(encodeJsonLine).join("");
   // R0b / HIGH-1 (fact-store capacity plan §15.5 decision 3; LOW-1/LOW-4 review fold, 2026-10-05):
   // a missing ledger must always be resolved against the PRE-append store, never the post-append
   // one -- otherwise this call's own new data could answer, for itself, the very question
@@ -479,11 +523,11 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   // nothing to misreport, unlike the real append/retention pass below (Finding F4-B2), where
   // records have already reached disk.
   if (normalized.length > 0) {
-    const ledgerBefore = await readFactIntegrityLedger(descartesPaths);
+    const ledgerBefore = await readFactIntegrityLedger(descartesPaths, family);
     if (ledgerBefore.reason === "missing") {
       await runFactRetention(descartesPaths, options);
     }
-    await fs.appendFile(storePaths.factsFile, normalized.map(encodeJsonLine).join(""), { mode: 0o600 });
+    await fs.appendFile(storePaths.factsFile, encoded, { mode: 0o600 });
   }
   // Finding F4-B2 (daybreak-blue BLOCKER), mirrors appendMetricPoints: enforceFactRetention runs
   // AFTER the append above has already durably succeeded, so a retention-only failure must never
@@ -500,16 +544,178 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
   } catch (error) {
     retentionError = (error instanceof Error ? error.message : String(error)) || "unknown retention error";
   }
-  return { written_count: normalized.length, retention, ...(retentionError ? { retention_error: retentionError } : {}) };
+  return {
+    written_count: normalized.length,
+    // S4: this call's own appended bytes -- the family's live per-tick volume when the daemon appends
+    // one structural tick, which status compares against the budget (cap_below_tick).
+    appended_bytes: Buffer.byteLength(encoded),
+    retention,
+    ...(retentionError ? { retention_error: retentionError } : {}),
+  };
+}
+
+function errorMessage(error, fallback) {
+  return (error instanceof Error ? error.message : String(error)) || fallback;
+}
+
+async function pathExists(file) {
+  try {
+    await fs.stat(file);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+/**
+ * Whether a family store has ever been created: its facts.jsonl or its ledger is on disk. A store
+ * that was never created (peer on a host with no VPN/Tailscale, canary with none configured) is NOT
+ * created by the retention sweep -- status reports it as `not observed (no store)`.
+ */
+export async function factStoreExists(descartesPaths, family) {
+  const { factsFile } = resolveFactStorePaths(descartesPaths, family);
+  const { integrityFile } = resolveFactIntegrityPaths(descartesPaths, family);
+  return (await pathExists(factsFile)) || (await pathExists(integrityFile));
+}
+
+/**
+ * S4 daemon write path (§4.3): route a structural tick's fact points to their family stores and run
+ * the registry-driven retention sweep.
+ *   - Grouping happens FIRST and throws on any unregistered fact_name, so a bad batch writes nothing
+ *     to any family (I7).
+ *   - Each family with new points is appended with its own budget (options.budgets[family], else
+ *     options.maxBytes, else the registry default). One family's append or retention failure is
+ *     reported for that family and never stops another family from persisting.
+ *   - Every OTHER family whose store already exists gets a retention pass too (no new points), so a
+ *     family that stopped producing facts still age-evicts instead of keeping data past 30 days.
+ *     Iterates the closed registry, never the filesystem; a family that appended this call already
+ *     ran retention and is not swept twice; a store that was never created is not created.
+ * Returns { written_count, families: {<family>: {written_count, appended_bytes?, budget_bytes,
+ * retention?, retention_error?, append_error?}}, retention_error?, append_error? } -- the combined
+ * error strings name their family.
+ */
+export async function appendFactPointsByFamily(descartesPaths, factPoints, options = {}) {
+  const grouped = groupFactPointsByFamily(factPoints);
+  const { budgets, maxBytes, ...passOptions } = options;
+  const families = {};
+  let writtenCount = 0;
+  const appendErrors = [];
+  const retentionErrors = [];
+  for (const family of FACT_FAMILY_IDS) {
+    const budgetBytes = budgets?.[family] ?? maxBytes ?? FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+    const familyOptions = { ...passOptions, family, maxBytes: budgetBytes };
+    if (grouped.has(family)) {
+      try {
+        const result = await appendFactPoints(descartesPaths, grouped.get(family), familyOptions);
+        writtenCount += result.written_count;
+        families[family] = { ...result, budget_bytes: budgetBytes };
+        if (result.retention_error) retentionErrors.push(`${family}: ${result.retention_error}`);
+      } catch (error) {
+        const message = errorMessage(error, "unknown fact-append error");
+        families[family] = { written_count: 0, budget_bytes: budgetBytes, append_error: message };
+        appendErrors.push(`${family}: ${message}`);
+      }
+      continue;
+    }
+    let exists;
+    try {
+      exists = await factStoreExists(descartesPaths, family);
+    } catch (error) {
+      const message = errorMessage(error, "unknown fact-store stat error");
+      families[family] = { written_count: 0, budget_bytes: budgetBytes, retention_error: message };
+      retentionErrors.push(`${family}: ${message}`);
+      continue;
+    }
+    if (!exists) continue;
+    try {
+      const retention = await runFactRetention(descartesPaths, familyOptions);
+      families[family] = { written_count: 0, budget_bytes: budgetBytes, retention };
+    } catch (error) {
+      const message = errorMessage(error, "unknown retention error");
+      families[family] = { written_count: 0, budget_bytes: budgetBytes, retention_error: message };
+      retentionErrors.push(`${family}: ${message}`);
+    }
+  }
+  return {
+    written_count: writtenCount,
+    families,
+    ...(appendErrors.length > 0 ? { append_error: appendErrors.join("; ") } : {}),
+    ...(retentionErrors.length > 0 ? { retention_error: retentionErrors.join("; ") } : {}),
+  };
 }
 
 /**
  * Mirrors readMetricPoints: re-validates each record through normalizeFactPoint and drops
  * (doesn't throw) any that fail — same "drop invalid, count corrupt separately" split as
  * history-store.js's readJsonLines-consuming readers.
+ *
+ * S4 (fact-store capacity plan §4.3, I7): exactly one of
+ *   - options.family: one family store (its own ledger, floors and -- for a novelty family -- its own
+ *     seen-set), or
+ *   - options.families: several family stores, read independently and merged: points merged and
+ *     ts-sorted, counts summed, a COMBINED completeness for display (worst status, latest of each
+ *     loss timestamp, newest floors, `coverage` "unknown" > "narrowed" > "full"), and every family's
+ *     own read under `family_reads` -- which the trust/coverage predicates in
+ *     fact-store-completeness.js AND over (trust holds only if every family is trusted; a combined
+ *     floor is never used to gate, since one family's newer age floor could otherwise mask another
+ *     family's byte-cap floor).
+ * is REQUIRED; a missing or unknown family throws (no legacy single-store default). A requested
+ * seen-set family must be one of the families read (a set is only ever validated against its own
+ * family's ledger).
  */
 export async function readFactPoints(descartesPaths, options = {}) {
-  const storePaths = resolveFactStorePaths(descartesPaths);
+  const hasFamily = options.family !== undefined;
+  const hasFamilies = options.families !== undefined;
+  if (hasFamily === hasFamilies) {
+    throw new Error("readFactPoints requires exactly one of options.family or options.families (no legacy single-store default)");
+  }
+  const families = hasFamily ? [requireFactFamily(options.family)] : options.families;
+  if (!Array.isArray(families) || families.length === 0) throw new Error("readFactPoints requires a non-empty options.families");
+  for (const family of families) requireFactFamily(family);
+  const unique = [...new Set(families)];
+  const seenSetFamilies = Array.isArray(options.seenSetFamilies) ? options.seenSetFamilies : [];
+  for (const family of seenSetFamilies) {
+    if (!unique.includes(family)) throw new Error(`readFactPoints: seen-set family ${String(family)} is not one of the families read`);
+  }
+  if (hasFamily) return readFamilyFactPoints(descartesPaths, unique[0], options);
+  const reads = [];
+  for (const family of unique) reads.push([family, await readFamilyFactPoints(descartesPaths, family, options)]);
+  return mergeFamilyReads(reads);
+}
+
+function mergeFamilyReads(reads) {
+  const points = reads.flatMap(([, read]) => read.points)
+    .sort((left, right) => new Date(left.ts).getTime() - new Date(right.ts).getTime());
+  const familyReads = {};
+  let seenSets;
+  for (const [family, read] of reads) {
+    const { points: _points, seen_sets: familySeenSets, ...rest } = read;
+    familyReads[family] = { ...rest, ...(familySeenSets ? { seen_sets: familySeenSets } : {}) };
+    if (familySeenSets) seenSets = { ...(seenSets ?? {}), ...familySeenSets };
+  }
+  const corruptCount = reads.reduce((sum, [, read]) => sum + read.corrupt_count, 0);
+  const schemaInvalidCount = reads.reduce((sum, [, read]) => sum + read.schema_invalid_count, 0);
+  return {
+    points,
+    corrupt_count: corruptCount,
+    schema_invalid_count: schemaInvalidCount,
+    // The combined (display) completeness is over the family stores that EXIST: a never-created store
+    // is reported per family as absent ("not observed (no store)"), not folded in as "unknown".
+    completeness: combineFamilyCompleteness((reads.some(([, read]) => read.store_exists) ? reads.filter(([, read]) => read.store_exists) : reads)
+      .map(([, read]) => read.completeness), {
+      oldestCertifiedTs: points.length > 0 ? points[0].ts : null,
+    }),
+    bytes: reads.reduce((sum, [, read]) => sum + read.bytes, 0),
+    store_exists: reads.some(([, read]) => read.store_exists),
+    families: reads.map(([family]) => family),
+    family_reads: familyReads,
+    ...(seenSets ? { seen_sets: seenSets } : {}),
+  };
+}
+
+async function readFamilyFactPoints(descartesPaths, family, options) {
+  const storePaths = resolveFactStorePaths(descartesPaths, family);
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
   if (options.now !== undefined && !Number.isFinite(nowMs)) {
     throw new Error("readFactPoints requires options.now to parse as a valid date");
@@ -533,7 +739,7 @@ export async function readFactPoints(descartesPaths, options = {}) {
   const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
   const sinceMs = options.windowMs !== undefined ? nowMs - options.windowMs : undefined;
   const { records, corrupt_count, bytes, raw_bytes: rawBytes, exists } = await readJsonLines(storePaths.factsFile);
-  const integrity = await readFactIntegrityLedger(descartesPaths);
+  const integrity = await readFactIntegrityLedger(descartesPaths, family);
   // R0b read-side floor (fact-store capacity plan §4.1 item 3, invariant I1): never return a point
   // at or below the ledger's exclusive byte-cap floor. Enforced HERE, once, in the store -- never
   // as six per-detector copies (six chances for one to be missing and fabricate). Points at or
@@ -571,10 +777,11 @@ export async function readFactPoints(descartesPaths, options = {}) {
   // (generation, committed pass id, no pending pass) so the pair can never desync. Only a "valid"
   // set carries entries.
   let seenSets;
-  if (Array.isArray(options.seenSetFamilies) && options.seenSetFamilies.length > 0) {
+  const seenSetFamilies = Array.isArray(options.seenSetFamilies) ? options.seenSetFamilies.filter((name) => name === family) : [];
+  if (seenSetFamilies.length > 0) {
     seenSets = {};
-    for (const family of options.seenSetFamilies) {
-      seenSets[family] = await readNoveltySeenSet(descartesPaths, family, {
+    for (const setFamily of seenSetFamilies) {
+      seenSets[setFamily] = await readNoveltySeenSet(descartesPaths, setFamily, {
         ledger: integrity.ledger,
         nowMs,
         retentionMs,
@@ -594,5 +801,16 @@ export async function readFactPoints(descartesPaths, options = {}) {
       oldestCertifiedTs: points.length > 0 ? points[0].ts : null,
     },
   );
-  return { points, corrupt_count, schema_invalid_count: schemaInvalidCount, completeness, ...(seenSets ? { seen_sets: seenSets } : {}) };
+  return {
+    points,
+    corrupt_count,
+    schema_invalid_count: schemaInvalidCount,
+    completeness,
+    family,
+    // S4 status: the store's on-disk size, and whether it was ever created (facts.jsonl or ledger on
+    // disk) -- a never-created store reads as `not observed (no store)`, not "still learning".
+    bytes,
+    store_exists: exists || integrity.reason !== "missing",
+    ...(seenSets ? { seen_sets: seenSets } : {}),
+  };
 }

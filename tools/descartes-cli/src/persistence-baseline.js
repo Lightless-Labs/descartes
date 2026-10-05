@@ -322,7 +322,7 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT;
 
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now, seenSetFamilies: ["scheduled_job"] });
+  const readResult = await readFacts(descartesPaths, { family: "scheduled_job", windowMs, now: options.now, seenSetFamilies: ["scheduled_job"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupScheduledJobFactsByTick(points);
 

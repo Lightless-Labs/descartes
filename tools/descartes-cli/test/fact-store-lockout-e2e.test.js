@@ -8,6 +8,12 @@
 // evaluating through routine eviction instead of re-arming (the S2-interim behavior this test pinned
 // before S3b: re-arm on every narrowed structural read, no evaluated keys).
 //
+// S4 (per-family stores, §4.3/§4.5): the default budgets (service 18 MiB, ...) would not byte-evict
+// within 40 real-volume ticks, and watch.json cannot configure a budget below the T8 horizon floor,
+// so this test forces routine eviction through the daemon's TEST-ONLY `factStoreBudgets` seam: the
+// three novelty families' stores are sized to fill after ~27 real-volume ticks (like the old shared
+// 5 MB store did) and then evict on every structural tick.
+//
 // Scope: Leg A/B/C only. The count rules (session.count_drop, peer.count_*) cannot reach
 // MIN_SAMPLE_COUNT=30 in a 5 MB shared store at this volume (Leg D); that is T2's job once the
 // per-family budgets (S4) land, so it is deliberately NOT asserted here.
@@ -17,7 +23,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { runDaemonIteration } from "../src/daemon.js";
-import { DEFAULT_FACT_MAX_BYTES } from "../src/fact-store.js";
+import { FAMILY_DEFAULT_BUDGET_BYTES } from "../src/fact-families.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { computeServiceAppearanceCandidates, computeServiceBaselineCandidates, loadServiceBaselineStore } from "../src/service-baseline.js";
 import { computeProcessLineageBaselineCandidates, loadProcessLineageBaselineStore } from "../src/process-lineage-baseline.js";
@@ -27,6 +33,16 @@ import { realVolumeStructuralCollectors } from "./fixtures/real-volume-tick.js";
 const HOUR_MS = 60 * 60 * 1000;
 const BASE_MS = Date.parse("2026-10-01T00:00:00.000Z");
 const STRUCTURAL_TICKS = 40;
+const MIB = 1024 * 1024;
+// ~27 ticks of each novelty family at the generated tick's volume (service ~132 KB, lineage ~44 KB,
+// scheduled_job ~2.6 KB per tick); every other family keeps its default budget.
+const FORCED_BUDGETS = {
+  ...Object.fromEntries(FAMILY_DEFAULT_BUDGET_BYTES),
+  service: 3.5 * MIB,
+  process_lineage: 1.15 * MIB,
+  scheduled_job: 0.07 * MIB,
+};
+const EVICTING_FAMILIES = ["service", "process_lineage", "scheduled_job"];
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-lockout-e2e-"));
@@ -48,7 +64,7 @@ function fastCollectorFakes() {
   };
 }
 
-test("T1: at real per-tick volume and the 5 MB default, routine byte-cap eviction does not lock the watch tier out (no 31-day degraded tail, no hourly anchor re-arm, coverage keeps being reported)", { timeout: 300_000 }, async () => {
+test("T1: at real per-tick volume with the novelty family stores forced to fill, routine byte-cap eviction does not lock the watch tier out (no 31-day degraded tail, no hourly anchor re-arm, coverage keeps being reported)", { timeout: 300_000 }, async () => {
   const paths = await tempPaths();
   const { collectors, structuralCollectorToggles } = realVolumeStructuralCollectors();
   const profile = {
@@ -81,6 +97,7 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
       ts,
       now: ts,
       evaluateAlerts: true,
+      factStoreBudgets: FORCED_BUDGETS,
       ...observers,
     });
     const anchors = {
@@ -91,9 +108,10 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
     const tick = {
       index,
       ts,
-      bytecapEvicted: structural.structuralFacts?.retention?.bytecap_evicted_count ?? 0,
+      bytecapEvicted: Math.min(...EVICTING_FAMILIES.map((family) => structural.structuralFacts?.families?.[family]?.retention?.bytecap_evicted_count ?? 0)),
       written: structural.structuralFacts?.written_count ?? 0,
       status: structural.status.fact_store_completeness?.status,
+      familyStatus: Object.fromEntries(EVICTING_FAMILIES.map((family) => [family, structural.status.fact_store_completeness?.families?.[family]?.status])),
       seenSets: structural.status.novelty_seen_sets,
       coverage: Object.fromEntries(coverage),
       anchors: Object.fromEntries(Object.entries(anchors).map(([key, state]) => [key, { pending: state.cold_start_pending, since: state.cold_start_since_ts }])),
@@ -102,7 +120,7 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
     // HEAD, which is what keeps the re-accumulation branch from ever running.
     if (index >= 26) {
       const fastTs = new Date(BASE_MS + index * HOUR_MS + 30 * 60 * 1000).toISOString();
-      const fast = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), structuralCollectors: collectors, ts: fastTs, now: fastTs, ...observers });
+      const fast = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), structuralCollectors: collectors, ts: fastTs, now: fastTs, factStoreBudgets: FORCED_BUDGETS, ...observers });
       assert.equal(fast.structuralFacts, undefined, "the half-hour tick must not be a structural tick");
       tick.fastStatus = fast.status.fact_store_completeness?.status;
       tick.fastSeenSets = fast.status.novelty_seen_sets;
@@ -110,12 +128,11 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
     ticks.push(tick);
   }
 
-  // Precondition: the generated tick is real-host-sized and the store is at its 5 MB default.
+  // Precondition: the generated tick is real-host-sized and EVERY novelty family store evicts.
   assert.ok(ticks[0].written >= 700, `expected ~722 records per tick, got ${ticks[0].written}`);
   const firstEviction = ticks.find((tick) => tick.bytecapEvicted > 0);
-  assert.ok(firstEviction, "the 5 MB default store must start byte-evicting within 40 real-volume ticks");
-  assert.ok(firstEviction.index >= 20 && firstEviction.index <= 30, `eviction should start near tick 28 (5 MB / ~185 KB), started at ${firstEviction.index}`);
-  assert.equal(DEFAULT_FACT_MAX_BYTES, 5 * 1024 * 1024);
+  assert.ok(firstEviction, "the forced novelty-family stores must all start byte-evicting within 40 real-volume ticks");
+  assert.ok(firstEviction.index >= 20 && firstEviction.index <= 32, `eviction should start near tick 27, started at ${firstEviction.index}`);
   const afterEviction = ticks.filter((tick) => tick.index > firstEviction.index);
   assert.ok(afterEviction.length >= 8);
   // Eviction is routine: it keeps happening on every structural tick once full.
@@ -127,6 +144,9 @@ test("T1: at real per-tick volume and the 5 MB default, routine byte-cap evictio
   // store byte-evicted -- on structural AND fast ticks.
   for (const tick of afterEviction) {
     if (tick.status !== "intact") problems.push(`Leg A: tick ${tick.index} daemon fact-history read is ${tick.status}`);
+    for (const [family, status] of Object.entries(tick.familyStatus)) {
+      if (status !== "intact") problems.push(`Leg A: tick ${tick.index} ${family} store read is ${status}`);
+    }
     if (tick.fastStatus !== undefined && tick.fastStatus !== "intact") problems.push(`Leg A: tick ${tick.index}+30m fast-tick history read is ${tick.fastStatus}`);
   }
   // Leg B: no detector re-arms on byte-cap eviction -- the ordinary service baseline AND (S3b) the

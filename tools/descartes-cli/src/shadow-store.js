@@ -10,6 +10,7 @@ import {
 } from "./constraint-store.js";
 import { evaluateShadowConstraints } from "./constraint-eval.js";
 import { readFactPoints } from "./fact-store.js";
+import { readerFamilies } from "./fact-families.js";
 import { certifiedReadWindowOk, factHistoryTrustworthy } from "./fact-store-completeness.js";
 
 // Shadow evaluation is structurally separate from real alerting — not a flag, a different
@@ -298,7 +299,7 @@ export async function evaluateAndLogShadowConstraints(descartesPaths, options = 
   // Read window and lookup staleness share one resolved nowMs snapshot (never a bare options.now that
   // would let readFactPoints take its own, later, Date.now() and drop a horizon-edge-fresh fact).
   const factWindowMs = options.factWindowMs ?? freshnessMs;
-  const readResult = await readFacts(descartesPaths, { windowMs: factWindowMs, now: nowMs });
+  const readResult = await readFacts(descartesPaths, { families: readerFamilies("shadow_evaluator"), windowMs: factWindowMs, now: nowMs });
   // Missing historical exercises can make a shadow candidate look falsely safe. Do not
   // evaluate or append a soak record until this fact-history read is trustworthy.
   // Narrowing (fact-store capacity plan S3, fact-families.js READER_COVERAGE "shadow_evaluator"):

@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { alertId, applyAlertCandidates, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
-import { appendFactPoints } from "../src/fact-store.js";
+import { appendFactPointsByFamily } from "../src/fact-store.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "../src/session-baseline.js";
@@ -135,10 +135,10 @@ async function seed(paths, { alerts = [], factPoints = [], now, learnedEnabled =
   if (learnedEnabled) await writeLearnedConfig(paths, { enabled: true });
   if (alerts.length > 0) await writeAlertRecords(paths, alerts);
   if (factPoints.length > 0) {
-    await appendFactPoints(paths, factPoints, { now });
+    await appendFactPointsByFamily(paths, factPoints, { now });
     // A second clean retention pass confirms the shared completeness ledger as intact. This
     // keeps positive correlation fixtures representative of established fact history.
-    await appendFactPoints(paths, [], { now });
+    await appendFactPointsByFamily(paths, [], { now });
   }
 }
 

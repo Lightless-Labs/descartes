@@ -669,7 +669,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
   // exactly what process-lineage-baseline.js does for computeProcessLineageBaselineCandidates.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "session", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupSessionFactsByTick(points);
 
