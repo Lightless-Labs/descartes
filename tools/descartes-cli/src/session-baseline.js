@@ -434,6 +434,17 @@ export function computeWindowedSessionStats(groups, { stddevFloor = DEFAULT_STDD
 // upgrade, a documented behavioral invariant this fix must not touch.
 const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16}$/;
 
+// A3 (2026-10 calibration review): bounded churn LOOKBACK. The OLDER side of a churn pair must lie
+// within the last K complete tick-groups before the latest one (i.e. at or after the ts of the
+// K-th complete tick-group preceding the latest). Without this bound, a same-named session absent
+// for days and then recreated with a new creation fingerprint fired session.churn against an
+// observation of any age in the 31-day window -- a session being started again, not the
+// kill-then-resurrect this rule exists for (that incident shape resurrects within hours: the older
+// observation is 1..K complete ticks back). An entity whose only earlier observation is outside the
+// bound is UNEVALUABLE (no fresh pair): not a churn entry and not reported as evaluated, so any
+// persisted churn alert for it freezes rather than falsely recovering.
+export const DEFAULT_SESSION_CHURN_LOOKBACK_TICKS = 3;
+
 /**
  * Must-fix 4 (recency bound, hard requirement): for each entity_key with two or more
  * session.presence points in the pool, compares the two most recent points' created_at_fingerprint.
@@ -478,18 +489,24 @@ const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16
  *     an entity is "evaluated" iff it had >=2 observations across DISTINCT ticks, was unambiguous
  *     on both the newest and the chosen-earlier tick, had both created_at_fingerprints defined and
  *     neither "unknown", is RECENCY-FRESH (its newest observation is in the latest complete
- *     tick-group), and carries a CONFORMING (in-contract) hashed entity_key. Entities skipped as
+ *     tick-group), carries a CONFORMING (in-contract) hashed entity_key, and whose chosen earlier
+ *     observation lies within the A3 lookback bound (DEFAULT_SESSION_CHURN_LOOKBACK_TICKS complete
+ *     ticks before the latest). Entities skipped as
  *     <2-obs / same-tick-ambiguous / missing-or-unknown-fingerprint (per §8.C's named skip
  *     reasons), and additionally as STALE or OUT-OF-CONTRACT (per the recovery-coverage contract's
  *     "excluding entities it skipped as ... stale / unevaluable"), are NOT reported — so the daemon
  *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
  */
-function evaluateSessionChurn(points = []) {
+function evaluateSessionChurn(points = [], { lookbackTicks = DEFAULT_SESSION_CHURN_LOOKBACK_TICKS } = {}) {
   const groups = groupSessionFactsByTick(points);
   const completeGroups = groups.filter((group) => group.censusState === "complete");
   if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [] };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
+  // A3 lookback bound: the earliest instant an OLDER observation may carry -- the ts of the K-th
+  // complete tick-group before the latest (or the earliest complete tick-group when fewer exist).
+  // Compared by parsed instant, like every other ts comparison in this function.
+  const lookbackBoundMs = new Date(completeGroups[Math.max(0, completeGroups.length - 1 - lookbackTicks)].ts).getTime();
 
   const byEntity = new Map();
   for (const group of groups) {
@@ -578,6 +595,7 @@ function evaluateSessionChurn(points = []) {
     // re-gate).
     if (newerMs !== latestCompleteMs) continue; // must-fix 4 recency bound (K=1) -- STALE pair, unevaluable
     if (!SESSION_CHURN_ENTITY_KEY_PATTERN.test(entityKey)) continue; // F7: nonconforming entity_key shape -- unevaluable, never republished
+    if (!(olderMs >= lookbackBoundMs)) continue; // A3 lookback bound -- prior observation too old, unevaluable (freeze)
 
     // Fresh + conforming + unambiguous + both fingerprints known: a definitive verdict either way,
     // so this identity WAS genuinely evaluated (whether it churned or is clear) and is reported.
@@ -595,8 +613,8 @@ function evaluateSessionChurn(points = []) {
  * which now ALSO computes which entity_keys were genuinely evaluated; see its doc comment). Every
  * existing caller and test that reads a bare churn-entry array keeps working through this wrapper.
  */
-export function detectSessionChurn(points = []) {
-  return evaluateSessionChurn(points).churnEntries;
+export function detectSessionChurn(points = [], options = {}) {
+  return evaluateSessionChurn(points, options).churnEntries;
 }
 
 // ---------------------------------------------------------------------------------------------

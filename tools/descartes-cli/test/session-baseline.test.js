@@ -14,6 +14,7 @@ import {
   DEFAULT_CRITICAL_SIGMA,
   DEFAULT_DEVIATION_SIGMA,
   DEFAULT_MIN_SAMPLE_COUNT,
+  DEFAULT_SESSION_CHURN_LOOKBACK_TICKS,
   DEFAULT_STDDEV_FLOOR,
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
@@ -597,6 +598,44 @@ test("session.churn non-fire: a STALE pair (entity churned, then absent from eve
     censusMarkerPoint(tickTs(4), "complete"), // latest complete tick-group
   ];
   assert.deepEqual(detectSessionChurn(points), []);
+});
+
+// A3 (2026-10 calibration review): the OLDER side of a churn pair must lie within the last
+// DEFAULT_SESSION_CHURN_LOOKBACK_TICKS complete ticks before the latest one. Without the bound, a
+// same-named session absent for days (e.g. 119 hourly ticks) and recreated with a new fingerprint
+// fired session.churn -- that is a session being started again, not a kill-then-resurrect.
+function churnLookbackFixture(ticksBack, { entityKey = "session.tmux.aaaaaaaaaaaaaaaa" } = {}) {
+  const latest = 200;
+  const points = [];
+  for (let hour = latest - 130; hour <= latest; hour += 1) {
+    points.push(censusMarkerPoint(tickTs(hour), "complete"));
+  }
+  points.push(sessionPoint(tickTs(latest - ticksBack), entityKey, "1111111111111111"));
+  points.push(sessionPoint(tickTs(latest), entityKey, "2222222222222222"));
+  return { points, latestTs: tickTs(latest), entityKey };
+}
+
+test("session.churn (A3): the incident shape -- killed then resurrected within hours (older observation 1..K complete ticks back) still fires", () => {
+  assert.equal(DEFAULT_SESSION_CHURN_LOOKBACK_TICKS, 3);
+  for (let ticksBack = 1; ticksBack <= DEFAULT_SESSION_CHURN_LOOKBACK_TICKS; ticksBack += 1) {
+    const { points, entityKey } = churnLookbackFixture(ticksBack);
+    assert.deepEqual(
+      detectSessionChurn(points),
+      [{ entity_key: entityKey, prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" }],
+      `older observation ${ticksBack} complete tick(s) back must still fire`,
+    );
+  }
+});
+
+test("session.churn non-fire (A3): an older observation K+1 complete ticks back does NOT fire, nor one 119 ticks back -- and the entity is NOT reported as evaluated (freeze, never a fabricated recovery)", async () => {
+  for (const ticksBack of [DEFAULT_SESSION_CHURN_LOOKBACK_TICKS + 1, 119]) {
+    const { points, latestTs, entityKey } = churnLookbackFixture(ticksBack);
+    assert.deepEqual(detectSessionChurn(points), [], `older observation ${ticksBack} complete ticks back must not fire`);
+    const paths = await tempPaths();
+    const result = await seedAndCompute(paths, points, { now: latestTs });
+    assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0);
+    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)), false);
+  }
 });
 
 test("session.churn non-fire: pre-existing-history-at-first-run (upgrade-day storm guard, must-fix 4) — weeks of already-differing MARKERLESS fingerprints emit ZERO churn on the first post-deploy call", () => {
