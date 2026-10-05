@@ -120,6 +120,20 @@ fn run_probe() -> i32 {
 
 #[cfg(target_os = "linux")]
 fn run_resolve_pid(pid: u32) -> i32 {
+    // This guard is the first /proc operation for PID resolution. Without it, an inherited
+    // ancestor procfs can make the numeric request name a process from a different PID namespace.
+    if let Err(error) = descartes_root_helper::procfs::ensure_procfs_pid_namespace() {
+        hardening::drop_capabilities();
+        if error.to_string() == descartes_root_helper::procfs::PROCFS_NAMESPACE_MISMATCH_REASON {
+            eprintln!(
+                "descartes-root-helper: cannot resolve pid {pid} ({})",
+                descartes_root_helper::procfs::PROCFS_NAMESPACE_MISMATCH_REASON
+            );
+            return EXIT_PROCFS_NAMESPACE_MISMATCH;
+        }
+        eprintln!("descartes-root-helper: could not inspect procfs for pid {pid}");
+        return EXIT_RESOLUTION_FAILURE;
+    }
     let resolved = proc_linux::resolve_pid(pid);
     // Drop right after the reads that need the (future) capability, before ANY output -- success
     // or failure, per hardening.rs's documented sequence: resolve -> drop -> emit.
@@ -148,6 +162,21 @@ fn run_resolve_pid(_pid: u32) -> i32 {
 #[cfg(target_os = "linux")]
 fn run_resolve_socket(target: socket::SocketTarget) -> i32 {
     use proc_linux::SocketOutcome;
+
+    // Keep the namespace check ahead of the resolver's first `/proc` open. The resolver repeats
+    // the check at the socket-table boundary as defense in depth for future call sites.
+    if let Err(error) = descartes_root_helper::procfs::ensure_procfs_pid_namespace() {
+        hardening::drop_capabilities();
+        if error.to_string() == descartes_root_helper::procfs::PROCFS_NAMESPACE_MISMATCH_REASON {
+            eprintln!(
+                "descartes-root-helper: cannot resolve socket ({})",
+                descartes_root_helper::procfs::PROCFS_NAMESPACE_MISMATCH_REASON
+            );
+            return EXIT_PROCFS_NAMESPACE_MISMATCH;
+        }
+        eprintln!("descartes-root-helper: could not inspect procfs");
+        return EXIT_RESOLUTION_FAILURE;
+    }
 
     let outcome = proc_linux::resolve_socket(&target);
     // Drop right after the reads that need the capability, before ANY output -- success or

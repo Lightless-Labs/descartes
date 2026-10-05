@@ -112,17 +112,26 @@ pub fn open_proc_root() -> io::Result<OwnedFd> {
 /// socket resolution. The numeric pid is resolved by this process and remains valid under the
 /// helper's seccomp policy.
 pub fn open_proc_net() -> io::Result<OwnedFd> {
+    ensure_procfs_pid_namespace()?;
+    let pid_dir = open_pid_dir(std::process::id())?;
+    open_dir_at(pid_dir.as_fd(), "net")
+}
+
+/// Verifies the procfs view before any caller opens a target `/proc/<pid>` entry. A procfs mount
+/// from an ancestor PID namespace can expose a numeric PID that names an unrelated host process;
+/// fail closed with a distinct reason instead of resolving that process as the requested target.
+pub fn ensure_procfs_pid_namespace() -> io::Result<()> {
     let proc_root = open_proc_root()?;
     let pid = std::process::id();
     let self_target = read_link_at(proc_root.as_fd(), "self")?;
-    if !proc_self_target_matches_pid(&self_target, pid) {
-        return Err(io::Error::new(
+    if proc_self_target_matches_pid(&self_target, pid) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
             io::ErrorKind::InvalidData,
             PROCFS_NAMESPACE_MISMATCH_REASON,
-        ));
+        ))
     }
-    let pid_dir = open_pid_dir(std::process::id())?;
-    open_dir_at(pid_dir.as_fd(), "net")
 }
 
 fn proc_self_target_matches_pid(target: &OsStr, pid: u32) -> bool {
@@ -487,6 +496,12 @@ mod tests {
         assert!(proc_self_target_matches_pid(OsStr::new("1234"), 1234));
         assert!(!proc_self_target_matches_pid(OsStr::new("1235"), 1234));
         assert!(!proc_self_target_matches_pid(OsStr::new("self"), 1234));
+    }
+
+    #[test]
+    fn procfs_namespace_guard_succeeds_for_the_active_procfs_view_and_has_a_distinct_reason() {
+        ensure_procfs_pid_namespace().expect("the test process must see its own procfs namespace");
+        assert_ne!(PROCFS_NAMESPACE_MISMATCH_REASON, "target_not_found");
     }
 
     #[test]
