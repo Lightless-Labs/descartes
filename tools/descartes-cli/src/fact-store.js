@@ -204,6 +204,25 @@ function encodeJsonLine(record) {
 }
 
 /**
+ * R0b defense-in-depth (fact-store capacity plan §4.1 item 1, invariant I3): the coverage claim
+ * rests on byte-cap eviction removing a strict, tick-aligned oldest-end prefix -- every evicted
+ * record strictly older than every kept one. Computed over the two sets directly (never assuming
+ * they are sorted), so a future change to the sort or the keep loop that breaks the property
+ * aborts the pass before anything is written instead of silently opening a gap inside the
+ * retained range (or keeping part of a split tick).
+ */
+export function assertSuffixEviction(evicted, kept) {
+  if (evicted.length === 0 || kept.length === 0) return;
+  let maxEvictedMs = Number.NEGATIVE_INFINITY;
+  for (const { tsMs } of evicted) if (tsMs > maxEvictedMs) maxEvictedMs = tsMs;
+  let minKeptMs = Number.POSITIVE_INFINITY;
+  for (const { tsMs } of kept) if (tsMs < minKeptMs) minKeptMs = tsMs;
+  if (!(maxEvictedMs < minKeptMs)) {
+    throw new Error("enforceFactRetention suffix violation: byte-cap eviction must remove a strict, tick-aligned oldest-ts prefix");
+  }
+}
+
+/**
  * Deliberate deviation from history-store.js's enforceHistoryRetention (convention #2):
  * the retention rewrite uses tmp+rename (atomic), not a direct fs.writeFile — facts feed
  * mining/promotion decisions (S6c/S7), where partial-write corruption is more consequential
@@ -265,24 +284,45 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
   const futureThresholdMs = nowMs + FUTURE_FACT_TOLERANCE_MS;
   const futureDropped = validRecords.filter(({ tsMs }) => tsMs > futureThresholdMs);
   const ageEvicted = validRecords.filter(({ tsMs }) => tsMs < cutoffMs);
-  const candidates = validRecords
+  const sortedCandidates = validRecords
     .filter(({ tsMs }) => tsMs >= cutoffMs && tsMs <= futureThresholdMs)
     .sort((left, right) => left.tsMs - right.tsMs);
+  // Test-only seam (fact-store capacity plan T5): lets a test force a non-suffix order through the
+  // keep loop below to prove assertSuffixEviction refuses it. Never set in production.
+  const candidates = typeof options.orderRetentionCandidates === "function"
+    ? options.orderRetentionCandidates(sortedCandidates)
+    : sortedCandidates;
 
-  const keptReversed = [];
-  let usedBytes = 0;
+  // Byte-cap selection: keep the newest records that fit, walking newest-first and stopping at the
+  // FIRST record that does not fit (never skipping one to fit an older one) -- so the kept set is a
+  // suffix of the ts-sorted candidates and eviction only ever removes an oldest-end prefix.
+  let keepFrom = candidates.length;
+  let fitBytes = 0;
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const line = encodeJsonLine(candidates[index].record);
-    const size = Buffer.byteLength(line);
-    if (keptReversed.length > 0 && usedBytes + size > maxBytes) break;
-    if (size > maxBytes && keptReversed.length === 0) break;
-    keptReversed.push(line);
-    usedBytes += size;
+    const size = Buffer.byteLength(encodeJsonLine(candidates[index].record));
+    if (fitBytes + size > maxBytes) break;
+    fitBytes += size;
+    keepFrom = index;
   }
+  // R0b tick alignment (fact-store capacity plan §4.1 item 1, invariant I3): the sort is stable, so
+  // records sharing one ts keep file order and the cut above can split a tick -- typically keeping
+  // its census/overflow markers (emitted last) while evicting some of its presence facts, which
+  // would read as a COMPLETE tick that is missing entities (a fabricated disappearance/count drop).
+  // Evict every kept record that shares the newest evicted record's ts, so no part of a split tick
+  // survives whatever the per-family record order. Degenerate cases follow: a single tick larger
+  // than maxBytes, or maxBytes 0, evicts everything.
+  if (keepFrom > 0) {
+    const boundaryMs = candidates[keepFrom - 1].tsMs;
+    while (keepFrom < candidates.length && candidates[keepFrom].tsMs === boundaryMs) keepFrom += 1;
+  }
+  const evictedCandidates = candidates.slice(0, keepFrom);
+  const keptCandidates = candidates.slice(keepFrom);
+  assertSuffixEviction(evictedCandidates, keptCandidates);
 
-  const keptLines = keptReversed.reverse();
+  const keptLines = keptCandidates.map(({ record }) => encodeJsonLine(record));
+  const usedBytes = keptLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
   const keptRecords = keptLines.map((line) => JSON.parse(line));
-  const bytecapEvicted = candidates.length - keptRecords.length;
+  const bytecapEvicted = evictedCandidates.length;
   // daybreak-blue security sweep, fact-store BLOCKER #1, fix layer 2: every valid record must
   // be either kept or counted as an observable eviction (age/bytecap) -- no valid record may
   // silently vanish from the accounting. This is a defense-in-depth backstop against this bug
