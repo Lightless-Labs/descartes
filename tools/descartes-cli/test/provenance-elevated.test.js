@@ -403,6 +403,39 @@ test("same-port multi-row aggregation preserves every row reason and elevated pr
   assert.equal(outcome.result.privilege.elevated_available, false);
 });
 
+test("cross-UID multi-row aggregation preserves every helper reason and privilege diagnostic", async () => {
+  const paths = await tempPaths();
+  await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });
+  const otherUid = (process.getuid?.() ?? 1000) + 1;
+  const outcome = await resolveByPortLinux(8080, fakeElevatedOptions({
+    paths,
+    readFile: async (filePath) => filePath === "/proc/net/tcp"
+      ? tcpListeningRowsFixture({ uid: otherUid, inodes: ["424242", "424243"] })
+      : "1\n",
+    probeElevatedHelper: async () => ({ available: true, mechanism: "cap_sys_ptrace" }),
+    invokeElevatedHelper: async (_helperPath, argv) => ({
+      status: "unable",
+      ...(argv.at(-1) === "424242"
+        ? { helper_timeout_killed: true }
+        : { helper_hardening_failure: true }),
+      stdout: "",
+      stderr: "",
+    }),
+  }));
+
+  assert.equal(outcome.resolvedStatus, "partial");
+  assert.deepEqual(outcome.result.resolved.reasons, ["helper_timeout_killed", "helper_hardening_failure"]);
+  assert.deepEqual(outcome.result.source.details.reasons, ["helper_timeout_killed", "helper_hardening_failure"]);
+  assert.deepEqual(outcome.result.privilege, {
+    mechanism: "unprivileged",
+    elevated_available: false,
+    elevated_used: false,
+    ptrace_scope: "1",
+    helper_timeout_killed: true,
+    helper_hardening_failure: true,
+  });
+});
+
 test("same-UID uncertain fd attribution falls through to the enabled elevated exhaustive scan", async () => {
   const paths = await tempPaths();
   await writeProvenanceConfig(paths, { elevated: { enabled: true, mechanism: "cap_sys_ptrace" } });

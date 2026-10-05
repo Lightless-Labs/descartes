@@ -1307,6 +1307,22 @@ export async function resolveByPortLinux(port, options = {}) {
   const attributions = [];
   const outcomes = [];
   let singleResolutionOutcome;
+  const buildElevatedFailureAttribution = (originalReason, elevatedOutcome) => {
+    const originalClass = classifyOwnerAmbiguityReason(originalReason);
+    const elevatedReason = elevatedOutcome.result.resolved.reason;
+    const elevatedReasons = elevatedOutcome.result.resolved.reasons
+      ?? [elevatedReason].filter((reason) => reason !== undefined);
+    const elevatedClass = classifyOwnerAmbiguityReason(elevatedReason);
+    const rank = { unknown: 0, partial: 1, truncated: 2, ambiguous: 3 };
+    const originalRank = rank[originalClass?.status ?? "partial"];
+    const elevatedRank = rank[elevatedClass?.status ?? "partial"];
+    return {
+      resolved: false,
+      reason: elevatedRank >= originalRank ? elevatedReason : originalReason,
+      reasons: elevatedReasons,
+      privilege: elevatedOutcome.result.privilege,
+    };
+  };
   for (const [index, entry] of matches.entries()) {
     const socket = sockets[index];
     if (currentUid !== undefined && entry.uid === currentUid) {
@@ -1394,20 +1410,7 @@ export async function resolveByPortLinux(port, options = {}) {
           outcomes.push(elevatedOutcome);
           continue;
         }
-        const originalClass = classifyOwnerAmbiguityReason(originalReason);
-        const elevatedReason = elevatedOutcome.result.resolved.reason;
-        const elevatedReasons = elevatedOutcome.result.resolved.reasons
-          ?? [elevatedReason].filter((reason) => reason !== undefined);
-        const elevatedClass = classifyOwnerAmbiguityReason(elevatedReason);
-        const rank = { unknown: 0, partial: 1, truncated: 2, ambiguous: 3 };
-        const originalRank = rank[originalClass?.status ?? "partial"];
-        const elevatedRank = rank[elevatedClass?.status ?? "partial"];
-        attributions.push({
-          resolved: false,
-          reason: elevatedRank >= originalRank ? elevatedReason : originalReason,
-          reasons: elevatedReasons,
-          privilege: elevatedOutcome.result.privilege,
-        });
+        attributions.push(buildElevatedFailureAttribution(originalReason, elevatedOutcome));
         continue;
       }
       attributions.push({ resolved: false, reason: originalReason });
@@ -1419,7 +1422,10 @@ export async function resolveByPortLinux(port, options = {}) {
         outcomes.push(outcome);
         continue;
       }
-      attributions.push({ resolved: false, reason: outcome.result.resolved.reason ?? "socket_attribution_unresolved" });
+      attributions.push(buildElevatedFailureAttribution(
+        outcome.result.resolved.reason ?? "socket_attribution_unresolved",
+        outcome,
+      ));
       singleResolutionOutcome = outcome;
       continue;
     }

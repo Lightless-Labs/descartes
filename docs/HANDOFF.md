@@ -2,6 +2,15 @@
 
 **Last updated:** 2026-10-05
 
+## Current session — cross-UID multi-row provenance aggregation (2026-10-05)
+
+Fixed the remaining cross-UID same-port aggregation gap on `harden/root-helper-2026-10`.
+Same-UID and cross-UID failed elevation rows now use one attribution builder, preserving each
+row's full reason list and privilege diagnostics for the reducer. Added a two-row regression
+covering helper timeout plus hardening failure, including `ptrace_scope`. The fresh-XDG
+`npm test` run reported 2,096 tests: 2,040 passed, 22 environment-only failures, and 34
+skips. No Rust files were modified; no push or merge was performed.
+
 ## Current session — daybreak-blue remaining root-helper MEDIUM fixes (2026-10-05)
 
 The two remaining Node provenance findings are fixed locally on `harden/root-helper-2026-10`
