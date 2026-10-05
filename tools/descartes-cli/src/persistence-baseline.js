@@ -23,7 +23,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, ruleHorizonOk } from "./fact-store-completeness.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
   SCHEDULED_JOB_PRESENCE_FACT_NAME,
@@ -270,12 +270,17 @@ function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
 // hash-only shape, NOT service.disappeared's scoped 2026-07-24 cleartext-name exception. A future
 // operator sign-off can flip this to carry a sanitized job_kind/job_source/job_name, exactly as
 // noted in the plan — this default is a one-line follow-up away, not a redesign.
-export function buildScheduledJobAppearedCandidates(entries = []) {
+// Fact-store capacity plan §4.2 (step S3): a novelty claim carries its scope. history_certified_after_ts
+// turns "not seen in this host's recent history" into "not seen since <ts>" -- the start of the
+// certified memory the claim was decided against (noveltyHistoryScopeTs, fact-store-completeness.js).
+// Omitted (never null: the sanitizer redacts null) only when no scope is known.
+export function buildScheduledJobAppearedCandidates(entries = [], { historyCertifiedAfterTs } = {}) {
   return entries.map((entry) => {
     const entityKeyHash = hashScheduledJobEntityKey(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
       entity_key_hash: entityKeyHash,
       first_seen_ts: entry.first_seen_ts,
+      ...(typeof historyCertifiedAfterTs === "string" ? { history_certified_after_ts: historyCertifiedAfterTs } : {}),
     });
     return {
       id: alertId(SCHEDULED_JOB_APPEARED_RULE_ID, entityKeyHash),
@@ -424,5 +429,5 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildScheduledJobAppearedCandidates(appearances), evaluatedAlertKeys };
+  return { candidates: buildScheduledJobAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult) }), evaluatedAlertKeys };
 }

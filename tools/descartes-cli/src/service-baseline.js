@@ -39,7 +39,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, ruleHorizonOk } from "./fact-store-completeness.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
@@ -852,12 +852,17 @@ function hashServiceAppearedEntityKey(entityKey) {
 // 2026-07-24 cleartext-service-name exception to this new rule_id (that exception is explicitly
 // narrow, "do not generalize"). A future operator sign-off can add a sanitized `service_name`
 // diagnostics field the same way service.disappeared did, without a redesign.
-export function buildAppearedCandidates(entries = []) {
+// Fact-store capacity plan §4.2 (step S3): a novelty claim carries its scope. history_certified_after_ts
+// turns "not seen in this host's recent history" into "not seen since <ts>" -- the start of the
+// certified memory the claim was decided against (noveltyHistoryScopeTs, fact-store-completeness.js).
+// Omitted (never null: the sanitizer redacts null) only when no scope is known.
+export function buildAppearedCandidates(entries = [], { historyCertifiedAfterTs } = {}) {
   return entries.map((entry) => {
     const entityKeyHash = hashServiceAppearedEntityKey(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
       entity_key_hash: entityKeyHash,
       first_seen_ts: entry.first_seen_ts,
+      ...(typeof historyCertifiedAfterTs === "string" ? { history_certified_after_ts: historyCertifiedAfterTs } : {}),
     });
     return {
       id: alertId(SERVICE_APPEARED_RULE_ID, entityKeyHash),
@@ -1018,5 +1023,5 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
 
   if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys };
 
-  return { candidates: buildAppearedCandidates(appearances), evaluatedAlertKeys };
+  return { candidates: buildAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult) }), evaluatedAlertKeys };
 }

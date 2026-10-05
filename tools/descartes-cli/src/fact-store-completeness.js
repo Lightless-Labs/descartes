@@ -168,6 +168,19 @@ export function ruleHorizonOk(readResult, ruleId, nowMs) {
 }
 
 /**
+ * The scope of a novelty claim decided against this read's retained window (§4.2, §5 point 4): the
+ * certified boundary when the store is narrowed, else the oldest point the read returned (the store
+ * has held everything since then). undefined when neither is known. Display only.
+ */
+export function noveltyHistoryScopeTs(readResult) {
+  const completeness = readResult?.completeness;
+  if (!isObject(completeness)) return undefined;
+  if (isValidTimestamp(completeness.certified_after_ts)) return completeness.certified_after_ts;
+  if (isValidTimestamp(completeness.oldest_certified_ts)) return completeness.oldest_certified_ts;
+  return undefined;
+}
+
+/**
  * The non-detector readers' narrowing gate (fact-families.js READER_COVERAGE "read_window"; replaces
  * the interim requireFullCoverage gate of review-fold MEDIUM-1). True exactly when byte-cap eviction
  * is INVISIBLE to a read of `windowMs` ending at `nowMs` (windowMs undefined = an unbounded read):

@@ -1003,3 +1003,19 @@ test("computeProcessLineageBaselineCandidates (recovery coverage): a stale/uneva
     "nothing corrupt/lost -- staleness alone gates this tick, not cold-start",
   );
 });
+
+// Fact-store capacity plan §4.2 (step S3): novelty diagnostics carry their scope.
+test("S3: a novel_edge candidate carries history_certified_after_ts (the start of the memory it was decided against), surviving the diagnostics sanitizer", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeProcessLineageBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const points = flatten([completeTick(tickTs(0)), completeTick(tickTs(1)), completeTick(tickTs(2), [["shell", "node"], ["shell", "python"]])]);
+  const result = await computeProcessLineageBaselineCandidates(paths, {
+    now: tickTs(2),
+    minHistoryTickCount: 2,
+    activeFreshnessMs: HOUR_MS,
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", oldest_certified_ts: tickTs(0) }),
+  });
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].diagnostics.history_certified_after_ts, tickTs(0));
+});

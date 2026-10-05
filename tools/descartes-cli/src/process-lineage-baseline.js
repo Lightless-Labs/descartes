@@ -9,7 +9,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, ruleHorizonOk } from "./fact-store-completeness.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
@@ -301,12 +301,17 @@ function hashLineageEdgeEntityKey(entityKey) {
     .slice(0, 16);
 }
 
-export function buildNovelEdgeCandidates(entries = []) {
+// Fact-store capacity plan §4.2 (step S3): a novelty claim carries its scope. history_certified_after_ts
+// turns "not seen in this host's recent history" into "not seen since <ts>" -- the start of the
+// certified memory the claim was decided against (noveltyHistoryScopeTs, fact-store-completeness.js).
+// Omitted (never null: the sanitizer redacts null) only when no scope is known.
+export function buildNovelEdgeCandidates(entries = [], { historyCertifiedAfterTs } = {}) {
   return entries.map((entry) => {
     const entityKeyHash = hashLineageEdgeEntityKey(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
       entity_key_hash: entityKeyHash,
       first_seen_ts: entry.first_seen_ts,
+      ...(typeof historyCertifiedAfterTs === "string" ? { history_certified_after_ts: historyCertifiedAfterTs } : {}),
     });
     return {
       id: alertId(PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, entityKeyHash),
@@ -482,5 +487,5 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildNovelEdgeCandidates(novel), evaluatedAlertKeys };
+  return { candidates: buildNovelEdgeCandidates(novel, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult) }), evaluatedAlertKeys };
 }
