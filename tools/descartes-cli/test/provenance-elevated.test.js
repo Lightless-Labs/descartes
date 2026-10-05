@@ -353,7 +353,7 @@ test("defaultInvokeElevatedHelper maps the helper's EXIT_OWNER_AMBIGUOUS (5) to 
     readFile: async () => "1\n",
   });
   const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
-  assert.equal(outcome.resolvedStatus, "partial");
+  assert.equal(outcome.resolvedStatus, "ambiguous");
   assert.equal(outcome.result.resolved.pid, undefined);
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "1", elevated_owner_ambiguous: true });
 });
@@ -399,12 +399,12 @@ test("resolveCrossUidPortResult surfaces fd_scan_truncated in the provenance dia
   });
 
   const outcome = await resolveCrossUidPortResult({ port: 8080, primary: { ...PRIMARY }, sockets }, options);
-  // Fail-safe degrade is UNCHANGED — no pid fabricated, owning uid preserved, partial/0.4/missing_permission.
-  assert.equal(outcome.resolvedStatus, "partial");
+  // The fail-safe degrade retains the owning uid but now names the bounded scan condition.
+  assert.equal(outcome.resolvedStatus, "truncated");
   assert.equal(outcome.result.resolved.pid, undefined);
   assert.equal(outcome.result.resolved.user.uid, 1000);
   const fields = computeProvenanceEnvelopeFields(outcome.resolvedStatus, outcome.result.source.type);
-  assert.deepEqual(fields, { status: "partial", confidence: 0.4, reviewHint: "missing_permission" });
+  assert.deepEqual(fields, { status: "truncated", confidence: 0, reviewHint: "out_of_range" });
   // ...but the truncation is now OBSERVABLE, attached the same way as ptrace_scope, never gating resolution.
   assert.deepEqual(outcome.result.privilege, { mechanism: "unprivileged", elevated_available: false, elevated_used: false, ptrace_scope: "0", fd_scan_truncated: true });
 });

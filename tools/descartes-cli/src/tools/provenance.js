@@ -336,9 +336,12 @@ export function summarizeSocketAttributions(attributions = []) {
     return { status: "ambiguous", executablePath: undefined, reason: "socket_attribution_missing" };
   }
   const identities = new Set();
+  const reasons = [];
   for (const attribution of attributions) {
     if (attribution?.resolved !== true) {
-      return { status: "ambiguous", executablePath: undefined, reason: attribution?.reason ?? "socket_attribution_unresolved" };
+      const reason = attribution?.reason ?? "socket_attribution_unresolved";
+      if (!reasons.includes(reason)) reasons.push(reason);
+      continue;
     }
     const identity = attribution.processIdentity;
     if (!identity || !Number.isInteger(identity.tgid) || typeof identity.start_time !== "string") {
@@ -346,8 +349,16 @@ export function summarizeSocketAttributions(attributions = []) {
     }
     identities.add(`${identity.tgid}:${identity.start_time}`);
   }
+  if (reasons.length > 0) {
+    const status = reasons.some((reason) => ["owner_ambiguous", "elevated_owner_ambiguous"].includes(reason))
+      ? "ambiguous"
+      : reasons.includes("fd_scan_truncated")
+        ? "truncated"
+        : "partial";
+    return { status, executablePath: undefined, reason: reasons[0], reasons };
+  }
   if (identities.size !== 1) {
-    return { status: "ambiguous", executablePath: undefined, reason: "owner_ambiguous" };
+    return { status: "ambiguous", executablePath: undefined, reason: "owner_ambiguous", reasons: ["owner_ambiguous"] };
   }
   return { status: "ok", reason: "socket_attribution_consistent" };
 }
@@ -515,8 +526,8 @@ export function parseProvenancePs(stdout) {
 
 export function computeProvenanceEnvelopeFields(resolvedStatus, sourceType) {
   const confidence = resolvedStatus === "ok" && sourceType !== "unknown" ? 1 : resolvedStatus === "partial" ? 0.4 : 0;
-  const reviewHint = resolvedStatus === "partial" ? "missing_permission" : sourceType === "unknown" ? "ambiguous" : "none";
-  const status = resolvedStatus === "ok" ? "ok" : resolvedStatus === "partial" ? "partial" : "unknown";
+  const reviewHint = resolvedStatus === "partial" ? "missing_permission" : resolvedStatus === "truncated" ? "out_of_range" : sourceType === "unknown" || resolvedStatus === "ambiguous" ? "ambiguous" : "none";
+  const status = ["ok", "partial", "ambiguous", "truncated"].includes(resolvedStatus) ? resolvedStatus : "unknown";
   return { status, confidence, reviewHint };
 }
 
@@ -841,6 +852,23 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
   // 2026-10 (research finding 2): the exact socket is held by processes running different
   // executables -- the helper named no owner rather than guess.
   const ownerAmbiguous = observedInvoke?.owner_ambiguous === true;
+  const degradedReasons = [
+    ...(fdScanTruncated ? ["fd_scan_truncated"] : []),
+    ...(ownerAmbiguous ? ["elevated_owner_ambiguous"] : []),
+  ];
+  const degradedOutcome = degradedReasons.length === 0
+    ? unprivilegedOutcome
+    : (() => {
+      const resolvedStatus = ownerAmbiguous ? "ambiguous" : "truncated";
+      const reason = ownerAmbiguous ? "elevated_owner_ambiguous" : "fd_scan_truncated";
+      const core = {
+        ...unprivilegedCore,
+        resolvedStatus,
+        resolved: { ...unprivilegedCore.resolved, status: resolvedStatus, reason, reasons: degradedReasons },
+        source: { ...unprivilegedCore.source, details: { ...unprivilegedCore.source.details, reason, reasons: degradedReasons } },
+      };
+      return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
+    })();
   const withDiagnostics = (outcome) => {
     if (ptraceScope === undefined && !fdScanTruncated && !helperHardeningFailure && !helperSeccompKilled && !helperTimeoutKilled && !ownerAmbiguous) return outcome; // byte-identical: no diagnostic fields.
     const privilege = { ...outcome.result.privilege };
@@ -853,7 +881,7 @@ export async function resolveCrossUidPortResult({ port, primary, sockets }, opti
     return { ...outcome, result: { ...outcome.result, privilege } };
   };
 
-  if (!upgrade) return withDiagnostics(unprivilegedOutcome);
+  if (!upgrade) return withDiagnostics(degradedOutcome);
 
   // Trust model: the owning uid is a FREE, confident fact the unprivileged path already resolved
   // (primary.uid). The helper is trusted ONLY for the NEW fact it provides (the pid + exe/command),
@@ -986,15 +1014,16 @@ async function resolveByPortLinux(port, options = {}) {
     const summary = summarizeSocketAttributions(attributions);
     if (summary.status !== "ok") {
       const core = {
-        resolvedStatus: "partial",
+        resolvedStatus: summary.status,
         resolved: {
-          status: "partial",
+          status: summary.status,
           pid: undefined,
           user: { uid: undefined, username: undefined, username_unavailable: true },
           reason: summary.reason,
+          ...(summary.reasons ? { reasons: summary.reasons } : {}),
         },
         ancestry: [],
-        source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: summary.reason, socket_count: matches.length } },
+        source: { type: "unknown", name: undefined, confidence: 0, review_hint: "ambiguous", details: { reason: summary.reason, ...(summary.reasons ? { reasons: summary.reasons } : {}), socket_count: matches.length } },
       };
       return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
     }
@@ -1021,10 +1050,13 @@ async function resolveByPortLinux(port, options = {}) {
 
   if (matches.length === 1 && attributions[0]?.resolved !== true && currentUid !== undefined && primary.uid === currentUid) {
     const reason = attributions[0]?.reason ?? "socket_attribution_unresolved";
+    const resolvedStatus = ["owner_ambiguous", "elevated_owner_ambiguous"].includes(reason)
+      ? "ambiguous"
+      : reason === "fd_scan_truncated" ? "truncated" : "partial";
     const core = {
-      resolvedStatus: "partial",
+      resolvedStatus,
       resolved: {
-        status: "partial",
+        status: resolvedStatus,
         pid: undefined,
         user: { uid: primary.uid, username: undefined, username_unavailable: true },
         reason,

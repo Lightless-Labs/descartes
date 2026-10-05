@@ -133,7 +133,16 @@ test("same-port socket attribution is ambiguous when inodes map to different exe
   assert.equal(summarizeSocketAttributions([
     { resolved: true, executablePath: "/usr/sbin/nginx", processIdentity: { tgid: 100, start_time: "10" } },
     { resolved: false },
-  ]).status, "ambiguous");
+  ]).status, "partial");
+  assert.deepEqual(summarizeSocketAttributions([
+    { resolved: false, reason: "fd_scan_truncated" },
+    { resolved: false, reason: "elevated_owner_ambiguous" },
+  ]), {
+    status: "ambiguous",
+    executablePath: undefined,
+    reason: "fd_scan_truncated",
+    reasons: ["fd_scan_truncated", "elevated_owner_ambiguous"],
+  });
 });
 
 test("same-executable SO_REUSEPORT holders are ambiguous, while TCP and UDP from one process agree", () => {
@@ -386,6 +395,8 @@ test("parseContainerInspectPid parses a plain numeric docker/podman inspect pid"
 test("computeProvenanceEnvelopeFields maps resolved status/source type to confidence and review_hint", () => {
   assert.deepEqual(computeProvenanceEnvelopeFields("ok", "shell"), { status: "ok", confidence: 1, reviewHint: "none" });
   assert.deepEqual(computeProvenanceEnvelopeFields("partial", "unknown"), { status: "partial", confidence: 0.4, reviewHint: "missing_permission" });
+  assert.deepEqual(computeProvenanceEnvelopeFields("ambiguous", "unknown"), { status: "ambiguous", confidence: 0, reviewHint: "ambiguous" });
+  assert.deepEqual(computeProvenanceEnvelopeFields("truncated", "unknown"), { status: "truncated", confidence: 0, reviewHint: "out_of_range" });
   assert.deepEqual(computeProvenanceEnvelopeFields("unknown", "unknown"), { status: "unknown", confidence: 0, reviewHint: "ambiguous" });
 });
 
