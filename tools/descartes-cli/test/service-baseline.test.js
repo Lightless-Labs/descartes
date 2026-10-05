@@ -741,7 +741,7 @@ test("computeServiceBaselineCandidates: rollback repairs a future anchor and wat
     minHistoryTickCount: 6,
     establishedMinCensusCount: 2,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }),
   };
   await computeServiceBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal((await loadServiceBaselineStore(paths)).state.last_folded_ts, undefined);
@@ -1404,4 +1404,27 @@ test("[P9] SERVICE_APPEARED_RULE_ID classifies to unknown_namespace -- structura
   const classified = classifyAlertNamespace(SERVICE_APPEARED_RULE_ID);
   assert.equal(classified.namespace, undefined);
   assert.equal(classified.hardExcluded, false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store capacity plan §4.2, step S3: service.disappeared's 6 h eligibility horizon.
+// ---------------------------------------------------------------------------------------------
+
+test("S3 horizon: a horizon-short service store emits no service.disappeared and reports no coverage, never re-arms, advances the fold, and resumes on the same tick", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
+  const points = flatten([...establishedTicks(["svc-a", "svc-b"], 4), completeTick(tickTs(4), ["svc-a"])]);
+  const narrowed = (floorTs) => async () => intactReadResult(points, { status: "intact", coverage: "narrowed", bytecap_floor_ts: floorTs, age_floor_ts: null });
+
+  const short = await computeServiceBaselineCandidates(paths, { now: tickTs(4), readFactPoints: narrowed(tickTs(-1)) });
+  assert.deepEqual(short.candidates, [], "5 h < 6 h: no disappearance claim");
+  assert.deepEqual(short.evaluatedAlertKeys, [], "no coverage, so a persisted alert freezes rather than recovering");
+  const state = (await loadServiceBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, false, "a short horizon never re-arms the lockout (I5)");
+  assert.equal(state.last_folded_ts, tickTs(4), "the fold still advances");
+
+  const restored = await computeServiceBaselineCandidates(paths, { now: tickTs(4), readFactPoints: narrowed(tickTs(-2)) });
+  assert.equal(restored.candidates.filter((candidate) => candidate.rule_id === SERVICE_DISAPPEARED_RULE_ID).length, 1, "exactly 6 h: resumes on the same tick, no re-accumulation");
+  assert.ok(restored.evaluatedAlertKeys.length > 0);
 });

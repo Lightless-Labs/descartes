@@ -117,7 +117,9 @@ function flatten(groupsOfPoints) {
 // Fact-store completeness hardening (Slice 4) fixtures, mirroring process-lineage-baseline.test.js's
 // intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
 // dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
-function intactReadResult(points, completeness = { status: "intact" }) {
+// coverage: "full" -- a real intact store always reports its coverage (fact-store capacity plan S2);
+// since S3 the per-rule eligibility horizon fails closed on a completeness without it (LOW-2).
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return {
     points,
     corrupt_count: 0,
@@ -908,7 +910,7 @@ test("computeSessionBaselineCandidates: rollback repairs a future anchor and wat
   const options = {
     minHistoryTickCount: 6,
     minSampleCount: 2,
-    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }),
   };
   await computeSessionBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal((await loadSessionBaselineStore(paths)).state.last_folded_ts, undefined);
@@ -1318,4 +1320,51 @@ test("recovery coverage (ii) — UNEVALUATED identities are NOT reported (so a p
     false,
     "a provisional (warm-up) count_drop must not report the global identity",
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store capacity plan §4.2, step S3: the per-rule eligibility horizon. count_drop (30 h) and
+// churn (6 h) are gated independently; a horizon-short rule emits no candidate and reports no
+// coverage, and NOTHING else changes (no cold-start re-arm; the fold proceeds), so it resumes on the
+// very tick its certified span recovers. The narrowed reader rewrites only the floor -- the gate is
+// a pure function of (floor, now), so the points are deliberately left as-is.
+// ---------------------------------------------------------------------------------------------
+
+function narrowedSessionReader(floorTs) {
+  return async (paths, options) => {
+    const read = await readFactPoints(paths, options);
+    return { ...read, completeness: { ...read.completeness, coverage: "narrowed", bytecap_floor_ts: floorTs, age_floor_ts: null } };
+  };
+}
+
+test("S3 horizon: count_drop (30 h) and churn (6 h) are gated per rule -- short emits nothing and reports no coverage, never re-arms, and resumes on the same tick", async () => {
+  const paths = await tempPaths();
+  const ticks = [];
+  // 20 sessions per tick for count_drop, with ONE conforming session (session.<mux>.<hash>) among
+  // them so churn has an identity to evaluate.
+  for (let i = 0; i < 31; i += 1) ticks.push([...completeTick(tickTs(i), 19), sessionPoint(tickTs(i), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222")]);
+  const now = tickTs(30);
+  const baseline = await seedAndCompute(paths, flatten(ticks), { now });
+  const dropKey = alertId(SESSION_COUNT_DROP_RULE_ID, "global");
+  assert.ok(baseline.evaluatedAlertKeys.includes(dropKey), "control: count_drop evaluated with full coverage");
+  const baselineChurnCount = baseline.evaluatedAlertKeys.filter((key) => key !== dropKey).length;
+  assert.ok(baselineChurnCount > 0, "control: churn identities evaluated with full coverage");
+
+  // 25 h of certified history: count_drop (30 h) is short, churn (6 h) is not.
+  const dropShort = await computeSessionBaselineCandidates(paths, { now, readFactPoints: narrowedSessionReader(tickTs(5)) });
+  assert.equal(dropShort.evaluatedAlertKeys.includes(dropKey), false, "a horizon-short count_drop reports no coverage, so a persisted alert freezes");
+  assert.equal(dropShort.candidates.some((candidate) => candidate.rule_id === SESSION_COUNT_DROP_RULE_ID), false);
+  assert.equal(dropShort.evaluatedAlertKeys.filter((key) => key !== dropKey).length, baselineChurnCount, "churn is gated independently and still evaluates");
+
+  // 3 h: both short.
+  const bothShort = await computeSessionBaselineCandidates(paths, { now, readFactPoints: narrowedSessionReader(tickTs(27)) });
+  assert.deepEqual(bothShort.evaluatedAlertKeys, []);
+  assert.deepEqual(bothShort.candidates, []);
+  const state = (await loadSessionBaselineStore(paths)).state;
+  assert.equal(state.cold_start_pending, false, "a short horizon never re-arms the cold-start lockout (I5)");
+
+  // 31 h: both restored, on the same tick, with no re-accumulation.
+  const restored = await computeSessionBaselineCandidates(paths, { now, readFactPoints: narrowedSessionReader(tickTs(-1)) });
+  assert.ok(restored.evaluatedAlertKeys.includes(dropKey));
+  assert.equal(restored.evaluatedAlertKeys.filter((key) => key !== dropKey).length, baselineChurnCount);
 });

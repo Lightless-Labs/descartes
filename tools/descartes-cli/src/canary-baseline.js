@@ -9,7 +9,7 @@ import { loadCanaryManifest } from "./canary-manifest.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import {
   CANARY_CENSUS_FACT_NAME,
   CANARY_CENSUS_MARKER_ENTITY_KEY,
@@ -778,7 +778,13 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
     })
     : { vanished: [], evaluatedCanaryIds: new Set() };
   const rawVanished = vanishedWalk.vanished;
-  const outputVanished = coldStartPendingThisTick ? [] : rawVanished;
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; 6 h), applied to the canary_vanished
+  // ABSENCE claim only -- the one history-gated reason under canary.tampered. canary.tripped
+  // (positive evidence) and the manifest/store tamper reasons (direct I/O signals) are not
+  // history claims and stay ungated, exactly as they stay outside the cold-start lockout.
+  const vanishedHorizonOk = ruleHorizonOk(readResult, CANARY_TAMPERED_RULE_ID, nowMs);
+  const vanishedEvaluable = !coldStartPendingThisTick && vanishedHorizonOk;
+  const outputVanished = vanishedEvaluable ? rawVanished : [];
   for (const entry of outputVanished) {
     tamperEntries.push({ reason: "canary_vanished", canary_id: entry.canary_id, kind: entry.kind, last_seen_ts: entry.last_seen_ts });
   }
@@ -904,7 +910,7 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   // groups + fresh census + this canary established under a verified, still-monitored identity.
   // Present-established canaries are reported too (found clear -> a stale canary_vanished alert can
   // recover, one tick after the canary reappears in the `previous` complete group).
-  if (!coldStartPendingThisTick && manifestReadOk) {
+  if (vanishedEvaluable && manifestReadOk) {
     for (const canaryId of vanishedWalk.evaluatedCanaryIds) {
       evaluatedAlertKeys.add(alertId(CANARY_TAMPERED_RULE_ID, hashCanaryTamperKey(`canary_vanished:${canaryId}`)));
     }

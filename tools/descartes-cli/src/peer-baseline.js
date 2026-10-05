@@ -25,7 +25,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, computeZScore, emptyWelfordStats, foldWelford, updateEwma } from "./welford-stats.js";
 
@@ -863,12 +863,17 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // fresh from `windowed`/`windowedDrop` on EVERY call — including ticks where nothing new was
   // folded — so applyAlertCandidates never spuriously "recovers" an active peer.count_spike/
   // peer.count_drop just because this source skipped a redundant write.
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3), per direction (both 30 h,
+  // MIN_SAMPLE_COUNT). A horizon-short direction emits no candidate and reports no coverage; the
+  // lockout/fold above are untouched, so it resumes on the tick its certified span recovers.
+  const spikeHorizonOk = ruleHorizonOk(readResult, PEER_COUNT_SPIKE_RULE_ID, nowMs);
+  const dropHorizonOk = ruleHorizonOk(readResult, PEER_COUNT_DROP_RULE_ID, nowMs);
   const candidates = [];
   const spikeCandidate = buildCountSpikeCandidate(
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
     { deviationSigma },
   );
-  if (spikeCandidate) candidates.push(spikeCandidate);
+  if (spikeCandidate && spikeHorizonOk) candidates.push(spikeCandidate);
   const dropCandidate = buildCountDropCandidate(
     { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
     { deviationSigma },
@@ -888,7 +893,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
         && groupMs > new Date(persistedState.cold_start_since_ts).getTime()
         && groupMs < scoredDropMs;
     }).length >= minHistoryTickCount);
-  if (dropCandidate && dropRecoveryReady) candidates.push(dropCandidate);
+  if (dropCandidate && dropRecoveryReady && dropHorizonOk) candidates.push(dropCandidate);
 
   // Detector-reported recovery coverage (plan §8.B/§8.C, peer recipe). evaluatedAlertKeys = the
   // alert identities this detector GENUINELY evaluated this tick -- every family it had
@@ -905,10 +910,10 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     count_drop-only warm-up the spike direction does not share), so gating drop on
   //     windowedDrop.confidence_state alone would fabricate a recovery.
   const evaluatedAlertKeys = [];
-  if (windowed.confidence_state === "established") {
+  if (windowed.confidence_state === "established" && spikeHorizonOk) {
     evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, "global"));
   }
-  if (windowedDrop.confidence_state === "established" && dropRecoveryReady) {
+  if (windowedDrop.confidence_state === "established" && dropRecoveryReady && dropHorizonOk) {
     evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, "global"));
   }
   return { candidates, evaluatedAlertKeys };

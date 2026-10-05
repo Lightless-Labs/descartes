@@ -30,6 +30,8 @@
 // is still a continuity break (prefix-digest check), and the corrupt, schema-invalid, continuity
 // and future-fact channels keep their trust semantics (I4). last_bytecap_evict_ts and
 // bytecap_evicted_total stay as informational fields.
+import { ruleHorizonMs } from "./fact-families.js";
+
 export const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = Object.freeze([
   "last_future_fact_ts",
   "last_corrupt_ts",
@@ -99,22 +101,25 @@ export function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
 
 // A completeness object carries a VALID ledger's coverage report only when coverage is exactly
 // "full" or "narrowed" (LOW-2, review fold: buildCompleteness reports "unknown" when there is no
-// ledger at all, whose null floor would otherwise read as "never narrowed").
+// ledger at all, whose null floor would otherwise read as "never narrowed"). A floor field that is
+// absent reads as null (a real store always reports both; hand-built "full" fixtures omit them),
+// but a "narrowed" report with no floor at all is self-contradictory and fails closed, as does any
+// floor that is present but not a valid timestamp.
 function validLedgerFloors(readResult) {
   const completeness = readResult?.completeness;
   if (!isObject(completeness)) return undefined;
   if (completeness.coverage !== "full" && completeness.coverage !== "narrowed") return undefined;
   const floors = {};
   for (const field of ["bytecap_floor_ts", "age_floor_ts"]) {
-    if (!Object.prototype.hasOwnProperty.call(completeness, field)) return undefined;
     const value = completeness[field];
-    if (value === null) {
+    if (value === null || value === undefined) {
       floors[field] = null;
       continue;
     }
     if (!isValidTimestamp(value)) return undefined;
     floors[field] = Date.parse(value);
   }
+  if (completeness.coverage === "narrowed" && floors.bytecap_floor_ts === null && floors.age_floor_ts === null) return undefined;
   return floors;
 }
 
@@ -147,6 +152,19 @@ export function certifiedHorizonOk(readResult, { nowMs, horizonMs } = {}) {
   } catch {
     return false;
   }
+}
+
+/**
+ * certifiedHorizonOk with the rule's registered horizon (fact-families.js RULE_HORIZONS). An
+ * unregistered rule fails closed. The per-detector gate (§4.2): a rule is evaluable only when it is
+ * not cold-start pending AND this holds; when it does not, the detector emits no candidate and
+ * reports no evaluatedAlertKeys for that rule -- and nothing else changes (no re-arm, the fold and
+ * store write proceed), so the rule resumes on the very tick its horizon recovers.
+ */
+export function ruleHorizonOk(readResult, ruleId, nowMs) {
+  const horizonMs = ruleHorizonMs(ruleId);
+  if (horizonMs === undefined) return false;
+  return certifiedHorizonOk(readResult, { nowMs, horizonMs });
 }
 
 /**

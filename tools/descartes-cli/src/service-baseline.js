@@ -39,7 +39,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
@@ -649,16 +649,23 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   // Recovery-coverage report (§8.B/§8.C): the alert identities this detector GENUINELY evaluated
   // this tick — empty when coldStartPendingThisTick (computeCensusEvaluatedAlertKeys short-circuits
   // on it), matching the frozen `[]` candidates below.
-  const evaluatedAlertKeys = computeCensusEvaluatedAlertKeys(currentGroups, {
-    coldStartPendingThisTick,
-    nowMs,
-    freshnessMs,
-    minCompleteGroups: 2, // detectServiceDisappearances' own `completeGroups.length < 2 -> []` gate
-    ruleId: SERVICE_DISAPPEARED_RULE_ID,
-    hashEntityKey: hashServiceEntityKey,
-  });
+  //
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; 6 h): computed AFTER the lockout
+  // state machine and the store write above, never an input to either (I5) -- a horizon-short tick
+  // emits nothing and reports no coverage, then resumes the moment the certified span recovers.
+  const horizonOk = ruleHorizonOk(readResult, SERVICE_DISAPPEARED_RULE_ID, nowMs);
+  const evaluatedAlertKeys = horizonOk
+    ? computeCensusEvaluatedAlertKeys(currentGroups, {
+      coldStartPendingThisTick,
+      nowMs,
+      freshnessMs,
+      minCompleteGroups: 2, // detectServiceDisappearances' own `completeGroups.length < 2 -> []` gate
+      ruleId: SERVICE_DISAPPEARED_RULE_ID,
+      hashEntityKey: hashServiceEntityKey,
+    })
+    : [];
 
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys };
+  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys };
 
   // Re-emission every tick (load-bearing, mirrors session/peer's own "re-emission every tick"
   // behavior): built fresh from `disappearances` on EVERY call — never dependent on whether a store
@@ -959,7 +966,10 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
     }
   }
 
-  const appearances = coldStartPendingThisTick
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h). Never an input
+  // to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = ruleHorizonOk(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
+  const appearances = coldStartPendingThisTick || !horizonOk
     ? []
     : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount });
 
@@ -995,16 +1005,18 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   // threshold detectServiceAppearances applies (`completeGroups.length < minHistoryTickCount + 1`,
   // where it is called with minHistoryTickCount: establishedMinCensusCount) — NOT the lockout
   // re-accumulation `minHistoryTickCount`, which is a different knob with a colliding name.
-  const evaluatedAlertKeys = computeCensusEvaluatedAlertKeys(currentGroups, {
-    coldStartPendingThisTick,
-    nowMs,
-    freshnessMs,
-    minCompleteGroups: establishedMinCensusCount + 1,
-    ruleId: SERVICE_APPEARED_RULE_ID,
-    hashEntityKey: hashServiceAppearedEntityKey,
-  });
+  const evaluatedAlertKeys = horizonOk
+    ? computeCensusEvaluatedAlertKeys(currentGroups, {
+      coldStartPendingThisTick,
+      nowMs,
+      freshnessMs,
+      minCompleteGroups: establishedMinCensusCount + 1,
+      ruleId: SERVICE_APPEARED_RULE_ID,
+      hashEntityKey: hashServiceAppearedEntityKey,
+    })
+    : [];
 
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys };
+  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys };
 
   return { candidates: buildAppearedCandidates(appearances), evaluatedAlertKeys };
 }

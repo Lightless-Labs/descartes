@@ -23,7 +23,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
   SCHEDULED_JOB_PRESENCE_FACT_NAME,
@@ -382,16 +382,20 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   }
 
   const detectionOptions = { nowMs, freshnessMs, minHistoryTickCount };
-  const appearances = coldStartPendingThisTick ? [] : detectScheduledJobAppearances(currentGroups, detectionOptions);
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h). Never an input
+  // to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = ruleHorizonOk(readResult, SCHEDULED_JOB_APPEARED_RULE_ID, nowMs);
+  const evaluable = !coldStartPendingThisTick && horizonOk;
+  const appearances = evaluable ? detectScheduledJobAppearances(currentGroups, detectionOptions) : [];
 
   // Detector-reported recovery coverage (§8.B/§8.C): the alert identities this detector genuinely
   // evaluated this tick. Gated by the SAME coldStartPendingThisTick short-circuit that zeroes
   // `appearances`, then by detectScheduledJobAppearances' own readiness gates (via the sibling
   // predicate). Empty when the detector could not evaluate — the daemon then freezes any persisted
   // scheduled_job.appeared alert instead of fabricating a recovery.
-  const evaluatedAlertKeys = (coldStartPendingThisTick
-    ? []
-    : scheduledJobEvaluatedEntityKeys(currentGroups, detectionOptions))
+  const evaluatedAlertKeys = (evaluable
+    ? scheduledJobEvaluatedEntityKeys(currentGroups, detectionOptions)
+    : [])
     .map((entityKey) => alertId(SCHEDULED_JOB_APPEARED_RULE_ID, hashScheduledJobEntityKey(entityKey)));
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming

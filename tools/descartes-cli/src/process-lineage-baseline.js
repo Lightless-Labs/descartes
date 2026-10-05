@@ -9,7 +9,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
@@ -444,13 +444,17 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     }
   }
 
-  const novel = coldStartPendingThisTick ? [] : detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 6 d). Never an input to
+  // the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = ruleHorizonOk(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, nowMs);
+  const evaluable = !coldStartPendingThisTick && horizonOk;
+  const novel = evaluable ? detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount }) : [];
   // §8.B/§8.C coverage: reported from the SAME state the detector already computed (currentGroups +
   // the readiness predicate), zeroed under coldStartPendingThisTick exactly as `novel` is -- never a
   // change to detection logic, cold-start lockout, or completeness gates.
-  const evaluatedAlertKeys = coldStartPendingThisTick
-    ? []
-    : computeEvaluatedProcessLineageEdgeKeys(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
+  const evaluatedAlertKeys = evaluable
+    ? computeEvaluatedProcessLineageEdgeKeys(currentGroups, { nowMs, freshnessMs, minHistoryTickCount })
+    : [];
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
   // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still

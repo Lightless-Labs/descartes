@@ -157,7 +157,9 @@ function flatten(groupsOfPoints) {
 // Fact-store completeness hardening (Slice 5) fixtures, mirroring session-baseline.test.js's
 // intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
 // dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
-function intactReadResult(points, completeness = { status: "intact" }) {
+// coverage: "full" -- a real intact store always reports its coverage (fact-store capacity plan S2);
+// since S3 the per-rule eligibility horizon fails closed on a completeness without it (LOW-2).
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return {
     points,
     corrupt_count: 0,
@@ -1069,7 +1071,7 @@ test("computePeerBaselineCandidates: rollback repairs a future anchor and waterm
   const options = {
     minHistoryTickCount: 6,
     minSampleCount: 2,
-    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }),
   };
   await computePeerBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal((await loadPeerBaselineStore(paths)).state.last_folded_ts, undefined);
@@ -1548,4 +1550,33 @@ test("computePeerBaselineCandidates calls the real (default) loadWatchConfig whe
   });
   assert.deepEqual(result.candidates, []);
   assert.equal(readCalled, true, "watch.json's real ENOENT default is enabled:true (watch-by-default slice 1) -- unlike the pre-split default, I/O IS attempted even with nothing injected");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store capacity plan §4.2, step S3: the per-rule eligibility horizon (spike/drop, 30 h each).
+// ---------------------------------------------------------------------------------------------
+
+function narrowedPeerReader(floorTs) {
+  return async (paths, options) => {
+    const read = await readFactPoints(paths, options);
+    return { ...read, completeness: { ...read.completeness, coverage: "narrowed", bytecap_floor_ts: floorTs, age_floor_ts: null } };
+  };
+}
+
+test("S3 horizon: a horizon-short peer store reports neither direction and emits nothing, never re-arms, and both directions resume on the tick the span recovers", async () => {
+  const paths = await tempPaths();
+  const flatTicks = [];
+  for (let i = 0; i < 31; i += 1) flatTicks.push(...activeTickWithMarker(tickTs(i), 5));
+  const now = tickTs(30);
+  const baseline = await seedAndCompute(paths, flatTicks, { now });
+  const both = [alertId(PEER_COUNT_SPIKE_RULE_ID, "global"), alertId(PEER_COUNT_DROP_RULE_ID, "global")].sort();
+  assert.deepEqual([...baseline.evaluatedAlertKeys].sort(), both, "control: both directions evaluated with full coverage");
+
+  const short = await computePeerBaselineCandidates(paths, { now, readFactPoints: narrowedPeerReader(tickTs(5)) });
+  assert.deepEqual(short.evaluatedAlertKeys, [], "25 h < 30 h: no coverage for either direction");
+  assert.deepEqual(short.candidates, []);
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false, "no cold-start re-arm (I5)");
+
+  const restored = await computePeerBaselineCandidates(paths, { now, readFactPoints: narrowedPeerReader(tickTs(0)) });
+  assert.deepEqual([...restored.evaluatedAlertKeys].sort(), both, "exactly 30 h: both directions resume on the same tick");
 });

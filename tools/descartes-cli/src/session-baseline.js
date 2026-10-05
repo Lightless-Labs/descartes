@@ -31,7 +31,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 // Slice 4b (observed-incident collectors plan), Decision 4 / Fable review MUST-FIX 5: the four
 // pure Welford/EWMA/z-score primitives + DEFAULT_BASELINE_FACT_WINDOW_MS were extracted into
@@ -808,6 +808,14 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // daemon then freezes every owned session identity, never fabricating a recovery).
   if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
 
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3): PER RULE -- count_drop is
+  // statistical (30 h) and churn a fingerprint diff (6 h). A horizon-short rule emits no candidate
+  // and reports no coverage (so a persisted alert freezes rather than recovering off a window too
+  // short to evaluate it), and nothing else changes: the lockout and the fold above already ran, so
+  // the rule resumes on the very tick its certified span recovers.
+  const dropHorizonOk = ruleHorizonOk(readResult, SESSION_COUNT_DROP_RULE_ID, nowMs);
+  const churnHorizonOk = ruleHorizonOk(readResult, SESSION_CHURN_RULE_ID, nowMs);
+
   const candidates = [];
   const evaluatedAlertKeys = [];
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
@@ -817,7 +825,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
     { deviationSigma, criticalSigma },
   );
-  if (dropCandidate) candidates.push(dropCandidate);
+  if (dropCandidate && dropHorizonOk) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
   // against the latest complete tick -- exactly the preconditions buildCountDropCandidate itself
@@ -828,7 +836,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
-  if (dropEvaluated) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
+  if (dropEvaluated && dropHorizonOk) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
 
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
   const currentPoints = points.filter((point) => currentGroupTimestamps.has(point.ts));
@@ -837,9 +845,11 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // evaluateSessionChurn. Each evaluated key (whether it churned or was clear) is reported so the
   // daemon can recover a now-stable session's persisted churn alert; skipped/stale/ambiguous entities
   // are absent, so their alerts freeze.
-  const { churnEntries, evaluatedEntityKeys } = evaluateSessionChurn(currentPoints);
-  candidates.push(...buildChurnCandidates(churnEntries));
-  for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+  if (churnHorizonOk) {
+    const { churnEntries, evaluatedEntityKeys } = evaluateSessionChurn(currentPoints);
+    candidates.push(...buildChurnCandidates(churnEntries));
+    for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+  }
 
   return { candidates, evaluatedAlertKeys };
 }

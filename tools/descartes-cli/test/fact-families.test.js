@@ -113,9 +113,11 @@ test("certifiedHorizonOk: fails closed on no valid ledger (coverage unknown, LOW
   assert.equal(certifiedHorizonOk(completeness({ bytecap_floor_ts: iso(NOW_MS + 1), coverage: "narrowed" }), { nowMs: NOW_MS, horizonMs: 0 }), false, "a floor in the future is never eligible");
   assert.equal(certifiedHorizonOk(completeness(), { nowMs: Number.NaN, horizonMs: HOUR }), false);
   assert.equal(certifiedHorizonOk(completeness(), { nowMs: NOW_MS, horizonMs: Number.NaN }), false);
-  const missingFloorKeys = completeness();
-  delete missingFloorKeys.completeness.bytecap_floor_ts;
-  assert.equal(certifiedHorizonOk(missingFloorKeys, { nowMs: NOW_MS, horizonMs: HOUR }), false, "a completeness without the floor fields is malformed");
+  const narrowedWithoutFloor = completeness({ coverage: "narrowed" });
+  delete narrowedWithoutFloor.completeness.bytecap_floor_ts;
+  delete narrowedWithoutFloor.completeness.age_floor_ts;
+  assert.equal(certifiedHorizonOk(narrowedWithoutFloor, { nowMs: NOW_MS, horizonMs: HOUR }), false, "'narrowed' with no floor at all is self-contradictory");
+  assert.equal(certifiedHorizonOk({ completeness: { status: "intact", coverage: "full" } }, { nowMs: NOW_MS, horizonMs: HOUR }), true, "an absent floor field on a 'full' report reads as null");
 });
 
 test("certifiedHorizonOk is pure: it never mutates its input", () => {
