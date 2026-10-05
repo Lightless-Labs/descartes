@@ -2,7 +2,11 @@
 
 **Last updated:** 2026-10-05
 
-## Current continuity — fact-store capacity S4 + S5 built; follow-up daybreak G2 findings fixed; not pushed or merged (2026-10-05)
+## Current continuity — fact-store capacity S6 built (per-rule `baseline status`, T11); not pushed or merged (2026-10-05)
+
+S6 is done on `feat/fact-store-capacity-2026-10` (plan §22). `48991a9`: the six watch-tier producers report a per-rule `ruleEvaluations` record from their own gates (no detection change). `5aa6276`: `baseline status`/`inspect` run those producers read-only with the daemon's options and report each rule's phase (`watching` exactly when the detector would evaluate), `not observed (no store)` for never-created stores, a per-family certified-history block, and the `cap_below_tick` / `budget_below_horizon_floor` / `history_horizon_short` / `retention_failing` reasons; T11 compares status against a real daemon fast tick per rule over seven scenarios, and a Leg E regression is red on the old status. Full suite (fresh scratch `XDG_*`): 2232 tests, 2198 pass, 0 fail, 34 skipped. **Next:** S7 soak, then S8/G3 (G3 questions in §22.4). Do not push.
+
+## Earlier continuity — fact-store capacity S4 + S5 built; follow-up daybreak G2 findings fixed; not pushed or merged (2026-10-05)
 
 The follow-up G2 re-gate is complete on the current branch. The resumed-quarantine HIGH-1 and retention-alert MEDIUM findings are fixed; the earlier future-dated quarantine medium remains fixed. The final conservative resume correction also covers a crash after rename with an empty root and incomplete per-item metadata. Focused migration/seen-set/status tests are green. Final fresh-XDG full suite: 2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
 

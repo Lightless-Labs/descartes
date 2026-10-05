@@ -7,6 +7,7 @@
 **Addendum:** 2026-10-05: S3 (eligibility horizon) and S3b (first/last-seen set) built, plus the G1 re-gate LOWs (§18).
 **Addendum:** 2026-10-05: S4 (per-family stores, routing, per-family veto, budgets, status) and S5 (legacy quarantine, Q5) built, with T7-T10 and T12 (§19). S6/S7 not started; the branch awaits **daybreak G2**.
 **Addendum:** 2026-10-05: daybreak G2 review rework (NEEDS-REWORK: H1 + L1-L5): an upgraded install no longer certifies novelty memory over the history S5 quarantined; per-finding dispositions in §20.
+**Addendum:** 2026-10-05: S6 (CLI consistency) built with T11: `baseline status` reports per rule from the detectors' own gates, run read-only (§22).
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -1116,3 +1117,51 @@ The sandbox failures are environment-only: 17 notifier-reuse loopback binds, 3 t
 The resume path now advances `quarantine_epoch` and stamps `quarantine_epoch_ts` at the resume pass even when the legacy root is empty. An in-progress marker without complete per-item metadata is therefore treated as unproven. The crash-after-rename reproduction (quarantine at 2 h, `svc-C` moved at 60 h, resume with empty root, detector check at 67 h) is green: the epoch advances to 60 h and `svc-C` is not claimed new.
 
 Fresh-XDG full-suite verification after this correction: **2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped**. The 22 environment failures are 17 notifier-reuse loopback-bind tests, 3 tap-bump loopback-bind tests, and 2 live-host provenance tests (`unknown` instead of `ok`).
+
+## 22. Addendum: S6 execution (2026-10-05)
+
+**Addendum:** 2026-10-05. S6 (CLI consistency, §7) and T11 (§8) are built on `feat/fact-store-capacity-2026-10`, on top of §21. Nothing is pushed. S7 (soak) is not started. Every test and command ran with fresh scratch `XDG_*` directories (`mktemp -d`); `~/.local/state/descartes` was never read or written, and the running daemon was not touched.
+
+### 22.1 Commits and full-suite totals
+
+| commit | step | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `48991a9` | S6 groundwork: per-rule `ruleEvaluations` from each watch-tier producer (`buildRuleEvaluation`) | 2221 | 2187 | 0 | 34 |
+| `5aa6276` | S6: `baseline status`/`inspect` per rule, family history block, status reasons; T11; Leg E regression | 2232 | 2198 | 0 | 34 |
+
+The 22 managed-sandbox failures recorded in §21 (loopback binds, live-host provenance) did not reproduce in this environment; both runs were 0 fail.
+
+### 22.2 What landed
+
+- **Detectors (`48991a9`).** The six watch-tier producers (service, service-appearance, process-lineage, scheduled-job, session, peer) return an additive `ruleEvaluations: {<rule_id>: {evaluable, gate, history_reason?, evaluatedAlertKeys}}`, built by `buildRuleEvaluation` (`fact-store-completeness.js`) from the values each producer already computes, in its own order: `history_untrusted` (factHistoryTrustworthy), `cold_start_pending` (the persistent lockout), `history_horizon_short` (`ruleHorizonOk` / `noveltyHorizonOk`), then the producer's own readiness gate (`insufficient_complete_history`, `latest_census_stale`, `baseline_warming_up`, `drop_history_not_ready`, `no_complete_census`), else `ok`. The per-rule keys are the producer's own `evaluatedAlertKeys`. The readiness halves of the census predicates are factored out unchanged, so a ready window with zero entities reports as evaluating. No detection, lockout or coverage change: `safeCandidates` reads only `candidates`/`evaluatedAlertKeys`, and the watch-disabled shape is unchanged (pinned).
+- **`baseline status` (`5aa6276`).** For each of the five domains, status runs that domain's producers **read-only** on the same state the daemon's next fast tick sees: the same family reads, the persisted detector stores, one shared `now`, the loaded `watch.json`, and the daemon's own options (`activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE x` the structural interval, passed only to the four census producers, as `runDaemonIteration` does). Every write seam is a no-op. Each rule's `phase` comes from its producer's `ruleEvaluations`: `watching`, `still learning — n of 6`, `cannot establish — history untrusted (<reason>)`, `history horizon below minimum (since <ts>)`, the readiness phases, or `not observed (no store)` when the family store was never created (`store_exists === false`). The domain phase is the common rule phase, or `partially watching — k of n rules`. A disabled watch tier reports `disabled` with no fact I/O (the old status read all five families first).
+- **Family history block** (`families.<family>`): `store`, `status`, `coverage`, `certified_after_ts`, `bytecap_floor_ts`, `oldest_certified_ts`, `certified_horizon_ms` (now − max(byte-cap floor, age floor); `null` when never narrowed), the budget (`budget_bytes`, `budget_source`, `floor_bytes`, `budget_rejected`), and for the three novelty families the seen-set's `status`/`certified_since_ts`/`scope_ts`.
+- **Reasons** (per rule, annotations only; they never change a phase): `not_observed_no_store`; `history_horizon_short` (live gate, or a since clock on the daemon record); `cap_below_tick`, `retention_failing`, `horizon_invariant_unmet` (from `fact_store_budgets.families.<f>` on the daemon's last status record); `budget_below_horizon_floor` (computed live by `resolveFactStoreBudgets` over `watch.json`). `daemon_record` carries the record's `status` (present/absent/unreadable), `ts`, the structural interval used, and `fact_store_legacy` / `fact_store_deprecations`. An absent or unreadable record contributes nothing.
+- **T11** (`test/baseline-status-consistency.test.js`). At each checkpoint, status runs first, then a real daemon fast tick at the same instant (structural forced not-due) with every watch-tier producer observed. Per rule: `watching ⇔` the daemon's producer evaluates; `phase === "watching" ⇔` it evaluates; evaluated keys are set-equal; and `watching ⇒` `factHistoryTrustworthy(read, {anchorTs}).trust ∧ ruleEligible(read, rule, now)` on a fresh read (the shared predicate the daemon's veto uses) and the lockout is clear. Scenarios over the seeded real-volume generator: fresh install (no store); no peer/session collectors (those stores never created while the others watch); clean accumulation through count-rule establishment at ~31 ticks, then a stale census; a 2 h structural interval (freshness parity); forced budgets sized from a probe tick (service narrowed with a valid seen-set and novelty still evaluating; session/peer horizon-short); a corrupt line (history untrusted); the S5 post-upgrade fixture (novelty horizon-short since the upgrade tick, measured against the seen-set). The test asserts the gate matrix was actually exercised per rule, and that `session.churn` watches with zero keys (the generator's session census is empty, I11).
+- **Leg E regression** (same file): after 10 clean ticks the session lockout has cleared but `session.count_drop` is still warming up; the domain must not read `watching`. **Red on the previous `baseline.js`** (it returned `watching`), green now.
+- **Mutation checks** (run by hand, not committed): status ignoring the recorded interval (freshness parity) fails the 2 h scenario; enabling the producers' real store writes fails the read-only check (a deleted detector store is a state where the producer would write); treating every store as present fails the fresh-install and no-peer scenarios.
+- `baseline.test.js`: the fresh-install expectation is now `not observed (no store)` (reason in place); a disabled-tier test pins no fact read. README's baseline lines describe the per-rule status.
+
+### 22.3 Deviations from the plan text
+
+1. **The shared predicate is the detector's own, not a re-implementation.** §7 S6 says status "derives phase per rule from the shared would-evaluate predicate (pending ∧ trust ∧ horizon ∧ fresh complete latest group)". The cold-start lockout exists as six reviewed copies inside the producers and cannot be called without them, so status runs the producers read-only and reads their per-rule report. `ruleEligible` / `noveltyRuleEligible` are the daemon-side oracle T11 checks against, not a second status computation.
+2. **"Fresh complete latest group" is not one uniform term.** The census rules gate on N complete ticks plus a fresh latest complete census; `session.churn` has no freshness gate (it needs one complete census and a fresh pair per entity); the statistical rules gate on an established baseline (`peer.count_drop` additionally on marker-complete history since the anchor). Status reports each detector's own readiness gate by name rather than imposing a uniform freshness term the detector does not apply.
+3. **Scope: the eight watch-tier rules** of the five baseline domains. `canary.tampered` and `correlation.login_kill_proximity` are learned-tier (`descartes learned status`), and correlation's coverage is deliberately empty (§16 era deferral).
+4. **A fresh install reads `not observed (no store)`**, not `still learning — 0 of 6` (§4.4/I11). The cold-start reason (`initial_baseline`) is still reported.
+5. **Re-established but not yet cleared.** A persisted-pending detector whose re-accumulation has reached 6 reads `still learning — 6 of 6` until the daemon's next tick persists the clear, because the producer itself does not evaluate on that tick ("a tick cannot self-heal and alert in the same breath").
+6. **History untrusted is its own phase** (`cannot establish — history untrusted (<reason>)`); the old status called it "still learning".
+7. **The old `cannot establish — census incomplete` domain phase is gone.** It keyed on the latest group being incomplete, which no detector gates on (they use the latest *complete* census). It survives as a `latest_census_incomplete: true` domain flag.
+8. **The structural interval comes from the daemon's last status record** (`profile.structural.interval_ms`, default 1 h): the CLI has no profile of its own. It sets the freshness parity and the floors shown.
+9. **CLI cost:** six producer runs per status call (the service store is read twice). CLI only; the daemon is unchanged.
+
+### 22.4 G3 questions
+
+1. **Running the producers from the CLI** (read-only, every write seam a no-op, pinned by a snapshot test). Accept, or extract the six lockout copies into one shared pure function first (larger edit to G1/G2-reviewed detectors)?
+2. **Daemon-record reasons** (`cap_below_tick`, `retention_failing`, horizon-short since) are display-only and come from a same-UID-writable file, like every other status surface. Accept?
+3. **"Would evaluate" vs "would recover".** Status reports what the detector evaluates. The daemon's independent per-family veto (no-anchor trust, `ruleEligible`) can still freeze a recovery the detector reported; T11 shows `watching ⇒ ruleEligible` on every scenario, but status does not separately show the daemon's veto. Add it?
+4. **Canary and correlation** stay out of `baseline status` (learned tier). Add a learned-tier per-rule view to `learned status`?
+
+### 22.5 Final state
+
+Final code commit `5aa6276`: **2232 tests, 2198 pass, 0 fail, 34 skipped, 0 todo** (fresh scratch `XDG_*`). S6 is complete per §7. **Next:** S7 (real-host soak against a copy of the state directory), then S8/G3.
+
