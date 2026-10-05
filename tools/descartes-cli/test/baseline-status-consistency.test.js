@@ -9,14 +9,23 @@
 // reads), and the producers' results are observed. Status before the daemon tick matters: the daemon's
 // detectors write their stores, so the reverse order would compare two different states.
 //
-// The shared-predicate oracle the plan names is checked too: a rule status reports "watching" has
-// trusted history since its detector's anchor (factHistoryTrustworthy) AND passes the daemon's own
-// per-rule eligibility predicate (ruleEligible: ruleHorizonOk / noveltyRuleEligible) on a fresh read.
+// Those comparisons mostly prove status and the daemon ran the same detector on the same inputs, so
+// independent oracles are checked too (S6 review M1):
+//   - the shared predicate, both directions: a rule status reports "watching" has trusted history
+//     since its detector's anchor (factHistoryTrustworthy), a clear lockout, and passes the daemon's
+//     own per-rule eligibility predicate (ruleEligible) on a fresh read; and each not-watching gate
+//     (history_untrusted, cold_start_pending, history_horizon_short) is independently true;
+//   - freshness from the test's own record of the newest complete census it wrote: a watching census
+//     rule has a fresh one, the census-stale gate fires only on a stale one, and EVERY rule carries
+//     the latest_census_stale reason exactly when it is stale (the session/peer detectors have no
+//     freshness gate, H1);
+//   - the per-rule keys partition each producer's top-level evaluatedAlertKeys (the daemon's coverage).
 //
 // Scenarios (seeded real-volume generator, small scale): a never-created store (fresh install, and a
 // host with no peer/session collectors), clean accumulation through count-rule establishment, a stale
-// latest census, narrowed + horizon-short family stores, an untrusted (corrupt) store, and an
-// already-locked-out install after the S5 upgrade.
+// latest census (4 h and 10 days), a 2 h interval, narrowed + horizon-short family stores (30 h count
+// rules, and the 6 h set-diff rules), a partial-census tail (incomplete latest census, no complete
+// census left), an untrusted (corrupt) store, and an already-locked-out install after the S5 upgrade.
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -64,6 +73,8 @@ const RULES = new Map([
   [PEER_COUNT_SPIKE_RULE_ID, { label: "peer", load: loadPeerBaselineStore, family: "peer" }],
   [PEER_COUNT_DROP_RULE_ID, { label: "peer", load: loadPeerBaselineStore, family: "peer" }],
 ]);
+const COLLECTOR_OF_FAMILY = { service: "services", session: "sessions", peer: "vpn-peer-status", scheduled_job: "scheduled-jobs", process_lineage: "process-lineage" };
+const CENSUS_RULES = new Set([SERVICE_DISAPPEARED_RULE_ID, SERVICE_APPEARED_RULE_ID, SCHEDULED_JOB_APPEARED_RULE_ID, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID]);
 const PRODUCERS = {
   computeServiceBaselineCandidates: ["service", computeServiceBaselineCandidates],
   computeServiceAppearanceCandidates: ["service-appearance", computeServiceAppearanceCandidates],
@@ -93,8 +104,24 @@ function fastCollectorFakes() {
   };
 }
 
+// Collector wrappers that make one family's census PARTIAL on a tick (the real translators: a
+// truncated service enumeration, an "unable" session multiplexer).
+const PARTIAL_COLLECTORS = {
+  service: ["services", (envelope) => ({ ...envelope, result: { ...envelope.result, truncated: true } })],
+  session: ["sessions", (envelope) => ({ ...envelope, result: { ...envelope.result, multiplexers: [{ multiplexer: "tmux", status: "unable" }, { multiplexer: "screen", status: "absent" }] } })],
+};
+
 function scenarioRig({ scale = 0.05, disabledCollectors = [], factStoreBudgets, structuralIntervalMs = HOUR_MS } = {}) {
-  const { collectors, structuralCollectorToggles } = realVolumeStructuralCollectors({ scale });
+  const { collectors: baseCollectors, structuralCollectorToggles } = realVolumeStructuralCollectors({ scale });
+  // The test's own record of the newest COMPLETE census it wrote per family: the independent
+  // freshness oracle (it never consults baseline.js or the detectors).
+  const lastCompleteMs = {};
+  let partialThisTick = new Set();
+  const collectors = Object.fromEntries(Object.entries(baseCollectors).map(([id, collect]) => [id, async (...args) => {
+    const envelope = await collect(...args);
+    const partial = Object.entries(PARTIAL_COLLECTORS).find(([family, [collectorId]]) => collectorId === id && partialThisTick.has(family));
+    return partial ? partial[1][1](envelope) : envelope;
+  }]));
   const toggles = Object.fromEntries(Object.entries(structuralCollectorToggles).map(([id, toggle]) => [id, disabledCollectors.includes(id) ? { enabled: false } : toggle]));
   const profile = {
     interval_ms: 60_000,
@@ -104,10 +131,21 @@ function scenarioRig({ scale = 0.05, disabledCollectors = [], factStoreBudgets, 
   const extra = factStoreBudgets ? { factStoreBudgets } : {};
   return {
     profile,
-    async structural(paths, hour) {
+    activeFreshnessMs: 3 * structuralIntervalMs,
+    lastCompleteMs,
+    async structural(paths, hour, { partial = [] } = {}) {
       const ts = iso(BASE_MS + hour * HOUR_MS);
-      const result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), structuralCollectors: collectors, ts, now: ts, ...extra });
+      partialThisTick = new Set(partial);
+      let result;
+      try {
+        result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), structuralCollectors: collectors, ts, now: ts, ...extra });
+      } finally {
+        partialThisTick = new Set();
+      }
       assert.ok(result.structuralFacts, `hour ${hour} is a structural tick`);
+      for (const family of ["service", "session", "peer", "scheduled_job", "process_lineage"]) {
+        if (!partial.includes(family) && !disabledCollectors.includes(COLLECTOR_OF_FAMILY[family])) lastCompleteMs[family] = Date.parse(ts);
+      }
       return result;
     },
     // A daemon fast tick at `nowIso` with structural forced not-due, observing every watch-tier
@@ -135,7 +173,7 @@ function scenarioRig({ scale = 0.05, disabledCollectors = [], factStoreBudgets, 
   };
 }
 
-const coverage = { gates: new Map(), zeroKeyWatching: new Set(), checkpoints: 0 };
+const coverage = { gates: new Map(), zeroKeyWatching: new Set(), staleReason: new Set(), checkpoints: 0, incompleteLatest: 0 };
 
 function record(ruleId, gate) {
   if (!coverage.gates.has(ruleId)) coverage.gates.set(ruleId, new Set());
@@ -166,18 +204,50 @@ async function checkpoint(paths, rig, nowIso, label) {
       record(ruleId, detector.gate);
     }
     if (statusRule.watching && statusRule.evaluated_alert_keys.length === 0) coverage.zeroKeyWatching.add(ruleId);
-    // The shared-predicate oracle (I11): "watching" => trusted since the anchor AND the daemon's own
-    // per-rule eligibility predicate on a fresh read of the same store.
+    if (status.families[family]?.store === "absent") continue;
+    // Independent freshness oracle (I11 "a fresh complete latest group"): the age of the newest
+    // complete census THIS TEST wrote for the family, against the daemon's 3 x structural interval.
+    const lastComplete = rig.lastCompleteMs[family];
+    const independentlyStale = lastComplete === undefined || !(nowMs - lastComplete <= rig.activeFreshnessMs);
+    // Every rule, census or not, carries latest_census_stale exactly when the census is stale (H1:
+    // the session/peer detectors have no freshness gate, so status must disclose it).
+    assert.equal(statusRule.reasons.includes("latest_census_stale"), independentlyStale, `${where}: latest_census_stale reason <=> the latest complete census is older than ${rig.activeFreshnessMs} ms (reasons ${statusRule.reasons})`);
+    if (independentlyStale) coverage.staleReason.add(ruleId);
+    if (CENSUS_RULES.has(ruleId)) {
+      if (statusRule.watching) assert.equal(independentlyStale, false, `${where}: a watching census rule has a fresh latest complete census`);
+      if (detector.gate === "latest_census_stale") assert.equal(independentlyStale, true, `${where}: the census-stale gate fires only on a stale census`);
+    }
+    // The shared-predicate oracle (I11), both directions, on a fresh read of the same store and the
+    // persisted detector state: "watching" => trusted since the anchor, lockout clear and the
+    // daemon's own ruleEligible; and each not-watching gate is independently true.
+    const novelty = RULE_HORIZONS.get(ruleId).kind === "novelty";
+    const read = await readFactPoints(paths, { family, now: nowIso, ...(novelty ? { seenSetFamilies: [family] } : {}) });
+    const entry = await load(paths);
+    const { state } = entry;
+    const trust = factHistoryTrustworthy(read, { anchorTs: state.cold_start_since_ts, nowMs, requireFullCoverage: novelty && !validNoveltySeenSet(read, ruleId) });
+    const eligible = ruleEligible(read, ruleId, nowMs);
     if (statusRule.watching) {
-      const novelty = RULE_HORIZONS.get(ruleId).kind === "novelty";
-      const read = await readFactPoints(paths, { family, now: nowIso, ...(novelty ? { seenSetFamilies: [family] } : {}) });
-      const { state } = await load(paths);
-      const trust = factHistoryTrustworthy(read, { anchorTs: state.cold_start_since_ts, nowMs, requireFullCoverage: novelty && !validNoveltySeenSet(read, ruleId) });
       assert.equal(trust.trust, true, `${where}: watching implies trusted history (${trust.reason})`);
       assert.equal(state.cold_start_pending, false, `${where}: watching implies the lockout is clear`);
-      assert.equal(ruleEligible(read, ruleId, nowMs), true, `${where}: watching implies the daemon's ruleEligible`);
+      assert.equal(eligible, true, `${where}: watching implies the daemon's ruleEligible`);
+    } else if (detector.gate === "history_untrusted") {
+      assert.equal(trust.trust, false, `${where}: history_untrusted implies factHistoryTrustworthy is false`);
+    } else if (detector.gate === "cold_start_pending") {
+      assert.ok(state.cold_start_pending === true || entry.missing === true || entry.corrupt === true, `${where}: cold_start_pending implies a persisted lockout or a lost store`);
+    } else if (detector.gate === "history_horizon_short") {
+      assert.equal(eligible, false, `${where}: history_horizon_short implies the daemon's ruleEligible is false`);
     }
   }
+  // The daemon's coverage is each producer's TOP-LEVEL evaluatedAlertKeys; the per-rule keys status
+  // reports partition it exactly (pairwise disjoint, union equal), in every state.
+  for (const producer of new Set([...RULES.values()].map((value) => value.label))) {
+    const result = observed.get(producer);
+    const ruleIds = [...RULES].filter(([, value]) => value.label === producer).map(([ruleId]) => ruleId);
+    const perRule = ruleIds.flatMap((ruleId) => result.ruleEvaluations[ruleId].evaluatedAlertKeys);
+    assert.equal(new Set(perRule).size, perRule.length, `${label} @ ${nowIso}: ${producer}'s per-rule keys are disjoint`);
+    assert.deepEqual([...perRule].sort(), [...(result.evaluatedAlertKeys ?? [])].sort(), `${label} @ ${nowIso}: ${producer}'s per-rule keys partition its evaluatedAlertKeys`);
+  }
+  for (const domain of status.domains) if (domain.latest_census_incomplete) coverage.incompleteLatest += 1;
   return status;
 }
 
@@ -231,8 +301,19 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
       await rig.structural(paths, hour);
       if (checkpoints.has(hour)) await checkpoint(paths, rig, iso(BASE_MS + (hour + 0.5) * HOUR_MS), `clean h${hour}`);
     }
-    // No structural tick for 4 h: the latest complete census is older than 3 x the interval.
-    await checkpoint(paths, rig, iso(BASE_MS + 39.5 * HOUR_MS), "clean stale");
+    // No structural tick for 4 h, then for 10 days: the latest complete census is older than 3 x the
+    // interval. The four census rules stop (latest_census_stale gate); session/peer have no freshness
+    // gate in their detectors and keep evaluating (disclosed, §22.3/§22.4) -- status says "watching",
+    // as the detector does, and every rule carries the latest_census_stale reason.
+    for (const [hours, name] of [[39.5, "clean stale 4h"], [35 + 240, "clean stale 240h"]]) {
+      const stale = await checkpoint(paths, rig, iso(BASE_MS + hours * HOUR_MS), name);
+      const rules = stale.domains.flatMap((domain) => domain.rules);
+      for (const rule of rules) assert.ok(rule.reasons.includes("latest_census_stale"), `${name}: ${rule.rule_id} carries latest_census_stale (${rule.reasons})`);
+      for (const ruleId of CENSUS_RULES) assert.equal(rules.find((rule) => rule.rule_id === ruleId).gate, "latest_census_stale", `${name}: ${ruleId}`);
+      for (const ruleId of [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID]) {
+        assert.equal(rules.find((rule) => rule.rule_id === ruleId).phase, "watching", `${name}: ${ruleId} still evaluates in its detector (no freshness gate)`);
+      }
+    }
   });
 
   await t.test("a non-default structural interval (2 h): status uses the daemon's freshness (3 x interval), so a 4 h-old census still evaluates", async () => {
@@ -288,6 +369,54 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
     }
   });
 
+  await t.test("set-diff horizon short: service and session stores narrowed below 6 h", async () => {
+    const probe = await tempPaths("probe-short");
+    const first = await scenarioRig().structural(probe, 0);
+    const tickBytes = (family) => first.status.fact_store_budgets.families[family].last_tick_bytes;
+    const budgets = Object.fromEntries(Object.entries(first.status.fact_store_budgets.families).map(([family, entry]) => [family, entry.budget_bytes]));
+    budgets.service = Math.floor(tickBytes("service") * 4.5); // ~4 ticks: below the 6 h set-diff horizon
+    budgets.session = Math.floor(tickBytes("session") * 4.5);
+    const paths = await tempPaths("short");
+    // Clear the lockouts at the default budgets first (a store narrowed below 6 ticks from the start
+    // never re-accumulates 6 complete ticks), then shrink the budgets.
+    const wide = scenarioRig();
+    for (let hour = 0; hour <= 8; hour += 1) await wide.structural(paths, hour);
+    const rig = scenarioRig({ factStoreBudgets: budgets });
+    Object.assign(rig.lastCompleteMs, wide.lastCompleteMs);
+    for (let hour = 9; hour <= 14; hour += 1) {
+      await rig.structural(paths, hour);
+      if (hour === 9 || hour === 14) await checkpoint(paths, rig, iso(BASE_MS + (hour + 0.5) * HOUR_MS), `short h${hour}`);
+    }
+    const status = await buildBaselineStatus(paths, { now: iso(BASE_MS + 14.5 * HOUR_MS) });
+    const rules = status.domains.flatMap((domain) => domain.rules);
+    assert.equal(rules.find((rule) => rule.rule_id === SERVICE_DISAPPEARED_RULE_ID).gate, "history_horizon_short");
+    assert.equal(rules.find((rule) => rule.rule_id === SESSION_CHURN_RULE_ID).gate, "history_horizon_short");
+  });
+
+  await t.test("a partial-census tail: incomplete latest census, no complete census left in a narrowed window", async () => {
+    const probe = await tempPaths("probe-partial");
+    const first = await scenarioRig().structural(probe, 0);
+    const tickBytes = (family) => first.status.fact_store_budgets.families[family].last_tick_bytes;
+    const budgets = Object.fromEntries(Object.entries(first.status.fact_store_budgets.families).map(([family, entry]) => [family, entry.budget_bytes]));
+    budgets.service = Math.floor(tickBytes("service") * 8.5); // ~8 ticks: still >= the 6 h set-diff horizon
+    budgets.session = Math.floor(tickBytes("session") * 8.5);
+    const paths = await tempPaths("partial");
+    const rig = scenarioRig({ factStoreBudgets: budgets });
+    for (let hour = 0; hour <= 9; hour += 1) await rig.structural(paths, hour);
+    await checkpoint(paths, rig, iso(BASE_MS + 9.5 * HOUR_MS), "partial before");
+    let status;
+    for (let hour = 10; hour <= 20; hour += 1) {
+      await rig.structural(paths, hour, { partial: ["service", "session"] });
+      if (hour === 10 || hour === 13 || hour === 20) status = await checkpoint(paths, rig, iso(BASE_MS + (hour + 0.5) * HOUR_MS), `partial h${hour}`);
+    }
+    const service = status.domains.find((domain) => domain.domain === "service");
+    const session = status.domains.find((domain) => domain.domain === "session");
+    assert.equal(service.latest_census_incomplete, true);
+    assert.equal(session.latest_census_incomplete, true);
+    assert.equal(service.rules.find((rule) => rule.rule_id === SERVICE_DISAPPEARED_RULE_ID).gate, "insufficient_complete_history");
+    assert.equal(session.rules.find((rule) => rule.rule_id === SESSION_CHURN_RULE_ID).gate, "no_complete_census");
+  });
+
   await t.test("an untrusted store (a corrupt line): history untrusted, never watching", async () => {
     const paths = await tempPaths("corrupt");
     const rig = scenarioRig();
@@ -322,10 +451,10 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
 
   // The matrix the plan names (I11 / T11) was actually exercised.
   const expected = {
-    [SERVICE_DISAPPEARED_RULE_ID]: ["no_store", "history_untrusted", "cold_start_pending", "ok", "latest_census_stale"],
+    [SERVICE_DISAPPEARED_RULE_ID]: ["no_store", "history_untrusted", "cold_start_pending", "ok", "latest_census_stale", "history_horizon_short", "insufficient_complete_history"],
     [SERVICE_APPEARED_RULE_ID]: ["no_store", "history_untrusted", "ok", "history_horizon_short", "latest_census_stale"],
     [SESSION_COUNT_DROP_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short"],
-    [SESSION_CHURN_RULE_ID]: ["no_store", "ok"],
+    [SESSION_CHURN_RULE_ID]: ["no_store", "ok", "history_horizon_short", "no_complete_census"],
     [PEER_COUNT_SPIKE_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short"],
     [PEER_COUNT_DROP_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short"],
     [SCHEDULED_JOB_APPEARED_RULE_ID]: ["no_store", "ok", "history_horizon_short", "latest_census_stale"],
@@ -334,6 +463,11 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
   for (const [ruleId, gates] of Object.entries(expected)) {
     for (const gate of gates) assert.ok(coverage.gates.get(ruleId)?.has(gate), `${ruleId} exercised gate ${gate}; saw ${[...(coverage.gates.get(ruleId) ?? [])]}`);
   }
+  // Not reached at this level: peer.count_drop's drop_history_not_ready (needs lockout-complete but
+  // marker-incomplete peer ticks after a re-armed anchor over an established drop baseline).
+  // The stale-census reason was seen on every rule, and an incomplete latest census was exercised.
+  for (const ruleId of RULES.keys()) assert.ok(coverage.staleReason.has(ruleId), `${ruleId} carried the latest_census_stale reason on a stale census`);
+  assert.ok(coverage.incompleteLatest > 0, "an incomplete latest census was exercised");
   // Zero entities still evaluate and still read watching (I11): this generator's session census is
   // always empty.
   assert.ok(coverage.zeroKeyWatching.has(SESSION_CHURN_RULE_ID), "session.churn watches an empty session census");

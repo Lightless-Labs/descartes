@@ -159,6 +159,20 @@ function hasIncompleteLatest(domain, groups) {
   return groups.length > 0 && !isComplete(domain, groups[groups.length - 1]);
 }
 
+// H1 (S6 review; I11 "a fresh complete latest group"): no complete census within the daemon's
+// freshness window (ACTIVE_FRESHNESS_MULTIPLE x the structural interval -- the same activeFreshnessMs
+// the four census detectors gate on), including a window with no complete census left at all. The
+// census rules stop on this (their latest_census_stale gate); the session and peer detectors apply no
+// freshness gate and keep evaluating on the last census for up to the fact window (31 days), so for
+// them this is the only signal that the collector is dead. Annotation only: it never changes a phase.
+function latestCompleteCensusStale(domain, groups, nowMs, activeFreshnessMs) {
+  if (groups.length === 0) return false;
+  const complete = completeGroups(domain, groups);
+  if (complete.length === 0) return true;
+  const latestMs = new Date(complete[complete.length - 1].ts).getTime();
+  return !(nowMs - latestMs <= activeFreshnessMs);
+}
+
 function stateReason(entry, groups) {
   return coldStartEntryReason({
     storeLossThisTick: Boolean(entry.missing || entry.corrupt),
@@ -443,9 +457,10 @@ function horizonShortSinceOf(daemonRecord, ruleId, nowMs) {
 
 // The status reasons for one rule (fact-store capacity plan §4.4/§7 S6). Annotations only: the phase
 // comes from the detector's own gate; a reason never makes a rule "watching" or stops it.
-function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince }) {
+function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale }) {
   const reasons = [];
   if (absent) reasons.push("not_observed_no_store");
+  if (!absent && (censusStale || ruleEvaluation?.gate === "latest_census_stale")) reasons.push("latest_census_stale");
   if (ruleEvaluation?.gate === "history_horizon_short" || horizonShortSince) reasons.push("history_horizon_short");
   if (familyBlock.cap_below_tick) reasons.push("cap_below_tick");
   if (familyBlock.budget_rejected?.reason === "budget_below_horizon_floor") reasons.push("budget_below_horizon_floor");
@@ -478,6 +493,7 @@ function buildDomainReports(inputs) {
     const familyBlock = familyStatusBlock({ family: definition.family, familyRead, nowMs: inputs.nowMs, budgets, structuralIntervalMs: inputs.structuralIntervalMs, daemonRecord: inputs.daemonRecord });
     families[definition.family] = familyBlock;
     const absent = storeAbsent(familyRead);
+    const censusStale = !absent && latestCompleteCensusStale(definition.domain, groups, inputs.nowMs, inputs.activeFreshnessMs);
     const rules = [];
     for (const run of runs) {
       const entry = run.entry ? { ...run.entry, domain: definition.domain } : undefined;
@@ -499,7 +515,7 @@ function buildDomainReports(inputs) {
           evaluated_count: keys.length,
           horizon_ms: RULE_HORIZONS.get(ruleId)?.horizonMs,
           ...(horizonShortSince ? { horizon_short_since_ts: horizonShortSince } : {}),
-          reasons: ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince }),
+          reasons: ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale }),
         });
       }
     }
