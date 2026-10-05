@@ -75,6 +75,15 @@ export const MAX_TARGET_EXAMPLES = 5;
 export const MAX_PORT_TARGET_KEYS = 5;
 export const MAX_BASELINE_SHOW_ENTRIES = 50;
 
+function normalizePortTargetKey(value) {
+  const text = String(value ?? "");
+  const separator = text.indexOf(".");
+  if (separator < 1) return text;
+  const protocol = text.slice(0, separator).toLowerCase();
+  const normalizedProtocol = protocol === "tcp6" ? "tcp" : protocol === "udp6" ? "udp" : protocol;
+  return `${normalizedProtocol}${text.slice(separator)}`;
+}
+
 // Fixed-length hash output, consistent with sanitizeDiagnostics' fixed-length-hash allowlist
 // (diagnostics-sanitizer.js's HEX_HASH_LENGTHS includes 16 -- the same length alertId() and
 // provenance-warnings.js's hashExecutablePath() already truncate to).
@@ -202,16 +211,22 @@ export function applyIdentityObservation(existingRecord, observation = {}, optio
     targetExamples = boundedPushUnique(targetExamples, observation.target, MAX_TARGET_EXAMPLES, targetExampleEqual);
   }
 
-  let portTargetKeys = existingRecord?.port_target_keys ?? [];
+  let portTargetKeys = [...new Set((existingRecord?.port_target_keys ?? []).map(normalizePortTargetKey).filter(Boolean))];
+  let portTargetKeysTruncated = existingRecord?.port_target_keys_truncated === true;
   for (const key of Array.isArray(observation.portTargetKeys) ? observation.portTargetKeys : []) {
-    if (!key) continue;
-    portTargetKeys = boundedPushUnique(portTargetKeys, key, MAX_PORT_TARGET_KEYS, stringEqual);
+    const normalizedKey = normalizePortTargetKey(key);
+    if (!normalizedKey) continue;
+    if (!portTargetKeys.includes(normalizedKey) && portTargetKeys.length >= MAX_PORT_TARGET_KEYS) portTargetKeysTruncated = true;
+    portTargetKeys = boundedPushUnique(portTargetKeys, normalizedKey, MAX_PORT_TARGET_KEYS, stringEqual);
   }
   const currentPortTargetKeys = Object.hasOwn(options, "currentPortTargetKeys")
-    ? [...new Set((Array.isArray(options.currentPortTargetKeys) ? options.currentPortTargetKeys : []).filter(Boolean))]
+    ? [...new Set((Array.isArray(options.currentPortTargetKeys) ? options.currentPortTargetKeys : []).map(normalizePortTargetKey).filter(Boolean))].slice(0, MAX_PORT_TARGET_KEYS)
     : Array.isArray(observation.portTargetKeys)
-    ? [...new Set(observation.portTargetKeys.filter(Boolean))].slice(0, MAX_PORT_TARGET_KEYS)
-    : existingRecord?.current_port_target_keys ?? [];
+    ? [...new Set(observation.portTargetKeys.map(normalizePortTargetKey).filter(Boolean))].slice(0, MAX_PORT_TARGET_KEYS)
+    : (existingRecord?.current_port_target_keys ?? []).map(normalizePortTargetKey).slice(0, MAX_PORT_TARGET_KEYS);
+  const currentPortTargetKeysTruncated = options.currentPortTargetKeysTruncated === true
+    || (Array.isArray(options.currentPortTargetKeys) && new Set(options.currentPortTargetKeys.map(normalizePortTargetKey).filter(Boolean)).size > MAX_PORT_TARGET_KEYS)
+    || existingRecord?.current_port_target_keys_truncated === true;
 
   return {
     kind: "signature",
@@ -241,7 +256,9 @@ export function applyIdentityObservation(existingRecord, observation = {}, optio
     // Additive (S5 implementation detail): bounded list of "protocol.port" strings this identity
     // has been observed publicly serving -- drives new_public_bind's reverse-index lookup below.
     port_target_keys: portTargetKeys,
+    port_target_keys_truncated: portTargetKeysTruncated,
     current_port_target_keys: currentPortTargetKeys,
+    current_port_target_keys_truncated: currentPortTargetKeysTruncated,
   };
 }
 
@@ -365,7 +382,8 @@ export async function writeSignatureStore(descartesPaths, store) {
 // identity -- degrade-to-unfingerprinted, never degrade-to-invisible).
 // Returns the identity hashes of every already-fingerprinted record an identityHash:undefined
 // observation could be (same hashed path/owner + source). Shared by the fold-time skip below and by
-// deriveIdentityCoverage's exclusion of unverified identities (2026-10), so both use one matcher.
+// The fold-time skip treats an unverified observation as not observed; the stored identity record
+// remains untouched for this reconcile.
 function unverifiedObservationMatches(signatures, observation) {
   if (observation?.identityHash !== undefined) return [];
   const executablePathHash = hashIdentityField(observation?.executablePath);
@@ -405,9 +423,8 @@ export function reconcileSignatures(store, observations = [], options = {}) {
  * `{ store, skippedObservations }`, where `skippedObservations` are the observations dropped by the
  * S5-follow-2 transient-stat-failure guard. Such an observation means "a process matching a
  * fingerprinted identity is running but could not be VERIFIED this reconcile" -- the matching
- * record was NOT re-observed (its last_seen does not advance), so the coverage derivation
- * (deriveIdentityCoverage) must never report it, or any target it could be holding, as
- * evaluated-clear.
+ * record was NOT re-observed (its last_seen does not advance). The producer is safe-frozen, so
+ * this can never authorize a recovery key or clear any target it could be holding.
  */
 export function reconcileSignaturesDetailed(store, observations = [], options = {}) {
   const ts = options.ts ?? new Date().toISOString();
@@ -429,9 +446,16 @@ export function reconcileSignaturesDetailed(store, observations = [], options = 
     const identityHash = computeIdentitySignature(observation);
     foldableObservations.push({ observation, identityHash });
     if (Array.isArray(observation.portTargetKeys)) {
-      if (!currentPortsByIdentity.has(identityHash)) currentPortsByIdentity.set(identityHash, new Set());
+      if (!currentPortsByIdentity.has(identityHash)) currentPortsByIdentity.set(identityHash, { keys: new Set(), truncated: false });
+      const currentPorts = currentPortsByIdentity.get(identityHash);
       for (const portKey of observation.portTargetKeys) {
-        if (portKey) currentPortsByIdentity.get(identityHash).add(portKey);
+        const normalizedKey = normalizePortTargetKey(portKey);
+        if (!normalizedKey || currentPorts.keys.has(normalizedKey)) continue;
+        if (currentPorts.keys.size >= MAX_PORT_TARGET_KEYS) {
+          currentPorts.truncated = true;
+          continue;
+        }
+        currentPorts.keys.add(normalizedKey);
       }
     }
   }
@@ -444,7 +468,9 @@ export function reconcileSignaturesDetailed(store, observations = [], options = 
       // One identity signature can represent several same-key PIDs in a single census. The
       // current port set is per identity/tick, not per last folded PID; otherwise a listenerless
       // sibling processed last would erase a live sibling's public bind.
-      foldOptions.currentPortTargetKeys = [...currentPortsByIdentity.get(identityHash)];
+      const currentPorts = currentPortsByIdentity.get(identityHash);
+      foldOptions.currentPortTargetKeys = [...currentPorts.keys];
+      foldOptions.currentPortTargetKeysTruncated = currentPorts.truncated;
     }
     signatures[identityHash] = options.seedKnownGood
       ? seedKnownGoodIdentity(existing, observation, foldOptions)
@@ -457,14 +483,14 @@ export function reconcileSignaturesDetailed(store, observations = [], options = 
       const record = signatures[identityHash];
       const processKey = record?.inputs_hash?.executable_path_hash;
       if (processKey) seededTargetKeys.add(`process.${processKey}`);
-      for (const portKey of record?.port_target_keys ?? []) seededTargetKeys.add(`port.${portKey}`);
+      for (const portKey of record?.port_target_keys ?? []) seededTargetKeys.add(`port.${normalizePortTargetKey(portKey)}`);
     }
     for (const [identityHash, record] of Object.entries(signatures)) {
       if (seededHashes.has(identityHash) || record.state !== "known_good") continue;
       const processKey = record.inputs_hash?.executable_path_hash;
       const recordKeys = [
         processKey ? `process.${processKey}` : undefined,
-        ...(record.port_target_keys ?? []).map((key) => `port.${key}`),
+        ...(record.port_target_keys ?? []).map((key) => `port.${normalizePortTargetKey(key)}`),
       ].filter(Boolean);
       if (recordKeys.some((key) => seededTargetKeys.has(key))) {
         signatures[identityHash] = { ...record, state: "retired" };
@@ -487,32 +513,21 @@ export function reconcileSignaturesDetailed(store, observations = [], options = 
 // Candidate derivation (pure -- operates only on an already-loaded store snapshot).
 // ---------------------------------------------------------------------------------------------
 
-// Fingerprint helpers (2026-10, recovery coverage): the SINGLE source of each rule's fingerprint,
-// used by both the candidate builders below and deriveIdentityCoverage, so a reported coverage key
-// is always exactly alertId(rule_id, <the fingerprint the builder emits>). Each returns `undefined`
-// when no safe fingerprint exists; the builders then fall back to the shared literal "unknown"
-// (unchanged behavior), which coverage NEVER reports -- distinct targets collapse onto it, so
-// reporting it would let one target's evaluation recover another's alert.
+// Fingerprint helpers: the single source of each rule's candidate fingerprint. Each returns
+// `undefined` when no safe fingerprint exists; builders then use the shared "unknown" fallback.
 export function unknownIdentityFingerprint(identityHash) {
   return typeof identityHash === "string" && identityHash ? identityHash : undefined;
 }
 
 export function newPublicBindFingerprint(portKey) {
-  return sanitizeIdentityString(`port.${portKey}`);
+  return sanitizeIdentityString(`port.${normalizePortTargetKey(portKey)}`);
 }
 
 export function identityDriftFingerprint(targetKey) {
-  return sanitizeIdentityString(targetKey);
-}
-
-// Every target key (identity_drift grouping key) a record participates in -- the same keys
-// groupKnownGoodByTargetKey indexes, independent of the record's state.
-function recordTargetKeys(record) {
-  const keys = [];
-  const processKey = record?.inputs_hash?.executable_path_hash;
-  if (processKey) keys.push(`process.${processKey}`);
-  for (const portKey of record?.port_target_keys ?? []) keys.push(`port.${portKey}`);
-  return keys;
+  const normalizedTarget = String(targetKey ?? "").startsWith("port.")
+    ? `port.${normalizePortTargetKey(String(targetKey).slice("port.".length))}`
+    : targetKey;
+  return sanitizeIdentityString(normalizedTarget);
 }
 
 function groupKnownGoodByTargetKey(signatures) {
@@ -525,7 +540,7 @@ function groupKnownGoodByTargetKey(signatures) {
     if (record.state !== "known_good") continue;
     const processKey = record.inputs_hash?.executable_path_hash;
     if (processKey) pushEntry(`process.${processKey}`, { identityHash, record });
-    for (const portKey of record.port_target_keys ?? []) pushEntry(`port.${portKey}`, { identityHash, record });
+    for (const portKey of record.port_target_keys ?? []) pushEntry(`port.${normalizePortTargetKey(portKey)}`, { identityHash, record });
   }
   return groups;
 }
@@ -551,9 +566,10 @@ function buildUnknownIdentityCandidate(identityHash, record) {
 }
 
 function buildNewPublicBindCandidate(identityHash, record, portKey) {
-  const [protocol, portStr] = String(portKey).split(".");
+  const normalizedPortKey = normalizePortTargetKey(portKey);
+  const [protocol, portStr] = String(normalizedPortKey).split(".");
   const localPort = Number(portStr);
-  const fingerprint = newPublicBindFingerprint(portKey) ?? "unknown";
+  const fingerprint = newPublicBindFingerprint(normalizedPortKey) ?? "unknown";
   const diagnostics = sanitizeDiagnostics({
     identity_hash: identityHash,
     protocol,
@@ -591,30 +607,6 @@ function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
     diagnostics,
     evidence_refs: ["provenance-identity"],
   };
-}
-
-const PUBLIC_BIND_ADDRESSES = new Set(["0.0.0.0", "[::]", "*"]);
-
-function publicPortTargetKey(socket) {
-  if (!PUBLIC_BIND_ADDRESSES.has(socket?.local_address)) return undefined;
-  if (typeof socket?.protocol !== "string" || socket.protocol.length === 0) return undefined;
-  const port = Number(socket.local_port);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) return undefined;
-  return `${socket.protocol}.${port}`;
-}
-
-function completePublicPortTargets(socketCensus) {
-  if (socketCensus?.status !== "ok" || !Array.isArray(socketCensus.sockets)) return undefined;
-  if (Array.isArray(socketCensus.reasons) && socketCensus.reasons.length > 0) return undefined;
-  if (socketCensus.truncated === true || socketCensus.parseLoss === true || socketCensus.parse_loss === true) return undefined;
-  return new Set(socketCensus.sockets.map(publicPortTargetKey).filter(Boolean));
-}
-
-function portTargetListMayBeBounded(record) {
-  // Legacy records have no explicit truncation marker. A list at the storage cap is therefore
-  // treated conservatively as possibly truncated; coverage must never infer a clear from it.
-  return (record?.port_target_keys ?? []).length >= MAX_PORT_TARGET_KEYS
-    || record?.port_target_keys_truncated === true;
 }
 
 /**
@@ -679,7 +671,7 @@ export function deriveIdentityCandidates(store, options = {}) {
     if (!isPresent(record)) continue; // Recovered: unseen for longer than the presence window.
     candidates.push(buildUnknownIdentityCandidate(identityHash, record));
     for (const portKey of record.current_port_target_keys ?? record.port_target_keys ?? []) {
-      candidates.push(buildNewPublicBindCandidate(identityHash, record, portKey));
+      candidates.push(buildNewPublicBindCandidate(identityHash, record, normalizePortTargetKey(portKey)));
     }
   }
 
@@ -696,85 +688,11 @@ export function deriveIdentityCandidates(store, options = {}) {
   return candidates;
 }
 
-/**
- * Detector-reported recovery coverage for provenance identities.
- *
- * A successful census is not enough to authorize recovery from absence. Coverage is positive
- * evidence only: the exact identity signature must have been observed in this tick, and the
- * corresponding candidate predicate must now be false. A record that is absent, aged out, or
- * superseded by a different signature contributes no key. This deliberately removes the old
- * process/port-target supersession heuristic; target sharing is not identity evidence.
- */
-export function deriveIdentityCoverage(store, {
-  skippedObservations = [],
-  observations = [],
-  socketCensus,
-  ts,
-} = {}) {
-  if (!store?.bootstrapped_at || ts === undefined) return [];
-  const signatures = store.signatures ?? {};
-  const skippedHashes = new Set((skippedObservations ?? []).map((observation) => computeIdentitySignature(observation)));
-  const observed = new Map();
-  for (const observation of observations ?? []) {
-    const identityHash = computeIdentitySignature(observation);
-    if (skippedHashes.has(identityHash)) continue;
-    const record = signatures[identityHash];
-    if (!record || record.last_seen !== ts) continue;
-    if (!observed.has(identityHash)) observed.set(identityHash, []);
-    observed.get(identityHash).push({ observation, record });
-  }
-
-  const candidates = new Set(deriveIdentityCandidates(store, { now: ts, presenceWindowMs: Number.MAX_SAFE_INTEGER }).map((candidate) => candidate.id));
-  const currentPublicPortTargets = completePublicPortTargets(socketCensus);
-  const keys = new Set();
-  const addIfClear = (ruleId, fingerprint) => {
-    if (!fingerprint) return;
-    const key = alertId(ruleId, fingerprint);
-    if (!candidates.has(key)) keys.add(key);
-  };
-
-  const groupsByTarget = groupKnownGoodByTargetKey(signatures);
-  for (const [identityHash, siblingEntries] of observed) {
-    // Same-key observations are one persisted identity record, but they are separate positive
-    // observations. Fold them as a group: a clear is valid only when every sibling agrees that
-    // the condition is clear. This prevents last-observation-wins coverage.
-    const unknownConditionClear = siblingEntries.every(({ record }) => (
-      record.state !== "known_good" || record.origin !== "grace_window"
-    ));
-    if (unknownConditionClear) {
-      addIfClear(UNKNOWN_IDENTITY_RULE_ID, unknownIdentityFingerprint(identityHash));
-    }
-
-    // Port recovery is authorized only by the complete raw socket census. Persisted
-    // port_target_keys/current_port_target_keys are bounded introspection fields, not evidence of
-    // absence; a record at the bound is fail-closed even if the target is not in that list.
-    if (currentPublicPortTargets !== undefined) {
-      const portKeys = new Set();
-      for (const { record } of siblingEntries) {
-        if (portTargetListMayBeBounded(record)) continue;
-        for (const portKey of record.port_target_keys ?? []) portKeys.add(portKey);
-      }
-      for (const portKey of portKeys) {
-        const fingerprint = newPublicBindFingerprint(portKey);
-        if (fingerprint && !currentPublicPortTargets.has(portKey)) keys.add(alertId(NEW_PUBLIC_BIND_RULE_ID, fingerprint));
-      }
-    }
-
-    // A drift key can clear positively when every same-key observation is clear and no other
-    // known-good identity is currently present for that target. An absent known-good record is
-    // intentionally still a veto: it may simply have departed or been hidden by incomplete data.
-    const targetKeys = new Set(siblingEntries.flatMap(({ record }) => recordTargetKeys(record)));
-    for (const targetKey of targetKeys) {
-      const fingerprint = identityDriftFingerprint(targetKey);
-      if (!fingerprint) continue;
-      const group = groupsByTarget.get(targetKey) ?? [];
-      const groupIsClear = group.every(({ identityHash: otherHash }) => otherHash === identityHash);
-      if (groupIsClear) {
-        addIfClear(IDENTITY_DRIFT_RULE_ID, fingerprint);
-      }
-    }
-  }
-  return [...keys];
+// Provenance identity recovery is deliberately safe-frozen. Keep this compatibility seam
+// fail-closed for old callers and fixtures, but do not retain any positive-clear derivation here:
+// no observation, census, sibling fold, or absence claim may produce an evaluated alert key.
+export function deriveIdentityCoverage() {
+  return [];
 }
 
 // ---------------------------------------------------------------------------------------------

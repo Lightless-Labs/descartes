@@ -118,6 +118,17 @@ test("gatherIdentityObservations populates identityHash from a bounded fs.stat C
   assert.match(observations[0].identityHash, /^[0-9a-f]{16}$/);
 });
 
+test("gatherIdentityObservations treats macOS :: as public and normalizes tcp6/udp6 transport keys", async () => {
+  const observations = await gatherIdentityObservations(fakeCollectorOptions({
+    listListeningSocketsWithPid: async () => [
+      { protocol: "tcp6", local_address: "::", local_port: 8080, pid: 100 },
+      { protocol: "udp6", local_address: "[::]", local_port: 5353, pid: 100 },
+    ],
+  }));
+  assert.equal(observations.length, 1);
+  assert.deepEqual(observations[0].portTargetKeys.sort(), ["tcp.8080", "udp.5353"]);
+});
+
 test("gatherIdentityObservations: DEGRADE-NOT-FABRICATE -- a stat failure (ENOENT/permission/race) leaves identityHash undefined, never a fabricated value, and never throws", async () => {
   const observations = await gatherIdentityObservations(fakeCollectorOptions({
     statExecutablePath: async () => {
@@ -674,7 +685,7 @@ test("coverage: a DEGRADED collection does NOT advance last_reconciled_at or las
   assert.equal(recovered.evaluatedAlertKeys.includes(unknownKey), false);
 });
 
-test("coverage: the same identity observed present with its alert condition cleared is covered", async () => {
+test("safe-frozen provenance identity coverage: a same-record clear is never covered", async () => {
   const paths = await tempPaths();
   const { identityHash, unknownKey, bindKey } = await seedConfirmedIdentity(paths);
   const { store } = await loadSignatureStore(paths);
@@ -687,8 +698,47 @@ test("coverage: the same identity observed present with its alert condition clea
   });
   assert.equal(result.candidates.some((candidate) => candidate.id === unknownKey), false);
   assert.equal(result.candidates.some((candidate) => candidate.id === bindKey), false);
-  assert.ok(result.evaluatedAlertKeys.includes(unknownKey));
-  assert.ok(result.evaluatedAlertKeys.includes(bindKey));
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+});
+
+test("safe-frozen provenance identity coverage: all four daybreak reproductions report no keys", async () => {
+  const cases = [
+    {
+      name: "macOS IPv6 wildcard spelling",
+      collection: okCollection([{ ...CONFIRMED_OBSERVATION, portTargetKeys: [] }]),
+      socketCensus: { status: "ok", sockets: [{ protocol: "tcp", local_address: "::", local_port: 9500, pid: 100 }], reasons: [] },
+    },
+    {
+      name: "Linux tcp6 protocol re-key",
+      collection: okCollection([{ ...CONFIRMED_OBSERVATION, portTargetKeys: [] }]),
+      socketCensus: { status: "ok", sockets: [{ protocol: "tcp6", local_address: "[::]", local_port: 9500, pid: 100 }], reasons: [] },
+    },
+    {
+      name: "unprivileged cross-UID absence",
+      collection: okCollection([]),
+      socketCensus: { status: "ok", sockets: [], reasons: [] },
+    },
+    {
+      name: "transient-stat-skipped sibling",
+      collection: okCollection([{ ...CONFIRMED_OBSERVATION, identityHash: undefined }]),
+      socketCensus: socketCensusForObservations([]),
+    },
+  ];
+
+  for (const scenario of cases) {
+    const paths = await tempPaths();
+    const { unknownKey, bindKey } = await seedConfirmedIdentity(paths);
+    const result = await computeProvenanceIdentityCandidates(paths, {
+      ...coverageOptions(async () => {
+        const collection = await scenario.collection();
+        return { ...collection, socketCensus: scenario.socketCensus };
+      }),
+      now: hoursAfterT0(1),
+    });
+    assert.deepEqual(result.evaluatedAlertKeys, [], scenario.name);
+    assert.equal(result.evaluatedAlertKeys.includes(unknownKey), false, scenario.name);
+    assert.equal(result.evaluatedAlertKeys.includes(bindKey), false, scenario.name);
+  }
 });
 
 test("coverage: re-keying to a different path and port never covers the old identity keys", async () => {

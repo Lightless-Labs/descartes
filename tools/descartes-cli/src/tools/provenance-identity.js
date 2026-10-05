@@ -23,12 +23,12 @@ import {
   computeExecutableStatFingerprint,
   computeIdentitySignature,
   deriveIdentityCandidates,
-  deriveIdentityCoverage,
   loadSignatureStore,
   reconcileSignaturesDetailed,
   writeSignatureStore,
 } from "../provenance-store.js";
 import { buildParentTreeResult } from "./processes.js";
+import { normalizeSocketAddress, normalizeSocketProtocol } from "./network.js";
 import { classifySourceFromAncestry, isPublicBindAddress, resolveExecutableInfo } from "./provenance.js";
 import { listListeningSocketsWithPidStatus, snapshotProvenanceProcessesStatus } from "./provenance-warnings.js";
 
@@ -255,8 +255,8 @@ export async function collectIdentityObservations(options = {}) {
     const publicPortKeys = [
       ...new Set(
         pidSockets
-          .filter((socket) => isPublicBindAddress(socket.local_address))
-          .map((socket) => `${socket.protocol}.${socket.local_port}`),
+          .filter((socket) => isPublicBindAddress(normalizeSocketAddress(socket.local_address)))
+          .map((socket) => `${normalizeSocketProtocol(socket.protocol)}.${socket.local_port}`),
       ),
     ];
 
@@ -307,20 +307,21 @@ export async function collectIdentityObservations(options = {}) {
  * provenance-store.js's DEFAULT_IDENTITY_PRESENCE_WINDOW_MS -- see that function's own doc
  * comment.
  *
- * DETECTOR-REPORTED RECOVERY COVERAGE (plan 2026-09-20 §8.B; 2026-10 conversion of this DEFERRED
- * producer). Returns `{ candidates, evaluatedAlertKeys }` on EVERY path. A candidate no longer being
- * emitted is NOT, by itself, a recovery: the daemon recovers a persisted identity alert only when
- * its alertId is in `evaluatedAlertKeys`, and this function reports an identity there ONLY when
- * THIS tick's collection genuinely and successfully re-observed the host:
+ * DETECTOR-REPORTED RECOVERY COVERAGE (plan 2026-09-20 §8.B; 2026-10 operator decision). Returns
+ * `{ candidates, evaluatedAlertKeys }` on EVERY path, but this producer is SAFE-FROZEN:
+ * `evaluatedAlertKeys` is always `[]`. A candidate no longer being emitted is never a recovery;
+ * provenance identity alerts remain active until acknowledged. The shape is retained so a future
+ * privileged, machine-wide census can restore positive global-absence coverage without changing
+ * the daemon producer contract.
+ *
+ * The collector/reconcile still performs honest bookkeeping and folds genuinely resolved presence:
  *   - gate off / never bootstrapped / store unreadable-as-empty -> no keys (freeze);
  *   - not due (inside the reconcile interval; no fresh host I/O this tick) -> no keys (freeze; a
  *     present candidate is still emitted from the store, so active alerts stay active);
- *   - due + collection DEGRADED (any census gap -- see collectIdentityObservations) or malformed ->
- *     no keys, `last_reconciled_at` NOT advanced, no record treated as departed; only the
- *     genuinely-resolved observations (real presence) are folded;
- *   - due + collection OK -> only a same-record positive re-observation whose alert condition is
- *     clear contributes evaluatedAlertKeys (provenance-store.js's deriveIdentityCoverage). Present
- *     and still bad stays frozen; absent, aged-out, or superseded records never contribute keys.
+ *   - due + collection DEGRADED (any census gap) or malformed -> no keys, `last_reconciled_at`
+ *     NOT advanced; only genuinely-resolved observations are folded;
+ *   - due + collection OK -> no keys, including positive same-record clears, absent records,
+ *     re-keyed records, and transient-stat-skipped siblings.
  *     A departed-process alert therefore stays frozen until acknowledged.
  *
  * RECONCILE BOOKKEEPING: `last_reconciled_at` = last SUCCESSFUL complete reconcile only;
@@ -343,7 +344,6 @@ export async function computeProvenanceIdentityCandidates(descartesPaths, option
   const due = !Number.isFinite(lastAttemptMs) || nowMs - lastAttemptMs >= reconcileIntervalMs;
 
   let currentStore = store;
-  let evaluatedAlertKeys = [];
   if (due) {
     const collect = options.collectIdentityObservations ?? collectIdentityObservations;
     const collection = await collect(options);
@@ -352,7 +352,7 @@ export async function computeProvenanceIdentityCandidates(descartesPaths, option
     const observations = Array.isArray(collection?.observations) ? collection.observations : [];
     const collectionOk = collection?.status === "ok" && Array.isArray(collection?.observations);
     const ts = options.ts ?? new Date(nowMs).toISOString();
-    const { store: reconciled, skippedObservations } = reconcileSignaturesDetailed(
+    const { store: reconciled } = reconcileSignaturesDetailed(
       store,
       observations,
       { ts, iterationKey: ts, ...options, seedKnownGood: false },
@@ -378,16 +378,10 @@ export async function computeProvenanceIdentityCandidates(descartesPaths, option
     }
     const writeStore = options.writeSignatureStore ?? writeSignatureStore;
     await writeStore(descartesPaths, currentStore);
-    if (collectionOk) evaluatedAlertKeys = deriveIdentityCoverage(currentStore, {
-      skippedObservations,
-      observations,
-      socketCensus: collection.socketCensus,
-      ts,
-    });
   }
 
   const candidates = deriveIdentityCandidates(currentStore, { now: nowMs, presenceWindowMs: options.identityPresenceWindowMs });
-  return { candidates, evaluatedAlertKeys };
+  return { candidates, evaluatedAlertKeys: [] };
 }
 
 // Additive, exported for test-fixture reuse/clarity (mirrors provenance-store.js's own export of

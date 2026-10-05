@@ -77,3 +77,14 @@ test("parseMacLsofListeningSockets parses bounded lsof listener rows", () => {
     { protocol: "tcp", state: "LISTEN", command: "Control", pid: 431, local_address: "*", local_port: 5000 },
   ]);
 });
+
+test("parseMacLsofListeningSockets canonicalizes an IPv6 wildcard and skips valid portless UDP wildcard rows", () => {
+  const sockets = parseMacLsofListeningSockets(`COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node     1234 me     23u  IPv6 0xabc              0t0  TCP [::]:3000 (LISTEN)
+mdns     4321 me     24u  IPv6 0xdef              0t0  UDP *:*
+`, { limit: 10 });
+
+  assert.deepEqual(sockets, [
+    { protocol: "tcp", state: "LISTEN", command: "node", pid: 1234, local_address: "[::]", local_port: 3000 },
+  ]);
+});

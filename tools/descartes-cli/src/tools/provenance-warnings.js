@@ -47,6 +47,7 @@ import {
   isRecognizedSupervisorSourceType,
   listProcPids,
   MAX_LINUX_FD_SCAN_PIDS,
+  MAX_LINUX_SOCKET_ROWS_PER_SOURCE,
   parseProcNetContentsDetailed,
   parseProvenancePs,
   provenancePsArgsForPlatform,
@@ -353,6 +354,7 @@ export const SOCKET_CENSUS_DEGRADED_REASONS = Object.freeze({
   LSOF_TRUNCATED: "lsof_truncated",
   PROC_NET_UNREADABLE: "proc_net_unreadable",
   PROC_NET_UNPARSEABLE: "proc_net_unparseable",
+  PROC_NET_TRUNCATED: "proc_net_truncated",
   PROC_PID_ENUMERATION_FAILED: "proc_pid_enumeration_failed",
   PROC_PID_SCAN_TRUNCATED: "proc_pid_scan_truncated",
   UNSUPPORTED_PLATFORM: "unsupported_platform",
@@ -408,10 +410,13 @@ async function listLinuxListeningSocketsDetailed(options) {
   for (const [protocol, filePath] of LINUX_PROC_NET_SOURCES) {
     try {
       const contents = await readFileFn(filePath);
-      const parsed = parseProcNetContentsDetailed(contents, { protocol });
+      const parsed = parseProcNetContentsDetailed(contents, { protocol, limit: MAX_LINUX_SOCKET_ROWS_PER_SOURCE });
       entries.push(...parsed.entries);
       if (parsed.rejected > 0 && !reasons.includes(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_UNPARSEABLE)) {
         reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_UNPARSEABLE);
+      }
+      if (parsed.truncated && !reasons.includes(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_TRUNCATED)) {
+        reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_TRUNCATED);
       }
     } catch (error) {
       // This /proc source is unavailable on this host; continue with the others (legacy behavior).
@@ -424,7 +429,12 @@ async function listLinuxListeningSocketsDetailed(options) {
       }
     }
   }
-  const listening = entries.filter((entry) => (entry.protocol.startsWith("tcp") ? entry.state === "LISTEN" : true));
+  if (entries.length > MAX_LINUX_SOCKET_ROWS_PER_SOURCE && !reasons.includes(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_TRUNCATED)) {
+    reasons.push(SOCKET_CENSUS_DEGRADED_REASONS.PROC_NET_TRUNCATED);
+  }
+  const listening = entries
+    .slice(0, MAX_LINUX_SOCKET_ROWS_PER_SOURCE)
+    .filter((entry) => (entry.protocol.startsWith("tcp") ? entry.state === "LISTEN" : true));
   if (listening.length === 0) return { sockets: [], reasons };
 
   const listPids = options.listProcPids ?? listProcPids;

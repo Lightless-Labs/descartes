@@ -49,6 +49,17 @@ function uniqueBy(items, keyFn) {
   return result;
 }
 
+export function normalizeSocketProtocol(protocol) {
+  const value = String(protocol ?? "").toLowerCase();
+  if (value === "tcp6") return "tcp";
+  if (value === "udp6") return "udp";
+  return value;
+}
+
+export function normalizeSocketAddress(address) {
+  return String(address ?? "") === "::" ? "[::]" : address;
+}
+
 export function normalizeInterfaces(interfaces = os.networkInterfaces()) {
   return Object.entries(interfaces).flatMap(([name, addresses]) => (addresses ?? []).map((address) => ({
     name,
@@ -116,13 +127,14 @@ export function parseScutilDns(stdout) {
 function parseAddressPort(endpoint) {
   const clean = String(endpoint ?? "").replace(/^\[/, "").replace(/\]$/, "");
   if (!clean) return { address: undefined, port: undefined };
+  if (clean === "::") return { address: "[::]", port: undefined };
 
   const bracketed = String(endpoint).match(/^\[([^\]]+)\]:(\*|\d+)$/);
-  if (bracketed) return { address: bracketed[1], port: bracketed[2] === "*" ? undefined : Number(bracketed[2]) };
+  if (bracketed) return { address: normalizeSocketAddress(bracketed[1]), port: bracketed[2] === "*" ? undefined : Number(bracketed[2]) };
 
   const lastColon = clean.lastIndexOf(":");
   if (lastColon === -1) return { address: clean, port: undefined };
-  const address = clean.slice(0, lastColon) || "*";
+  const address = normalizeSocketAddress(clean.slice(0, lastColon) || "*");
   const portText = clean.slice(lastColon + 1);
   return { address, port: portText === "*" ? undefined : Number(portText) };
 }
@@ -133,7 +145,7 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
     if (parts.length < 5) return undefined;
     const local = parseAddressPort(parts[4]);
     return {
-      protocol: parts[0],
+      protocol: normalizeSocketProtocol(parts[0]),
       state: parts[1],
       local_address: local.address,
       local_port: local.port,
@@ -147,14 +159,22 @@ export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}
   let rejected = 0;
   for (const line of String(stdout ?? "").split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
     const match = line.match(/^(\S+)\s+(\d+)\s+\S+.*\s+(TCP|UDP)\s+(.+?)(?:\s+\(LISTEN\))?$/);
-    const protocol = match?.[3]?.toLowerCase();
+    const protocol = normalizeSocketProtocol(match?.[3]);
     const isTcp = protocol === "tcp";
     if (!match || (isTcp && !/\(LISTEN\)$/.test(line))) {
       rejected += 1;
       continue;
     }
     const local = parseAddressPort(match[4]);
-    if (!local.address || local.port === undefined) {
+    if (!local.address) {
+      rejected += 1;
+      continue;
+    }
+    // macOS emits UDP wildcard bookkeeping rows such as `*: *`/`*:*` for an
+    // unconnected, portless socket. They are valid census rows but carry no
+    // bind target, so ignore them without degrading the census.
+    if (local.port === undefined) {
+      if (protocol === "udp" && local.address === "*") continue;
       rejected += 1;
       continue;
     }

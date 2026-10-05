@@ -19,7 +19,7 @@ import {
   snapshotProvenanceProcesses,
   snapshotProvenanceProcessesStatus,
 } from "../src/tools/provenance-warnings.js";
-import { MAX_LINUX_FD_SCAN_PIDS } from "../src/tools/provenance.js";
+import { MAX_LINUX_FD_SCAN_PIDS, MAX_LINUX_SOCKET_ROWS_PER_SOURCE } from "../src/tools/provenance.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-provenance-warnings-test-"));
@@ -440,7 +440,7 @@ test("listListeningSocketsWithPidStatus('darwin'): a clean lsof census is status
     runFixedExecFile: async (_command, args) => ({
       status: "ok",
       stdout: args.includes("-iUDP")
-        ? `${LSOF_HEADER}node     1234 me     24u  IPv4 0xabc              0t0  UDP 0.0.0.0:5353\n`
+        ? `${LSOF_HEADER}node     1234 me     24u  IPv4 0xabc              0t0  UDP 0.0.0.0:5353\nmdns     4321 me     25u  IPv6 0xdef              0t0  UDP *:*\n`
         : `${LSOF_HEADER}node     1234 me     23u  IPv4 0xabc              0t0  TCP 0.0.0.0:3000 (LISTEN)\n`,
     }),
   });
@@ -584,6 +584,24 @@ test("listListeningSocketsWithPidStatus('linux'): a pid list at the fd-scan cap 
   }));
   assert.equal(result.status, "degraded");
   assert.deepEqual(result.reasons, ["proc_pid_scan_truncated"]);
+});
+
+test("listListeningSocketsWithPidStatus('linux'): raw /proc/net socket rows are bounded and overflow is DEGRADED", async () => {
+  const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+  const rows = Array.from({ length: MAX_LINUX_SOCKET_ROWS_PER_SOURCE + 1 }, (_, index) => {
+    const port = (10000 + index).toString(16).padStart(4, "0");
+    return ` ${index}: 00000000:${port} 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 ${60000 + index} 1 0000000000000000 100 0 0 10 0`;
+  }).join("\n");
+  const result = await listListeningSocketsWithPidStatus("linux", linuxStatusOptions({
+    readFile: async (file) => {
+      if (file === "/proc/net/tcp") return `${header}\n${rows}`;
+      if (file === "/proc/net/udp") return `${header}\n`;
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    },
+  }));
+  assert.equal(result.status, "degraded");
+  assert.ok(result.reasons.includes("proc_net_truncated"));
+  assert.equal(result.sockets.length, MAX_LINUX_SOCKET_ROWS_PER_SOURCE);
 });
 
 test("listListeningSocketsWithPidStatus: an unsupported platform is DEGRADED, never an empty ok census", async () => {

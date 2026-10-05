@@ -127,6 +127,11 @@ test("computeIdentitySignature changes when exactly one input (source_classifica
   assert.notEqual(base, differentSource);
 });
 
+test("public-bind and drift fingerprints normalize IPv4/IPv6 transport protocol suffixes", () => {
+  assert.equal(newPublicBindFingerprint("tcp6.8080"), newPublicBindFingerprint("tcp.8080"));
+  assert.equal(identityDriftFingerprint("port.udp6.5353"), identityDriftFingerprint("port.udp.5353"));
+});
+
 // ---------------------------------------------------------------------------------------------
 // TDD item 3: provisional -> known_good promotion boundary, table-driven. Grace window:
 // stable_sample_count >= 3 AND stable_iteration_count >= 2 DISTINCT structural ticks.
@@ -626,6 +631,26 @@ test("reconcileSignatures unions current public ports across same-key sibling ob
   assert.deepEqual(store.signatures[identityHash].current_port_target_keys, ["tcp.8080"]);
 });
 
+test("reconcileSignatures bounds the unioned current port list and marks overflow as truncated", () => {
+  const observation = {
+    executablePath: "/opt/many/bin/worker",
+    identityHash: "many-many-many-1",
+    sourceClassification: "shell",
+    owningUser: "501",
+    portTargetKeys: Array.from({ length: 6 }, (_, index) => `tcp.${8000 + index}`),
+  };
+  const identityHash = computeIdentitySignature(observation);
+  const store = reconcileSignatures({ version: 1, signatures: {} }, [observation], {
+    ts: "2026-07-10T01:00:00.000Z",
+    iterationKey: "tick-1",
+  });
+  const record = store.signatures[identityHash];
+  assert.equal(record.current_port_target_keys.length, 5);
+  assert.equal(record.current_port_target_keys_truncated, true);
+  assert.equal(record.port_target_keys.length, 5);
+  assert.equal(record.port_target_keys_truncated, true);
+});
+
 function coverageStore() {
   return {
     version: 1,
@@ -758,7 +783,7 @@ test("deriveIdentityCoverage uses the complete raw socket census, including prov
   assert.equal(keys.includes(alertId(NEW_PUBLIC_BIND_RULE_ID, newPublicBindFingerprint("tcp.8080"))), false);
 });
 
-test("deriveIdentityCoverage covers a public bind only when the complete raw census proves the target is gone", () => {
+test("deriveIdentityCoverage is retired and never covers a public bind, even with a complete raw census", () => {
   const observation = {
     executablePath: "/opt/gone/bin/worker",
     identityHash: "gone-gone-gone-1",
@@ -787,7 +812,7 @@ test("deriveIdentityCoverage covers a public bind only when the complete raw cen
     ts: "2026-07-10T01:00:00.000Z",
     socketCensus: completeSocketCensus([]),
   });
-  assert.ok(covered.includes(bindKey));
+  assert.equal(covered.includes(bindKey), false);
 
   const incomplete = deriveIdentityCoverage(store, {
     observations: [{ ...observation, portTargetKeys: [] }],

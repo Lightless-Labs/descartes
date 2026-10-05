@@ -14,7 +14,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, readlink, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
-import { parseMacLsofListeningSockets } from "./network.js";
+import { normalizeSocketAddress, normalizeSocketProtocol, parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
 import { defaultInvokeElevatedHelper, readPtraceScopeDiagnostic, resolveElevated } from "./provenance-elevated.js";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig } from "../provenance-elevated-config.js";
@@ -31,6 +31,7 @@ const MAX_ANCESTRY_DEPTH = 16;
 // lister in provenance-warnings.js needs this cap to detect a TRUNCATED pid scan (owners past the
 // cap are unobserved, not absent).
 export const MAX_LINUX_FD_SCAN_PIDS = 4096;
+export const MAX_LINUX_SOCKET_ROWS_PER_SOURCE = 4096;
 
 const CRON_COMMS = new Set(["cron", "crond", "atd"]);
 const SHELL_COMMS = new Set(["bash", "zsh", "sh", "fish"]);
@@ -177,7 +178,7 @@ export function classifySourceFromAncestry(ancestryChain = []) {
 // ---------------------------------------------------------------------------------------------
 
 export function isPublicBindAddress(address) {
-  return PUBLIC_BIND_ADDRESSES.has(String(address));
+  return PUBLIC_BIND_ADDRESSES.has(normalizeSocketAddress(address));
 }
 
 // Exported (additive, S4) so callers that need to know "is this source type a recognized
@@ -282,10 +283,10 @@ export function parseProcNetLine(line, { protocol } = {}) {
     || !/^\d+$/.test(String(inode ?? ""))) return undefined;
 
   return {
-    protocol: protocol ?? (isV6 ? "tcp6" : "tcp"),
-    local_address: address,
+    protocol: normalizeSocketProtocol(protocol ?? (isV6 ? "tcp6" : "tcp")),
+    local_address: normalizeSocketAddress(address),
     local_port: localPort,
-    state: String(protocol ?? "").startsWith("udp") ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
+    state: normalizeSocketProtocol(protocol ?? (isV6 ? "tcp6" : "tcp")).startsWith("udp") ? "UNCONN" : (TCP_STATE_NAMES[stateHex] ?? stateHex),
     uid: Number.isFinite(uid) ? uid : undefined,
     inode,
   };
@@ -295,17 +296,17 @@ export function parseProcNetContents(contents, { protocol } = {}) {
   return parseProcNetContentsDetailed(contents, { protocol }).entries;
 }
 
-export function parseProcNetContentsDetailed(contents, { protocol } = {}) {
-  const lines = String(contents ?? "").split("\n").slice(1);
+export function parseProcNetContentsDetailed(contents, { protocol, limit = Number.MAX_SAFE_INTEGER } = {}) {
+  const lines = String(contents ?? "").split("\n").slice(1).filter((line) => line.trim());
+  const boundedLines = lines.slice(0, limit + 1);
   const entries = [];
   let rejected = 0;
-  for (const line of lines) {
-    if (!line.trim()) continue;
+  for (const line of boundedLines) {
     const entry = parseProcNetLine(line, { protocol });
     if (entry) entries.push(entry);
     else rejected += 1;
   }
-  return { entries, rejected };
+  return { entries: entries.slice(0, limit), rejected, truncated: lines.length > limit };
 }
 
 // Pure inode->pid matcher over an already-performed fd scan. fdScanResults is
