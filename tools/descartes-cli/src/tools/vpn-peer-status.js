@@ -319,6 +319,7 @@ async function collectWireguardPeers(options) {
 // bracketed type classifier. Keep the whole pre-name token loose because macOS emits forms such
 // as `VPN (...)`, `IPSec`, and `PPP --> com.example...`.
 const SCUTIL_NC_LINE_RE = /^\*?\s*\(([^)]+)\)\s+([0-9A-Fa-f-]{36})\s+.+?\s+"([^"]*)"\s+\[([^\]]+)\]\s*$/;
+const SCUTIL_NC_HEADER_RE = /^Available network connection services in the current set \(\*=enabled\):$/;
 const VPN_SERVICE_TYPE_RE = /^(?:VPN:.*|IPSec|PPP:L2TP)$/i;
 const TAILSCALE_SERVICE_TYPE_RE = /^VPN:io\.tailscale\.ipn\.[^\s]+$/i;
 
@@ -328,6 +329,7 @@ export function parseScutilNcListDetailed(stdout) {
   for (const rawLine of String(stdout ?? "").split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
+    if (SCUTIL_NC_HEADER_RE.test(line)) continue;
     const match = line.match(SCUTIL_NC_LINE_RE);
     if (!match) {
       unparsed_count += 1;

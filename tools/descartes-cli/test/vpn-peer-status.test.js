@@ -173,6 +173,7 @@ test("parseWgHandshakes maps pubkey -> epoch seconds, 0 means never handshaked",
 
 test("parseScutilNcList parses real macOS output with the type token between UUID and name", () => {
   const stdout = [
+    "Available network connection services in the current set (*=enabled):",
     '* (Connected)    1E4E6C58-F859-4E51-92A6-BF4B14A23689 VPN (com.example.vpn) "Corp VPN"     [PPP:L2TP]',
     '  (Disconnected) 2A7BDCE1-1234-4E51-92A6-BF4B14A23690 IPSec "Home VPN"     [IPSec]',
   ].join("\n");
@@ -185,6 +186,7 @@ test("parseScutilNcList parses real macOS output with the type token between UUI
 
 test("parseScutilNcList classifies VPN types, excludes modem types from VPN counting, and marks Tailscale", () => {
   const detailed = parseScutilNcListDetailed([
+    "Available network connection services in the current set (*=enabled):",
     '* (Connected) B91A0000-0000-0000-0000-00000000A702 VPN (io.tailscale.ipn.macsys) "Tailscale" [VPN:io.tailscale.ipn.macsys]',
     '* (Disconnected) EA7E0000-0000-0000-0000-000000000000 PPP --> com.example.spice.0 "Spice modem" [PPP:Modem]',
     '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
@@ -465,6 +467,7 @@ test("permission-denied on who/last -> missing_permission, never fabricated as z
 test("macOS VPN service parsing keeps VPNs, drops the modem, and does not double-count Tailscale", async () => {
   const runFixedExecFile = scriptedExec(baseScript({
     [JSON.stringify(["scutil", "--nc", "list"])]: ok([
+      "Available network connection services in the current set (*=enabled):",
       '* (Connected) B91A0000-0000-0000-0000-00000000A702 VPN (io.tailscale.ipn.macsys) "Tailscale" [VPN:io.tailscale.ipn.macsys]',
       '* (Disconnected) EA7E0000-0000-0000-0000-000000000000 PPP --> com.example.spice.0 "Spice modem" [PPP:Modem]',
       '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
