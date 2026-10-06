@@ -19,6 +19,7 @@ import {
 } from "../src/alert-store.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { resolveNotificationDeliveryPaths } from "../src/notification-delivery.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-alerts-test-"));
@@ -284,6 +285,38 @@ test("legacy active records with last_notified are due until audit evidence prov
 
   const escalated = applyAlertCandidates(persistent.alerts, [{ ...persistent.alerts[0], severity: "critical" }], { now: "2026-05-28T05:01:00.000Z" });
   assert.deepEqual(escalated.notification_due_ids, ["alert_legacy"]);
+});
+
+test("legacy migration trusts only a successful delivery audit at or after the current activation", async () => {
+  const paths = await tempPaths();
+  const store = resolveAlertStorePaths(paths);
+  await fs.mkdir(store.dir, { recursive: true });
+  const legacy = {
+    id: "alert_legacy_audit",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    status: "active",
+    severity: "warning",
+    title: "Memory high",
+    summary: "Still high",
+    first_seen: "2026-10-06T00:00:00.000Z",
+    last_seen: "2026-10-06T00:05:00.000Z",
+    last_notified: "2026-10-06T00:01:00.000Z",
+    diagnostics: { min: 0.92 },
+  };
+  await fs.writeFile(store.alertsFile, JSON.stringify({ version: 1, alerts: [legacy] }));
+  const delivery = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(delivery.auditFile), { recursive: true });
+  await fs.writeFile(delivery.auditFile, [
+    JSON.stringify({ ts: "2026-10-05T23:59:00.000Z", status: "delivered", payload: { alert_id: legacy.id, severity: "critical" } }),
+    JSON.stringify({ ts: "2026-10-06T00:01:00.000Z", status: "error", payload: { alert_id: legacy.id, severity: "warning" } }),
+    JSON.stringify({ ts: "2026-10-06T00:02:00.000Z", status: "delivered", payload: { alert_id: legacy.id, severity: "warning" } }),
+  ].join("\n") + "\n");
+
+  const [migrated] = await readAlertRecords(paths);
+  assert.equal(migrated.episode_notified_at, "2026-10-06T00:02:00.000Z");
+  assert.equal(migrated.notified_severity_max, "warning");
+  assert.equal(migrated.last_notified, "2026-10-06T00:01:00.000Z", "legacy field is retained as history, never used as proof");
 });
 
 test("a fixed alert active for five simulated days produces one notification", () => {
