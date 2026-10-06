@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
+import { confirmAlertDelivery, materialEvidenceDigest, recordAlertAdjudication } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -72,6 +73,25 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
+
+function deliveryWasSuccessful(delivery) {
+  return delivery?.status === "delivered" || delivery?.status === "cli_only" || delivery?.status === "recorded" || delivery?.delivered === true;
+}
+
+async function confirmDeliveryIfPossible(descartesPaths, alert, delivery, options) {
+  if (!deliveryWasSuccessful(delivery)) return false;
+  try {
+    await confirmAlertDelivery(descartesPaths, alert.id, {
+      now: options.now,
+      severity: alert.severity,
+      evidenceDigest: alert.material_evidence_digest ?? materialEvidenceDigest(alert),
+    });
+    return true;
+  } catch (error) {
+    console.warn(`descartes: confirmed delivery state update failed for alert ${alert.id}: ${error?.message ?? error}`);
+    return false;
+  }
+}
 
 // S13 must-fix 2: a critical-severity call is guaranteed a slot out of max_calls_per_hour so a
 // burst of non-critical (e.g. learned-artifact) findings cannot starve a real emergency
@@ -586,9 +606,10 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       // intentional non-failure outcome -- "disabled"/"cli_only" are config states, not failures --
       // and stays `fired`, matching this function's pre-existing "only a throw means failed"
       // contract for those.
-      if (delivery?.status === "error" || delivery?.status === "unavailable") {
+      if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
         failed.push(alert.id);
       } else {
+        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now });
         fired.push(alert.id);
       }
     } catch (error) {
@@ -893,8 +914,11 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     };
     try {
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
-      if (delivery?.status === "error" || delivery?.status === "unavailable") failed.push(alert.id);
-      else fired.push(alert.id);
+      if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") failed.push(alert.id);
+      else {
+        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now });
+        fired.push(alert.id);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
@@ -1259,7 +1283,7 @@ function hashPromptText(text) {
 export async function adjudicateAlertNotifications(descartesPaths, evaluation, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
-  const dueIds = evaluation?.notification_due_ids ?? [];
+  const dueIds = evaluation?.adjudication_due_ids ?? evaluation?.notification_due_ids ?? [];
   if (!config.enabled) return { status: "disabled", decisions: [] };
   if (dueIds.length === 0) return { status: "no_due_alerts", decisions: [] };
 
@@ -1519,6 +1543,9 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const delivery = decision.notify
           ? await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id })
           : undefined;
+        if (decision.notify) {
+          await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now });
+        }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
           alert_id: alert.id,
@@ -1538,8 +1565,17 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           prompt_hash: hashPromptText(promptText),
           prompt_template_version: ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
           decision,
+          adjudication: { notify: decision.notify, evidence_digest: alert.material_evidence_digest ?? materialEvidenceDigest(alert) },
           delivery,
         });
+        if (appended && !decision.notify) {
+          await recordAlertAdjudication(descartesPaths, alert.id, {
+            now,
+            severity: alert.severity,
+            evidenceDigest: alert.material_evidence_digest ?? materialEvidenceDigest(alert),
+            notify: false,
+          });
+        }
       } catch (error) {
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,

@@ -25,7 +25,7 @@ import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-b
 import { containmentRecommendationRuleIds } from "../src/containment-recommend.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
-import { applyAlertCandidates } from "../src/alert-store.js";
+import { applyAlertCandidates, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
@@ -394,6 +394,44 @@ test("enabled alert intelligence wakes fake LLM and records audited decision", a
   assert.equal(audit[0].status, "ok");
   assert.equal(audit[0].decision.notify, true);
   assert.equal(audit[0].decision.title, "Memory pressure is high");
+});
+
+test("notify:false is adjudication state, not delivery state, and reopens only for changed evidence", async () => {
+  const paths = await tempPaths();
+  const prompts = [];
+  const candidate = alert({ diagnostics: { identity_hash: "identity-a", observed_at: "2026-10-06T00:00:00.000Z" } });
+  const first = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, first.alerts);
+  const config = normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 });
+  const decision = { notify: false, severity: "warning", title: "No notification", body: "Not actionable", reason: "stable" };
+  const firstRun = await adjudicateAlertNotifications(paths, {
+    alerts: first.alerts,
+    adjudication_due_ids: first.adjudication_due_ids,
+    notification_due_ids: first.notification_due_ids,
+  }, {
+    now: "2026-10-06T00:01:00.000Z",
+    config,
+    createSession: fakeCreateSession(prompts, decision),
+  });
+  assert.equal(firstRun.decisions[0].decision.notify, false);
+  assert.equal((await readAlertRecords(paths))[0].episode_notified_at, null);
+  assert.equal((await readAlertRecords(paths))[0].adjudication.notify, false);
+
+  const unchanged = applyAlertCandidates(await readAlertRecords(paths), [candidate], { now: "2026-10-06T00:02:00.000Z" });
+  assert.deepEqual(unchanged.notification_due_ids, [candidate.id], "notify:false never proves delivery");
+  assert.deepEqual(unchanged.adjudication_due_ids, [], "unchanged evidence is not re-adjudicated");
+  const quietRun = await adjudicateAlertNotifications(paths, unchanged, {
+    now: "2026-10-06T00:02:00.000Z",
+    config,
+    createSession: async () => { throw new Error("unchanged notify:false must not wake the model"); },
+  });
+  assert.equal(quietRun.status, "no_due_alerts");
+
+  const changed = applyAlertCandidates(await readAlertRecords(paths), [{
+    ...candidate,
+    diagnostics: { identity_hash: "identity-b" },
+  }], { now: "2026-10-06T00:03:00.000Z" });
+  assert.deepEqual(changed.adjudication_due_ids, [candidate.id]);
 });
 
 test("alert intelligence respects max calls per hour", async () => {
@@ -1466,14 +1504,16 @@ test("deterministic local delivery follows episode notification state across per
 
   let state = [];
   const first = applyAlertCandidates(state, [candidate], { now: "2026-07-14T00:01:00.000Z" });
-  state = first.alerts;
+  await writeAlertRecords(paths, first.alerts);
   await emitSessionAlertSignals(paths, first, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+  state = await readAlertRecords(paths);
 
   const persistent = applyAlertCandidates(state, [{ ...candidate, summary: "Still below baseline." }], { now: "2026-07-15T00:01:00.000Z" });
   state = persistent.alerts;
   await emitSessionAlertSignals(paths, persistent, { now: "2026-07-15T00:01:00.000Z", deliverNotification });
 
   const escalated = applyAlertCandidates(state, [{ ...candidate, severity: "critical", summary: "Session count collapsed." }], { now: "2026-07-15T00:02:00.000Z" });
+  await writeAlertRecords(paths, escalated.alerts);
   await emitSessionAlertSignals(paths, escalated, { now: "2026-07-15T00:02:00.000Z", deliverNotification });
 
   assert.equal(deliveries.length, 2);
@@ -1580,7 +1620,7 @@ test("a resolved delivery with status 'unavailable' is reported as failed, not f
   assert.deepEqual(result.failed, [current.id]);
 });
 
-test("resolved delivery statuses undefined/recorded/delivered/skipped/disabled/cli_only all remain fired (non-regression)", async () => {
+test("only successful delivery statuses fire; skipped/disabled remain due", async () => {
   const paths = await tempPaths();
   const statuses = [undefined, "recorded", "delivered", "skipped", "disabled", "cli_only"];
   for (const status of statuses) {
@@ -1594,8 +1634,9 @@ test("resolved delivery statuses undefined/recorded/delivered/skipped/disabled/c
       now: "2026-09-04T00:00:00.000Z",
       deliverNotification: async () => (status === undefined ? undefined : { status }),
     });
-    assert.deepEqual(result.fired, [current.id], `status ${status} must stay fired`);
-    assert.deepEqual(result.failed, [], `status ${status} must not be reported as failed`);
+    const expectedFailed = status === "skipped" || status === "disabled";
+    assert.deepEqual(result.fired, expectedFailed ? [] : [current.id], `status ${status} delivery classification`);
+    assert.deepEqual(result.failed, expectedFailed ? [current.id] : [], `status ${status} delivery classification`);
   }
 });
 

@@ -2,9 +2,11 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { buildHistorySummary, readDaemonStatus } from "./history-store.js";
+import { readNotificationDeliveryAudit } from "./notification-delivery.js";
 
 export const DEFAULT_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
+const ALERT_STORE_LOCK_STALE_MS = 30_000;
 
 // Retained as a compatibility export for the historical alert-config constraint and callers that
 // import the old symbol. Alert delivery no longer uses this value: episode state below is the only
@@ -21,6 +23,45 @@ export function resolveAlertStorePaths(descartesPaths) {
 
 async function ensureAlertDir(descartesPaths) {
   await fs.mkdir(resolveAlertStorePaths(descartesPaths).dir, { recursive: true, mode: 0o700 });
+}
+
+async function withAlertStoreLock(descartesPaths, operation) {
+  const { dir } = resolveAlertStorePaths(descartesPaths);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const lockFile = path.join(dir, "alerts.json.lock");
+  const owner = `${process.pid}:${crypto.randomUUID()}`;
+  for (;;) {
+    try {
+      const handle = await fs.open(lockFile, "wx", 0o600);
+      try {
+        await handle.writeFile(owner, "utf8");
+      } finally {
+        await handle.close();
+      }
+      try {
+        return await operation();
+      } finally {
+        try {
+          const currentOwner = await fs.readFile(lockFile, "utf8");
+          if (currentOwner === owner) await fs.unlink(lockFile);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        const stat = await fs.stat(lockFile);
+        if (Date.now() - stat.mtimeMs > ALERT_STORE_LOCK_STALE_MS) {
+          await fs.unlink(lockFile);
+          continue;
+        }
+      } catch (statError) {
+        if (statError?.code !== "ENOENT") throw statError;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
 }
 
 function normalizeIso(ts, fieldName = "timestamp") {
@@ -200,20 +241,16 @@ export function normalizeAlertRecord(record) {
   const lastSeen = normalizeIso(record.last_seen ?? firstSeen, "last_seen");
   const status = ["active", "recovered", "acknowledged", "suppressed"].includes(record.status) ? record.status : "active";
   const lastNotified = record.last_notified ? normalizeIso(record.last_notified, "last_notified") : null;
-  const episodeNotifiedAt = record.episode_notified_at
-    ? normalizeIso(record.episode_notified_at, "episode_notified_at")
-    : lastNotified;
-  const notifiedSeverityMax = ["info", "warning", "critical"].includes(record.notified_severity_max)
-    ? record.notified_severity_max
-    : episodeNotifiedAt && ["info", "warning", "critical"].includes(record.severity)
-      ? record.severity
-      : null;
+  const episodeNotifiedAt = record.episode_notified_at ? normalizeIso(record.episode_notified_at, "episode_notified_at") : null;
+  const notifiedSeverityMax = record.notified_severity_max === undefined || record.notified_severity_max === null
+    ? null
+    : String(record.notified_severity_max);
   return {
     id: String(record.id ?? alertId(ruleId, fingerprint)),
     rule_id: ruleId,
     fingerprint,
     status,
-    severity: ["info", "warning", "critical"].includes(record.severity) ? record.severity : "warning",
+    severity: record.severity === undefined || record.severity === null ? "warning" : String(record.severity),
     title: String(record.title ?? ruleId),
     summary: String(record.summary ?? ""),
     evidence_refs: Array.isArray(record.evidence_refs) ? record.evidence_refs.map(String).slice(0, 16) : [],
@@ -227,8 +264,57 @@ export function normalizeAlertRecord(record) {
       : status === "recovered" ? null : firstSeen,
     notified_severity_max: notifiedSeverityMax,
     episode_notified_at: episodeNotifiedAt,
+    material_evidence_digest: record.material_evidence_digest ? String(record.material_evidence_digest) : materialEvidenceDigest(record),
+    adjudicated_at: record.adjudicated_at ? normalizeIso(record.adjudicated_at, "adjudicated_at") : null,
+    adjudicated_evidence_digest: record.adjudicated_evidence_digest ? String(record.adjudicated_evidence_digest) : null,
+    adjudication: record.adjudication && typeof record.adjudication === "object" && !Array.isArray(record.adjudication)
+      ? { notify: record.adjudication.notify === true, severity: record.adjudication.severity === undefined ? undefined : String(record.adjudication.severity) }
+      : null,
     diagnostics: record.diagnostics && typeof record.diagnostics === "object" && !Array.isArray(record.diagnostics) ? record.diagnostics : {},
   };
+}
+
+function canonicalEvidence(value) {
+  if (Array.isArray(value)) return value.map(canonicalEvidence);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalEvidence(value[key])]));
+  }
+  return value;
+}
+
+export function materialEvidenceDigest(candidateOrRecord = {}) {
+  const diagnostics = candidateOrRecord?.diagnostics && typeof candidateOrRecord.diagnostics === "object"
+    ? candidateOrRecord.diagnostics
+    : {};
+  return crypto.createHash("sha256")
+    .update(JSON.stringify(canonicalEvidence(diagnostics)))
+    .digest("hex");
+}
+
+async function deriveLegacyDeliveryState(descartesPaths, alerts, legacyAlertIds = new Set()) {
+  if (alerts.length === 0) return alerts;
+  let audit = [];
+  try {
+    audit = await readNotificationDeliveryAudit(descartesPaths);
+  } catch (error) {
+    console.warn(`descartes: notification delivery audit unavailable (${error?.message ?? error}); legacy alerts remain due`);
+  }
+  return alerts.map((alert) => {
+    if (!legacyAlertIds.has(alert.id)) return alert;
+    const activation = new Date(alert.episode_started_at ?? alert.first_seen).getTime();
+    const successful = audit
+      .filter((record) => record?.payload?.alert_id === alert.id && ["delivered", "cli_only"].includes(record.status))
+      .filter((record) => Number.isFinite(new Date(record.ts).getTime()) && new Date(record.ts).getTime() >= activation)
+      .sort((left, right) => String(right.ts).localeCompare(String(left.ts)))[0];
+    if (!successful) {
+      return normalizeAlertRecord({ ...alert, episode_notified_at: null, notified_severity_max: null });
+    }
+    return normalizeAlertRecord({
+      ...alert,
+      episode_notified_at: successful.ts,
+      notified_severity_max: successful.payload?.severity ?? alert.severity,
+    });
+  });
 }
 
 export async function readAlertRecords(descartesPaths) {
@@ -245,10 +331,12 @@ export async function readAlertRecords(descartesPaths) {
     // errors) is a distinct, more severe case and must keep propagating unchanged — see the
     // catch block below, which this loop does not touch.
     const normalized = [];
+    const legacyAlertIds = new Set();
     let quarantinedCount = 0;
     for (const rawAlert of rawAlerts ?? []) {
       try {
         normalized.push(normalizeAlertRecord(rawAlert));
+        if (!Object.hasOwn(rawAlert ?? {}, "material_evidence_digest")) legacyAlertIds.add(String(rawAlert?.id ?? alertId(rawAlert?.rule_id, rawAlert?.fingerprint ?? "global")));
       } catch (recordError) {
         quarantinedCount += 1;
         const identifier = rawAlert?.id ?? rawAlert?.rule_id ?? "<unknown>";
@@ -258,14 +346,14 @@ export async function readAlertRecords(descartesPaths) {
     if (quarantinedCount > 0) {
       console.warn(`descartes: readAlertRecords quarantined ${quarantinedCount} malformed record(s) out of ${(rawAlerts ?? []).length}`);
     }
-    return normalized;
+    return deriveLegacyDeliveryState(descartesPaths, normalized, legacyAlertIds);
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
 }
 
-export async function writeAlertRecords(descartesPaths, alerts) {
+async function writeAlertRecordsUnlocked(descartesPaths, alerts) {
   await ensureAlertDir(descartesPaths);
   const { alertsFile } = resolveAlertStorePaths(descartesPaths);
   const normalized = alerts.map(normalizeAlertRecord).sort((left, right) => {
@@ -274,27 +362,34 @@ export async function writeAlertRecords(descartesPaths, alerts) {
     return right.last_seen.localeCompare(left.last_seen);
   });
   const payload = JSON.stringify({ version: 1, alerts: normalized }, null, 2);
-  const tmpFile = `${alertsFile}.${process.pid}.tmp`;
+  const tmpFile = `${alertsFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(tmpFile, payload, { mode: 0o600 });
   await fs.rename(tmpFile, alertsFile);
   return normalized;
 }
 
+export async function writeAlertRecords(descartesPaths, alerts) {
+  return withAlertStoreLock(descartesPaths, () => writeAlertRecordsUnlocked(descartesPaths, alerts));
+}
+
 const ALERT_SEVERITY_RANK = { info: 0, warning: 1, critical: 2 };
+export function alertSeverityRank(severity) {
+  return Object.hasOwn(ALERT_SEVERITY_RANK, severity) ? ALERT_SEVERITY_RANK[severity] : 3;
+}
 
 function notificationDue(alert, { newEpisode = false, previousAlert } = {}) {
   if (["suppressed", "recovered"].includes(alert.status)) return false;
   if (newEpisode) return true;
 
-  const notifiedMax = ALERT_SEVERITY_RANK[alert.notified_severity_max];
-  if (Number.isFinite(notifiedMax)) {
-    return ALERT_SEVERITY_RANK[alert.severity] > notifiedMax;
+  const notifiedMax = alertSeverityRank(alert.notified_severity_max);
+  if (alert.notified_severity_max !== null && alert.notified_severity_max !== undefined) {
+    return alertSeverityRank(alert.severity) > notifiedMax;
   }
 
   // An operator acknowledgement suppresses ordinary persistence, including a legacy record that
   // has not yet acquired episode fields. A higher severity is still a new security-relevant change.
   if (previousAlert?.status === "acknowledged" || alert.status === "acknowledged") {
-    return ALERT_SEVERITY_RANK[alert.severity] > ALERT_SEVERITY_RANK[previousAlert?.severity];
+    return alertSeverityRank(alert.severity) > alertSeverityRank(previousAlert?.severity);
   }
   return true;
 }
@@ -304,6 +399,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   const byId = new Map(existingAlerts.map((alert) => [alert.id, normalizeAlertRecord(alert)]));
   const activeCandidateIds = new Set(candidates.map((candidate) => candidate.id));
   const notificationDueIds = [];
+  const adjudicationDueIds = [];
   // Detector-reported recovery coverage (§8.A): the covered set is keyed on alert IDENTITY
   // (alert.id = alertId(rule_id, fingerprint)), not rule_id, so recovery is authorized per persisted
   // alert rather than per family. undefined means "unrestricted", i.e. today's exact behavior: any
@@ -316,7 +412,8 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
 
   for (const candidate of candidates) {
     const current = byId.get(candidate.id);
-    const newEpisode = !current || current.status === "recovered";
+    const evidenceDigest = materialEvidenceDigest(candidate);
+    const newEpisode = !current || current.status === "recovered" || current.material_evidence_digest !== evidenceDigest;
     const base = current ?? normalizeAlertRecord({
       ...candidate,
       status: "active",
@@ -336,14 +433,20 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       episode_started_at: newEpisode ? now : base.episode_started_at,
       notified_severity_max: newEpisode ? null : base.notified_severity_max,
       episode_notified_at: newEpisode ? null : base.episode_notified_at,
+      material_evidence_digest: evidenceDigest,
+      adjudicated_at: newEpisode ? null : base.adjudicated_at,
+      adjudicated_evidence_digest: newEpisode ? null : base.adjudicated_evidence_digest,
+      adjudication: newEpisode ? null : base.adjudication,
     });
+    const severityChanged = current && current.severity !== next.severity;
     if (notificationDue(next, { newEpisode, previousAlert: current })) {
-      next.last_notified = now;
-      next.episode_notified_at = now;
-      if (next.notified_severity_max === null || ALERT_SEVERITY_RANK[next.severity] >= ALERT_SEVERITY_RANK[next.notified_severity_max]) {
-        next.notified_severity_max = next.severity;
-      }
       notificationDueIds.push(next.id);
+    }
+    const sameNegativeAdjudication = next.adjudicated_evidence_digest === evidenceDigest
+      && next.adjudication?.notify === false
+      && next.adjudication?.severity === next.severity;
+    if (!sameNegativeAdjudication && (newEpisode || severityChanged || notificationDueIds.includes(next.id))) {
+      adjudicationDueIds.push(next.id);
     }
     byId.set(next.id, next);
   }
@@ -362,6 +465,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   return {
     alerts: [...byId.values()],
     notification_due_ids: notificationDueIds,
+    adjudication_due_ids: adjudicationDueIds,
   };
 }
 
@@ -391,24 +495,74 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
     candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
   );
   const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
-  return { alerts: applied.alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
+  return { alerts: applied.alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids, adjudication_due_ids: applied.adjudication_due_ids };
 }
 
 export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
-  const evaluated = await evaluateAlerts(descartesPaths, options);
-  const alerts = await writeAlertRecords(descartesPaths, evaluated.alerts);
-  return { ...evaluated, alerts };
+  return withAlertStoreLock(descartesPaths, async () => {
+    const evaluated = await evaluateAlerts(descartesPaths, options);
+    const alerts = await writeAlertRecordsUnlocked(descartesPaths, evaluated.alerts);
+    return { ...evaluated, alerts };
+  });
+}
+
+export async function confirmAlertDelivery(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  return withAlertStoreLock(descartesPaths, async () => {
+    const alerts = await readAlertRecords(descartesPaths);
+    let confirmed = false;
+    const updated = alerts.map((alert) => {
+      if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+      if (options.evidenceDigest && alert.material_evidence_digest !== options.evidenceDigest) return alert;
+      confirmed = true;
+      const nextRank = alertSeverityRank(options.severity ?? alert.severity);
+      const currentRank = alert.notified_severity_max === null ? -1 : alertSeverityRank(alert.notified_severity_max);
+      return normalizeAlertRecord({
+        ...alert,
+        last_notified: now,
+        episode_notified_at: now,
+        notified_severity_max: nextRank >= currentRank ? (options.severity ?? alert.severity) : alert.notified_severity_max,
+      });
+    });
+    if (!confirmed) return { confirmed: false };
+    const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+    return { confirmed: true, alert: written.find((alert) => alert.id === alertIdValue) };
+  });
+}
+
+export async function recordAlertAdjudication(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  return withAlertStoreLock(descartesPaths, async () => {
+    const alerts = await readAlertRecords(descartesPaths);
+    let recorded = false;
+    const updated = alerts.map((alert) => {
+      if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+      if (options.evidenceDigest && alert.material_evidence_digest !== options.evidenceDigest) return alert;
+      recorded = true;
+      return normalizeAlertRecord({
+        ...alert,
+        adjudicated_at: now,
+        adjudicated_evidence_digest: options.evidenceDigest ?? alert.material_evidence_digest,
+        adjudication: { notify: options.notify === true, severity: options.severity ?? alert.severity },
+      });
+    });
+    if (!recorded) return { recorded: false };
+    const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+    return { recorded: true, alert: written.find((alert) => alert.id === alertIdValue) };
+  });
 }
 
 export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
-  const alerts = await readAlertRecords(descartesPaths);
-  let found = false;
-  const updated = alerts.map((alert) => {
-    if (alert.id !== alertId) return alert;
-    found = true;
-    return normalizeAlertRecord({ ...alert, status: "acknowledged", acknowledged_at: now });
+  return withAlertStoreLock(descartesPaths, async () => {
+    const alerts = await readAlertRecords(descartesPaths);
+    let found = false;
+    const updated = alerts.map((alert) => {
+      if (alert.id !== alertId) return alert;
+      found = true;
+      return normalizeAlertRecord({ ...alert, status: "acknowledged", acknowledged_at: now });
+    });
+    if (!found) throw new Error(`Alert not found: ${alertId}`);
+    return (await writeAlertRecordsUnlocked(descartesPaths, updated)).find((alert) => alert.id === alertId);
   });
-  if (!found) throw new Error(`Alert not found: ${alertId}`);
-  return (await writeAlertRecords(descartesPaths, updated)).find((alert) => alert.id === alertId);
 }

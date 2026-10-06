@@ -7,6 +7,7 @@ import {
   acknowledgeAlert,
   alertId,
   applyAlertCandidates,
+  confirmAlertDelivery,
   evaluateAlertRules,
   evaluateAlerts,
   evaluateAndPersistAlerts,
@@ -113,7 +114,7 @@ test("alert rules report missing and stale daemon samples", () => {
   assert(stale.some((candidate) => candidate.rule_id === "daemon.samples.stale"));
 });
 
-test("candidate application notifies once per episode, escalates once, and rearms after recovery", () => {
+test("candidate application reports due work and rearms after recovery", () => {
   const first = applyAlertCandidates([], [{
     id: "alert_memory",
     rule_id: "system.memory.sustained_high",
@@ -126,12 +127,13 @@ test("candidate application notifies once per episode, escalates once, and rearm
   }], { now: "2026-05-28T00:00:00.000Z" });
   assert.equal(first.alerts.length, 1);
   assert.deepEqual(first.notification_due_ids, ["alert_memory"]);
-  assert.equal(first.alerts[0].last_notified, "2026-05-28T00:00:00.000Z");
+  assert.equal(first.alerts[0].last_notified, null);
   assert.equal(first.alerts[0].episode_started_at, "2026-05-28T00:00:00.000Z");
-  assert.equal(first.alerts[0].episode_notified_at, "2026-05-28T00:00:00.000Z");
-  assert.equal(first.alerts[0].notified_severity_max, "warning");
+  assert.equal(first.alerts[0].episode_notified_at, null);
+  assert.equal(first.alerts[0].notified_severity_max, null);
 
-  const second = applyAlertCandidates(first.alerts, [{
+  const delivered = { ...first.alerts[0], last_notified: "2026-05-28T00:00:00.000Z", episode_notified_at: "2026-05-28T00:00:00.000Z", notified_severity_max: "warning" };
+  const second = applyAlertCandidates([delivered], [{
     ...first.alerts[0],
     summary: "Still high",
   }], { now: "2026-05-28T05:00:00.000Z" });
@@ -146,10 +148,11 @@ test("candidate application notifies once per episode, escalates once, and rearm
     title: "Critical memory pressure",
   }], { now: "2026-05-28T05:01:00.000Z" });
   assert.deepEqual(escalated.notification_due_ids, ["alert_memory"]);
-  assert.equal(escalated.alerts[0].notified_severity_max, "critical");
-  assert.equal(escalated.alerts[0].episode_notified_at, "2026-05-28T05:01:00.000Z");
+  assert.equal(escalated.alerts[0].notified_severity_max, "warning");
+  assert.equal(escalated.alerts[0].episode_notified_at, "2026-05-28T00:00:00.000Z");
 
-  const deescalated = applyAlertCandidates(escalated.alerts, [{
+  const escalatedDelivered = { ...escalated.alerts[0], last_notified: "2026-05-28T05:01:00.000Z", episode_notified_at: "2026-05-28T05:01:00.000Z", notified_severity_max: "critical" };
+  const deescalated = applyAlertCandidates([escalatedDelivered], [{
     ...escalated.alerts[0],
     severity: "warning",
   }], { now: "2026-05-28T05:02:00.000Z" });
@@ -165,7 +168,45 @@ test("candidate application notifies once per episode, escalates once, and rearm
   }], { now: "2026-05-28T05:04:00.000Z" });
   assert.deepEqual(reactivated.notification_due_ids, ["alert_memory"]);
   assert.equal(reactivated.alerts[0].episode_started_at, "2026-05-28T05:04:00.000Z");
-  assert.equal(reactivated.alerts[0].notified_severity_max, "warning");
+  assert.equal(reactivated.alerts[0].notified_severity_max, null);
+});
+
+test("episode notification state is committed only by a confirmed delivery", async () => {
+  const paths = await tempPaths();
+  const candidate = {
+    id: "alert_delivery_contract",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "critical",
+    title: "Memory high",
+    summary: "High",
+    diagnostics: { min: 0.97, threshold: 0.9 },
+  };
+
+  // The injected candidate is outside the fixed-rule evaluator, so use the pure result to pin
+  // the delivery contract without depending on host history.
+  const applied = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  assert.deepEqual(applied.notification_due_ids, [candidate.id]);
+  assert.equal(applied.alerts[0].episode_notified_at, null);
+  assert.equal(applied.alerts[0].notified_severity_max, null);
+
+  const failed = applyAlertCandidates(applied.alerts, [candidate], { now: "2026-10-06T00:01:00.000Z" });
+  assert.deepEqual(failed.notification_due_ids, [candidate.id], "a failed/unavailable delivery remains due");
+  assert.equal(failed.alerts[0].episode_notified_at, null);
+
+  const confirmed = await confirmAlertDelivery(paths, candidate.id, {
+    now: "2026-10-06T00:02:00.000Z",
+    severity: candidate.severity,
+    evidenceDigest: applied.alerts[0].material_evidence_digest,
+  });
+  assert.equal(confirmed.confirmed, true);
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted[0].episode_notified_at, "2026-10-06T00:02:00.000Z");
+  assert.equal(persisted[0].notified_severity_max, "critical");
+  const quiet = applyAlertCandidates(persisted, [candidate], { now: "2026-10-06T00:03:00.000Z" });
+  assert.deepEqual(quiet.notification_due_ids, []);
+  assert.equal(persisted.some((alert) => alert.id === candidate.id), true);
 });
 
 test("acknowledgement suppresses persistence but not a later severity escalation", () => {
@@ -180,6 +221,8 @@ test("acknowledgement suppresses persistence but not a later severity escalation
     first_seen: "2026-05-28T00:00:00.000Z",
     last_seen: "2026-05-28T01:00:00.000Z",
     last_notified: "2026-05-28T00:00:00.000Z",
+    episode_notified_at: "2026-05-28T00:00:00.000Z",
+    notified_severity_max: "warning",
     acknowledged_at: "2026-05-28T00:01:00.000Z",
   };
 
@@ -190,10 +233,10 @@ test("acknowledgement suppresses persistence but not a later severity escalation
   const escalated = applyAlertCandidates(persistent.alerts, [{ ...persistent.alerts[0], severity: "critical" }], { now: "2026-05-28T05:01:00.000Z" });
   assert.equal(escalated.alerts[0].status, "acknowledged");
   assert.deepEqual(escalated.notification_due_ids, ["alert_ack"]);
-  assert.equal(escalated.alerts[0].notified_severity_max, "critical");
+  assert.equal(escalated.alerts[0].notified_severity_max, "warning");
 });
 
-test("legacy active records with last_notified are already notified in their current episode", () => {
+test("legacy active records with last_notified are due until audit evidence proves delivery", () => {
   const legacy = {
     id: "alert_legacy",
     rule_id: "system.memory.sustained_high",
@@ -208,10 +251,10 @@ test("legacy active records with last_notified are already notified in their cur
   };
 
   const persistent = applyAlertCandidates([legacy], [{ ...legacy }], { now: "2026-05-28T05:00:00.000Z" });
-  assert.deepEqual(persistent.notification_due_ids, []);
+  assert.deepEqual(persistent.notification_due_ids, ["alert_legacy"]);
   assert.equal(persistent.alerts[0].episode_started_at, "2026-05-28T00:00:00.000Z");
-  assert.equal(persistent.alerts[0].episode_notified_at, "2026-05-28T00:00:00.000Z");
-  assert.equal(persistent.alerts[0].notified_severity_max, "warning");
+  assert.equal(persistent.alerts[0].episode_notified_at, null);
+  assert.equal(persistent.alerts[0].notified_severity_max, null);
 
   const escalated = applyAlertCandidates(persistent.alerts, [{ ...persistent.alerts[0], severity: "critical" }], { now: "2026-05-28T05:01:00.000Z" });
   assert.deepEqual(escalated.notification_due_ids, ["alert_legacy"]);
@@ -232,7 +275,9 @@ test("a fixed alert active for five simulated days produces one notification", (
       diagnostics: {},
     }], { now });
     notificationCount += result.notification_due_ids.length;
-    alerts = result.alerts;
+    alerts = result.alerts.map((alert) => result.notification_due_ids.includes(alert.id)
+      ? { ...alert, last_notified: now, episode_notified_at: now, notified_severity_max: alert.severity }
+      : alert);
   }
   assert.equal(notificationCount, 1);
   assert.equal(alerts[0].status, "active");
