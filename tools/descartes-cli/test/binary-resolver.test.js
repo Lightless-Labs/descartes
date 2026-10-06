@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveCollectorBinary, runResolvedExecFile } from "../src/tools/binary-resolver.js";
+import { candidatePaths, resolveCollectorBinary, runResolvedExecFile } from "../src/tools/binary-resolver.js";
 
 function regularExecutable(mode = 0o100755) {
   return { mode, uid: 0, dev: 1, ino: 2, isFile: () => true };
@@ -48,6 +48,13 @@ test("resolveCollectorBinary uses only pinned absolute candidates and accepts a 
   assert.equal(resolution.trust_verdict, "trusted");
   assert.ok(seen.every((candidate) => candidate.startsWith("/")));
   assert.equal(seen.includes("tailscale"), false);
+});
+
+test("candidatePaths includes the standard Nix profile locations for the daemon user", () => {
+  const candidates = candidatePaths("tmux", "linux", { homeDir: "/home/daemon", username: "daemon" });
+  assert.equal(candidates.includes("/nix/var/nix/profiles/default/bin/tmux"), true);
+  assert.equal(candidates.includes("/home/daemon/.nix-profile/bin/tmux"), true);
+  assert.equal(candidates.includes("/etc/profiles/per-user/daemon/bin/tmux"), true);
 });
 
 test("resolveCollectorBinary rejects a candidate in a world-writable directory as untrusted_binary", async () => {

@@ -205,8 +205,8 @@ The collectors cover many areas:
 - VPN and peer status: WireGuard, macOS VPN services, and Tailscale.
 
 Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
-pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path). The
-resolver follows symlinks, requires a regular executable,
+pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
+the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
 and checks the file plus every ancestor directory to `/`: only root or the daemon UID may own a
 component, and group/world-writable components are rejected. Same-UID owner writability is inside
 Descartes' current trust boundary and is recorded in provenance. An offending component, stat

@@ -1,4 +1,5 @@
 import { realpath as defaultRealpath, stat as defaultStat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -17,6 +18,7 @@ const COMMON_BINARY_DIRECTORIES = Object.freeze([
   "/usr/local/sbin",
   "/run/current-system/sw/bin",
   "/snap/bin",
+  "/nix/var/nix/profiles/default/bin",
 ]);
 
 const PLATFORM_BINARY_DIRECTORIES = Object.freeze({
@@ -33,15 +35,24 @@ const SPECIAL_BINARY_PATHS = Object.freeze({
   ]),
 });
 
+function nixProfileDirectories({ homeDir = os.homedir(), username = os.userInfo().username } = {}) {
+  return [
+    path.join(homeDir, ".nix-profile", "bin"),
+    path.join("/etc/profiles/per-user", username, "bin"),
+  ];
+}
+
 export function candidatePaths(binary, platform, options = {}) {
   const directories = PLATFORM_BINARY_DIRECTORIES[platform] ?? PLATFORM_BINARY_DIRECTORIES.linux;
   const special = platform === "darwin" ? (SPECIAL_BINARY_PATHS[binary] ?? []) : [];
   const configured = (options.trustedBinaryPaths ?? [])
     .filter((candidate) => typeof candidate === "string" && path.isAbsolute(candidate) && path.basename(candidate) === binary);
+  const nix = nixProfileDirectories(options);
   return [...new Set([
     ...configured,
     ...special,
     ...directories.map((directory) => path.join(directory, binary)),
+    ...nix.map((directory) => path.join(directory, binary)),
   ])];
 }
 
@@ -161,6 +172,8 @@ export async function resolveCollectorBinary(binary, {
   realpathFn = defaultRealpath,
   expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined,
   trustedBinaryPaths = [],
+  homeDir,
+  username,
 } = {}) {
   const name = String(binary ?? "");
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
@@ -168,7 +181,7 @@ export async function resolveCollectorBinary(binary, {
   }
 
   const configuredPaths = new Set(trustedBinaryPaths.filter((candidate) => typeof candidate === "string" && path.isAbsolute(candidate)));
-  const candidates = candidatePaths(name, platform, { trustedBinaryPaths });
+  const candidates = candidatePaths(name, platform, { trustedBinaryPaths, homeDir, username });
   let firstUntrusted;
 
   for (const candidate of candidates) {

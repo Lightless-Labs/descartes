@@ -11,8 +11,10 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 Collector subprocesses do not consult the ambient `PATH` (important for launchd, whose daemon
 environment may not contain user-installed tools). A shared resolver checks regular executable
 files in a pinned platform allowlist: `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`,
-`/usr/local/sbin`, NixOS and Snap locations, Homebrew locations on macOS, and the macOS
-`/Applications/Tailscale.app/Contents/MacOS/Tailscale` CLI path. The resolver follows
+`/usr/local/sbin`, the standard Nix profile locations (`/nix/var/nix/profiles/default/bin`, the
+daemon user's `~/.nix-profile/bin`, and `/etc/profiles/per-user/<user>/bin`), NixOS and Snap
+locations, Homebrew locations on macOS, and the macOS `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
+CLI path. The resolver follows
 symlinks, requires a regular executable, and checks the file plus every ancestor directory to `/`:
 only root or the daemon UID may own each component, and group/world-writable components are
 rejected. Same-UID owner writability is accepted within the current trust boundary but recorded as
