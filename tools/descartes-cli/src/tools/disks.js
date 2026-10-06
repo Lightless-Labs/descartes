@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -118,9 +119,14 @@ export function classifyFilesystem(fs) {
 
 export async function collectDiskEvidence() {
   return timedEnvelope(async () => {
+    const runDf = (args) => runResolvedExecFile("df", args, {
+      timeout: 3000,
+      maxBuffer: 1024 * 1024,
+      execFileAsync,
+    });
     const [space, inodes] = await Promise.all([
-      execFileAsync("df", ["-kP"], { timeout: 3000, maxBuffer: 1024 * 1024 }).then(({ stdout }) => parseDf(stdout)),
-      execFileAsync("df", ["-iP"], { timeout: 3000, maxBuffer: 1024 * 1024 }).then(({ stdout }) => parseDfInodes(stdout)).catch((error) => ({ unable: error instanceof Error ? error.message : String(error) })),
+      runDf(["-kP"]).then((result) => result.status === "ok" ? parseDf(result.stdout) : { status: result.availability ?? "unable", unable: result.error }),
+      runDf(["-iP"]).then((result) => result.status === "ok" ? parseDfInodes(result.stdout) : { status: result.availability ?? "unable", unable: result.error }),
     ]);
 
     return {

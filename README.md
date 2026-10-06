@@ -204,6 +204,12 @@ The collectors cover many areas:
 - tmux and screen sessions;
 - VPN and peer status: WireGuard, macOS VPN services, and Tailscale.
 
+Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
+pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path),
+and the resolved executable path is retained in evidence. A miss on those known paths is
+`not_found_on_known_paths`, which is incomplete/unknown evidence—not proof that software is
+not installed and never a complete zero in a census.
+
 For the full list, see `docs/reference/collectors.md`.
 
 `--no-investigate` is a fallback mode. It turns off the LLM-requested evidence tools. It

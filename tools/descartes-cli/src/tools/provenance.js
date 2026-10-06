@@ -13,6 +13,7 @@
 import { execFile } from "node:child_process";
 import { readdir, readFile, readlink, stat } from "node:fs/promises";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { normalizeSocketAddress, normalizeSocketProtocol, parseMacLsofListeningSockets } from "./network.js";
 import { buildParentTreeResult, redactAndBoundProcessArgs } from "./processes.js";
@@ -56,23 +57,17 @@ function truncate(value, max = 2048) {
 }
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 256 * 1024,
-    });
-    return { status: "ok", stdout, stderr: truncate(stderr), command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "unable",
-      error: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      stdout: truncate(error?.stdout ?? ""),
-      stderr: truncate(error?.stderr ?? ""),
-      command: { argv, read_only: true },
-    };
-  }
+  const result = await runResolvedExecFile(command, args, {
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 256 * 1024,
+    execFileAsync,
+  });
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? ""),
+    stderr: truncate(result.stderr ?? ""),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

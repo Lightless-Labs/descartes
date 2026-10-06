@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -37,38 +38,21 @@ function truncate(value, max = 2048) {
 }
 
 async function runFixedCommand(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 5000,
-      maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    });
-    return {
-      status: "ok",
-      stdout,
-      stderr: truncate(stderr),
-      command: { argv, read_only: true },
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (options.allowPartial && message.includes("stdout maxBuffer") && error?.stdout) {
-      return {
-        status: "ok",
-        partial_output: true,
-        error: message,
-        stdout: error.stdout,
-        stderr: truncate(error?.stderr ?? "", 2048),
-        command: { argv, read_only: true },
-      };
-    }
-    return {
-      status: "unable",
-      error: message,
-      stdout: truncate(error?.stdout ?? "", 4096),
-      stderr: truncate(error?.stderr ?? "", 2048),
-      command: { argv, read_only: true },
-    };
+  const result = await runResolvedExecFile(command, args, {
+    timeout: options.timeout ?? 5000,
+    maxBuffer: options.maxBuffer ?? 1024 * 1024,
+    execFileAsync,
+  });
+  const message = result.error ?? "";
+  if (options.allowPartial && message.includes("stdout maxBuffer") && result.stdout) {
+    return { ...result, status: "ok", partial_output: true, stderr: truncate(result.stderr ?? "", 2048) };
   }
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? "", 4096),
+    stderr: truncate(result.stderr ?? "", 2048),
+  };
 }
 
 function looksSecretToken(value) {

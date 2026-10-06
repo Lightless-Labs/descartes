@@ -2,6 +2,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -26,7 +27,13 @@ async function collectSwap() {
 
   if (process.platform === "darwin") {
     try {
-      const { stdout } = await execFileAsync("sysctl", ["vm.swapusage"], { timeout: 2000, maxBuffer: 1024 * 64 });
+      const result = await runResolvedExecFile("sysctl", ["vm.swapusage"], {
+        timeout: 2000,
+        maxBuffer: 1024 * 64,
+        execFileAsync,
+      });
+      if (result.status !== "ok") return { unable: result.error, status: result.availability ?? "unable", source: "sysctl vm.swapusage" };
+      const { stdout } = result;
       const total = stdout.match(/total = ([\d.]+)([MG])/)?.slice(1, 3);
       const used = stdout.match(/used = ([\d.]+)([MG])/)?.slice(1, 3);
       const free = stdout.match(/free = ([\d.]+)([MG])/)?.slice(1, 3);

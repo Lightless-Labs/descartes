@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -40,28 +41,18 @@ export function normalizeTimeSyncRequest(options = {}) {
 }
 
 async function runFixedCommand(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
-      maxBuffer: options.maxBuffer ?? 512 * 1024,
-    });
-    return {
-      status: "ok",
-      stdout,
-      stderr: truncate(stderr),
-      command: { argv, read_only: true, network: options.network ?? false },
-    };
-  } catch (error) {
-    return {
-      status: "unable",
-      error: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      stdout: truncate(error?.stdout ?? "", 4096),
-      stderr: truncate(error?.stderr ?? "", 2048),
-      command: { argv, read_only: true, network: options.network ?? false },
-    };
-  }
+  const result = await runResolvedExecFile(command, args, {
+    timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
+    maxBuffer: options.maxBuffer ?? 512 * 1024,
+    execFileAsync,
+  });
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? "", 4096),
+    stderr: truncate(result.stderr ?? "", 2048),
+    command: { ...result.command, network: options.network ?? false },
+  };
 }
 
 function parseBool(value) {
@@ -271,8 +262,8 @@ async function collectMacTimeSync(request) {
   if (launchctl.status === "ok") result.timed_service = launchctlParsed;
   probes.push({ source: "launchctl_timed", status: launchctl.status, command: launchctl.command, stderr: launchctl.stderr, error: launchctl.error, parsed: launchctlParsed });
 
-  const usingNetworkTime = normalizeSystemsetupResult(await runFixedCommand("/usr/sbin/systemsetup", ["-getusingnetworktime"]));
-  const networkServer = normalizeSystemsetupResult(await runFixedCommand("/usr/sbin/systemsetup", ["-getnetworktimeserver"]));
+  const usingNetworkTime = normalizeSystemsetupResult(await runFixedCommand("systemsetup", ["-getusingnetworktime"]));
+  const networkServer = normalizeSystemsetupResult(await runFixedCommand("systemsetup", ["-getnetworktimeserver"]));
   const systemsetupParsed = parseMacSystemsetup(`${usingNetworkTime.stdout}\n${networkServer.stdout}`);
   if (Object.keys(systemsetupParsed).length > 0) Object.assign(result, systemsetupParsed);
   probes.push({ source: "systemsetup_network_time", status: usingNetworkTime.status, command: usingNetworkTime.command, stderr: usingNetworkTime.stderr, error: usingNetworkTime.error, parsed: parseMacSystemsetup(usingNetworkTime.stdout) });

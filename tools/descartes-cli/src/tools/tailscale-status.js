@@ -10,12 +10,14 @@
 // exposes a service, or touches certificates/keys. `status --json` is read-only and prints no
 // private key or auth material.
 //
-// Degrade-not-fabricate: ENOENT means the binary is absent; a parsed logged-out backend state is
+// Degrade-not-fabricate: a miss on pinned known paths (including ENOENT) means the binary is
+// not_found_on_known_paths; a parsed logged-out backend state is
 // a truthful zero; malformed output and all other failures are unable. Permission failures are
 // documented as elevation candidates, but this collector never escalates.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { isBinaryNotFound, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -23,23 +25,12 @@ const execFileAsync = promisify(execFile);
 export const DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 512 * 1024,
-    });
-    return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "error",
-      code: error?.code,
-      stdout: error?.stdout ?? "",
-      stderr: error?.stderr ?? "",
-      error: error instanceof Error ? error.message : String(error),
-      command: { argv, read_only: true },
-    };
-  }
+  return runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 512 * 1024,
+    execFileAsync,
+  });
 }
 
 function isPermissionDenied(probe) {
@@ -114,7 +105,7 @@ export async function collectTailscaleStatusEvidence(options = {}) {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;
     const probe = await runExec("tailscale", ["status", "--json"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
 
-    if (probe.code === "ENOENT") return resultForFailure("absent", probe, { cap });
+    if (isBinaryNotFound(probe)) return resultForFailure("not_found_on_known_paths", probe, { cap });
     if (probe.status !== "ok") {
       return resultForFailure(isPermissionDenied(probe) ? "missing_permission" : "unable", probe, { cap });
     }

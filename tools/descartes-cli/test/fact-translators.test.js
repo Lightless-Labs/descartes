@@ -784,19 +784,34 @@ test("factPointsFromSessionEvidence: a non-truncated collector result never emit
 
 // --- Census marker (Slice 4 Slice-1-addendum, must-fixes 1/2) ----------------------------------
 
+test("factPointsFromSessionEvidence: a known-path miss is an unknown census marker, not a complete zero", () => {
+  const evidence = [sessionEnvelope({
+    sessions: [],
+    multiplexers: [
+      { multiplexer: "tmux", status: "not_found_on_known_paths" },
+      { multiplexer: "screen", status: "not_found_on_known_paths" },
+    ],
+    truncated: false,
+  })];
+  const points = factPointsFromSessionEvidence(evidence, { ts: TS });
+  assert.equal(points.length, 1);
+  assert.equal(points[0].attributes.census_state, "unknown");
+  assert.equal(points[0].attributes.binary_availability, "tmux:not_found_on_known_paths|screen:not_found_on_known_paths");
+});
+
 test("factPointsFromSessionEvidence: emits a complete census marker on every successful envelope, excluded from the session count", () => {
   const evidence = [sessionEnvelope({
     sessions: [{ multiplexer: "tmux", session_name: "solo", attached: true, window_count: 1, created_at_epoch_seconds: 1720000000 }],
-    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "not_found_on_known_paths" }],
     truncated: false,
   })];
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY);
   assert.ok(marker, "expected a census marker fact point");
   assert.equal(marker.fact_name, "session.presence");
-  assert.equal(marker.attributes.census_state, "complete");
+  assert.equal(marker.attributes.census_state, "unknown");
   assert.equal(marker.confidence, 0);
-  // "absent" (genuinely not installed) must NOT count as partial.
+  // A known-path miss is incomplete and must not be mistaken for a complete zero.
   const nonMarkerPoints = points.filter((p) => p.entity_key !== SESSION_CENSUS_MARKER_ENTITY_KEY);
   assert.equal(nonMarkerPoints.length, 1, "the marker itself must not be counted as a session");
 });
@@ -804,13 +819,13 @@ test("factPointsFromSessionEvidence: emits a complete census marker on every suc
 test("factPointsFromSessionEvidence: a genuinely zero-session tick (EXACT-ZERO, must-fix 1) still emits a complete census marker and no session.presence session facts", () => {
   const evidence = [sessionEnvelope({
     sessions: [],
-    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+    multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "not_found_on_known_paths" }],
     truncated: false,
   })];
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
   assert.equal(points.length, 1, "expected exactly the census marker, no session facts");
   assert.equal(points[0].entity_key, SESSION_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(points[0].attributes.census_state, "complete");
+  assert.equal(points[0].attributes.census_state, "unknown");
 });
 
 test("factPointsFromSessionEvidence: census_state is 'partial' when ANY multiplexer reports 'unable' (must-fix 2)", () => {

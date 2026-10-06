@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { readlink, readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { buildLineageEntityKey } from "../fact-translators.js";
 
 const execFileAsync = promisify(execFile);
@@ -174,13 +175,20 @@ export function topProcessesBy(processes, key, limit) {
 
 async function getProcessSnapshot() {
   const args = psArgsForPlatform();
-  const { stdout } = await execFileAsync("ps", args, { timeout: 3000, maxBuffer: 1024 * 1024 });
+  const result = await runResolvedExecFile("ps", args, {
+    timeout: 3000,
+    maxBuffer: 1024 * 1024,
+    execFileAsync,
+  });
+  if (result.status !== "ok") {
+    const error = new Error(result.error ?? "ps could not be executed");
+    Object.assign(error, result);
+    throw error;
+  }
+  const { stdout } = result;
   return {
     processes: parsePs(stdout),
-    command: {
-      argv: ["ps", ...args],
-      read_only: true,
-    },
+    command: result.command,
   };
 }
 

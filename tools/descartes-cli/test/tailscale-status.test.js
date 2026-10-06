@@ -144,11 +144,11 @@ test("BEHAVIORAL: the collector invokes only tailscale status --json", async () 
   assert.deepEqual(calls.map(({ command, args }) => [command, ...args]), [["tailscale", "status", "--json"]]);
 });
 
-test("ENOENT degrades to absent and never fabricates a zero", async () => {
+test("ENOENT is not-found-on-known-paths and never fabricates a zero", async () => {
   const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript()) });
   assert.equal(envelope.status, "unable");
   assert.equal(envelope.confidence, 0);
-  assert.equal(envelope.result.status, "absent");
+  assert.equal(envelope.result.status, "not_found_on_known_paths");
   assert.deepEqual(envelope.result.peers, []);
 });
 

@@ -124,7 +124,7 @@ test("parseScreenLs skips a malformed line but still parses a well-formed siblin
 
 // --- collectSessionEvidence: degrade-not-fabricate ---
 
-test("neither tmux nor screen present -> envelope is unable/confidence:0, NEVER a fabricated zero-sessions ok", async () => {
+test("tmux/screen ENOENT is not-found-on-known-paths -> envelope is unable/confidence:0, NEVER a fabricated zero-sessions ok", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({ tmux: enoent(), screen: enoent() }),
   });
@@ -132,7 +132,7 @@ test("neither tmux nor screen present -> envelope is unable/confidence:0, NEVER 
   assert.equal(envelope.confidence, 0);
   assert.equal(envelope.review_hint, "missing_permission");
   assert.equal(envelope.result.any_binary_available, false);
-  assert.deepEqual(envelope.result.multiplexers.map((m) => m.status), ["absent", "absent"]);
+  assert.deepEqual(envelope.result.multiplexers.map((m) => m.status), ["not_found_on_known_paths", "not_found_on_known_paths"]);
 });
 
 test("tmux absent, screen present with genuinely zero sessions -> ok/empty, distinguishable from the neither-binary-present case", async () => {

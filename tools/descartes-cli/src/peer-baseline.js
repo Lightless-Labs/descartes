@@ -40,7 +40,7 @@ const PEER_FACT_NAME = "peer.presence";
 // `typeof === "string"` but does NOT match this pattern (garbled facts.jsonl content, a bit-flip,
 // a future/incompatible marker producer) is NOT a legitimate regime key -- see
 // groupPeerFactsByTick's own use of this pattern below for why a type-only guard is insufficient.
-const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|missing_permission|unable|not_applicable|unknown)";
+const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|not_found_on_known_paths|missing_permission|unable|not_applicable|unknown)";
 const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v1:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
 
 export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
@@ -58,6 +58,10 @@ export function peerCountFingerprintForAvailabilitySignature(availabilitySignatu
   return availabilitySignature === undefined
     ? PEER_COUNT_MARKERLESS_FINGERPRINT
     : PEER_COUNT_VPN_FINGERPRINT;
+}
+
+function availabilitySignatureHasUnknownBinary(signature) {
+  return typeof signature === "string" && signature.split(":")[1]?.split("-").includes("not_found_on_known_paths");
 }
 
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
@@ -466,6 +470,7 @@ export function groupPeerFactsByTick(points = []) {
  *   - "complete": every other tick-group, including a genuine (or false, per MUST-FIX 2) zero.
  */
 function tickGroupDisposition(group) {
+  if (availabilitySignatureHasUnknownBinary(group?.availabilitySignature)) return "unknown";
   return group.hasOverflow ? "overflow" : "complete";
 }
 
@@ -495,6 +500,7 @@ function overflowCanBeScored(group) {
 // signature's own content, which is what the regime key (§2c) exists for.
 function dropTickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
+  if (availabilitySignatureHasUnknownBinary(group?.availabilitySignature)) return "unknown";
   // F6 fix: a present-but-invalid marker must fail closed like markerless is excluded from
   // "complete" -- but it is its OWN disposition, distinct from "markerless", so it can never be
   // conflated with (or silently trusted as) the legacy no-marker-at-all case.

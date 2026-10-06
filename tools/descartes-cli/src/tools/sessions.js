@@ -26,6 +26,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { isBinaryNotFound, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -38,23 +39,12 @@ export const DEFAULT_SESSION_ENTITY_LIMIT = 200;
 const TMUX_FORMAT = "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}";
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 256 * 1024,
-    });
-    return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "error",
-      code: error?.code,
-      stdout: error?.stdout ?? "",
-      stderr: error?.stderr ?? "",
-      error: error instanceof Error ? error.message : String(error),
-      command: { argv, read_only: true },
-    };
-  }
+  return runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 256 * 1024,
+    execFileAsync,
+  });
 }
 
 /**
@@ -140,7 +130,7 @@ export function parseScreenLs(stdout) {
 }
 
 /**
- * tmux exits non-zero both when the binary is genuinely absent (ENOENT) AND when it's present
+ * tmux exits non-zero both when the binary is missing from known paths (ENOENT) AND when it's present
  * but no server is running (the honest "zero tmux sessions" case) — these must not be conflated.
  * Any OTHER failure (permission denied, timeout, unexpected error) degrades this multiplexer to
  * "unable" rather than being guessed as either extreme.
@@ -154,8 +144,8 @@ async function collectTmuxSessions(options = {}) {
     const parsed = parseTmuxSessions(probe.stdout);
     return { multiplexer: "tmux", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command };
   }
-  if (probe.code === "ENOENT") {
-    return { multiplexer: "tmux", status: "absent", sessions: [], command: probe.command };
+  if (isBinaryNotFound(probe)) {
+    return { multiplexer: "tmux", status: "not_found_on_known_paths", sessions: [], command: probe.command };
   }
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   if (/no server running|no such file or directory|error connecting to/i.test(text)) {
@@ -177,8 +167,8 @@ async function collectScreenSessions(options = {}) {
   const args = ["-ls"];
   const probe = await runExec("screen", args, { timeout: options.timeout, maxBuffer: options.maxBuffer });
 
-  if (probe.code === "ENOENT") {
-    return { multiplexer: "screen", status: "absent", sessions: [], command: probe.command };
+  if (isBinaryNotFound(probe)) {
+    return { multiplexer: "screen", status: "not_found_on_known_paths", sessions: [], command: probe.command };
   }
 
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
