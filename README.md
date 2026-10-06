@@ -207,10 +207,13 @@ The collectors cover many areas:
 Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
 pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
 the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
-and checks the file plus every ancestor directory to `/`: only root or the daemon UID may own a
-component, and group/world-writable components are rejected. Same-UID owner writability is inside
-Descartes' current trust boundary and is recorded in provenance. An offending component, stat
-failure, or binary replacement detected by the immediate pre-exec `(dev, ino)` recheck produces
+and checks the file plus every ancestor directory to `/`: the effective writer set of each
+component must be contained in `{root, daemon UID}`. Owner/group write bits are resolved to actual
+UIDs (macOS `dscl`, Linux `getent` plus primary-group users); world-writable components and
+unresolvable membership are rejected. Same-UID owner writability is inside Descartes' current
+trust boundary and is recorded in provenance. Shell wrappers are rejected unless explicitly
+operator-trusted, so a trusted wrapper can never authorize an untrusted downstream binary. An
+offending component, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)` recheck produces
 `untrusted_binary`; the collector does not execute it and the census remains incomplete. The
 recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU window.
 

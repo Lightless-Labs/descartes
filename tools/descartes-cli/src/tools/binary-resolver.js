@@ -1,10 +1,13 @@
-import { realpath as defaultRealpath, stat as defaultStat } from "node:fs/promises";
+import { readFile as defaultReadFile, realpath as defaultRealpath, stat as defaultStat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsyncDefault = promisify(execFile);
+const MACOS_GROUP_LOOKUP = "/usr/bin/dscl";
+const MACOS_UID_LOOKUP = "/usr/bin/id";
+const LINUX_GROUP_LOOKUP = "/usr/bin/getent";
 
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
 export const UNTRUSTED_BINARY = "untrusted_binary";
@@ -60,15 +63,6 @@ function isRegularExecutable(statResult) {
   return Boolean(statResult?.isFile?.()) && (Number(statResult.mode) & 0o111) !== 0;
 }
 
-function isGroupOrWorldWritable(statResult) {
-  return (Number(statResult?.mode) & 0o022) !== 0;
-}
-
-function ownerIsAllowed(statResult, expectedUid) {
-  const uid = Number(statResult?.uid);
-  return uid === 0 || (Number.isFinite(expectedUid) && uid === expectedUid);
-}
-
 function ancestorPaths(filePath) {
   const ancestors = [];
   let current = path.dirname(filePath);
@@ -99,7 +93,7 @@ function missing(error) {
   return error?.code === "ENOENT" || error?.code === "ENOTDIR";
 }
 
-function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [] }) {
+function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [], writerUids = [] }) {
   return {
     status: UNTRUSTED_BINARY,
     path: undefined,
@@ -108,10 +102,113 @@ function trustFailure({ resolvedPath, component, reason, sameUidWritableComponen
     offending_component: component,
     trust_reason: reason,
     same_uid_writable_components: sameUidWritableComponents,
+    writer_uids: writerUids,
+    operator_override_hint: "Review this absolute path and add it to trusted_binary_paths in watch.json only if the operator accepts the risk.",
   };
 }
 
-async function inspectTrustedPath(resolvedPath, { statFn, expectedUid, operatorTrusted = false } = {}) {
+function asUid(value) {
+  const uid = Number(String(value).trim());
+  return Number.isInteger(uid) && uid >= 0 ? uid : undefined;
+}
+
+function parseDsclGroupMembership(stdout) {
+  const line = String(stdout ?? "").split("\n").find((candidate) => /^GroupMembership:\s*/.test(candidate.trim()));
+  if (!line) return undefined;
+  return line.replace(/^\s*GroupMembership:\s*/, "").trim().split(/\s+/).filter(Boolean);
+}
+
+function parseDsclPrimaryGroupList(stdout, gid) {
+  return String(stdout ?? "").split("\n").flatMap((line) => {
+    const fields = line.trim().split(/\s+/);
+    return fields.length >= 2 && fields.at(-1) === String(gid) ? [fields[0]] : [];
+  });
+}
+
+function parseDsclGroupList(stdout, gid) {
+  const fields = String(stdout ?? "").split("\n").map((line) => line.trim().split(/\s+/));
+  return fields.find((parts) => parts.length >= 2 && parts.at(-1) === String(gid))?.[0];
+}
+
+function parseGetentGroup(stdout, gid) {
+  const line = String(stdout ?? "").split("\n").map((candidate) => candidate.trim())
+    .find((candidate) => candidate && candidate.split(":").length >= 4 && candidate.split(":")[2] === String(gid));
+  if (!line) return undefined;
+  const fields = line.split(":");
+  return { name: fields[0], members: fields[3] ? fields[3].split(",").filter(Boolean) : [] };
+}
+
+function parseGetentPasswd(stdout, names, gid) {
+  const wanted = new Set(names);
+  const uids = new Set();
+  for (const line of String(stdout ?? "").split("\n")) {
+    const fields = line.trim().split(":");
+    if (fields.length < 4) continue;
+    const uid = asUid(fields[2]);
+    const primaryGid = fields[3];
+    if (uid !== undefined && (wanted.has(fields[0]) || primaryGid === String(gid))) uids.add(uid);
+  }
+  return uids;
+}
+
+async function execLookup(execFileAsync, command, args) {
+  try {
+    const result = await execFileAsync(command, args, { timeout: 2000, maxBuffer: 256 * 1024 });
+    return { stdout: result.stdout ?? "" };
+  } catch (error) {
+    return { error };
+  }
+}
+
+async function loadGroupWriterUids(gid, { platform, cache = {}, execFileAsync = execFileAsyncDefault } = {}) {
+  const numericGid = asUid(gid);
+  if (numericGid === undefined) return { error: "group_id_unavailable" };
+  cache.groupWriterUids ??= new Map();
+  if (cache.groupWriterUids.has(numericGid)) return cache.groupWriterUids.get(numericGid);
+
+  let result;
+  if (platform === "darwin") {
+    const groupList = await execLookup(execFileAsync, MACOS_GROUP_LOOKUP, [".", "-list", "/Groups", "PrimaryGroupID"]);
+    const groupName = groupList.error ? undefined : parseDsclGroupList(groupList.stdout, numericGid);
+    if (!groupName) result = { error: "group_membership_unresolvable" };
+    else {
+      const [membership, primaryUsers] = await Promise.all([
+        execLookup(execFileAsync, MACOS_GROUP_LOOKUP, [".", "-read", `/Groups/${groupName}`, "GroupMembership"]),
+        execLookup(execFileAsync, MACOS_GROUP_LOOKUP, [".", "-list", "/Users", "PrimaryGroupID"]),
+      ]);
+      const supplementaryNames = membership.error ? undefined : parseDsclGroupMembership(membership.stdout);
+      const primaryNames = primaryUsers.error ? undefined : parseDsclPrimaryGroupList(primaryUsers.stdout, numericGid);
+      if (!supplementaryNames || !primaryNames) result = { error: "group_membership_unresolvable" };
+      else {
+        const names = [...new Set([...supplementaryNames, ...primaryNames])];
+        const uidResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_UID_LOOKUP, ["-u", name])));
+        const uids = uidResults.map((entry) => entry.error ? undefined : asUid(entry.stdout)).filter((uid) => uid !== undefined);
+        result = uids.length === uidResults.length ? { uids } : { error: "group_membership_unresolvable" };
+      }
+    }
+  } else if (platform === "linux") {
+    const group = await execLookup(execFileAsync, LINUX_GROUP_LOOKUP, ["group", String(numericGid)]);
+    const parsedGroup = group.error ? undefined : parseGetentGroup(group.stdout, numericGid);
+    const passwd = await execLookup(execFileAsync, LINUX_GROUP_LOOKUP, ["passwd"]);
+    if (!parsedGroup || passwd.error) result = { error: "group_membership_unresolvable" };
+    else result = { uids: [...parseGetentPasswd(passwd.stdout, parsedGroup.members, numericGid)] };
+  } else {
+    result = { error: "group_membership_unresolvable" };
+  }
+
+  cache.groupWriterUids.set(numericGid, result);
+  return result;
+}
+
+async function inspectTrustedPath(resolvedPath, {
+  statFn,
+  readFileFn = defaultReadFile,
+  expectedUid,
+  platform = process.platform,
+  operatorTrusted = false,
+  groupWriterUidsFn = loadGroupWriterUids,
+  groupWriterCache = {},
+} = {}) {
   const fileResult = await safeStat(statFn, resolvedPath);
   if (!fileResult.stat) return trustFailure({ resolvedPath, component: resolvedPath, reason: "stat_failed" });
   if (!isRegularExecutable(fileResult.stat)) {
@@ -139,15 +236,49 @@ async function inspectTrustedPath(resolvedPath, { statFn, expectedUid, operatorT
     if (component !== resolvedPath && !result.stat.isDirectory?.()) {
       return trustFailure({ resolvedPath, component, reason: "not_directory", sameUidWritableComponents });
     }
-    if (!ownerIsAllowed(result.stat, expectedUid)) {
-      return trustFailure({ resolvedPath, component, reason: "owner_not_root_or_daemon", sameUidWritableComponents });
+    const mode = Number(result.stat.mode);
+    const ownerWritable = (mode & 0o200) !== 0;
+    const groupWritable = (mode & 0o020) !== 0;
+    const otherWritable = (mode & 0o002) !== 0;
+    const writerUids = [];
+    if (ownerWritable) {
+      const ownerUid = asUid(result.stat.uid);
+      if (ownerUid === undefined) return trustFailure({ resolvedPath, component, reason: "owner_unresolvable", sameUidWritableComponents });
+      writerUids.push(ownerUid);
     }
-    if (isGroupOrWorldWritable(result.stat)) {
-      return trustFailure({ resolvedPath, component, reason: "group_or_world_writable", sameUidWritableComponents });
+    if (groupWritable) {
+      const groupResult = await groupWriterUidsFn(result.stat.gid, {
+        platform,
+        cache: groupWriterCache,
+      });
+      if (!groupResult || groupResult.error || !Array.isArray(groupResult.uids)) {
+        return trustFailure({ resolvedPath, component, reason: groupResult?.error ?? "group_membership_unresolvable", sameUidWritableComponents, writerUids });
+      }
+      writerUids.push(...groupResult.uids);
     }
-    if (Number(result.stat.uid) === expectedUid && (Number(result.stat.mode) & 0o200) !== 0) {
+    const uniqueWriterUids = [...new Set(writerUids)];
+    if (otherWritable || uniqueWriterUids.some((uid) => uid !== 0 && uid !== expectedUid)) {
+      return trustFailure({
+        resolvedPath,
+        component,
+        reason: otherWritable ? "everyone_writable" : "writer_set_not_subset_allowed",
+        sameUidWritableComponents,
+        writerUids: uniqueWriterUids,
+      });
+    }
+    if (ownerWritable && Number(result.stat.uid) === expectedUid) {
       sameUidWritableComponents.push(component);
     }
+  }
+
+  let contents;
+  try {
+    contents = await readFileFn(resolvedPath, { encoding: "utf8" });
+  } catch {
+    return trustFailure({ resolvedPath, component: resolvedPath, reason: "script_probe_failed", sameUidWritableComponents });
+  }
+  if (String(contents).startsWith("#!")) {
+    return trustFailure({ resolvedPath, component: resolvedPath, reason: "shell_wrapper_not_allowed", sameUidWritableComponents });
   }
 
   return {
@@ -162,9 +293,10 @@ async function inspectTrustedPath(resolvedPath, { statFn, expectedUid, operatorT
 
 /**
  * Resolve a collector command without consulting PATH. Candidates are realpath-resolved and a
- * normal candidate is accepted only when the executable and every directory up to / are owned by
- * root or the daemon UID and no component is group/world writable. Same-UID owner writability is
- * intentionally accepted and recorded in same_uid_writable_components as provenance.
+ * normal candidate is accepted only when the executable and every directory up to / has an
+ * effective writer set contained in {root, daemon UID}. Owner/group write bits are expanded to
+ * actual UIDs; world-write, unresolved membership, and shell wrappers fail closed. Same-UID owner
+ * writability is intentionally accepted and recorded in same_uid_writable_components.
  */
 export async function resolveCollectorBinary(binary, {
   platform = process.platform,
@@ -174,6 +306,10 @@ export async function resolveCollectorBinary(binary, {
   trustedBinaryPaths = [],
   homeDir,
   username,
+  readFileFn = defaultReadFile,
+  groupWriterUidsFn = loadGroupWriterUids,
+  groupWriterCache = {},
+  execFileAsync = execFileAsyncDefault,
 } = {}) {
   const name = String(binary ?? "");
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
@@ -193,7 +329,16 @@ export async function resolveCollectorBinary(binary, {
       }
       continue;
     }
-    const inspected = await inspectTrustedPath(real.path, { statFn, expectedUid, operatorTrusted });
+    const inspected = await inspectTrustedPath(real.path, {
+      statFn,
+      readFileFn,
+      expectedUid,
+      platform,
+      operatorTrusted,
+      groupWriterUidsFn,
+      groupWriterCache,
+      execFileAsync,
+    });
     if (inspected.status === "resolved") {
       return { ...inspected, binary: name, candidates };
     }
