@@ -17,7 +17,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { isBinaryNotFound, runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -88,6 +88,10 @@ function resultForFailure(status, probe, extra = {}) {
     elevation_candidate: status === "missing_permission",
     error: probe?.error,
     command: probe?.command,
+    binary_provenance: binaryProvenance(probe?.binary),
+    ...(status === "untrusted_binary" ? {
+      operator_override_hint: "Review the offending component and add the exact absolute Tailscale executable to trusted_binary_paths in watch.json only if the operator accepts the risk.",
+    } : {}),
     ...extra,
   };
 }
@@ -107,7 +111,8 @@ export async function collectTailscaleStatusEvidence(options = {}) {
 
     if (isBinaryNotFound(probe)) return resultForFailure("not_found_on_known_paths", probe, { cap });
     if (probe.status !== "ok") {
-      return resultForFailure(isPermissionDenied(probe) ? "missing_permission" : "unable", probe, { cap });
+      const status = isBinaryUntrusted(probe) ? "untrusted_binary" : isPermissionDenied(probe) ? "missing_permission" : "unable";
+      return resultForFailure(status, probe, { cap });
     }
 
     let parsed;
@@ -133,6 +138,7 @@ export async function collectTailscaleStatusEvidence(options = {}) {
         cap,
         elevation_candidate: false,
         command: probe.command,
+        binary_provenance: binaryProvenance(probe.binary),
       };
     }
 
@@ -149,14 +155,15 @@ export async function collectTailscaleStatusEvidence(options = {}) {
       cap,
       elevation_candidate: false,
       command: probe.command,
+      binary_provenance: binaryProvenance(probe.binary),
     };
   }, (result) => evidenceEnvelope({
     id: "tailscale-status",
-    status: result.status === "ok" ? "ok" : "unable",
+    status: result.status === "ok" ? "ok" : result.status === "untrusted_binary" ? "warning" : "unable",
     source: "tailscale_status",
     result,
     confidence: result.status === "ok" ? 1 : 0,
-    reviewHint: result.status === "missing_permission" ? "missing_permission" : "none",
+    reviewHint: result.status === "untrusted_binary" ? "untrusted_binary" : result.status === "missing_permission" ? "missing_permission" : "none",
     tool: "collect_tailscale_status",
     target: `cap=${result.cap ?? cap}`,
   }));

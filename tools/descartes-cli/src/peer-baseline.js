@@ -60,10 +60,17 @@ export function peerCountFingerprintForAvailabilitySignature(availabilitySignatu
     : PEER_COUNT_VPN_FINGERPRINT;
 }
 
-function availabilitySignatureHasUnknownBinary(signature) {
+const COMPLETE_PEER_SOURCE_STATUSES = new Set(["ok", "absent", "not_applicable"]);
+
+function availabilitySignatureHasIncompleteSource(signature) {
+  if (signature === undefined) return false;
   const codes = typeof signature === "string" ? signature.split(":")[1]?.split("-") : undefined;
-  const vpnServicesStatus = codes?.[3];
-  return ["partial", "not_found_on_known_paths", "untrusted_binary", "unable", "unknown"].includes(vpnServicesStatus);
+  if (!Array.isArray(codes) || codes.length !== 5) return true;
+  // The VPN-services census is the source whose incomplete service inventory changes the
+  // identity/count universe used by these rules. Other source slots retain their existing
+  // regime behavior (for example a WireGuard permission gap is already represented by its own
+  // source status and does not make a VPN-services census incomplete).
+  return !COMPLETE_PEER_SOURCE_STATUSES.has(codes[3]);
 }
 
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
@@ -472,7 +479,7 @@ export function groupPeerFactsByTick(points = []) {
  *   - "complete": every other tick-group, including a genuine (or false, per MUST-FIX 2) zero.
  */
 function tickGroupDisposition(group) {
-  if (availabilitySignatureHasUnknownBinary(group?.availabilitySignature)) return "unknown";
+  if (availabilitySignatureHasIncompleteSource(group?.availabilitySignature)) return "unknown";
   return group.hasOverflow ? "overflow" : "complete";
 }
 
@@ -502,7 +509,7 @@ function overflowCanBeScored(group) {
 // signature's own content, which is what the regime key (§2c) exists for.
 function dropTickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
-  if (availabilitySignatureHasUnknownBinary(group?.availabilitySignature)) return "unknown";
+  if (availabilitySignatureHasIncompleteSource(group?.availabilitySignature)) return "unknown";
   // F6 fix: a present-but-invalid marker must fail closed like markerless is excluded from
   // "complete" -- but it is its OWN disposition, distinct from "markerless", so it can never be
   // conflated with (or silently trusted as) the legacy no-marker-at-all case.
@@ -561,7 +568,7 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   // deliberate score-but-never-fold posture (a truncated count is still a real lower-bound
   // observation; a garbled/contradictory marker is not evidence of anything at all).
   const mostRecentIsInvalidSignature = currentSignature === PEER_SIGNATURE_INVALID
-    || availabilitySignatureHasUnknownBinary(currentSignature);
+    || availabilitySignatureHasIncompleteSource(currentSignature);
 
   // The most recent COMPLETE tick-group, if the tail of `groups` is itself complete, is also the
   // tail of `completeGroups` (filtering preserves order and cannot re-order past the tail).

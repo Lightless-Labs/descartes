@@ -190,8 +190,9 @@ async function collectScreenSessions(options = {}) {
  * Session-census L0 collector (Slice 1). Combines tmux + screen results, bounds the combined
  * entity count at DEFAULT_SESSION_ENTITY_LIMIT (must-fix 5), and computes the overall
  * degrade-not-fabricate envelope status: "unable"/confidence 0 only when NEITHER multiplexer
- * binary is present/usable this tick — any single successful (even zero-session) read from
- * either multiplexer counts as a real "ok" observation.
+ * binary is present/usable this tick. A successful read from one multiplexer does not make the
+ * census complete when its sibling is missing, untrusted, or unable: the outer envelope becomes
+ * a partial warning so the baseline cannot fold a zero as a complete two-source census.
  */
 export async function collectSessionEvidence(options = {}) {
   const cap = Math.max(1, Number(options.sessionLimit) || DEFAULT_SESSION_ENTITY_LIMIT);
@@ -210,6 +211,7 @@ export async function collectSessionEvidence(options = {}) {
     }
 
     const anyBinaryAvailable = multiplexers.some((mux) => mux.status === "ok");
+    const censusComplete = multiplexers.every((mux) => mux.status === "ok");
     const truncated = allSessions.length > cap;
 
     return {
@@ -221,6 +223,7 @@ export async function collectSessionEvidence(options = {}) {
         binary_provenance: binaryProvenance(mux.binary),
       })),
       any_binary_available: anyBinaryAvailable,
+      census_state: censusComplete ? "complete" : "partial",
       total_count: allSessions.length,
       sessions: allSessions.slice(0, cap),
       truncated,
@@ -228,11 +231,13 @@ export async function collectSessionEvidence(options = {}) {
     };
   }, (result) => evidenceEnvelope({
     id: "sessions",
-    status: result.any_binary_available ? "ok" : "unable",
+    status: result.census_state === "complete" ? "ok" : result.any_binary_available ? "warning" : "unable",
     source: "session_multiplexer",
     result,
-    confidence: result.any_binary_available ? 1 : 0,
-    reviewHint: result.any_binary_available ? "none" : "missing_permission",
+    confidence: result.census_state === "complete" ? 1 : result.any_binary_available ? 0.5 : 0,
+    reviewHint: result.census_state === "complete"
+      ? "none"
+      : result.multiplexers.find((mux) => mux.status !== "ok")?.status === "untrusted_binary" ? "untrusted_binary" : "missing_permission",
     tool: "collect_sessions",
     target: `cap=${result.cap}`,
   }));

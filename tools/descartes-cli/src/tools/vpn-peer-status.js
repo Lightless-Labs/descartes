@@ -321,7 +321,7 @@ async function collectWireguardPeers(options) {
 const SCUTIL_NC_LINE_RE = /^\*?\s*\(([^)]+)\)\s+([0-9A-Fa-f-]{36})\s+.+?\s+"([^"]*)"\s+\[([^\]]+)\]\s*$/;
 const SCUTIL_NC_HEADER_RE = /^Available network connection services in the current set \(\*=enabled\):$/;
 const VPN_SERVICE_TYPE_RE = /^(?:VPN:.*|IPSec|PPP:L2TP)$/i;
-const TAILSCALE_SERVICE_TYPE_RE = /^VPN:io\.tailscale\.ipn\.[^\s]+$/i;
+const TAILSCALE_SERVICE_TYPE_IDS = new Set(["io.tailscale.ipn.macos", "io.tailscale.ipn.macsys"]);
 
 export function parseScutilNcListDetailed(stdout) {
   const services = [];
@@ -336,7 +336,7 @@ export function parseScutilNcListDetailed(stdout) {
       continue;
     }
     const [, status, uuid, name, service_type] = match;
-    const is_tailscale = TAILSCALE_SERVICE_TYPE_RE.test(service_type);
+    const is_tailscale = TAILSCALE_SERVICE_TYPE_IDS.has(String(service_type).toLowerCase().replace(/^vpn:/, ""));
     services.push({
       status: status.trim(),
       service_uuid: uuid,

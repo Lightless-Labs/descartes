@@ -722,15 +722,12 @@ function buildSessionOverflowMarkerFactPoint(result, envelope, ts) {
   };
 }
 
-// A known-path miss is not evidence of a genuine zero. Keep it distinct as "unknown" so the
-// session baseline cannot fold a daemon-PATH failure into a complete census. Older operational
-// failures remain "partial" for compatibility with the existing baseline diagnostics.
+// Every multiplexer must report `ok` for a complete two-source census. A known-path miss,
+// untrusted binary, or execution failure is not evidence of a genuine zero, so all such states
+// remain `partial` and the session baseline cannot fold the tick.
 function censusStateFor(result) {
   const multiplexers = Array.isArray(result?.multiplexers) ? result.multiplexers : [];
-  const anyNotFound = multiplexers.some((mux) => mux?.status === "not_found_on_known_paths");
-  const anyUnable = multiplexers.some((mux) => mux?.status === "unable");
-  if (anyNotFound) return "unknown";
-  return anyUnable ? "partial" : "complete";
+  return multiplexers.length === 0 || multiplexers.every((mux) => mux?.status === "ok") ? "complete" : "partial";
 }
 
 function binaryAvailabilityFor(result) {

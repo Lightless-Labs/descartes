@@ -190,12 +190,14 @@ test("parseScutilNcList classifies VPN types, excludes modem types from VPN coun
     '* (Connected) B91A0000-0000-0000-0000-00000000A702 VPN (io.tailscale.ipn.macsys) "Tailscale" [VPN:io.tailscale.ipn.macsys]',
     '* (Disconnected) EA7E0000-0000-0000-0000-000000000000 PPP --> com.example.spice.0 "Spice modem" [PPP:Modem]',
     '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
+    '* (Connected) 4A2B0000-0000-0000-0000-000000000004 VPN (io.tailscale.ipn.attacker) "Other VPN" [VPN:io.tailscale.ipn.attacker]',
   ].join("\n"));
 
   assert.equal(detailed.unparsed_count, 0);
   assert.deepEqual(detailed.services.map((service) => [service.service_name, service.is_vpn, service.is_tailscale]), [
     ["Tailscale", true, true],
     ["Spice modem", false, false],
+    ["Other VPN", true, false],
     ["Other VPN", true, false],
   ]);
 });

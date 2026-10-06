@@ -726,6 +726,23 @@ test("30 partial vpn_services ticks never establish peer count rules and freeze 
   assert.equal(reconciled.alerts.find((alert) => alert.id === existing.id)?.status, "active", "an incomplete tick must freeze the existing alert identity");
 });
 
+test("30 missing_permission vpn_services ticks never establish or cover peer count rules", async () => {
+  const paths = await tempPaths();
+  const signature = "v1:ok-ok-ok-missing_permission-ok";
+  const ticks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    ticks.push(...activeTickWithMarker(tickTs(i), i === DEFAULT_PEER_MIN_SAMPLE_COUNT - 1 ? 1 : 0, signature));
+  }
+
+  const result = await seedAndCompute(paths, ticks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT - 1) });
+  const state = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(state.confidence_state, "provisional");
+  assert.equal(state.stats.count, 0);
+  assert.equal(state.drop.stats.count, 0);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+});
+
 test("computeWindowedPeerStats regime-keyed fold: confidence_state resets to 'provisional' immediately on a regime flip, even though the OLD regime was already 'established'", () => {
   const degradedSignature = "v1:ok-ok-missing_permission-ok-ok";
   const preFlipTicks = [];
