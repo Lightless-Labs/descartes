@@ -131,6 +131,7 @@ export function renderAlertList(alerts, options = {}) {
     if (alert.summary) lines.push(`  ${alert.summary}`);
     lines.push(`  first_seen=${alert.first_seen} last_seen=${alert.last_seen}`);
     if (alert.acknowledged_at) lines.push(`  acknowledged_at=${alert.acknowledged_at}`);
+    if (alert.delivery_failure_count > 0) lines.push(`  delivery= failing (${alert.delivery_failure_count} failure${alert.delivery_failure_count === 1 ? "" : "s"}${alert.delivery_failure_reason ? `: ${alert.delivery_failure_reason}` : ""})`);
   }
   return lines.join("\n");
 }

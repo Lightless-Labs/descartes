@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { confirmAlertDelivery, materialEvidenceDigest, recordAlertAdjudication } from "./alert-store.js";
+import { confirmAlertDelivery, materialEvidenceDigest, recordAlertAdjudication, recordAlertDeliveryFailure } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -90,6 +90,18 @@ async function confirmDeliveryIfPossible(descartesPaths, alert, delivery, option
   } catch (error) {
     console.warn(`descartes: confirmed delivery state update failed for alert ${alert.id}: ${error?.message ?? error}`);
     return false;
+  }
+}
+
+async function recordDeliveryFailureIfPossible(descartesPaths, alert, options) {
+  try {
+    await recordAlertDeliveryFailure(descartesPaths, alert.id, {
+      now: options.now,
+      reason: options.reason,
+      evidenceDigest: alert.material_evidence_digest ?? materialEvidenceDigest(alert),
+    });
+  } catch (error) {
+    console.warn(`descartes: delivery failure status update failed for alert ${alert.id}: ${error?.message ?? error}`);
   }
 }
 
@@ -607,6 +619,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       // and stays `fired`, matching this function's pre-existing "only a throw means failed"
       // contract for those.
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
+        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status });
         failed.push(alert.id);
       } else {
         await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now });
@@ -615,6 +628,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
+      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message });
       failed.push(alert.id);
     }
   }
@@ -914,7 +928,10 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     };
     try {
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
-      if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") failed.push(alert.id);
+      if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
+        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status });
+        failed.push(alert.id);
+      }
       else {
         await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now });
         fired.push(alert.id);
@@ -922,6 +939,7 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
+      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message });
       failed.push(alert.id);
     }
   }
@@ -1403,6 +1421,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
       const { namespace } = classifyAlertNamespace(alert.rule_id);
       let promptText;
       let appended;
+      let deliveryAttempted = false;
       // F5 fix: read directly off the (possibly un-normalized) config, not a normalized variable --
       // see resolveModelDeadlineMs's doc comment.
       const deadlineMs = resolveModelDeadlineMs(config.model_deadline_ms);
@@ -1541,9 +1560,12 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const rawText = contentToText(finalAssistantMessage.content).trim();
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
         const delivery = decision.notify
-          ? await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id })
+          ? (deliveryAttempted = true, await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id }))
           : undefined;
         if (decision.notify) {
+          if (!deliveryWasSuccessful(delivery)) {
+            await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed" });
+          }
           await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now });
         }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
@@ -1577,6 +1599,9 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           });
         }
       } catch (error) {
+        if (deliveryAttempted) {
+          await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: error instanceof Error ? error.message : String(error) });
+        }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
           alert_id: alert.id,

@@ -270,6 +270,9 @@ export function normalizeAlertRecord(record) {
     adjudication: record.adjudication && typeof record.adjudication === "object" && !Array.isArray(record.adjudication)
       ? { notify: record.adjudication.notify === true, severity: record.adjudication.severity === undefined ? undefined : String(record.adjudication.severity) }
       : null,
+    delivery_failure_count: Number.isInteger(record.delivery_failure_count) && record.delivery_failure_count > 0 ? record.delivery_failure_count : 0,
+    last_delivery_failure_at: record.last_delivery_failure_at ? normalizeIso(record.last_delivery_failure_at, "last_delivery_failure_at") : null,
+    delivery_failure_reason: record.delivery_failure_reason ? String(record.delivery_failure_reason) : null,
     diagnostics: record.diagnostics && typeof record.diagnostics === "object" && !Array.isArray(record.diagnostics) ? record.diagnostics : {},
   };
 }
@@ -522,11 +525,36 @@ export async function confirmAlertDelivery(descartesPaths, alertIdValue, options
         last_notified: now,
         episode_notified_at: now,
         notified_severity_max: nextRank >= currentRank ? (options.severity ?? alert.severity) : alert.notified_severity_max,
+        delivery_failure_count: 0,
+        last_delivery_failure_at: null,
+        delivery_failure_reason: null,
       });
     });
     if (!confirmed) return { confirmed: false };
     const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
     return { confirmed: true, alert: written.find((alert) => alert.id === alertIdValue) };
+  });
+}
+
+export async function recordAlertDeliveryFailure(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  return withAlertStoreLock(descartesPaths, async () => {
+    const alerts = await readAlertRecords(descartesPaths);
+    let recorded = false;
+    const updated = alerts.map((alert) => {
+      if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+      if (options.evidenceDigest && alert.material_evidence_digest !== options.evidenceDigest) return alert;
+      recorded = true;
+      return normalizeAlertRecord({
+        ...alert,
+        delivery_failure_count: alert.delivery_failure_count + 1,
+        last_delivery_failure_at: now,
+        delivery_failure_reason: String(options.reason ?? "delivery_failed").slice(0, 240),
+      });
+    });
+    if (!recorded) return { recorded: false };
+    const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+    return { recorded: true, alert: written.find((alert) => alert.id === alertIdValue) };
   });
 }
 

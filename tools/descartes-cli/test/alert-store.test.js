@@ -13,6 +13,7 @@ import {
   evaluateAndPersistAlerts,
   FIXED_ALERT_RULE_IDS,
   readAlertRecords,
+  recordAlertDeliveryFailure,
   resolveAlertStorePaths,
   writeAlertRecords,
 } from "../src/alert-store.js";
@@ -207,6 +208,31 @@ test("episode notification state is committed only by a confirmed delivery", asy
   const quiet = applyAlertCandidates(persisted, [candidate], { now: "2026-10-06T00:03:00.000Z" });
   assert.deepEqual(quiet.notification_due_ids, []);
   assert.equal(persisted.some((alert) => alert.id === candidate.id), true);
+});
+
+test("delivery failures remain visible without consuming the episode", async () => {
+  const paths = await tempPaths();
+  const candidate = {
+    id: "alert_failure_visible",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Memory high",
+    summary: "High",
+    diagnostics: { min: 0.92 },
+  };
+  const applied = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const failure = await recordAlertDeliveryFailure(paths, candidate.id, {
+    now: "2026-10-06T00:01:00.000Z",
+    reason: "unavailable",
+    evidenceDigest: applied.alerts[0].material_evidence_digest,
+  });
+  assert.equal(failure.recorded, true);
+  const stored = (await readAlertRecords(paths))[0];
+  assert.equal(stored.delivery_failure_count, 1);
+  assert.equal(stored.delivery_failure_reason, "unavailable");
+  assert.equal(stored.episode_notified_at, null);
 });
 
 test("acknowledgement suppresses persistence but not a later severity escalation", () => {
