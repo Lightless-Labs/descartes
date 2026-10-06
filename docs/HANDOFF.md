@@ -2,6 +2,25 @@
 
 **Last updated:** 2026-10-06
 
+## Current continuity — G3 full-store fallback removal (2026-10-06)
+
+The remaining daybreak G3 blocker is fixed locally on `feat/fact-store-capacity-2026-10`. Novelty
+eligibility now requires a valid current-epoch seen-set and its registered certified horizon; the
+full-store eligibility fallback is removed. Missing, unreadable, invalid, no-ledger, pending-pass,
+lineage-mismatch, overflow, epoch mismatch, and unreadable/pending/future marker states all fail
+closed. The read path reports the underlying seen-set status first, while the shared
+`noveltyRuleEligible` predicate is used by the three producers, rule evaluations/status, and daemon
+veto. Non-valid novelty produces no candidates or recovery coverage and carries the seen-set status
+as the rule/status reason until a successful fold re-certifies it. Re-seeding preserves its existing
+non-null post-quarantine certified-since boundary rules.
+
+TDD regressions cover the same-epoch `svc-B` return at t7 (7 h into 48 h), daemon alert freeze, all
+non-valid statuses with a real `EISDIR` unreadable fixture, and successful-fold recovery only at
+the 48 h boundary. Focused novelty/process-lineage/service verification: 140/140 pass. Final
+fresh-XDG `npm test`: 2243 total, 2187 pass, 22 managed-sandbox environment failures, 34 skipped,
+0 todo, 0 product failures. The 22 environment failures are 17 notifier-reuse loopback binds,
+3 tap-bump loopback binds, and 2 live-host provenance checks. No push or merge.
+
 ## Current continuity — G3 quarantine-epoch read closure rework (2026-10-06)
 
 The daybreak-blue G3 confirmation blocker is fixed locally on `feat/fact-store-capacity-2026-10`.

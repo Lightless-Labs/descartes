@@ -23,7 +23,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, noveltySeenSetStatus, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
@@ -449,6 +449,7 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
       historyTrust,
       coldStartPendingThisTick,
       horizonOk,
+      horizonReason: noveltySeenSetStatus(readResult, SCHEDULED_JOB_APPEARED_RULE_ID),
       readinessGate: scheduledJobEvaluationReadiness(currentGroups, detectionOptions).gate,
       evaluatedAlertKeys,
     }),

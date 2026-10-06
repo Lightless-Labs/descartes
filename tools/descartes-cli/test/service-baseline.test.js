@@ -132,12 +132,23 @@ function establishedTicks(entityKeys, count = DEFAULT_SERVICE_ESTABLISHED_MIN_CE
 // peer-baseline.test.js's own intactReadResult/degradedReadResult exactly -- injected via
 // options.readFactPoints so the dedicated cold-start tests below don't need to fabricate real
 // ledger corruption/eviction.
-function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }, { seenSet = true } = {}) {
+  const entries = new Map();
+  for (const point of points) {
+    if (point.fact_name !== "service.presence") continue;
+    const tsMs = Date.parse(point.ts);
+    const prior = entries.get(point.entity_key);
+    entries.set(point.entity_key, {
+      firstMs: prior ? Math.min(prior.firstMs, tsMs) : tsMs,
+      lastMs: prior ? Math.max(prior.lastMs, tsMs) : tsMs,
+    });
+  }
   return {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
     completeness,
+    ...(seenSet ? { seen_sets: { service: { status: "valid", certified_since_ts: null, entries } } } : {}),
   };
 }
 
@@ -1333,7 +1344,7 @@ test("computeServiceAppearanceCandidates: narrowed history re-arms before evalua
     minHistoryTickCount: 1,
     establishedMinCensusCount: 3,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }),
+    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }, { seenSet: false }),
   });
 
   assert.deepEqual(result.candidates, [], "a narrowed retained window must not fabricate service.appeared");

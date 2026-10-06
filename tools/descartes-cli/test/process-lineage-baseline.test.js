@@ -81,12 +81,23 @@ function flatten(ticks) {
   return ticks.flat();
 }
 
-function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }, { seenSet = true, seenSetPoints = points } = {}) {
+  const entries = new Map();
+  for (const point of seenSetPoints) {
+    if (point.fact_name !== PROCESS_LINEAGE_EDGE_FACT_NAME) continue;
+    const tsMs = Date.parse(point.ts);
+    const prior = entries.get(point.entity_key);
+    entries.set(point.entity_key, {
+      firstMs: prior ? Math.min(prior.firstMs, tsMs) : tsMs,
+      lastMs: prior ? Math.max(prior.lastMs, tsMs) : tsMs,
+    });
+  }
   return {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
     completeness,
+    ...(seenSet ? { seen_sets: { process_lineage: { status: "valid", certified_since_ts: null, entries } } } : {}),
   };
 }
 
@@ -372,7 +383,7 @@ test("computeProcessLineageBaselineCandidates: rollback repairs a future anchor 
   const options = {
     minHistoryTickCount: 6,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }, { seenSetPoints: points.filter((point) => Date.parse(point.ts) <= Date.parse(tickTs(7))) }),
   };
   await computeProcessLineageBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal((await loadProcessLineageBaselineStore(paths)).state.last_folded_ts, undefined);
@@ -739,7 +750,7 @@ test("computeProcessLineageBaselineCandidates: narrowed history re-arms before e
     now: tickTs(4),
     minHistoryTickCount: 3,
     activeFreshnessMs: HOUR_MS,
-    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }),
+    readFactPoints: async () => intactReadResult(retainedPoints, { status: "intact", coverage: "narrowed" }, { seenSet: false }),
   });
 
   assert.deepEqual(result.candidates, [], "a narrowed retained window must not fabricate process.lineage.novel_edge");

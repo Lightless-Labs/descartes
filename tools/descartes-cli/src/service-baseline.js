@@ -39,7 +39,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, noveltySeenSetStatus, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
@@ -1057,6 +1057,7 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
       historyTrust,
       coldStartPendingThisTick,
       horizonOk,
+      horizonReason: noveltySeenSetStatus(readResult, SERVICE_APPEARED_RULE_ID),
       readinessGate: censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups: establishedMinCensusCount + 1 }).gate,
       evaluatedAlertKeys,
     }),

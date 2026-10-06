@@ -801,10 +801,6 @@ async function readFamilyFactPoints(descartesPaths, family, options) {
         ledger: integrity.ledger,
         nowMs,
         retentionMs,
-        // Used only to decide whether a non-valid seen-set may fall back to the full store. The
-        // oldest point in this certified read is the family store's certified start for this
-        // decision; a quarantine newer than it invalidates the fallback until the next fold.
-        storeCertifiedStartTs: points[0]?.ts ?? null,
         ...(options.seenSetMaxEntries !== undefined ? { maxEntries: options.seenSetMaxEntries } : {}),
       });
     }

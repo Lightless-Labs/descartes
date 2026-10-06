@@ -1291,3 +1291,20 @@ regression covers all three novelty families at candidate, `ruleEvaluations`, an
 levels, and a table-driven read test covers every ordinary non-valid seen-set status. Focused
 verification is 282/282. The fresh-XDG full suite is 2240 total, 2184 pass, 22 managed-sandbox
 environment failures, 34 skipped, 0 todo, with 0 product failures.
+
+### 24.2 G3 final correction: no full-store novelty fallback (2026-10-06)
+
+**Reason:** daybreak's same-epoch loss reproduction showed that a missing or otherwise non-valid
+seen-set could still authorize novelty from full fact-store coverage before a fold re-certified it.
+The fallback is removed entirely. `service.appeared`, `scheduled_job.appeared`, and
+`process.lineage.novel_edge` now require a valid current-epoch seen-set and its certified horizon;
+every other seen-set status is ineligible, emits no candidate or recovery coverage, and carries the
+underlying seen-set status into rule/status reporting. A successful fold re-seeds with its existing
+certified-since boundary rules, and eligibility begins only when the registered horizon is met.
+
+TDD coverage includes the t7/48 h same-epoch loss reproduction (`svc-B`), daemon recovery veto,
+all ordinary and marker/epoch non-valid statuses (with `unreadable` forced by `EISDIR`), and
+47 h/48 h post-fold re-certification checks. Focused novelty/process-lineage/service verification:
+140 tests, 140 pass. Final fresh-XDG `npm test`: **2243 tests, 2187 pass, 22 managed-sandbox
+environment failures, 34 skipped, 0 todo, 0 product failures**. Environment failures are 17
+notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.

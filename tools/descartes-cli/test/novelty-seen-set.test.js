@@ -320,7 +320,7 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
 
   for (const entry of families) {
     const read = await readFactPoints(paths, { family: entry.family, now: latest, windowMs: 31 * DAY, seenSetFamilies: [entry.family] });
-    assert.equal(read.seen_sets[entry.family].status, "quarantine_epoch_mismatch", `${entry.family}: stale set is not valid after migration`);
+    assert.equal(read.seen_sets[entry.family].status, "lineage_mismatch", `${entry.family}: stale set reports its underlying status after migration`);
     assert.equal(noveltyRuleEligible(read, entry.ruleId, Date.parse(latest)), false, `${entry.family}: shared eligibility predicate vetoes stale epoch`);
 
     const result = await entry.compute(paths, {
@@ -331,6 +331,7 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
     assert.deepEqual(result.candidates, [], `${entry.family}: no candidate from stale novelty memory`);
     assert.deepEqual(result.evaluatedAlertKeys, [], `${entry.family}: no recovery coverage from stale novelty memory`);
     assert.equal(result.ruleEvaluations[entry.ruleId].gate, "history_horizon_short", `${entry.family}: status uses the same horizon-short gate`);
+    assert.equal(result.ruleEvaluations[entry.ruleId].horizon_reason, "lineage_mismatch", `${entry.family}: status retains the underlying seen-set reason`);
     assert.equal(result.ruleEvaluations[entry.ruleId].evaluable, false, `${entry.family}: rule is not evaluable`);
   }
 
@@ -373,7 +374,7 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
     const alert = daemon.alerts.alerts.find((candidate) => candidate.rule_id === entry.ruleId);
     assert.equal(alert.status, "active", `${entry.family}: daemon veto freezes recovery on a stale migration epoch`);
   }
-  assert.equal(daemon.status.novelty_seen_sets.service.status, "quarantine_epoch_mismatch");
+  assert.equal(daemon.status.novelty_seen_sets.service.status, "lineage_mismatch");
 
   for (const entry of families) {
     await enforceFactRetention(paths, { family: entry.family, now: latest });
@@ -382,7 +383,7 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
   }
 });
 
-test("G3 blocker audit: every ordinary non-valid seen-set status still honors a newer migration epoch before full-store fallback", async () => {
+test("G3 blocker audit: every ordinary non-valid seen-set status is reported first and remains ineligible", async () => {
   const statuses = ["missing", "unreadable", "invalid", "no_ledger", "pending_pass", "lineage_mismatch", "overflow"];
   for (const expectedStatus of statuses) {
     const paths = await tempPaths();
@@ -398,7 +399,10 @@ test("G3 blocker audit: every ordinary non-valid seen-set status still honors a 
     if (expectedStatus === "missing") {
       await fs.unlink(seenSetFile);
     } else if (expectedStatus === "unreadable") {
-      await fs.writeFile(seenSetFile, "{");
+      // A malformed JSON file is `invalid`, not `unreadable`. Use a directory at the file path so
+      // fs.readFile fails with EISDIR and the read path reports the underlying I/O status.
+      await fs.unlink(seenSetFile);
+      await fs.mkdir(seenSetFile, { recursive: true });
     } else {
       const set = JSON.parse(await fs.readFile(seenSetFile, "utf8"));
       if (expectedStatus === "invalid") {
@@ -432,8 +436,126 @@ test("G3 blocker audit: every ordinary non-valid seen-set status still honors a 
     }
 
     const read = await readFactPoints(paths, { family: "service", now: at(2), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
-    assert.equal(read.seen_sets.service.status, "quarantine_epoch_mismatch", `${expectedStatus} is not allowed to mask migration invalidation`);
+    assert.equal(read.seen_sets.service.status, expectedStatus, `${expectedStatus} is reported before any migration status`);
     assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(2))), false, `${expectedStatus} cannot authorize full-store novelty fallback`);
+  }
+});
+
+test("G3: same-epoch seen-set loss at t7 is horizon-short, not a full-store novelty claim, and cannot recover a daemon alert", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+
+  // The legacy store contains svc-B and is quarantined at t0. The current epoch is therefore
+  // valid, but its seen-set is the only trusted memory that can distinguish svc-B's return.
+  const { factsRootDir } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(0), "svc-B"))}\n`);
+  await migrateLegacyFactStore(paths, { now: at(0) });
+  for (let hour = 0; hour <= 7; hour += 1) {
+    await appendFactPoints(paths, serviceTick(at(hour), hour === 7 ? ["svc-A", "svc-B"] : ["svc-A"]), { family: "service", now: at(hour) });
+  }
+  await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: at(7) });
+  await fs.unlink(resolveSeenSetPaths(paths, "service").file);
+
+  const latest = at(7);
+  const read = await readFactPoints(paths, { family: "service", now: latest, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  assert.equal(read.completeness.coverage, "full", "the reproduction keeps full fact-store coverage so only the seen-set gate can stop it");
+  assert.equal(read.seen_sets.service.status, "missing");
+  assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(latest)), false);
+
+  const result = await computeServiceAppearanceCandidates(paths, {
+    now: latest,
+    activeFreshnessMs: 2 * HOUR,
+    minHistoryTickCount: 1,
+    establishedMinCensusCount: 2,
+  });
+  assert.deepEqual(result.candidates, [], "svc-B is not claimable seven hours into the 48-hour horizon");
+  assert.deepEqual(result.evaluatedAlertKeys, [], "horizon-short novelty reports no recovery coverage");
+  assert.equal(result.ruleEvaluations[SERVICE_APPEARED_RULE_ID].gate, "history_horizon_short");
+  assert.equal(result.ruleEvaluations[SERVICE_APPEARED_RULE_ID].horizon_reason, "missing");
+
+  await writeLearnedConfig(paths, { enabled: true });
+  const fingerprint = "0123456789abcdef";
+  await writeAlertRecords(paths, [{
+    rule_id: SERVICE_APPEARED_RULE_ID,
+    fingerprint,
+    status: "active",
+    severity: "warning",
+    title: "t",
+    summary: "t",
+    first_seen: latest,
+    last_seen: latest,
+    diagnostics: {},
+  }]);
+  const daemon = await runDaemonIteration(paths, {
+    profile: { interval_ms: 60000, collectors: {} },
+    collectors: {},
+    ts: latest,
+    now: latest,
+    computeServiceAppearanceCandidates: async () => ({
+      candidates: [],
+      evaluatedAlertKeys: [alertId(SERVICE_APPEARED_RULE_ID, fingerprint)],
+    }),
+  });
+  const alert = daemon.alerts.alerts.find((candidate) => candidate.rule_id === SERVICE_APPEARED_RULE_ID);
+  assert.equal(alert.status, "active", "the daemon veto keeps the active novelty alert from recovering");
+  assert.equal(daemon.status.novelty_seen_sets.service.status, "missing");
+});
+
+test("G3: a successful fold re-certifies lost seen-set memory, but eligibility waits for the full novelty horizon", async () => {
+  const paths = await tempPaths();
+  const { factsRootDir } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(0), "svc-B"))}\n`);
+  await migrateLegacyFactStore(paths, { now: at(0) });
+  for (let hour = 0; hour <= 7; hour += 1) {
+    await appendFactPoints(paths, serviceTick(at(hour), hour === 7 ? ["svc-A", "svc-B"] : ["svc-A"]), { family: "service", now: at(hour) });
+  }
+  await fs.unlink(resolveSeenSetPaths(paths, "service").file);
+
+  await enforceFactRetention(paths, { family: "service", now: at(7) });
+  const recertified = await readFactPoints(paths, { family: "service", now: at(7), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  assert.equal(recertified.seen_sets.service.status, "valid");
+  assert.equal(recertified.seen_sets.service.certified_since_ts, at(7));
+
+  const shortNow = at(54); // 47 h after the successful fold
+  const eligibleNow = at(55); // 48 h after the successful fold
+  const shortRead = await readFactPoints(paths, { family: "service", now: shortNow, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  const eligibleRead = await readFactPoints(paths, { family: "service", now: eligibleNow, windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+  assert.equal(noveltyRuleEligible(shortRead, SERVICE_APPEARED_RULE_ID, Date.parse(shortNow)), false);
+  assert.equal(noveltyRuleEligible(eligibleRead, SERVICE_APPEARED_RULE_ID, Date.parse(eligibleNow)), true);
+});
+
+test("G3: marker and epoch failures remain non-valid seen-set reasons", async () => {
+  const cases = [
+    ["quarantine_epoch_mismatch", async ({ seenSetFile }) => {
+      const set = JSON.parse(await fs.readFile(seenSetFile, "utf8"));
+      set.quarantine_epoch = 0;
+      await fs.writeFile(seenSetFile, `${JSON.stringify(set)}\n`);
+    }],
+    ["quarantine_marker_unreadable", async ({ markerFile }) => fs.writeFile(markerFile, "{not json")],
+    ["quarantine_migration_pending", async ({ factsRootDir }) => fs.writeFile(path.join(factsRootDir, "facts.jsonl"), "pending")],
+    ["quarantine_marker_future", async ({ markerFile }) => fs.writeFile(markerFile, JSON.stringify({
+      schema_version: 2,
+      in_progress: null,
+      quarantines: [],
+      quarantine_epoch: 1,
+      quarantine_epoch_ts: "2099-01-01T00:00:00.000Z",
+    }))],
+  ];
+  for (const [expectedStatus, mutate] of cases) {
+    const paths = await tempPaths();
+    const { factsRootDir, markerFile } = resolveLegacyFactStorePaths(paths);
+    await fs.mkdir(factsRootDir, { recursive: true });
+    await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(0), "legacy-svc"))}\n`);
+    await migrateLegacyFactStore(paths, { now: at(0) });
+    await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });
+    const { file: seenSetFile } = resolveSeenSetPaths(paths, "service");
+    await mutate({ factsRootDir, markerFile, seenSetFile });
+
+    const read = await readFactPoints(paths, { family: "service", now: at(0), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+    assert.equal(read.seen_sets.service.status, expectedStatus);
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(0))), false);
   }
 });
 
@@ -757,7 +879,7 @@ test("S3b: a store older than the 30-day retention (age floor inside the 31 d de
   assert.equal((await loadServiceAppearanceBaselineStore(paths)).state.cold_start_pending, false);
 });
 
-test("S3b: an injected read that carries no seen-set keeps the interim behavior -- full coverage still fires novelty", async () => {
+test("G3: an injected read that carries no seen-set is never eligible, even with full coverage", async () => {
   const paths = await tempPaths();
   await writeWatchConfig(paths, { enabled: true });
   await writeServiceAppearanceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: at(-1) });
@@ -766,7 +888,9 @@ test("S3b: an injected read that carries no seen-set keeps the interim behavior 
     now: at(4),
     readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "full" } }),
   });
-  assert.equal(result.candidates.length, 1);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+  assert.equal(result.ruleEvaluations[SERVICE_APPEARED_RULE_ID].horizon_reason, undefined);
 });
 
 // ---------------------------------------------------------------------------------------------

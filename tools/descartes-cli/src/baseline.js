@@ -469,7 +469,10 @@ function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, c
   if (absent) reasons.push("not_observed_no_store");
   if (absent && legacyPending) reasons.push("legacy_store_pending_migration");
   if (!absent && (censusStale || ruleEvaluation?.gate === "latest_census_stale")) reasons.push("latest_census_stale");
-  if (ruleEvaluation?.gate === "history_horizon_short") reasons.push("history_horizon_short");
+  if (ruleEvaluation?.gate === "history_horizon_short") {
+    reasons.push("history_horizon_short");
+  }
+  if (!absent && ruleEvaluation?.horizon_reason) reasons.push(`seen_set_${ruleEvaluation.horizon_reason}`);
   if (familyBlock.cap_below_tick) reasons.push("cap_below_tick");
   if (familyBlock.budget_rejected?.reason === "budget_below_horizon_floor") reasons.push("budget_below_horizon_floor");
   if (familyBlock.horizon_invariant_unmet) reasons.push("horizon_invariant_unmet");
@@ -522,6 +525,7 @@ function buildDomainReports(inputs) {
           watching,
           gate: absent ? "no_store" : error !== undefined ? "detector_error" : ruleEvaluation.gate,
           ...(ruleEvaluation?.history_reason ? { history_reason: ruleEvaluation.history_reason } : {}),
+          ...(ruleEvaluation?.horizon_reason ? { horizon_reason: ruleEvaluation.horizon_reason } : {}),
           ...(error !== undefined && !absent ? { error } : {}),
           evaluated_alert_keys: keys,
           evaluated_count: keys.length,
