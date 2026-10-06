@@ -2,6 +2,24 @@
 
 **Last updated:** 2026-10-06
 
+## Daybreak rework closure — 2026-10-06
+
+On branch `fix/collector-sources-2026-10`, the daybreak-blue findings and live-host regressions are
+fixed locally and have not been pushed or merged. Atomic commits for this task are `3eefccf`
+(provenance process-table output bound), `44540d9` (effective writer-set binary trust and wrapper
+rejection), `bdbc560` (incomplete session/VPN census handling and finite Tailscale IDs), and
+`5897fb2` (operator-trusted path threading through daemon, Pi, and all resolver-backed collectors).
+The writer-set policy expands group writers using macOS `dscl`/primary-group users or Linux
+`getent`, caches membership per tick, rejects unresolved membership, and applies to every ancestor;
+operator-trusted absolute paths remain an explicit override. Script wrappers are rejected unless the
+exact path is operator-trusted, so a trusted wrapper cannot substitute for a rejected downstream
+binary. Tailscale untrusted evidence retains the offending component, reason, and override hint.
+
+Validation: the required fresh-XDG full `npm test` run with host access passed **2113/2113, 0
+failures, 34 skips, 2147 total**. The two live macOS provenance regressions pass outside the
+sandbox (45/45 provenance/Pi targeted tests). The focused collector suites and operator-trusted
+end-to-end tests also pass. No push or merge was performed.
+
 ## Collector-source hardening — 2026-10-06
 
 On branch `fix/collector-sources-2026-10`, H6 is committed locally as `be09348` and H5 is
