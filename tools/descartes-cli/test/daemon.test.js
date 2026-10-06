@@ -2458,6 +2458,30 @@ test("Slice 4 wiring: computeSessionBaselineCandidates is the daemon's fourth ex
   assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
 });
 
+test("S6 H1: an active session.count_drop alert stays active when the latest complete census becomes stale", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
+
+  const fresh = await runIsolatedDaemonTick(paths, hour(30));
+  const freshAlert = fresh.alerts.alerts.find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(freshAlert?.status, "active", "the control tick must establish the active alert");
+
+  // The structural interval is one hour, so the latest census is stale after 3 hours. No new
+  // structural tick means the detector must report no coverage and the daemon must freeze, not
+  // recover, the active alert.
+  const stale = await runIsolatedDaemonTick(paths, hour(34));
+  const staleAlert = stale.alerts.alerts.find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(stale.alerts.candidates.some((candidate) => candidate.rule_id === SESSION_COUNT_DROP_RULE_ID), false, "a stale census must not emit a candidate from stale data");
+  assert.equal(staleAlert?.status, "active", "a stale census must freeze the active alert");
+  assert.equal((await readAlertRecords(paths)).find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
+});
+
 test("Slice 4 wiring: a fingerprint change on the latest tick-group produces a real session.churn alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });

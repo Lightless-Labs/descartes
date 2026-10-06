@@ -15,10 +15,9 @@
 //     since its detector's anchor (factHistoryTrustworthy), a clear lockout, and passes the daemon's
 //     own per-rule eligibility predicate (ruleEligible) on a fresh read; and each not-watching gate
 //     (history_untrusted, cold_start_pending, history_horizon_short) is independently true;
-//   - freshness from the test's own record of the newest complete census it wrote: a watching census
-//     rule has a fresh one, the census-stale gate fires only on a stale one, and EVERY rule carries
-//     the latest_census_stale reason exactly when it is stale (the session/peer detectors have no
-//     freshness gate, H1);
+//   - freshness from the test's own record of the newest complete census it wrote: a watching rule
+//     has a fresh one, the census-stale gate fires only on a stale one, and EVERY rule carries the
+//     latest_census_stale reason exactly when it is stale;
 //   - the per-rule keys partition each producer's top-level evaluatedAlertKeys (the daemon's coverage).
 //
 // Scenarios (seeded real-volume generator, small scale): a never-created store (fresh install, and a
@@ -305,16 +304,16 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
       if (checkpoints.has(hour)) await checkpoint(paths, rig, iso(BASE_MS + (hour + 0.5) * HOUR_MS), `clean h${hour}`);
     }
     // No structural tick for 4 h, then for 10 days: the latest complete census is older than 3 x the
-    // interval. The four census rules stop (latest_census_stale gate); session/peer have no freshness
-    // gate in their detectors and keep evaluating (disclosed, §22.3/§22.4) -- status says "watching",
-    // as the detector does, and every rule carries the latest_census_stale reason.
+    // interval. All eight rules stop on the same latest_census_stale gate and report no coverage.
     for (const [hours, name] of [[39.5, "clean stale 4h"], [35 + 240, "clean stale 240h"]]) {
       const stale = await checkpoint(paths, rig, iso(BASE_MS + hours * HOUR_MS), name);
       const rules = stale.domains.flatMap((domain) => domain.rules);
       for (const rule of rules) assert.ok(rule.reasons.includes("latest_census_stale"), `${name}: ${rule.rule_id} carries latest_census_stale (${rule.reasons})`);
-      for (const ruleId of CENSUS_RULES) assert.equal(rules.find((rule) => rule.rule_id === ruleId).gate, "latest_census_stale", `${name}: ${ruleId}`);
-      for (const ruleId of [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID]) {
-        assert.equal(rules.find((rule) => rule.rule_id === ruleId).phase, "watching", `${name}: ${ruleId} still evaluates in its detector (no freshness gate)`);
+      for (const ruleId of RULES.keys()) {
+        const rule = rules.find((candidate) => candidate.rule_id === ruleId);
+        assert.equal(rule.gate, "latest_census_stale", `${name}: ${ruleId}`);
+        assert.equal(rule.phase, "cannot evaluate — latest complete census is stale", `${name}: ${ruleId} phase`);
+        assert.deepEqual(rule.evaluated_alert_keys, [], `${name}: ${ruleId} reports no stale-data coverage`);
       }
     }
   });
@@ -456,10 +455,10 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
   const expected = {
     [SERVICE_DISAPPEARED_RULE_ID]: ["no_store", "history_untrusted", "cold_start_pending", "ok", "latest_census_stale", "history_horizon_short", "insufficient_complete_history"],
     [SERVICE_APPEARED_RULE_ID]: ["no_store", "history_untrusted", "ok", "history_horizon_short", "latest_census_stale"],
-    [SESSION_COUNT_DROP_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short"],
-    [SESSION_CHURN_RULE_ID]: ["no_store", "ok", "history_horizon_short", "no_complete_census"],
-    [PEER_COUNT_SPIKE_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short"],
-    [PEER_COUNT_DROP_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short"],
+    [SESSION_COUNT_DROP_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short", "latest_census_stale"],
+    [SESSION_CHURN_RULE_ID]: ["no_store", "ok", "history_horizon_short", "no_complete_census", "latest_census_stale"],
+    [PEER_COUNT_SPIKE_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short", "latest_census_stale"],
+    [PEER_COUNT_DROP_RULE_ID]: ["no_store", "baseline_warming_up", "ok", "history_horizon_short", "latest_census_stale"],
     [SCHEDULED_JOB_APPEARED_RULE_ID]: ["no_store", "ok", "history_horizon_short", "latest_census_stale"],
     [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID]: ["no_store", "ok", "history_horizon_short", "latest_census_stale"],
   };
