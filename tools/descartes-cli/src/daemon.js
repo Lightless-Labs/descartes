@@ -1262,8 +1262,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // and a family that was not read (its tier is off, or the read threw) counts as untrusted.
     historyVetoedRuleIds = new Set([...HISTORY_DEPENDENT_ALERT_RULE_IDS].filter((ruleId) => (RULE_HORIZONS.get(ruleId)?.families ?? [undefined])
       .some((family) => familyTrust.get(family)?.trust !== true)));
-    // Novelty rules (S3b): the SAME predicate the detectors use -- a valid seen-set and its horizon,
-    // or (without one) full coverage plus the fact-floor horizon. Every other rule: the fact floor.
+    // Novelty rules (S3b): the SAME predicate the detectors use -- a valid current-epoch seen-set and
+    // its horizon, nothing else (G3: no full-store fallback). Every other rule: the fact floor.
     // S3b review MEDIUM-2: correlation's referent is its whole 31 d read window (the same window and
     // predicate the detector uses -- ruleEligible), not only its 3 d horizon, so a correlation the
     // detector silenced is vetoed AND reported horizon-short here. S4: evaluated against each of the

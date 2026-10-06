@@ -20,9 +20,9 @@
 //   - LINEAGE-STAMPED to the fact ledger: ledger_generation + ledger_pass_id (the committed pass it
 //     was folded with). A read validates the set against the SAME ledger readFactPoints just read --
 //     generation match, pass id === last_committed_pass_id, no pending pass -- and anything else
-//     (missing, unreadable, invalid shape, mismatch, pending, overflow) is NOT valid: the novelty
-//     detector then keeps the interim full-coverage gate, so under narrowing it re-arms and claims
-//     nothing (I14). Never "everything is new".
+//     (missing, unreadable, invalid shape, mismatch, pending, overflow, quarantine-epoch mismatch) is
+//     NOT valid: the novelty rule is then ineligible (no candidates, no coverage, horizon-short) until a
+//     successful fold re-certifies (G3, bdf10a1 removed the full-store fallback). Never "everything is new".
 //   - RE-SEED on any loss of continuity (missing/invalid/mismatched set, overflow): rebuilt from the
 //     pass's certified candidates with certified_since_ts = the newest point before which memory is
 //     not certified: max(prior byte-cap floor, prior age floor, every loss marker) when this pass's

@@ -1001,7 +1001,7 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   }
 
   // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h), measured against
-  // the seen-set's certified span when it decides novelty (S3b), else the fact store's floor. Never an
+  // the valid current-epoch seen-set's certified span (S3b; no full-store fallback since G3). Never an
   // input to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
   const horizonOk = noveltyRuleEligible(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
   const appearances = coldStartPendingThisTick || !horizonOk
