@@ -2,21 +2,26 @@
 
 **Last updated:** 2026-10-06
 
-## Current continuity — G3 quarantine-epoch read closure (2026-10-06)
+## Current continuity — G3 quarantine-epoch read closure rework (2026-10-06)
 
-The daybreak-blue G3 blocker is closed locally on `feat/fact-store-capacity-2026-10`: a migration
-epoch change on a non-structural fast tick now invalidates an older novelty seen-set immediately.
-`readNoveltySeenSet` compares the recorded set epoch with the current migration marker and fails
-closed for mismatch, unreadable/pending, or future marker state. The shared `noveltyRuleEligible`
-predicate is used by the three novelty producers and the daemon veto; rule evaluations/status report
-`history_horizon_short`, producers return no candidates or recovery coverage, and the daemon freezes
-recovery until a later fold re-certifies the set. The regression covers service, scheduled-job, and
-process-lineage novelty with no intervening append, plus the daemon recovery veto. Plan addendum: §24.
+The daybreak-blue G3 confirmation blocker is fixed locally on `feat/fact-store-capacity-2026-10`.
+The earlier closure checked the migration marker only after `lineage_mismatch` and other seen-set
+early returns, allowing a stale set to fall through to the full-store novelty fallback. The read
+path now evaluates migration first for every seen-set state. For a missing/invalid set, it also
+rejects the fallback when the current quarantine episode is newer than the family read's certified
+start, or when the marker is unreadable, pending, or future-dated. The existing shared
+`noveltyRuleEligible` predicate remains the single gate used by all three novelty producers,
+rule evaluations/status, and the daemon veto: horizon-short means no candidates, empty recovery
+coverage, and no daemon recovery until a later fold re-certifies the family.
 
-Focused novelty/baseline/family-veto verification: 175 tests, 175 pass, 0 fail. Full fresh-XDG
-`npm test`: 2240 tests, 2184 pass, 22 managed-sandbox environment failures, 34 skipped, 0 todo,
-0 product failures. The 22 environment failures are 17 notifier-reuse loopback binds, 3 tap-bump
-loopback binds, and 2 live-host provenance checks. No push or merge.
+The regression combines `lineage_mismatch` with fast-tick migration for service, scheduled-job,
+and process-lineage novelty at producer/status/daemon level; all active daemon alerts remain
+active. A table-driven audit covers missing, unreadable, invalid, no-ledger, pending-pass,
+lineage-mismatch, and overflow statuses. Focused novelty/baseline/family-veto verification:
+282 tests, 282 pass, 0 fail. Full fresh-XDG `npm test`: 2240 tests, 2184 pass, 22 managed-sandbox
+environment failures, 34 skipped, 0 todo, 0 product failures. The 22 environment failures are
+17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.
+No push or merge.
 
 ## Current continuity — S6 H1 freshness closure (2026-10-06)
 

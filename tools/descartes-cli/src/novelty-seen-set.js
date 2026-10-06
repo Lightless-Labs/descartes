@@ -354,9 +354,35 @@ export async function foldNoveltySeenSets(descartesPaths, {
  * Read-side validation against the ledger the SAME readFactPoints call just read. Returns a
  * display-safe summary plus, only when valid, the entries map the novelty detectors consult.
  */
-export async function readNoveltySeenSet(descartesPaths, family, { ledger, nowMs, retentionMs = DEFAULT_SEEN_SET_RETENTION_MS, maxEntries } = {}) {
+export async function readNoveltySeenSet(descartesPaths, family, {
+  ledger,
+  nowMs,
+  retentionMs = DEFAULT_SEEN_SET_RETENTION_MS,
+  maxEntries,
+  storeCertifiedStartTs,
+} = {}) {
   const { set, reason } = await readSeenSetFile(descartesPaths, family, { maxEntries });
   const base = { family, status: reason ?? "valid", certified_since_ts: null, scope_ts: null, entry_count: 0 };
+  // Migration runs on every daemon iteration, including a fast tick. Evaluate it before ANY
+  // seen-set status return: otherwise lineage_mismatch, overflow, pending_pass, or a missing set
+  // can fall through to the full-store novelty fallback and authorize a claim against a history
+  // whose discarded legacy epoch has not been re-certified.
+  const quarantine = await legacyQuarantineEpoch(descartesPaths, { now: nowMs }).catch(() => ({ status: "unreadable" }));
+  if (quarantine.status === "unreadable") return { ...base, status: "quarantine_marker_unreadable" };
+  if (quarantine.status === "legacy_pending") return { ...base, status: "quarantine_migration_pending" };
+  if (quarantine.status === "future") return { ...base, status: "quarantine_marker_future" };
+  const setEpochDiffers = set && quarantine.epoch !== set.quarantine_epoch;
+  // A non-valid set has no epoch to compare. In that case the full-store fallback may only use a
+  // store whose certified lineage began after the latest quarantine episode. An absent start is
+  // deliberately conservative: there is no trustworthy boundary against which to prove that the
+  // store postdates the discarded history.
+  const quarantinePostdatesStore = !set && quarantine.status === "valid" && quarantine.epoch > 0
+    && (!isIsoTimestamp(storeCertifiedStartTs)
+      || !isIsoTimestamp(quarantine.epoch_ts)
+      || Date.parse(quarantine.epoch_ts) > Date.parse(storeCertifiedStartTs));
+  if ((quarantine.status !== "absent" && quarantine.status !== "valid") || setEpochDiffers || quarantinePostdatesStore) {
+    return { ...base, status: "quarantine_epoch_mismatch" };
+  }
   if (!set) return base;
   base.certified_since_ts = set.certified_since_ts;
   base.entry_count = Object.keys(set.entries).length;
@@ -365,18 +391,6 @@ export async function readNoveltySeenSet(descartesPaths, family, { ledger, nowMs
   if (ledger.continuity?.pending_pass) return { ...base, status: "pending_pass" };
   if (set.ledger_generation !== ledger.generation || set.ledger_pass_id !== ledger.continuity?.last_committed_pass_id) {
     return { ...base, status: "lineage_mismatch" };
-  }
-  // Migration runs on every daemon iteration, including a fast tick. A seen-set folded before a
-  // new quarantine epoch is not certified against the current history boundary until the next
-  // structural fold rewrites it. Keep this check on the read path so every consumer (detectors,
-  // baseline status, and the daemon veto) receives the same invalidation state.
-  const quarantine = await legacyQuarantineEpoch(descartesPaths, { now: nowMs }).catch(() => ({ status: "unreadable" }));
-  if (quarantine.status === "unreadable") return { ...base, status: "quarantine_marker_unreadable" };
-  if (quarantine.status === "legacy_pending") return { ...base, status: "quarantine_migration_pending" };
-  if (quarantine.status === "future") return { ...base, status: "quarantine_marker_future" };
-  if ((quarantine.status !== "absent" && quarantine.status !== "valid")
-    || quarantine.epoch !== set.quarantine_epoch) {
-    return { ...base, status: "quarantine_epoch_mismatch" };
   }
   // The claim's scope: memory runs back to certified_since (or the lineage start) but never further
   // than the 30-day retention past last_seen.

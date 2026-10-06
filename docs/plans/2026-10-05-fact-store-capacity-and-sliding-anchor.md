@@ -1274,3 +1274,20 @@ recovery until a later fold re-certifies the set. Ordinary missing sets retain t
 full-coverage fallback. The regression covers service appearance, scheduled-job appearance, and
 process-lineage novelty after migration with no intervening append, plus the daemon veto. Focused
 seen-set verification: 36 tests, 36 pass.
+
+### 24.1 G3 confirmation rework (2026-10-06)
+
+Daybreak-blue reproduced the remaining fall-through by combining a lost-fold `lineage_mismatch`
+with a migration performed on a fast tick. The prior read-side check was below the non-valid
+seen-set returns, and the shared predicate recognized only migration-specific statuses; the full
+store could therefore authorize novelty and recovery. The rework moves migration evaluation before
+all seen-set status returns. When no usable set exists, the read compares the current quarantine
+episode with the family read's certified start and fails closed if the episode is newer or its
+marker is unreadable/pending/future. This preserves the ordinary full-store fallback only when the
+store is demonstrably from after the last quarantine.
+
+The shared `noveltyRuleEligible` predicate remains the producer/status/daemon gate. The TDD
+regression covers all three novelty families at candidate, `ruleEvaluations`, and daemon recovery
+levels, and a table-driven read test covers every ordinary non-valid seen-set status. Focused
+verification is 282/282. The fresh-XDG full suite is 2240 total, 2184 pass, 22 managed-sandbox
+environment failures, 34 skipped, 0 todo, with 0 product failures.

@@ -308,6 +308,16 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
   const migration = await migrateLegacyFactStore(paths, { now: latest });
   assert.equal(migration.status, "quarantined");
 
+  // Combine the migration with the other non-valid status that previously masked it. This models
+  // a lost fold write after the last committed pass: the set's ledger lineage is stale, while the
+  // migration marker also advanced on this fast tick.
+  for (const entry of families) {
+    const { file } = resolveSeenSetPaths(paths, entry.family);
+    const set = JSON.parse(await fs.readFile(file, "utf8"));
+    set.ledger_pass_id += 1;
+    await fs.writeFile(file, `${JSON.stringify(set)}\n`);
+  }
+
   for (const entry of families) {
     const read = await readFactPoints(paths, { family: entry.family, now: latest, windowMs: 31 * DAY, seenSetFamilies: [entry.family] });
     assert.equal(read.seen_sets[entry.family].status, "quarantine_epoch_mismatch", `${entry.family}: stale set is not valid after migration`);
@@ -329,7 +339,18 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
   // that alert active.
   await writeLearnedConfig(paths, { enabled: true });
   const fingerprint = "0123456789abcdef";
-  await writeAlertRecords(paths, [{ rule_id: SERVICE_APPEARED_RULE_ID, fingerprint, status: "active", severity: "warning", title: "t", summary: "t", first_seen: latest, last_seen: latest, diagnostics: {} }]);
+  const daemonAlerts = families.map((entry) => ({
+    rule_id: entry.ruleId,
+    fingerprint,
+    status: "active",
+    severity: "warning",
+    title: "t",
+    summary: "t",
+    first_seen: latest,
+    last_seen: latest,
+    diagnostics: {},
+  }));
+  await writeAlertRecords(paths, daemonAlerts);
   const daemon = await runDaemonIteration(paths, {
     profile: { interval_ms: 60000, collectors: {} },
     collectors: {},
@@ -339,15 +360,80 @@ test("G3 blocker: a non-structural migration epoch change invalidates all novelt
       candidates: [],
       evaluatedAlertKeys: [alertId(SERVICE_APPEARED_RULE_ID, fingerprint)],
     }),
+    computeScheduledJobBaselineCandidates: async () => ({
+      candidates: [],
+      evaluatedAlertKeys: [alertId(SCHEDULED_JOB_APPEARED_RULE_ID, fingerprint)],
+    }),
+    computeProcessLineageBaselineCandidates: async () => ({
+      candidates: [],
+      evaluatedAlertKeys: [alertId(PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, fingerprint)],
+    }),
   });
-  const alert = daemon.alerts.alerts.find((entry) => entry.rule_id === SERVICE_APPEARED_RULE_ID);
-  assert.equal(alert.status, "active", "the daemon veto freezes recovery on a stale migration epoch");
+  for (const entry of families) {
+    const alert = daemon.alerts.alerts.find((candidate) => candidate.rule_id === entry.ruleId);
+    assert.equal(alert.status, "active", `${entry.family}: daemon veto freezes recovery on a stale migration epoch`);
+  }
   assert.equal(daemon.status.novelty_seen_sets.service.status, "quarantine_epoch_mismatch");
 
   for (const entry of families) {
     await enforceFactRetention(paths, { family: entry.family, now: latest });
     const recertified = await readFactPoints(paths, { family: entry.family, now: latest, windowMs: 31 * DAY, seenSetFamilies: [entry.family] });
     assert.equal(recertified.seen_sets[entry.family].status, "valid", `${entry.family}: the next fold re-certifies the current epoch`);
+  }
+});
+
+test("G3 blocker audit: every ordinary non-valid seen-set status still honors a newer migration epoch before full-store fallback", async () => {
+  const statuses = ["missing", "unreadable", "invalid", "no_ledger", "pending_pass", "lineage_mismatch", "overflow"];
+  for (const expectedStatus of statuses) {
+    const paths = await tempPaths();
+    await appendFactPoints(paths, serviceTick(at(0), ["svc-A"]), { family: "service", now: at(0) });
+    const { factsRootDir } = resolveLegacyFactStorePaths(paths);
+    await fs.mkdir(factsRootDir, { recursive: true });
+    await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(1), "legacy-svc"))}\n`);
+    const migration = await migrateLegacyFactStore(paths, { now: at(2) });
+    assert.equal(migration.status, "quarantined");
+
+    const { file: seenSetFile } = resolveSeenSetPaths(paths, "service");
+    const { integrityFile } = resolveFactIntegrityPaths(paths, "service");
+    if (expectedStatus === "missing") {
+      await fs.unlink(seenSetFile);
+    } else if (expectedStatus === "unreadable") {
+      await fs.writeFile(seenSetFile, "{");
+    } else {
+      const set = JSON.parse(await fs.readFile(seenSetFile, "utf8"));
+      if (expectedStatus === "invalid") {
+        set.entries = [];
+      } else if (expectedStatus === "no_ledger") {
+        await fs.unlink(integrityFile);
+      } else if (expectedStatus === "pending_pass") {
+        const ledger = JSON.parse(await fs.readFile(integrityFile, "utf8"));
+        ledger.continuity.pending_pass = {
+          pass_id: ledger.continuity.last_committed_pass_id + 1,
+          corrupt_count: ledger.corrupt_dropped_total,
+          schema_invalid_count: ledger.schema_invalid_dropped_total,
+          bytecap_evicted_count: ledger.bytecap_evicted_total,
+          age_evicted_count: ledger.age_evicted_total,
+          output_record_count: ledger.continuity.last_rewrite_record_count,
+          output_newest_ts: ledger.continuity.last_rewrite_newest_ts,
+          output_bytes: ledger.continuity.last_rewrite_bytes,
+          output_digest: ledger.continuity.output_digest,
+          future_fact_count: ledger.future_fact_dropped_total,
+        };
+        await fs.writeFile(integrityFile, `${JSON.stringify(ledger)}\n`);
+      } else if (expectedStatus === "lineage_mismatch") {
+        set.ledger_pass_id += 1;
+      } else if (expectedStatus === "overflow") {
+        set.overflow = true;
+        set.entries = {};
+      }
+      if (expectedStatus !== "no_ledger" && expectedStatus !== "pending_pass") {
+        await fs.writeFile(seenSetFile, `${JSON.stringify(set)}\n`);
+      }
+    }
+
+    const read = await readFactPoints(paths, { family: "service", now: at(2), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
+    assert.equal(read.seen_sets.service.status, "quarantine_epoch_mismatch", `${expectedStatus} is not allowed to mask migration invalidation`);
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(2))), false, `${expectedStatus} cannot authorize full-store novelty fallback`);
   }
 });
 
