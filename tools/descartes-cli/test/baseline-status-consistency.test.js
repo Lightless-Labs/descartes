@@ -305,7 +305,7 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
     }
     // No structural tick for 4 h, then for 10 days: the latest complete census is older than 3 x the
     // interval. All eight rules stop on the same latest_census_stale gate and report no coverage.
-    for (const [hours, name] of [[39.5, "clean stale 4h"], [35 + 240, "clean stale 240h"]]) {
+    for (const [hours, name] of [[39, "clean stale 4h"], [35 + 240, "clean stale 240h"]]) {
       const stale = await checkpoint(paths, rig, iso(BASE_MS + hours * HOUR_MS), name);
       const rules = stale.domains.flatMap((domain) => domain.rules);
       for (const rule of rules) assert.ok(rule.reasons.includes("latest_census_stale"), `${name}: ${rule.rule_id} carries latest_census_stale (${rule.reasons})`);
