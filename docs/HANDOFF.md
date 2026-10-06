@@ -1,8 +1,14 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-06
 
-## Current continuity — fact-store capacity S6 built (per-rule `baseline status`, T11); not pushed or merged (2026-10-05)
+## Current continuity — S6 H1 freshness closure (2026-10-06)
+
+The S6 review H1 is closed on `feat/fact-store-capacity-2026-10`. `4fc0384` adds the red T11 stale-census expectations and a daemon-level active `session.count_drop` freeze regression; `d10243f` gives `session.count_drop`, `session.churn`, `peer.count_spike`, and `peer.count_drop` the same `activeFreshnessMs` gate as the census rules. A stale latest complete census now emits no stale-data candidates or `evaluatedAlertKeys`, so alerts freeze and never recover from dead census data. `evaluateSessionChurn` takes the evaluation clock, and baseline status receives the recorded structural interval for all eight census-dependent rules.
+
+Focused detector/daemon/T11 verification: 325 tests, 325 pass, 0 fail, 0 skipped. Full fresh-XDG suite after `d10243f`: 2238 tests, 2182 pass, 22 managed-sandbox failures, 34 skipped, 0 product failures. The 22 environment failures are 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. The prior red-test commit's two product failures were the intended stale-census assertions before the fix. No push or merge. Next: S8/G3.
+
+## Earlier continuity — fact-store capacity S6 built (per-rule `baseline status`, T11); not pushed or merged (2026-10-05)
 
 S6 is done on `feat/fact-store-capacity-2026-10` (plan §22). `48991a9`: the six watch-tier producers report a per-rule `ruleEvaluations` record from their own gates (no detection change). `5aa6276`: `baseline status`/`inspect` run those producers read-only with the daemon's options and report each rule's phase (`watching` exactly when the detector would evaluate), `not observed (no store)` for never-created stores, a per-family certified-history block, and the `cap_below_tick` / `budget_below_horizon_floor` / `history_horizon_short` / `retention_failing` reasons; T11 compares status against a real daemon fast tick per rule over seven scenarios, and a Leg E regression is red on the old status. Full suite (fresh scratch `XDG_*`): 2232 tests, 2198 pass, 0 fail, 34 skipped.
 
