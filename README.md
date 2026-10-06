@@ -274,6 +274,14 @@ descartes alerts intelligence enable --max-per-hour 3
 descartes alerts notifications setup --channel desktop
 ```
 
+Ordinary alert delivery is episode-based: a newly active alert notifies once, a persistent alert
+stays quiet, and only an escalation above the highest severity already notified in that episode
+notifies again. De-escalation is silent. Recovery rearms the alert for one notification on its next
+activation, and an acknowledgement does not suppress a later severity escalation. Episode state is
+stored with each alert record; the retired 15-minute re-notification cooldown is retained only as a
+legacy compatibility field. The `adjudication.budget_exhausted` meta-signal is separate and keeps
+its own one-hour notification window.
+
 ## Self-learning and defensive detection (watch by default, author opt-in)
 
 Structural watching is on by default. It uses `watch.json` and can do these things:

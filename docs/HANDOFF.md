@@ -1,6 +1,19 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-05 (evening)
+**Last updated:** 2026-10-06
+
+## R3 notify-once delivery policy — 2026-10-06
+
+On branch `feat/notify-once-2026-10`, the operator-accepted R3 delivery change is implemented
+locally: ordinary alerts persist episode start, highest notified severity, and episode notification
+timestamps; delivery occurs on activation and severity escalation only, rearms after recovery, and
+allows escalation after acknowledgement. Existing active records with `last_notified` are read as
+already notified for their current episode. Deterministic session/peer/local delivery consumes the
+same episode-qualified `notification_due_ids`. `budget_exhausted` remains a separate hourly
+meta-signal. Focused alert-store + alert-intelligence tests are green (158/158). Fresh-XDG full
+`npm test`: **2151 total / 2095 pass / 22 sandbox or live-host failures / 34 skip**; the failures
+are the known 20 loopback `listen EPERM` tests plus 2 live macOS provenance checks returning
+`unknown` instead of `ok`, with no changed-behavior failures. No push or merge.
 
 ## Review-fix update — 2026-10-05
 
