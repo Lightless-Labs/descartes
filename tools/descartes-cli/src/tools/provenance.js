@@ -65,8 +65,12 @@ async function runFixedExecFile(command, args, options = {}) {
   return {
     ...result,
     status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
-    stdout: truncate(result.stdout ?? ""),
-    stderr: truncate(result.stderr ?? ""),
+    // The process-table snapshot is deliberately allowed to use its full bounded maxBuffer.
+    // Truncating every command to the normal 2 KiB diagnostic ceiling can remove the target PID
+    // from a live macOS `ps -axo` listing, turning a resolvable process into a fabricated
+    // "not found or permission limited" result.
+    stdout: truncate(result.stdout ?? "", options.stdoutMax ?? 2048),
+    stderr: truncate(result.stderr ?? "", options.stderrMax ?? 2048),
   };
 }
 
@@ -624,7 +628,11 @@ async function resolveCodesignInfo(executablePath) {
 async function resolvePidCore(pid) {
   // A busy host's full process table (unbounded args, every process) can exceed 1MB; bound
   // generously rather than silently truncating the snapshot the target pid needs to be found in.
-  const psResult = await runFixedExecFile("ps", provenancePsArgsForPlatform(), { timeout: 3000, maxBuffer: 8 * 1024 * 1024 });
+  const psResult = await runFixedExecFile("ps", provenancePsArgsForPlatform(), {
+    timeout: 3000,
+    maxBuffer: 8 * 1024 * 1024,
+    stdoutMax: 8 * 1024 * 1024,
+  });
   const processes = psResult.status === "ok" ? parseProvenancePs(psResult.stdout) : [];
   const target = processes.find((item) => item.pid === pid);
 
