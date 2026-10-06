@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-10-06
 
-## R3 notify-once delivery policy — 2026-10-06 — daybreak rework in progress
+## R3 notify-once delivery policy — 2026-10-06 — complete locally
 
 On branch `feat/notify-once-2026-10`, this rework removes generic material-evidence episode
 inference and all ignore lists. Episodes are `(alert id, incident_key ?? "default")`, with keys
@@ -17,8 +17,12 @@ delivery, and applies 1m→1h exponential failure backoff with coalesced failure
 timeout skips alert persistence and is written into daemon status. README documents the producer
 identity policy and the default-key audit.
 
-Focused tests and the fresh-XDG full suite are still pending after the implementation changes. No
-push or merge.
+Focused changed suites pass 186/186; the producer/lock subset passes 112/112. Fresh-XDG `npm test`
+passes 2109/2165, with 22 pre-existing sandbox/live-host failures and 34 skips: 20 loopback
+`listen EPERM` cases in notifier-reuse/tap-bump, and 2 live-process provenance checks returning
+`unknown` instead of `ok`. No changed-behavior test failed. Local commits are `77b0d1d`
+(`Define producer-owned alert episodes`) and `f852fca` (`Bound notification delivery persistence`);
+neither was pushed or merged.
 
 ## Review-fix update — 2026-10-05
 
