@@ -4,8 +4,9 @@
 
 ## R3 notify-once delivery policy — 2026-10-06 — daybreak rework complete
 
-On branch `feat/notify-once-2026-10`, the daybreak-blue findings are fixed locally in six
-small commits (`b4c239e`, `24ae174`, `86576d7`, `edfc7ba`, `0f46dce`, `6e1b777`):
+On branch `feat/notify-once-2026-10`, the daybreak-blue findings are fixed locally in the
+finding commits (`b4c239e`, `24ae174`, `86576d7`, `edfc7ba`, `0f46dce`, `6e1b777`) plus the
+delivery-audit reconciliation follow-up (`965e20c`):
 
 - episode notification fields are committed only by a post-delivery, alert-store-locked
   confirmation; failed, unavailable, skipped, thrown, timed-out, and budget-rejected work stays due;
