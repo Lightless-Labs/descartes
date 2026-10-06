@@ -104,7 +104,9 @@ export async function ownerIsProvablyGone(owner, options = {}) {
 function singletonBusyError(file, owner, reason = "already owned") {
   const ownerText = owner ? ` (pid ${owner.pid}, nonce ${owner.nonce})` : " (owner metadata is unreadable)";
   const clear = `Stop the owner if it is running, then remove ${file} only after verifying that no Descartes daemon remains.`;
-  return new Error(`Descartes daemon singleton is ${reason}${ownerText}. ${clear}`);
+  const error = new Error(`Descartes daemon singleton is ${reason}${ownerText}. ${clear}`);
+  error.code = "DAEMON_SINGLETON_BUSY";
+  return error;
 }
 
 async function sleepMonotonic(ms) {
@@ -159,7 +161,9 @@ export async function acquireDaemonSingleton(descartesPaths, options = {}) {
         throw singletonBusyError(file, existing, existing?.process_start_identity ? "already owned" : "cannot prove the owner is gone");
       }
       if (monotonicNow() - started >= timeoutMs) {
-        throw new Error(`Descartes daemon singleton acquisition timed out after ${timeoutMs}ms (monotonic deadline); ${file} remains untouched.`);
+        const timeout = new Error(`Descartes daemon singleton acquisition timed out after ${timeoutMs}ms (monotonic deadline); ${file} remains untouched.`);
+        timeout.code = "DAEMON_SINGLETON_BUSY";
+        throw timeout;
       }
       await sleepMonotonic(retryMs);
     }

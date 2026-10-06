@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS,
   defaultNotificationChannel,
   deliverNotificationDecision,
   normalizeNotificationPayload,
@@ -282,4 +283,27 @@ test("native macOS helper resolution reports invalid configured helpers as unava
   });
   assert.equal(record.status, "unavailable");
   assert.match(record.reason, /not an executable file/);
+});
+
+test("delivery audit rotates every row type and retains a summary", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(auditFile), { recursive: true });
+  const seed = Array.from({ length: MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS }, (_, index) => JSON.stringify({
+    ts: new Date(Date.UTC(2026, 9, 6, 0, 0, index)).toISOString(),
+    status: index % 2 === 0 ? "delivered" : "cli_only",
+    channel: "cli",
+    payload: { title: `Alert ${index}`, body: "Body" },
+  })).join("\n");
+  await fs.writeFile(auditFile, `${seed}\n`);
+  await deliverNotificationDecision(paths, { notify: true, title: "Alert newest", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-06T00:20:00.000Z",
+  });
+  const audit = await readNotificationDeliveryAudit(paths);
+  assert.equal(audit.length, MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS);
+  assert.equal(audit[0].status, "summary");
+  assert.equal(audit[0].reason, "audit_rotation");
+  assert.equal(audit[0].dropped_count, 2);
+  assert.equal(audit.at(-1).payload.title, "Alert newest");
 });

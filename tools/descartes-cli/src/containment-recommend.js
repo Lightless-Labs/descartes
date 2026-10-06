@@ -368,6 +368,9 @@ export async function computeContainmentRecommendationCandidates(descartesPaths,
       id: alertId(recommendation.rule_id, fingerprint),
       rule_id: recommendation.rule_id,
       fingerprint,
+      // Recommendations inherit the triggering incident. Consecutive incidents under one
+      // trigger alert therefore create distinct recommendation notifications too.
+      incident_key: alert.current_incident_key ?? alert.incident_key ?? "default",
       severity: "warning",
       title: `Descartes containment recommendation: ${recommendation.verb}`,
       summary: `RECOMMEND-ONLY: consider ${recommendation.verb}. Descartes will not act on this.`,

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { alertEpisodeKey, claimAlertDelivery, confirmAlertDelivery, recordAlertAdjudication, recordAlertDeliveryFailure } from "./alert-store.js";
+import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -85,7 +85,7 @@ async function confirmDeliveryIfPossible(descartesPaths, alert, delivery, option
       now: options.now,
       severity: alert.severity,
       episodeKey: options.episodeKey ?? alertEpisodeKey(alert),
-      claimantId: options.claimantId,
+      incidentKey: options.incidentKey ?? alertEpisodeKey(alert),
     });
     return true;
   } catch (error) {
@@ -100,26 +100,31 @@ async function recordDeliveryFailureIfPossible(descartesPaths, alert, options) {
       now: options.now,
       reason: options.reason,
       episodeKey: options.episodeKey ?? alertEpisodeKey(alert),
-      claimantId: options.claimantId,
+      incidentKey: options.incidentKey ?? alertEpisodeKey(alert),
     });
   } catch (error) {
     console.warn(`descartes: delivery failure status update failed for alert ${alert.id}: ${error?.message ?? error}`);
   }
 }
 
-async function claimDeliveryIfPossible(descartesPaths, alert, options) {
-  // Pure unit callers may intentionally provide no filesystem paths; the daemon and CLI always
-  // pass resolved Descartes paths, where claimAlertDelivery performs the locked persistence.
-  if (!descartesPaths?.stateDir) return { claimed: true, persisted: false, claimant_id: undefined, episode_key: alertEpisodeKey(alert) };
-  try {
-    return await claimAlertDelivery(descartesPaths, alert.id, {
-      now: options.now,
-      episodeKey: alertEpisodeKey(alert),
-    });
-  } catch (error) {
-    console.warn(`descartes: delivery claim failed for alert ${alert.id}: ${error?.message ?? error}`);
-    return { claimed: false, reason: "claim_failed" };
-  }
+async function deliveryStillDue(descartesPaths, alert, now) {
+  if (!descartesPaths?.stateDir) return true;
+  const current = (await readAlertRecords(descartesPaths)).find((entry) => entry.id === alert.id);
+  // Pure/unit callers may intentionally provide an evaluation without a persisted alert record.
+  // The daemon path always has one; only a persisted record can prove that a stale evaluation was
+  // already delivered.
+  if (!current) return true;
+  if (["recovered", "suppressed"].includes(current.status)) return false;
+  const key = alertEpisodeKey(alert);
+  const currentRank = alertSeverityRank(current.severity);
+  const notifiedRank = alertSeverityRank(current.notified_severity_max);
+  if (current.notified_incident_keys?.includes(key) && currentRank <= notifiedRank) return false;
+  const nowMs = new Date(now).getTime();
+  const lastAttemptMs = current.last_attempt_at ? new Date(current.last_attempt_at).getTime() : NaN;
+  if (Number.isFinite(lastAttemptMs) && lastAttemptMs <= nowMs && Number.isFinite(current.backoff_delay_ms)
+    && nowMs < lastAttemptMs + current.backoff_delay_ms && !current.notified_incident_keys?.includes(key)
+    && currentRank <= notifiedRank) return false;
+  return true;
 }
 
 // S13 must-fix 2: a critical-severity call is guaranteed a slot out of max_calls_per_hour so a
@@ -626,11 +631,10 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   const failed = [];
   for (const alert of dueSessionAlerts) {
     const decision = buildSessionAlertNotificationDecision(alert);
-    let claim;
     try {
-      claim = await claimDeliveryIfPossible(descartesPaths, alert, { now });
-      if (!claim.claimed) continue;
-      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey: claim.episode_key });
+      if (!(await deliveryStillDue(descartesPaths, alert, now))) continue;
+      const episodeKey = alertEpisodeKey(alert);
+      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       // daybreak-blue #6 (MEDIUM): deliverNotificationDecision RESOLVES (it never throws) with a
       // status enum -- "error"/"unavailable" mean the notification did NOT reach the operator, and
       // must not be reported as fired. Every other resolved status ("recorded"/"delivered"/
@@ -639,16 +643,16 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       // and stays `fired`, matching this function's pre-existing "only a throw means failed"
       // contract for those.
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
-        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey: claim.episode_key, claimantId: claim.claimant_id });
+        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
         failed.push(alert.id);
       } else {
-        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey: claim.episode_key, claimantId: claim.claimant_id });
+        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
         fired.push(alert.id);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
-      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey: claim?.episode_key, claimantId: claim?.claimant_id });
+      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey: alertEpisodeKey(alert) });
       failed.push(alert.id);
     }
   }
@@ -946,23 +950,22 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
       title: alert.title,
       body: alert.summary || alert.title,
     };
-    let claim;
     try {
-      claim = await claimDeliveryIfPossible(descartesPaths, alert, { now });
-      if (!claim.claimed) continue;
-      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey: claim.episode_key });
+      if (!(await deliveryStillDue(descartesPaths, alert, now))) continue;
+      const episodeKey = alertEpisodeKey(alert);
+      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
-        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey: claim.episode_key, claimantId: claim.claimant_id });
+        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
         failed.push(alert.id);
       }
       else {
-        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey: claim.episode_key, claimantId: claim.claimant_id });
+        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
         fired.push(alert.id);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
-      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey: claim?.episode_key, claimantId: claim?.claimant_id });
+      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey: alertEpisodeKey(alert) });
       failed.push(alert.id);
     }
   }
@@ -1445,7 +1448,6 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
       let promptText;
       let appended;
       let deliveryAttempted = false;
-      let deliveryClaim;
       // F5 fix: read directly off the (possibly un-normalized) config, not a normalized variable --
       // see resolveModelDeadlineMs's doc comment.
       const deadlineMs = resolveModelDeadlineMs(config.model_deadline_ms);
@@ -1585,16 +1587,16 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
         let delivery;
         if (decision.notify) {
-          deliveryClaim = await claimDeliveryIfPossible(descartesPaths, alert, { now });
-          if (!deliveryClaim.claimed) throw new Error("delivery_claim_unavailable");
+          if (!(await deliveryStillDue(descartesPaths, alert, now))) throw new Error("delivery_no_longer_due");
           deliveryAttempted = true;
-          delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey: deliveryClaim.episode_key });
+          const episodeKey = alertEpisodeKey(alert);
+          delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
         }
         if (decision.notify) {
           if (!deliveryWasSuccessful(delivery)) {
-            await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey: deliveryClaim.episode_key, claimantId: deliveryClaim.claimant_id });
+            await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey: alertEpisodeKey(alert) });
           }
-          await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey: deliveryClaim.episode_key, claimantId: deliveryClaim.claimant_id });
+          await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey: alertEpisodeKey(alert), incidentKey: alertEpisodeKey(alert) });
         }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
@@ -1631,8 +1633,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           await recordDeliveryFailureIfPossible(descartesPaths, alert, {
             now,
             reason: error instanceof Error ? error.message : String(error),
-            episodeKey: deliveryClaim?.episode_key,
-            claimantId: deliveryClaim?.claimant_id,
+            episodeKey: alertEpisodeKey(alert),
           });
         }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {

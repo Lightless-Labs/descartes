@@ -4,7 +4,8 @@ import {
   readAlertIntelligenceConfig,
   writeAlertIntelligenceConfig,
 } from "./alert-intelligence.js";
-import { acknowledgeAlert, evaluateAlerts, fixedAlertIds, readAlertRecords } from "./alert-store.js";
+import { evaluateAlerts, fixedAlertIds, readAlertRecords } from "./alert-store.js";
+import { queueOrApplyAlertCommand } from "./alert-command-queue.js";
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
@@ -296,9 +297,14 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
   }
 
   if (options.subcommand === "ack") {
-    const alert = await acknowledgeAlert(descartesPaths, options.alertId);
-    if (options.json) output(JSON.stringify({ alert }, null, 2));
-    else output(`Acknowledged ${alert.id}: ${alert.title}`);
+    const result = await queueOrApplyAlertCommand(descartesPaths, { type: "ack", alert_id: options.alertId });
+    if (result.queued) {
+      if (options.json) output(JSON.stringify({ queued: true, alert_id: options.alertId }, null, 2));
+      else output(`Queued acknowledgement for ${options.alertId}; the daemon will apply it on its next tick.`);
+      return;
+    }
+    if (options.json) output(JSON.stringify({ alert: result.alert }, null, 2));
+    else output(`Acknowledged ${result.alert.id}: ${result.alert.title}`);
     return;
   }
 

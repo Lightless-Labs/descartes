@@ -128,7 +128,10 @@ test("first sight of a present path (no prior baseline) seeds silently -- no tri
 test("an mtime advance on an established path fires mtime_changed exactly once; a second unchanged tick does not re-fire", () => {
   const previous = { [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 } };
   const first = detectCredentialAccess(previous, [okEntry({ mtime: 3000 })]);
-  assert.deepEqual(first.findings, [{ category: "ssh_private_key", path_hash: PATH_HASH_A, trip_reason: "mtime_changed" }]);
+  assert.equal(first.findings[0].category, "ssh_private_key");
+  assert.equal(first.findings[0].path_hash, PATH_HASH_A);
+  assert.equal(first.findings[0].trip_reason, "mtime_changed");
+  assert.match(first.findings[0].change_identity, /^[0-9a-f]{16}$/);
 
   // The baseline advanced unconditionally -- comparing the SAME (now-current) stat again does not
   // re-fire (edge-triggered).
@@ -139,7 +142,10 @@ test("an mtime advance on an established path fires mtime_changed exactly once; 
 test("an ino change (file replaced) fires ino_changed", () => {
   const previous = { [PATH_HASH_A]: { atime: 1000, mtime: 2000, ino: 42 } };
   const { findings } = detectCredentialAccess(previous, [okEntry({ mtime: 2000, ino: 99 })]);
-  assert.deepEqual(findings, [{ category: "ssh_private_key", path_hash: PATH_HASH_A, trip_reason: "ino_changed" }]);
+  assert.equal(findings[0].category, "ssh_private_key");
+  assert.equal(findings[0].path_hash, PATH_HASH_A);
+  assert.equal(findings[0].trip_reason, "ino_changed");
+  assert.match(findings[0].change_identity, /^[0-9a-f]{16}$/);
 });
 
 test("[O7] atime is disabled for every v1 entry: an atime advance alone (mtime/ino unchanged) never fires, because a real v1 entry's watch list is always ['mtime','ino'] — an injected fixture with watch:['atime'] IS the only way to reach that branch, proving it exists but is unreachable via any real v1 path", () => {
@@ -170,7 +176,10 @@ test("invalid current entries are skipped without firing or corrupting the retai
     { ...okEntry({ pathHash: PATH_HASH_A, mtime: Number.NaN }), category: "prod-db.example.com" },
     okEntry({ pathHash: PATH_HASH_B, mtime: 4000, ino: 43 }),
   ]);
-  assert.deepEqual(result.findings, [{ category: "ssh_private_key", path_hash: PATH_HASH_B, trip_reason: "mtime_changed" }]);
+  assert.equal(result.findings[0].category, "ssh_private_key");
+  assert.equal(result.findings[0].path_hash, PATH_HASH_B);
+  assert.equal(result.findings[0].trip_reason, "mtime_changed");
+  assert.match(result.findings[0].change_identity, /^[0-9a-f]{16}$/);
   assert.deepEqual(result.nextEntries[PATH_HASH_A], previous[PATH_HASH_A]);
   assert.deepEqual(result.nextEntries[PATH_HASH_B], { atime: 1000, mtime: 4000, ino: 43 });
 });
@@ -188,11 +197,12 @@ test("garbled current path hash/category/watch/stat entries neither fire nor ent
 });
 
 test("buildCredentialAccessCandidates: severity is ALWAYS 'warning', fingerprint/id are hashed, diagnostics carry only category/trip_reason/path_hash -- never a literal path", () => {
-  const candidate = buildCredentialAccessCandidates([{ category: "aws_credentials", path_hash: PATH_HASH_A, trip_reason: "mtime_changed" }])[0];
+  const candidate = buildCredentialAccessCandidates([{ category: "aws_credentials", path_hash: PATH_HASH_A, trip_reason: "mtime_changed", change_identity: "fedcba9876543210" }])[0];
   assert.equal(candidate.rule_id, CREDENTIAL_ACCESS_RULE_ID);
   assert.equal(candidate.severity, "warning");
   assert.equal(candidate.fingerprint, expectedHash(PATH_HASH_A));
   assert.deepEqual(candidate.diagnostics, { category: "aws_credentials", trip_reason: "mtime_changed", path_hash: PATH_HASH_A });
+  assert.match(candidate.incident_key, /^credential:[0-9a-f]{16}:[0-9a-f]{16}$/);
   // Honest-claim wording lives in alert-intelligence.js's notification branch; the candidate
   // title/summary here must not claim a "read"/"access" either.
   assert.equal(/access|read/i.test(candidate.title + candidate.summary), false, "must not claim to detect a read/access — only a change");

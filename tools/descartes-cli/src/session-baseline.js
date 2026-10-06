@@ -696,6 +696,9 @@ export function buildChurnCandidates(churnEntries = []) {
       id: alertId(SESSION_CHURN_RULE_ID, entry.entity_key),
       rule_id: SESSION_CHURN_RULE_ID,
       fingerprint: entry.entity_key,
+      // The transition, not the stable session identity, is the incident. This lets A→B→C
+      // remain two distinct notifications under the same alert id.
+      incident_key: `churn:${entry.entity_key}:${entry.prior_fingerprint}:${entry.current_fingerprint}`,
       severity: "warning",
       title: "Session churn detected",
       summary: "A tracked session's creation fingerprint changed between observations (possible kill-then-resurrect).",

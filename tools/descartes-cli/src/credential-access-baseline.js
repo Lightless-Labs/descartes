@@ -186,7 +186,10 @@ export function detectCredentialAccess(previousEntries = {}, latestSnapshot = []
       evaluatedPathHashes.push(pathHash);
       const tripReason = computeStatDiffTripReason(previous, latest, Array.isArray(entry.watch) ? entry.watch : []);
       if (tripReason) {
-        findings.push({ category: entry.category, path_hash: pathHash, trip_reason: tripReason });
+        const changeIdentity = crypto.createHash("sha256")
+          .update(`${pathHash}\0${latest.mtime}\0${latest.ino}\0${latest.atime}`)
+          .digest("hex").slice(0, 16);
+        findings.push({ category: entry.category, path_hash: pathHash, trip_reason: tripReason, change_identity: changeIdentity });
       }
     }
     nextEntries[pathHash] = latest;
@@ -215,6 +218,7 @@ export function buildCredentialAccessCandidates(entries = []) {
       id: alertId(CREDENTIAL_ACCESS_RULE_ID, fingerprint),
       rule_id: CREDENTIAL_ACCESS_RULE_ID,
       fingerprint,
+      incident_key: `credential:${entry.path_hash}:${entry.change_identity ?? entry.trip_reason}`,
       severity: "warning",
       // Honest-claim wording (plan Slice D): mtime/ino evidence proves a REWRITE or REPLACE, not
       // a read — a genuine credential READ leaves mtime untouched, and atime is disabled for

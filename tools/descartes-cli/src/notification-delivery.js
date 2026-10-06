@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -239,38 +240,59 @@ function commandForPayload(channel, payload, options = {}) {
   return { unavailable: `Unsupported notification channel: ${channel}` };
 }
 
+export const MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS = 1000;
+const deliveryAuditCache = new Map();
+
 async function appendDeliveryAudit(descartesPaths, record) {
   const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
   await ensureParent(auditFile);
-  const failure = ["error", "unavailable", "disabled"].includes(record.status);
-  if (failure) {
-    let lines = [];
+  let records = deliveryAuditCache.get(auditFile);
+  if (!records) {
+    records = [];
     try {
-      lines = (await fs.readFile(auditFile, "utf8")).split("\n").filter(Boolean);
+      records = (await fs.readFile(auditFile, "utf8")).split("\n").filter(Boolean).map((line) => {
+        try { return JSON.parse(line); } catch { return undefined; }
+      }).filter(Boolean);
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
-    const previous = lines.length > 0 ? (() => { try { return JSON.parse(lines.at(-1)); } catch { return undefined; } })() : undefined;
-    const sameFailure = previous && previous.status === record.status
-      && previous.channel === record.channel
-      && previous.reason === record.reason
-      && JSON.stringify(previous.payload ?? {}) === JSON.stringify(record.payload ?? {});
-    if (sameFailure) {
-      const coalesced = { ...previous, last_ts: record.ts, repeat_count: (previous.repeat_count ?? 1) + 1 };
-      lines[lines.length - 1] = JSON.stringify(coalesced);
-      const tmp = `${auditFile}.${process.pid}.${Date.now()}.tmp`;
-      await fs.writeFile(tmp, `${lines.slice(-1000).join("\n")}\n`, { mode: 0o600 });
-      await fs.rename(tmp, auditFile);
-      return coalesced;
-    }
-    lines.push(JSON.stringify(record));
-    const tmp = `${auditFile}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(tmp, `${lines.slice(-1000).join("\n")}\n`, { mode: 0o600 });
-    await fs.rename(tmp, auditFile);
-    return record;
+    deliveryAuditCache.set(auditFile, records);
   }
-  await fs.appendFile(auditFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  return record;
+  const previous = records.at(-1);
+  const failure = ["error", "unavailable", "disabled"].includes(record.status);
+  const sameFailure = failure && previous && previous.status === record.status
+    && previous.channel === record.channel
+    && previous.reason === record.reason
+    && JSON.stringify(previous.payload ?? {}) === JSON.stringify(record.payload ?? {});
+  const next = sameFailure
+    ? { ...previous, last_ts: record.ts, repeat_count: (previous.repeat_count ?? 1) + 1 }
+    : record;
+  if (sameFailure) records[records.length - 1] = next;
+  else records.push(next);
+  if (records.length > MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS) {
+    const hasSummary = records[0]?.status === "summary";
+    const previousSummary = hasSummary ? records[0] : undefined;
+    const rawRecords = hasSummary ? records.slice(1) : records;
+    const dropCount = rawRecords.length - (MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS - 1);
+    const dropped = rawRecords.slice(0, dropCount);
+    records = [{
+      ts: record.ts,
+      status: "summary",
+      reason: "audit_rotation",
+      dropped_count: (previousSummary?.dropped_count ?? 0) + dropped.length,
+      first_dropped_ts: dropped[0]?.ts,
+      last_dropped_ts: dropped.at(-1)?.last_ts ?? dropped.at(-1)?.ts,
+    }, ...rawRecords.slice(dropCount)];
+  }
+  deliveryAuditCache.set(auditFile, records);
+  if (!sameFailure && records.length <= MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS && records[0]?.status !== "summary") {
+    await fs.appendFile(auditFile, `${JSON.stringify(next)}\n`, { mode: 0o600 });
+    return next;
+  }
+  const tmp = `${auditFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tmp, `${records.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
+  await fs.rename(tmp, auditFile);
+  return next;
 }
 
 export async function readNotificationDeliveryAudit(descartesPaths) {

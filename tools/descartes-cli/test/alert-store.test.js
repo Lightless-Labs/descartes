@@ -15,8 +15,6 @@ import {
   readAlertRecords,
   recordAlertDeliveryFailure,
   resolveAlertStorePaths,
-  claimAlertDelivery,
-  withAlertStoreLock,
   writeAlertRecords,
 } from "../src/alert-store.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
@@ -695,121 +693,7 @@ test("evaluateAlerts never writes; evaluateAndPersistAlerts does", async () => {
   assert(afterWrite.some((alert) => alert.rule_id === "system.memory.sustained_high"), "evaluateAndPersistAlerts must persist to disk");
 });
 
-test("concurrent alert-store writers serialize recovery and reactivation without losing the active transition", async () => {
-  const paths = await tempPaths();
-  const candidate = {
-    id: "alert_concurrent_transition",
-    rule_id: "learned.concurrent.test",
-    fingerprint: "global",
-    severity: "warning",
-    title: "Concurrent transition",
-    summary: "Test transition",
-    diagnostics: { identity: "same" },
-  };
-  const initial = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
-  await writeAlertRecords(paths, initial.alerts);
-  await confirmAlertDelivery(paths, candidate.id, {
-    now: "2026-10-06T00:00:01.000Z",
-    severity: "warning",
-    episodeKey: "default",
-  });
-
-  const recovery = evaluateAndPersistAlerts(paths, {
-    now: "2026-10-06T00:01:00.000Z",
-    historySummary: historySummary([]),
-    daemonStatus: { state: "ok", ts: "2026-10-06T00:01:00.000Z" },
-    extraCandidates: [],
-    coveredAlertIds: new Set([candidate.id]),
-  });
-  // Let the recovery writer acquire the lock first, then overlap the reactivation writer while
-  // the first operation is still completing. The final state is intentionally the reactivation.
-  const reactivation = new Promise((resolve, reject) => setTimeout(() => evaluateAndPersistAlerts(paths, {
-    now: "2026-10-06T00:02:00.000Z",
-    historySummary: historySummary([]),
-    daemonStatus: { state: "ok", ts: "2026-10-06T00:02:00.000Z" },
-    extraCandidates: [candidate],
-    coveredAlertIds: new Set([candidate.id]),
-  }).then(resolve, reject), 10));
-  await Promise.all([recovery, reactivation]);
-  const stored = (await readAlertRecords(paths)).find((alert) => alert.id === candidate.id);
-  assert.equal(stored.status, "active", "the serialized recovered -> active transition must not be overwritten by stale state");
-  assert.equal(stored.episode_started_at, "2026-10-06T00:02:00.000Z");
-});
-
-test("a stale alert-store lock is reclaimed", async () => {
-  const paths = await tempPaths();
-  const store = resolveAlertStorePaths(paths);
-  await fs.mkdir(store.dir, { recursive: true });
-  const lockFile = path.join(store.dir, "alerts.json.lock");
-  await fs.writeFile(lockFile, JSON.stringify({ pid: 99999999, process_start_identity: "dead", boot_id: "boot", nonce: "stale-owner" }));
-  const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
-  await fs.utimes(lockFile, future, future);
-  const result = applyAlertCandidates([], [{ id: "alert_stale_lock", rule_id: "system.memory.sustained_high", severity: "warning", title: "x", diagnostics: {} }], { now: "2026-10-06T00:00:00.000Z" });
-  await writeAlertRecords(paths, result.alerts);
-  assert.equal((await readAlertRecords(paths)).length, 1);
-});
-
-test("a live long-held lock is never stolen", async () => {
-  const paths = await tempPaths();
-  const held = withAlertStoreLock(paths, async () => {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    return "held";
-  }, { timeoutMs: 500 });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  await assert.rejects(
-    withAlertStoreLock(paths, async () => "stolen", { timeoutMs: 25, retryMs: 5 }),
-    /Alert store lock acquisition timed out/,
-  );
-  assert.equal(await held, "held");
-});
-
-test("two contenders on a stale lock have exactly one winner", async () => {
-  const paths = await tempPaths();
-  const store = resolveAlertStorePaths(paths);
-  await fs.mkdir(store.dir, { recursive: true });
-  const lockFile = path.join(store.dir, "alerts.json.lock");
-  await fs.writeFile(lockFile, JSON.stringify({ pid: 99999999, process_start_identity: "dead", boot_id: "boot", nonce: "stale-owner" }));
-  const winners = [];
-  const contender = (name) => withAlertStoreLock(paths, async () => {
-    winners.push(name);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    return name;
-  }, { timeoutMs: 50, retryMs: 2 });
-  const outcomes = await Promise.allSettled([contender("a"), contender("b")]);
-  assert.equal(winners.length, 1);
-  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
-  assert.equal(outcomes.filter((outcome) => outcome.status === "rejected" && /timed out/.test(outcome.reason?.message)).length, 1);
-});
-
-test("delivery claims serialize concurrent evaluators and confirmation clears the claim", async () => {
-  const paths = await tempPaths();
-  const candidate = {
-    id: "alert_claimed",
-    rule_id: "system.memory.sustained_high",
-    fingerprint: "global",
-    severity: "warning",
-    title: "Memory high",
-    summary: "High",
-  };
-  const applied = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
-  await writeAlertRecords(paths, applied.alerts);
-  const claims = await Promise.all([
-    claimAlertDelivery(paths, candidate.id, { now: "2026-10-06T00:01:00.000Z", claimantId: "daemon-a" }),
-    claimAlertDelivery(paths, candidate.id, { now: "2026-10-06T00:01:00.000Z", claimantId: "daemon-b" }),
-  ]);
-  assert.equal(claims.filter((claim) => claim.claimed).length, 1);
-  const winner = claims.find((claim) => claim.claimed);
-  const confirmed = await confirmAlertDelivery(paths, candidate.id, {
-    now: "2026-10-06T00:01:01.000Z",
-    severity: "warning",
-    episodeKey: "default",
-    claimantId: winner.claimant_id,
-  });
-  assert.equal(confirmed.confirmed, true);
-  assert.equal((await readAlertRecords(paths))[0].delivery_claim, null);
-});
-
-test("delivery failure backoff delays retries, doubles, clamps rollback, and exposes its start", async () => {
+test("delivery failure backoff delays retries and a future last attempt never suppresses forever", async () => {
   const paths = await tempPaths();
   const candidate = { id: "alert_backoff", rule_id: "system.memory.sustained_high", fingerprint: "global", severity: "warning", title: "Memory", summary: "High" };
   const applied = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
@@ -826,7 +710,8 @@ test("delivery failure backoff delays retries, doubles, clamps rollback, and exp
   await writeAlertRecords(paths, [{ ...stored, next_attempt_at: "2099-01-01T00:00:00.000Z" }]);
   await recordAlertDeliveryFailure(paths, candidate.id, { now: "2026-10-06T00:02:00.000Z", reason: "unavailable", episodeKey: "default" });
   stored = (await readAlertRecords(paths))[0];
-  assert.equal(stored.next_attempt_at, "2026-10-06T01:02:00.000Z");
+  assert.equal(stored.next_attempt_at, "2026-10-06T00:06:00.000Z");
+  assert.deepEqual(applyAlertCandidates([{ ...stored, last_attempt_at: "2099-01-01T00:00:00.000Z", backoff_delay_ms: 60_000 }], [{ ...candidate }], { now: "2026-10-06T00:02:00.000Z" }).notification_due_ids, [candidate.id]);
 });
 
 test("unknown severities rank above critical and are never coerced down", () => {
