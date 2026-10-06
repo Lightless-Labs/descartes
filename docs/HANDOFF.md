@@ -2,18 +2,32 @@
 
 **Last updated:** 2026-10-06
 
-## R3 notify-once delivery policy — 2026-10-06
+## R3 notify-once delivery policy — 2026-10-06 — daybreak rework complete
 
-On branch `feat/notify-once-2026-10`, the operator-accepted R3 delivery change is implemented
-locally: ordinary alerts persist episode start, highest notified severity, and episode notification
-timestamps; delivery occurs on activation and severity escalation only, rearms after recovery, and
-allows escalation after acknowledgement. Existing active records with `last_notified` are read as
-already notified for their current episode. Deterministic session/peer/local delivery consumes the
-same episode-qualified `notification_due_ids`. `budget_exhausted` remains a separate hourly
-meta-signal. Focused alert-store + alert-intelligence tests are green (158/158). Fresh-XDG full
-`npm test`: **2151 total / 2095 pass / 22 sandbox or live-host failures / 34 skip**; the failures
-are the known 20 loopback `listen EPERM` tests plus 2 live macOS provenance checks returning
-`unknown` instead of `ok`, with no changed-behavior failures. No push or merge.
+On branch `feat/notify-once-2026-10`, the daybreak-blue findings are fixed locally in six
+small commits (`b4c239e`, `24ae174`, `86576d7`, `edfc7ba`, `0f46dce`, `6e1b777`):
+
+- episode notification fields are committed only by a post-delivery, alert-store-locked
+  confirmation; failed, unavailable, skipped, thrown, timed-out, and budget-rejected work stays due;
+  repeated channel failures are visible through `delivery_failure_count`, timestamp, and reason;
+- LLM adjudication is separate: `notify:false` records adjudication fields and evidence digest but
+  never marks delivery, and the model reopens when material evidence or severity changes;
+- legacy migration uses only a successful notification-delivery audit record for the alert id at or
+  after current activation; `last_notified` alone is not proof, so missing audit evidence notifies
+  once after upgrade;
+- active/acknowledged/frozen records use a generic canonical material-evidence digest over sanitized
+  diagnostics, with per-rule allowlists of volatile fields to ignore. Port identity A→B, repeated
+  canary trips, and a new correlation anchor rearm; unchanged material evidence stays silent;
+- daemon and CLI alert-store writers share an O_EXCL lock with stale-lock reclamation; concurrent
+  recovered→active transitions are covered; unknown severities are preserved and rank above
+  `critical` for escalation comparison.
+
+Detection, candidate generation, recovery/coverage, and persisted active-candidate scope were not
+changed by this work. Focused alert-store + alert-intelligence tests: **161/161** before the final
+lock/severity additions, **23/23** alert-store after them. Fresh-XDG full `npm test`: **2159 total /
+2103 pass / 22 sandbox or live-host failures / 34 skip**. The 22 failures are environment-only:
+20 loopback `listen EPERM` tests and 2 live macOS provenance checks returning `unknown` instead of
+`ok`; no changed-behavior test failed. No push or merge.
 
 ## Review-fix update — 2026-10-05
 

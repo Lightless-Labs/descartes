@@ -277,10 +277,31 @@ descartes alerts notifications setup --channel desktop
 Ordinary alert delivery is episode-based: a newly active alert notifies once, a persistent alert
 stays quiet, and only an escalation above the highest severity already notified in that episode
 notifies again. De-escalation is silent. Recovery rearms the alert for one notification on its next
-activation, and an acknowledgement does not suppress a later severity escalation. Episode state is
-stored with each alert record; the retired 15-minute re-notification cooldown is retained only as a
-legacy compatibility field. The `adjudication.budget_exhausted` meta-signal is separate and keeps
-its own one-hour notification window.
+activation, and an acknowledgement does not suppress a later severity escalation. Episode fields
+are committed only after the delivery adapter returns a successful result (`delivered` or the
+explicit local `cli_only` result); disabled, unavailable, skipped, thrown, timed-out, and
+budget-rejected work stays due for retry. Delivery failures remain visible in `alerts list` and the
+JSON alert record through a bounded failure count, timestamp, and reason.
+
+An episode is also keyed by a material-evidence digest computed from the candidate's sanitized
+diagnostics. The digest canonicalizes all diagnostic fields and removes only the per-rule allowlisted
+volatile fields (observation/evaluation timestamps and detector counters that tick every evaluation),
+so incident identity fields remain material without a hand-written list of “what matters.” A digest
+change while an alert is active, acknowledged, or frozen starts a new episode; unchanged material
+evidence stays silent. The retired 15-minute re-notification cooldown is retained only as a legacy
+compatibility field.
+
+LLM adjudication is separate from delivery. A completed `notify:false` result records
+`adjudicated_at`, its evidence digest, and the false notification outcome, but never marks the
+operator as notified; the model is reconsidered when material evidence or severity changes.
+On upgrade, legacy episode state is derived only from a successful notification-delivery audit
+record for the alert id at or after its current activation. A legacy `last_notified` value without
+that audit evidence is treated as not notified, so it may notify once after upgrade.
+
+Alert-store read-modify-write operations use a shared O_EXCL lock with stale-lock reclamation for
+the daemon and CLI writers. Unknown/foreign severities are preserved and rank above `critical` for
+escalation comparison, so new severity values fail loud. The `adjudication.budget_exhausted`
+meta-signal is separate and keeps its own one-hour notification window.
 
 ## Self-learning and defensive detection (watch by default, author opt-in)
 
