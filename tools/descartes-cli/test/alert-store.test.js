@@ -678,3 +678,55 @@ test("evaluateAlerts never writes; evaluateAndPersistAlerts does", async () => {
   const afterWrite = await readAlertRecords(paths);
   assert(afterWrite.some((alert) => alert.rule_id === "system.memory.sustained_high"), "evaluateAndPersistAlerts must persist to disk");
 });
+
+test("concurrent alert-store writers serialize recovery and reactivation without losing the active transition", async () => {
+  const paths = await tempPaths();
+  const candidate = {
+    id: "alert_concurrent_transition",
+    rule_id: "learned.concurrent.test",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Concurrent transition",
+    summary: "Test transition",
+    diagnostics: { identity: "same" },
+  };
+  const initial = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, initial.alerts);
+  await confirmAlertDelivery(paths, candidate.id, {
+    now: "2026-10-06T00:00:01.000Z",
+    severity: "warning",
+    evidenceDigest: initial.alerts[0].material_evidence_digest,
+  });
+
+  const recovery = evaluateAndPersistAlerts(paths, {
+    now: "2026-10-06T00:01:00.000Z",
+    historySummary: historySummary([]),
+    daemonStatus: { state: "ok", ts: "2026-10-06T00:01:00.000Z" },
+    extraCandidates: [],
+    coveredAlertIds: new Set([candidate.id]),
+  });
+  const reactivation = evaluateAndPersistAlerts(paths, {
+    now: "2026-10-06T00:02:00.000Z",
+    historySummary: historySummary([]),
+    daemonStatus: { state: "ok", ts: "2026-10-06T00:02:00.000Z" },
+    extraCandidates: [candidate],
+    coveredAlertIds: new Set([candidate.id]),
+  });
+  await Promise.all([recovery, reactivation]);
+  const stored = (await readAlertRecords(paths)).find((alert) => alert.id === candidate.id);
+  assert.equal(stored.status, "active", "the serialized recovered -> active transition must not be overwritten by stale state");
+  assert.equal(stored.episode_started_at, "2026-10-06T00:02:00.000Z");
+});
+
+test("a stale alert-store lock is reclaimed", async () => {
+  const paths = await tempPaths();
+  const store = resolveAlertStorePaths(paths);
+  await fs.mkdir(store.dir, { recursive: true });
+  const lockFile = path.join(store.dir, "alerts.json.lock");
+  await fs.writeFile(lockFile, "stale-owner");
+  const stale = new Date(Date.now() - 120_000);
+  await fs.utimes(lockFile, stale, stale);
+  const result = applyAlertCandidates([], [{ id: "alert_stale_lock", rule_id: "system.memory.sustained_high", severity: "warning", title: "x", diagnostics: {} }], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, result.alerts);
+  assert.equal((await readAlertRecords(paths)).length, 1);
+});
