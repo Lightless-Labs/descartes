@@ -1258,3 +1258,19 @@ The state came from a `cp -R` copy of `~/.local/state/descartes` and the config 
   - After quarantine, the text status prints `legacy fact store: none` while a quarantine directory remains pending deletion for 31 days.
 
 **Verdict:** S7 passes. The only open items are the G3 operator-noise question on the `horizon_short` notification cadence and the two cosmetic labels above.
+
+## 24. Addendum: G3 quarantine-epoch read closure (2026-10-06)
+
+**Reason for addendum:** daybreak-blue found that migration advances the quarantine epoch on every
+daemon iteration, including a non-structural fast tick, while the seen-set epoch was checked only
+when the next structural retention pass folded it. A stale set could therefore authorize a novelty
+claim and recovery coverage between those two events.
+
+**Closure:** `readNoveltySeenSet` now compares the set's recorded epoch with the current migration
+marker on every read. An epoch mismatch, unreadable marker, pending root migration, or future marker
+marks the set invalid for novelty. The shared novelty eligibility predicate then reports
+`history_horizon_short`, returns no candidates and no recovery coverage, and the daemon veto freezes
+recovery until a later fold re-certifies the set. Ordinary missing sets retain their existing
+full-coverage fallback. The regression covers service appearance, scheduled-job appearance, and
+process-lineage novelty after migration with no intervening append, plus the daemon veto. Focused
+seen-set verification: 36 tests, 36 pass.

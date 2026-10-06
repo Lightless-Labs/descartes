@@ -2,6 +2,22 @@
 
 **Last updated:** 2026-10-06
 
+## Current continuity — G3 quarantine-epoch read closure (2026-10-06)
+
+The daybreak-blue G3 blocker is closed locally on `feat/fact-store-capacity-2026-10`: a migration
+epoch change on a non-structural fast tick now invalidates an older novelty seen-set immediately.
+`readNoveltySeenSet` compares the recorded set epoch with the current migration marker and fails
+closed for mismatch, unreadable/pending, or future marker state. The shared `noveltyRuleEligible`
+predicate is used by the three novelty producers and the daemon veto; rule evaluations/status report
+`history_horizon_short`, producers return no candidates or recovery coverage, and the daemon freezes
+recovery until a later fold re-certifies the set. The regression covers service, scheduled-job, and
+process-lineage novelty with no intervening append, plus the daemon recovery veto. Plan addendum: §24.
+
+Focused novelty/baseline/family-veto verification: 175 tests, 175 pass, 0 fail. Full fresh-XDG
+`npm test`: 2240 tests, 2184 pass, 22 managed-sandbox environment failures, 34 skipped, 0 todo,
+0 product failures. The 22 environment failures are 17 notifier-reuse loopback binds, 3 tap-bump
+loopback binds, and 2 live-host provenance checks. No push or merge.
+
 ## Current continuity — S6 H1 freshness closure (2026-10-06)
 
 The S6 review H1 is closed on `feat/fact-store-capacity-2026-10`. `4fc0384` adds the red T11 stale-census expectations and a daemon-level active `session.count_drop` freeze regression; `d10243f` gives `session.count_drop`, `session.churn`, `peer.count_spike`, and `peer.count_drop` the same `activeFreshnessMs` gate as the census rules. A stale latest complete census now emits no stale-data candidates or `evaluatedAlertKeys`, so alerts freeze and never recover from dead census data. `evaluateSessionChurn` takes the evaluation clock, and baseline status receives the recorded structural interval for all eight census-dependent rules.

@@ -366,6 +366,18 @@ export async function readNoveltySeenSet(descartesPaths, family, { ledger, nowMs
   if (set.ledger_generation !== ledger.generation || set.ledger_pass_id !== ledger.continuity?.last_committed_pass_id) {
     return { ...base, status: "lineage_mismatch" };
   }
+  // Migration runs on every daemon iteration, including a fast tick. A seen-set folded before a
+  // new quarantine epoch is not certified against the current history boundary until the next
+  // structural fold rewrites it. Keep this check on the read path so every consumer (detectors,
+  // baseline status, and the daemon veto) receives the same invalidation state.
+  const quarantine = await legacyQuarantineEpoch(descartesPaths, { now: nowMs }).catch(() => ({ status: "unreadable" }));
+  if (quarantine.status === "unreadable") return { ...base, status: "quarantine_marker_unreadable" };
+  if (quarantine.status === "legacy_pending") return { ...base, status: "quarantine_migration_pending" };
+  if (quarantine.status === "future") return { ...base, status: "quarantine_marker_future" };
+  if ((quarantine.status !== "absent" && quarantine.status !== "valid")
+    || quarantine.epoch !== set.quarantine_epoch) {
+    return { ...base, status: "quarantine_epoch_mismatch" };
+  }
   // The claim's scope: memory runs back to certified_since (or the lineage start) but never further
   // than the 30-day retention past last_seen.
   const retentionStartMs = Number.isFinite(nowMs) ? nowMs - retentionMs : Number.NEGATIVE_INFINITY;

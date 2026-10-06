@@ -215,6 +215,21 @@ export function validNoveltySeenSet(readResult, ruleId) {
   return isObject(set) && set.status === "valid" && set.entries instanceof Map ? set : undefined;
 }
 
+// A migration marker transition is different from an ordinary missing/invalid seen-set. The
+// latter may still fall back to an intact, full fact-store window; the former means the marker has
+// invalidated the set's history and that window cannot authorize a novelty claim until the next
+// fold re-certifies the set. This predicate is shared by detector gates, status rule evaluations,
+// and the daemon's ruleEligible veto through noveltyRuleEligible.
+export function noveltySeenSetMigrationInvalid(readResult, ruleId) {
+  const family = noveltyFamilyForRule(ruleId);
+  if (family === undefined) return false;
+  const status = readResult?.seen_sets?.[family]?.status;
+  return status === "quarantine_epoch_mismatch"
+    || status === "quarantine_marker_unreadable"
+    || status === "quarantine_migration_pending"
+    || status === "quarantine_marker_future";
+}
+
 /**
  * The horizon referent for a NOVELTY rule (S3b, plan §18): with a valid seen-set the rule decides
  * novelty against the set, so its minimum-memory horizon (Q2: 48 h / 48 h / 6 d) is measured against
@@ -223,6 +238,7 @@ export function validNoveltySeenSet(readResult, ruleId) {
  * (ruleHorizonOk); the caller ALSO keeps the interim full-coverage gate in that case.
  */
 export function noveltyHorizonOk(readResult, ruleId, nowMs) {
+  if (noveltySeenSetMigrationInvalid(readResult, ruleId)) return false;
   const set = validNoveltySeenSet(readResult, ruleId);
   if (!set) return ruleHorizonOk(readResult, ruleId, nowMs);
   const horizonMs = ruleHorizonMs(ruleId);
@@ -240,6 +256,7 @@ export function noveltyHorizonOk(readResult, ruleId, nowMs) {
  * or, without one, the interim S2 rule -- full (un-narrowed) coverage AND the fact-floor horizon.
  */
 export function noveltyRuleEligible(readResult, ruleId, nowMs) {
+  if (noveltySeenSetMigrationInvalid(readResult, ruleId)) return false;
   if (validNoveltySeenSet(readResult, ruleId)) return noveltyHorizonOk(readResult, ruleId, nowMs);
   return readResult?.completeness?.coverage === "full" && ruleHorizonOk(readResult, ruleId, nowMs);
 }

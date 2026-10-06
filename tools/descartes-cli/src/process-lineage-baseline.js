@@ -9,7 +9,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
@@ -462,7 +462,7 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
 
   // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 6 d). Never an input to
   // the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
-  const horizonOk = noveltyHorizonOk(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, nowMs);
+  const horizonOk = noveltyRuleEligible(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, nowMs);
   const evaluable = !coldStartPendingThisTick && horizonOk;
   const novel = evaluable ? detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount, seenEntries: seenSet?.entries }) : [];
   // §8.B/§8.C coverage: reported from the SAME state the detector already computed (currentGroups +

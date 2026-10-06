@@ -17,8 +17,8 @@ import {
 } from "../src/novelty-seen-set.js";
 import { noveltyRuleEligible } from "../src/fact-store-completeness.js";
 import { groupServiceFactsByTick, computeServiceAppearanceCandidates, detectServiceAppearances, loadServiceAppearanceBaselineStore, writeServiceAppearanceBaselineStore, SERVICE_APPEARED_RULE_ID } from "../src/service-baseline.js";
-import { groupProcessLineageFactsByTick } from "../src/process-lineage-baseline.js";
-import { groupScheduledJobFactsByTick } from "../src/persistence-baseline.js";
+import { computeProcessLineageBaselineCandidates, groupProcessLineageFactsByTick, writeProcessLineageBaselineStore, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID } from "../src/process-lineage-baseline.js";
+import { computeScheduledJobBaselineCandidates, groupScheduledJobFactsByTick, writePersistenceBaselineStore, SCHEDULED_JOB_APPEARED_RULE_ID } from "../src/persistence-baseline.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
 import { migrateLegacyFactStore, resolveLegacyFactStorePaths } from "../src/fact-store-migration.js";
@@ -147,11 +147,13 @@ for (const kind of ["marker", "garbled-marker", "legacy-file", "legacy-seen-sets
     const expectedBoundary = kind === "marker" ? at(0) : at(3);
     assert.equal(set.certified_since_ts, expectedBoundary, "an unreadable or pending migration is a fresh discard episode on every observed pass");
     const read = await readFactPoints(paths, { family: "service", now: at(3), windowMs: 31 * DAY, seenSetFamilies: ["service"] });
-    assert.equal(read.seen_sets.service.status, "valid");
-    assert.equal(read.seen_sets.service.scope_ts, expectedBoundary, "the claim scope never reaches back past the latest observed discard");
+    const markerTrusted = kind === "marker";
+    const expectedStatus = markerTrusted ? "valid" : kind === "garbled-marker" ? "quarantine_marker_unreadable" : "quarantine_migration_pending";
+    assert.equal(read.seen_sets.service.status, expectedStatus, "the read path exposes unresolved migration evidence");
+    if (markerTrusted) assert.equal(read.seen_sets.service.scope_ts, expectedBoundary, "the claim scope never reaches back past the latest observed discard");
     assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(3))), false, "horizon-short, not silently eligible");
     assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(47))), false);
-    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(Date.parse(expectedBoundary) === Date.parse(at(0)) ? 48 : 51))), true, "the 48 h horizon recovers from the latest boundary");
+    assert.equal(noveltyRuleEligible(read, SERVICE_APPEARED_RULE_ID, Date.parse(at(Date.parse(expectedBoundary) === Date.parse(at(0)) ? 48 : 51))), markerTrusted, "only a trusted marker can let the 48 h horizon recover");
   });
 }
 
@@ -253,6 +255,100 @@ test("G2 HIGH-1 re-gate: a resumed quarantine with root data is a new discard ep
   await appendFactPoints(paths, serviceTick(at(67), ["svc-A", "svc-C"]), { family: "service", now: at(67) });
   const result = await computeServiceAppearanceCandidates(paths, { now: at(67) });
   assert.deepEqual(result.candidates, [], "svc-C from a resumed quarantine is not claimed new at +7h");
+});
+
+test("G3 blocker: a non-structural migration epoch change invalidates all novelty families until the next fold", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  const families = [
+    {
+      family: "service",
+      ruleId: SERVICE_APPEARED_RULE_ID,
+      writeStore: writeServiceAppearanceBaselineStore,
+      compute: computeServiceAppearanceCandidates,
+      pointsForTick: (ts, latest) => serviceTick(ts, latest ? ["svc-A", "svc-B"] : ["svc-A"]),
+      options: { minHistoryTickCount: 1, establishedMinCensusCount: 2 },
+    },
+    {
+      family: "scheduled_job",
+      ruleId: SCHEDULED_JOB_APPEARED_RULE_ID,
+      writeStore: writePersistenceBaselineStore,
+      compute: computeScheduledJobBaselineCandidates,
+      pointsForTick: (ts, latest) => [
+        presence(ts, latest ? "job-A" : "job-base", "scheduled_job.presence"),
+        marker(ts, "complete", "scheduled_job.census"),
+      ],
+      options: { minHistoryTickCount: 1 },
+    },
+    {
+      family: "process_lineage",
+      ruleId: PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID,
+      writeStore: writeProcessLineageBaselineStore,
+      compute: computeProcessLineageBaselineCandidates,
+      pointsForTick: (ts, latest) => [
+        presence(ts, latest ? "edge-new" : "edge-base", "process.lineage_edge"),
+        marker(ts, "complete", "process.lineage_edge.census"),
+      ],
+      options: { minHistoryTickCount: 1 },
+    },
+  ];
+  const latest = at(72);
+  for (const entry of families) {
+    await entry.writeStore(paths, { cold_start_pending: false, last_folded_ts: at(-1) });
+    for (const hour of [0, 24, 48, 72]) {
+      await appendFactPoints(paths, entry.pointsForTick(at(hour), hour === 72), { family: entry.family, now: at(hour) });
+    }
+  }
+
+  // This is the fast-tick window: migration advances the current marker after the last append and
+  // no structural append/fold runs before the producers read their old epoch-0 seen-sets.
+  const { factsRootDir } = resolveLegacyFactStorePaths(paths);
+  await fs.mkdir(factsRootDir, { recursive: true });
+  await fs.writeFile(path.join(factsRootDir, "facts.jsonl"), `${JSON.stringify(presence(at(48), "legacy-svc"))}\n`);
+  const migration = await migrateLegacyFactStore(paths, { now: latest });
+  assert.equal(migration.status, "quarantined");
+
+  for (const entry of families) {
+    const read = await readFactPoints(paths, { family: entry.family, now: latest, windowMs: 31 * DAY, seenSetFamilies: [entry.family] });
+    assert.equal(read.seen_sets[entry.family].status, "quarantine_epoch_mismatch", `${entry.family}: stale set is not valid after migration`);
+    assert.equal(noveltyRuleEligible(read, entry.ruleId, Date.parse(latest)), false, `${entry.family}: shared eligibility predicate vetoes stale epoch`);
+
+    const result = await entry.compute(paths, {
+      now: latest,
+      activeFreshnessMs: 2 * HOUR,
+      ...entry.options,
+    });
+    assert.deepEqual(result.candidates, [], `${entry.family}: no candidate from stale novelty memory`);
+    assert.deepEqual(result.evaluatedAlertKeys, [], `${entry.family}: no recovery coverage from stale novelty memory`);
+    assert.equal(result.ruleEvaluations[entry.ruleId].gate, "history_horizon_short", `${entry.family}: status uses the same horizon-short gate`);
+    assert.equal(result.ruleEvaluations[entry.ruleId].evaluable, false, `${entry.family}: rule is not evaluable`);
+  }
+
+  // The daemon has its own recovery pass. Feed it a producer report that would otherwise cover an
+  // active appearance alert; its independent veto must use the same stale-epoch predicate and keep
+  // that alert active.
+  await writeLearnedConfig(paths, { enabled: true });
+  const fingerprint = "0123456789abcdef";
+  await writeAlertRecords(paths, [{ rule_id: SERVICE_APPEARED_RULE_ID, fingerprint, status: "active", severity: "warning", title: "t", summary: "t", first_seen: latest, last_seen: latest, diagnostics: {} }]);
+  const daemon = await runDaemonIteration(paths, {
+    profile: { interval_ms: 60000, collectors: {} },
+    collectors: {},
+    ts: latest,
+    now: latest,
+    computeServiceAppearanceCandidates: async () => ({
+      candidates: [],
+      evaluatedAlertKeys: [alertId(SERVICE_APPEARED_RULE_ID, fingerprint)],
+    }),
+  });
+  const alert = daemon.alerts.alerts.find((entry) => entry.rule_id === SERVICE_APPEARED_RULE_ID);
+  assert.equal(alert.status, "active", "the daemon veto freezes recovery on a stale migration epoch");
+  assert.equal(daemon.status.novelty_seen_sets.service.status, "quarantine_epoch_mismatch");
+
+  for (const entry of families) {
+    await enforceFactRetention(paths, { family: entry.family, now: latest });
+    const recertified = await readFactPoints(paths, { family: entry.family, now: latest, windowMs: 31 * DAY, seenSetFamilies: [entry.family] });
+    assert.equal(recertified.seen_sets[entry.family].status, "valid", `${entry.family}: the next fold re-certifies the current epoch`);
+  }
 });
 
 test("G2 HIGH-1 re-gate: a crash after rename with an empty root still advances the resume epoch and suppresses svc-C at +7h", async () => {

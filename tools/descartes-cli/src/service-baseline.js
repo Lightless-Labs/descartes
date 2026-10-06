@@ -39,7 +39,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyHorizonOk, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
 import { seenBeforeTick } from "./novelty-seen-set.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
@@ -1003,7 +1003,7 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h), measured against
   // the seen-set's certified span when it decides novelty (S3b), else the fact store's floor. Never an
   // input to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
-  const horizonOk = noveltyHorizonOk(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
+  const horizonOk = noveltyRuleEligible(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
   const appearances = coldStartPendingThisTick || !horizonOk
     ? []
     : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount, seenEntries: seenSet?.entries });
