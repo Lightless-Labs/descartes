@@ -318,15 +318,15 @@ async function deriveLegacyDeliveryState(descartesPaths, alerts, legacyAlertIds 
     console.warn(`descartes: notification delivery audit unavailable (${error?.message ?? error}); legacy alerts remain due`);
   }
   return alerts.map((alert) => {
-    if (!legacyAlertIds.has(alert.id)) return alert;
     const activation = new Date(alert.episode_started_at ?? alert.first_seen).getTime();
     const successful = audit
       .filter((record) => record?.payload?.alert_id === alert.id && ["delivered", "cli_only"].includes(record.status))
       .filter((record) => Number.isFinite(new Date(record.ts).getTime()) && new Date(record.ts).getTime() >= activation)
       .sort((left, right) => String(right.ts).localeCompare(String(left.ts)))[0];
-    if (!successful) {
+    if (!successful && legacyAlertIds.has(alert.id)) {
       return normalizeAlertRecord({ ...alert, episode_notified_at: null, notified_severity_max: null });
     }
+    if (!successful) return alert;
     return normalizeAlertRecord({
       ...alert,
       episode_notified_at: successful.ts,
