@@ -9,6 +9,7 @@
 **Addendum:** 2026-10-05: daybreak G2 review rework (NEEDS-REWORK: H1 + L1-L5): an upgraded install no longer certifies novelty memory over the history S5 quarantined; per-finding dispositions in §20.
 **Addendum:** 2026-10-05: S6 (CLI consistency) built with T11: `baseline status` reports per rule from the detectors' own gates, run read-only (§22).
 **Reviewed:** 2026-10-05 (S6 review, NEEDS-REWORK: H1, M1-M3, L1-L6 + a Leg E nit) → reworked; dispositions in §22.6.
+**Addendum:** 2026-10-06: S7 soak run against a copy of the real state directory, with real collectors, default budgets and an accelerated clock (2 × 264 structural ticks). No product anomaly found; results in §23.
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -1191,3 +1192,65 @@ The S6 review (NEEDS-REWORK) was reworked on the same branch; every test ran wit
 - **L5 (fixed, `370a979`):** the text output shows the cold-start reason only when a rule in the domain is cold-start pending; JSON keeps `cold_start_reason`.
 - **L6 (rejected):** on every path the daemon or status uses, `dropEvaluated` is false only while the baseline is not established. Neither passes `minSampleCount`, so established means >= 30 complete groups; `last_observation` is then always set, `computeZScore` returns a finite number (0 for a non-positive effective stddev), and `mean_before` starts at 0. The other terms are reachable only with a caller-supplied `minSampleCount <= 0`, so `baseline_warming_up` is exact here. Left unchanged rather than editing a reviewed detector for an unreachable branch.
 - **Nit (fixed, `7a3d373`):** see the Leg E bullet in §22.2.
+
+## 23. Addendum: S7 real-host soak (2026-10-06)
+
+**Addendum:** 2026-10-06. S7 ran on `fb77b5d` (no code change). It answers the S7 bullet in §7 with numbers.
+
+**What was run, and why it is neither of the named variants.** The CLI's foreground loop always uses `defaultDaemonProfile()`: a 1 h structural interval, and `--interval` only sets the fast-tick sleep. So 36 structural ticks through the CLI would take 36 h of wall clock. No `test:soak` script or slow T2 test exists either. A scratch driver (not committed) called `runDaemonIteration` from this branch with the following setup:
+- The real fast and structural collectors (no collector injection).
+- The default profile, which means a 1 h structural interval and every family at its default budget.
+- Notifications neutralised three ways: `notifications.json` and `alert-intelligence.json` both `{enabled:false}`, `adjudicateAlerts: false`, and a `deliverNotification` recorder that never sends.
+- An injected `ts`/`now` that advances one simulated hour per structural tick, with 2 fast ticks between structural ticks.
+
+The state came from a `cp -R` copy of `~/.local/state/descartes` and the config directory (without `auth.json`) under `mktemp -d`. All four `XDG_*` variables pointed at the scratch root; `HOME` stayed real so the collectors see the host. Two independent full runs of **264 structural ticks (11 simulated days) + 528 fast ticks** each took about 30 min of wall clock. A third, short run with `learned.json` enabled measured the learned-on read cost. The accelerated clock is the one deviation from a true soak: the collectors see about 7 s of real host activity per simulated hour (see the last bullet).
+
+**Isolation.** These checks held in every run:
+- An fs tripwire on every `fs`/`fs/promises` entry point for the real state and config paths fired 0 times.
+- `lsof` on the driver showed 0 open real-path files.
+- In the real tree, only the installed 0.0.47 launchd daemon's own write set changed (`alerts/alerts.json`, `daemon/stdout.log`, `history/daemon-status.json`, `history/metrics.jsonl`). The installed daemon has no `fact-families.js`.
+- Nothing under the real `learned/` changed: same mtimes and inodes, no `facts-legacy-*`, no per-family directories. `auth.json` was untouched.
+- The launchd daemon was not touched.
+
+**Results (run 1 / run 2, which agree).**
+- **Legacy store.** It was quarantined on tick 1 into `learned/facts-legacy-<iso>/`: `facts.jsonl` (185 KB, 722 records) and `integrity.json`, with `delete_after` set to +31 d. The quarantined files were never read again (0 reads in 792 iterations; only the marker `facts-legacy.json` is read). Seven per-family stores were created. All 792 iterations ended in state `ok`, with 0 storage or retention errors.
+- **Budgets respected.** No family went over its budget, and no family raised `cap_below_tick`, `retention_failing`, `rejected`, `clamped` or `horizon_invariant_unmet`. Peak sizes against budget:
+
+  | Family | Peak / budget | Notes |
+  |---|---|---|
+  | service | 18,833,529 / 18,874,368 B | ~132 KB per tick |
+  | process_lineage | 10,463,108 / 10,485,760 B | ~43 KB per tick |
+  | peer | 0.66 / 16 MiB | |
+  | scheduled_job | 0.69 / 5 MiB | |
+  | provenance | 0.77 / 4 MiB | |
+  | network | 0.51 / 4 MiB | |
+  | session | 0.07 / 4 MiB | |
+
+- **Service evicts every tick once full, and keeps evaluating.** Byte-cap eviction ran on every structural tick from tick 144 to tick 264 (121 of 121 ticks). Lineage did the same from tick 246 (run 1) or 245 (run 2) onward. Through eviction, `baseline status` kept service at `watching` (517 keys evaluated). The family stayed `intact`, coverage `narrowed`, with a certified horizon of 144 h, above the 48 h horizon; lineage's was 245 h, above 6 d.
+- **Watch domains reach "watching".** `baseline status` was checked every 6 ticks through `runBaseline`, and the real CLI was run once at the end under a `Date`-offset preload because the state is dated in the future. The progression:
+  - Tick 1: `history_unknown`, because each new ledger is `unknown` for its first pass.
+  - Tick 2: every family `intact`.
+  - By tick 6: `service.disappeared` and `session.churn` were watching.
+  - By tick 30: `session.count_drop`, `peer.count_spike` and `peer.count_drop` were watching.
+  - By tick 54: `service.appeared` and `scheduled_job.appeared` were watching. Their horizon-short state cleared at tick 49.
+  - By tick 150: `process.lineage.novel_edge` was watching. Its horizon-short state cleared at tick 145.
+  - Final state: all five domains `watching`.
+  - Run 1 only: peer re-warmed for ticks 234-239 after a real `tailscale` probe came back `unable`, which changed the availability signature. That is by design.
+- **`horizon_short` raised, then cleared.** `history_horizon_short` listed the three novelty rules from tick 1 and only lineage from tick 49, and was empty from tick 145. The fixed `daemon.fact_history.horizon_short` alert went active at tick 25 (24 h, "3 rules"), changed to "1 rule" at tick 49, and recovered at tick 145. All of this matches §20.1.
+- **Read cost, against T9's 5 s bound.** Learned off (this host's config), at full stores, one fast tick read 35 files and 76.7 MiB: service ×3, lineage ×2, scheduled_job/session/peer ×2. Measured costs:
+  - readFile I/O alone: p50 24 ms, max 121 ms.
+  - Whole fast tick, including the real collectors: p50 1.1 s, p95 1.4-2.0 s. The maximum was 5.5 s at tick 66, which read only 31 MiB, so that was collector or host contention, not read cost.
+  - A direct read+parse benchmark of that reader set on the final stores: 1.1-1.2 s warm and 2.2 s cold. Service costs ~270 ms per 18 MiB read, matching §15.4's ~15 ms/MiB.
+  - Learned on: 42 reads and 78.1 MiB (peer ×3), with fast ticks of 1.3-1.7 s (one at 3.6 s).
+  - Learned-on structural ticks took 28 s on the first pass (constraint mining over full stores), then 7-12 s. That is not fast-tick cost, but it is new information.
+- **Every alert raised, with its rule_id and why.**
+  - `daemon.fact_history.horizon_short`: the expected upgrade alert above. It re-notifies at every cooldown expiry while active (15 min; every iteration under this clock): 360 recorder calls with `notify:true` over ticks 25-144, none sent. At a real 1 min cadence that would be about 480 notifications over about 5 days on an upgraded host with notifications enabled. The cooldown behaviour is pre-existing; the length of this alert's active window is new (G2 question 1, for G3).
+  - `process.lineage.novel_edge`: 25 alerts in run 1 and 7 in run 2, all from tick 145 on (none while horizon-short). Each recovered on the next structural tick. For every one, the edge's first sighting in both the seen-set (certified since tick 1) and the store equals the alert tick, and no fingerprint repeats. So these are genuine first-seen spawn edges from real concurrent host activity, which the accelerated clock compresses. None of them is an evicted edge flagged again: 2 alerts in run 1 fired after lineage eviction began, and both were genuinely new.
+  - `peer.count_spike`: run 1, tick 248. A real fourth tailscale peer came online (mean 4.2, sd 0.44).
+  - `system.memory.sustained_high`: carried active in the copied state from the live host. It recovered on the first fast tick and re-raised only in the 4-fast-per-hour learned run. This is a sampling artifact of the accelerated clock (20-minute sample spacing), unrelated to this slice.
+  - Nothing else: no `service.*`, `scheduled_job.appeared`, `session.*` or `peer.count_drop` alert.
+- **Minor observations (not blockers).**
+  - On tick 1 only, status shows `cold_start_reason: corrupt_facts` for every domain. `coldStartEntryReason` returns that label whenever there is no store loss, and the persisted label stays `initial_baseline`.
+  - After quarantine, the text status prints `legacy fact store: none` while a quarantine directory remains pending deletion for 31 days.
+
+**Verdict:** S7 passes. The only open items are the G3 operator-noise question on the `horizon_short` notification cadence and the two cosmetic labels above.
