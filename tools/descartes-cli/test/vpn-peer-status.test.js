@@ -31,6 +31,21 @@ function enoent() {
   return failure({ code: "ENOENT", error: "spawn ENOENT" });
 }
 
+function untrusted(binary) {
+  return {
+    status: "untrusted_binary",
+    error: "untrusted",
+    command: { argv: [binary], read_only: true },
+    binary: {
+      binary,
+      status: "untrusted_binary",
+      resolved_path: `/tmp/unsafe/${binary}`,
+      trust_verdict: "untrusted_binary",
+      offending_component: "/tmp/unsafe",
+    },
+  };
+}
+
 function permissionDenied(stderr = "Permission denied\n") {
   return failure({ code: 1, stderr });
 }
@@ -356,6 +371,26 @@ test("SSH-only: who reports a remote login, WG/scutil not found -> exactly one s
   assert.equal(envelope.result.total_count, 1);
   assert.equal(envelope.result.peers[0].source_type, "ssh");
   assert.equal(envelope.result.sources.wireguard.status, "not_found_on_known_paths");
+});
+
+test("an untrusted vpn_services binary is incomplete and its resolved-path trust provenance is retained", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "darwin",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["scutil", "--nc", "list"])]: untrusted("scutil"),
+    })),
+  });
+  assert.equal(envelope.result.sources.vpn_services.status, "untrusted_binary");
+  assert.deepEqual(envelope.result.sources.vpn_services.binary_provenance, {
+    requested_binary: "scutil",
+    resolved_path: "/tmp/unsafe/scutil",
+    trust_verdict: "untrusted_binary",
+    offending_component: "/tmp/unsafe",
+    trust_reason: undefined,
+    same_uid_writable_components: [],
+  });
+  assert.equal(envelope.result.any_source_available, false);
+  assert.equal(envelope.result.total_count, 0);
 });
 
 test("WireGuard present with peers, SSH not found -> exactly the WG peers, no fabricated SSH data", async () => {

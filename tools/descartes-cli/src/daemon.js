@@ -367,7 +367,7 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
  * Sibling to collectDaemonEvidence for the slower structural (services/network/scheduled-jobs)
  * cadence — identical enabled-flag/injectable-collectors pattern, stable evidence ordering.
  */
-export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}) {
+export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
   const activeCollectors = {
     services: collectors.services ?? collectServiceEvidence,
     network: collectors.network ?? collectNetworkEvidence,
@@ -396,8 +396,9 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network());
   if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
   if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
-  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions());
-  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"]());
+  const collectorOptions = { trustedBinaryPaths: options.trustedBinaryPaths ?? [] };
+  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
+  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
   if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"]());
   if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary());
   if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"]());
@@ -982,7 +983,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           };
         }
         const outcome = await withDeadline(
-          collectStructuralEvidence(structuralProfile, structuralCollectors),
+          collectStructuralEvidence(structuralProfile, structuralCollectors, {
+            trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+          }),
           deadlineMs,
           () => STRUCTURAL_TICK_TIMED_OUT,
         );

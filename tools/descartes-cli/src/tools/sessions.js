@@ -26,7 +26,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { isBinaryNotFound, runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -142,18 +142,21 @@ async function collectTmuxSessions(options = {}) {
 
   if (probe.status === "ok") {
     const parsed = parseTmuxSessions(probe.stdout);
-    return { multiplexer: "tmux", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command };
+    return { multiplexer: "tmux", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) {
-    return { multiplexer: "tmux", status: "not_found_on_known_paths", sessions: [], command: probe.command };
+    return { multiplexer: "tmux", status: "not_found_on_known_paths", sessions: [], command: probe.command, binary: probe.binary };
+  }
+  if (isBinaryUntrusted(probe)) {
+    return { multiplexer: "tmux", status: "untrusted_binary", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
   }
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   if (/no server running|no such file or directory|error connecting to/i.test(text)) {
     // tmux binary present, ran, and told us (via its own no-server error) that zero sessions
     // exist — a real, distinguishable fact, not a fabricated one.
-    return { multiplexer: "tmux", status: "ok", sessions: [], malformed_count: 0, command: probe.command };
+    return { multiplexer: "tmux", status: "ok", sessions: [], malformed_count: 0, command: probe.command, binary: probe.binary };
   }
-  return { multiplexer: "tmux", status: "unable", sessions: [], error: probe.error, command: probe.command };
+  return { multiplexer: "tmux", status: "unable", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 /**
@@ -168,15 +171,19 @@ async function collectScreenSessions(options = {}) {
   const probe = await runExec("screen", args, { timeout: options.timeout, maxBuffer: options.maxBuffer });
 
   if (isBinaryNotFound(probe)) {
-    return { multiplexer: "screen", status: "not_found_on_known_paths", sessions: [], command: probe.command };
+    return { multiplexer: "screen", status: "not_found_on_known_paths", sessions: [], command: probe.command, binary: probe.binary };
+  }
+
+  if (isBinaryUntrusted(probe)) {
+    return { multiplexer: "screen", status: "untrusted_binary", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
   }
 
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   const parsed = parseScreenLs(text);
   if (probe.status === "ok" || parsed.no_sockets || parsed.sessions.length > 0) {
-    return { multiplexer: "screen", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command };
+    return { multiplexer: "screen", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command, binary: probe.binary };
   }
-  return { multiplexer: "screen", status: "unable", sessions: [], error: probe.error, command: probe.command };
+  return { multiplexer: "screen", status: "unable", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 /**
@@ -211,6 +218,7 @@ export async function collectSessionEvidence(options = {}) {
         multiplexer: mux.multiplexer,
         status: mux.status,
         ...(mux.error ? { error: mux.error } : {}),
+        binary_provenance: binaryProvenance(mux.binary),
       })),
       any_binary_available: anyBinaryAvailable,
       total_count: allSessions.length,

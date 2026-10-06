@@ -33,7 +33,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { isBinaryNotFound, runResolvedExecFile } from "./binary-resolver.js";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -96,11 +96,12 @@ async function collectSshWho(options) {
   const probe = await runExec("who", [], { timeout: options.timeout, maxBuffer: options.maxBuffer });
   if (probe.status === "ok") {
     const { entries } = parseWhoOutput(probe.stdout);
-    return { status: "ok", entries, command: probe.command };
+    return { status: "ok", entries, command: probe.command, binary: probe.binary };
   }
-  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], command: probe.command };
-  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], error: probe.error, command: probe.command };
-  return { status: "unable", entries: [], error: probe.error, command: probe.command };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], command: probe.command, binary: probe.binary };
+  if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
+  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
+  return { status: "unable", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -151,11 +152,12 @@ async function collectSshLast(options) {
   const probe = await runExec("last", ["-n", String(n)], { timeout: options.timeout, maxBuffer: options.maxBuffer });
   if (probe.status === "ok") {
     const { entries, malformed_count } = parseLastOutput(probe.stdout);
-    return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command };
+    return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
   }
-  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command };
-  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], requested_n: n, error: probe.error, command: probe.command };
-  return { status: "unable", entries: [], requested_n: n, error: probe.error, command: probe.command };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command, binary: probe.binary };
+  if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
+  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
+  return { status: "unable", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -232,7 +234,10 @@ async function collectWireguardPeers(options) {
   const listProbe = await wgShowInterfaces(runExec, options);
 
   if (isBinaryNotFound(listProbe)) {
-    return { status: "not_found_on_known_paths", interfaces: [], peers: [], elevation_candidate: false };
+    return { status: "not_found_on_known_paths", interfaces: [], peers: [], elevation_candidate: false, binary: listProbe.binary };
+  }
+  if (isBinaryUntrusted(listProbe)) {
+    return { status: "untrusted_binary", interfaces: [], peers: [], elevation_candidate: false, error: listProbe.error, binary: listProbe.binary };
   }
   if (listProbe.status !== "ok") {
     const elevationCandidate = isPermissionDenied(listProbe);
@@ -242,6 +247,7 @@ async function collectWireguardPeers(options) {
       peers: [],
       elevation_candidate: elevationCandidate,
       error: listProbe.error,
+      binary: listProbe.binary,
     };
   }
 
@@ -300,6 +306,7 @@ async function collectWireguardPeers(options) {
     // (cap+1)th interface vanishing from the census with no trace.
     interfaces_truncated: allInterfaceNames.length > MAX_WG_INTERFACES,
     total_interface_count: allInterfaceNames.length,
+    binary: listProbe.binary,
   };
 }
 
@@ -350,10 +357,11 @@ async function collectVpnServices(options) {
 
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const probe = await runExec("scutil", ["--nc", "list"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [] };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [], binary: probe.binary };
   if (probe.status !== "ok") {
-    if (isPermissionDenied(probe)) return { status: "missing_permission", services: [], error: probe.error };
-    return { status: "unable", services: [], error: probe.error };
+    if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", services: [], error: probe.error, binary: probe.binary };
+    if (isPermissionDenied(probe)) return { status: "missing_permission", services: [], error: probe.error, binary: probe.binary };
+    return { status: "unable", services: [], error: probe.error, binary: probe.binary };
   }
   const parsed = parseScutilNcListDetailed(probe.stdout);
   return {
@@ -361,6 +369,7 @@ async function collectVpnServices(options) {
     services: parsed.services.filter((service) => service.is_vpn && !service.is_tailscale),
     unparsed_count: parsed.unparsed_count,
     tailscale_entry_observed: parsed.services.some((service) => service.is_tailscale),
+    binary: probe.binary,
   };
 }
 
@@ -377,17 +386,19 @@ async function collectEstablishedInbound(options) {
 
   if (platform === "linux") {
     const probe = await runExec("ss", ["-H", "-tn", "state", "established"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-    if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0 };
-    if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error };
+    if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
+    if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
+    if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
     const lines = String(probe.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
-    return { status: "ok", count: lines.length };
+    return { status: "ok", count: lines.length, binary: probe.binary };
   }
 
   const probe = await runExec("netstat", ["-an", "-p", "tcp"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0 };
-  if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
+  if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
+  if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
   const count = String(probe.stdout ?? "").split("\n").filter((line) => /established/i.test(line)).length;
-  return { status: "ok", count };
+  return { status: "ok", count, binary: probe.binary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -447,8 +458,8 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
     return {
       platform,
       sources: {
-        ssh_who: { status: who.status, error: who.error },
-        ssh_last: { status: last.status, error: last.error, requested_n: last.requested_n },
+        ssh_who: { status: who.status, error: who.error, binary_provenance: binaryProvenance(who.binary) },
+        ssh_last: { status: last.status, error: last.error, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
         wireguard: {
           status: wireguard.status,
           error: wireguard.error,
@@ -456,14 +467,16 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
           interfaces: wireguard.interfaces ?? [],
           interfaces_truncated: wireguard.interfaces_truncated ?? false,
           total_interface_count: wireguard.total_interface_count ?? (wireguard.interfaces?.length ?? 0),
+          binary_provenance: binaryProvenance(wireguard.binary),
         },
         vpn_services: {
           status: vpnServices.status,
           error: vpnServices.error,
           unparsed_count: vpnServices.unparsed_count ?? 0,
           tailscale_entry_observed: vpnServices.tailscale_entry_observed ?? false,
+          binary_provenance: binaryProvenance(vpnServices.binary),
         },
-        established_inbound: { status: establishedInbound.status, error: establishedInbound.error },
+        established_inbound: { status: establishedInbound.status, error: establishedInbound.error, binary_provenance: binaryProvenance(establishedInbound.binary) },
       },
       any_source_available: anySourceAvailable,
       total_count: allPeers.length,

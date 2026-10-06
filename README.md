@@ -205,10 +205,28 @@ The collectors cover many areas:
 - VPN and peer status: WireGuard, macOS VPN services, and Tailscale.
 
 Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
-pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path),
-and the resolved executable path is retained in evidence. A miss on those known paths is
-`not_found_on_known_paths`, which is incomplete/unknown evidence—not proof that software is
-not installed and never a complete zero in a census.
+pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path). The
+resolver follows symlinks, requires a regular executable,
+and checks the file plus every ancestor directory to `/`: only root or the daemon UID may own a
+component, and group/world-writable components are rejected. Same-UID owner writability is inside
+Descartes' current trust boundary and is recorded in provenance. An offending component, stat
+failure, or binary replacement detected by the immediate pre-exec `(dev, ino)` recheck produces
+`untrusted_binary`; the collector does not execute it and the census remains incomplete. The
+recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU window.
+
+An operator may explicitly accept a non-standard absolute executable by listing it in
+`$XDG_CONFIG_HOME/descartes/watch.json`:
+
+```json
+{
+  "trusted_binary_paths": ["/opt/operator-tools/bin/tmux"]
+}
+```
+
+Each configured entry is still realpath-resolved and checked as a regular executable before use,
+and evidence reports it as `operator_trusted`. A miss on known paths is
+`not_found_on_known_paths`, which is incomplete/unknown evidence—not proof that software is not
+installed and never a complete zero in a census.
 
 For the full list, see `docs/reference/collectors.md`.
 

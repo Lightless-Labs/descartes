@@ -28,6 +28,7 @@ import { deriveFindings } from "./tools/findings.js";
 import { readSamplingArtifactEvidence, sampleDimensionEvidence } from "./tools/sampling.js";
 import { selectTriageModel } from "./model-selection.js";
 import { assertSafeTriageToolNames, TRIAGE_TOOL_NAMES } from "./tool-policy.js";
+import { loadWatchConfig } from "./watch-store.js";
 
 function jsonToolResult(value) {
   return {
@@ -44,6 +45,12 @@ export function createEvidenceTools(paths) {
   // evidence" fabrication vector -- see evidence-freeze.js's documented "not itself a host-state
   // collector" contract for derive_findings, which this registry now actually enforces).
   const evidenceRegistry = new Map();
+  let collectorConfigPromise;
+  async function collectorOptions() {
+    collectorConfigPromise ??= loadWatchConfig(paths).catch(() => ({}));
+    const config = await collectorConfigPromise;
+    return { trustedBinaryPaths: config.trusted_binary_paths ?? [] };
+  }
   function registerEvidence(bundle) {
     if (bundle?.id) evidenceRegistry.set(bundle.id, bundle);
     if (Array.isArray(bundle?.evidence)) {
@@ -203,7 +210,10 @@ export function createEvidenceTools(paths) {
       description: "Collect read-only tmux/screen session inventory for the invoking user: session name, attached/detached state, window count, and creation time where the multiplexer exposes it. Same-UID only — does not enumerate other users' sessions.",
       parameters: Type.Object({ session_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectSessionEvidence({ sessionLimit: params.session_limit ?? DEFAULT_SESSION_ENTITY_LIMIT }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectSessionEvidence({
+        sessionLimit: params.session_limit ?? DEFAULT_SESSION_ENTITY_LIMIT,
+        ...(await collectorOptions()),
+      }))),
     }),
     defineTool({
       name: "collect_vpn_peer_status",
@@ -211,7 +221,10 @@ export function createEvidenceTools(paths) {
       description: "Collect a read-only baseline of VPN/SSH peer identity: SSH login census (who) and bounded recent history (last -n), WireGuard peers/endpoints/latest-handshakes (status only, never keys), and macOS VPN service state. No traffic content is inspected, no privilege is escalated, and no host actions are taken.",
       parameters: Type.Object({ peer_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectVpnPeerStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_PEER_ENTITY_LIMIT }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectVpnPeerStatusEvidence({
+        peerLimit: params.peer_limit ?? DEFAULT_PEER_ENTITY_LIMIT,
+        ...(await collectorOptions()),
+      }))),
     }),
     defineTool({
       name: "collect_tailscale_status",

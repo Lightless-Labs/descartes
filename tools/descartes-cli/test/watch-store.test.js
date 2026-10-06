@@ -46,6 +46,16 @@ test("watch enablement switch reads back a present watch.json", async () => {
   assert.equal(reread.enabled, false);
 });
 
+test("watch.json round-trips absolute operator-trusted collector binary paths", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, {
+    enabled: true,
+    trusted_binary_paths: ["/opt/operator/tmux", "/opt/operator/tmux", "relative/tmux", 42],
+  });
+  const reread = await loadWatchConfig(paths);
+  assert.deepEqual(reread.trusted_binary_paths, ["/opt/operator/tmux"]);
+});
+
 test("watch enablement switch round-trips an explicit enabled:true the same as the default", async () => {
   const paths = await tempPaths();
   await writeWatchConfig(paths, { enabled: true });

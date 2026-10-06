@@ -43,6 +43,11 @@ function normalizeFactStoreMaxBytes(value) {
   return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
 }
 
+function normalizeTrustedBinaryPaths(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((candidate) => typeof candidate === "string" && path.isAbsolute(candidate)))];
+}
+
 export function normalizeWatchConfig(config = {}) {
   return {
     // The one deliberate inversion vs. normalizeLearnedConfig's `config.enabled === true`
@@ -52,6 +57,10 @@ export function normalizeWatchConfig(config = {}) {
     enabled: config.enabled !== false,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
     fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
+    // Explicit absolute paths are an operator escape hatch for binaries whose ownership/mode
+    // cannot satisfy the normal trust boundary. binary-resolver.js still realpath- and
+    // regular-executable-checks every selected entry before it can run.
+    trusted_binary_paths: normalizeTrustedBinaryPaths(config.trusted_binary_paths),
   };
 }
 
@@ -68,6 +77,8 @@ export function normalizeWatchConfig(config = {}) {
 function isSchemaValidWatchConfig(parsed) {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
   if ("enabled" in parsed && typeof parsed.enabled !== "boolean") return false;
+  if ("trusted_binary_paths" in parsed && (!Array.isArray(parsed.trusted_binary_paths)
+    || parsed.trusted_binary_paths.some((candidate) => typeof candidate !== "string" || !path.isAbsolute(candidate)))) return false;
   return true;
 }
 

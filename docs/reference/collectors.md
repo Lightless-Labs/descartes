@@ -12,11 +12,18 @@ Collector subprocesses do not consult the ambient `PATH` (important for launchd,
 environment may not contain user-installed tools). A shared resolver checks regular executable
 files in a pinned platform allowlist: `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`,
 `/usr/local/sbin`, NixOS and Snap locations, Homebrew locations on macOS, and the macOS
-`/Applications/Tailscale.app/Contents/MacOS/Tailscale` CLI path. It also rejects executables in
-world-writable directories. Evidence records the resolved absolute path and requested binary.
-If no known candidate is usable, the source reports `not_found_on_known_paths`; this is
-incomplete/unknown evidence, not an inferred `not_installed` state and never a complete zero in
-a census.
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale` CLI path. The resolver follows
+symlinks, requires a regular executable, and checks the file plus every ancestor directory to `/`:
+only root or the daemon UID may own each component, and group/world-writable components are
+rejected. Same-UID owner writability is accepted within the current trust boundary but recorded as
+provenance. A failed check is `untrusted_binary`, is never executed, and leaves the source census
+incomplete. The immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual
+resolution-to-exec TOCTOU window. Operators may list explicit absolute escape-hatch paths in
+`watch.json` under `trusted_binary_paths`; those entries still need realpath + regular-file
+validation and are reported as `operator_trusted`. Evidence records the requested binary, resolved
+absolute path, trust verdict, and any offending component. If no known candidate is usable, the
+source reports `not_found_on_known_paths`; this is incomplete/unknown evidence, not an inferred
+`not_installed` state and never a complete zero in a census.
 
 `descartes incident freeze` reuses this same registered collector set (the broad `collect_*` tools) to persist a Descartes-owned forensic snapshot on demand, without adding any new evidence-collection surface. It is documented separately at `docs/reference/incident-freeze.md` since it is an action, not a collector.
 

@@ -19,6 +19,21 @@ function enoent() {
   return failure({ code: "ENOENT", error: "spawn tmux ENOENT" });
 }
 
+function untrusted() {
+  return {
+    status: "untrusted_binary",
+    error: "untrusted",
+    command: { argv: ["tmux"], read_only: true },
+    binary: {
+      binary: "tmux",
+      status: "untrusted_binary",
+      resolved_path: "/tmp/unsafe/tmux",
+      trust_verdict: "untrusted_binary",
+      offending_component: "/tmp/unsafe",
+    },
+  };
+}
+
 // Injects distinct fakes per binary name so a single test can simulate any combination of
 // tmux/screen behavior without a real tmux/screen installation (plan §2's local testability
 // model — mirrors provenance-warnings.js's own options.runFixedExecFile DI convention).
@@ -133,6 +148,24 @@ test("tmux/screen ENOENT is not-found-on-known-paths -> envelope is unable/confi
   assert.equal(envelope.review_hint, "missing_permission");
   assert.equal(envelope.result.any_binary_available, false);
   assert.deepEqual(envelope.result.multiplexers.map((m) => m.status), ["not_found_on_known_paths", "not_found_on_known_paths"]);
+});
+
+test("an untrusted tmux binary is incomplete, never executed as a zero-session source, and remains in census provenance", async () => {
+  const envelope = await collectSessionEvidence({
+    runFixedExecFile: fakeExec({ tmux: untrusted(), screen: enoent() }),
+  });
+  assert.equal(envelope.status, "unable");
+  assert.equal(envelope.confidence, 0);
+  const tmux = envelope.result.multiplexers.find((entry) => entry.multiplexer === "tmux");
+  assert.equal(tmux.status, "untrusted_binary");
+  assert.deepEqual(tmux.binary_provenance, {
+    requested_binary: "tmux",
+    resolved_path: "/tmp/unsafe/tmux",
+    trust_verdict: "untrusted_binary",
+    offending_component: "/tmp/unsafe",
+    trust_reason: undefined,
+    same_uid_writable_components: [],
+  });
 });
 
 test("tmux absent, screen present with genuinely zero sessions -> ok/empty, distinguishable from the neither-binary-present case", async () => {
