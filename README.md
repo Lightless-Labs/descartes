@@ -277,12 +277,17 @@ descartes alerts notifications setup --channel desktop
 Ordinary alert delivery is episode-based: a newly active alert notifies once, a persistent alert
 stays quiet, and only an escalation above the highest severity already notified in that episode
 notifies again. De-escalation is silent. Recovery rearms the alert for one notification on its next
-activation, and an acknowledgement does not suppress a later severity escalation. Episode fields
-are committed only after the delivery adapter returns a successful result (`delivered` or the
+activation, and an acknowledgement does not suppress a later incident or severity escalation. An
+active episode is a bounded set of incident keys, not a single current key, so simultaneous
+identities under one alert id are all represented. A candidate whose key has not been notified is
+due; the retained set is capped at 256 keys and overflow remains notify-safe. Episode notification
+state is committed only after the delivery adapter returns a successful result (`delivered` or the
 explicit local `cli_only` result); disabled, unavailable, skipped, thrown, timed-out, and
-budget-rejected work stays due for retry. Delivery failures use exponential retry backoff (1 minute,
-doubling to 1 hour), expose `delivery_failing_since`/`next_attempt_at`, and coalesce repeated
-identical failure-audit rows.
+budget-rejected work stays due for retry. Delivery failures store `last_attempt_at` plus a delay
+(1 minute, doubling to 1 hour); a future last-attempt timestamp from clock rollback is eligible
+immediately. Crash after external delivery but before confirmation is explicitly at-least-once: a
+duplicate is acceptable, silence is not. Delivery audit rows are bounded for every result type by
+rotation with a retained summary.
 
 The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
 diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
@@ -299,21 +304,29 @@ is:
 - fixed daemon/system/disk rules and `constraint.violation.*`: `default`, because each alert id is
   already the stable condition/fingerprint. Session and peer baseline deviations use `default` for
   the same reason; their mean, max, count, z-score, and stability fields are never episode state.
-- service/scheduled-job/lineage novelty and credential-access rules: `default`, because their
-  entity/path fingerprint is already the novelty identity. Provenance warning observations,
-  containment recommendations, and canary tamper conditions likewise use their stable producer
-  fingerprint and do not promote changing diagnostics into incident identity.
+- session churn uses the observed transition (`prior_fingerprint` → `current_fingerprint`), and
+  credential access uses the observed metadata-change identity, so consecutive A→B→C changes notify
+  separately. Provenance bind/identity candidates carry their live identity hashes, including
+  multiple simultaneous identities under one port alert. Containment recommendations carry the
+  triggering incident key. Service/scheduled-job/lineage novelty and stable canary-tamper rules use
+  their stable producer identity.
 
 LLM adjudication is separate from delivery. A completed `notify:false` result records adjudication
 for the current episode but never marks the operator as notified. On upgrade, a record missing
 `episode_started_at` cannot prove current-activation delivery and is notified once; older audit rows
-are never promoted. Before delivery, the daemon records a locked delivery claim. A live claim is
-skipped by other evaluators, and confirmation or failure clears it.
+are never promoted. The daemon is the sole alert-state writer. CLI mutations such as `alerts ack`
+append to `state/alerts/commands.jsonl` and print that they are queued while the daemon owns the
+singleton; if no daemon is running, the CLI acquires that same singleton and applies the command
+directly.
 
-Alert-store read-modify-write operations use a bounded owner-verified lock. Lock metadata includes
-PID, process-start identity when available, boot ID when available, and a nonce; stale takeover is
-allowed only after the owner is provably gone, never from wall-clock age. Lock timeout fails closed,
-skips alert persistence for that tick, and records the persistence error in daemon status.
+At daemon start, Descartes creates `daemon.singleton` with O_EXCL metadata: PID, process-start
+identity when available, boot identity when available, and a nonce. A second daemon refuses to
+start. Linux stale ownership is reclaimed only when the owner is provably gone. On macOS, when no
+process-start identity is available, Descartes refuses to guess and prints the exact file to clear
+after the operator verifies that no daemon remains. Bounded waits use a monotonic clock; wall-clock
+timestamps are not used for singleton staleness or wait deadlines. A crash after external delivery
+but before confirmation remains at-least-once by design: the next daemon run may repeat the
+notification, but it will not silently lose it.
 Unknown/foreign severities are preserved and rank above `critical` for escalation comparison. The
 `adjudication.budget_exhausted` meta-signal is separate and keeps its own one-hour notification window.
 

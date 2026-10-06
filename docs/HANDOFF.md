@@ -2,27 +2,33 @@
 
 **Last updated:** 2026-10-06
 
-## R3 notify-once delivery policy — 2026-10-06 — complete locally
+## R3 notify-once architecture simplification — 2026-10-06 — local delivery work
 
-On branch `feat/notify-once-2026-10`, this rework removes generic material-evidence episode
-inference and all ignore lists. Episodes are `(alert id, incident_key ?? "default")`, with keys
-declared by the canary, correlation, and provenance producers where one alert identity can contain
-multiple incidents. Service/scheduled-job/lineage novelty and the other stable-fingerprint rules
-use the default key. Detection, candidate existence, coverage/recovery, and active-state scope are
-unchanged.
+On branch `feat/notify-once-2026-10`, alert delivery is now single-daemon-owned. The daemon acquires
+`daemon.singleton` with O_EXCL metadata (PID, process-start identity when available, boot identity
+when available, and nonce); a second daemon refuses to start. Linux stale ownership is reclaimed only
+when the owner is provably gone. macOS without a process-start identity refuses to guess and prints
+the exact file the operator may clear after verifying that no daemon remains. Bounded waits use a
+monotonic clock, never wall-clock deadlines.
 
-The alert store now preserves missing legacy `episode_started_at` as missing, uses bounded
-owner-verified lock metadata (PID/start identity/boot ID/nonce), records delivery claims before
-delivery, and applies 1m→1h exponential failure backoff with coalesced failure audit rows. A lock
-timeout skips alert persistence and is written into daemon status. README documents the producer
-identity policy and the default-key audit.
+The per-delivery alert-store lock, takeover guard, and delivery claim are removed. The daemon is
+the sole alert-state writer. CLI acknowledgements append to `state/alerts/commands.jsonl` while the
+daemon owns the singleton; the daemon applies the queue on its next tick. If no daemon is running,
+the CLI acquires the same singleton and applies the command directly.
 
-Focused changed suites pass 186/186; the producer/lock subset passes 112/112. Fresh-XDG `npm test`
-passes 2109/2165, with 22 pre-existing sandbox/live-host failures and 34 skips: 20 loopback
-`listen EPERM` cases in notifier-reuse/tap-bump, and 2 live-process provenance checks returning
-`unknown` instead of `ok`. No changed-behavior test failed. Local commits are `77b0d1d`
-(`Define producer-owned alert episodes`) and `f852fca` (`Bound notification delivery persistence`);
-neither was pushed or merged.
+Episodes are bounded sets of incident keys (`notified_incident_keys` plus observed episode keys), so
+multiple simultaneous identities under one alert id are retained. Session churn, credential metadata
+changes, and containment recommendations now carry incident identities. New incident keys and
+severity escalation bypass backoff; backoff stores `last_attempt_at + delay`, and a future timestamp
+from rollback is eligible immediately. Delivery remains explicitly at-least-once across a crash
+after external delivery and before confirmation: duplicates are acceptable, silence is not. The
+notification audit rotates all result types with a retained summary.
+
+Focused singleton, queue, alert-store, notify-once, producer, notification, intelligence, alerts,
+and daemon suites are green locally. Fresh-XDG `npm test` completed with 2,115 passing, 22
+environment failures, 34 skipped, and 2,171 total. The failures are 20 sandbox loopback
+`listen EPERM` tests and 2 live-host macOS provenance checks returning `unknown` instead of `ok`;
+no changed-behavior failures were observed. No push or merge is authorized.
 
 ## Review-fix update — 2026-10-05
 
