@@ -58,6 +58,7 @@ function truncate(value, max = 2048) {
 
 async function runFixedExecFile(command, args, options = {}) {
   const result = await runResolvedExecFile(command, args, {
+    ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 256 * 1024,
     execFileAsync,
@@ -413,9 +414,9 @@ export function parseIdUsernameOutput(stdout) {
   return trimmed;
 }
 
-async function resolveUsernameForUid(uid) {
+async function resolveUsernameForUid(uid, options = {}) {
   if (uid === undefined || uid === null || Number.isNaN(Number(uid))) return { username: undefined, username_unavailable: true };
-  const result = await runFixedExecFile("id", ["-un", String(uid)], { timeout: 2000, maxBuffer: 8192 });
+  const result = await runFixedExecFile("id", ["-un", String(uid)], { ...options, timeout: 2000, maxBuffer: 8192 });
   if (result.status !== "ok") return { username: undefined, username_unavailable: true };
   const username = parseIdUsernameOutput(result.stdout);
   if (!username) return { username: undefined, username_unavailable: true };
@@ -552,7 +553,7 @@ function finalizeProvenanceResult({ targetSelection, core, sockets, privilege })
 // Exported (additive, S4): the structural provenance-warning collector's bounded deleted-exe
 // check (narrowed-candidate-only, see plan section 4) reuses this exact
 // lsof/fs.stat-on-macOS / readlink-on-linux orchestration rather than re-implementing it.
-export async function resolveExecutableInfo(pid) {
+export async function resolveExecutableInfo(pid, options = {}) {
   if (process.platform === "linux") {
     try {
       const target = await readlink(`/proc/${pid}/exe`);
@@ -569,7 +570,7 @@ export async function resolveExecutableInfo(pid) {
   }
 
   if (process.platform === "darwin") {
-    const lsofResult = await runFixedExecFile("lsof", ["-a", "-p", String(pid), "-d", "txt"], { timeout: 2500, maxBuffer: 256 * 1024 });
+    const lsofResult = await runFixedExecFile("lsof", ["-a", "-p", String(pid), "-d", "txt"], { ...options, timeout: 2500, maxBuffer: 256 * 1024 });
     if (lsofResult.status !== "ok") {
       return { executable_path: undefined, executable_path_unavailable: true, deleted_exe: "unknown", deleted_exe_confidence: undefined };
     }
@@ -595,10 +596,10 @@ export async function resolveExecutableInfo(pid) {
   return { executable_path: undefined, executable_path_unavailable: true, deleted_exe: "unknown", deleted_exe_confidence: undefined };
 }
 
-async function resolveCodesignInfo(executablePath) {
+async function resolveCodesignInfo(executablePath, options = {}) {
   if (!executablePath) return { status: "unsupported", unavailable_reason: "executable_path_unavailable" };
 
-  const codesignResult = await runFixedExecFile("codesign", ["-dv", executablePath], { timeout: 2500, maxBuffer: 256 * 1024 });
+  const codesignResult = await runFixedExecFile("codesign", ["-dv", executablePath], { ...options, timeout: 2500, maxBuffer: 256 * 1024 });
   const combined = `${codesignResult.stdout ?? ""}\n${codesignResult.stderr ?? ""}`;
   const identityMatch = combined.match(/^Authority=(.+)$/m);
   const notSigned = /code object is not signed/i.test(combined);
@@ -606,7 +607,7 @@ async function resolveCodesignInfo(executablePath) {
 
   // spctl is deliberately excluded from any hard rule input (it false-positives on legitimate
   // unbundled CLI/daemon binaries) — surfaced only as a low-confidence, operator-facing signal.
-  const spctlResult = await runFixedExecFile("spctl", ["--assess", "-t", "execute", executablePath], { timeout: 2500, maxBuffer: 256 * 1024 });
+  const spctlResult = await runFixedExecFile("spctl", ["--assess", "-t", "execute", executablePath], { ...options, timeout: 2500, maxBuffer: 256 * 1024 });
   const spctlCombined = `${spctlResult.stdout ?? ""}\n${spctlResult.stderr ?? ""}`;
   const notarized = /source=Notarized Developer ID/i.test(spctlCombined) ? true : spctlResult.status === "ok" ? false : undefined;
 
@@ -625,10 +626,11 @@ async function resolveCodesignInfo(executablePath) {
   };
 }
 
-async function resolvePidCore(pid) {
+async function resolvePidCore(pid, options = {}) {
   // A busy host's full process table (unbounded args, every process) can exceed 1MB; bound
   // generously rather than silently truncating the snapshot the target pid needs to be found in.
   const psResult = await runFixedExecFile("ps", provenancePsArgsForPlatform(), {
+    ...options,
     timeout: 3000,
     maxBuffer: 8 * 1024 * 1024,
     stdoutMax: 8 * 1024 * 1024,
@@ -653,8 +655,8 @@ async function resolvePidCore(pid) {
   const ancestry = chain.map((item) => ({ pid: item.pid, ppid: item.ppid, command_snippet: item.command, args_redaction: item.args_redaction }));
   const source = classifySourceFromAncestry(ancestryChain);
 
-  const [executableInfo, userInfo] = await Promise.all([resolveExecutableInfo(pid), resolveUsernameForUid(target.uid)]);
-  const codesign = process.platform === "darwin" ? await resolveCodesignInfo(executableInfo.executable_path) : undefined;
+  const [executableInfo, userInfo] = await Promise.all([resolveExecutableInfo(pid, options), resolveUsernameForUid(target.uid, options)]);
+  const codesign = process.platform === "darwin" ? await resolveCodesignInfo(executableInfo.executable_path, options) : undefined;
 
   return {
     resolvedStatus: "ok",
@@ -680,19 +682,19 @@ async function resolvePidCore(pid) {
   };
 }
 
-async function resolveByPid(pid) {
-  const core = await resolvePidCore(pid);
+async function resolveByPid(pid, options = {}) {
+  const core = await resolvePidCore(pid, options);
   return finalizeProvenanceResult({ targetSelection: { kind: "pid", value: pid }, core, sockets: [] });
 }
 
-async function resolveByPortMac(port) {
-  const probe = await runFixedExecFile("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], { timeout: 3500, maxBuffer: 512 * 1024 });
+async function resolveByPortMac(port, options = {}) {
+  const probe = await runFixedExecFile("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"], { ...options, timeout: 3500, maxBuffer: 512 * 1024 });
   if (probe.status !== "ok") return { resolvedStatus: "unknown", result: buildNotFoundResult("port", port, probe) };
 
   const sockets = buildMacPortSockets(probe.stdout, port);
   if (sockets.length === 0) return { resolvedStatus: "unknown", result: buildNotFoundResult("port", port, probe) };
 
-  const core = await resolvePidCore(sockets[0].pid);
+  const core = await resolvePidCore(sockets[0].pid, options);
   return finalizeProvenanceResult({
     targetSelection: { kind: "port", value: port },
     core,
@@ -854,7 +856,7 @@ async function resolveByPortLinux(port, options = {}) {
     const fdScanResults = await scanProcFdForInode(candidatePids);
     const matchResult = resolvePidFromFdScanResults(primary.inode, fdScanResults);
     if (matchResult.status === "ok") {
-      const core = await resolvePidCore(matchResult.pid);
+      const core = await resolvePidCore(matchResult.pid, options);
       return finalizeProvenanceResult({ targetSelection: { kind: "port", value: port }, core, sockets });
     }
   }
@@ -866,24 +868,24 @@ async function resolveByPortLinux(port, options = {}) {
 }
 
 async function resolveByPort(port, options = {}) {
-  if (process.platform === "darwin") return resolveByPortMac(port);
+  if (process.platform === "darwin") return resolveByPortMac(port, options);
   if (process.platform === "linux") return resolveByPortLinux(port, options);
   return { resolvedStatus: "unknown", result: buildNotFoundResult("port", port) };
 }
 
-async function resolveByContainer(containerId) {
+async function resolveByContainer(containerId, options = {}) {
   const runtimes = ["docker", "podman"];
   let lastProbe;
   for (const runtime of runtimes) {
     // `--` terminates flag parsing so the container ref is always treated as a positional arg
     // (defense-in-depth alongside the charset guard in normalizeProvenanceTarget).
-    const probe = await runFixedExecFile(runtime, ["inspect", "-f", "{{.State.Pid}}", "--", containerId], { timeout: 4000, maxBuffer: 64 * 1024 });
+    const probe = await runFixedExecFile(runtime, ["inspect", "-f", "{{.State.Pid}}", "--", containerId], { ...options, timeout: 4000, maxBuffer: 64 * 1024 });
     lastProbe = probe;
     if (probe.status !== "ok") continue;
     const pid = parseContainerInspectPid(probe.stdout);
     if (pid === undefined) continue;
 
-    const core = await resolvePidCore(pid);
+    const core = await resolvePidCore(pid, options);
     core.source = {
       type: "container",
       name: runtime,
@@ -897,9 +899,9 @@ async function resolveByContainer(containerId) {
 }
 
 async function resolveByTarget(targetSelection, options = {}) {
-  if (targetSelection.kind === "pid") return resolveByPid(targetSelection.value);
+  if (targetSelection.kind === "pid") return resolveByPid(targetSelection.value, options);
   if (targetSelection.kind === "port") return resolveByPort(targetSelection.value, options);
-  if (targetSelection.kind === "container") return resolveByContainer(targetSelection.value);
+  if (targetSelection.kind === "container") return resolveByContainer(targetSelection.value, options);
   return { resolvedStatus: "unknown", result: buildNotFoundResult(targetSelection.kind, targetSelection.value) };
 }
 

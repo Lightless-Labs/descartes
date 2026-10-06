@@ -597,6 +597,42 @@ test("collectStructuralEvidence calls only enabled structural collectors in a st
   assert.deepEqual(onlyNetwork.map((e) => e.id), ["network-basics"]);
 });
 
+test("collectStructuralEvidence threads operator trust options through every resolver-backed collector", async () => {
+  const trustedBinaryPaths = ["/opt/homebrew/bin/tmux"];
+  const writerMembershipCache = {};
+  const seen = [];
+  const capture = (name, id, tool) => async (options) => {
+    seen.push({ name, options });
+    return envelope(id, tool, {});
+  };
+  const collectors = {
+    services: capture("services", "services", "collect_services"),
+    network: capture("network", "network-basics", "collect_network"),
+    "scheduled-jobs": capture("scheduled-jobs", "scheduled-jobs", "collect_scheduled_jobs"),
+    provenance: capture("provenance", "provenance-warnings", "collect_provenance_warnings"),
+    sessions: capture("sessions", "sessions", "collect_sessions"),
+    "vpn-peer-status": capture("vpn-peer-status", "vpn-peer-status", "collect_vpn_peer_status"),
+    "tailscale-status": capture("tailscale-status", "tailscale-status", "collect_tailscale_status"),
+    "process-lineage": capture("process-lineage", "process-lineage-edges", "collect_process_lineage"),
+  };
+  await collectStructuralEvidence({ collectors: {
+    services: { enabled: true },
+    network: { enabled: true },
+    "scheduled-jobs": { enabled: true },
+    provenance: { enabled: true },
+    sessions: { enabled: true },
+    "vpn-peer-status": { enabled: true },
+    "tailscale-status": { enabled: true },
+    "process-lineage": { enabled: true },
+  } }, collectors, { trustedBinaryPaths, writerMembershipCache });
+
+  assert.equal(seen.length, 8);
+  for (const { options } of seen) {
+    assert.deepEqual(options.trustedBinaryPaths, trustedBinaryPaths);
+    assert.equal(options.writerMembershipCache, writerMembershipCache);
+  }
+});
+
 test("collectStructuralEvidence runs the process-lineage collector only when enabled", async () => {
   const calls = [];
   const evidence = await collectStructuralEvidence({

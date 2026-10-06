@@ -117,9 +117,10 @@ export function classifyFilesystem(fs) {
   };
 }
 
-export async function collectDiskEvidence() {
+export async function collectDiskEvidence(options = {}) {
   return timedEnvelope(async () => {
     const runDf = (args) => runResolvedExecFile("df", args, {
+      ...options,
       timeout: 3000,
       maxBuffer: 1024 * 1024,
       execFileAsync,

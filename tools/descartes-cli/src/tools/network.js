@@ -16,6 +16,7 @@ function truncate(value, max = 4096) {
 
 async function runFixedCommand(command, args, options = {}) {
   const result = await runResolvedExecFile(command, args, {
+    ...options,
     timeout: options.timeout ?? 2500,
     maxBuffer: options.maxBuffer ?? 1024 * 512,
     execFileAsync,
@@ -205,9 +206,9 @@ export function parseMacLsofListeningSockets(stdout, { limit = 50 } = {}) {
   return parseMacLsofListeningSocketsDetailed(stdout, { limit }).entries;
 }
 
-async function collectDefaultRoutes() {
+async function collectDefaultRoutes(options = {}) {
   if (process.platform === "linux") {
-    const command = await runFixedCommand("ip", ["route", "show", "default"]);
+    const command = await runFixedCommand("ip", ["route", "show", "default"], options);
     return {
       status: command.status,
       routes: command.status === "ok" ? parseLinuxDefaultRoutes(command.stdout) : [],
@@ -217,7 +218,7 @@ async function collectDefaultRoutes() {
     };
   }
   if (process.platform === "darwin") {
-    const command = await runFixedCommand("route", ["-n", "get", "default"]);
+    const command = await runFixedCommand("route", ["-n", "get", "default"], options);
     return {
       status: command.status,
       routes: command.status === "ok" ? parseMacDefaultRoute(command.stdout) : [],
@@ -229,7 +230,7 @@ async function collectDefaultRoutes() {
   return { status: "unsupported", routes: [], error: `unsupported platform: ${process.platform}` };
 }
 
-async function collectDnsResolvers() {
+async function collectDnsResolvers(options = {}) {
   if (process.platform === "linux") {
     try {
       return { status: "ok", resolvers: parseResolvConf(await fs.readFile("/etc/resolv.conf", "utf8")), sources: ["/etc/resolv.conf"] };
@@ -238,7 +239,7 @@ async function collectDnsResolvers() {
     }
   }
   if (process.platform === "darwin") {
-    const command = await runFixedCommand("scutil", ["--dns"], { timeout: 2500, maxBuffer: 1024 * 512 });
+    const command = await runFixedCommand("scutil", ["--dns"], { ...options, timeout: 2500, maxBuffer: 1024 * 512 });
     return {
       status: command.status,
       resolvers: command.status === "ok" ? parseScutilDns(command.stdout) : [],
@@ -278,9 +279,9 @@ async function lookupWithTimeout(target, timeoutMs = 2500) {
   }
 }
 
-async function collectListeningSockets(limit) {
+async function collectListeningSockets(limit, options = {}) {
   if (process.platform === "linux") {
-    const command = await runFixedCommand("ss", ["-H", "-ltnu"], { timeout: 2500, maxBuffer: 1024 * 512 });
+    const command = await runFixedCommand("ss", ["-H", "-ltnu"], { ...options, timeout: 2500, maxBuffer: 1024 * 512 });
     return {
       status: command.status,
       sockets: command.status === "ok" ? parseLinuxListeningSockets(command.stdout, { limit }) : [],
@@ -291,7 +292,7 @@ async function collectListeningSockets(limit) {
     };
   }
   if (process.platform === "darwin") {
-    const command = await runFixedCommand("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { timeout: 3500, maxBuffer: 1024 * 512 });
+    const command = await runFixedCommand("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { ...options, timeout: 3500, maxBuffer: 1024 * 512 });
     return {
       status: command.status,
       sockets: command.status === "ok" ? parseMacLsofListeningSockets(command.stdout, { limit }) : [],
@@ -304,13 +305,13 @@ async function collectListeningSockets(limit) {
   return { status: "unsupported", sockets: [], error: `unsupported platform: ${process.platform}`, truncated: false };
 }
 
-export async function collectNetworkEvidence({ checkDnsReachability = true, socketLimit = 50 } = {}) {
+export async function collectNetworkEvidence({ checkDnsReachability = true, socketLimit = 50, ...options } = {}) {
   const boundedSocketLimit = Math.min(Math.max(Number(socketLimit) || 50, 1), 200);
   return timedEnvelope(async () => {
     const [defaultRoutes, dnsResolvers, listeningSockets, dnsReachability] = await Promise.all([
-      collectDefaultRoutes(),
-      collectDnsResolvers(),
-      collectListeningSockets(boundedSocketLimit),
+      collectDefaultRoutes(options),
+      collectDnsResolvers(options),
+      collectListeningSockets(boundedSocketLimit, options),
       checkDnsReachability ? lookupWithTimeout(DNS_LOOKUP_TARGET) : Promise.resolve({ status: "skipped", target: DNS_LOOKUP_TARGET, network_probe: false }),
     ]);
 

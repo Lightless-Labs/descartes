@@ -7,7 +7,7 @@ import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
 
-async function collectSwap() {
+async function collectSwap(options = {}) {
   if (process.platform === "linux") {
     try {
       const meminfo = await fs.readFile("/proc/meminfo", "utf8");
@@ -28,6 +28,7 @@ async function collectSwap() {
   if (process.platform === "darwin") {
     try {
       const result = await runResolvedExecFile("sysctl", ["vm.swapusage"], {
+        ...options,
         timeout: 2000,
         maxBuffer: 1024 * 64,
         execFileAsync,
@@ -56,12 +57,12 @@ async function collectSwap() {
   return { unable: `unsupported platform: ${process.platform}` };
 }
 
-export async function collectSystemEvidence() {
+export async function collectSystemEvidence(options = {}) {
   return timedEnvelope(async () => {
     const cpus = os.cpus();
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
-    const swap = await collectSwap();
+    const swap = await collectSwap(options);
 
     return {
       hostname: os.hostname(),

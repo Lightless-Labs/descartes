@@ -61,6 +61,11 @@ async function runFixedExecFile(command, args, options = {}) {
   });
 }
 
+function probeOptions(options, overrides = {}) {
+  const { runFixedExecFile: _injectedRunner, ...resolverOptions } = options;
+  return { ...resolverOptions, ...overrides };
+}
+
 function isPermissionDenied(probe) {
   if (probe.code === "EACCES" || probe.code === "EPERM") return true;
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`.toLowerCase();
@@ -93,7 +98,7 @@ export function parseWhoOutput(stdout) {
 
 async function collectSshWho(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("who", [], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("who", [], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (probe.status === "ok") {
     const { entries } = parseWhoOutput(probe.stdout);
     return { status: "ok", entries, command: probe.command, binary: probe.binary };
@@ -149,7 +154,7 @@ export function parseLastOutput(stdout) {
 async function collectSshLast(options) {
   const n = Math.max(1, Number(options.lastHistoryLimit) || DEFAULT_LAST_HISTORY_LIMIT);
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("last", ["-n", String(n)], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("last", ["-n", String(n)], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (probe.status === "ok") {
     const { entries, malformed_count } = parseLastOutput(probe.stdout);
     return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
@@ -184,16 +189,16 @@ async function collectSshLast(options) {
 // ---------------------------------------------------------------------------------------------
 
 async function wgShowInterfaces(runExec, options) {
-  return runExec("wg", ["show", "interfaces"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", "interfaces"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowPeers(runExec, iface, options) {
-  return runExec("wg", ["show", iface, "peers"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", iface, "peers"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowEndpoints(runExec, iface, options) {
-  return runExec("wg", ["show", iface, "endpoints"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", iface, "endpoints"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowLatestHandshakes(runExec, iface, options) {
-  return runExec("wg", ["show", iface, "latest-handshakes"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", iface, "latest-handshakes"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 
 export function parseWgInterfaceList(stdout) {
@@ -358,7 +363,7 @@ async function collectVpnServices(options) {
   if (platform !== "darwin") return { status: "not_applicable", services: [] };
 
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("scutil", ["--nc", "list"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("scutil", ["--nc", "list"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [], binary: probe.binary };
   if (probe.status !== "ok") {
     if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", services: [], error: probe.error, binary: probe.binary };
@@ -387,7 +392,7 @@ async function collectEstablishedInbound(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
 
   if (platform === "linux") {
-    const probe = await runExec("ss", ["-H", "-tn", "state", "established"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+    const probe = await runExec("ss", ["-H", "-tn", "state", "established"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
     if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
     if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
     if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
@@ -395,7 +400,7 @@ async function collectEstablishedInbound(options) {
     return { status: "ok", count: lines.length, binary: probe.binary };
   }
 
-  const probe = await runExec("netstat", ["-an", "-p", "tcp"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("netstat", ["-an", "-p", "tcp"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
   if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };

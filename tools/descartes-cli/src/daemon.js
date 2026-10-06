@@ -350,16 +350,16 @@ export function metricPointsFromEvidence(evidence, options = {}) {
   return points;
 }
 
-export async function collectDaemonEvidence(profile = defaultDaemonProfile(), collectors = {}) {
+export async function collectDaemonEvidence(profile = defaultDaemonProfile(), collectors = {}, options = {}) {
   const activeCollectors = {
     system: collectors.system ?? collectSystemEvidence,
     processes: collectors.processes ?? collectProcessEvidence,
     disks: collectors.disks ?? collectDiskEvidence,
   };
   const evidence = [];
-  if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system());
-  if (profile.collectors.processes?.enabled) evidence.push(await activeCollectors.processes({ limit: profile.collectors.processes.limit ?? DEFAULT_DAEMON_PROCESS_LIMIT }));
-  if (profile.collectors.disks?.enabled) evidence.push(await activeCollectors.disks());
+  if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system(options));
+  if (profile.collectors.processes?.enabled) evidence.push(await activeCollectors.processes({ limit: profile.collectors.processes.limit ?? DEFAULT_DAEMON_PROCESS_LIMIT, ...options }));
+  if (profile.collectors.disks?.enabled) evidence.push(await activeCollectors.disks(options));
   return evidence;
 }
 
@@ -392,16 +392,20 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
   };
   const evidence = [];
-  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
-  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network());
-  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
-  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
-  const collectorOptions = { trustedBinaryPaths: options.trustedBinaryPaths ?? [] };
+  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(options));
+  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network(options));
+  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"](options));
+  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance(options));
+  const collectorOptions = {
+    ...options,
+    trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    writerMembershipCache: options.writerMembershipCache ?? {},
+  };
   if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
   if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
-  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"]());
-  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary());
-  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"]());
+  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"](options));
+  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary(options));
+  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"](options));
   return evidence;
 }
 
@@ -923,7 +927,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  const evidence = await collectDaemonEvidence(profile, options.collectors);
+  const collectorOptions = {
+    trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+    writerMembershipCache: {},
+  };
+  const evidence = await collectDaemonEvidence(profile, options.collectors, collectorOptions);
   const points = metricPointsFromEvidence(evidence, { ts });
   // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
   // degrades this tick's write result to an honest zero rather than aborting the entire tick
@@ -983,9 +991,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           };
         }
         const outcome = await withDeadline(
-          collectStructuralEvidence(structuralProfile, structuralCollectors, {
-            trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
-          }),
+          collectStructuralEvidence(structuralProfile, structuralCollectors, collectorOptions),
           deadlineMs,
           () => STRUCTURAL_TICK_TIMED_OUT,
         );

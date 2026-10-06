@@ -34,6 +34,7 @@ function truncate(value, max = 2048) {
 
 async function runFixedCommand(command, args, options = {}) {
   const result = await runResolvedExecFile(command, args, {
+    ...options,
     timeout: options.timeout ?? 3500,
     maxBuffer: options.maxBuffer ?? 1024 * 1024,
     execFileAsync,
@@ -295,12 +296,12 @@ async function listCronDirectory(directory, { source, schedule, limit }) {
   }
 }
 
-async function collectCronJobs({ limit, includeSystem, includeUser }) {
+async function collectCronJobs({ limit, includeSystem, includeUser, resolverOptions }) {
   const probes = [];
   const jobs = [];
 
   if (includeUser) {
-    const userCrontab = await runFixedCommand("crontab", ["-l"]);
+    const userCrontab = await runFixedCommand("crontab", ["-l"], resolverOptions);
     const noCrontab = userCrontab.status !== "ok" && /no crontab/i.test(`${userCrontab.stderr}\n${userCrontab.stdout}\n${userCrontab.error ?? ""}`);
     const parsedJobs = userCrontab.status === "ok"
       ? parseCronContent(userCrontab.stdout, { source: "user_crontab", path: "crontab -l", hasUserField: false })
@@ -364,17 +365,17 @@ async function collectCronJobs({ limit, includeSystem, includeUser }) {
   return { jobs, probes };
 }
 
-async function collectSystemdTimers({ limit, includeSystem, includeUser }) {
+async function collectSystemdTimers({ limit, includeSystem, includeUser, resolverOptions }) {
   const probes = [];
   const jobs = [];
   if (includeSystem) {
-    const command = await runFixedCommand("systemctl", ["list-timers", "--all", "--no-pager", "--no-legend"]);
+    const command = await runFixedCommand("systemctl", ["list-timers", "--all", "--no-pager", "--no-legend"], resolverOptions);
     const parsed = command.status === "ok" ? parseSystemctlListTimers(command.stdout, { scope: "system" }) : [];
     jobs.push(...parsed);
     probes.push({ source: "systemd_timers", status: command.status, command: command.command, stderr: command.stderr, error: command.error, job_count: parsed.length });
   }
   if (includeUser) {
-    const command = await runFixedCommand("systemctl", ["--user", "list-timers", "--all", "--no-pager", "--no-legend"]);
+    const command = await runFixedCommand("systemctl", ["--user", "list-timers", "--all", "--no-pager", "--no-legend"], resolverOptions);
     const parsed = command.status === "ok" ? parseSystemctlListTimers(command.stdout, { scope: "user" }) : [];
     jobs.push(...parsed);
     probes.push({ source: "systemd_user_timers", status: command.status, command: command.command, stderr: command.stderr, error: command.error, job_count: parsed.length });
@@ -412,11 +413,11 @@ async function listLaunchdPlists({ limit, includeSystem, includeUser }) {
   return { files: files.slice(0, MAX_LAUNCHD_PLIST_CANDIDATES), probes };
 }
 
-async function collectLaunchdScheduledJobs({ limit, includeSystem, includeUser }) {
+async function collectLaunchdScheduledJobs({ limit, includeSystem, includeUser, resolverOptions }) {
   const { files, probes } = await listLaunchdPlists({ limit, includeSystem, includeUser });
   const jobs = [];
   for (const file of files) {
-    const command = await runFixedCommand("plutil", ["-convert", "json", "-o", "-", file.path], { timeout: 2500 });
+    const command = await runFixedCommand("plutil", ["-convert", "json", "-o", "-", file.path], { ...resolverOptions, timeout: 2500 });
     if (command.status !== "ok") {
       probes.push({ source: "launchd_plist", status: "unable", path: file.path, command: command.command, stderr: command.stderr, error: command.error, job_count: 0 });
       continue;
@@ -505,17 +506,18 @@ function reviewHint(result) {
 
 export async function collectScheduledJobsEvidence(options = {}) {
   const request = normalizeScheduledJobsRequest(options);
+  Object.defineProperty(request, "resolver_options", { value: options });
   return timedEnvelope(async () => {
-    const cron = await collectCronJobs({ limit: request.job_limit, includeSystem: request.include_system, includeUser: request.include_user });
+    const cron = await collectCronJobs({ limit: request.job_limit, includeSystem: request.include_system, includeUser: request.include_user, resolverOptions: request.resolver_options });
     let platformJobs = [];
     let platformProbes = [];
 
     if (process.platform === "linux") {
-      const timers = await collectSystemdTimers({ limit: request.job_limit, includeSystem: request.include_system, includeUser: request.include_user });
+      const timers = await collectSystemdTimers({ limit: request.job_limit, includeSystem: request.include_system, includeUser: request.include_user, resolverOptions: request.resolver_options });
       platformJobs = timers.jobs;
       platformProbes = timers.probes;
     } else if (process.platform === "darwin") {
-      const launchd = await collectLaunchdScheduledJobs({ limit: request.job_limit, includeSystem: request.include_system, includeUser: request.include_user });
+      const launchd = await collectLaunchdScheduledJobs({ limit: request.job_limit, includeSystem: request.include_system, includeUser: request.include_user, resolverOptions: request.resolver_options });
       platformJobs = launchd.jobs;
       platformProbes = launchd.probes;
     } else {

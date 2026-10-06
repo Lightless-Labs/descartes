@@ -240,8 +240,9 @@ async function collectPathSource(source, request) {
   }
 }
 
-async function runFixedCommand(command, args) {
+async function runFixedCommand(command, args, options = {}) {
   const result = await runResolvedExecFile(command, args, {
+    ...options,
     timeout: 5000,
     maxBuffer: MAX_COMMAND_BUFFER,
     execFileAsync,
@@ -254,8 +255,8 @@ async function runFixedCommand(command, args) {
   };
 }
 
-async function collectCommandSource(source, request) {
-  const command = await runFixedCommand(source.command, source.args);
+async function collectCommandSource(source, request, options = {}) {
+  const command = await runFixedCommand(source.command, source.args, options);
   const parsed = command.status === "ok"
     ? parseCertificateBundle(command.stdout, {
       source: source.id,
@@ -347,7 +348,7 @@ export async function collectCertificateEvidence(options = {}) {
     const sourceResults = [];
     for (const source of sourceDefinitions) {
       sourceResults.push(source.type === "command"
-        ? await collectCommandSource(source, request)
+        ? await collectCommandSource(source, request, options)
         : await collectPathSource(source, request));
     }
 

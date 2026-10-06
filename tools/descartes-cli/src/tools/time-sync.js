@@ -42,6 +42,7 @@ export function normalizeTimeSyncRequest(options = {}) {
 
 async function runFixedCommand(command, args, options = {}) {
   const result = await runResolvedExecFile(command, args, {
+    ...options,
     timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
     maxBuffer: options.maxBuffer ?? 512 * 1024,
     execFileAsync,
@@ -218,22 +219,22 @@ async function collectLinuxTimeSync(request) {
     "--property=NTPSynchronized",
     "--property=TimeUSec",
     "--property=RTCTimeUSec",
-  ]);
+  ], request.resolver_options);
   const showParsed = show.status === "ok" ? parseTimedatectlShow(show.stdout) : {};
   if (show.status === "ok") Object.assign(result, showParsed);
   probes.push({ source: "timedatectl_show", status: show.status, command: show.command, stderr: show.stderr, error: show.error, parsed: showParsed });
 
-  const status = await runFixedCommand("timedatectl", ["status", "--no-pager"]);
+  const status = await runFixedCommand("timedatectl", ["status", "--no-pager"], request.resolver_options);
   const statusParsed = status.status === "ok" ? parseTimedatectlStatus(status.stdout) : {};
   if (status.status === "ok") Object.assign(result, statusParsed);
   probes.push({ source: "timedatectl_status", status: status.status, command: status.command, stderr: status.stderr, error: status.error, parsed: statusParsed });
 
-  const chrony = await runFixedCommand("chronyc", ["tracking"]);
+  const chrony = await runFixedCommand("chronyc", ["tracking"], request.resolver_options);
   const chronyParsed = chrony.status === "ok" ? parseChronycTracking(chrony.stdout) : {};
   if (chrony.status === "ok") result.chrony = chronyParsed;
   probes.push({ source: "chronyc_tracking", status: chrony.status, optional: true, command: chrony.command, stderr: chrony.stderr, error: chrony.error, parsed: chronyParsed });
 
-  const ntpq = await runFixedCommand("ntpq", ["-pn"]);
+  const ntpq = await runFixedCommand("ntpq", ["-pn"], request.resolver_options);
   const peers = ntpq.status === "ok" ? parseNtpqPeers(ntpq.stdout) : [];
   if (ntpq.status === "ok") result.ntpq = { peers: peers.slice(0, 20), selected_peer: peers.find((peer) => peer.selected) };
   probes.push({ source: "ntpq_peers", status: ntpq.status, optional: true, command: ntpq.command, stderr: ntpq.stderr, error: ntpq.error, result_count: peers.length });
@@ -243,7 +244,7 @@ async function collectLinuxTimeSync(request) {
       probes.push({ source: "sntp_offset", status: "unable", optional: true, error: request.server_error, parsed: {} });
     } else {
       const server = request.server ?? "pool.ntp.org";
-      const sntp = await runFixedCommand("sntp", ["-t", "2", server], { timeout: 4000, network: true });
+      const sntp = await runFixedCommand("sntp", ["-t", "2", server], { ...request.resolver_options, timeout: 4000, network: true });
       const sntpParsed = sntp.status === "ok" ? parseSntpOutput(sntp.stdout) : {};
       if (sntp.status === "ok") result.sntp_offset = sntpParsed;
       probes.push({ source: "sntp_offset", status: sntp.status, optional: true, command: sntp.command, stderr: sntp.stderr, error: sntp.error, parsed: sntpParsed });
@@ -257,13 +258,13 @@ async function collectMacTimeSync(request) {
   const probes = [];
   const result = { platform: process.platform };
 
-  const launchctl = await runFixedCommand("launchctl", ["print", "system/com.apple.timed"]);
+  const launchctl = await runFixedCommand("launchctl", ["print", "system/com.apple.timed"], request.resolver_options);
   const launchctlParsed = launchctl.status === "ok" ? parseLaunchctlPrintService(launchctl.stdout) : {};
   if (launchctl.status === "ok") result.timed_service = launchctlParsed;
   probes.push({ source: "launchctl_timed", status: launchctl.status, command: launchctl.command, stderr: launchctl.stderr, error: launchctl.error, parsed: launchctlParsed });
 
-  const usingNetworkTime = normalizeSystemsetupResult(await runFixedCommand("systemsetup", ["-getusingnetworktime"]));
-  const networkServer = normalizeSystemsetupResult(await runFixedCommand("systemsetup", ["-getnetworktimeserver"]));
+  const usingNetworkTime = normalizeSystemsetupResult(await runFixedCommand("systemsetup", ["-getusingnetworktime"], request.resolver_options));
+  const networkServer = normalizeSystemsetupResult(await runFixedCommand("systemsetup", ["-getnetworktimeserver"], request.resolver_options));
   const systemsetupParsed = parseMacSystemsetup(`${usingNetworkTime.stdout}\n${networkServer.stdout}`);
   if (Object.keys(systemsetupParsed).length > 0) Object.assign(result, systemsetupParsed);
   probes.push({ source: "systemsetup_network_time", status: usingNetworkTime.status, command: usingNetworkTime.command, stderr: usingNetworkTime.stderr, error: usingNetworkTime.error, parsed: parseMacSystemsetup(usingNetworkTime.stdout) });
@@ -274,7 +275,7 @@ async function collectMacTimeSync(request) {
       probes.push({ source: "sntp_offset", status: "unable", optional: true, error: request.server_error, parsed: {} });
     } else {
       const server = request.server ?? result.network_time_server ?? "time.apple.com";
-      const sntp = await runFixedCommand("sntp", ["-t", "2", server], { timeout: 4000, network: true });
+      const sntp = await runFixedCommand("sntp", ["-t", "2", server], { ...request.resolver_options, timeout: 4000, network: true });
       const sntpParsed = sntp.status === "ok" ? parseSntpOutput(sntp.stdout) : {};
       if (sntp.status === "ok") result.sntp_offset = sntpParsed;
       probes.push({ source: "sntp_offset", status: sntp.status, optional: true, command: sntp.command, stderr: sntp.stderr, error: sntp.error, parsed: sntpParsed });
@@ -333,6 +334,7 @@ function reviewHint(result) {
 
 export async function collectTimeSyncEvidence(options = {}) {
   const request = normalizeTimeSyncRequest(options);
+  Object.defineProperty(request, "resolver_options", { value: options });
   return timedEnvelope(async () => {
     let collected;
     if (process.platform === "linux") collected = await collectLinuxTimeSync(request);

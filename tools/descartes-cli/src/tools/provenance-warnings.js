@@ -73,6 +73,7 @@ export const DEFAULT_PROVENANCE_FACT_WINDOW_MS = 3 * 60 * 60 * 1000; // 3 hours
 
 async function runFixedExecFile(command, args, options = {}) {
   const result = await runResolvedExecFile(command, args, {
+    ...options,
     timeout: options.timeout ?? 3000,
     maxBuffer: options.maxBuffer ?? 512 * 1024,
     execFileAsync,
@@ -564,7 +565,7 @@ export async function collectProvenanceWarningsEvidence(options = {}) {
       let executableInfo;
       if (narrowed) {
         narrowedCandidateCount += 1;
-        executableInfo = await resolveExeInfo(pid);
+        executableInfo = await resolveExeInfo(pid, options);
       }
 
       // Reuses detectWarnings verbatim so severity/confidence/message stay the canonical S3

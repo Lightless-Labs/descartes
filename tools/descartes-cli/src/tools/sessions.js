@@ -47,6 +47,11 @@ async function runFixedExecFile(command, args, options = {}) {
   });
 }
 
+function probeOptions(options, overrides = {}) {
+  const { runFixedExecFile: _injectedRunner, ...resolverOptions } = options;
+  return { ...resolverOptions, ...overrides };
+}
+
 /**
  * Pure parser for `tmux list-sessions -F` output in TMUX_FORMAT's tab-separated shape. Lines
  * that don't split into exactly 4 fields, or whose numeric fields don't parse, are skipped
@@ -138,7 +143,7 @@ export function parseScreenLs(stdout) {
 async function collectTmuxSessions(options = {}) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const args = ["list-sessions", "-F", TMUX_FORMAT];
-  const probe = await runExec("tmux", args, { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("tmux", args, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
   if (probe.status === "ok") {
     const parsed = parseTmuxSessions(probe.stdout);
@@ -168,7 +173,7 @@ async function collectTmuxSessions(options = {}) {
 async function collectScreenSessions(options = {}) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const args = ["-ls"];
-  const probe = await runExec("screen", args, { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("screen", args, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
   if (isBinaryNotFound(probe)) {
     return { multiplexer: "screen", status: "not_found_on_known_paths", sessions: [], command: probe.command, binary: probe.binary };

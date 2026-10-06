@@ -173,9 +173,10 @@ export function topProcessesBy(processes, key, limit) {
     .slice(0, limit);
 }
 
-async function getProcessSnapshot() {
+async function getProcessSnapshot(options = {}) {
   const args = psArgsForPlatform();
   const result = await runResolvedExecFile("ps", args, {
+    ...options,
     timeout: 3000,
     maxBuffer: 1024 * 1024,
     execFileAsync,
@@ -236,9 +237,9 @@ export function buildLineageEdges(processes = []) {
   };
 }
 
-export async function collectProcessLineageEvidence() {
+export async function collectProcessLineageEvidence(options = {}) {
   return timedEnvelope(async () => {
-    const { processes, command } = await getProcessSnapshot();
+    const { processes, command } = await getProcessSnapshot(options);
     const { edges, truncated } = buildLineageEdges(processes);
     return { edges, edge_count: edges.length, truncated, command };
   }, (result) => evidenceEnvelope({
@@ -252,8 +253,8 @@ export async function collectProcessLineageEvidence() {
   }));
 }
 
-async function runPs(limit) {
-  const { processes, command } = await getProcessSnapshot();
+async function runPs(limit, options = {}) {
+  const { processes, command } = await getProcessSnapshot(options);
   return {
     top_cpu: topProcessesBy(processes, "cpu_percent", limit),
     top_memory: topProcessesBy(processes, "memory_percent", limit),
@@ -405,8 +406,8 @@ export function buildParentTreeResult(processes, pid, maxDepth = 16, command = u
   };
 }
 
-export async function collectProcessEvidence({ limit = 10 } = {}) {
-  return timedEnvelope(async () => runPs(limit), (result) => evidenceEnvelope({
+export async function collectProcessEvidence({ limit = 10, ...options } = {}) {
+  return timedEnvelope(async () => runPs(limit, options), (result) => evidenceEnvelope({
     id: "top-processes",
     source: "process_table",
     result,
@@ -415,10 +416,10 @@ export async function collectProcessEvidence({ limit = 10 } = {}) {
   }));
 }
 
-export async function inspectProcessEvidence({ pid } = {}) {
+export async function inspectProcessEvidence({ pid, ...options } = {}) {
   const normalizedPid = normalizePid(pid);
   return timedEnvelope(async () => {
-    const { processes, command } = await getProcessSnapshot();
+    const { processes, command } = await getProcessSnapshot(options);
     const metadata = await linuxProcessMetadata(normalizedPid);
     return buildInspectProcessResult(processes, normalizedPid, command, metadata);
   }, (inspection) => evidenceEnvelope({
@@ -433,11 +434,11 @@ export async function inspectProcessEvidence({ pid } = {}) {
   }));
 }
 
-export async function inspectParentTreeEvidence({ pid, maxDepth = 16 } = {}) {
+export async function inspectParentTreeEvidence({ pid, maxDepth = 16, ...options } = {}) {
   const normalizedPid = normalizePid(pid);
   const boundedDepth = Math.min(Math.max(Number(maxDepth) || 16, 1), 64);
   return timedEnvelope(async () => {
-    const { processes, command } = await getProcessSnapshot();
+    const { processes, command } = await getProcessSnapshot(options);
     return buildParentTreeResult(processes, normalizedPid, boundedDepth, command);
   }, (inspection) => evidenceEnvelope({
     id: `process-parent-tree-${normalizedPid}`,

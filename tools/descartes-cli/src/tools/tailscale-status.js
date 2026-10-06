@@ -33,6 +33,11 @@ async function runFixedExecFile(command, args, options = {}) {
   });
 }
 
+function probeOptions(options, overrides = {}) {
+  const { runFixedExecFile: _injectedRunner, ...resolverOptions } = options;
+  return { ...resolverOptions, ...overrides };
+}
+
 function isPermissionDenied(probe) {
   if (probe.code === "EACCES" || probe.code === "EPERM") return true;
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`.toLowerCase();
@@ -107,7 +112,7 @@ export async function collectTailscaleStatusEvidence(options = {}) {
 
   return timedEnvelope(async () => {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;
-    const probe = await runExec("tailscale", ["status", "--json"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+    const probe = await runExec("tailscale", ["status", "--json"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
     if (isBinaryNotFound(probe)) return resultForFailure("not_found_on_known_paths", probe, { cap });
     if (probe.status !== "ok") {
