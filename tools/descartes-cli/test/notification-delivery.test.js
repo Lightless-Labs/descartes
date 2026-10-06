@@ -71,6 +71,23 @@ test("disabled delivery records a local audit without invoking adapters", async 
   assert.equal((await readNotificationDeliveryAudit(paths)).length, 1);
 });
 
+test("repeated identical delivery failures are coalesced and the audit stays bounded", async () => {
+  const paths = await tempPaths();
+  const options = {
+    now: "2026-05-29T00:01:00.000Z",
+    episodeKey: "default",
+    alertId: "alert_repeat",
+    ruleId: "system.memory.sustained_high",
+  };
+  await deliverNotificationDecision(paths, { notify: true, title: "Alert", body: "Body" }, options);
+  const second = await deliverNotificationDecision(paths, { notify: true, title: "Alert", body: "Body" }, { ...options, now: "2026-05-29T00:02:00.000Z" });
+  assert.equal(second.status, "disabled");
+  const audit = await readNotificationDeliveryAudit(paths);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].repeat_count, 2);
+  assert.equal(audit[0].last_ts, "2026-05-29T00:02:00.000Z");
+});
+
 test("enabled linux desktop delivery uses fixed notify-send command with injected runner", async () => {
   const paths = await tempPaths();
   await writeNotificationDeliveryConfig(paths, { enabled: true, channel: "linux-desktop" }, { now: "2026-05-29T00:00:00.000Z" });

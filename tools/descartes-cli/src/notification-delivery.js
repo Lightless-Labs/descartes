@@ -74,6 +74,7 @@ export function normalizeNotificationPayload(decision = {}, options = {}) {
   return {
     alert_id: options.alertId ? String(options.alertId) : undefined,
     rule_id: options.ruleId ? String(options.ruleId) : undefined,
+    episode_key: options.episodeKey ? String(options.episodeKey) : undefined,
     severity,
     title: clampString(decision.title, 80) || "Descartes alert",
     body: clampString(decision.body, 240) || "Descartes noticed a local system alert.",
@@ -241,6 +242,33 @@ function commandForPayload(channel, payload, options = {}) {
 async function appendDeliveryAudit(descartesPaths, record) {
   const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
   await ensureParent(auditFile);
+  const failure = ["error", "unavailable", "disabled"].includes(record.status);
+  if (failure) {
+    let lines = [];
+    try {
+      lines = (await fs.readFile(auditFile, "utf8")).split("\n").filter(Boolean);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const previous = lines.length > 0 ? (() => { try { return JSON.parse(lines.at(-1)); } catch { return undefined; } })() : undefined;
+    const sameFailure = previous && previous.status === record.status
+      && previous.channel === record.channel
+      && previous.reason === record.reason
+      && JSON.stringify(previous.payload ?? {}) === JSON.stringify(record.payload ?? {});
+    if (sameFailure) {
+      const coalesced = { ...previous, last_ts: record.ts, repeat_count: (previous.repeat_count ?? 1) + 1 };
+      lines[lines.length - 1] = JSON.stringify(coalesced);
+      const tmp = `${auditFile}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeFile(tmp, `${lines.slice(-1000).join("\n")}\n`, { mode: 0o600 });
+      await fs.rename(tmp, auditFile);
+      return coalesced;
+    }
+    lines.push(JSON.stringify(record));
+    const tmp = `${auditFile}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tmp, `${lines.slice(-1000).join("\n")}\n`, { mode: 0o600 });
+    await fs.rename(tmp, auditFile);
+    return record;
+  }
   await fs.appendFile(auditFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   return record;
 }

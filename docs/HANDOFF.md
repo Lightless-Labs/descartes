@@ -2,33 +2,23 @@
 
 **Last updated:** 2026-10-06
 
-## R3 notify-once delivery policy — 2026-10-06 — daybreak rework complete
+## R3 notify-once delivery policy — 2026-10-06 — daybreak rework in progress
 
-On branch `feat/notify-once-2026-10`, the daybreak-blue findings are fixed locally in the
-finding commits (`b4c239e`, `24ae174`, `86576d7`, `edfc7ba`, `0f46dce`, `6e1b777`) plus the
-delivery-audit reconciliation follow-up (`965e20c`):
+On branch `feat/notify-once-2026-10`, this rework removes generic material-evidence episode
+inference and all ignore lists. Episodes are `(alert id, incident_key ?? "default")`, with keys
+declared by the canary, correlation, and provenance producers where one alert identity can contain
+multiple incidents. Service/scheduled-job/lineage novelty and the other stable-fingerprint rules
+use the default key. Detection, candidate existence, coverage/recovery, and active-state scope are
+unchanged.
 
-- episode notification fields are committed only by a post-delivery, alert-store-locked
-  confirmation; failed, unavailable, skipped, thrown, timed-out, and budget-rejected work stays due;
-  repeated channel failures are visible through `delivery_failure_count`, timestamp, and reason;
-- LLM adjudication is separate: `notify:false` records adjudication fields and evidence digest but
-  never marks delivery, and the model reopens when material evidence or severity changes;
-- legacy migration uses only a successful notification-delivery audit record for the alert id at or
-  after current activation; `last_notified` alone is not proof, so missing audit evidence notifies
-  once after upgrade;
-- active/acknowledged/frozen records use a generic canonical material-evidence digest over sanitized
-  diagnostics, with per-rule allowlists of volatile fields to ignore. Port identity A→B, repeated
-  canary trips, and a new correlation anchor rearm; unchanged material evidence stays silent;
-- daemon and CLI alert-store writers share an O_EXCL lock with stale-lock reclamation; concurrent
-  recovered→active transitions are covered; unknown severities are preserved and rank above
-  `critical` for escalation comparison.
+The alert store now preserves missing legacy `episode_started_at` as missing, uses bounded
+owner-verified lock metadata (PID/start identity/boot ID/nonce), records delivery claims before
+delivery, and applies 1m→1h exponential failure backoff with coalesced failure audit rows. A lock
+timeout skips alert persistence and is written into daemon status. README documents the producer
+identity policy and the default-key audit.
 
-Detection, candidate generation, recovery/coverage, and persisted active-candidate scope were not
-changed by this work. Focused alert-store + alert-intelligence tests: **161/161** before the final
-lock/severity additions, **23/23** alert-store after them. Fresh-XDG full `npm test`: **2159 total /
-2103 pass / 22 sandbox or live-host failures / 34 skip**. The 22 failures are environment-only:
-20 loopback `listen EPERM` tests and 2 live macOS provenance checks returning `unknown` instead of
-`ok`; no changed-behavior test failed. No push or merge.
+Focused tests and the fresh-XDG full suite are still pending after the implementation changes. No
+push or merge.
 
 ## Review-fix update — 2026-10-05
 

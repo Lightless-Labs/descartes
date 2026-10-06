@@ -1243,6 +1243,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let mainExtraCandidates;
   let mainAlerts;
   let coveredAlertIds;
+  let alertPersistenceError;
   // Detector-reported recovery coverage (§8.B): the per-tick, owner-scoped map of the alert
   // identities each producer LABEL reported it genuinely evaluated this tick (Map<label,
   // Set<alertId>>). Populated by safeCandidates at the twelve detector call sites below and consumed
@@ -1408,10 +1409,25 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // call's ADDITIONAL always-excluded containment.recommend.* — withheld here because
         // containment is the only phase that legitimately evaluates it) and tier-ownership.
         coveredAlertIds,
+        lockTimeoutMs: options.lockTimeoutMs,
+        lockRetryMs: options.lockRetryMs,
       });
+    if (mainAlerts?.persistence_status === "lock_unavailable") {
+      alertPersistenceError = mainAlerts.persistence_error;
+      const failedStatus = {
+        ...status,
+        state: "error",
+        storage_write_error: combineErrors(status.storage_write_error, `alert-store: ${alertPersistenceError}`),
+      };
+      try {
+        status = await persistStatus(descartesPaths, failedStatus);
+      } catch {
+        status = failedStatus;
+      }
+    }
   }
   let alerts = mainAlerts;
-  if (mainAlerts) {
+  if (mainAlerts && !alertPersistenceError) {
     // Containment is a second phase: it consumes only the main evaluation's current active alerts
     // and notification-due IDs. Re-merge the first phase's candidates so shared recovery semantics
     // do not recover sibling alert families during the containment persistence pass.
@@ -1477,6 +1493,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       // itself threw, in which case failedLabels excludes its rule_ids just like any other
       // detector). §7.7 vetoes (history-untrusted, failed-detector, tier-ownership) apply identically.
       coveredAlertIds: containmentCoveredAlertIds,
+      lockTimeoutMs: options.lockTimeoutMs,
+      lockRetryMs: options.lockRetryMs,
     });
     alerts = {
       ...containmentAlerts,
@@ -1487,6 +1505,19 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         ...(containmentAlerts.notification_due_ids ?? []),
       ])],
     };
+    if (alerts?.persistence_status === "lock_unavailable") {
+      alertPersistenceError = alerts.persistence_error;
+      const failedStatus = {
+        ...status,
+        state: "error",
+        storage_write_error: combineErrors(status.storage_write_error, `alert-store: ${alertPersistenceError}`),
+      };
+      try {
+        status = await persistStatus(descartesPaths, failedStatus);
+      } catch {
+        status = failedStatus;
+      }
+    }
   }
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
   // (Decision 2) and therefore structurally can NEVER reach adjudicateAlertNotifications' LLM path
@@ -1504,7 +1535,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // false / no alerts), not `[]` -- emitSessionAlertSignals returns a delivery-result object, not a
   // candidate array.
   const emitSessionAlerts = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
-  const sessionAlertDelivery = alerts && options.deliverSessionAlerts !== false
+  const sessionAlertDelivery = alerts && !alertPersistenceError && options.deliverSessionAlerts !== false
     ? await safeCandidates(
         "session-alert-delivery",
         () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification }),
@@ -1529,7 +1560,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // — see emitMetricAlertFallbackSignals' own header comment for the full invariant-preservation
   // rationale. Same DI-seam + safeCandidates discipline as sessionAlertDelivery immediately above.
   const emitMetricFallback = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
-  const metricAlertFallback = alerts && options.deliverMetricAlertFallback !== false
+  const metricAlertFallback = alerts && !alertPersistenceError && options.deliverMetricAlertFallback !== false
     ? await safeCandidates(
         "metric-alert-fallback",
         () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig }),
@@ -1537,10 +1568,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       )
     : undefined;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
-  const alertIntelligence = alerts && options.adjudicateAlerts !== false
+  const alertIntelligence = alerts && !alertPersistenceError && options.adjudicateAlerts !== false
     ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig })
     : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, structuralEvidence, structuralFacts, shadowEvaluation };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

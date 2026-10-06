@@ -280,28 +280,42 @@ notifies again. De-escalation is silent. Recovery rearms the alert for one notif
 activation, and an acknowledgement does not suppress a later severity escalation. Episode fields
 are committed only after the delivery adapter returns a successful result (`delivered` or the
 explicit local `cli_only` result); disabled, unavailable, skipped, thrown, timed-out, and
-budget-rejected work stays due for retry. Delivery failures remain visible in `alerts list` and the
-JSON alert record through a bounded failure count, timestamp, and reason.
+budget-rejected work stays due for retry. Delivery failures use exponential retry backoff (1 minute,
+doubling to 1 hour), expose `delivery_failing_since`/`next_attempt_at`, and coalesce repeated
+identical failure-audit rows.
 
-An episode is also keyed by a material-evidence digest computed from the candidate's sanitized
-diagnostics. The digest canonicalizes all diagnostic fields and removes only the per-rule allowlisted
-volatile fields (observation/evaluation timestamps and detector counters that tick every evaluation),
-so incident identity fields remain material without a hand-written list of “what matters.” A digest
-change while an alert is active, acknowledged, or frozen starts a new episode; unchanged material
-evidence stays silent. The retired 15-minute re-notification cooldown is retained only as a legacy
-compatibility field.
+The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
+diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
+is:
 
-LLM adjudication is separate from delivery. A completed `notify:false` result records
-`adjudicated_at`, its evidence digest, and the false notification outcome, but never marks the
-operator as notified; the model is reconsidered when material evidence or severity changes.
-On upgrade, legacy episode state is derived only from a successful notification-delivery audit
-record for the alert id at or after its current activation. A legacy `last_notified` value without
-that audit evidence is treated as not notified, so it may notify once after upgrade.
+- `canary.tripped`: an opaque hash of canary id, trip reason, and observed trip timestamp, so
+  consecutive observed trips are separate incidents; `canary.tampered` remains `default` because
+  its fingerprint already represents the stable tamper condition.
+- `correlation.login_kill_proximity`: an opaque hash of anchor rule, anchor tick timestamp, and
+  peer identity; proximity, pool size, and prior-tick statistics are diagnostics only.
+- `provenance.port.new_public_bind`, `provenance.process.unknown_identity`, and
+  `provenance.process.identity_drift`: the producer's sanitized process identity hash, so a port
+  owner or process identity change is a new incident.
+- fixed daemon/system/disk rules and `constraint.violation.*`: `default`, because each alert id is
+  already the stable condition/fingerprint. Session and peer baseline deviations use `default` for
+  the same reason; their mean, max, count, z-score, and stability fields are never episode state.
+- service/scheduled-job/lineage novelty and credential-access rules: `default`, because their
+  entity/path fingerprint is already the novelty identity. Provenance warning observations,
+  containment recommendations, and canary tamper conditions likewise use their stable producer
+  fingerprint and do not promote changing diagnostics into incident identity.
 
-Alert-store read-modify-write operations use a shared O_EXCL lock with stale-lock reclamation for
-the daemon and CLI writers. Unknown/foreign severities are preserved and rank above `critical` for
-escalation comparison, so new severity values fail loud. The `adjudication.budget_exhausted`
-meta-signal is separate and keeps its own one-hour notification window.
+LLM adjudication is separate from delivery. A completed `notify:false` result records adjudication
+for the current episode but never marks the operator as notified. On upgrade, a record missing
+`episode_started_at` cannot prove current-activation delivery and is notified once; older audit rows
+are never promoted. Before delivery, the daemon records a locked delivery claim. A live claim is
+skipped by other evaluators, and confirmation or failure clears it.
+
+Alert-store read-modify-write operations use a bounded owner-verified lock. Lock metadata includes
+PID, process-start identity when available, boot ID when available, and a nonce; stale takeover is
+allowed only after the owner is provably gone, never from wall-clock age. Lock timeout fails closed,
+skips alert persistence for that tick, and records the persistence error in daemon status.
+Unknown/foreign severities are preserved and rank above `critical` for escalation comparison. The
+`adjudication.budget_exhausted` meta-signal is separate and keeps its own one-hour notification window.
 
 ## Self-learning and defensive detection (watch by default, author opt-in)
 
