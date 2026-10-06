@@ -91,6 +91,10 @@ export const DEFAULT_MIN_SAMPLE_COUNT = 30;
 // DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT value exactly.
 export const DEFAULT_SESSION_MIN_HISTORY_TICK_COUNT = 6;
 
+// Matches the daemon's active freshness fallback when this producer is invoked directly. The
+// daemon always supplies activeFreshnessMs from its resolved structural interval.
+export const DEFAULT_SESSION_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
+
 // A reasonable, undramatic smoothing constant for the persisted (but not v0-trigger-consuming,
 // see Decision 3's "EWMA's role, scoped explicitly") ewma/ewma_variance fields — not part of the
 // trigger math, so not flagged PROVISIONAL alongside the three sigma/floor constants above.
@@ -462,12 +466,22 @@ const SESSION_CHURN_ENTITY_KEY_PATTERN = /^session\.(?:tmux|screen)\.[0-9a-f]{16
  *     "excluding entities it skipped as ... stale / unevaluable"), are NOT reported — so the daemon
  *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
  */
-function evaluateSessionChurn(points = []) {
-  const groups = groupSessionFactsByTick(points);
+function sessionCensusReadiness(groups, { nowMs, freshnessMs = DEFAULT_SESSION_FRESHNESS_FALLBACK_MS } = {}) {
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  // `ready` (S6, I11): churn evaluates whenever at least one complete census tick exists -- with zero
-  // tracked sessions it evaluates and finds nothing, which is still "watching".
-  if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [], ready: false };
+  if (completeGroups.length === 0) return { gate: "no_complete_census", completeGroups };
+  if (!Number.isFinite(nowMs)) return { gate: "ok", completeGroups };
+  const latestMs = new Date(completeGroups[completeGroups.length - 1].ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale", completeGroups };
+  return { gate: "ok", completeGroups };
+}
+
+export function evaluateSessionChurn(points = [], { nowMs, freshnessMs = DEFAULT_SESSION_FRESHNESS_FALLBACK_MS } = {}) {
+  const groups = groupSessionFactsByTick(points);
+  const censusReadiness = sessionCensusReadiness(groups, { nowMs, freshnessMs });
+  const { completeGroups } = censusReadiness;
+  // `ready` (S6, I11): churn evaluates whenever at least one fresh complete census tick exists --
+  // with zero tracked sessions it evaluates and finds nothing, which is still "watching".
+  if (censusReadiness.gate !== "ok") return { churnEntries: [], evaluatedEntityKeys: [], ready: false, gate: censusReadiness.gate };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
 
@@ -566,7 +580,7 @@ function evaluateSessionChurn(points = []) {
       churnEntries.push({ entity_key: entityKey, prior_fingerprint: older.fingerprint, current_fingerprint: newer.fingerprint });
     }
   }
-  return { churnEntries, evaluatedEntityKeys, ready: true };
+  return { churnEntries, evaluatedEntityKeys, ready: true, gate: "ok" };
 }
 
 /**
@@ -575,8 +589,8 @@ function evaluateSessionChurn(points = []) {
  * which now ALSO computes which entity_keys were genuinely evaluated; see its doc comment). Every
  * existing caller and test that reads a bare churn-entry array keeps working through this wrapper.
  */
-export function detectSessionChurn(points = []) {
-  return evaluateSessionChurn(points).churnEntries;
+export function detectSessionChurn(points = [], options = {}) {
+  return evaluateSessionChurn(points, options).churnEntries;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -678,6 +692,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   const loadStore = options.loadSessionBaselineStore ?? loadSessionBaselineStore;
   const { state: persistedState, corrupt: corruptBaselineStore, missing: missingBaselineStore } = await loadStore(descartesPaths);
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_SESSION_FRESHNESS_FALLBACK_MS;
   const nowIso = new Date(nowMs).toISOString();
   const currentGroups = groups.filter((group) => {
     const groupMs = new Date(group.ts).getTime();
@@ -826,6 +841,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // the rule resumes on the very tick its certified span recovers.
   const dropHorizonOk = ruleHorizonOk(readResult, SESSION_COUNT_DROP_RULE_ID, nowMs);
   const churnHorizonOk = ruleHorizonOk(readResult, SESSION_CHURN_RULE_ID, nowMs);
+  const censusReadiness = sessionCensusReadiness(currentGroups, { nowMs, freshnessMs });
+  const censusFresh = censusReadiness.gate === "ok";
 
   const candidates = [];
   const evaluatedAlertKeys = [];
@@ -836,7 +853,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
     { deviationSigma, criticalSigma },
   );
-  if (dropCandidate && dropHorizonOk) candidates.push(dropCandidate);
+  if (dropCandidate && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
   // against the latest complete tick -- exactly the preconditions buildCountDropCandidate itself
@@ -847,7 +864,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
-  const dropKeys = dropEvaluated && dropHorizonOk ? [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] : [];
+  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] : [];
   evaluatedAlertKeys.push(...dropKeys);
 
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
@@ -860,10 +877,11 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   let churnReady = false;
   const churnKeys = [];
   if (churnHorizonOk) {
-    const { churnEntries, evaluatedEntityKeys, ready } = evaluateSessionChurn(currentPoints);
+    const { churnEntries, evaluatedEntityKeys, ready, gate } = evaluateSessionChurn(currentPoints, { nowMs, freshnessMs });
     churnReady = ready;
     candidates.push(...buildChurnCandidates(churnEntries));
     for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+    if (gate !== "ok") churnReady = false;
   }
   evaluatedAlertKeys.push(...churnKeys);
 
@@ -871,10 +889,14 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // above (display only; the daemon reads only candidates/evaluatedAlertKeys).
   const ruleEvaluations = {
     [SESSION_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
-      historyTrust, coldStartPendingThisTick, horizonOk: dropHorizonOk, readinessGate: dropEvaluated ? "ok" : "baseline_warming_up", evaluatedAlertKeys: dropKeys,
+      historyTrust, coldStartPendingThisTick, horizonOk: dropHorizonOk,
+      readinessGate: censusReadiness.gate === "latest_census_stale" ? "latest_census_stale" : dropEvaluated ? "ok" : "baseline_warming_up",
+      evaluatedAlertKeys: dropKeys,
     }),
     [SESSION_CHURN_RULE_ID]: buildRuleEvaluation({
-      historyTrust, coldStartPendingThisTick, horizonOk: churnHorizonOk, readinessGate: churnReady ? "ok" : "no_complete_census", evaluatedAlertKeys: churnKeys,
+      historyTrust, coldStartPendingThisTick, horizonOk: churnHorizonOk,
+      readinessGate: censusReadiness.gate === "latest_census_stale" ? "latest_census_stale" : churnReady ? "ok" : "no_complete_census",
+      evaluatedAlertKeys: churnKeys,
     }),
   };
   return { candidates, evaluatedAlertKeys, ruleEvaluations };

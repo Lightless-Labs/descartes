@@ -67,7 +67,7 @@ import { legacyFactStorePendingItems } from "./fact-store-migration.js";
 // running the watch-tier detectors themselves, read-only, on the same state the daemon's next fast
 // tick would see: the same family reads, the same persisted detector stores, the same `now`, the same
 // watch config, and the same options the daemon passes (activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE x
-// the structural interval to the four census detectors, nothing to session/peer). Every write seam is a
+// the structural interval to every census-dependent detector). Every write seam is a
 // no-op, so status never mutates anything. Each detector reports its own per-rule gates
 // (`ruleEvaluations`, fact-store-completeness.js buildRuleEvaluation): history trust, the persistent
 // cold-start lockout, the eligibility horizon (ruleHorizonOk / noveltyHorizonOk -- the same predicates
@@ -160,10 +160,8 @@ function hasIncompleteLatest(domain, groups) {
 
 // H1 (S6 review; I11 "a fresh complete latest group"): no complete census within the daemon's
 // freshness window (ACTIVE_FRESHNESS_MULTIPLE x the structural interval -- the same activeFreshnessMs
-// the four census detectors gate on), including a window with no complete census left at all. The
-// census rules stop on this (their latest_census_stale gate); the session and peer detectors apply no
-// freshness gate and keep evaluating on the last census for up to the fact window (31 days), so for
-// them this is the only signal that the collector is dead. Annotation only: it never changes a phase.
+// every census-dependent detector gates on), including a window with no complete census left at all.
+// A stale census stops every census-dependent rule and freezes its recovery coverage.
 function latestCompleteCensusStale(domain, groups, nowMs, activeFreshnessMs) {
   if (groups.length === 0) return false;
   const complete = completeGroups(domain, groups);
@@ -249,8 +247,8 @@ function establishedForDomain(domain, points, groups) {
 }
 
 // Each domain's detectors, with exactly the DI seams the daemon's call uses (daemon.js
-// runDaemonIteration: `detectorOptionsFor({ activeFreshnessMs })` for the four census detectors,
-// `detectorOptionsFor()` for session and peer). `freshness` mirrors which ones get activeFreshnessMs.
+// runDaemonIteration: `detectorOptionsFor({ activeFreshnessMs })` for every census-dependent
+// detector. `freshness` mirrors which producers get activeFreshnessMs.
 const DOMAIN_DEFINITIONS = [
   {
     domain: "service",
@@ -266,7 +264,7 @@ const DOMAIN_DEFINITIONS = [
     family: "session",
     group: groupSessionFactsByTick,
     producers: [
-      { label: "session", compute: computeSessionBaselineCandidates, loadKey: "loadSessionBaselineStore", load: loadSessionBaselineStore, writeKey: "writeSessionBaselineStore", freshness: false, rules: [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID] },
+      { label: "session", compute: computeSessionBaselineCandidates, loadKey: "loadSessionBaselineStore", load: loadSessionBaselineStore, writeKey: "writeSessionBaselineStore", freshness: true, rules: [SESSION_COUNT_DROP_RULE_ID, SESSION_CHURN_RULE_ID] },
     ],
   },
   {
@@ -274,7 +272,7 @@ const DOMAIN_DEFINITIONS = [
     family: "peer",
     group: groupPeerFactsByTick,
     producers: [
-      { label: "peer", compute: computePeerBaselineCandidates, loadKey: "loadPeerBaselineStore", load: loadPeerBaselineStore, writeKey: "writePeerBaselineStore", freshness: false, rules: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID] },
+      { label: "peer", compute: computePeerBaselineCandidates, loadKey: "loadPeerBaselineStore", load: loadPeerBaselineStore, writeKey: "writePeerBaselineStore", freshness: true, rules: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID] },
     ],
   },
   {
@@ -315,7 +313,7 @@ async function readDaemonRecord(descartesPaths, options) {
 // daemon last recorded; without a usable record it uses the daemon's default.
 //
 // NOT display-only (S6 review M3): the interval sets activeFreshnessMs, which decides
-// latest_census_stale vs watching for the four census rules. A recorded value is accepted only within
+// latest_census_stale vs watching for the census-dependent rules. A recorded value is accepted only within
 // the bounds validateDaemonProfile enforces before a daemon will run (a finite number >=
 // MIN_STRUCTURAL_INTERVAL_MS; the daemon has no upper bound, so neither does this). A value outside
 // them was not written by a running daemon, so status uses the default and says which source it used.

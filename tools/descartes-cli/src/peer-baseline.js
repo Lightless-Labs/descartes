@@ -79,6 +79,10 @@ const DEFAULT_PEER_EWMA_ALPHA = 2 / (DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
 // detector owning its own re-establishment tuning.
 export const DEFAULT_PEER_MIN_HISTORY_TICK_COUNT = 6;
 
+// Matches the daemon's active freshness fallback when this producer is invoked directly. The
+// daemon always supplies activeFreshnessMs from its resolved structural interval.
+export const DEFAULT_PEER_FRESHNESS_FALLBACK_MS = 3 * 60 * 60 * 1000;
+
 // ---------------------------------------------------------------------------------------------
 // Store I/O (atomic tmp+rename 0o600, corrupt-tolerant — mirrors session-baseline.js's own
 // loadSessionBaselineStore/writeSessionBaselineStore convention exactly, simpler shape: v0 has no
@@ -391,6 +395,14 @@ export function groupPeerFactsByTick(points = []) {
  */
 export function tickGroupDisposition(group) {
   return group.hasOverflow ? "overflow" : "complete";
+}
+
+function peerCensusReadiness(groups, { nowMs, freshnessMs = DEFAULT_PEER_FRESHNESS_FALLBACK_MS } = {}) {
+  const completeGroups = groups.filter((group) => tickGroupDisposition(group) === "complete");
+  if (completeGroups.length === 0 || !Number.isFinite(nowMs)) return { gate: "ok", completeGroups };
+  const latestMs = new Date(completeGroups[completeGroups.length - 1].ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale", completeGroups };
+  return { gate: "ok", completeGroups };
 }
 
 // Slice 4c (§2b): deliberately NOT unified with tickGroupDisposition above. Extending that
@@ -712,6 +724,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const loadStore = options.loadPeerBaselineStore ?? loadPeerBaselineStore;
   const { state: persistedState, corrupt: corruptBaselineStore, missing: missingBaselineStore } = await loadStore(descartesPaths);
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  const freshnessMs = options.activeFreshnessMs ?? DEFAULT_PEER_FRESHNESS_FALLBACK_MS;
   const nowIso = new Date(nowMs).toISOString();
   const currentGroups = groups.filter((group) => {
     const groupMs = new Date(group.ts).getTime();
@@ -877,12 +890,14 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // lockout/fold above are untouched, so it resumes on the tick its certified span recovers.
   const spikeHorizonOk = ruleHorizonOk(readResult, PEER_COUNT_SPIKE_RULE_ID, nowMs);
   const dropHorizonOk = ruleHorizonOk(readResult, PEER_COUNT_DROP_RULE_ID, nowMs);
+  const censusReadiness = peerCensusReadiness(currentGroups, { nowMs, freshnessMs });
+  const censusFresh = censusReadiness.gate === "ok";
   const candidates = [];
   const spikeCandidate = buildCountSpikeCandidate(
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
     { deviationSigma },
   );
-  if (spikeCandidate && spikeHorizonOk) candidates.push(spikeCandidate);
+  if (spikeCandidate && spikeHorizonOk && censusFresh) candidates.push(spikeCandidate);
   const dropCandidate = buildCountDropCandidate(
     { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
     { deviationSigma },
@@ -902,7 +917,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
         && groupMs > new Date(persistedState.cold_start_since_ts).getTime()
         && groupMs < scoredDropMs;
     }).length >= minHistoryTickCount);
-  if (dropCandidate && dropRecoveryReady && dropHorizonOk) candidates.push(dropCandidate);
+  if (dropCandidate && dropRecoveryReady && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
 
   // Detector-reported recovery coverage (plan §8.B/§8.C, peer recipe). evaluatedAlertKeys = the
   // alert identities this detector GENUINELY evaluated this tick -- every family it had
@@ -918,8 +933,8 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     too few marker-complete ticks have re-accumulated since the cold-start anchor (a
   //     count_drop-only warm-up the spike direction does not share), so gating drop on
   //     windowedDrop.confidence_state alone would fabricate a recovery.
-  const spikeKeys = windowed.confidence_state === "established" && spikeHorizonOk ? [alertId(PEER_COUNT_SPIKE_RULE_ID, "global")] : [];
-  const dropKeys = windowedDrop.confidence_state === "established" && dropRecoveryReady && dropHorizonOk ? [alertId(PEER_COUNT_DROP_RULE_ID, "global")] : [];
+  const spikeKeys = windowed.confidence_state === "established" && spikeHorizonOk && censusFresh ? [alertId(PEER_COUNT_SPIKE_RULE_ID, "global")] : [];
+  const dropKeys = windowedDrop.confidence_state === "established" && dropRecoveryReady && dropHorizonOk && censusFresh ? [alertId(PEER_COUNT_DROP_RULE_ID, "global")] : [];
   const evaluatedAlertKeys = [...spikeKeys, ...dropKeys];
   // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
   const ruleEvaluations = {
@@ -927,14 +942,14 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
       historyTrust,
       coldStartPendingThisTick,
       horizonOk: spikeHorizonOk,
-      readinessGate: windowed.confidence_state === "established" ? "ok" : "baseline_warming_up",
+      readinessGate: censusReadiness.gate === "latest_census_stale" ? "latest_census_stale" : windowed.confidence_state === "established" ? "ok" : "baseline_warming_up",
       evaluatedAlertKeys: spikeKeys,
     }),
     [PEER_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
       historyTrust,
       coldStartPendingThisTick,
       horizonOk: dropHorizonOk,
-      readinessGate: windowedDrop.confidence_state !== "established" ? "baseline_warming_up" : dropRecoveryReady ? "ok" : "drop_history_not_ready",
+      readinessGate: censusReadiness.gate === "latest_census_stale" ? "latest_census_stale" : windowedDrop.confidence_state !== "established" ? "baseline_warming_up" : dropRecoveryReady ? "ok" : "drop_history_not_ready",
       evaluatedAlertKeys: dropKeys,
     }),
   };
