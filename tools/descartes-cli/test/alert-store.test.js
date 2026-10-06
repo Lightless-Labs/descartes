@@ -705,13 +705,15 @@ test("concurrent alert-store writers serialize recovery and reactivation without
     extraCandidates: [],
     coveredAlertIds: new Set([candidate.id]),
   });
-  const reactivation = evaluateAndPersistAlerts(paths, {
+  // Let the recovery writer acquire the lock first, then overlap the reactivation writer while
+  // the first operation is still completing. The final state is intentionally the reactivation.
+  const reactivation = new Promise((resolve, reject) => setTimeout(() => evaluateAndPersistAlerts(paths, {
     now: "2026-10-06T00:02:00.000Z",
     historySummary: historySummary([]),
     daemonStatus: { state: "ok", ts: "2026-10-06T00:02:00.000Z" },
     extraCandidates: [candidate],
     coveredAlertIds: new Set([candidate.id]),
-  });
+  }).then(resolve, reject), 10));
   await Promise.all([recovery, reactivation]);
   const stored = (await readAlertRecords(paths)).find((alert) => alert.id === candidate.id);
   assert.equal(stored.status, "active", "the serialized recovered -> active transition must not be overwritten by stale state");
@@ -729,4 +731,28 @@ test("a stale alert-store lock is reclaimed", async () => {
   const result = applyAlertCandidates([], [{ id: "alert_stale_lock", rule_id: "system.memory.sustained_high", severity: "warning", title: "x", diagnostics: {} }], { now: "2026-10-06T00:00:00.000Z" });
   await writeAlertRecords(paths, result.alerts);
   assert.equal((await readAlertRecords(paths)).length, 1);
+});
+
+test("unknown severities rank above critical and are never coerced down", () => {
+  const candidate = {
+    id: "alert_unknown_severity",
+    rule_id: "foreign.future_rule",
+    fingerprint: "global",
+    severity: "emergency",
+    title: "Foreign severity",
+    summary: "Unknown severity must fail loud.",
+    diagnostics: { incident: "same" },
+  };
+  const existing = {
+    ...candidate,
+    severity: "critical",
+    last_notified: "2026-10-06T00:00:00.000Z",
+    episode_notified_at: "2026-10-06T00:00:00.000Z",
+    notified_severity_max: "critical",
+    first_seen: "2026-10-06T00:00:00.000Z",
+    last_seen: "2026-10-06T00:00:00.000Z",
+  };
+  const result = applyAlertCandidates([existing], [candidate], { now: "2026-10-06T00:01:00.000Z" });
+  assert.equal(result.alerts[0].severity, "emergency");
+  assert.deepEqual(result.notification_due_ids, [candidate.id]);
 });
