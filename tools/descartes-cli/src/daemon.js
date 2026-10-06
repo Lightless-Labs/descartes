@@ -1493,8 +1493,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // below — left unmitigated, this milestone's first alerting slice would never actively notify the
   // operator. This deterministic, non-LLM delivery branch (mirrors emitBudgetExhaustedSignal's own
   // "straight through deliverNotificationDecision, NEVER through the LLM" precedent) reuses the
-  // notification_due_ids/cooldown bookkeeping applyAlertCandidates already computed inside
-  // evaluateAndPersistAlerts above — no new cooldown machinery, no session/LLM construction.
+  // notification_due_ids/episode bookkeeping applyAlertCandidates already computed inside
+  // evaluateAndPersistAlerts above — no new episode machinery, no session/LLM construction.
   // Slice 4b Decision 3b (Fable review MUST-FIX 4): emitSessionAlertSignals now also delivers a
   // due peer.count_spike (also unknown_namespace, per Decision 3) through this identical branch —
   // the widened allowlist is composed inside alert-intelligence.js itself, not here.

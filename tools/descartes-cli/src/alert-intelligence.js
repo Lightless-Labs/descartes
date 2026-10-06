@@ -476,6 +476,8 @@ async function hasRecentBudgetExhaustedNotification(descartesPaths, now, windowM
 // very gate protects.
 async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, droppedCritical, deliverNotification }) {
   if (await hasRecentBudgetExhaustedNotification(descartesPaths, now)) {
+    // budget_exhausted is a meta-signal, not an alert episode; it intentionally retains its own
+    // one-hour delivery window.
     return { fired: false, reason: "cooldown" };
   }
   const severity = droppedCritical > 0 ? "critical" : "warning";
@@ -509,13 +511,13 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
 //     unrelated fail-closed namespace;
 //   - the decision handed to deliverNotificationDecision is hand-built and deterministic — never
 //     a session, never an LLM call;
-//   - reuses the notification_due_ids/cooldown state applyAlertCandidates already computed for
+//   - reuses the notification_due_ids/episode state applyAlertCandidates already computed for
 //     every candidate (including these two rule_ids) inside evaluateAndPersistAlerts — no new
-//     cooldown machinery. Correction, load-bearing (must-fix 3): applyAlertCandidates stamps
-//     last_notified/cooldown_until on a candidate even when nothing is actually delivered
-//     downstream — that stamp reflects only that the candidate was processed, not that any
-//     human-visible delivery happened. This function's own tests assert on an actual call into
-//     (or mock of) deliverNotificationDecision, never merely on the cooldown/last_notified fields;
+//     episode machinery. Correction, load-bearing (must-fix 3): applyAlertCandidates stamps
+//     episode notification state on a candidate even when nothing is actually delivered downstream
+//     — that stamp reflects only that the candidate was processed, not that any human-visible
+//     delivery happened. This function's own tests assert on an actual call into (or mock of)
+//     deliverNotificationDecision, never merely on persisted episode fields;
 //   - the delivered body is counts/hash-only for session.*/peer.* — never a raw session/peer
 //     identity, matching the sanitized diagnostics shape those candidate builders already produce.
 //     EXCEPTION (operator decision, 2026-07-24, scoped to service.disappeared ONLY): the delivered

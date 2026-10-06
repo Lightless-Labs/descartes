@@ -113,7 +113,7 @@ test("alert rules report missing and stale daemon samples", () => {
   assert(stale.some((candidate) => candidate.rule_id === "daemon.samples.stale"));
 });
 
-test("candidate application dedupes alerts, enforces cooldown, and recovers absent candidates", () => {
+test("candidate application notifies once per episode, escalates once, and rearms after recovery", () => {
   const first = applyAlertCandidates([], [{
     id: "alert_memory",
     rule_id: "system.memory.sustained_high",
@@ -123,22 +123,119 @@ test("candidate application dedupes alerts, enforces cooldown, and recovers abse
     summary: "High",
     evidence_refs: ["history-summary"],
     diagnostics: {},
-  }], { now: "2026-05-28T00:00:00.000Z", cooldownMs: 60_000 });
+  }], { now: "2026-05-28T00:00:00.000Z" });
   assert.equal(first.alerts.length, 1);
   assert.deepEqual(first.notification_due_ids, ["alert_memory"]);
   assert.equal(first.alerts[0].last_notified, "2026-05-28T00:00:00.000Z");
+  assert.equal(first.alerts[0].episode_started_at, "2026-05-28T00:00:00.000Z");
+  assert.equal(first.alerts[0].episode_notified_at, "2026-05-28T00:00:00.000Z");
+  assert.equal(first.alerts[0].notified_severity_max, "warning");
 
   const second = applyAlertCandidates(first.alerts, [{
     ...first.alerts[0],
     summary: "Still high",
-  }], { now: "2026-05-28T00:00:30.000Z", cooldownMs: 60_000 });
+  }], { now: "2026-05-28T05:00:00.000Z" });
   assert.equal(second.alerts.length, 1);
   assert.deepEqual(second.notification_due_ids, []);
   assert.equal(second.alerts[0].first_seen, "2026-05-28T00:00:00.000Z");
   assert.equal(second.alerts[0].summary, "Still high");
 
-  const recovered = applyAlertCandidates(second.alerts, [], { now: "2026-05-28T00:02:00.000Z", cooldownMs: 60_000 });
+  const escalated = applyAlertCandidates(second.alerts, [{
+    ...second.alerts[0],
+    severity: "critical",
+    title: "Critical memory pressure",
+  }], { now: "2026-05-28T05:01:00.000Z" });
+  assert.deepEqual(escalated.notification_due_ids, ["alert_memory"]);
+  assert.equal(escalated.alerts[0].notified_severity_max, "critical");
+  assert.equal(escalated.alerts[0].episode_notified_at, "2026-05-28T05:01:00.000Z");
+
+  const deescalated = applyAlertCandidates(escalated.alerts, [{
+    ...escalated.alerts[0],
+    severity: "warning",
+  }], { now: "2026-05-28T05:02:00.000Z" });
+  assert.deepEqual(deescalated.notification_due_ids, []);
+  assert.equal(deescalated.alerts[0].notified_severity_max, "critical");
+
+  const recovered = applyAlertCandidates(deescalated.alerts, [], { now: "2026-05-28T05:03:00.000Z" });
   assert.equal(recovered.alerts[0].status, "recovered");
+
+  const reactivated = applyAlertCandidates(recovered.alerts, [{
+    ...recovered.alerts[0],
+    severity: "warning",
+  }], { now: "2026-05-28T05:04:00.000Z" });
+  assert.deepEqual(reactivated.notification_due_ids, ["alert_memory"]);
+  assert.equal(reactivated.alerts[0].episode_started_at, "2026-05-28T05:04:00.000Z");
+  assert.equal(reactivated.alerts[0].notified_severity_max, "warning");
+});
+
+test("acknowledgement suppresses persistence but not a later severity escalation", () => {
+  const acknowledged = {
+    id: "alert_ack",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    status: "acknowledged",
+    severity: "warning",
+    title: "Memory high",
+    summary: "Still high",
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T01:00:00.000Z",
+    last_notified: "2026-05-28T00:00:00.000Z",
+    acknowledged_at: "2026-05-28T00:01:00.000Z",
+  };
+
+  const persistent = applyAlertCandidates([acknowledged], [{ ...acknowledged }], { now: "2026-05-28T05:00:00.000Z" });
+  assert.equal(persistent.alerts[0].status, "acknowledged");
+  assert.deepEqual(persistent.notification_due_ids, []);
+
+  const escalated = applyAlertCandidates(persistent.alerts, [{ ...persistent.alerts[0], severity: "critical" }], { now: "2026-05-28T05:01:00.000Z" });
+  assert.equal(escalated.alerts[0].status, "acknowledged");
+  assert.deepEqual(escalated.notification_due_ids, ["alert_ack"]);
+  assert.equal(escalated.alerts[0].notified_severity_max, "critical");
+});
+
+test("legacy active records with last_notified are already notified in their current episode", () => {
+  const legacy = {
+    id: "alert_legacy",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    status: "active",
+    severity: "warning",
+    title: "Memory high",
+    summary: "Still high",
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T01:00:00.000Z",
+    last_notified: "2026-05-28T00:00:00.000Z",
+  };
+
+  const persistent = applyAlertCandidates([legacy], [{ ...legacy }], { now: "2026-05-28T05:00:00.000Z" });
+  assert.deepEqual(persistent.notification_due_ids, []);
+  assert.equal(persistent.alerts[0].episode_started_at, "2026-05-28T00:00:00.000Z");
+  assert.equal(persistent.alerts[0].episode_notified_at, "2026-05-28T00:00:00.000Z");
+  assert.equal(persistent.alerts[0].notified_severity_max, "warning");
+
+  const escalated = applyAlertCandidates(persistent.alerts, [{ ...persistent.alerts[0], severity: "critical" }], { now: "2026-05-28T05:01:00.000Z" });
+  assert.deepEqual(escalated.notification_due_ids, ["alert_legacy"]);
+});
+
+test("a fixed alert active for five simulated days produces one notification", () => {
+  let alerts = [];
+  let notificationCount = 0;
+  for (let hour = 0; hour <= 5 * 24; hour += 1) {
+    const now = new Date(Date.UTC(2026, 4, 28, hour)).toISOString();
+    const result = applyAlertCandidates(alerts, [{
+      id: "alert_horizon_short",
+      rule_id: "daemon.fact_history.horizon_short",
+      fingerprint: "global",
+      severity: "warning",
+      title: "Fact history horizon is short",
+      summary: "The fact history is shorter than expected.",
+      diagnostics: {},
+    }], { now });
+    notificationCount += result.notification_due_ids.length;
+    alerts = result.alerts;
+  }
+  assert.equal(notificationCount, 1);
+  assert.equal(alerts[0].status, "active");
 });
 
 test("acknowledgement persists and suppresses re-notification while condition remains", async () => {

@@ -25,6 +25,7 @@ import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-b
 import { containmentRecommendationRuleIds } from "../src/containment-recommend.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
+import { applyAlertCandidates } from "../src/alert-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
@@ -1430,7 +1431,7 @@ test("emitSessionAlertSignals fires ONLY for session.* rule_ids — a due non-se
   assert.equal(deliveries[0].ruleId, SESSION_COUNT_DROP_RULE_ID);
 });
 
-test("emitSessionAlertSignals respects cooldown: an alert absent from notification_due_ids (a second tick within the cooldown window, per applyAlertCandidates) does not re-deliver", async () => {
+test("emitSessionAlertSignals only delivers alerts present in the episode-qualified due set", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const sessionAlert = alert({ id: "alert_session_count_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "warning", diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" } });
@@ -1439,11 +1440,45 @@ test("emitSessionAlertSignals respects cooldown: an alert absent from notificati
   const first = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [sessionAlert.id] }, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
   assert.deepEqual(first.fired, [sessionAlert.id]);
 
-  // A second tick within cooldown: applyAlertCandidates would NOT include this id in
-  // notification_due_ids again (see alert-store.js's notificationDue) — simulated here directly.
+  // A persistent second tick: applyAlertCandidates would NOT include this id in
+  // notification_due_ids again — simulated here directly.
   const second = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [] }, { now: "2026-07-14T00:05:00.000Z", deliverNotification });
   assert.deepEqual(second.fired, []);
   assert.equal(deliveries.length, 1, "must not re-deliver within the cooldown window");
+});
+
+test("deterministic local delivery follows episode notification state across persistence and escalation", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const deliverNotification = async (descartesPaths, decision, opts) => {
+    deliveries.push({ decision, opts });
+    return { status: "recorded" };
+  };
+  const candidate = {
+    id: "alert_session_episode",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: "global",
+    severity: "warning",
+    title: "Session count deviation",
+    summary: "Session count is below baseline.",
+    diagnostics: { observed_count: 5, mean_before: 20, z_score: -4, confidence_state: "established" },
+  };
+
+  let state = [];
+  const first = applyAlertCandidates(state, [candidate], { now: "2026-07-14T00:01:00.000Z" });
+  state = first.alerts;
+  await emitSessionAlertSignals(paths, first, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+
+  const persistent = applyAlertCandidates(state, [{ ...candidate, summary: "Still below baseline." }], { now: "2026-07-15T00:01:00.000Z" });
+  state = persistent.alerts;
+  await emitSessionAlertSignals(paths, persistent, { now: "2026-07-15T00:01:00.000Z", deliverNotification });
+
+  const escalated = applyAlertCandidates(state, [{ ...candidate, severity: "critical", summary: "Session count collapsed." }], { now: "2026-07-15T00:02:00.000Z" });
+  await emitSessionAlertSignals(paths, escalated, { now: "2026-07-15T00:02:00.000Z", deliverNotification });
+
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.equal(deliveries[1].decision.severity, "critical");
 });
 
 test("emitSessionAlertSignals: last_notified/cooldown_until being present on the alert record is NOT itself treated as delivery evidence — only an actual deliverNotification call counts", async () => {
@@ -1985,7 +2020,7 @@ test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due 
   assert.equal(deliveries.length, 0);
 });
 
-test("emitSessionAlertSignals respects cooldown for peer.count_spike too: an alert absent from notification_due_ids does not re-deliver", async () => {
+test("emitSessionAlertSignals respects the episode-qualified due set for peer.count_spike", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const peerAlert = alert({ id: "alert_peer_count_spike", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
@@ -2247,7 +2282,7 @@ test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due 
   assert.equal(deliveries.length, 0);
 });
 
-test("emitSessionAlertSignals respects cooldown for service.disappeared too: an alert absent from notification_due_ids does not re-deliver", async () => {
+test("emitSessionAlertSignals respects the episode-qualified due set for service.disappeared", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const serviceAlert = alert({ id: "alert_service_disappeared", rule_id: SERVICE_DISAPPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 } });
@@ -3138,4 +3173,3 @@ test("budget: a REAL elapsed hour frees the trailing-hour LLM-call budget (ordin
   assert.equal(second.status, "ok", "a genuinely-elapsed hour must still free the budget -- the fix must not regress ordinary aging-out");
   assert.equal(prompts.length, 2);
 });
-

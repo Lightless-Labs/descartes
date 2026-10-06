@@ -6,6 +6,11 @@ import { buildHistorySummary, readDaemonStatus } from "./history-store.js";
 export const DEFAULT_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
 
+// Retained as a compatibility export for the historical alert-config constraint and callers that
+// import the old symbol. Alert delivery no longer uses this value: episode state below is the only
+// notification policy for ordinary alerts. The budget_exhausted meta-signal keeps its own one-hour
+// delivery window in alert-intelligence.js.
+
 export function resolveAlertStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "alerts");
   return {
@@ -193,20 +198,35 @@ export function normalizeAlertRecord(record) {
   const fingerprint = String(record.fingerprint ?? "global");
   const firstSeen = normalizeIso(record.first_seen ?? record.last_seen ?? new Date().toISOString(), "first_seen");
   const lastSeen = normalizeIso(record.last_seen ?? firstSeen, "last_seen");
+  const status = ["active", "recovered", "acknowledged", "suppressed"].includes(record.status) ? record.status : "active";
+  const lastNotified = record.last_notified ? normalizeIso(record.last_notified, "last_notified") : null;
+  const episodeNotifiedAt = record.episode_notified_at
+    ? normalizeIso(record.episode_notified_at, "episode_notified_at")
+    : lastNotified;
+  const notifiedSeverityMax = ["info", "warning", "critical"].includes(record.notified_severity_max)
+    ? record.notified_severity_max
+    : episodeNotifiedAt && ["info", "warning", "critical"].includes(record.severity)
+      ? record.severity
+      : null;
   return {
     id: String(record.id ?? alertId(ruleId, fingerprint)),
     rule_id: ruleId,
     fingerprint,
-    status: ["active", "recovered", "acknowledged", "suppressed"].includes(record.status) ? record.status : "active",
+    status,
     severity: ["info", "warning", "critical"].includes(record.severity) ? record.severity : "warning",
     title: String(record.title ?? ruleId),
     summary: String(record.summary ?? ""),
     evidence_refs: Array.isArray(record.evidence_refs) ? record.evidence_refs.map(String).slice(0, 16) : [],
     first_seen: firstSeen,
     last_seen: lastSeen,
-    last_notified: record.last_notified ? normalizeIso(record.last_notified, "last_notified") : null,
+    last_notified: lastNotified,
     cooldown_until: record.cooldown_until ? normalizeIso(record.cooldown_until, "cooldown_until") : null,
     acknowledged_at: record.acknowledged_at ? normalizeIso(record.acknowledged_at, "acknowledged_at") : null,
+    episode_started_at: record.episode_started_at
+      ? normalizeIso(record.episode_started_at, "episode_started_at")
+      : status === "recovered" ? null : firstSeen,
+    notified_severity_max: notifiedSeverityMax,
+    episode_notified_at: episodeNotifiedAt,
     diagnostics: record.diagnostics && typeof record.diagnostics === "object" && !Array.isArray(record.diagnostics) ? record.diagnostics : {},
   };
 }
@@ -260,17 +280,27 @@ export async function writeAlertRecords(descartesPaths, alerts) {
   return normalized;
 }
 
-function notificationDue(alert, nowMs) {
-  if (["acknowledged", "suppressed", "recovered"].includes(alert.status)) return false;
-  if (!alert.last_notified) return true;
-  const cooldownMs = alert.cooldown_until ? new Date(alert.cooldown_until).getTime() : undefined;
-  return Number.isFinite(cooldownMs) ? nowMs >= cooldownMs : false;
+const ALERT_SEVERITY_RANK = { info: 0, warning: 1, critical: 2 };
+
+function notificationDue(alert, { newEpisode = false, previousAlert } = {}) {
+  if (["suppressed", "recovered"].includes(alert.status)) return false;
+  if (newEpisode) return true;
+
+  const notifiedMax = ALERT_SEVERITY_RANK[alert.notified_severity_max];
+  if (Number.isFinite(notifiedMax)) {
+    return ALERT_SEVERITY_RANK[alert.severity] > notifiedMax;
+  }
+
+  // An operator acknowledgement suppresses ordinary persistence, including a legacy record that
+  // has not yet acquired episode fields. A higher severity is still a new security-relevant change.
+  if (previousAlert?.status === "acknowledged" || alert.status === "acknowledged") {
+    return ALERT_SEVERITY_RANK[alert.severity] > ALERT_SEVERITY_RANK[previousAlert?.severity];
+  }
+  return true;
 }
 
 export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
-  const nowMs = new Date(now).getTime();
-  const cooldownMs = options.cooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
   const byId = new Map(existingAlerts.map((alert) => [alert.id, normalizeAlertRecord(alert)]));
   const activeCandidateIds = new Set(candidates.map((candidate) => candidate.id));
   const notificationDueIds = [];
@@ -286,6 +316,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
 
   for (const candidate of candidates) {
     const current = byId.get(candidate.id);
+    const newEpisode = !current || current.status === "recovered";
     const base = current ?? normalizeAlertRecord({
       ...candidate,
       status: "active",
@@ -293,7 +324,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       last_seen: now,
     });
     const nextStatus = base.status === "acknowledged" || base.status === "suppressed" ? base.status : "active";
-    const next = normalizeAlertRecord({
+    let next = normalizeAlertRecord({
       ...base,
       ...candidate,
       status: nextStatus,
@@ -302,10 +333,16 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       acknowledged_at: nextStatus === "acknowledged" ? base.acknowledged_at : null,
       last_notified: base.last_notified,
       cooldown_until: base.cooldown_until,
+      episode_started_at: newEpisode ? now : base.episode_started_at,
+      notified_severity_max: newEpisode ? null : base.notified_severity_max,
+      episode_notified_at: newEpisode ? null : base.episode_notified_at,
     });
-    if (notificationDue(next, nowMs)) {
+    if (notificationDue(next, { newEpisode, previousAlert: current })) {
       next.last_notified = now;
-      next.cooldown_until = new Date(nowMs + cooldownMs).toISOString();
+      next.episode_notified_at = now;
+      if (next.notified_severity_max === null || ALERT_SEVERITY_RANK[next.severity] >= ALERT_SEVERITY_RANK[next.notified_severity_max]) {
+        next.notified_severity_max = next.severity;
+      }
       notificationDueIds.push(next.id);
     }
     byId.set(next.id, next);
