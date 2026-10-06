@@ -705,7 +705,7 @@ test("Slice 6 must-fix 2 (schema-pinned, strengthened per adversarial review): E
 // ---------------------------------------------------------------------------------------------
 
 test("buildCorrelationCandidate: severity is unconditionally 'warning' regardless of anchor.severity", () => {
-  const anchor = { rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", severity: "critical", first_seen_ms: Date.now() };
+  const anchor = { rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", severity: "critical", first_seen_ms: Date.now(), anchor_tick_ts: "2026-02-01T00:05:00.000Z" };
   const bestPeer = {
     point: { entity_key: "peer.wireguard.9999999999999999", attributes: { source_type: "wireguard", login_hour_bucket: "02" } },
     delta_ms: 1000,
@@ -716,6 +716,9 @@ test("buildCorrelationCandidate: severity is unconditionally 'warning' regardles
   assert.equal(candidate.diagnostics.anchor_severity, "critical");
   assert.equal(candidate.rule_id, CORRELATION_RULE_ID);
   assert.equal(candidate.id, alertId(CORRELATION_RULE_ID, `global__peer.wireguard.9999999999999999`));
+  const later = buildCorrelationCandidate({ ...anchor, anchor_tick_ts: "2026-02-01T00:45:00.000Z" }, bestPeer, 1);
+  const earlier = buildCorrelationCandidate({ ...anchor, anchor_tick_ts: "2026-02-01T00:05:00.000Z" }, bestPeer, 1);
+  assert.notEqual(earlier.incident_key, later.incident_key, "same-hour same-peer correlations use the anchor tick as episode identity");
 });
 
 // ---------------------------------------------------------------------------------------------

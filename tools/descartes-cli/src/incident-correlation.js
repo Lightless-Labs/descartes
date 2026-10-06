@@ -29,6 +29,7 @@
 //     no raw session name/peer host/IP/free-text ever reaches either field (must-fix 2).
 //   - Stored severity is capped at "warning" unconditionally in v0 (must-fix 7) -- the anchor's
 //     real severity is preserved only as the anchor_severity diagnostic, never inherited directly.
+import { createHash } from "node:crypto";
 import { alertId, readAlertRecords } from "./alert-store.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
@@ -103,6 +104,7 @@ export function findKillSideAnchors(alertRecords = [], { now, lookbackMs = DEFAU
       rule_id: alert.rule_id,
       fingerprint: alert.fingerprint ?? "global",
       first_seen: alert.first_seen,
+      anchor_tick_ts: alert.episode_started_at ?? alert.first_seen,
       first_seen_ms: firstSeenMs,
       severity: KNOWN_SEVERITIES.has(alert.severity) ? alert.severity : "warning",
     });
@@ -252,6 +254,10 @@ export function buildCorrelationCandidate(anchor, bestPeer, poolSize) {
   const peerObservedHourBucket = point.attributes?.login_hour_bucket ?? "unknown";
   const proximitySeconds = Math.round(bestPeer.delta_ms / 1000);
   const fingerprint = `${anchor.fingerprint}__${peerEntityKey}`;
+  const incident_key = createHash("sha256")
+    .update(`correlation.login_kill_proximity.incident:${anchor.rule_id}\0${anchor.anchor_tick_ts ?? anchor.first_seen}\0${peerEntityKey}`)
+    .digest("hex")
+    .slice(0, 16);
 
   const diagnostics = sanitizeDiagnostics({
     kill_rule_id: anchor.rule_id,
@@ -271,6 +277,9 @@ export function buildCorrelationCandidate(anchor, bestPeer, poolSize) {
     id: alertId(CORRELATION_RULE_ID, fingerprint),
     rule_id: CORRELATION_RULE_ID,
     fingerprint,
+    // The stable alert id identifies the anchor family/peer. The episode key identifies this
+    // particular anchor event so a second same-peer correlation with a later anchor tick notifies.
+    incident_key,
     severity: "warning", // must-fix 7: capped unconditionally, never anchor.severity.
     title: buildCorrelationTitle(anchor),
     summary: buildCorrelationSummary(anchor, peerSourceType, peerObservedHourBucket, proximitySeconds, poolSize),

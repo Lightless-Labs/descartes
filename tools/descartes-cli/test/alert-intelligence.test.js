@@ -396,7 +396,7 @@ test("enabled alert intelligence wakes fake LLM and records audited decision", a
   assert.equal(audit[0].decision.title, "Memory pressure is high");
 });
 
-test("notify:false is adjudication state, not delivery state, and reopens only for changed evidence", async () => {
+test("notify:false is adjudication state, not delivery state, and reopens only for a new producer episode", async () => {
   const paths = await tempPaths();
   const prompts = [];
   const candidate = alert({ diagnostics: { identity_hash: "identity-a", observed_at: "2026-10-06T00:00:00.000Z" } });
@@ -427,9 +427,16 @@ test("notify:false is adjudication state, not delivery state, and reopens only f
   });
   assert.equal(quietRun.status, "no_due_alerts");
 
+  const diagnosticOnly = applyAlertCandidates(await readAlertRecords(paths), [{
+    ...candidate,
+    diagnostics: { identity_hash: "identity-b", observed_at: "2026-10-06T00:03:00.000Z" },
+  }], { now: "2026-10-06T00:03:00.000Z" });
+  assert.deepEqual(diagnosticOnly.adjudication_due_ids, []);
+
   const changed = applyAlertCandidates(await readAlertRecords(paths), [{
     ...candidate,
-    diagnostics: { identity_hash: "identity-b" },
+    incident_key: "identity-b",
+    diagnostics: { identity_hash: "identity-b", observed_at: "2026-10-06T00:03:00.000Z" },
   }], { now: "2026-10-06T00:03:00.000Z" });
   assert.deepEqual(changed.adjudication_due_ids, [candidate.id]);
 });

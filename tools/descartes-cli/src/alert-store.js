@@ -2,11 +2,14 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { buildHistorySummary, readDaemonStatus } from "./history-store.js";
-import { readNotificationDeliveryAudit } from "./notification-delivery.js";
 
 export const DEFAULT_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
-const ALERT_STORE_LOCK_STALE_MS = 30_000;
+export const DEFAULT_ALERT_STORE_LOCK_TIMEOUT_MS = 5_000;
+export const DEFAULT_ALERT_STORE_LOCK_RETRY_MS = 10;
+export const DELIVERY_BACKOFF_BASE_MS = 60_000;
+export const DELIVERY_BACKOFF_CAP_MS = 60 * 60 * 1000;
+const PROCESS_CLAIMANT_ID = `${process.pid}:${crypto.randomUUID()}`;
 
 // Retained as a compatibility export for the historical alert-config constraint and callers that
 // import the old symbol. Alert delivery no longer uses this value: episode state below is the only
@@ -25,25 +28,121 @@ async function ensureAlertDir(descartesPaths) {
   await fs.mkdir(resolveAlertStorePaths(descartesPaths).dir, { recursive: true, mode: 0o700 });
 }
 
-async function withAlertStoreLock(descartesPaths, operation) {
+async function readBootId() {
+  try {
+    return (await fs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readProcessStartIdentity(pid) {
+  try {
+    const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return undefined;
+    const fieldsAfterComm = stat.slice(closeParen + 2).trim().split(/\s+/);
+    return fieldsAfterComm[19] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function currentOwnerMetadata() {
+  return {
+    pid: process.pid,
+    process_start_identity: (await readProcessStartIdentity(process.pid)) ?? null,
+    boot_id: (await readBootId()) ?? null,
+    nonce: crypto.randomUUID(),
+  };
+}
+
+function parseLockOwner(value) {
+  try {
+    const owner = JSON.parse(value);
+    if (!owner || typeof owner !== "object" || !Number.isInteger(owner.pid) || typeof owner.nonce !== "string" || !owner.nonce) return undefined;
+    return owner;
+  } catch {
+    return undefined;
+  }
+}
+
+async function ownerIsProvablyGone(owner) {
+  if (!owner) return false;
+  if (owner.boot_id) {
+    const bootId = await readBootId();
+    if (bootId && bootId !== owner.boot_id) return true;
+  }
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return true;
+    return false;
+  }
+  if (!owner.process_start_identity) return false;
+  const currentStart = await readProcessStartIdentity(owner.pid);
+  return Boolean(currentStart && currentStart !== owner.process_start_identity);
+}
+
+async function freshLockFile(dir, owner) {
+  const temp = path.join(dir, `alerts.json.lock.${process.pid}.${crypto.randomUUID()}.tmp`);
+  await fs.writeFile(temp, JSON.stringify(owner), { mode: 0o600, flag: "wx" });
+  return temp;
+}
+
+async function takeOverVerifiedStaleLock(dir, lockFile, staleOwner, owner) {
+  const takeoverGuard = `${lockFile}.takeover`;
+  try {
+    await fs.writeFile(takeoverGuard, JSON.stringify(owner), { mode: 0o600, flag: "wx" });
+  } catch (error) {
+    if (error?.code === "EEXIST") return false;
+    throw error;
+  }
+  let temp;
+  try {
+    temp = await freshLockFile(dir, owner);
+    let reread;
+    try {
+      reread = parseLockOwner(await fs.readFile(lockFile, "utf8"));
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+    if (!reread || reread.nonce !== staleOwner.nonce || !(await ownerIsProvablyGone(reread))) return false;
+    // The guard prevents another Descartes contender from racing this compare-and-replace.
+    // rename() then replaces the verified stale lock atomically; no wall-clock age is involved.
+    await fs.rename(temp, lockFile);
+    return true;
+  } finally {
+    if (temp) await fs.unlink(temp).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+    await fs.unlink(takeoverGuard).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+  }
+}
+
+export async function withAlertStoreLock(descartesPaths, operation, options = {}) {
   const { dir } = resolveAlertStorePaths(descartesPaths);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const lockFile = path.join(dir, "alerts.json.lock");
-  const owner = `${process.pid}:${crypto.randomUUID()}`;
+  const owner = await currentOwnerMetadata();
+  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_ALERT_STORE_LOCK_TIMEOUT_MS);
+  const takeoverGuard = `${lockFile}.takeover`;
   for (;;) {
     try {
-      const handle = await fs.open(lockFile, "wx", 0o600);
-      try {
-        await handle.writeFile(owner, "utf8");
-      } finally {
-        await handle.close();
-      }
+      await fs.access(takeoverGuard);
+      if (Date.now() >= deadline) throw new Error(`Alert store lock acquisition timed out after ${options.timeoutMs ?? DEFAULT_ALERT_STORE_LOCK_TIMEOUT_MS}ms`);
+      await new Promise((resolve) => setTimeout(resolve, options.retryMs ?? DEFAULT_ALERT_STORE_LOCK_RETRY_MS));
+      continue;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    try {
+      await fs.writeFile(lockFile, JSON.stringify(owner), { mode: 0o600, flag: "wx" });
       try {
         return await operation();
       } finally {
         try {
-          const currentOwner = await fs.readFile(lockFile, "utf8");
-          if (currentOwner === owner) await fs.unlink(lockFile);
+          const currentOwner = parseLockOwner(await fs.readFile(lockFile, "utf8"));
+          if (currentOwner?.nonce === owner.nonce) await fs.unlink(lockFile);
         } catch (error) {
           if (error?.code !== "ENOENT") throw error;
         }
@@ -51,15 +150,26 @@ async function withAlertStoreLock(descartesPaths, operation) {
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       try {
-        const stat = await fs.stat(lockFile);
-        if (Date.now() - stat.mtimeMs > ALERT_STORE_LOCK_STALE_MS) {
-          await fs.unlink(lockFile);
-          continue;
+        const staleOwner = parseLockOwner(await fs.readFile(lockFile, "utf8"));
+        if (staleOwner && await ownerIsProvablyGone(staleOwner)) {
+          if (await takeOverVerifiedStaleLock(dir, lockFile, staleOwner, owner)) {
+            try {
+              return await operation();
+            } finally {
+              try {
+                const currentOwner = parseLockOwner(await fs.readFile(lockFile, "utf8"));
+                if (currentOwner?.nonce === owner.nonce) await fs.unlink(lockFile);
+              } catch (releaseError) {
+                if (releaseError?.code !== "ENOENT") throw releaseError;
+              }
+            }
+          }
         }
       } catch (statError) {
         if (statError?.code !== "ENOENT") throw statError;
       }
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (Date.now() >= deadline) throw new Error(`Alert store lock acquisition timed out after ${options.timeoutMs ?? DEFAULT_ALERT_STORE_LOCK_TIMEOUT_MS}ms`);
+      await new Promise((resolve) => setTimeout(resolve, options.retryMs ?? DEFAULT_ALERT_STORE_LOCK_RETRY_MS));
     }
   }
 }
@@ -98,6 +208,18 @@ function pushCandidate(candidates, candidate) {
     evidence_refs: ["history-summary"],
     ...candidate,
   });
+}
+
+function normalizeIncidentKey(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (/^[A-Za-z0-9._:-]{1,128}$/.test(text)) return text;
+  return `sha256:${crypto.createHash("sha256").update(text).digest("hex")}`;
+}
+
+export function alertEpisodeKey(alertOrCandidate = {}) {
+  return normalizeIncidentKey(alertOrCandidate.incident_key) ?? "default";
 }
 
 // The complete, static set of rule_ids evaluateAlertRules() can ever produce. Used to scope
@@ -249,6 +371,7 @@ export function normalizeAlertRecord(record) {
     id: String(record.id ?? alertId(ruleId, fingerprint)),
     rule_id: ruleId,
     fingerprint,
+    incident_key: normalizeIncidentKey(record.incident_key),
     status,
     severity: record.severity === undefined || record.severity === null ? "warning" : String(record.severity),
     title: String(record.title ?? ruleId),
@@ -259,80 +382,36 @@ export function normalizeAlertRecord(record) {
     last_notified: lastNotified,
     cooldown_until: record.cooldown_until ? normalizeIso(record.cooldown_until, "cooldown_until") : null,
     acknowledged_at: record.acknowledged_at ? normalizeIso(record.acknowledged_at, "acknowledged_at") : null,
-    episode_started_at: record.episode_started_at
-      ? normalizeIso(record.episode_started_at, "episode_started_at")
-      : status === "recovered" ? null : firstSeen,
+    // A missing episode_started_at is meaningful legacy state: it cannot prove delivery after
+    // the current activation and must remain missing until applyAlertCandidates starts the upgrade
+    // episode. Never synthesize first_seen here.
+    episode_started_at: record.episode_started_at ? normalizeIso(record.episode_started_at, "episode_started_at") : null,
     notified_severity_max: notifiedSeverityMax,
     episode_notified_at: episodeNotifiedAt,
-    material_evidence_digest: String(record.material_evidence_digest ?? "").startsWith("v2:")
-      ? String(record.material_evidence_digest)
-      : materialEvidenceDigest(record),
     adjudicated_at: record.adjudicated_at ? normalizeIso(record.adjudicated_at, "adjudicated_at") : null,
-    adjudicated_evidence_digest: record.adjudicated_evidence_digest ? String(record.adjudicated_evidence_digest) : null,
+    adjudicated_episode_key: normalizeIncidentKey(record.adjudicated_episode_key),
     adjudication: record.adjudication && typeof record.adjudication === "object" && !Array.isArray(record.adjudication)
       ? { notify: record.adjudication.notify === true, severity: record.adjudication.severity === undefined ? undefined : String(record.adjudication.severity) }
       : null,
     delivery_failure_count: Number.isInteger(record.delivery_failure_count) && record.delivery_failure_count > 0 ? record.delivery_failure_count : 0,
     last_delivery_failure_at: record.last_delivery_failure_at ? normalizeIso(record.last_delivery_failure_at, "last_delivery_failure_at") : null,
     delivery_failure_reason: record.delivery_failure_reason ? String(record.delivery_failure_reason) : null,
+    delivery_failing_since: record.delivery_failing_since ? normalizeIso(record.delivery_failing_since, "delivery_failing_since") : null,
+    next_attempt_at: record.next_attempt_at ? normalizeIso(record.next_attempt_at, "next_attempt_at") : null,
+    delivery_claim: record.delivery_claim && typeof record.delivery_claim === "object" && !Array.isArray(record.delivery_claim)
+      && typeof record.delivery_claim.claimant_id === "string" && record.delivery_claim.claimant_id
+      ? {
+        episode_key: normalizeIncidentKey(record.delivery_claim.episode_key) ?? "default",
+        claimant_id: String(record.delivery_claim.claimant_id).slice(0, 200),
+        pid: Number.isInteger(record.delivery_claim.pid) ? record.delivery_claim.pid : undefined,
+        process_start_identity: record.delivery_claim.process_start_identity ? String(record.delivery_claim.process_start_identity).slice(0, 128) : undefined,
+        boot_id: record.delivery_claim.boot_id ? String(record.delivery_claim.boot_id).slice(0, 128) : undefined,
+        nonce: record.delivery_claim.nonce ? String(record.delivery_claim.nonce).slice(0, 128) : undefined,
+        claimed_at: record.delivery_claim.claimed_at ? normalizeIso(record.delivery_claim.claimed_at, "delivery_claim.claimed_at") : firstSeen,
+      }
+      : null,
     diagnostics: record.diagnostics && typeof record.diagnostics === "object" && !Array.isArray(record.diagnostics) ? record.diagnostics : {},
   };
-}
-
-export const MATERIAL_EVIDENCE_VOLATILE_FIELDS = Object.freeze({
-  "*": Object.freeze(["age_ms", "daemon_status_ts", "evaluation_ts", "newest_sample_ts", "now", "observation_ts", "observed_at", "timestamp", "ts", "window_ms"]),
-  "canary.tripped": Object.freeze(["age_ms", "evaluation_ts", "observation_ts", "observed_at", "timestamp", "ts"]),
-  "provenance.port.new_public_bind": Object.freeze(["age_ms", "evaluation_ts", "observation_ts", "observed_at", "stable_iteration_count", "stable_sample_count", "timestamp", "ts"]),
-  "correlation.login_kill_proximity": Object.freeze(["age_ms", "candidate_pool_size", "evaluation_ts", "observation_ts", "observed_at", "peer_novelty_prior_tick_count", "proximity_seconds", "timestamp", "ts"]),
-});
-
-function canonicalEvidence(value, ignoredFields) {
-  if (Array.isArray(value)) return value.map((entry) => canonicalEvidence(entry, ignoredFields));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.keys(value).sort()
-      .filter((key) => !ignoredFields.has(key))
-      .map((key) => [key, canonicalEvidence(value[key], ignoredFields)]));
-  }
-  return value;
-}
-
-export function materialEvidenceDigest(candidateOrRecord = {}) {
-  const diagnostics = candidateOrRecord?.diagnostics && typeof candidateOrRecord.diagnostics === "object"
-    ? candidateOrRecord.diagnostics
-    : {};
-  const volatileFields = new Set([
-    ...(MATERIAL_EVIDENCE_VOLATILE_FIELDS["*"] ?? []),
-    ...(MATERIAL_EVIDENCE_VOLATILE_FIELDS[candidateOrRecord?.rule_id] ?? []),
-  ]);
-  return `v2:${crypto.createHash("sha256")
-    .update(JSON.stringify(canonicalEvidence(diagnostics, volatileFields)))
-    .digest("hex")}`;
-}
-
-async function deriveLegacyDeliveryState(descartesPaths, alerts, legacyAlertIds = new Set()) {
-  if (alerts.length === 0) return alerts;
-  let audit = [];
-  try {
-    audit = await readNotificationDeliveryAudit(descartesPaths);
-  } catch (error) {
-    console.warn(`descartes: notification delivery audit unavailable (${error?.message ?? error}); legacy alerts remain due`);
-  }
-  return alerts.map((alert) => {
-    const activation = new Date(alert.episode_started_at ?? alert.first_seen).getTime();
-    const successful = audit
-      .filter((record) => record?.payload?.alert_id === alert.id && ["delivered", "cli_only"].includes(record.status))
-      .filter((record) => Number.isFinite(new Date(record.ts).getTime()) && new Date(record.ts).getTime() >= activation)
-      .sort((left, right) => String(right.ts).localeCompare(String(left.ts)))[0];
-    if (!successful && legacyAlertIds.has(alert.id)) {
-      return normalizeAlertRecord({ ...alert, episode_notified_at: null, notified_severity_max: null });
-    }
-    if (!successful) return alert;
-    return normalizeAlertRecord({
-      ...alert,
-      episode_notified_at: successful.ts,
-      notified_severity_max: successful.payload?.severity ?? alert.severity,
-    });
-  });
 }
 
 export async function readAlertRecords(descartesPaths) {
@@ -349,12 +428,10 @@ export async function readAlertRecords(descartesPaths) {
     // errors) is a distinct, more severe case and must keep propagating unchanged — see the
     // catch block below, which this loop does not touch.
     const normalized = [];
-    const legacyAlertIds = new Set();
     let quarantinedCount = 0;
     for (const rawAlert of rawAlerts ?? []) {
       try {
         normalized.push(normalizeAlertRecord(rawAlert));
-        if (!Object.hasOwn(rawAlert ?? {}, "material_evidence_digest")) legacyAlertIds.add(String(rawAlert?.id ?? alertId(rawAlert?.rule_id, rawAlert?.fingerprint ?? "global")));
       } catch (recordError) {
         quarantinedCount += 1;
         const identifier = rawAlert?.id ?? rawAlert?.rule_id ?? "<unknown>";
@@ -364,7 +441,7 @@ export async function readAlertRecords(descartesPaths) {
     if (quarantinedCount > 0) {
       console.warn(`descartes: readAlertRecords quarantined ${quarantinedCount} malformed record(s) out of ${(rawAlerts ?? []).length}`);
     }
-    return deriveLegacyDeliveryState(descartesPaths, normalized, legacyAlertIds);
+    return normalized;
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
@@ -395,9 +472,10 @@ export function alertSeverityRank(severity) {
   return Object.hasOwn(ALERT_SEVERITY_RANK, severity) ? ALERT_SEVERITY_RANK[severity] : 3;
 }
 
-function notificationDue(alert, { newEpisode = false, previousAlert } = {}) {
+function notificationDue(alert, { newEpisode = false, previousAlert, nowMs } = {}) {
   if (["suppressed", "recovered"].includes(alert.status)) return false;
   if (newEpisode) return true;
+  if (Number.isFinite(nowMs) && alert.next_attempt_at && new Date(alert.next_attempt_at).getTime() > nowMs) return false;
 
   const notifiedMax = alertSeverityRank(alert.notified_severity_max);
   if (alert.notified_severity_max !== null && alert.notified_severity_max !== undefined) {
@@ -430,10 +508,14 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
 
   for (const candidate of candidates) {
     const current = byId.get(candidate.id);
-    const evidenceDigest = materialEvidenceDigest(candidate);
-    const newEpisode = !current || current.status === "recovered" || current.material_evidence_digest !== evidenceDigest;
+    const candidateEpisodeKey = alertEpisodeKey(candidate);
+    const newEpisode = !current
+      || current.status === "recovered"
+      || alertEpisodeKey(current) !== candidateEpisodeKey
+      || !current.episode_started_at;
     const base = current ?? normalizeAlertRecord({
       ...candidate,
+      incident_key: candidateEpisodeKey === "default" ? null : candidateEpisodeKey,
       status: "active",
       first_seen: now,
       last_seen: now,
@@ -451,16 +533,15 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       episode_started_at: newEpisode ? now : base.episode_started_at,
       notified_severity_max: newEpisode ? null : base.notified_severity_max,
       episode_notified_at: newEpisode ? null : base.episode_notified_at,
-      material_evidence_digest: evidenceDigest,
       adjudicated_at: newEpisode ? null : base.adjudicated_at,
-      adjudicated_evidence_digest: newEpisode ? null : base.adjudicated_evidence_digest,
+      adjudicated_episode_key: newEpisode ? null : base.adjudicated_episode_key,
       adjudication: newEpisode ? null : base.adjudication,
     });
     const severityChanged = current && current.severity !== next.severity;
-    if (notificationDue(next, { newEpisode, previousAlert: current })) {
+    if (notificationDue(next, { newEpisode, previousAlert: current, nowMs: new Date(now).getTime() })) {
       notificationDueIds.push(next.id);
     }
-    const sameNegativeAdjudication = next.adjudicated_evidence_digest === evidenceDigest
+    const sameNegativeAdjudication = next.adjudicated_episode_key === alertEpisodeKey(next)
       && next.adjudication?.notify === false
       && next.adjudication?.severity === next.severity;
     if (!sameNegativeAdjudication && (newEpisode || severityChanged || notificationDueIds.includes(next.id))) {
@@ -498,7 +579,7 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   const [historySummary, daemonStatus, existing] = await Promise.all([
     options.historySummary ? Promise.resolve(options.historySummary) : buildHistorySummary(descartesPaths, { now, windowMs: options.windowMs ?? DEFAULT_ALERT_WINDOW_MS, limit: options.limit }),
     options.daemonStatus ? Promise.resolve(options.daemonStatus) : readDaemonStatus(descartesPaths),
-    readAlertRecords(descartesPaths),
+    options.existingAlerts ? Promise.resolve(options.existingAlerts) : readAlertRecords(descartesPaths),
   ]);
   const candidates = evaluateAlertRules(historySummary, daemonStatus, { now, thresholds: options.thresholds });
   const extraCandidates = Array.isArray(options.extraCandidates) ? options.extraCandidates : [];
@@ -517,11 +598,24 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
 }
 
 export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
-  return withAlertStoreLock(descartesPaths, async () => {
-    const evaluated = await evaluateAlerts(descartesPaths, options);
-    const alerts = await writeAlertRecordsUnlocked(descartesPaths, evaluated.alerts);
-    return { ...evaluated, alerts };
-  });
+  // Candidate computation and history reads happen outside the lock. The locked section only
+  // re-reads the latest alert snapshot, applies the already-computed candidates, and atomically
+  // writes it. This bounds lock hold time without changing detector coverage or recovery semantics.
+  const evaluated = await evaluateAlerts(descartesPaths, options);
+    const candidates = [...(evaluated.candidates ?? []), ...(Array.isArray(options.extraCandidates) ? options.extraCandidates : [])]
+    .map((candidate) => candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") });
+  try {
+    return await withAlertStoreLock(descartesPaths, async () => {
+      const latest = await readAlertRecords(descartesPaths);
+      const applied = applyAlertCandidates(latest, candidates, { now: options.now ?? new Date().toISOString(), cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
+      const alerts = await writeAlertRecordsUnlocked(descartesPaths, applied.alerts);
+      return { ...evaluated, alerts, notification_due_ids: applied.notification_due_ids, adjudication_due_ids: applied.adjudication_due_ids };
+    }, { timeoutMs: options.lockTimeoutMs, retryMs: options.lockRetryMs });
+  } catch (error) {
+    if (!String(error?.message ?? error).includes("Alert store lock acquisition timed out")) throw error;
+    console.warn(`descartes: alert-store persistence skipped (${error.message})`);
+    return { ...evaluated, alerts: evaluated.alerts, notification_due_ids: [], adjudication_due_ids: [], persistence_status: "lock_unavailable", persistence_error: error.message };
+  }
 }
 
 export async function confirmAlertDelivery(descartesPaths, alertIdValue, options = {}) {
@@ -531,7 +625,8 @@ export async function confirmAlertDelivery(descartesPaths, alertIdValue, options
     let confirmed = false;
     const updated = alerts.map((alert) => {
       if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
-      if (options.evidenceDigest && alert.material_evidence_digest !== options.evidenceDigest) return alert;
+      if (options.episodeKey && alertEpisodeKey(alert) !== options.episodeKey) return alert;
+      if (options.claimantId && alert.delivery_claim?.claimant_id !== options.claimantId) return alert;
       confirmed = true;
       const nextRank = alertSeverityRank(options.severity ?? alert.severity);
       const currentRank = alert.notified_severity_max === null ? -1 : alertSeverityRank(alert.notified_severity_max);
@@ -543,6 +638,9 @@ export async function confirmAlertDelivery(descartesPaths, alertIdValue, options
         delivery_failure_count: 0,
         last_delivery_failure_at: null,
         delivery_failure_reason: null,
+        delivery_failing_since: null,
+        next_attempt_at: null,
+        delivery_claim: null,
       });
     });
     if (!confirmed) return { confirmed: false };
@@ -558,19 +656,75 @@ export async function recordAlertDeliveryFailure(descartesPaths, alertIdValue, o
     let recorded = false;
     const updated = alerts.map((alert) => {
       if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
-      if (options.evidenceDigest && alert.material_evidence_digest !== options.evidenceDigest) return alert;
+      if (options.episodeKey && alertEpisodeKey(alert) !== options.episodeKey) return alert;
+      if (options.claimantId && alert.delivery_claim?.claimant_id !== options.claimantId) return alert;
       recorded = true;
+      const count = alert.delivery_failure_count + 1;
+      const nowMs = new Date(now).getTime();
+      const requestedDelay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+      const existingNextMs = alert.next_attempt_at ? new Date(alert.next_attempt_at).getTime() : NaN;
+      const nextAttemptMs = Number.isFinite(existingNextMs) && existingNextMs > nowMs + DELIVERY_BACKOFF_CAP_MS
+        ? nowMs + DELIVERY_BACKOFF_CAP_MS
+        : nowMs + requestedDelay;
       return normalizeAlertRecord({
         ...alert,
-        delivery_failure_count: alert.delivery_failure_count + 1,
+        delivery_failure_count: count,
         last_delivery_failure_at: now,
         delivery_failure_reason: String(options.reason ?? "delivery_failed").slice(0, 240),
+        delivery_failing_since: alert.delivery_failing_since ?? now,
+        next_attempt_at: new Date(nextAttemptMs).toISOString(),
+        delivery_claim: null,
       });
     });
     if (!recorded) return { recorded: false };
     const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
     return { recorded: true, alert: written.find((alert) => alert.id === alertIdValue) };
   });
+}
+
+export async function claimAlertDelivery(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const claimantId = String(options.claimantId ?? PROCESS_CLAIMANT_ID).slice(0, 200);
+  return withAlertStoreLock(descartesPaths, async () => {
+    const alerts = await readAlertRecords(descartesPaths);
+    let found = false;
+    let claimed;
+    const updated = [];
+    for (const alert of alerts) {
+      if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) {
+        updated.push(alert);
+        continue;
+      }
+      found = true;
+      const requestedEpisode = options.episodeKey ?? alertEpisodeKey(alert);
+      if (alertEpisodeKey(alert) !== requestedEpisode) {
+        updated.push(alert);
+        continue;
+      }
+      if (alert.delivery_claim && !(await ownerIsProvablyGone(alert.delivery_claim))) {
+        updated.push(alert);
+        continue;
+      }
+      claimed = normalizeAlertRecord({
+        ...alert,
+        delivery_claim: {
+          episode_key: requestedEpisode,
+          claimant_id: claimantId,
+          pid: process.pid,
+          process_start_identity: (await readProcessStartIdentity(process.pid)) ?? null,
+          boot_id: (await readBootId()) ?? null,
+          nonce: crypto.randomUUID(),
+          claimed_at: now,
+        },
+      });
+      updated.push(claimed);
+    }
+    if (!found) return { claimed: true, persisted: false, claimant_id: claimantId, episode_key: options.episodeKey ?? "default" };
+    if (!claimed) return { claimed: false, reason: "delivery_claimed" };
+    const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+    const saved = written.find((alert) => alert.id === alertIdValue);
+    return { claimed: saved?.delivery_claim?.claimant_id === claimantId, claimant_id: claimantId, episode_key: alertEpisodeKey(saved ?? claimed), alert: saved };
+  }, { timeoutMs: options.lockTimeoutMs, retryMs: options.lockRetryMs });
 }
 
 export async function recordAlertAdjudication(descartesPaths, alertIdValue, options = {}) {
@@ -580,12 +734,12 @@ export async function recordAlertAdjudication(descartesPaths, alertIdValue, opti
     let recorded = false;
     const updated = alerts.map((alert) => {
       if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
-      if (options.evidenceDigest && alert.material_evidence_digest !== options.evidenceDigest) return alert;
+      if (options.episodeKey && alertEpisodeKey(alert) !== options.episodeKey) return alert;
       recorded = true;
       return normalizeAlertRecord({
         ...alert,
         adjudicated_at: now,
-        adjudicated_evidence_digest: options.evidenceDigest ?? alert.material_evidence_digest,
+        adjudicated_episode_key: options.episodeKey ?? alertEpisodeKey(alert),
         adjudication: { notify: options.notify === true, severity: options.severity ?? alert.severity },
       });
     });

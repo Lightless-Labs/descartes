@@ -12,15 +12,15 @@ import {
   evaluateAlerts,
   evaluateAndPersistAlerts,
   FIXED_ALERT_RULE_IDS,
-  materialEvidenceDigest,
   readAlertRecords,
   recordAlertDeliveryFailure,
   resolveAlertStorePaths,
+  claimAlertDelivery,
+  withAlertStoreLock,
   writeAlertRecords,
 } from "../src/alert-store.js";
 import { appendMetricPoints, writeDaemonStatus } from "../src/history-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
-import { resolveNotificationDeliveryPaths } from "../src/notification-delivery.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-alerts-test-"));
@@ -201,7 +201,7 @@ test("episode notification state is committed only by a confirmed delivery", asy
   const confirmed = await confirmAlertDelivery(paths, candidate.id, {
     now: "2026-10-06T00:02:00.000Z",
     severity: candidate.severity,
-    evidenceDigest: applied.alerts[0].material_evidence_digest,
+    episodeKey: "default",
   });
   assert.equal(confirmed.confirmed, true);
   const persisted = await readAlertRecords(paths);
@@ -228,7 +228,7 @@ test("delivery failures remain visible without consuming the episode", async () 
   const failure = await recordAlertDeliveryFailure(paths, candidate.id, {
     now: "2026-10-06T00:01:00.000Z",
     reason: "unavailable",
-    evidenceDigest: applied.alerts[0].material_evidence_digest,
+    episodeKey: "default",
   });
   assert.equal(failure.recorded, true);
   const stored = (await readAlertRecords(paths))[0];
@@ -237,7 +237,26 @@ test("delivery failures remain visible without consuming the episode", async () 
   assert.equal(stored.episode_notified_at, null);
 });
 
-test("material evidence digest ignores evaluation volatility but re-arms identity changes", () => {
+test("ordinary memory statistics do not create a second episode", () => {
+  const candidate = {
+    id: alertId("system.memory.sustained_high", "global"),
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Memory high",
+    summary: "Memory remains high",
+    diagnostics: { mean: 0.92, max: 0.94, count: 10, observed_at: "2026-10-06T00:00:00.000Z" },
+  };
+  const first = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  const delivered = { ...first.alerts[0], episode_notified_at: "2026-10-06T00:00:00.000Z", notified_severity_max: "warning" };
+  const drifted = applyAlertCandidates([delivered], [{
+    ...candidate,
+    diagnostics: { mean: 0.97, max: 0.99, count: 11, observed_at: "2026-10-06T00:01:00.000Z" },
+  }], { now: "2026-10-06T00:01:00.000Z" });
+  assert.deepEqual(drifted.notification_due_ids, []);
+});
+
+test("producer-declared incident keys re-arm without diagnostic digests or ignore lists", () => {
   const delivered = (result) => ({
     ...result.alerts[0],
     last_notified: "2026-10-06T00:00:00.000Z",
@@ -248,32 +267,32 @@ test("material evidence digest ignores evaluation volatility but re-arms identit
     id: alertId("provenance.port.new_public_bind", "port.tcp.443"),
     rule_id: "provenance.port.new_public_bind",
     fingerprint: "port.tcp.443",
+    incident_key: "identity-a",
     severity: "warning",
     title: "New public bind",
     summary: "A new identity owns 443.",
     diagnostics: { identity_hash: "identity-a", protocol: "tcp", local_port: 443, observed_at: "2026-10-06T00:00:00.000Z" },
   };
-  assert.equal(materialEvidenceDigest(base), materialEvidenceDigest({ ...base, diagnostics: { ...base.diagnostics, observed_at: "2026-10-06T00:01:00.000Z" } }));
   let first = applyAlertCandidates([], [base], { now: "2026-10-06T00:00:00.000Z" });
   assert.deepEqual(first.notification_due_ids, [base.id]);
   let state = [delivered(first)];
   const unchanged = applyAlertCandidates(state, [{ ...base, diagnostics: { ...base.diagnostics, observed_at: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
   assert.deepEqual(unchanged.notification_due_ids, [], "unchanged material evidence is silent");
 
-  const identityB = { ...base, diagnostics: { ...base.diagnostics, identity_hash: "identity-b", observed_at: "2026-10-06T00:02:00.000Z" } };
+  const identityB = { ...base, incident_key: "identity-b", diagnostics: { ...base.diagnostics, identity_hash: "identity-b", observed_at: "2026-10-06T00:02:00.000Z" } };
   const changed = applyAlertCandidates(state, [identityB], { now: "2026-10-06T00:02:00.000Z" });
   assert.deepEqual(changed.notification_due_ids, [base.id], "identity A -> B on the same port is a new episode");
-  assert.notEqual(changed.alerts[0].material_evidence_digest, state[0].material_evidence_digest);
 
   const canary = {
     ...base,
     id: alertId("canary.tripped", "canary-hash"),
     rule_id: "canary.tripped",
     fingerprint: "canary-hash",
+    incident_key: "trip-a",
     diagnostics: { canary_id_hash: "canary-hash", trip_reason: "changed", last_seen_ts: "2026-10-06T00:00:00.000Z" },
   };
   const canaryFirst = applyAlertCandidates([], [canary], { now: "2026-10-06T00:00:00.000Z" });
-  const canarySecond = applyAlertCandidates([delivered(canaryFirst)], [{ ...canary, diagnostics: { ...canary.diagnostics, last_seen_ts: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
+  const canarySecond = applyAlertCandidates([delivered(canaryFirst)], [{ ...canary, incident_key: "trip-b", diagnostics: { ...canary.diagnostics, last_seen_ts: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
   assert.deepEqual(canarySecond.notification_due_ids, [canary.id], "a second canary trip remains material even with a stable canary identity");
 
   const correlation = {
@@ -281,10 +300,11 @@ test("material evidence digest ignores evaluation volatility but re-arms identit
     id: alertId("correlation.login_kill_proximity", "anchor-a__peer-a"),
     rule_id: "correlation.login_kill_proximity",
     fingerprint: "anchor-a__peer-a",
+    incident_key: "anchor-tick-a",
     diagnostics: { anchor_fingerprint: "anchor-a", peer_entity_key: "peer-a", observed_at: "2026-10-06T00:00:00.000Z", proximity_seconds: 5 },
   };
   const correlationFirst = applyAlertCandidates([], [correlation], { now: "2026-10-06T00:00:00.000Z" });
-  const correlationChanged = applyAlertCandidates([delivered(correlationFirst)], [{ ...correlation, diagnostics: { ...correlation.diagnostics, anchor_fingerprint: "anchor-b", observed_at: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
+  const correlationChanged = applyAlertCandidates([delivered(correlationFirst)], [{ ...correlation, incident_key: "anchor-tick-b", diagnostics: { ...correlation.diagnostics, anchor_fingerprint: "anchor-b", observed_at: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
   assert.deepEqual(correlationChanged.notification_due_ids, [correlation.id], "a frozen correlation with a new anchor is a new episode");
 });
 
@@ -302,6 +322,7 @@ test("acknowledgement suppresses persistence but not a later severity escalation
     last_notified: "2026-05-28T00:00:00.000Z",
     episode_notified_at: "2026-05-28T00:00:00.000Z",
     notified_severity_max: "warning",
+    episode_started_at: "2026-05-28T00:00:00.000Z",
     acknowledged_at: "2026-05-28T00:01:00.000Z",
   };
 
@@ -331,7 +352,7 @@ test("legacy active records with last_notified are due until audit evidence prov
 
   const persistent = applyAlertCandidates([legacy], [{ ...legacy }], { now: "2026-05-28T05:00:00.000Z" });
   assert.deepEqual(persistent.notification_due_ids, ["alert_legacy"]);
-  assert.equal(persistent.alerts[0].episode_started_at, "2026-05-28T00:00:00.000Z");
+  assert.equal(persistent.alerts[0].episode_started_at, "2026-05-28T05:00:00.000Z");
   assert.equal(persistent.alerts[0].episode_notified_at, null);
   assert.equal(persistent.alerts[0].notified_severity_max, null);
 
@@ -339,7 +360,7 @@ test("legacy active records with last_notified are due until audit evidence prov
   assert.deepEqual(escalated.notification_due_ids, ["alert_legacy"]);
 });
 
-test("legacy migration trusts only a successful delivery audit at or after the current activation", async () => {
+test("legacy Oct-1 delivery cannot prove Oct-3 current activation", async () => {
   const paths = await tempPaths();
   const store = resolveAlertStorePaths(paths);
   await fs.mkdir(store.dir, { recursive: true });
@@ -351,24 +372,18 @@ test("legacy migration trusts only a successful delivery audit at or after the c
     severity: "warning",
     title: "Memory high",
     summary: "Still high",
-    first_seen: "2026-10-06T00:00:00.000Z",
-    last_seen: "2026-10-06T00:05:00.000Z",
-    last_notified: "2026-10-06T00:01:00.000Z",
+    first_seen: "2026-10-01T00:00:00.000Z",
+    last_seen: "2026-10-03T00:05:00.000Z",
+    last_notified: "2026-10-01T00:01:00.000Z",
     diagnostics: { min: 0.92 },
   };
   await fs.writeFile(store.alertsFile, JSON.stringify({ version: 1, alerts: [legacy] }));
-  const delivery = resolveNotificationDeliveryPaths(paths);
-  await fs.mkdir(path.dirname(delivery.auditFile), { recursive: true });
-  await fs.writeFile(delivery.auditFile, [
-    JSON.stringify({ ts: "2026-10-05T23:59:00.000Z", status: "delivered", payload: { alert_id: legacy.id, severity: "critical" } }),
-    JSON.stringify({ ts: "2026-10-06T00:01:00.000Z", status: "error", payload: { alert_id: legacy.id, severity: "warning" } }),
-    JSON.stringify({ ts: "2026-10-06T00:02:00.000Z", status: "delivered", payload: { alert_id: legacy.id, severity: "warning" } }),
-  ].join("\n") + "\n");
-
   const [migrated] = await readAlertRecords(paths);
-  assert.equal(migrated.episode_notified_at, "2026-10-06T00:02:00.000Z");
-  assert.equal(migrated.notified_severity_max, "warning");
-  assert.equal(migrated.last_notified, "2026-10-06T00:01:00.000Z", "legacy field is retained as history, never used as proof");
+  assert.equal(migrated.episode_started_at, null);
+  const upgraded = applyAlertCandidates([migrated], [{ ...migrated }], { now: "2026-10-03T00:06:00.000Z" });
+  assert.deepEqual(upgraded.notification_due_ids, [legacy.id]);
+  assert.equal(upgraded.alerts[0].episode_started_at, "2026-10-03T00:06:00.000Z");
+  assert.equal(migrated.last_notified, "2026-10-01T00:01:00.000Z", "legacy field is retained as history, never used as proof");
 });
 
 test("a fixed alert active for five simulated days produces one notification", () => {
@@ -402,6 +417,7 @@ test("acknowledgement persists and suppresses re-notification while condition re
     summary: "Disk high",
     first_seen: "2026-05-28T00:00:00.000Z",
     last_seen: "2026-05-28T00:00:00.000Z",
+    episode_started_at: "2026-05-28T00:00:00.000Z",
   }]);
 
   const acknowledged = await acknowledgeAlert(paths, alert.id, { now: "2026-05-28T00:01:00.000Z" });
@@ -695,7 +711,7 @@ test("concurrent alert-store writers serialize recovery and reactivation without
   await confirmAlertDelivery(paths, candidate.id, {
     now: "2026-10-06T00:00:01.000Z",
     severity: "warning",
-    evidenceDigest: initial.alerts[0].material_evidence_digest,
+    episodeKey: "default",
   });
 
   const recovery = evaluateAndPersistAlerts(paths, {
@@ -725,12 +741,92 @@ test("a stale alert-store lock is reclaimed", async () => {
   const store = resolveAlertStorePaths(paths);
   await fs.mkdir(store.dir, { recursive: true });
   const lockFile = path.join(store.dir, "alerts.json.lock");
-  await fs.writeFile(lockFile, "stale-owner");
-  const stale = new Date(Date.now() - 120_000);
-  await fs.utimes(lockFile, stale, stale);
+  await fs.writeFile(lockFile, JSON.stringify({ pid: 99999999, process_start_identity: "dead", boot_id: "boot", nonce: "stale-owner" }));
+  const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  await fs.utimes(lockFile, future, future);
   const result = applyAlertCandidates([], [{ id: "alert_stale_lock", rule_id: "system.memory.sustained_high", severity: "warning", title: "x", diagnostics: {} }], { now: "2026-10-06T00:00:00.000Z" });
   await writeAlertRecords(paths, result.alerts);
   assert.equal((await readAlertRecords(paths)).length, 1);
+});
+
+test("a live long-held lock is never stolen", async () => {
+  const paths = await tempPaths();
+  const held = withAlertStoreLock(paths, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return "held";
+  }, { timeoutMs: 500 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await assert.rejects(
+    withAlertStoreLock(paths, async () => "stolen", { timeoutMs: 25, retryMs: 5 }),
+    /Alert store lock acquisition timed out/,
+  );
+  assert.equal(await held, "held");
+});
+
+test("two contenders on a stale lock have exactly one winner", async () => {
+  const paths = await tempPaths();
+  const store = resolveAlertStorePaths(paths);
+  await fs.mkdir(store.dir, { recursive: true });
+  const lockFile = path.join(store.dir, "alerts.json.lock");
+  await fs.writeFile(lockFile, JSON.stringify({ pid: 99999999, process_start_identity: "dead", boot_id: "boot", nonce: "stale-owner" }));
+  const winners = [];
+  const contender = (name) => withAlertStoreLock(paths, async () => {
+    winners.push(name);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return name;
+  }, { timeoutMs: 50, retryMs: 2 });
+  const outcomes = await Promise.allSettled([contender("a"), contender("b")]);
+  assert.equal(winners.length, 1);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "rejected" && /timed out/.test(outcome.reason?.message)).length, 1);
+});
+
+test("delivery claims serialize concurrent evaluators and confirmation clears the claim", async () => {
+  const paths = await tempPaths();
+  const candidate = {
+    id: "alert_claimed",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Memory high",
+    summary: "High",
+  };
+  const applied = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const claims = await Promise.all([
+    claimAlertDelivery(paths, candidate.id, { now: "2026-10-06T00:01:00.000Z", claimantId: "daemon-a" }),
+    claimAlertDelivery(paths, candidate.id, { now: "2026-10-06T00:01:00.000Z", claimantId: "daemon-b" }),
+  ]);
+  assert.equal(claims.filter((claim) => claim.claimed).length, 1);
+  const winner = claims.find((claim) => claim.claimed);
+  const confirmed = await confirmAlertDelivery(paths, candidate.id, {
+    now: "2026-10-06T00:01:01.000Z",
+    severity: "warning",
+    episodeKey: "default",
+    claimantId: winner.claimant_id,
+  });
+  assert.equal(confirmed.confirmed, true);
+  assert.equal((await readAlertRecords(paths))[0].delivery_claim, null);
+});
+
+test("delivery failure backoff delays retries, doubles, clamps rollback, and exposes its start", async () => {
+  const paths = await tempPaths();
+  const candidate = { id: "alert_backoff", rule_id: "system.memory.sustained_high", fingerprint: "global", severity: "warning", title: "Memory", summary: "High" };
+  const applied = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  await recordAlertDeliveryFailure(paths, candidate.id, { now: "2026-10-06T00:00:00.000Z", reason: "unavailable", episodeKey: "default" });
+  let stored = (await readAlertRecords(paths))[0];
+  assert.equal(stored.next_attempt_at, "2026-10-06T00:01:00.000Z");
+  assert.equal(stored.delivery_failing_since, "2026-10-06T00:00:00.000Z");
+  assert.deepEqual(applyAlertCandidates([stored], [{ ...candidate }], { now: "2026-10-06T00:00:30.000Z" }).notification_due_ids, []);
+  assert.deepEqual(applyAlertCandidates([stored], [{ ...candidate }], { now: "2026-10-06T00:01:00.000Z" }).notification_due_ids, [candidate.id]);
+  await recordAlertDeliveryFailure(paths, candidate.id, { now: "2026-10-06T00:01:00.000Z", reason: "unavailable", episodeKey: "default" });
+  stored = (await readAlertRecords(paths))[0];
+  assert.equal(stored.next_attempt_at, "2026-10-06T00:03:00.000Z");
+  await writeAlertRecords(paths, [{ ...stored, next_attempt_at: "2099-01-01T00:00:00.000Z" }]);
+  await recordAlertDeliveryFailure(paths, candidate.id, { now: "2026-10-06T00:02:00.000Z", reason: "unavailable", episodeKey: "default" });
+  stored = (await readAlertRecords(paths))[0];
+  assert.equal(stored.next_attempt_at, "2026-10-06T01:02:00.000Z");
 });
 
 test("unknown severities rank above critical and are never coerced down", () => {
