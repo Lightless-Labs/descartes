@@ -1,6 +1,19 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-05 (evening)
+**Last updated:** 2026-10-06
+
+## Collector-source hardening — 2026-10-06
+
+On branch `fix/collector-sources-2026-10`, H6 is committed locally as `be09348` and H5 is
+committed locally in this worktree; neither has been pushed or merged. H6 adds shared pinned absolute
+binary resolution across collector subprocesses, records resolved paths/availability, and keeps
+`not_found_on_known_paths` out of complete session census markers. H5 parses real macOS
+`scutil --nc list` shapes, classifies bracketed VPN types, excludes Tailscale's own entry from
+VPN peer duplication, and marks successful-but-unparseable output partial. Focused changed-suite
+validation is green at 159 tests. Fresh-XDG full `npm test` reports **2154 total / 2098 pass /
+22 fail / 34 skip**; all 22 failures are sandbox/live-host environment failures (20 localhost
+listen `EPERM`, 2 live macOS process/provenance checks returning `unknown` because `ps` is blocked),
+with no changed-behavior failures identified.
 
 ## Review-fix update — 2026-10-05
 

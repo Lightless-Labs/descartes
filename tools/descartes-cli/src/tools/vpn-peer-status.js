@@ -14,8 +14,8 @@
 //   - Established-inbound cross-reference: `ss`/`netstat` (lowest-confidence, first-to-cut;
 //     kept as raw operator-triage context only -- never translated into a persisted peer fact).
 //
-// Degrade-not-fabricate (hard requirement, per source): a binary that is genuinely ABSENT
-// (ENOENT) degrades to "absent"; a binary that runs but is denied by the OS (EACCES/EPERM, or
+// Degrade-not-fabricate (hard requirement, per source): a binary missing from the pinned known
+// paths (including ENOENT) degrades to "not_found_on_known_paths"; a binary that runs but is denied by the OS (EACCES/EPERM, or
 // wg's own "Permission denied"/"Operation not permitted" stderr text) degrades to
 // "missing_permission" and is NEVER escalated (no sudo/pkexec/setcap/doas -- see the escalation
 // lint, test/escalation-lint.test.js, which scans this file too); a binary that runs and
@@ -33,6 +33,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { isBinaryNotFound, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -52,23 +53,12 @@ export const DEFAULT_LAST_HISTORY_LIMIT = 50;
 const MAX_WG_INTERFACES = 16;
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 256 * 1024,
-    });
-    return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "error",
-      code: error?.code,
-      stdout: error?.stdout ?? "",
-      stderr: error?.stderr ?? "",
-      error: error instanceof Error ? error.message : String(error),
-      command: { argv, read_only: true },
-    };
-  }
+  return runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 256 * 1024,
+    execFileAsync,
+  });
 }
 
 function isPermissionDenied(probe) {
@@ -108,7 +98,7 @@ async function collectSshWho(options) {
     const { entries } = parseWhoOutput(probe.stdout);
     return { status: "ok", entries, command: probe.command };
   }
-  if (probe.code === "ENOENT") return { status: "absent", entries: [], command: probe.command };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], command: probe.command };
   if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], error: probe.error, command: probe.command };
   return { status: "unable", entries: [], error: probe.error, command: probe.command };
 }
@@ -163,7 +153,7 @@ async function collectSshLast(options) {
     const { entries, malformed_count } = parseLastOutput(probe.stdout);
     return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command };
   }
-  if (probe.code === "ENOENT") return { status: "absent", entries: [], requested_n: n, command: probe.command };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command };
   if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], requested_n: n, error: probe.error, command: probe.command };
   return { status: "unable", entries: [], requested_n: n, error: probe.error, command: probe.command };
 }
@@ -241,8 +231,8 @@ async function collectWireguardPeers(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const listProbe = await wgShowInterfaces(runExec, options);
 
-  if (listProbe.code === "ENOENT") {
-    return { status: "absent", interfaces: [], peers: [], elevation_candidate: false };
+  if (isBinaryNotFound(listProbe)) {
+    return { status: "not_found_on_known_paths", interfaces: [], peers: [], elevation_candidate: false };
   }
   if (listProbe.status !== "ok") {
     const elevationCandidate = isPermissionDenied(listProbe);
@@ -318,22 +308,40 @@ async function collectWireguardPeers(options) {
 // every other platform without attempting the command at all -- scutil does not exist there).
 // ---------------------------------------------------------------------------------------------
 
-// "* (Connected)    1E4E6C58-F859-4E51-92A6-BF4B14A23689 "Corp VPN"      [PPP:L2TP]" -- an
-// optional leading "*" marks the default service; status in parens; a UUID; the operator-chosen
-// service name in quotes.
-const SCUTIL_NC_LINE_RE = /^\*?\s*\((\w[\w ]*)\)\s+([0-9A-Fa-f-]{36})\s+"([^"]*)"/;
+// Real output has a service-type token between the UUID and the quoted name, followed by a
+// bracketed type classifier. Keep the whole pre-name token loose because macOS emits forms such
+// as `VPN (...)`, `IPSec`, and `PPP --> com.example...`.
+const SCUTIL_NC_LINE_RE = /^\*?\s*\(([^)]+)\)\s+([0-9A-Fa-f-]{36})\s+.+?\s+"([^"]*)"\s+\[([^\]]+)\]\s*$/;
+const VPN_SERVICE_TYPE_RE = /^(?:VPN:.*|IPSec|PPP:L2TP)$/i;
+const TAILSCALE_SERVICE_TYPE_RE = /^VPN:io\.tailscale\.ipn\.macsys$/i;
 
-export function parseScutilNcList(stdout) {
+export function parseScutilNcListDetailed(stdout) {
   const services = [];
+  let unparsed_count = 0;
   for (const rawLine of String(stdout ?? "").split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     const match = line.match(SCUTIL_NC_LINE_RE);
-    if (!match) continue;
-    const [, status, uuid, name] = match;
-    services.push({ status: status.trim(), service_uuid: uuid, service_name: name });
+    if (!match) {
+      unparsed_count += 1;
+      continue;
+    }
+    const [, status, uuid, name, service_type] = match;
+    const is_tailscale = TAILSCALE_SERVICE_TYPE_RE.test(service_type) || name.trim().toLowerCase() === "tailscale";
+    services.push({
+      status: status.trim(),
+      service_uuid: uuid,
+      service_name: name,
+      service_type,
+      is_vpn: VPN_SERVICE_TYPE_RE.test(service_type),
+      is_tailscale,
+    });
   }
-  return services;
+  return { services, unparsed_count };
+}
+
+export function parseScutilNcList(stdout) {
+  return parseScutilNcListDetailed(stdout).services;
 }
 
 async function collectVpnServices(options) {
@@ -342,12 +350,18 @@ async function collectVpnServices(options) {
 
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const probe = await runExec("scutil", ["--nc", "list"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-  if (probe.code === "ENOENT") return { status: "absent", services: [] };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [] };
   if (probe.status !== "ok") {
     if (isPermissionDenied(probe)) return { status: "missing_permission", services: [], error: probe.error };
     return { status: "unable", services: [], error: probe.error };
   }
-  return { status: "ok", services: parseScutilNcList(probe.stdout) };
+  const parsed = parseScutilNcListDetailed(probe.stdout);
+  return {
+    status: parsed.unparsed_count > 0 ? "partial" : "ok",
+    services: parsed.services.filter((service) => service.is_vpn && !service.is_tailscale),
+    unparsed_count: parsed.unparsed_count,
+    tailscale_entry_observed: parsed.services.some((service) => service.is_tailscale),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -363,14 +377,14 @@ async function collectEstablishedInbound(options) {
 
   if (platform === "linux") {
     const probe = await runExec("ss", ["-H", "-tn", "state", "established"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-    if (probe.code === "ENOENT") return { status: "absent", count: 0 };
+    if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0 };
     if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error };
     const lines = String(probe.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
     return { status: "ok", count: lines.length };
   }
 
   const probe = await runExec("netstat", ["-an", "-p", "tcp"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-  if (probe.code === "ENOENT") return { status: "absent", count: 0 };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0 };
   if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error };
   const count = String(probe.stdout ?? "").split("\n").filter((line) => /established/i.test(line)).length;
   return { status: "ok", count };
@@ -443,7 +457,12 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
           interfaces_truncated: wireguard.interfaces_truncated ?? false,
           total_interface_count: wireguard.total_interface_count ?? (wireguard.interfaces?.length ?? 0),
         },
-        vpn_services: { status: vpnServices.status, error: vpnServices.error },
+        vpn_services: {
+          status: vpnServices.status,
+          error: vpnServices.error,
+          unparsed_count: vpnServices.unparsed_count ?? 0,
+          tailscale_entry_observed: vpnServices.tailscale_entry_observed ?? false,
+        },
         established_inbound: { status: establishedInbound.status, error: establishedInbound.error },
       },
       any_source_available: anySourceAvailable,
@@ -454,11 +473,17 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
     };
   }, (result) => evidenceEnvelope({
     id: "vpn-peer-status",
-    status: result.any_source_available ? "ok" : "unable",
+    status: result.any_source_available
+      ? (Object.values(result.sources).some((source) => source.status === "ok") ? "ok" : "warning")
+      : "unable",
     source: "vpn_peer_status",
     result,
-    confidence: result.any_source_available ? 1 : 0,
-    reviewHint: result.any_source_available ? "none" : "missing_permission",
+    confidence: result.any_source_available
+      ? (Object.values(result.sources).some((source) => source.status === "ok") ? 1 : 0.4)
+      : 0,
+    reviewHint: result.any_source_available
+      ? (Object.values(result.sources).some((source) => source.status === "ok") ? "none" : "ambiguous")
+      : "missing_permission",
     tool: "collect_vpn_peer_status",
     target: `cap=${result.cap}`,
   }));

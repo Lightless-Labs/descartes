@@ -6,6 +6,18 @@ This is the reference catalog for Descartes' current read-only evidence collecto
 
 Normal `descartes triage` is model-led: the model chooses among these guarded tools, and each tool returns structured local evidence. `collect_triage_evidence` is intentionally still only the compact resource-pressure bundle, not an all-collectors bundle.
 
+### Binary resolution
+
+Collector subprocesses do not consult the ambient `PATH` (important for launchd, whose daemon
+environment may not contain user-installed tools). A shared resolver checks regular executable
+files in a pinned platform allowlist: `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`,
+`/usr/local/sbin`, NixOS and Snap locations, Homebrew locations on macOS, and the macOS
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale` CLI path. It also rejects executables in
+world-writable directories. Evidence records the resolved absolute path and requested binary.
+If no known candidate is usable, the source reports `not_found_on_known_paths`; this is
+incomplete/unknown evidence, not an inferred `not_installed` state and never a complete zero in
+a census.
+
 `descartes incident freeze` reuses this same registered collector set (the broad `collect_*` tools) to persist a Descartes-owned forensic snapshot on demand, without adding any new evidence-collection surface. It is documented separately at `docs/reference/incident-freeze.md` since it is an action, not a collector.
 
 ## Safety and privacy notes
@@ -233,7 +245,7 @@ Sources:
 - Fixed `tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}'`.
 - Fixed `screen -ls`. `screen -ls` is known to exit non-zero on some versions even when it succeeds and sessions exist; the collector inspects stdout/stderr for screen's own recognizable session-listing content before treating a non-zero exit as a real failure, rather than misclassifying a healthy listing as unavailable.
 
-Behavior: degrade-not-fabricate — when neither `tmux` nor `screen` is present on the host, the envelope reports `status: "unable"`, `confidence: 0`; this is never conflated with "0 sessions". A multiplexer that IS present and genuinely reports zero sessions (tmux with no server running, screen's "No Sockets found") is a real, distinguishable fact: `status: "ok"`, an empty session list. Per-tick session entities are bounded at `DEFAULT_SESSION_ENTITY_LIMIT` (200); a count above the cap is truncated with an explicit `truncated: true` marker and the real `total_count` preserved, rather than silently dropping entities.
+Behavior: degrade-not-fabricate — when neither `tmux` nor `screen` is found on the pinned known paths, the envelope reports `status: "unable"`, `confidence: 0`, and the per-binary status is `not_found_on_known_paths`; this is incomplete evidence, never a complete zero. A multiplexer that IS present and genuinely reports zero sessions (tmux with no server running, screen's "No Sockets found") is a real, distinguishable fact: `status: "ok"`, an empty session list. Per-tick session entities are bounded at `DEFAULT_SESSION_ENTITY_LIMIT` (200); a count above the cap is truncated with an explicit `truncated: true` marker and the real `total_count` preserved, rather than silently dropping entities.
 
 Fact-history: on the daemon's hourly structural tick (gated behind the `learned.json` kill switch, like every other structural sub-collector), `factPointsFromSessionEvidence` (`fact-translators.js`) translates this census into `session.presence` fact-points. The persisted `entity_key` is a fixed-length (16-char) hex SHA-256 hash of a domain-separated preimage (`descartes.fact.session.v1:<multiplexer>:<session_name>`) — never the raw or charset-substituted session name. Persisted `attributes` are closed-enum/bucketed only: `attached` (`"true"`/`"false"`), `window_count_bucket` (`"0"`/`"1"`/`"2-4"`/`"5-9"`/`"10+"`/`"unknown"`), and `created_at_bucket` (an opaque 10-minute epoch-bucket index, or `"unknown"` for screen sessions, whose `-ls` output does not reliably expose a creation time) — never a raw session name or raw timestamp. A truncated tick additionally emits one `confidence: 0` overflow-marker fact so a session flood is visible as "truncation happened" rather than silently dropped. This collector emits fact-history only — no alert candidates; alerting on session-count deviation/churn is a separate, later slice.
 
@@ -251,7 +263,7 @@ Sources:
 - macOS VPN service state: fixed `scutil --nc list` (darwin only; reported `not_applicable` elsewhere without attempting the command).
 - Established-inbound cross-reference: `ss` (Linux) / `netstat` (macOS) — lowest-confidence, operator-triage context only; never translated into a persisted peer fact.
 
-Behavior: degrade-not-fabricate per source — a genuinely absent binary is `"absent"`; a permission/OS denial is `"missing_permission"`; a source that runs and reports zero peers/logins is a real, distinguishable `"ok"`/empty result, never conflated with unavailability. Per-tick peer entities are bounded at `DEFAULT_PEER_ENTITY_LIMIT` (200); a count above the cap is truncated with an explicit `truncated: true` marker and the real `total_count` preserved.
+Behavior: degrade-not-fabricate per source — a binary missing from the pinned known paths is `"not_found_on_known_paths"`; a permission/OS denial is `"missing_permission"`; a source that runs and reports zero peers/logins is a real, distinguishable `"ok"`/empty result, never conflated with unavailability. macOS `scutil --nc list` classifies VPN types from the bracketed type (`VPN:*`, `IPSec`, and `PPP:L2TP`), excludes `PPP:Modem`, and marks Tailscale's own entry so it is not double-counted. Successful output containing unparseable service lines is `"partial"`, never an `"ok"` zero. Per-tick peer entities are bounded at `DEFAULT_PEER_ENTITY_LIMIT` (200); a count above the cap is truncated with an explicit `truncated: true` marker and the real `total_count` preserved.
 
 Fact-history: on the daemon's hourly structural tick (gated behind the `learned.json` kill switch), `factPointsFromVpnPeerEvidence` (`fact-translators.js`) translates this census into `peer.presence` fact-points. The persisted `entity_key` is a fixed-length (16-char) hex SHA-256 hash of a versioned, domain-separated (`descartes.peer.v1`), NUL-joined preimage — computed by the dedicated `peer-signature-store.js` module (its own store/hash scheme, distinct from both the session and process identity schemes, and never written to `signatures.json`). WireGuard/VPN-service identity is the public key/service UUID ONLY (the endpoint/service name is an attribute, since an endpoint roams as a client migrates networks); SSH identity is `(source_type, remote_user, remote_host_as_observed)`, with the documented limitation that a dynamic client IP may keep an SSH peer's baseline provisional forever (consequence-free in v0). Persisted `attributes` are closed-enum/bucketed only: `source_type`, `presence_state` (`"observed_active"`/`"observed_historical"`), `login_hour_bucket` (a closed local hour-of-day bucket, `"00"`–`"23"`, or `"unknown"`), and `handshake_age_bucket` (closed-enum — `"never"`/`"lt_5m"`/`"lt_1h"`/`"lt_1d"`/`"lt_7d"`/`"gte_7d"`/`"unknown"`/`"n/a"` — never a raw epoch or precise seconds). A truncated tick additionally emits one `confidence: 0` overflow-marker fact. **This collector emits fact-history only — zero alert candidates.** It is not wired into `daemon.js`'s `extraCandidates`, and its `peer.presence` fact_name is not in `constraint-miner.js`'s mining allowlist; alerting on unattributed/odd-hour peer logins is a separate, later slice.
 
@@ -263,8 +275,8 @@ Collects a read-only baseline of Tailscale/tailnet peer identity from the local 
 `tailscale status --json` output. It does not call an admin/control-plane API, inspect traffic,
 escalate privilege, or expose any mutating/authentication command.
 
-Behavior: the command uses one fixed `execFile` argv (`tailscale status --json`). A missing binary
-is `absent`; parsed `NeedsLogin`, `NoState`, or `Stopped` backend state is a truthful
+Behavior: the command uses one fixed `execFile` argv (`tailscale status --json`) after pinned
+absolute-path resolution. A binary missing from known paths is `not_found_on_known_paths`; parsed `NeedsLogin`, `NoState`, or `Stopped` backend state is a truthful
 `logged_out` zero; permission failures are `missing_permission` with an elevation-candidate
 documentation marker; malformed JSON and other failures are `unable`. A Running daemon with no
 peers is a real successful zero. Per-tick peers are bounded at 200 with an explicit truncation

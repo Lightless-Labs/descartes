@@ -499,6 +499,7 @@ For the complete safety-invariant list, see `AGENTS.md`.
 | hostname | not persisted to metric history; appears in the transient triage evidence envelope and in an `incident freeze` bundle if you take one (freeze bundles stay local — never sent to an LLM) | **raw**, in the compact evidence summary sent to the selected model provider |
 | disk mount point | raw, in local metric history (`sensitivity: path`) | **raw**, but only for a filesystem at ≥90% used, up to 8, as part of `pressured_filesystems` |
 | disk filesystem device path | raw, in local metric history (`sensitivity: path`) | not sent |
+| collector binary availability and resolved path | status is retained in evidence/census markers; paths are local execution provenance | not sent |
 
 `descartes incident freeze` and the local `history`/`alerts` commands only ever touch the
 local, Descartes-owned store — nothing there leaves the host. A `triage` request is
