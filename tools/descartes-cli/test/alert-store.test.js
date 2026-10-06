@@ -12,6 +12,7 @@ import {
   evaluateAlerts,
   evaluateAndPersistAlerts,
   FIXED_ALERT_RULE_IDS,
+  materialEvidenceDigest,
   readAlertRecords,
   recordAlertDeliveryFailure,
   resolveAlertStorePaths,
@@ -234,6 +235,57 @@ test("delivery failures remain visible without consuming the episode", async () 
   assert.equal(stored.delivery_failure_count, 1);
   assert.equal(stored.delivery_failure_reason, "unavailable");
   assert.equal(stored.episode_notified_at, null);
+});
+
+test("material evidence digest ignores evaluation volatility but re-arms identity changes", () => {
+  const delivered = (result) => ({
+    ...result.alerts[0],
+    last_notified: "2026-10-06T00:00:00.000Z",
+    episode_notified_at: "2026-10-06T00:00:00.000Z",
+    notified_severity_max: result.alerts[0].severity,
+  });
+  const base = {
+    id: alertId("provenance.port.new_public_bind", "port.tcp.443"),
+    rule_id: "provenance.port.new_public_bind",
+    fingerprint: "port.tcp.443",
+    severity: "warning",
+    title: "New public bind",
+    summary: "A new identity owns 443.",
+    diagnostics: { identity_hash: "identity-a", protocol: "tcp", local_port: 443, observed_at: "2026-10-06T00:00:00.000Z" },
+  };
+  assert.equal(materialEvidenceDigest(base), materialEvidenceDigest({ ...base, diagnostics: { ...base.diagnostics, observed_at: "2026-10-06T00:01:00.000Z" } }));
+  let first = applyAlertCandidates([], [base], { now: "2026-10-06T00:00:00.000Z" });
+  assert.deepEqual(first.notification_due_ids, [base.id]);
+  let state = [delivered(first)];
+  const unchanged = applyAlertCandidates(state, [{ ...base, diagnostics: { ...base.diagnostics, observed_at: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
+  assert.deepEqual(unchanged.notification_due_ids, [], "unchanged material evidence is silent");
+
+  const identityB = { ...base, diagnostics: { ...base.diagnostics, identity_hash: "identity-b", observed_at: "2026-10-06T00:02:00.000Z" } };
+  const changed = applyAlertCandidates(state, [identityB], { now: "2026-10-06T00:02:00.000Z" });
+  assert.deepEqual(changed.notification_due_ids, [base.id], "identity A -> B on the same port is a new episode");
+  assert.notEqual(changed.alerts[0].material_evidence_digest, state[0].material_evidence_digest);
+
+  const canary = {
+    ...base,
+    id: alertId("canary.tripped", "canary-hash"),
+    rule_id: "canary.tripped",
+    fingerprint: "canary-hash",
+    diagnostics: { canary_id_hash: "canary-hash", trip_reason: "changed", last_seen_ts: "2026-10-06T00:00:00.000Z" },
+  };
+  const canaryFirst = applyAlertCandidates([], [canary], { now: "2026-10-06T00:00:00.000Z" });
+  const canarySecond = applyAlertCandidates([delivered(canaryFirst)], [{ ...canary, diagnostics: { ...canary.diagnostics, last_seen_ts: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
+  assert.deepEqual(canarySecond.notification_due_ids, [canary.id], "a second canary trip remains material even with a stable canary identity");
+
+  const correlation = {
+    ...base,
+    id: alertId("correlation.login_kill_proximity", "anchor-a__peer-a"),
+    rule_id: "correlation.login_kill_proximity",
+    fingerprint: "anchor-a__peer-a",
+    diagnostics: { anchor_fingerprint: "anchor-a", peer_entity_key: "peer-a", observed_at: "2026-10-06T00:00:00.000Z", proximity_seconds: 5 },
+  };
+  const correlationFirst = applyAlertCandidates([], [correlation], { now: "2026-10-06T00:00:00.000Z" });
+  const correlationChanged = applyAlertCandidates([delivered(correlationFirst)], [{ ...correlation, diagnostics: { ...correlation.diagnostics, anchor_fingerprint: "anchor-b", observed_at: "2026-10-06T00:01:00.000Z" } }], { now: "2026-10-06T00:01:00.000Z" });
+  assert.deepEqual(correlationChanged.notification_due_ids, [correlation.id], "a frozen correlation with a new anchor is a new episode");
 });
 
 test("acknowledgement suppresses persistence but not a later severity escalation", () => {

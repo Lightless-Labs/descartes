@@ -264,7 +264,9 @@ export function normalizeAlertRecord(record) {
       : status === "recovered" ? null : firstSeen,
     notified_severity_max: notifiedSeverityMax,
     episode_notified_at: episodeNotifiedAt,
-    material_evidence_digest: record.material_evidence_digest ? String(record.material_evidence_digest) : materialEvidenceDigest(record),
+    material_evidence_digest: String(record.material_evidence_digest ?? "").startsWith("v2:")
+      ? String(record.material_evidence_digest)
+      : materialEvidenceDigest(record),
     adjudicated_at: record.adjudicated_at ? normalizeIso(record.adjudicated_at, "adjudicated_at") : null,
     adjudicated_evidence_digest: record.adjudicated_evidence_digest ? String(record.adjudicated_evidence_digest) : null,
     adjudication: record.adjudication && typeof record.adjudication === "object" && !Array.isArray(record.adjudication)
@@ -277,10 +279,19 @@ export function normalizeAlertRecord(record) {
   };
 }
 
-function canonicalEvidence(value) {
-  if (Array.isArray(value)) return value.map(canonicalEvidence);
+export const MATERIAL_EVIDENCE_VOLATILE_FIELDS = Object.freeze({
+  "*": Object.freeze(["age_ms", "daemon_status_ts", "evaluation_ts", "newest_sample_ts", "now", "observation_ts", "observed_at", "timestamp", "ts", "window_ms"]),
+  "canary.tripped": Object.freeze(["age_ms", "evaluation_ts", "observation_ts", "observed_at", "timestamp", "ts"]),
+  "provenance.port.new_public_bind": Object.freeze(["age_ms", "evaluation_ts", "observation_ts", "observed_at", "stable_iteration_count", "stable_sample_count", "timestamp", "ts"]),
+  "correlation.login_kill_proximity": Object.freeze(["age_ms", "candidate_pool_size", "evaluation_ts", "observation_ts", "observed_at", "peer_novelty_prior_tick_count", "proximity_seconds", "timestamp", "ts"]),
+});
+
+function canonicalEvidence(value, ignoredFields) {
+  if (Array.isArray(value)) return value.map((entry) => canonicalEvidence(entry, ignoredFields));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalEvidence(value[key])]));
+    return Object.fromEntries(Object.keys(value).sort()
+      .filter((key) => !ignoredFields.has(key))
+      .map((key) => [key, canonicalEvidence(value[key], ignoredFields)]));
   }
   return value;
 }
@@ -289,9 +300,13 @@ export function materialEvidenceDigest(candidateOrRecord = {}) {
   const diagnostics = candidateOrRecord?.diagnostics && typeof candidateOrRecord.diagnostics === "object"
     ? candidateOrRecord.diagnostics
     : {};
-  return crypto.createHash("sha256")
-    .update(JSON.stringify(canonicalEvidence(diagnostics)))
-    .digest("hex");
+  const volatileFields = new Set([
+    ...(MATERIAL_EVIDENCE_VOLATILE_FIELDS["*"] ?? []),
+    ...(MATERIAL_EVIDENCE_VOLATILE_FIELDS[candidateOrRecord?.rule_id] ?? []),
+  ]);
+  return `v2:${crypto.createHash("sha256")
+    .update(JSON.stringify(canonicalEvidence(diagnostics, volatileFields)))
+    .digest("hex")}`;
 }
 
 async function deriveLegacyDeliveryState(descartesPaths, alerts, legacyAlertIds = new Set()) {
