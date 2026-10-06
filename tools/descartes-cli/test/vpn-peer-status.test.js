@@ -198,6 +198,21 @@ test("parseScutilNcList classifies VPN types, excludes modem types from VPN coun
   ]);
 });
 
+test("parseScutilNcList treats a display name of Tailscale as an ordinary VPN unless its bracketed type is recognized", () => {
+  const detailed = parseScutilNcListDetailed(
+    '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.acme) "Tailscale" [VPN:com.acme]',
+  );
+  assert.equal(detailed.unparsed_count, 0);
+  assert.deepEqual(detailed.services, [{
+    status: "Connected",
+    service_uuid: "3A2B0000-0000-0000-0000-000000000003",
+    service_name: "Tailscale",
+    service_type: "VPN:com.acme",
+    is_vpn: true,
+    is_tailscale: false,
+  }]);
+});
+
 test("parseScutilNcListDetailed counts successful-but-unparseable lines so an empty parse cannot be ok", () => {
   const detailed = parseScutilNcListDetailed([
     '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
