@@ -824,12 +824,13 @@ export const PEER_CENSUS_MARKER_ENTITY_KEY = "peer.census-marker.v1";
 // 5 fixed source keys vpn-peer-status.js's envelope always produces (sources.{ssh_who,ssh_last,
 // wireguard,vpn_services,established_inbound}.status). Grounded against tools/vpn-peer-status.js's
 // real closed status vocabulary (confirmed by direct read): "ok" | "partial" | "absent" |
-// "missing_permission" | "unable" | "not_applicable" (not every source can emit every value --
+// "not_found_on_known_paths" | "untrusted_binary" | "missing_permission" | "unable" |
+// "not_applicable" (not every source can emit every value --
 // e.g. only wireguard emits "partial", only vpn_services emits "not_applicable" -- but the bucket
 // function below is defensive against ANY future status literal, mapping anything outside this
 // closed set to "unknown" rather than embedding an unrecognized raw string).
 const CLOSED_PEER_SOURCE_STATUS_VALUES = new Set([
-  "ok", "partial", "absent", "not_found_on_known_paths", "missing_permission", "unable", "not_applicable",
+  "ok", "partial", "absent", "not_found_on_known_paths", "untrusted_binary", "missing_permission", "unable", "not_applicable",
 ]);
 
 function normalizedSourceStatus(status) {

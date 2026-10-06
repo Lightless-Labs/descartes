@@ -1019,7 +1019,7 @@ test("factPointsFromVpnPeerEvidence: emits a census marker on every successful e
   assert.equal(marker.confidence, 0);
   assert.match(
     marker.attributes.availability_signature,
-    /^v1:(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|missing_permission|unable|not_applicable|unknown)$/,
+    /^v1:(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)$/,
   );
   assert.equal(marker.attributes.availability_signature, "v1:ok-ok-ok-ok-ok");
 });
@@ -1037,6 +1037,13 @@ test("factPointsFromVpnPeerEvidence: a degraded source (wireguard missing_permis
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
   assert.equal(marker.attributes.availability_signature, "v1:ok-ok-missing_permission-ok-ok");
   assert.notEqual(marker.attributes.availability_signature, "v1:ok-ok-ok-ok-ok");
+});
+
+test("factPointsFromVpnPeerEvidence: an untrusted vpn_services source is preserved in the availability signature", () => {
+  const evidence = [peerEnvelope({ peers: [], sources: allOkSources({ vpn_services: { status: "untrusted_binary" } }), truncated: false })];
+  const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
+  const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
+  assert.equal(marker.attributes.availability_signature, "v1:ok-ok-ok-untrusted_binary-ok");
 });
 
 test("factPointsFromVpnPeerEvidence: the who-fails/last-succeeds SSH-only fixture produces its own distinct signature", () => {
@@ -1071,7 +1078,7 @@ test("factPointsFromVpnPeerEvidence: a malformed/missing result.sources object d
 });
 
 test("factPointsFromVpnPeerEvidence: the census marker's availability_signature never leaks a raw source status beyond the 6-value closed set", () => {
-  const CLOSED_SOURCE_STATUS_VALUES = new Set(["ok", "partial", "absent", "missing_permission", "unable", "not_applicable", "unknown"]);
+  const CLOSED_SOURCE_STATUS_VALUES = new Set(["ok", "partial", "absent", "not_found_on_known_paths", "untrusted_binary", "missing_permission", "unable", "not_applicable", "unknown"]);
   const evidence = [peerEnvelope({ peers: [], sources: allOkSources({ established_inbound: { status: "not_applicable" }, wireguard: { status: "partial" } }), truncated: false })];
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);

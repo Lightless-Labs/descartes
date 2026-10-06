@@ -40,7 +40,7 @@ const PEER_FACT_NAME = "peer.presence";
 // `typeof === "string"` but does NOT match this pattern (garbled facts.jsonl content, a bit-flip,
 // a future/incompatible marker producer) is NOT a legitimate regime key -- see
 // groupPeerFactsByTick's own use of this pattern below for why a type-only guard is insufficient.
-const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|not_found_on_known_paths|missing_permission|unable|not_applicable|unknown)";
+const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)";
 const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v1:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
 
 export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
@@ -61,7 +61,9 @@ export function peerCountFingerprintForAvailabilitySignature(availabilitySignatu
 }
 
 function availabilitySignatureHasUnknownBinary(signature) {
-  return typeof signature === "string" && signature.split(":")[1]?.split("-").includes("not_found_on_known_paths");
+  const codes = typeof signature === "string" ? signature.split(":")[1]?.split("-") : undefined;
+  const vpnServicesStatus = codes?.[3];
+  return ["partial", "not_found_on_known_paths", "untrusted_binary", "unable", "unknown"].includes(vpnServicesStatus);
 }
 
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
@@ -558,7 +560,8 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   // folding — "exclude from the spike fold AND score (fail closed)", distinct from overflow's own
   // deliberate score-but-never-fold posture (a truncated count is still a real lower-bound
   // observation; a garbled/contradictory marker is not evidence of anything at all).
-  const mostRecentIsInvalidSignature = currentSignature === PEER_SIGNATURE_INVALID;
+  const mostRecentIsInvalidSignature = currentSignature === PEER_SIGNATURE_INVALID
+    || availabilitySignatureHasUnknownBinary(currentSignature);
 
   // The most recent COMPLETE tick-group, if the tail of `groups` is itself complete, is also the
   // tail of `completeGroups` (filtering preserves order and cannot re-order past the tail).
@@ -566,7 +569,8 @@ export function computeWindowedPeerStats(groups, { stddevFloor = DEFAULT_PEER_ST
   // lastObservation below, whether the tail is complete (excluded so it can score against a
   // window that doesn't already include itself — self-dampening avoidance) or overflow/invalid
   // (already absent from completeGroups, so nothing further to exclude).
-  const preScoreGroups = (mostRecentGroup && !mostRecentIsOverflow) ? completeGroups.slice(0, -1) : completeGroups;
+  const mostRecentIsComplete = mostRecentGroup && tickGroupDisposition(mostRecentGroup) === "complete";
+  const preScoreGroups = mostRecentIsComplete ? completeGroups.slice(0, -1) : completeGroups;
 
   let preScoreStats = emptyWelfordStats();
   let preScoreEwma = { ewma: undefined, ewma_variance: undefined };
