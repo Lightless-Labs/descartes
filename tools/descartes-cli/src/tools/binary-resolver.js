@@ -256,10 +256,14 @@ function onlyDisabledUserAuthorities(authorities) {
 async function execLookup(execFileAsync, command, args) {
   try {
     const result = await execFileAsync(command, args, { timeout: 5000, maxBuffer: 256 * 1024 });
-    return { stdout: result.stdout ?? "" };
+    return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   } catch (error) {
     return { error };
   }
+}
+
+function dsclOutput(result) {
+  return `${result?.stdout ?? ""}${result?.stderr ?? ""}`;
 }
 
 function unresolvedGroupMembership() {
@@ -271,27 +275,33 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   if (numericGid === undefined) return unresolvedGroupMembership();
 
   const searchPolicy = await execLookup(execFileAsync, MACOS_DSCL, ["/Search", "-read", "/", "CSPSearchPath"]);
-  if (searchPolicy.error || !localAuthenticationSearchPolicy(searchPolicy.stdout)) {
+  if (searchPolicy.error || !localAuthenticationSearchPolicy(dsclOutput(searchPolicy))) {
     return { error: "directory_bound" };
   }
 
   const groupList = await execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Groups", "PrimaryGroupID"]);
-  const groupName = groupList.error ? undefined : parseDsclGroupList(groupList.stdout, numericGid);
+  const groupName = groupList.error ? undefined : parseDsclGroupList(dsclOutput(groupList), numericGid);
   if (!groupName || !validLocalRecordName(groupName)) return unresolvedGroupMembership();
 
   const fullRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`]);
-  const nestedGroups = fullRecord.error ? undefined : parseMacOsNestedGroups(fullRecord.stdout);
-  if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(fullRecord.stdout)) || !nestedGroups || nestedGroups.length > 0) {
+  let nestedGroups = fullRecord.error ? undefined : parseMacOsNestedGroups(dsclOutput(fullRecord));
+  if (!fullRecord.error && nestedGroups === undefined) {
+    // macOS omits an absent NestedGroups attribute from a full record, but an attribute-specific
+    // read reports the absence explicitly. Never infer an empty set from the full-record omission.
+    const nestedRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "NestedGroups"]);
+    nestedGroups = nestedRecord.error ? undefined : parseMacOsNestedGroups(dsclOutput(nestedRecord));
+  }
+  if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(dsclOutput(fullRecord))) || !nestedGroups || nestedGroups.length > 0) {
     return unresolvedGroupMembership();
   }
-  const fullMembership = parseDsclGroupMembership(fullRecord.stdout);
+  const fullMembership = parseDsclGroupMembership(dsclOutput(fullRecord));
   if (!fullMembership) return unresolvedGroupMembership();
   // ACCEPTED RESIDUAL: a former member of any accepted component group can retain that group's GID in processes started before removal; multi-admin or directory-bound Macs fail closed.
-  const groupGuids = parseDsclGroupMembers(fullRecord.stdout);
+  const groupGuids = parseDsclGroupMembers(dsclOutput(fullRecord));
   if (!groupGuids) return unresolvedGroupMembership();
   const guidNames = await Promise.all(groupGuids.map(async (guid) => {
     const result = await execLookup(execFileAsync, MACOS_DSCL, [".", "-search", "/Users", "GeneratedUID", guid]);
-    return result.error ? undefined : parseDsclSearchUser(result.stdout, guid);
+    return result.error ? undefined : parseDsclSearchUser(dsclOutput(result), guid);
   }));
   if (guidNames.some((name) => name === undefined)) return unresolvedGroupMembership();
 
@@ -300,10 +310,10 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
     execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Users", "PrimaryGroupID"]),
   ]);
   if (membership.error) return unresolvedGroupMembership();
-  const supplementaryNames = parseDsclGroupMembership(membership.stdout);
+  const supplementaryNames = parseDsclGroupMembership(dsclOutput(membership));
   if (!supplementaryNames || primaryUsers.error) return unresolvedGroupMembership();
   if (supplementaryNames.join("\u0000") !== fullMembership.join("\u0000")) return unresolvedGroupMembership();
-  const primaryNames = parseDsclPrimaryGroupList(primaryUsers.stdout, numericGid);
+  const primaryNames = parseDsclPrimaryGroupList(dsclOutput(primaryUsers), numericGid);
   if (!primaryNames) return unresolvedGroupMembership();
   const names = [...new Set([...(supplementaryNames ?? []), ...guidNames, ...primaryNames])];
   if (names.some((name) => !validLocalRecordName(name))) return unresolvedGroupMembership();
@@ -311,14 +321,14 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   const userResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "AuthenticationAuthority", "UniqueID"])));
   const principals = userResults.map((result, index) => {
     if (result.error) return undefined;
-    const uid = parseDsclUniqueId(result.stdout);
+    const uid = parseDsclUniqueId(dsclOutput(result));
     if (uid === undefined) return undefined;
-    const authenticationAuthority = dsclAttributeEvidence(result.stdout, "AuthenticationAuthority");
+    const authenticationAuthority = dsclAttributeEvidence(dsclOutput(result), "AuthenticationAuthority");
     // A missing AuthenticationAuthority line is not evidence that the account is disabled.
     // Only dscl's explicit "No such key" response proves that the attribute is absent.
     if (!authenticationAuthority.present && !authenticationAuthority.explicitAbsent) return undefined;
     const authenticationAuthorities = authenticationAuthority.present
-      ? parseDsclAttributes(result.stdout, "AuthenticationAuthority")
+      ? parseDsclAttributes(dsclOutput(result), "AuthenticationAuthority")
       : [];
     return {
       name: names[index],

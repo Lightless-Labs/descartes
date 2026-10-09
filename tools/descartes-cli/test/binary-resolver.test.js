@@ -255,7 +255,8 @@ test("resolveCollectorBinary trusts a macOS admin group containing root, a non-a
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root _mbsetupuser thomas\nNo such key: GroupMembers\nNo such key: NestedGroups\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root _mbsetupuser thomas\nNo such key: GroupMembers\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin NestedGroups") return { stdout: "No such key: NestedGroups\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root _mbsetupuser thomas\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n_mbsetupuser 248\nthomas 20\n" };
       if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
