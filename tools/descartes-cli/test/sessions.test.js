@@ -5,6 +5,7 @@ import {
   DEFAULT_SESSION_ENTITY_LIMIT,
   parseScreenLs,
   parseTmuxSessions,
+  MAX_SESSION_ENTITY_LIMIT,
 } from "../src/tools/sessions.js";
 
 function ok(stdout, stderr = "") {
@@ -248,4 +249,17 @@ test("a session count at or below the cap is never marked truncated", async () =
   });
   assert.equal(envelope.result.sessions.length, cap);
   assert.equal(envelope.result.truncated, false);
+});
+
+// Fact-store capacity plan §2/S4: the session cap is a hard UPPER clamp (the session fact family's
+// budget invariant, T8, is sized against it), not merely a default.
+test("an options.sessionLimit above MAX_SESSION_ENTITY_LIMIT is clamped down to it", async () => {
+  const flood = Array.from({ length: MAX_SESSION_ENTITY_LIMIT + 50 }, (_, i) => `flood-${i}\t1\t0\t1720000000`).join("\n");
+  const envelope = await collectSessionEvidence({
+    sessionLimit: 100_000,
+    runFixedExecFile: fakeExec({ tmux: ok(flood), screen: enoent() }),
+  });
+  assert.equal(envelope.result.cap, MAX_SESSION_ENTITY_LIMIT);
+  assert.equal(envelope.result.sessions.length, MAX_SESSION_ENTITY_LIMIT);
+  assert.equal(envelope.result.truncated, true);
 });

@@ -10,7 +10,8 @@ import {
 } from "./constraint-store.js";
 import { evaluateShadowConstraints } from "./constraint-eval.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { readerFamilies } from "./fact-families.js";
+import { certifiedReadWindowOk, factHistoryTrustworthy } from "./fact-store-completeness.js";
 
 // Shadow evaluation is structurally separate from real alerting — not a flag, a different
 // code path (plan §5). Nothing in this module ever imports alert-store.js, never calls
@@ -297,10 +298,17 @@ export async function evaluateAndLogShadowConstraints(descartesPaths, options = 
   const freshnessMs = options.freshnessMs;
   // Read window and lookup staleness share one resolved nowMs snapshot (never a bare options.now that
   // would let readFactPoints take its own, later, Date.now() and drop a horizon-edge-fresh fact).
-  const readResult = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
+  const factWindowMs = options.factWindowMs ?? freshnessMs;
+  const readResult = await readFacts(descartesPaths, { families: readerFamilies("shadow_evaluator"), windowMs: factWindowMs, now: nowMs });
   // Missing historical exercises can make a shadow candidate look falsely safe. Do not
   // evaluate or append a soak record until this fact-history read is trustworthy.
-  if (!factHistoryTrustworthy(readResult, { nowMs }).trust) {
+  // Narrowing (fact-store capacity plan S3, fact-families.js READER_COVERAGE "shadow_evaluator"):
+  // evaluate only when byte-cap eviction is INVISIBLE to this read -- the soak sees exactly the
+  // points a never-byte-evicted store would return for the same window (certifiedReadWindowOk), so
+  // no exercise inside the window can be missing. Replaces the interim requireFullCoverage gate
+  // (MEDIUM-1), which refused on ANY byte-cap floor ever recorded, even one far older than this
+  // 3 h window -- i.e. permanently, on every host whose store had once filled.
+  if (!factHistoryTrustworthy(readResult, { nowMs }).trust || !certifiedReadWindowOk(readResult, { nowMs, windowMs: factWindowMs })) {
     return { evaluated_count: shadowConstraints.length, fired_count: 0, appended_count: 0 };
   }
   const { points } = readResult;

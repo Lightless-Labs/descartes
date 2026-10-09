@@ -21,6 +21,8 @@ import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT = 200;
+// Fact-store capacity plan §2/S4: hard UPPER clamp (see vpn-peer-status.js MAX_PEER_ENTITY_LIMIT).
+export const MAX_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 
 async function runFixedExecFile(command, args, options = {}) {
   const argv = [command, ...args];
@@ -108,7 +110,7 @@ function resultForFailure(status, probe, extra = {}) {
  * the single-source collector convention.
  */
 export async function collectTailscaleStatusEvidence(options = {}) {
-  const cap = Math.max(1, Number(options.peerLimit) || DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT);
+  const cap = Math.min(MAX_TAILSCALE_PEER_ENTITY_LIMIT, Math.max(1, Number(options.peerLimit) || DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT));
 
   return timedEnvelope(async () => {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;

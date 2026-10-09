@@ -9,6 +9,7 @@ export const DELIVERY_BACKOFF_BASE_MS = 60_000;
 export const DELIVERY_BACKOFF_CAP_MS = 60 * 60 * 1000;
 export const MAX_LIVE_INCIDENTS = 256;
 export const INCIDENT_STORM_KEY = "__incident_storm__";
+export const RETENTION_FAILURE_RULE_ID = "daemon.fact_store.retention_failing";
 
 // Retained as a compatibility export for the historical alert-config constraint and callers that
 // import the old symbol. Alert delivery no longer uses this value: episode state below is the only
@@ -96,6 +97,9 @@ export const FIXED_ALERT_RULE_IDS = new Set([
   "system.memory.sustained_high",
   "system.load.sustained_high",
   "disk.space.high_used_fraction",
+  // Fact-store capacity plan §4.2/I12 (step S3): HISTORY_HORIZON_SHORT_RULE_ID (fact-families.js),
+  // kept as a literal here like its siblings; alert-store.test.js pins the two equal.
+  "daemon.fact_history.horizon_short",
 ]);
 
 // Detector-reported recovery coverage (§8.A): coverage is now keyed on alert IDENTITY
@@ -169,6 +173,62 @@ export function evaluateAlertRules(historySummary, daemonStatus, options = {}) {
       summary: `Local history daemon status is older than ${Math.round(staleMs / 1000)}s.`,
       diagnostics: { daemon_status_ts: new Date(daemonStatusMs).toISOString(), stale_ms: staleMs, age_ms: nowMs - daemonStatusMs },
     });
+  }
+
+  // Fact-store capacity plan §4.2/§4.4, I12 (step S3): a history-dependent rule horizon-ineligible
+  // for longer than the daemon's threshold (HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals,
+  // computed and written by the daemon) is reported, never silent: a sustained short horizon on a
+  // novelty rule is a novelty-ABSORBING window (§5 N5), not a fail-closed one. Driven purely by the
+  // status record, so the CLI's read-only view agrees with the daemon. A malformed block raises
+  // nothing (it cannot vouch for anything); a well-formed one with a long-short rule always fires.
+  const horizonShort = daemonStatus?.history_horizon_short;
+  const horizonThresholdMs = Number(horizonShort?.threshold_ms);
+  if (horizonShort && typeof horizonShort === "object" && Number.isFinite(horizonThresholdMs) && horizonThresholdMs > 0
+    && horizonShort.rules && typeof horizonShort.rules === "object" && !Array.isArray(horizonShort.rules)) {
+    const overdue = Object.entries(horizonShort.rules)
+      .map(([ruleId, entry]) => ({ ruleId, sinceMs: Date.parse(entry?.since_ts) }))
+      .filter(({ sinceMs }) => Number.isFinite(sinceMs) && nowMs - sinceMs >= horizonThresholdMs)
+      .sort((left, right) => left.ruleId.localeCompare(right.ruleId));
+    if (overdue.length > 0) {
+      pushCandidate(candidates, {
+        rule_id: "daemon.fact_history.horizon_short",
+        severity: "warning",
+        title: "Detector history horizon is short",
+        summary: `${overdue.length} history-dependent rule(s) have had too little certified fact history to evaluate for at least ${Math.round(horizonThresholdMs / 3600000)}h; novelty first seen during this window will not alert later.`,
+        diagnostics: {
+          rule_ids: overdue.map(({ ruleId }) => ruleId).join(","),
+          oldest_since_ts: new Date(Math.min(...overdue.map(({ sinceMs }) => sinceMs))).toISOString(),
+          threshold_ms: horizonThresholdMs,
+        },
+      });
+    }
+  }
+
+  // Fact-store capacity plan §4.3 / G2 HIGH-2: retention failures are durable family state, not a
+  // one-tick structural-only condition. The daemon carries each family's retention_error or
+  // retention_failing block through fast ticks, so evaluate this fixed rule from the persisted
+  // status on every tick. One alert identity per family prevents a service failure from hiding or
+  // recovering a peer/network failure, and a clean structural pass removes the family's candidate.
+  const retentionFamilies = daemonStatus?.fact_store_budgets?.families;
+  if (retentionFamilies && typeof retentionFamilies === "object" && !Array.isArray(retentionFamilies)) {
+    for (const family of Object.keys(retentionFamilies).sort()) {
+      const entry = retentionFamilies[family];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      if (!(typeof entry.retention_error === "string" && entry.retention_error) && entry.retention_failing !== true) continue;
+      pushCandidate(candidates, {
+        rule_id: RETENTION_FAILURE_RULE_ID,
+        fingerprint: family,
+        severity: "warning",
+        title: "Fact-store retention is failing",
+        summary: `Fact retention for the ${family} family is failing; the store may grow beyond its bounded history.`,
+        diagnostics: {
+          family,
+          ...(typeof entry.retention_error === "string" ? { retention_error: entry.retention_error } : {}),
+          ...(typeof entry.retention_error_since_ts === "string" ? { retention_error_since_ts: entry.retention_error_since_ts } : {}),
+          ...(entry.retention_failing === true ? { retention_failing: true } : {}),
+        },
+      });
+    }
   }
 
   const memory = metrics.get("system.memory.used_fraction");
@@ -655,6 +715,20 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   ]);
   const candidates = evaluateAlertRules(historySummary, daemonStatus, { now, thresholds: options.thresholds });
   const extraCandidates = Array.isArray(options.extraCandidates) ? options.extraCandidates : [];
+  const successfulRetentionFamilies = options.successfulRetentionFamilies instanceof Set
+    ? options.successfulRetentionFamilies
+    : new Set();
+  const existingById = new Map(existing.map((alert) => [alert.id, alert]));
+  // An unresolved retention alert without successful-pass evidence is frozen in place. Re-emitting
+  // it as a synthetic candidate would turn stale status into fresh observation, advancing last_seen
+  // and notification eligibility on every fast tick (especially while both tiers are disabled).
+  // computeCoveredAlerts separately excludes the identity from recovery until its family reports a
+  // genuinely successful structural retention pass, so removing the candidate preserves HIGH-2.
+  const currentCandidates = candidates.filter((candidate) => {
+    if (candidate.rule_id !== RETENTION_FAILURE_RULE_ID || successfulRetentionFamilies.has(candidate.fingerprint)) return true;
+    const existingAlert = existingById.get(candidate.id);
+    return !existingAlert || !["active", "acknowledged"].includes(existingAlert.status);
+  });
   // Both sources MUST be merged into one array before the single applyAlertCandidates call below:
   // applyAlertCandidates' recovery logic marks any active alert id absent from the current candidate
   // array as "recovered", so evaluating fixed rules and extra (e.g. constraint) candidates separately
@@ -662,11 +736,11 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   // candidate already carries an `id` (set by pushCandidate); defensively assign the same alertId()
   // to any extraCandidates entry missing one, so a source that forgets to set `id` cannot desync
   // applyAlertCandidates' recovery-detection set from the ids it actually persists under.
-  const mergedCandidates = [...candidates, ...extraCandidates].map((candidate) =>
+  const mergedCandidates = [...currentCandidates, ...extraCandidates].map((candidate) =>
     candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
   );
   const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
-  return { alerts: applied.alerts, candidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids, notification_due_incidents: applied.notification_due_incidents, adjudication_due_ids: applied.adjudication_due_ids, adjudication_due_incidents: applied.adjudication_due_incidents };
+  return { alerts: applied.alerts, candidates: currentCandidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids, notification_due_incidents: applied.notification_due_incidents, adjudication_due_ids: applied.adjudication_due_ids, adjudication_due_incidents: applied.adjudication_due_incidents };
 }
 
 export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {

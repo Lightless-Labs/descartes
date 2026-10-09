@@ -91,12 +91,14 @@ function threeTicks(latestAttributes = {}) {
 // service-baseline.test.js's own intactReadResult/degradedReadResult exactly -- injected via
 // options.readFactPoints so the dedicated cold-start tests below don't need to fabricate real
 // ledger corruption/eviction.
-function intactReadResult(points, completeness = { status: "intact" }) {
+// coverage: "full" -- a real intact store always reports its coverage (fact-store capacity plan S2);
+// since S3 the per-rule eligibility horizon fails closed on a completeness without it (LOW-2).
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return { points, corrupt_count: 0, schema_invalid_count: 0, completeness };
 }
 
 function degradedReadResult(points, lossTs) {
-  return { points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded", last_bytecap_evict_ts: lossTs } };
+  return { points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded", last_continuity_break_ts: lossTs } };
 }
 
 // One millisecond before the given day's ts -- a convenient "anchored strictly before this
@@ -1535,4 +1537,41 @@ test("coverage (unevaluated: stale census): a stale census reports NEITHER the t
     result.evaluatedAlertKeys.includes(tamperedKey("manifest_unreadable")),
     "past the tier gate, the unconditional manifest_unreadable singleton must still be reported -- the freeze is targeted, not blanket",
   );
+});
+
+// Fact-store capacity plan §4.2, step S3: the 6 h eligibility horizon gates ONLY the canary_vanished
+// absence claim under canary.tampered; canary.tripped (positive evidence) and the manifest tamper
+// singleton are not history claims and keep reporting.
+test("S3 horizon: a horizon-short canary store gates canary_vanished (no candidate, no coverage) but not canary.tripped or the manifest identity", async () => {
+  const vanishPoints = [
+    presence(1, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
+    presence(2, "credential", { identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
+    census(3),
+  ];
+  const clearPoints = [
+    presence(1, "credential", { atime: "100", watch: "atime", identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(1),
+    presence(2, "credential", { atime: "100", watch: "atime", identity_fingerprint: CURRENT_CANARY_IDENTITY }), census(2),
+  ];
+  const run = (points, now, floorTs) => computeCanaryBaselineCandidates({}, {
+    now,
+    establishedMinCensusCount: 2,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "narrowed", bytecap_floor_ts: floorTs, age_floor_ts: null }),
+    loadCanaryBaselineStore: async () => ({ state: establishedCanaryState() }),
+    writeCanaryBaselineStore: async (_paths, next) => next,
+    loadCanaryManifest: async () => ({ canaries: [manifestCanary()], read_ok: true }),
+  });
+  const hoursBefore = (day, hours) => new Date(Date.parse(ts(day)) - hours * 60 * 60 * 1000).toISOString();
+
+  const vanishedShort = await run(vanishPoints, ts(3), hoursBefore(3, 5));
+  assert.equal(vanishedShort.candidates.some((candidate) => candidate.diagnostics?.reason === "canary_vanished"), false, "5 h < 6 h: no canary_vanished claim");
+  const vanishedOk = await run(vanishPoints, ts(3), hoursBefore(3, 6));
+  assert.equal(vanishedOk.candidates.some((candidate) => candidate.rule_id === "canary.tampered"), true, "control: exactly 6 h certified, canary_vanished fires");
+
+  const clearShort = await run(clearPoints, ts(2), hoursBefore(2, 5));
+  assert.equal(clearShort.evaluatedAlertKeys.includes(tamperedKey("canary_vanished:credential")), false, "a horizon-short absence identity is not reported -- a persisted canary_vanished freezes");
+  assert.ok(clearShort.evaluatedAlertKeys.includes(trippedKey("credential")), "canary.tripped is positive evidence and stays ungated");
+  assert.ok(clearShort.evaluatedAlertKeys.includes(tamperedKey("manifest_unreadable")), "the manifest tamper singleton is a direct I/O signal and stays ungated");
+  const clearOk = await run(clearPoints, ts(2), hoursBefore(2, 7));
+  assert.ok(clearOk.evaluatedAlertKeys.includes(tamperedKey("canary_vanished:credential")), "restored horizon: the absence identity is reported again on the same tick");
 });

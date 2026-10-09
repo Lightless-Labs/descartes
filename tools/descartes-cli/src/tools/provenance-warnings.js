@@ -36,6 +36,7 @@ import { alertId } from "../alert-store.js";
 import { loadLearnedConfig } from "../constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "../diagnostics-sanitizer.js";
 import { readFactPoints } from "../fact-store.js";
+import { readerFamilies } from "../fact-families.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { parseMacLsofListeningSocketsDetailed } from "./network.js";
 import { buildParentTreeResult } from "./processes.js";
@@ -332,6 +333,7 @@ export async function computeProvenanceWarningCandidates(descartesPaths, options
   // Slice 9 audit — no completeness gate needed: this maps latest warning facts; absence
   // produces no candidate rather than a novelty or absence claim.
   const { points } = await readFacts(descartesPaths, {
+    families: readerFamilies("provenance_warning"),
     windowMs: options.provenanceFactWindowMs ?? DEFAULT_PROVENANCE_FACT_WINDOW_MS,
     now: options.now,
   });

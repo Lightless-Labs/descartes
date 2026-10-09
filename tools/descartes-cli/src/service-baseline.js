@@ -39,7 +39,8 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, noveltySeenSetStatus, ruleHorizonOk, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { seenBeforeTick } from "./novelty-seen-set.js";
 import { SERVICE_CENSUS_FACT_NAME, SERVICE_CENSUS_MARKER_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
@@ -117,31 +118,9 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 export function normalizeServiceBaselineState(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -452,6 +431,19 @@ export function buildDisappearedCandidates(entries = []) {
 // fabricated recovery). When the tick was NOT evaluable (cold-start / too few complete groups /
 // stale latest census), NOTHING is reported, so every owned identity freezes rather than clearing
 // itself from silence.
+// S6 (I11): the readiness half of the predicate below, factored out unchanged so the per-rule status
+// report names WHICH gate stopped the rule (and so a ready window with zero services still reads as
+// evaluating). "ok" | "insufficient_complete_history" | "latest_census_stale".
+function censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups }) {
+  // Same filter detect* uses ("the" notion of a complete tick for this detector).
+  const completeGroups = currentGroups.filter((group) => group.censusState === "complete");
+  if (completeGroups.length < minCompleteGroups) return { gate: "insufficient_complete_history" }; // detect*'s >=complete-count gate
+  const latest = completeGroups[completeGroups.length - 1];
+  const latestMs = new Date(latest.ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale" }; // detect*'s freshness gate
+  return { gate: "ok", completeGroups };
+}
+
 export function computeCensusEvaluatedAlertKeys(currentGroups, {
   coldStartPendingThisTick,
   nowMs,
@@ -461,12 +453,9 @@ export function computeCensusEvaluatedAlertKeys(currentGroups, {
   hashEntityKey,
 }) {
   if (coldStartPendingThisTick) return [];
-  // Same filter detect* uses ("the" notion of a complete tick for this detector).
-  const completeGroups = currentGroups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minCompleteGroups) return []; // detect*'s >=complete-count gate
-  const latest = completeGroups[completeGroups.length - 1];
-  const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return []; // detect*'s freshness gate
+  const readiness = censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups });
+  if (readiness.gate !== "ok") return [];
+  const { completeGroups } = readiness;
   const union = new Set();
   for (const group of completeGroups) {
     for (const entityKey of group.entityKeys) union.add(entityKey);
@@ -515,7 +504,7 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   // exactly what process-lineage-baseline.js/session-baseline.js/peer-baseline.js do for their own
   // candidate computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "service", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupServiceFactsByTick(points);
 
@@ -671,21 +660,38 @@ export async function computeServiceBaselineCandidates(descartesPaths, options =
   // Recovery-coverage report (§8.B/§8.C): the alert identities this detector GENUINELY evaluated
   // this tick — empty when coldStartPendingThisTick (computeCensusEvaluatedAlertKeys short-circuits
   // on it), matching the frozen `[]` candidates below.
-  const evaluatedAlertKeys = computeCensusEvaluatedAlertKeys(currentGroups, {
-    coldStartPendingThisTick,
-    nowMs,
-    freshnessMs,
-    minCompleteGroups: 2, // detectServiceDisappearances' own `completeGroups.length < 2 -> []` gate
-    ruleId: SERVICE_DISAPPEARED_RULE_ID,
-    hashEntityKey: hashServiceEntityKey,
-  });
+  //
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; 6 h): computed AFTER the lockout
+  // state machine and the store write above, never an input to either (I5) -- a horizon-short tick
+  // emits nothing and reports no coverage, then resumes the moment the certified span recovers.
+  const horizonOk = ruleHorizonOk(readResult, SERVICE_DISAPPEARED_RULE_ID, nowMs);
+  const evaluatedAlertKeys = horizonOk
+    ? computeCensusEvaluatedAlertKeys(currentGroups, {
+      coldStartPendingThisTick,
+      nowMs,
+      freshnessMs,
+      minCompleteGroups: 2, // detectServiceDisappearances' own `completeGroups.length < 2 -> []` gate
+      ruleId: SERVICE_DISAPPEARED_RULE_ID,
+      hashEntityKey: hashServiceEntityKey,
+    })
+    : [];
 
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [SERVICE_DISAPPEARED_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      readinessGate: censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups: 2 }).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys, ruleEvaluations };
 
   // Re-emission every tick (load-bearing, mirrors session/peer's own "re-emission every tick"
   // behavior): built fresh from `disappearances` on EVERY call — never dependent on whether a store
   // write happened that tick.
-  return { candidates: buildDisappearedCandidates(disappearances), evaluatedAlertKeys };
+  return { candidates: buildDisappearedCandidates(disappearances), evaluatedAlertKeys, ruleEvaluations };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -832,6 +838,9 @@ export function detectServiceAppearances(groups = [], options = {}) {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_SERVICE_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT,
+    // S3b (§17): the family's valid seen-set entries, when the caller has one. Novelty is then
+    // latest \ (window-historical ∪ seen-before): the union can only suppress a claim.
+    seenEntries,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
   if (completeGroups.length < minHistoryTickCount + 1) return [];
@@ -848,6 +857,7 @@ export function detectServiceAppearances(groups = [], options = {}) {
   const appearances = [];
   for (const entityKey of latest.entityKeys) {
     if (historical.has(entityKey)) continue;
+    if (seenBeforeTick(seenEntries, entityKey, latest.ts)) continue;
     appearances.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return appearances;
@@ -867,12 +877,17 @@ export function hashServiceAppearedEntityKey(entityKey) {
 // 2026-07-24 cleartext-service-name exception to this new rule_id (that exception is explicitly
 // narrow, "do not generalize"). A future operator sign-off can add a sanitized `service_name`
 // diagnostics field the same way service.disappeared did, without a redesign.
-export function buildAppearedCandidates(entries = []) {
+// Fact-store capacity plan §4.2 (step S3): a novelty claim carries its scope. history_certified_after_ts
+// turns "not seen in this host's recent history" into "not seen since <ts>" -- the start of the
+// certified memory the claim was decided against (noveltyHistoryScopeTs, fact-store-completeness.js).
+// Omitted (never null: the sanitizer redacts null) only when no scope is known.
+export function buildAppearedCandidates(entries = [], { historyCertifiedAfterTs } = {}) {
   return entries.map((entry) => {
     const entityKeyHash = hashServiceAppearedEntityKey(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
       entity_key_hash: entityKeyHash,
       first_seen_ts: entry.first_seen_ts,
+      ...(typeof historyCertifiedAfterTs === "string" ? { history_certified_after_ts: historyCertifiedAfterTs } : {}),
     });
     return {
       id: alertId(SERVICE_APPEARED_RULE_ID, entityKeyHash),
@@ -913,7 +928,8 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   const establishedMinCensusCount = options.establishedMinCensusCount ?? DEFAULT_SERVICE_ESTABLISHED_MIN_CENSUS_COUNT;
 
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  // S3b (§17): also read the service seen-set, validated against this same read's ledger.
+  const readResult = await readFacts(descartesPaths, { family: "service", windowMs, now: options.now, seenSetFamilies: ["service"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupServiceFactsByTick(points);
 
@@ -933,7 +949,18 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  // Novelty over a narrowed window (daybreak G1 blocker 1): service.appeared claims an entity was
+  // never seen before. With a VALID seen-set (S3b, §17) that memory survives byte-cap eviction (I13)
+  // and novelty is decided against it, so narrowing is no longer a trust loss here. WITHOUT one
+  // (missing, invalid, lineage mismatch, pending pass, overflow, or an injected read that carries
+  // none), the interim S2 gate stays: a narrowed window is untrusted and re-arms the lockout through
+  // the existing cold-start path (I14: a seen-set that cannot prove continuity yields no claim).
+  const seenSet = validNoveltySeenSet(readResult, SERVICE_APPEARED_RULE_ID);
+  const historyTrust = factHistoryTrustworthy(readResult, {
+    anchorTs: persistedState.cold_start_since_ts,
+    nowMs,
+    requireFullCoverage: !seenSet,
+  });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
   // previously computed only after `appearances`, purely to gate the store WRITE) and added as a
@@ -973,9 +1000,13 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
     }
   }
 
-  const appearances = coldStartPendingThisTick
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h), measured against
+  // the valid current-epoch seen-set's certified span (S3b; no full-store fallback since G3). Never an
+  // input to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = noveltyRuleEligible(readResult, SERVICE_APPEARED_RULE_ID, nowMs);
+  const appearances = coldStartPendingThisTick || !horizonOk
     ? []
-    : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount });
+    : detectServiceAppearances(currentGroups, { nowMs, freshnessMs, minHistoryTickCount: establishedMinCensusCount, seenEntries: seenSet?.entries });
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
   // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
@@ -1009,16 +1040,29 @@ export async function computeServiceAppearanceCandidates(descartesPaths, options
   // threshold detectServiceAppearances applies (`completeGroups.length < minHistoryTickCount + 1`,
   // where it is called with minHistoryTickCount: establishedMinCensusCount) — NOT the lockout
   // re-accumulation `minHistoryTickCount`, which is a different knob with a colliding name.
-  const evaluatedAlertKeys = computeCensusEvaluatedAlertKeys(currentGroups, {
-    coldStartPendingThisTick,
-    nowMs,
-    freshnessMs,
-    minCompleteGroups: establishedMinCensusCount + 1,
-    ruleId: SERVICE_APPEARED_RULE_ID,
-    hashEntityKey: hashServiceAppearedEntityKey,
-  });
+  const evaluatedAlertKeys = horizonOk
+    ? computeCensusEvaluatedAlertKeys(currentGroups, {
+      coldStartPendingThisTick,
+      nowMs,
+      freshnessMs,
+      minCompleteGroups: establishedMinCensusCount + 1,
+      ruleId: SERVICE_APPEARED_RULE_ID,
+      hashEntityKey: hashServiceAppearedEntityKey,
+    })
+    : [];
 
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [SERVICE_APPEARED_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      horizonReason: noveltySeenSetStatus(readResult, SERVICE_APPEARED_RULE_ID),
+      readinessGate: censusEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minCompleteGroups: establishedMinCensusCount + 1 }).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  if (coldStartPendingThisTick || !horizonOk) return { candidates: [], evaluatedAlertKeys, ruleEvaluations };
 
-  return { candidates: buildAppearedCandidates(appearances), evaluatedAlertKeys };
+  return { candidates: buildAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SERVICE_APPEARED_RULE_ID) }), evaluatedAlertKeys, ruleEvaluations };
 }

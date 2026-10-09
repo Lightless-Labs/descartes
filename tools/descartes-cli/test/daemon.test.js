@@ -30,7 +30,9 @@ import {
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
 import { writeWatchConfig } from "../src/watch-store.js";
-import { appendFactPoints, enforceFactRetention, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, enforceFactRetention, normalizeFactPoint, readFactPoints, resolveFactStorePaths, appendFactPointsByFamily } from "../src/fact-store.js";
+import { FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES } from "../src/fact-families.js";
+import { resolveFactIntegrityPaths } from "../src/fact-store-integrity.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { alertId, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
@@ -52,6 +54,7 @@ import {
 } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
+import { certifiedReadWindowOk, ruleHorizonOk } from "../src/fact-store-completeness.js";
 import { readContainmentRecommendConfig, writeContainmentRecommendConfig } from "../src/containment-recommend.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, loadPeerBaselineStore, writePeerBaselineStore } from "../src/peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID, loadServiceAppearanceBaselineStore, loadServiceBaselineStore, writeServiceAppearanceBaselineStore, writeServiceBaselineStore } from "../src/service-baseline.js";
@@ -81,6 +84,15 @@ async function tempPaths() {
     XDG_STATE_HOME: path.join(root, "state"),
     XDG_CACHE_HOME: path.join(root, "cache"),
   });
+}
+
+// G2 L2: "no fact I/O" means no family store at all, not just the service one -- S4 split the store
+// into eight families, so a regression writing (say) the network, provenance or canary store under a
+// disabled kill switch or a timed-out tick must fail here. The facts tree itself must not exist.
+async function assertNoFactStoreWritten(paths) {
+  const factsRoot = path.join(paths.stateDir, "learned", "facts");
+  assert.equal(path.dirname(resolveFactStorePaths(paths, "service").factsFile), path.join(factsRoot, "service"), "the facts tree root is where the family stores live");
+  await assert.rejects(() => fs.access(factsRoot), { code: "ENOENT" }, "no family fact store was created");
 }
 
 function fakeRunner(responses, calls = []) {
@@ -570,6 +582,19 @@ test("validateDaemonProfile accepts default and structural-less profiles, reject
     }),
     /structural\.deadline_ms/,
   );
+  assert.doesNotThrow(() => validateDaemonProfile({
+    interval_ms: 60000,
+    collectors: {},
+    structural: { interval_ms: 15 * 60 * 1000, collectors: {} },
+  }));
+  assert.throws(
+    () => validateDaemonProfile({
+      interval_ms: 60000,
+      collectors: {},
+      structural: { interval_ms: 5 * 60 * 1000, collectors: {} },
+    }),
+    /structural\.interval_ms.*budget ceiling/,
+  );
 });
 
 test("collectStructuralEvidence calls only enabled structural collectors in a stable order", async () => {
@@ -963,7 +988,7 @@ test("S6b wiring: structural evidence is translated into fact-points and persist
   // appended on a successful, even zero-job, scheduled-jobs envelope) = 4.
   assert.equal(result.structuralFacts.written_count, 4);
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   assert.equal(points.length, 4);
   assert(points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
   assert(points.some((point) => point.fact_name === "network.listening_port.owner" && point.entity_key === "tcp:0.0.0.0:8080"));
@@ -986,7 +1011,7 @@ test("S6b wiring: no fact-points are persisted while the watch.json kill switch 
   });
 
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("S6b wiring: a timed-out structural tick discards its evidence entirely — no fact-points are persisted for a partial/timed-out tick", async () => {
@@ -1015,7 +1040,7 @@ test("S6b wiring: a timed-out structural tick discards its evidence entirely —
 
   assert.equal(result.structuralEvidence, undefined);
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("S6b wiring: no fact-points are persisted when profile.structural is absent (regression, matches S6a's byte-identical-fast-path guarantee)", async () => {
@@ -1025,7 +1050,7 @@ test("S6b wiring: no fact-points are persisted when profile.structural is absent
 
   const result = await runDaemonIteration(paths, { profile, collectors: fastCollectorFakes(), ts, now: ts, evaluateAlerts: false });
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 // --- Slice S7a, additive: evaluateAndLogShadowConstraints wired into the structural tick ---
@@ -1057,8 +1082,10 @@ function shadowConstraintFixture(overrides = {}) {
 // follow-up retention pass. Commit that follow-up after each fixture append so these wiring
 // tests exercise normal intact shadow evaluation rather than bootstrap suppression.
 async function appendFactPointsAndCommit(paths, points, options = {}) {
-  const result = await appendFactPoints(paths, points, options);
-  await enforceFactRetention(paths, { now: options.now !== undefined ? options.now : options.ts });
+  const result = await appendFactPointsByFamily(paths, points, options);
+  // S4: a second clean pass over EVERY written family store (the registry-driven sweep) commits each
+  // one's ledger, so the shadow evaluator's multi-family read is trusted.
+  await appendFactPointsByFamily(paths, [], { now: options.now !== undefined ? options.now : options.ts });
   return result;
 }
 
@@ -1082,17 +1109,18 @@ test("S7a wiring: with zero shadow constraints, a structural tick produces no sh
   await assert.rejects(() => fs.access(resolveShadowStorePaths(paths).shadowViolationsFile));
 });
 
-// Finding F2-Tier1: the configured learned-config fact_store_max_bytes must reach the live
-// appendFactPoints call site as options.maxBytes, so an operator has an actual lever to stop
-// routine bytecap eviction (previously hardcoded to fact-store.js's DEFAULT_FACT_MAX_BYTES with
-// no override surface at all).
-test("structural fact-persist threads watch-config fact_store_max_bytes (not learned-config's) into appendFactPoints as options.maxBytes", async () => {
+// Finding F2-Tier1, superseded by S4 (fact-store capacity plan §4.5 Config, operator Q5): the single
+// fact_store_max_bytes cap is replaced by per-family budgets (watch.json fact_store_budgets). The
+// operator lever survives -- per family, validated against the T8 horizon floor -- and the legacy key
+// is IGNORED (from watch.json and learned.json alike), so it can no longer shrink any store.
+test("S4: structural fact-persist threads watch.json fact_store_budgets (validated per family) into the persist call; the legacy fact_store_max_bytes is ignored", async () => {
   const paths = await tempPaths();
   const seenOptions = [];
   const spyAppendFactPoints = async (spyPaths, points, options) => {
     seenOptions.push(options);
     return appendFactPointsAndCommit(spyPaths, points, options);
   };
+  const raisedPeer = 32 * 1024 * 1024;
 
   await runDaemonIteration(paths, {
     profile: structuralProfile(),
@@ -1103,16 +1131,17 @@ test("structural fact-persist threads watch-config fact_store_max_bytes (not lea
     now: Date.parse("2026-05-24T00:00:00.000Z"),
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
-    // Deliberately DIFFERENT values (watch-by-default slice 1, plan §12.3 fact 3): the structural
-    // fact-store byte cap now sources from watchConfig, not learnedConfig, so this pins WHICH
-    // source actually wins -- a shared value on both flags (as before the split) couldn't tell.
     loadLearnedConfig: async () => ({ enabled: true, fact_store_max_bytes: 111111 }),
-    loadWatchConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456 }),
+    // peer raised (accepted); service below its horizon floor (rejected -> default).
+    loadWatchConfig: async () => ({ enabled: true, fact_store_max_bytes: 123456, fact_store_budgets: { peer: raisedPeer, service: 1024 } }),
     appendFactPoints: spyAppendFactPoints,
   });
 
   assert.equal(seenOptions.length, 1);
-  assert.equal(seenOptions[0].maxBytes, 123456, "maxBytes must come from watchConfig.fact_store_max_bytes, not learnedConfig's");
+  assert.equal(seenOptions[0].maxBytes, undefined, "no single cap is passed: the legacy fact_store_max_bytes is ignored");
+  assert.equal(seenOptions[0].budgets.peer, raisedPeer, "an accepted per-family budget reaches the store");
+  assert.equal(seenOptions[0].budgets.service, FAMILY_DEFAULT_BUDGET_BYTES.get("service"), "a budget below the horizon floor is rejected to the default");
+  assert.equal(seenOptions[0].budgets.network, FAMILY_DEFAULT_BUDGET_BYTES.get("network"));
 });
 
 test("S7a wiring: with one shadow constraint and a matching fact, exactly one shadow-violations.jsonl record is appended per structural tick", async () => {
@@ -1263,7 +1292,7 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
   await writeLearnedConfig(paths, { enabled: true });
 
   const structuralCalls = [];
-  const profile = structuralProfile({ interval_ms: 5 * 60000 });
+  const profile = structuralProfile({ interval_ms: 15 * 60000 });
   let simulatedNowMs = 0;
   let fastTicks = 0;
   const outputs = [];
@@ -1271,7 +1300,7 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
   await runForegroundDaemonLoop(paths, {
     intervalMs: profile.interval_ms,
     sleep: async () => {},
-    shouldStop: () => fastTicks >= 12,
+    shouldStop: () => fastTicks >= 32,
     output: (line) => outputs.push(JSON.parse(line)),
     iterate: async (iterationPaths) => {
       fastTicks += 1;
@@ -1289,10 +1318,10 @@ test("runForegroundDaemonLoop performs structural collection at the expected cad
     },
   });
 
-  // 12 fast ticks at 60s each span 0..660000ms; structural (every 300000ms) is due at ticks
-  // 1 (now=0, no checkpoint), 6 (now=300000), and 11 (now=600000) -> exactly 3 structural runs.
-  assert.equal(fastTicks, 12);
-  assert.equal(outputs.length, 12);
+  // 32 fast ticks at 60s each span 0..1860000ms; structural (every 900000ms) is due at ticks
+  // 1 (now=0, no checkpoint), 16 (now=900000), and 31 (now=1800000) -> exactly 3 structural runs.
+  assert.equal(fastTicks, 32);
+  assert.equal(outputs.length, 32);
   assert.equal(structuralCalls.filter((call) => call === "services").length, 3);
   assert.equal(structuralCalls.length, 9);
 });
@@ -1360,7 +1389,7 @@ test("S-live-1: byte-identical real alerts when the learned kill switch is off, 
 
   const withConstraintPaths = await tempPaths();
   await writeConstraints(withConstraintPaths, [activeConstraintFixture()]);
-  await appendFactPoints(withConstraintPaths, [
+  await appendFactPointsByFamily(withConstraintPaths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
   // configDir/learned.json intentionally never written here -> loadLearnedConfig defaults to
@@ -1393,7 +1422,7 @@ test("S-live-1: an active constraint violated by a current fact produces a real 
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -1415,7 +1444,7 @@ test("S-live-1: an active constraint whose target has no current fact does not f
 
   const result = await runIsolatedDaemonTick(paths);
   assert.equal(result.alerts.alerts.some((alert) => alert.rule_id === "constraint.violation.service-presence"), false);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("BLOCKER-1: a persisted constraint.violation alert stays active when learned monitoring is off and the active-constraint producer returns []", async () => {
@@ -1461,7 +1490,7 @@ test("Slice B: an active constraint whose only fact is older than 3× the struct
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } }, // would VIOLATE if it were fresh
   ], { ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
 
@@ -1483,7 +1512,7 @@ test("Slice B (must-fix guard): freshness is pinned to the STRUCTURAL interval, 
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
 
@@ -1503,7 +1532,7 @@ test("S-live-1: a satisfied active constraint does not fire", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } }, // satisfies expected "true"
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -1521,7 +1550,7 @@ test("S-live-1: draft, shadow, and review-ready constraints are never evaluated 
     activeConstraintFixture({ id: "constraint.mined.service-presence.shadow0000000", status: "shadow" }),
     activeConstraintFixture({ id: "constraint.mined.service-presence.reviewready00", status: "review-ready" }),
   ]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } }, // violates all three, if evaluated
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -1535,7 +1564,7 @@ test("S-live-1: a fixed-rule alert and an active-constraint alert coexist across
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: "2026-05-24T00:00:00.000Z" });
 
@@ -1572,7 +1601,7 @@ test("S-live-1: a fixed-rule alert and an active-constraint alert coexist across
   // clear returns when active-constraint is converted to report coverage. Meanwhile the
   // still-sustained-high-memory fixed alert must ALSO NOT be spuriously recovered by the
   // constraint source disappearing from extraCandidates.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } },
   ], { now: "2026-05-24T00:02:00.000Z" });
   const third = await runDaemonIteration(paths, { profile, collectors: highMemoryCollectors, ts: "2026-05-24T00:02:00.000Z", now: "2026-05-24T00:02:00.000Z" });
@@ -1627,7 +1656,7 @@ test("S4: byte-identical real alerts when the learned kill switch is off, even w
   const baseline = await runIsolatedDaemonTick(baselinePaths);
 
   const withWarningPaths = await tempPaths();
-  await appendFactPoints(withWarningPaths, [publicBindWarningFactFixture(), deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
+  await appendFactPointsByFamily(withWarningPaths, [publicBindWarningFactFixture(), deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
   // configDir/learned.json intentionally never written here -> loadLearnedConfig defaults to
   // { enabled: false }, exactly like the pre-S4 baseline above — computeProvenanceWarningCandidates
   // must short-circuit to [] before ever calling readFactPoints. Watch-by-default slice 1: the
@@ -1644,7 +1673,7 @@ test("S4: byte-identical real alerts when the learned kill switch is off, even w
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args);
+      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
     },
   });
 
@@ -1660,7 +1689,7 @@ test("S4: byte-identical real alerts when the learned kill switch is off, even w
 test("S4: an active public_bind_no_supervisor provenance-warning fact produces a real, sanitized alert record in alerts.json", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
-  await appendFactPoints(paths, [publicBindWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
+  await appendFactPointsByFamily(paths, [publicBindWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
 
   const result = await runIsolatedDaemonTick(paths);
   const alert = result.alerts.alerts.find((a) => a.rule_id === PUBLIC_BIND_RULE_ID);
@@ -1676,7 +1705,7 @@ test("S4: an active public_bind_no_supervisor provenance-warning fact produces a
 test("S4: an active deleted_exe_running provenance-warning fact produces a real, sanitized alert record with a hashed (never raw) executable path", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
-  await appendFactPoints(paths, [deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
+  await appendFactPointsByFamily(paths, [deletedExeWarningFactFixture()], { now: S_LIVE_1_TICK_TS });
 
   const result = await runIsolatedDaemonTick(paths);
   const alert = result.alerts.alerts.find((a) => a.rule_id === DELETED_EXE_RULE_ID);
@@ -1691,7 +1720,7 @@ test("S4: an active deleted_exe_running provenance-warning fact produces a real,
 test("S4: a cleared (active:\"false\") provenance-warning fact does not fire", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
-  await appendFactPoints(paths, [publicBindWarningFactFixture({ active: "false" })], { now: S_LIVE_1_TICK_TS });
+  await appendFactPointsByFamily(paths, [publicBindWarningFactFixture({ active: "false" })], { now: S_LIVE_1_TICK_TS });
 
   const result = await runIsolatedDaemonTick(paths);
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === PUBLIC_BIND_RULE_ID), false);
@@ -1756,7 +1785,7 @@ test("S4 structural wiring: the provenance sub-collector runs on a structural-du
     { id: "provenance-warnings", status: "ok", tool: "collect_provenance_warnings" },
   ]);
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   const warningPoint = points.find((point) => point.fact_name === "provenance.warning");
   assert.ok(warningPoint, "expected the structural provenance warning to be translated into a fact-point");
   assert.equal(warningPoint.attributes.rule_id, "public_bind_no_supervisor");
@@ -1789,7 +1818,7 @@ test("S4 structural wiring: a timed-out structural tick (provenance hangs) disca
   assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
   assert.equal(result.structuralEvidence, undefined);
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1839,7 +1868,7 @@ test("Slice 1: the sessions sub-collector runs on a structural-due tick alongsid
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "sessions"]);
   assert(result.status.structural_collector_statuses.some((entry) => entry.id === "sessions" && entry.status === "ok" && entry.tool === "collect_sessions"));
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   const sessionPoint = points.find((point) => point.fact_name === "session.presence");
   assert.ok(sessionPoint, "expected the structural session census to be translated into a fact-point");
   assert.match(sessionPoint.entity_key, /^session\.tmux\.[0-9a-f]{16}$/);
@@ -1879,7 +1908,7 @@ test("Slice 1: no session fact-points are persisted while the watch.json kill sw
   });
 
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("Slice 1 day-1 no-storm: the first-ever session observation seeds fact-history and emits no alert (this collector has no alert-candidate path at all)", async () => {
@@ -1909,7 +1938,7 @@ test("Slice 1 day-1 no-storm: the first-ever session observation seeds fact-hist
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   assert(points.some((point) => point.fact_name === "session.presence"), "expected fact-history to be seeded on first observation");
   assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("session")), false, "Slice 1 must never emit a session-related alert candidate");
 });
@@ -1994,7 +2023,7 @@ test("tailscale structural wiring persists hashed peer facts and adds no new ale
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   const peerPoint = points.find((point) => point.fact_name === "peer.presence");
   assert.ok(peerPoint);
   assert.match(peerPoint.entity_key, /^peer\.tailscale\.[0-9a-f]{16}$/);
@@ -2032,7 +2061,7 @@ test("Slice 3: the vpn-peer-status sub-collector runs on a structural-due tick a
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "vpn-peer-status"]);
   assert(result.status.structural_collector_statuses.some((entry) => entry.id === "vpn-peer-status" && entry.status === "ok" && entry.tool === "collect_vpn_peer_status"));
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   const peerPoint = points.find((point) => point.fact_name === "peer.presence");
   assert.ok(peerPoint, "expected the structural peer census to be translated into a fact-point");
   assert.match(peerPoint.entity_key, /^peer\.ssh\.[0-9a-f]{16}$/);
@@ -2068,7 +2097,7 @@ test("Slice 3: no peer fact-points are persisted while the watch.json kill switc
   });
 
   assert.equal(result.structuralFacts, undefined);
-  await assert.rejects(() => fs.access(resolveFactStorePaths(paths).factsFile));
+  await assertNoFactStoreWritten(paths);
 });
 
 test("Slice 3 day-1 no-storm: the first-ever peer observation seeds fact-history and emits no alert (this collector has no alert-candidate path at all)", async () => {
@@ -2092,7 +2121,7 @@ test("Slice 3 day-1 no-storm: the first-ever peer observation seeds fact-history
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   assert(points.some((point) => point.fact_name === "peer.presence"), "expected fact-history to be seeded on first observation");
   assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("peer")), false, "Slice 3 must never emit a peer-related alert candidate");
 });
@@ -2179,7 +2208,7 @@ test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a pro
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
     publicBindWarningFactFixture(),
   ], { now: "2026-05-24T00:00:00.000Z" });
@@ -2214,7 +2243,7 @@ test("S4 load-bearing: a fixed-rule alert, an active-constraint alert, and a pro
   // alerts must both recover, while the still-sustained-high-memory fixed alert must NOT be
   // spuriously recovered by either of the other two sources disappearing from extraCandidates,
   // and neither of the two learned sources may spuriously recover the other.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "true" } },
     publicBindWarningFactFixture({ active: "false" }),
   ], { now: "2026-05-24T00:02:00.000Z" });
@@ -2415,7 +2444,7 @@ test("Slice 4: byte-identical real alerts when the learned kill switch is off, e
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(withSessionsPaths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(withSessionsPaths, ticks, { now: hour(30) });
   // Watch-by-default slice 1 (§12.1): computeSessionBaselineCandidates now gates on watch.json,
   // not learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so
   // it still short-circuits to [] before ever calling readFactPoints, and so the shared
@@ -2429,7 +2458,7 @@ test("Slice 4: byte-identical real alerts when the learned kill switch is off, e
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args);
+      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
     },
   });
 
@@ -2454,8 +2483,8 @@ test("Slice 4 wiring: computeSessionBaselineCandidates is the daemon's fourth ex
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
@@ -2467,6 +2496,30 @@ test("Slice 4 wiring: computeSessionBaselineCandidates is the daemon's fourth ex
 
   const persisted = await readAlertRecords(paths);
   assert.ok(persisted.some((a) => a.id === alert.id && a.status === "active"));
+});
+
+test("S6 H1: an active session.count_drop alert stays active when the latest complete census becomes stale", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
+  const ticks = [];
+  for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
+  ticks.push(...completeSessionTick(hour(30), 0));
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
+
+  const fresh = await runIsolatedDaemonTick(paths, hour(30));
+  const freshAlert = fresh.alerts.alerts.find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(freshAlert?.status, "active", "the control tick must establish the active alert");
+
+  // The structural interval is one hour, so the latest census is stale after 3 hours. No new
+  // structural tick means the detector must report no coverage and the daemon must freeze, not
+  // recover, the active alert.
+  const stale = await runIsolatedDaemonTick(paths, hour(34));
+  const staleAlert = stale.alerts.alerts.find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(stale.alerts.candidates.some((candidate) => candidate.rule_id === SESSION_COUNT_DROP_RULE_ID), false, "a stale census must not emit a candidate from stale data");
+  assert.equal(staleAlert?.status, "active", "a stale census must freeze the active alert");
+  assert.equal((await readAlertRecords(paths)).find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID)?.status, "active");
 });
 
 test("Slice 4 wiring: a fingerprint change on the latest tick-group produces a real session.churn alert record in alerts.json", async () => {
@@ -2482,8 +2535,8 @@ test("Slice 4 wiring: a fingerprint change on the latest tick-group produces a r
     sessionFactPoint(hour(1), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222"),
     censusMarkerFactPoint(hour(1), "complete"),
   ];
-  await appendFactPoints(paths, ticks, { now: hour(1) });
-  await appendFactPoints(paths, [], { now: hour(1) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(1) });
+  await appendFactPointsByFamily(paths, [], { now: hour(1) });
 
   const result = await runIsolatedDaemonTick(paths, hour(1));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_CHURN_RULE_ID);
@@ -2525,7 +2578,7 @@ test("Slice 4 ts-cohesion (integration): every session.* fact point emitted with
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   const sessionPoints = points.filter((point) => point.fact_name === "session.presence");
   assert.ok(sessionPoints.length >= 3, "expected 2 session facts + 1 census marker");
   const distinctTimestamps = new Set(sessionPoints.map((point) => point.ts));
@@ -2544,8 +2597,8 @@ test("Slice 4, Decision 2b: a due session.count_drop is delivered through the de
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -2578,8 +2631,8 @@ test("Slice 4, Decision 2b: the deterministic delivery respects cooldown — a s
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const deliverNotification = async (descartesPaths, decision, opts) => { deliveries.push(opts); return { status: "recorded" }; };
@@ -2606,8 +2659,8 @@ test("Slice 4, Decision 2b: deliverSessionAlerts:false opts the daemon tick out 
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -2734,8 +2787,8 @@ test("Slice 4: computeSessionBaselineCandidates candidate shape matches the exis
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
@@ -2796,8 +2849,8 @@ test("Slice 6 wiring: computeCorrelationCandidates is the daemon's fifth extraCa
   // module's scope) — pre-establish the store and confirm the shared integrity ledger to 'intact'
   // so the anchor fires as this test already expects, same as the SESSION-specific fixtures above.
   await writeSessionBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, correlationFixtureFactPoints(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, correlationFixtureFactPoints(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   // Tick 1: computeSessionBaselineCandidates first derives and PERSISTS the session.count_drop
   // anchor. computeCorrelationCandidates reads alert-HISTORY from disk independently (Decision 1)
@@ -2833,7 +2886,7 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
   const baseline = await runIsolatedDaemonTick(baselinePaths);
 
   const withHistoryPaths = await tempPaths();
-  await appendFactPoints(withHistoryPaths, correlationFixtureFactPoints(), { now: hour(30) });
+  await appendFactPointsByFamily(withHistoryPaths, correlationFixtureFactPoints(), { now: hour(30) });
   // configDir/learned.json intentionally never written -> loadLearnedConfig defaults to
   // { enabled: false }, exactly like the baseline above — computeCorrelationCandidates must
   // short-circuit to [] before ever calling readFactPoints/readAlertRecords (correlation's OWN
@@ -2859,14 +2912,14 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args);
+      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
     },
   });
 
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store) must never be called while the learned.json/watch.json kill switches are off");
+  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store, { families: [...FACT_FAMILY_IDS] }) must never be called while the learned.json/watch.json kill switches are off");
 
   const persisted = await readAlertRecords(withHistoryPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === CORRELATION_RULE_ID), false);
@@ -2891,7 +2944,7 @@ test("Slice 4b: byte-identical real alerts when the learned kill switch is off, 
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
   ticks.push(...completePeerTick(hour(30), 8));
-  await appendFactPoints(withPeersPaths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(withPeersPaths, ticks, { now: hour(30) });
   // Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates now gates on watch.json, not
   // learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so it
   // still short-circuits to [] before ever calling readFactPoints, and so the shared fact-history
@@ -2905,7 +2958,7 @@ test("Slice 4b: byte-identical real alerts when the learned kill switch is off, 
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args);
+      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
     },
   });
 
@@ -2931,8 +2984,8 @@ test("Slice 4b wiring: computePeerBaselineCandidates is the daemon's sixth extra
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
   ticks.push(...completePeerTick(hour(30), 8));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID);
@@ -2960,8 +3013,8 @@ test("Slice 4b, Decision 3b: a due peer.count_spike is delivered through the det
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTick(hour(i), 2));
   ticks.push(...completePeerTick(hour(30), 8));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -3020,8 +3073,8 @@ test("Slice 4c wiring: computePeerBaselineCandidates' drop direction flows throu
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
   ticks.push(...completePeerTickWithMarker(hour(30), 1));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === PEER_COUNT_DROP_RULE_ID);
@@ -3048,8 +3101,8 @@ test("Slice 4c, delivery: a due peer.count_drop is delivered through the determi
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
   ticks.push(...completePeerTickWithMarker(hour(30), 1));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const result = await runDaemonIteration(paths, {
@@ -3080,7 +3133,7 @@ test("Slice 4c: byte-identical real alerts when the learned kill switch is off, 
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completePeerTickWithMarker(hour(i), 10));
   ticks.push(...completePeerTickWithMarker(hour(30), 1));
-  await appendFactPoints(withPeersPaths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(withPeersPaths, ticks, { now: hour(30) });
   // Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates now gates on watch.json, not
   // learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so it
   // still short-circuits to [] (both directions) before ever calling readFactPoints, and so the
@@ -3094,7 +3147,7 @@ test("Slice 4c: byte-identical real alerts when the learned kill switch is off, 
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args);
+      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
     },
   });
 
@@ -3137,7 +3190,7 @@ test("Slice 4b ts-cohesion (integration): peer.presence fact points share the sa
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
   const sessionPoints = points.filter((point) => point.fact_name === "session.presence");
   const peerPoints = points.filter((point) => point.fact_name === "peer.presence");
   assert.ok(sessionPoints.length > 0 && peerPoints.length > 0);
@@ -3246,8 +3299,8 @@ test("Process-lineage wiring: a novel edge flows through the daemon's alert pipe
   // ledger 'unknown' — duplicated facts share the latest fact ts, and excess records that don't
   // advance newest_ts are treated as unprovable/tampered (an intended continuity guard), not a
   // benign append.
-  await appendFactPoints(paths, lineageNoveltyFixtureFactPoints(), { now: hour(6) });
-  await appendFactPoints(paths, [], { now: hour(6) });
+  await appendFactPointsByFamily(paths, lineageNoveltyFixtureFactPoints(), { now: hour(6) });
+  await appendFactPointsByFamily(paths, [], { now: hour(6) });
 
   const result = await runIsolatedDaemonTick(paths, hour(6));
   const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID);
@@ -3316,8 +3369,8 @@ test("Scheduled-job persistence wiring: computeScheduledJobBaselineCandidates re
   // its own dedicated coverage in persistence-baseline.test.js.
   await writePersistenceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
   const { ticks, novelKey } = scheduledJobNoveltyFixtureFactPoints();
-  await appendFactPoints(paths, ticks, { now: hour(6) });
-  await appendFactPoints(paths, [], { now: hour(6) }); // confirm the shared integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, ticks, { now: hour(6) });
+  await appendFactPointsByFamily(paths, [], { now: hour(6) }); // confirm the shared integrity ledger to 'intact'
 
   const result = await runIsolatedDaemonTick(paths, hour(6));
   const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === SCHEDULED_JOB_APPEARED_RULE_ID);
@@ -3338,7 +3391,7 @@ test("Scheduled-job persistence: byte-identical real alerts when the learned kil
 
   const withJobsPaths = await tempPaths();
   const { ticks } = scheduledJobNoveltyFixtureFactPoints();
-  await appendFactPoints(withJobsPaths, ticks, { now: hour(6) });
+  await appendFactPointsByFamily(withJobsPaths, ticks, { now: hour(6) });
   // Watch-by-default slice 1 (§12.1): computeScheduledJobBaselineCandidates now gates on
   // watch.json, not learned.json -- explicitly disabled here (watch.json defaults enabled:true on
   // ENOENT) so it still short-circuits to [] before ever calling readFactPoints, and so the shared
@@ -3350,7 +3403,7 @@ test("Scheduled-job persistence: byte-identical real alerts when the learned kil
     ts: hour(6),
     now: hour(6),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
   });
 
   assert.deepEqual(withJobs.alerts.alerts, baseline.alerts.alerts);
@@ -3377,8 +3430,8 @@ test("Service-disappearance wiring: computeServiceBaselineCandidates is the daem
   // has its own dedicated coverage in service-baseline.test.js) and confirm the shared integrity
   // ledger to 'intact' before the tick.
   await writeServiceBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const result = await runIsolatedDaemonTick(paths, hour(30));
   const alert = result.alerts.alerts.find((a) => a.rule_id === SERVICE_DISAPPEARED_RULE_ID);
@@ -3405,7 +3458,7 @@ test("Service-disappearance: byte-identical real alerts when the learned kill sw
   const baseline = await runIsolatedDaemonTick(baselinePaths);
 
   const withServicesPaths = await tempPaths();
-  await appendFactPoints(withServicesPaths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
+  await appendFactPointsByFamily(withServicesPaths, serviceDisappearanceFixtureFactPoints(), { now: hour(30) });
   // Watch-by-default slice 1 (§12.1): computeServiceBaselineCandidates now gates on watch.json,
   // not learned.json -- explicitly disabled here (watch.json defaults enabled:true on ENOENT) so
   // it still short-circuits to [] before ever calling readFactPoints, and so the shared
@@ -3419,7 +3472,7 @@ test("Service-disappearance: byte-identical real alerts when the learned kill sw
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args);
+      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
     },
   });
 
@@ -3456,8 +3509,8 @@ test("Service-disappearance wiring, single-source-of-truth: a service.disappeare
     ...serviceDisappearanceFixtureFactPoints(),
     { ts: hour(30), fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ];
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   // now = shared latest ts (hour(30)) + 4h; activeFreshnessMs = 3 × DEFAULT_STRUCTURAL_INTERVAL_MS
   // (1h) = 3h (slice6Profile carries no `structural.interval_ms`, so runDaemonIteration resolves
@@ -3487,8 +3540,8 @@ test("Service-disappearance wiring, single-source-of-truth: a 1h-old service.dis
     ...serviceDisappearanceFixtureFactPoints(),
     { ts: hour(30), fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ];
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const freshNow = new Date(Date.parse(hour(30)) + 60 * 60 * 1000).toISOString();
   const result = await runDaemonIteration(paths, {
@@ -3518,8 +3571,8 @@ test("Service-appearance wiring: computeServiceAppearanceCandidates reaches the 
   const ticks = [];
   for (let i = 0; i < 3; i += 1) ticks.push(...completeServiceTick(hour(i), ["worker.service"]));
   ticks.push(...completeServiceTick(hour(3), ["worker.service", "new-backdoor.service"]));
-  await appendFactPoints(paths, ticks, { now: hour(3) });
-  await appendFactPoints(paths, [], { now: hour(3) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(3) });
+  await appendFactPointsByFamily(paths, [], { now: hour(3) });
 
   const result = await runIsolatedDaemonTick(paths, hour(3));
   const alert = result.alerts.alerts.find((candidate) => candidate.rule_id === SERVICE_APPEARED_RULE_ID);
@@ -3543,7 +3596,7 @@ test("Service-appearance: byte-identical real alerts when the watch kill switch 
   const ticks = [];
   for (let i = 0; i < 3; i += 1) ticks.push(...completeServiceTick(hour(i), ["worker.service"]));
   ticks.push(...completeServiceTick(hour(3), ["worker.service", "new-backdoor.service"]));
-  await appendFactPoints(withServicesPaths, ticks, { now: hour(3) });
+  await appendFactPointsByFamily(withServicesPaths, ticks, { now: hour(3) });
   // Watch-by-default slice 1 (§12.1): computeServiceAppearanceCandidates now gates on
   // watch.json, which defaults enabled:true on ENOENT -- explicitly disabled here (with a spy)
   // so this test's "no I/O is attempted" claim is enforced, not merely an accidental pass masked
@@ -3557,7 +3610,7 @@ test("Service-appearance: byte-identical real alerts when the watch kill switch 
     ts: hour(3),
     now: hour(3),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
   });
 
   assert.deepEqual(withServices.alerts.alerts, baseline.alerts.alerts);
@@ -3752,8 +3805,8 @@ test("Slice 7.2 wiring: containment is a post-evaluation phase — a current act
   await writeLearnedConfig(paths, { enabled: true });
   await writeContainmentRecommendConfig(paths, { enabled: true });
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const deliveries = [];
   const tick1 = await runDaemonIteration(paths, {
@@ -3793,8 +3846,8 @@ test("Slice 7.2 wiring: the containment opt-in OFF ⇒ zero recommendations, eve
   // containment-recommend.json intentionally never written -> readContainmentRecommendConfig
   // defaults to { enabled: false } — the same fail-closed default the config module itself pins.
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   await runIsolatedDaemonTick(paths, hour(30));
   const tick2Ts = new Date(Date.parse(hour(30)) + 60 * 1000).toISOString();
@@ -3831,7 +3884,7 @@ test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the 
   // real readAlertRecords call comes from daemon.js's own protective logic, not from
   // containment-recommend's internal hook (which never runs; computeContainmentRecommendationCandidates
   // still short-circuits before touching it). The fact store stays fully untouched either way.
-  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, containmentPeerSpikeTicks(), { now: hour(30) });
 
   let readFactsCalled = false;
   const result = await runDaemonIteration(paths, {
@@ -3840,12 +3893,12 @@ test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the 
     ts: hour(30),
     now: hour(30),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
   });
 
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false);
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "watch.json OFF also gates the underlying peer-baseline detector itself (moved off learned.json, §12.1)");
-  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store) must never be called while both learned.json and watch.json are OFF");
+  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store, { families: [...FACT_FAMILY_IDS] }) must never be called while both learned.json and watch.json are OFF");
 });
 
 test("Slice 7.2 wiring: no trigger present ⇒ zero recommendations (no storm on the first tick), even with both gates ON", async () => {
@@ -3862,8 +3915,8 @@ test("Slice 7.2 wiring, THE LOAD-BEARING FAIL-CLOSED TRANSITION (Definition of D
   await writeLearnedConfig(paths, { enabled: true });
   await writeContainmentRecommendConfig(paths, { enabled: true });
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const tick1 = await runIsolatedDaemonTick(paths, hour(30));
   const active = tick1.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");
@@ -3902,7 +3955,7 @@ test("Slice 7.2 wiring: byte-identical real alerts when watch, learned, AND the 
   const baseline = await runIsolatedDaemonTick(baselinePaths);
 
   const withHistoryPaths = await tempPaths();
-  await appendFactPoints(withHistoryPaths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(withHistoryPaths, containmentPeerSpikeTicks(), { now: hour(30) });
   // Neither learned.json nor containment-recommend.json is ever written here -> both default OFF,
   // exactly like the baseline above. Watch-by-default slice 1 (§12.1): computePeerBaselineCandidates
   // (the underlying trigger this test seeds) has itself MOVED to watch.json, which defaults
@@ -3918,7 +3971,7 @@ test("Slice 7.2 wiring: byte-identical real alerts when watch, learned, AND the 
     ts: hour(30),
     now: hour(30),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
   });
 
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
@@ -3944,7 +3997,7 @@ test("Cross-cutting SURVIVABILITY fix: one throwing detector degrades to zero ca
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -3988,7 +4041,7 @@ test("Cross-cutting SURVIVABILITY fix: one throwing detector degrades to zero ca
   const emptyPaths = await tempPaths();
   await writeLearnedConfig(emptyPaths, { enabled: true });
   await writeConstraints(emptyPaths, [activeConstraintFixture()]);
-  await appendFactPoints(emptyPaths, [
+  await appendFactPointsByFamily(emptyPaths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
   const withEmptySuccess = await runDaemonIteration(emptyPaths, {
@@ -4007,8 +4060,8 @@ test("Cross-cutting SURVIVABILITY fix: an injected computeContainmentRecommendat
   await writeLearnedConfig(paths, { enabled: true });
   await writeContainmentRecommendConfig(paths, { enabled: true });
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const warnings = [];
   const originalWarn = console.warn;
@@ -4045,8 +4098,8 @@ test("Cross-cutting SURVIVABILITY fix: an injected emitSessionAlertSignals throw
   const ticks = [];
   for (let i = 0; i < 30; i += 1) ticks.push(...completeSessionTick(hour(i), 20));
   ticks.push(...completeSessionTick(hour(30), 0));
-  await appendFactPoints(paths, ticks, { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, ticks, { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const warnings = [];
   const originalWarn = console.warn;
@@ -4092,7 +4145,7 @@ test("F4: a throwing appendMetricPoints degrades the metric-persist step to an h
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -4248,7 +4301,7 @@ test("F4 fabrication trap: a throwing writeDaemonStatus does NOT crash the tick 
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -4256,7 +4309,7 @@ test("F4 fabrication trap: a throwing writeDaemonStatus does NOT crash the tick 
   const baselinePaths = await tempPaths();
   await writeLearnedConfig(baselinePaths, { enabled: true });
   await writeConstraints(baselinePaths, [activeConstraintFixture()]);
-  await appendFactPoints(baselinePaths, [
+  await appendFactPointsByFamily(baselinePaths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
   const baseline = await runIsolatedDaemonTick(baselinePaths);
@@ -4368,7 +4421,7 @@ test("F4-B2: a non-fatal retention_error from the metric-persist writer surfaces
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -4436,7 +4489,7 @@ test("F4-B1 empty-message edge: a throwing appendMetricPoints with NO message st
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   await writeConstraints(paths, [activeConstraintFixture()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
   ], { now: S_LIVE_1_TICK_TS });
 
@@ -4498,17 +4551,14 @@ test("Fix 3: a genuinely degraded fact-history freezes a suppressed history-depe
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
-  const storePaths = resolveFactStorePaths(paths);
-  await fs.mkdir(storePaths.dir, { recursive: true });
-  await fs.writeFile(storePaths.factsFile, "not-json\n");
-  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window
-  // corrupt-line loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what
-  // daemon.js's own shared Fix-2/Fix-3 read will observe this tick.
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now });
-  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  // S4: the veto is per family, so the stores of the families under test are the ones degraded.
+  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window corrupt-line
+  // loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what daemon.js's own per-family
+  // reads will observe this tick.
+  await degradeFamilyStores(paths, ["session", "canary"], now);
+  const degradedRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(degradedRead.completeness.status, "degraded");
-  assert.equal(degradedRead.completeness.corrupt_dropped_total, 1);
+  assert.equal(degradedRead.completeness.corrupt_dropped_total, 2, "S4: one in-window corrupt line in each of the two degraded family stores");
 
   // Pre-existing active alerts: one history-dependent family (session.count_drop), plus the
   // wholesale-covered canary.tampered rule_id (shared with the non-history-gated tamper reasons
@@ -4560,11 +4610,10 @@ test("Fix 3 control (detector-reported coverage §8): a detector that REPORTS it
   const now = S_LIVE_1_TICK_TS;
 
   // A real, intact (not degraded) windowed fact-history read: one fact + a second clean pass.
-  await appendFactPoints(paths, [
-    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
-  ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  // S4: each rule recovers only off its OWN family store (session, canary), so seed those.
+  await appendFactPointsByFamily(paths, benignFactsForFamilies(["session", "canary"], now), { now });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [
@@ -4620,6 +4669,281 @@ test("A2 wiring: the session and peer baseline producers receive the SAME active
   assert.equal(seen.session.structuralIntervalMs, DEFAULT_STRUCTURAL_INTERVAL_MS, "session churn must receive the wall-clock structural interval");
 });
 
+test("MEDIUM-1 confirmation (fact-store capacity plan review fold): the daemon's per-family history veto still recovers through NARROWED (coverage: 'narrowed') history -- the six watch-tier detectors and the daemon veto deliberately do NOT opt into the interim requireFullCoverage gate that the miner/shadow/correlation now use (fact-store-coverage.test.js)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  // S3 (fact-store capacity plan): since the per-rule eligibility horizon landed, the evicted point
+  // sits 31 h back so session.count_drop's 30 h horizon is met -- this test is about narrowing not
+  // being a TRUST loss; the horizon-short case has its own test below.
+  const earlier = new Date(Date.parse(now) - 31 * 60 * 60 * 1000).toISOString();
+
+  // Force a real byte-cap eviction, so this is an actual narrowed read (not a hand-built stub):
+  // an earlier point, then a cap that only leaves room for the later one.
+  // S4: session.count_drop's history is the SESSION family store.
+  const earlierPoint = { ts: earlier, fact_name: "session.presence", entity_key: "svc-old", attributes: {} };
+  const laterPoint = { ts: now, fact_name: "session.presence", entity_key: "svc-new", attributes: {} };
+  const capBytes = Buffer.byteLength(`${JSON.stringify(normalizeFactPoint(laterPoint))}\n`);
+  await appendFactPointsByFamily(paths, [earlierPoint], { now: earlier, maxBytes: Number.MAX_SAFE_INTEGER });
+  await appendFactPointsByFamily(paths, [laterPoint], { now, maxBytes: capBytes });
+  const setupRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(setupRead.completeness.status, "intact", "setup: eviction alone must not degrade status");
+  assert.equal(setupRead.completeness.coverage, "narrowed", "setup: the store genuinely narrowed");
+
+  await writeAlertRecords(paths, [{
+    rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
+    title: "Session count deviation", summary: "test fixture", first_seen: now, last_seen: now, diagnostics: {},
+  }]);
+
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => ({ candidates: [], evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] }),
+  });
+
+  const sessionAlert = result.alerts.alerts.find((a) => a.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  assert.equal(sessionAlert.status, "recovered", "narrowed coverage alone must not veto the daemon's history trust -- only a real loss (degraded/unknown) does");
+});
+
+// Fact-store capacity plan §4.4 / I6 (step S3): the daemon's own per-rule horizon veto. A narrowed
+// store whose certified span is shorter than a rule's horizon freezes that rule's persisted alert
+// EVEN IF its producer (buggy, or a stub here) reports coverage -- the independent §7.7-style check
+// that still fires when a detector forgets its own gate.
+// S4 (fact-store capacity plan §4.3/§4.4): each rule's history lives in, and is vetoed on, its OWN
+// family store -- so a fixture for a session/peer/canary rule must narrow THAT family's store (a
+// family store that was never created is untrusted for its own rules, never borrowed from another).
+const BENIGN_FACT_NAME_BY_FAMILY = {
+  service: "service.presence",
+  process_lineage: "process.lineage_edge",
+  scheduled_job: "scheduled_job.presence",
+  session: "session.presence",
+  peer: "peer.presence",
+  canary: "canary.presence",
+  network: "network.listening_port.owner",
+  provenance: "provenance.warning",
+};
+
+// S4: one benign fact per requested family, so each of those family stores exists (and, after a
+// second clean pass, reads intact) -- the per-family veto checks each rule's OWN family store.
+function benignFactsForFamilies(families, ts, entityKey = "control") {
+  return families.map((family) => ({ ts, fact_name: BENIGN_FACT_NAME_BY_FAMILY[family], entity_key: entityKey, attributes: {} }));
+}
+
+// S4: a genuinely DEGRADED read for each requested family store (an in-window corrupt-line loss
+// after two clean passes), since the veto is per family.
+async function degradeFamilyStores(paths, families, now) {
+  for (const family of families) {
+    const storePaths = resolveFactStorePaths(paths, family);
+    await fs.mkdir(storePaths.dir, { recursive: true });
+    await fs.writeFile(storePaths.factsFile, "not-json\n");
+  }
+  await appendFactPointsByFamily(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
+}
+
+async function narrowedStoreWithFloorHoursAgo(paths, now, hoursAgo, family = "session") {
+  const earlier = new Date(Date.parse(now) - hoursAgo * 60 * 60 * 1000).toISOString();
+  const factName = BENIGN_FACT_NAME_BY_FAMILY[family];
+  const earlierPoint = { ts: earlier, fact_name: factName, entity_key: "svc-old", attributes: {} };
+  const laterPoint = { ts: now, fact_name: factName, entity_key: "svc-new", attributes: {} };
+  await appendFactPointsByFamily(paths, [earlierPoint], { now: earlier, maxBytes: Number.MAX_SAFE_INTEGER });
+  // Room for exactly the later (normalized) record: the earlier tick is evicted, the later one kept.
+  await appendFactPointsByFamily(paths, [laterPoint], { now, maxBytes: Buffer.byteLength(`${JSON.stringify(normalizeFactPoint(laterPoint))}\n`) });
+  const read = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(read.completeness.status, "intact");
+  assert.equal(read.completeness.coverage, "narrowed");
+  assert.equal(read.completeness.bytecap_floor_ts, earlier, "the floor is the evicted earlier tick, not the kept one");
+  assert.equal(read.points.length, 1);
+}
+
+test("S3 daemon horizon veto: a producer that reports coverage for a horizon-short rule still cannot recover its alert; a horizon-OK rule on the same read does", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 10); // 10 h certified: churn (6 h) OK, count_drop (30 h) short
+  await writeAlertRecords(paths, [
+    { rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical", title: "t", summary: "t", first_seen: now, last_seen: now, diagnostics: {} },
+    { rule_id: SESSION_CHURN_RULE_ID, fingerprint: "session.tmux.aaaaaaaaaaaaaaaa", status: "active", severity: "warning", title: "t", summary: "t", first_seen: now, last_seen: now, diagnostics: {} },
+  ]);
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    computeSessionBaselineCandidates: async () => ({
+      candidates: [],
+      evaluatedAlertKeys: [alertId(SESSION_COUNT_DROP_RULE_ID, "global"), alertId(SESSION_CHURN_RULE_ID, "session.tmux.aaaaaaaaaaaaaaaa")],
+    }),
+  });
+  const drop = result.alerts.alerts.find((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID);
+  const churn = result.alerts.alerts.find((alert) => alert.rule_id === SESSION_CHURN_RULE_ID);
+  assert.equal(drop.status, "active", "horizon-short count_drop stays frozen despite the producer's coverage report");
+  assert.equal(churn.status, "recovered", "churn's 6 h horizon is met on the same read, so it recovers");
+  assert.ok(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID], "the short rule is reported on the status record");
+  assert.equal(result.status.history_horizon_short.rules[SESSION_CHURN_RULE_ID], undefined);
+  assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+});
+
+test("S3 horizon-short signal (I12): since_ts carries forward across ticks, and the fixed daemon.fact_history.horizon_short alert fires only once a rule has been short for N structural intervals", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+  const first = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  const thresholdMs = first.status.history_horizon_short.threshold_ms;
+  assert.equal(thresholdMs, 24 * 60 * 60 * 1000, "N = 24 structural intervals at the default 1 h interval");
+  assert.equal(first.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+  assert.equal(first.alerts.alerts.some((alert) => alert.rule_id === "daemon.fact_history.horizon_short"), false, "not yet: short for 0 h");
+
+  // S3b review LOW-1: the clock carries only across CONSECUTIVE ticks (a prior status at most one
+  // structural interval old), so the daemon really ticks through the threshold, hour by hour.
+  let second;
+  for (let hour = 1; hour * 60 * 60 * 1000 <= thresholdMs; hour += 1) {
+    const tickTs = new Date(Date.parse(now) + hour * 60 * 60 * 1000).toISOString();
+    second = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: tickTs, now: tickTs });
+    if (hour * 60 * 60 * 1000 < thresholdMs) {
+      assert.equal(second.alerts.alerts.some((alert) => alert.rule_id === "daemon.fact_history.horizon_short"), false, `not yet at ${hour} h`);
+    }
+  }
+  assert.equal(second.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now, "since_ts is carried forward while the rule stays short");
+  const signal = second.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+  assert.ok(signal, "short for N intervals: the fixed signal fires");
+  assert.equal(signal.status, "active");
+  assert.match(signal.diagnostics.rule_ids, /session\.count_drop/);
+});
+
+test("S3 horizon-short signal: a corrupt prior status or a future since_ts restarts the clock at now (can only delay the signal, never raise it early)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+  const future = new Date(Date.parse(now) + 60 * 60 * 1000).toISOString();
+  const result = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    readDaemonStatus: async () => ({ history_horizon_short: { rules: { [SESSION_COUNT_DROP_RULE_ID]: { since_ts: future } } } }),
+  });
+  assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+  const corrupt = await runDaemonIteration(paths, {
+    profile: slice6Profile(),
+    collectors: fastCollectorFakes(),
+    ts: now,
+    now,
+    readDaemonStatus: async () => { throw new Error("corrupt"); },
+  });
+  assert.equal(corrupt.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+});
+
+test("S3b review MEDIUM-2: correlation silenced by a byte-cap floor inside its 31 d read window (but outside its 3 d horizon) is reported horizon-short, matching the detector's own refusal", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 10 * 24, "peer");
+  const read = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  assert.equal(ruleHorizonOk(read, CORRELATION_RULE_ID, Date.parse(now)), true, "discriminating: the 3 d horizon alone is met");
+  assert.equal(certifiedReadWindowOk(read, { nowMs: Date.parse(now), windowMs: 31 * 24 * 60 * 60 * 1000 }), false, "the detector refuses on this read");
+  const result = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  assert.deepEqual(Object.keys(result.status.history_horizon_short?.rules ?? {}), [CORRELATION_RULE_ID], "the silent detector is reported, never silently");
+});
+
+test("S3b review LOW-3: the horizon-short list names only rules whose tier is running -- learned off never lists correlation or canary.tampered", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: true });
+  await writeLearnedConfig(paths, { enabled: false });
+  const now = S_LIVE_1_TICK_TS;
+  await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+  const result = await runDaemonIteration(paths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: now, now });
+  const listed = Object.keys(result.status.history_horizon_short?.rules ?? {});
+  assert.ok(listed.includes(SESSION_COUNT_DROP_RULE_ID), "a short watch-tier rule is still reported");
+  assert.equal(listed.includes(CORRELATION_RULE_ID), false, "correlation is not running with learned off");
+  assert.equal(listed.includes(CANARY_TAMPERED_RULE_ID), false, "canary.tampered is not running with learned off");
+});
+
+test("S3b review LOW-1: since_ts carries only from a prior status at most one structural interval old -- after downtime the clock restarts and the fixed alert does not fire at once", async () => {
+  const now = S_LIVE_1_TICK_TS;
+  const nowMs = Date.parse(now);
+  const longAgo = new Date(nowMs - 3 * 24 * 60 * 60 * 1000).toISOString();
+  const run = async (priorTs) => {
+    const paths = await tempPaths();
+    await writeLearnedConfig(paths, { enabled: true });
+    await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+    return runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      readDaemonStatus: async () => ({ ts: priorTs, history_horizon_short: { rules: { [SESSION_COUNT_DROP_RULE_ID]: { since_ts: longAgo } } } }),
+    });
+  };
+  const horizonAlert = (result) => result.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+  // Control: the previous tick ran 30 min ago -> continuous, the clock carries and the alert fires.
+  const continuous = await run(new Date(nowMs - 30 * 60 * 1000).toISOString());
+  assert.equal(continuous.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, longAgo);
+  assert.ok(horizonAlert(continuous), "control: a continuously-short rule past the threshold raises the signal");
+  // The daemon was down for 3 days with "short since S" on disk: the gap is unobserved, so restart.
+  const afterDowntime = await run(longAgo);
+  assert.equal(afterDowntime.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now);
+  assert.equal(horizonAlert(afterDowntime), undefined, "never raised early off an unobserved gap");
+  // A prior status with no (or an unparseable, or a future) ts cannot vouch for continuity either.
+  for (const badTs of [undefined, "garbage", new Date(nowMs + 60 * 60 * 1000).toISOString()]) {
+    const result = await run(badTs);
+    assert.equal(result.status.history_horizon_short.rules[SESSION_COUNT_DROP_RULE_ID].since_ts, now, `prior ts ${String(badTs)}`);
+  }
+});
+
+test("S3b review LOW-2: an untrusted history read (missing ledger, or the read throws) carries the prior horizon-short block forward -- the fixed alert never fabricates a recovery, and no since clock restarts", async () => {
+  for (const variant of ["ledger-missing", "read-throws"]) {
+    const paths = await tempPaths();
+    await writeLearnedConfig(paths, { enabled: true });
+    const now = S_LIVE_1_TICK_TS;
+    const nowMs = Date.parse(now);
+    const longAgo = new Date(nowMs - 3 * 24 * 60 * 60 * 1000).toISOString();
+    await narrowedStoreWithFloorHoursAgo(paths, now, 2);
+    const first = await runDaemonIteration(paths, {
+      profile: slice6Profile(),
+      collectors: fastCollectorFakes(),
+      ts: now,
+      now,
+      readDaemonStatus: async () => ({ ts: new Date(nowMs - 30 * 60 * 1000).toISOString(), history_horizon_short: { rules: { [SESSION_COUNT_DROP_RULE_ID]: { since_ts: longAgo } } } }),
+    });
+    const before = first.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+    assert.equal(before?.status, "active", `${variant}: setup -- the signal is active`);
+
+    const next = new Date(nowMs + 60 * 1000).toISOString();
+    const options = { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: next, now: next };
+    if (variant === "ledger-missing") {
+      // S4: the session family's own ledger (the rules under test read the session store).
+      await fs.rm(resolveFactIntegrityPaths(paths, "session").integrityFile);
+    } else {
+      options.readFactPoints = async (descartesPaths, readOptions) => {
+        if (readOptions?.family === "session") throw new Error("injected history read failure");
+        return readFactPoints(descartesPaths, readOptions);
+      };
+    }
+    const second = await runDaemonIteration(paths, options);
+    assert.deepEqual(second.status.history_horizon_short, first.status.history_horizon_short, `${variant}: the prior block is carried unchanged`);
+    const after = second.alerts.alerts.find((alert) => alert.rule_id === "daemon.fact_history.horizon_short");
+    assert.equal(after?.status, "active", `${variant}: untrusted history is worse than short -- never a fabricated recovery`);
+  }
+});
+
+test("S3 horizon-short signal: no fact read (both tiers off) and an un-narrowed store report nothing", async () => {
+  const offPaths = await tempPaths();
+  await writeWatchConfig(offPaths, { enabled: false });
+  const off = await runDaemonIteration(offPaths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS });
+  assert.equal(off.status.history_horizon_short, undefined);
+  const fullPaths = await tempPaths();
+  await writeLearnedConfig(fullPaths, { enabled: true });
+  await appendFactPointsByFamily(fullPaths, [{ ts: S_LIVE_1_TICK_TS, fact_name: "service.presence", entity_key: "a", attributes: {} }], { now: S_LIVE_1_TICK_TS });
+  await appendFactPointsByFamily(fullPaths, [], { now: S_LIVE_1_TICK_TS });
+  const full = await runDaemonIteration(fullPaths, { profile: slice6Profile(), collectors: fastCollectorFakes(), ts: S_LIVE_1_TICK_TS, now: S_LIVE_1_TICK_TS });
+  assert.equal(full.status.history_horizon_short, undefined, "day-1 (no floor): every horizon is met");
+});
+
 // ---------------------------------------------------------------------------------------------
 // Detector-reported recovery coverage (§8) — CORE acceptance: freeze-by-default, FIXED exempt,
 // owner-scoped acceptance, and the §7.7 intersection (a report cannot override a global veto).
@@ -4658,12 +4982,12 @@ test("§8 owner-scope: a producer reporting ANOTHER family's alert identity must
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
   // Intact history so the §7.7 history veto is NOT the reason for any freeze here.
-  await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
+  await appendFactPointsByFamily(paths, [], { now });
   // Pin the intactness explicitly: without this, a silently-degraded read could freeze the alert via
   // the §7.7 history veto, masking whether owner-scope rejection is really the cause. Asserting
   // intact makes owner-scope the ONLY possible reason the session alert stays frozen below.
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -4700,12 +5024,12 @@ test("§8 intersection (§7.7): a correctly-reported identity still FREEZES when
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
   // A genuinely DEGRADED windowed read (in-window corrupt line) -> historyUntrusted true.
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, "not-json\n");
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now });
-  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
+  const degradedRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(degradedRead.completeness.status, "degraded");
 
   await writeAlertRecords(paths, [{
@@ -4741,9 +5065,9 @@ test("§8 partial shape (§7.4): a producer returning { candidates:[<present pos
   // Intact history so the §7.7 history veto is NOT the reason for the freeze; watch defaults ON so
   // the tier veto is not either -- the ONLY possible cause of the freeze below is "partial shape
   // collected no coverage".
-  await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   // A pre-persisted active session alert under a DIFFERENT fingerprint than the surfaced candidate --
@@ -4796,9 +5120,9 @@ test("§8 partial shape: a producer returning { candidates:[], evaluatedAlertKey
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
-  await appendFactPoints(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [{ ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} }], { now });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -5018,11 +5342,11 @@ test("§8.D config snapshot (BLOCKER-2 a): a producer that mutates configSnapsho
 
   // Intact history so the §7.7 history veto is NOT the cause of the freeze (canary.tripped is not
   // history-dependent anyway) -- the AUTHOR-tier veto reading the IMMUTABLE learned:false is.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -5070,17 +5394,14 @@ test("watch-by-default Fix-3 regression: a genuinely degraded fact-history must 
   await writeLearnedConfig(paths, { enabled: false });
   await writeWatchConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
-  const storePaths = resolveFactStorePaths(paths);
-  await fs.mkdir(storePaths.dir, { recursive: true });
-  await fs.writeFile(storePaths.factsFile, "not-json\n");
-  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window
-  // corrupt-line loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what
-  // daemon.js's own shared Fix-2/Fix-3 read will observe this tick.
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now });
-  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  // S4: the veto is per family, so the stores of the families under test are the ones degraded.
+  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window corrupt-line
+  // loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what daemon.js's own per-family
+  // reads will observe this tick.
+  await degradeFamilyStores(paths, ["session", "canary"], now);
+  const degradedRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(degradedRead.completeness.status, "degraded");
-  assert.equal(degradedRead.completeness.corrupt_dropped_total, 1);
+  assert.equal(degradedRead.completeness.corrupt_dropped_total, 2, "S4: one in-window corrupt line in each of the two degraded family stores");
 
   // Pre-existing active alerts: one history-dependent family (session.count_drop), plus the
   // wholesale-covered canary.tampered rule_id.
@@ -5143,17 +5464,14 @@ test("watch-by-default BLOCKER regression: a genuinely degraded fact-history mus
   await writeLearnedConfig(paths, { enabled: true });
   await writeWatchConfig(paths, { enabled: false });
   const now = S_LIVE_1_TICK_TS;
-  const storePaths = resolveFactStorePaths(paths);
-  await fs.mkdir(storePaths.dir, { recursive: true });
-  await fs.writeFile(storePaths.factsFile, "not-json\n");
-  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window
-  // corrupt-line loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what
-  // daemon.js's own shared Fix-2/Fix-3 read will observe this tick (once it runs at all).
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now });
-  const degradedRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  // S4: the veto is per family, so the stores of the families under test are the ones degraded.
+  // Two clean append-triggering passes -> continuity_ok:true with a real, in-window corrupt-line
+  // loss -- a genuinely DEGRADED (not "unknown") windowed read, exactly what daemon.js's own per-family
+  // reads will observe this tick (once it runs at all).
+  await degradeFamilyStores(paths, ["peer", "canary"], now);
+  const degradedRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(degradedRead.completeness.status, "degraded");
-  assert.equal(degradedRead.completeness.corrupt_dropped_total, 1);
+  assert.equal(degradedRead.completeness.corrupt_dropped_total, 2, "S4: one in-window corrupt line in each of the two degraded family stores");
 
   // Pre-existing active alerts: correlation.login_kill_proximity and canary.tampered -- both
   // still learned-gated (unmoved), both history-dependent.
@@ -5231,7 +5549,7 @@ test("watch-by-default BLOCKER-2 regression: a persisted history-dependent alert
     collectors: fastCollectorFakes(),
     ts: now,
     now,
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
     // Genuinely returns [] -- exactly what the real watch-gated short-circuit would produce with
     // watch:false, before ever reaching its own I/O.
     computeSessionBaselineCandidates: async () => [],
@@ -5270,11 +5588,11 @@ test("watch-by-default BLOCKER-3 regression (author-owned): correlation/canary.t
   // A real, intact (not degraded) windowed fact-history read: one fact + a second clean pass --
   // deliberately trustworthy, so historyUntrusted is false and the ONLY thing that can still
   // protect these alerts is tier-ownership exclusion.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   // Pre-existing active alerts: correlation.login_kill_proximity and canary.tampered -- both
@@ -5331,11 +5649,11 @@ test("§7.7 tier-veto (author-owned): correlation stays frozen under watch:true/
   const now = S_LIVE_1_TICK_TS;
 
   // Fully intact, trustworthy fact-history: the §7.7 history veto is NOT the cause of the freeze.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -5382,11 +5700,11 @@ test("§7.7 tier-veto (author-owned POSITIVE evidence): canary.tripped stays fro
   // Fully intact, trustworthy fact-history: the §7.7 history veto is NOT the cause of the freeze
   // (and canary.tripped is not history-dependent anyway, so it never could be) -- isolating the
   // AUTHOR-tier veto as the sole freeze.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -5422,11 +5740,11 @@ test("§7.7 tier-veto (author-owned POSITIVE evidence): credential.access stays 
 
   // Fully intact, trustworthy fact-history: the §7.7 history veto is NOT the cause of the freeze
   // (credential.access is not history-dependent) -- the AUTHOR-tier veto is the sole freeze.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -5460,11 +5778,11 @@ test("watch-by-default BLOCKER-3 regression (watch-owned): session.count_drop mu
   const now = S_LIVE_1_TICK_TS;
 
   // A real, intact (not degraded) windowed fact-history read -- deliberately trustworthy.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   // Pre-existing active alert: session.count_drop -- WATCH-owned (one of the six moved detectors).
@@ -5508,11 +5826,11 @@ test("Fix 3: BOTH evaluateAndPersistAlerts call sites are patched -- the contain
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, "not-json\n");
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   await writeAlertRecords(paths, [{
     rule_id: SESSION_COUNT_DROP_RULE_ID, fingerprint: "global", status: "active", severity: "critical",
@@ -5555,11 +5873,11 @@ test("BLOCKER 1: a detector EXCEPTION (fact-history otherwise TRUSTWORTHY) must 
   // A real, intact (not degraded) windowed fact-history read -- this tick's history IS
   // trustworthy, so under the pre-fix code coveredRuleIds stays `undefined` (fully unrestricted)
   // and ONLY the detector's own genuine exception can explain a fabricated recovery here.
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
   ], { now });
-  await appendFactPoints(paths, [], { now });
-  const intactRead = await readFactPoints(paths, { now, windowMs: 31 * 24 * 60 * 60 * 1000 });
+  await appendFactPointsByFamily(paths, [], { now });
+  const intactRead = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now, windowMs: 31 * 24 * 60 * 60 * 1000 });
   assert.equal(intactRead.completeness.status, "intact");
 
   await writeAlertRecords(paths, [{
@@ -5662,10 +5980,9 @@ test("BLOCKER 1 control: a DIFFERENT family that genuinely ran and returned [] t
   await writeLearnedConfig(paths, { enabled: true });
   const now = S_LIVE_1_TICK_TS;
 
-  await appendFactPoints(paths, [
-    { ts: now, fact_name: "service.presence", entity_key: "control", attributes: {} },
-  ], { now });
-  await appendFactPoints(paths, [], { now });
+  // S4: correlation recovers only off its OWN (peer) family store, so seed it.
+  await appendFactPointsByFamily(paths, benignFactsForFamilies(["peer"], now), { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   await writeAlertRecords(paths, [
     {
@@ -5707,8 +6024,8 @@ test("BLOCKER 1, phase-appropriate coverage: a containment-phase detector EXCEPT
   await writeLearnedConfig(paths, { enabled: true });
   await writeContainmentRecommendConfig(paths, { enabled: true });
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: hour(-1) });
-  await appendFactPoints(paths, containmentPeerSpikeTicks(), { now: hour(30) });
-  await appendFactPoints(paths, [], { now: hour(30) });
+  await appendFactPointsByFamily(paths, containmentPeerSpikeTicks(), { now: hour(30) });
+  await appendFactPointsByFamily(paths, [], { now: hour(30) });
 
   const tick1 = await runIsolatedDaemonTick(paths, hour(30));
   const active = tick1.alerts.alerts.find((a) => a.rule_id === "containment.recommend.block");

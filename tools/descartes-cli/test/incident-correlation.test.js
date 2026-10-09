@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { alertId, applyAlertCandidates, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
 import { writeLearnedConfig } from "../src/constraint-store.js";
-import { appendFactPoints } from "../src/fact-store.js";
+import { appendFactPointsByFamily } from "../src/fact-store.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID } from "../src/session-baseline.js";
@@ -135,10 +135,10 @@ async function seed(paths, { alerts = [], factPoints = [], now, learnedEnabled =
   if (learnedEnabled) await writeLearnedConfig(paths, { enabled: true });
   if (alerts.length > 0) await writeAlertRecords(paths, alerts);
   if (factPoints.length > 0) {
-    await appendFactPoints(paths, factPoints, { now });
+    await appendFactPointsByFamily(paths, factPoints, { now });
     // A second clean retention pass confirms the shared completeness ledger as intact. This
     // keeps positive correlation fixtures representative of established fact history.
-    await appendFactPoints(paths, [], { now });
+    await appendFactPointsByFamily(paths, [], { now });
   }
 }
 
@@ -153,6 +153,11 @@ function completeFactReadResult(points, { status = "intact", corruptCount = 0, s
       last_schema_invalid_ts: null,
       last_bytecap_evict_ts: null,
       last_continuity_break_ts: null,
+      // MEDIUM-1 (review fold): computeCorrelationCandidates now requires full coverage, not just
+      // an intact status (fact-store-completeness.js's requireFullCoverage). Default every fixture
+      // here to "full" so existing positive-path tests are unaffected; a test for the narrowed case
+      // overrides this explicitly.
+      coverage: "full",
       ...completeness,
     },
   };
@@ -297,11 +302,16 @@ test("Slice 6 positive fixture (motivating incident shape): odd-hour, low-prior-
   }
 });
 
-test("Slice 8: degraded, unknown, or this-tick-corrupt fact-history suppresses an otherwise qualifying correlation", async () => {
+test("Slice 8: degraded, unknown, this-tick-corrupt, or narrowed fact-history suppresses an otherwise qualifying correlation", async () => {
   const cases = [
     ["degraded completeness", completeFactReadResult([], { status: "degraded" })],
     ["unknown completeness", completeFactReadResult([], { status: "unknown" })],
     ["corrupt facts this tick", completeFactReadResult([], { corruptCount: 1 })],
+    // MEDIUM-1 (review fold): correlation's interim requireFullCoverage gate refuses a narrowed
+    // (byte-cap-evicted) store even though its status is "intact" -- it recomputes trust from the
+    // full read on every call, joining observations across the whole window. S3 replaces this
+    // with correlation's own horizon entry.
+    ["narrowed coverage", completeFactReadResult([], { coverage: "narrowed" })],
   ];
 
   for (const [label, readResultTemplate] of cases) {
@@ -838,4 +848,29 @@ test("Recovery coverage DEFERRED: a previously fabricating expiry scenario repor
     coveredAlertIds: new Set(result.evaluatedAlertKeys),
   });
   assert.equal(applied.alerts.find((alert) => alert.fingerprint === corrFingerprint)?.status, "active");
+});
+
+// Fact-store capacity plan S3: correlation's narrowing gate is certifiedReadWindowOk (byte-cap
+// eviction invisible to its 31 d read) plus its 3 d horizon -- replacing the interim
+// requireFullCoverage gate, which ALSO refused on the age floor that sits inside a 31 d window once a
+// store is 30 days old (every host, permanently). A byte-cap floor inside the window still refuses.
+test("S3: correlation evaluates over an age-narrowed (30-day-old) store but refuses a byte-cap floor inside its read window", async () => {
+  const anchorTs = dayTs(0, 2);
+  const now = dayTs(0, 3);
+  const nowMs = Date.parse(now);
+  const points = [
+    ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+    peerPoint(anchorTs, "peer.wireguard.9999999999999999"),
+  ];
+  const run = async (completeness) => {
+    const paths = await tempPaths();
+    await seed(paths, { alerts: [killSideAlertRecord(SESSION_COUNT_DROP_RULE_ID, anchorTs)] });
+    return computeCorrelationCandidates(paths, { now, readFactPoints: async () => completeFactReadResult(points, completeness) });
+  };
+  const ageOnly = await run({ coverage: "narrowed", bytecap_floor_ts: null, age_floor_ts: new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString() });
+  assert.equal(ageOnly.candidates.length, 1, "an age floor alone (retention, as on main) does not silence correlation");
+  const oldBytecap = await run({ coverage: "narrowed", bytecap_floor_ts: new Date(nowMs - 32 * 24 * 60 * 60 * 1000).toISOString(), age_floor_ts: null });
+  assert.equal(oldBytecap.candidates.length, 1, "a byte-cap floor older than the 31 d read window is invisible to it");
+  const inWindow = await run({ coverage: "narrowed", bytecap_floor_ts: new Date(nowMs - 4 * 24 * 60 * 60 * 1000).toISOString(), age_floor_ts: null });
+  assert.deepEqual(inWindow.candidates, [], "a byte-cap floor inside the window could hide an earlier sighting of the 'new' peer: refused");
 });

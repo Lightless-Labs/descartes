@@ -3,6 +3,14 @@
 **Created:** 2026-10-05
 **Status:** PLAN. Awaiting operator decisions (§12) and a pre-build multi-model plan review (Fable code-grounded, daybreak-blue, Astra) per `docs/solutions/2026-09-14-multi-model-review-and-planning-playbook.md`.
 **Reviewed:** 2026-10-05 (adversarial plan review, NEEDS-REVISION(7) → folded)
+**Addendum:** 2026-10-05: S0 grounding (§15), then S1 and S2 built on `feat/fact-store-capacity-2026-10` (§16). G1 ran; Q6 pulled in as S3b (§17).
+**Addendum:** 2026-10-05: S3 (eligibility horizon) and S3b (first/last-seen set) built, plus the G1 re-gate LOWs (§18).
+**Addendum:** 2026-10-05: S4 (per-family stores, routing, per-family veto, budgets, status) and S5 (legacy quarantine, Q5) built, with T7-T10 and T12 (§19). S6/S7 not started; the branch awaits **daybreak G2**.
+**Addendum:** 2026-10-05: daybreak G2 review rework (NEEDS-REWORK: H1 + L1-L5): an upgraded install no longer certifies novelty memory over the history S5 quarantined; per-finding dispositions in §20.
+**Addendum:** 2026-10-05: S6 (CLI consistency) built with T11: `baseline status` reports per rule from the detectors' own gates, run read-only (§22).
+**Reviewed:** 2026-10-05 (S6 review, NEEDS-REWORK: H1, M1-M3, L1-L6 + a Leg E nit) → reworked; dispositions in §22.6.
+**Addendum:** 2026-10-06: S7 soak run against a copy of the real state directory, with real collectors, default budgets and an accelerated clock (2 × 264 structural ticks). No product anomaly found; results in §23.
+**Addendum:** 2026-10-06: S6 review H1 closed. Session/peer count and churn rules now use the daemon's recorded structural freshness window; stale census data produces neither candidates nor recovery coverage. T11 and a daemon active-alert freeze regression cover the 4 h and 240 h cases.
 **Closes:** `todos/2026-09-06-f2-tier2-fact-store-sliding-anchor.md` (F2-Tier2), including the F2-Tier1 over-claim carve-out (todo lines 18-22).
 **Related:** `docs/plans/2026-09-20-detector-reported-recovery-coverage.md` (§7.7 intersection, §7.8 atomic landing, §8 build spec), `docs/plans/2026-09-10-watch-by-default-slice-1.md`, `docs/reviews/2026-09-06-trusted-state-step1-grounded-review.md` (F2-Tier2 section).
 **Severity:** watch-by-default ships default-ON, but on a real host the six watch-tier detector families lock out within about a day and never recover. The feature does nothing on real hosts today.
@@ -138,6 +146,7 @@ The safety argument rests on **tick-alignment** (item 1 below), not on marker or
      - Fix: extend `invalidLedgerBootstrap` to cover `ledgerReason === "missing" && live.exists && live.record_count > 0`. That case stamps `last_continuity_break_ts = nowIso`, exactly like `invalid`.
      - A missing ledger over an absent or empty store (first run, and M2's fresh per-family stores) still bootstraps clean.
      - Cost: after ledger loss, that family reads `degraded` for 31 days, the same bounded recovery as an invalid ledger. This also closes the pre-existing hole where deleting the ledger let a truncated store re-certify itself.
+     - **Superseded (review fold, LOW-1/LOW-4, post-S2).** "Absent or empty" above is too permissive: an *existing* 0-byte store with no ledger can only be our own prior retention output (the rewrite always writes a ledger alongside it; a genuine first run never writes `facts.jsonl` before its first ledger exists) -- so it is never a genuine first run, only an evicted-then-emptied store whose ledger was separately deleted. The shipped rule drops the emptiness clause entirely: `missingLedgerOverExistingStore = ledgerReason === "missing" && live.exists === true`. Only a genuinely absent store (`live.exists === false`, ENOENT) still bootstraps clean. `appendFactPoints` resolves the first-run shape by running one retention pass against the pre-append store whenever the ledger is missing, before its own append -- so this check is never contaminated by the same call's own new data, and the old `appendedToEmptyStore` carve-out is removed with no exception left in the rule.
      - Rejected alternative: seeding the floor from `live.newest_ts`. It breaks the `total > 0 ⇔ floor !== null` validation, and it would leave established detectors un-re-armed over a store whose lineage has just broken (contrary to I8).
    - **The floor is never clamped backwards *silently*.** It is never passed through `clampForward` (`:393-404`), because moving it backwards without a loss would certify evicted records.
    - **Future-dated floor.** *(Review fold, MEDIUM-3; replaces "bounded by the size of the skew".)* Eviction can set the floor to at most pass `nowIso + FUTURE_FACT_TOLERANCE_MS` (`fact-store.js:265-270`). With a clock that is N days fast, the floor is about real time + N days. Once the clock is corrected, the family would be blind for N days while reading intact with coverage "narrowed". That is an unbounded blind, which reverses Fix 1 (`fact-store-integrity.js:378-392`).
@@ -176,6 +185,7 @@ The grounded review requires that a minimum-span floor gate **detector eligibili
   - Otherwise it requires `nowMs − floor_ms >= horizonMs`, using the raw floor (§4.1 item 3).
   - *(Review fold, Q2 consequence.)* Under "applies only once narrowing has happened", a family whose budget holds fewer ticks than its horizon is eligible on day 1, when the floor is `null` and 6 h of novelty memory exists. It becomes ineligible at its first eviction. The §4.5 config floor (budget ≥ the T8 invariant) prevents this at configured budgets. Note also that every M2-upgraded host, not only low-volume ones, starts with day-1 novelty memory of about 6 h.
   - Missing or malformed completeness, or a floor in the future, → `false`.
+  - **(LOW-2, review fold.)** `bytecap_floor_ts === null` is ambiguous on its own: it also means "no ledger at all" (`buildCompleteness` now reports `coverage: "unknown"` in that case, not `"full"` -- fixed post-S2). S3 must gate `certifiedHorizonOk` on a VALID ledger (`coverage !== "unknown"`), not merely on the floor being `null`, or a missing/invalid ledger would read as day-1-eligible instead of failing closed.
 - **Per-detector gating.** A rule is evaluable when `!coldStartPendingThisTick && certifiedHorizonOk(...)`. When it is not evaluable the detector emits no candidates for that rule and reports no `evaluatedAlertKeys` for it (`session-baseline.js:831`, `peer-baseline.js:882`, `service-baseline.js:455-475`, …). The horizon is **per rule**: `session.count_drop` (statistical) and `session.churn` (fingerprint diff) have different horizons.
 - **No cold-start re-arm.** Narrowing is not a trust loss. Data in `(floor, now]` is complete. Re-accumulation counts only points above the floor, so it is automatically conservative. A detector whose horizon recovers resumes immediately and does not need 6 more ticks. A distinct reason (`history_horizon_short`) goes to status surfaces, so they say "history horizon below minimum" rather than "still learning".
 - **A short horizon is not fail-closed for novelty rules.** *(Review fold, MEDIUM-4.)* `service.appeared` builds `historical` from every prior complete group (`service-baseline.js:837-846`); process-lineage (`process-lineage-baseline.js:291`) and persistence (`persistence-baseline.js:247`) work the same way. Suppose an entity first appears while its rule is horizon-ineligible. By the time the rule resumes, the entity is already in `historical`, so it never alerts. A sustained short horizon is therefore a **novelty-absorbing window**, like a cold-start lockout. It suppresses alerts; it does not fabricate any. Consequences:
@@ -278,11 +288,11 @@ Trust holds only if every family is trusted.
 **Formula.** `budget_f = max(31 d × typical_f × headroom, H_max(f) × worst_f × 1.25)`, then bounded by read cost. `worst_f` is the **maximum-record-size** worst case (§2, max-key column), not cap × average.
 - The second term makes "inflating volume can narrow but never blind" a **provable** property for the default configuration. T8 pins `budget_f ≥ (H_max(f)/interval) × worst_tick_bytes(f) × 1.25`.
 
-**The table below is provisional until S0** pins exact worst-case tick sizes. *(Review fold, MEDIUM-6.)* The figures were sized with the average record size. Re-checked against the ~470 B max-key estimate:
+**Superseded by S0 (§15.4; Q1/Q2 operator-accepted, §12).** The table below was provisional pending S0's measurement of exact worst-case tick sizes against pinned max-length-key record sizes (not the ~470 B estimate this section originally used) and Q2's accepted horizons (service.appeared/scheduled_job.appeared 48 h, process.lineage.novel_edge 6 d -- longer than this section's original 24 h placeholder). Re-running the T8 arithmetic with both inputs breaks three of the figures below even though the pinned max records are smaller than the ~470 B estimate, because the accepted horizons are longer. **The table's budget and H_max columns are updated to the S0-revised values** (service 18 MiB/48 h, process_lineage 10 MiB/6 d, scheduled_job 5 MiB/48 h, peer 16 MiB/72 h, session/canary/network/provenance unchanged at 4 MiB); see §15.4 for the full per-family arithmetic and the read-cost re-check (it does not trip T9's bound). The paragraphs immediately below (sized against the original 24 h/~470 B inputs) are kept for the historical record of why the original figures were picked, not as the current defaults:
 - service: 24 × ~470 KB × 1.25 ≈ 14.1 MB, under 16 MB with about 13% margin. 16 MB holds ~35 worst ticks.
 - process_lineage (~2.8 MB), scheduled_job (~2.8 MB) and canary (~0.7 MB) are comfortably inside their budgets.
 - session: 30 × ~94 KB × 1.25 ≈ 3.5 MB, under 4 MB but thin.
-- **peer fails at 12 MB.** 72 × ~188 KB × 1.25 ≈ 16.9 MB. The 3 d `H_max` comes only from correlation. S0 decides between raising the peer budget to about 18 MB, which puts the worst-case total at about 62 MB, and a shorter correlation horizon (§4.2 table).
+- **peer fails at 12 MB.** 72 × ~188 KB × 1.25 ≈ 16.9 MB. The 3 d `H_max` comes only from correlation. S0 decided 16 MiB (§15.4), below the ~18 MB estimated here, because the pinned max peer record (392 B) is smaller than this section's ~188 KB-per-tick estimate implied.
 
 **Decision rule if S0 breaks the read-cost bound.** If the pinned worst-case budgets push T9 past its bound, **stop before S4** and escalate to the operator. The options:
 1. accept the higher read cost and raise T9's bound, with the measured figure;
@@ -292,18 +302,33 @@ Trust holds only if every family is trusted.
 Do not quietly shrink a budget below the T8 invariant.
 - Inflation is also visible: injected entities trigger novelty alerts, and a census over its ceiling is marked partial (`tools/services.js:31-36`).
 
-| family | typical B/tick | worst B/tick | **default budget** | typical horizon | worst-case horizon | H_max |
-|---|---:|---:|---:|---|---|---|
-| service | 132 KB | ~254 KB | **16 MB** | ~5.3 d (127 ticks) | ~2.75 d (66 ticks) | 24 h (yes) |
-| process_lineage | 44 KB | ~50 KB | **8 MB** | ~7.9 d | ~6.9 d | 24 h (yes) |
-| scheduled_job | 2.6 KB | ~67 KB | **4 MB** | 30 d (age-limited; needs 1.9 MB) | ~2.6 d | 24 h (yes) |
-| session | ≥0.25 KB | ~51 KB | **4 MB** | 30 d up to ~22 sessions | ~3.4 d | 30 h (yes) |
-| peer | ≥0.65 KB | ~130 KB (max-key ~188 KB) | **12 MB (S0: likely ~18 MB)** | 30 d up to ~52 peers | ~4.0 d (max-key ~2.7 d) | 3 d (**no** at max-key; see above) (correlation) |
-| canary | 0 (AUTHOR off) | ~60 KB | **4 MB** | 30 d | ~2.9 d | 6 h (yes) |
-| network | 2.2 KB | S0 | **4 MB** | 30 d (needs 1.6 MB) | S0 | n/a (AUTHOR; 3 h freshness) |
-| provenance | 3.3 KB | S0 | **4 MB** | 30 d (needs 2.4 MB) | S0 | n/a |
+**Original (provisional) table, kept for the historical record.** `typical horizon`/`worst-case horizon` below were computed against the budgets in THIS table, which Q1/Q2 (§12) superseded; they are stale for the three rows the S0-revised budget/H_max columns below changed (service, process_lineage, scheduled_job), and are not recomputed here -- see §15.4 for the current per-family arithmetic instead of trusting these two columns for those three rows.
 
-**Totals (provisional).** Budgets sum to 56 MB, or about 62 MB if S0 raises peer, versus 5 MB today. Steady state on this host is about 30 MB. At typical volume, peer and session are only ever age-evicted, so they get the full 30 days. This is R0a's intent. R0b covers the adversarial case.
+| family | typical B/tick | worst B/tick | default budget (original) | typical horizon | worst-case horizon | H_max (original) |
+|---|---:|---:|---:|---|---|---|
+| service | 132 KB | ~254 KB | 16 MB | ~5.3 d (127 ticks) | ~2.75 d (66 ticks) | 24 h (yes) |
+| process_lineage | 44 KB | ~50 KB | 8 MB | ~7.9 d | ~6.9 d | 24 h (yes) |
+| scheduled_job | 2.6 KB | ~67 KB | 4 MB | 30 d (age-limited; needs 1.9 MB) | ~2.6 d | 24 h (yes) |
+| session | ≥0.25 KB | ~51 KB | 4 MB | 30 d up to ~22 sessions | ~3.4 d | 30 h (yes) |
+| peer | ≥0.65 KB | ~130 KB (max-key ~188 KB) | 12 MB (S0: likely ~18 MB) | 30 d up to ~52 peers | ~4.0 d (max-key ~2.7 d) | 3 d (**no** at max-key; see above) (correlation) |
+| canary | 0 (AUTHOR off) | ~60 KB | 4 MB | 30 d | ~2.9 d | 6 h (yes) |
+| network | 2.2 KB | S0 | 4 MB | 30 d (needs 1.6 MB) | S0 | n/a (AUTHOR; 3 h freshness) |
+| provenance | 3.3 KB | S0 | 4 MB | 30 d (needs 2.4 MB) | S0 | n/a |
+
+**S0-revised table (current defaults; §15.4, Q1/Q2 §12).** Worst B/tick is the pinned, real-translator figure (§15.3); H_max is the operator-accepted Q2 horizon. `required` is the T8 invariant, `(H_max/interval) × worst B/tick × 1.25`.
+
+| family | worst B/tick (pinned) | H_max (accepted) | required | **default budget** |
+|---|---:|---|---:|---:|
+| service | 291,251 B | 48 h | 17,475,060 B (16.7 MiB) | **18 MiB** |
+| process_lineage | 50,497 B | 6 d | 9,089,460 B (8.7 MiB) | **10 MiB** |
+| scheduled_job | 71,075 B | 48 h | 4,264,500 B (4.07 MiB) | **5 MiB** |
+| session | 67,130 B | 30 h | 2,517,375 B (2.4 MiB) | **4 MiB** |
+| peer | 157,733 B | 72 h (correlation) | 14,195,970 B (13.5 MiB) | **16 MiB** |
+| canary | 100,447 B | 6 h | 753,353 B (0.7 MiB) | **4 MiB** |
+| network | S0 (not pinned; AUTHOR-tier) | n/a | -- | **4 MiB** |
+| provenance | S0 (not pinned) | n/a | -- | **4 MiB** |
+
+**Totals.** The S0-revised budgets sum to **65 MiB** (service 18 + process_lineage 10 + scheduled_job 5 + session 4 + peer 16 + canary 4 + network 4 + provenance 4), versus the original table's 56 MB (62 MB at peer's original ~18 MB estimate), versus 5 MB today. The read-cost decision rule (above) does not trip against the S0-revised figures: §15.4 re-checks T9's bound at ~2.1 s per fast tick, well under the 5 s bound. Steady state on this host is well below every budget; at typical volume, peer and session are only ever age-evicted, so they get the full 30 days. This is R0a's intent. R0b covers the adversarial case.
 
 **Read cost per 60 s fast tick at defaults:**
 - service: 3 reads (disappearance, appearance, daemon veto) × ~235 ms ≈ 0.7 s;
@@ -328,6 +353,7 @@ That totals about 1 s per minute (~1.6% of a core), versus about 0.55 s per minu
   - Established detectors (`cold_start_pending: false`, rare: only hosts that never evicted) re-arm once on the `unknown` read and clear after 6 ticks.
   - Count rules establish after 30 complete ticks.
   - Novelty memory starts over, the same as a fresh install.
+    - **Addendum (G2 H1, §20.1):** not quite. A fresh install has no history before its first pass; an upgraded one does, and S5 quarantined it. So an upgraded family store's seen-set is certified only from its first pass (`certified_since_ts` = that pass, not `null`), and the novelty rules read `history_horizon_short` for their Q2 horizons (48 h service/scheduled_job, 6 d lineage) after the upgrade instead of claiming "new" over a 30-day scope. A fresh install (no marker, no legacy item) still starts at `null`.
   - **Cost.** On evicting hosts, nothing is lost, because they were locked out anyway. That covers the one real macOS host measured, and very likely typical Linux hosts too: about 200-300 systemd units plus lineage is an estimated ~110 KB/tick, which fills 5 MB in about 2 days. That Linux figure is not measured; S0 should confirm it on a Linux host. Low-volume hosts lose established baselines: about 30 h of statistical warm-up, plus a burst of possible false novelty alerts like a day-1 install.
   - No detector-store schema changes.
 - **M3: quarantine the legacy store.** On first run, rename `learned/facts/facts.jsonl` and `integrity.json` into a quarantine directory **outside the facts tree**: `learned/facts-legacy-<iso>/`, not inside `learned/facts/`. *(Review fold, LOW.)* Inside the tree it would sit next to the family directories, and any filesystem walk would see it. Every reader and the sweep already iterate the closed registry (§4.3), so this is a second layer. No trust path reads it again. Deleting it (immediately or after 31 days) is §12 Q4.
@@ -400,7 +426,7 @@ The todo deferred F2-Tier2 because "a monitor keyed off that store sees a shorte
 
 - **I1.** `readFactPoints` never returns a point with `ts <= bytecap_floor_ts` (coverage oracle). The reported `certified_after_ts = max(floor, retention cutoff)` is never older than the floor.
 - **I2.** `bytecap_floor_ts` never decreases across passes within a continuous ledger lineage, including crash/retry, clock rollback, and `clampForward`. It moves backwards in exactly two cases, and each one stamps an in-window loss in the same pass:
-  - a ledger re-bootstrap over a non-empty store (missing, invalid or unreadable ledger, or pass-id exhaustion; §4.1 item 2, HIGH-1);
+  - a ledger re-bootstrap over an existing store (missing, invalid or unreadable ledger, or pass-id exhaustion; §4.1 item 2, HIGH-1; *review fold LOW-1/LOW-4: "existing", not "non-empty" -- an existing 0-byte store with no ledger can only be our own prior output, never a genuine first run*);
   - the future-floor clamp (`floor > nowIso + FUTURE_FACT_TOLERANCE_MS` → `nowIso`; MEDIUM-3).
 
   A floor that fails the plausibility check (`floor < last_rewrite_newest_ts` for a non-empty store) makes the ledger `invalid`.
@@ -565,16 +591,17 @@ The per-family stores sit in new paths. The legacy store is only quarantined (if
 
 ### Operator answers (2026-10-05)
 
-- **Q1 Budgets:** plan defaults (§4.5 as revised, so peer is about 18 MB and the total about 62 MB; still provisional until S0 measures record sizes).
-- **Q2 Novelty horizon:** the operator asked "Isn't 24 h short?". The answer given: the horizon is the *minimum* certified memory before a novelty rule may claim "new". It is not the memory length, which the budget sets. A horizon above a family's worst-case span blinds that family during volume spikes. **Proposed** (to be applied unless the operator objects):
+- **Q1 Budgets:** **superseded by the S0-revised defaults** (§15.4, measured against pinned worst-case record sizes, not the provisional ~470 B estimate): service 18 MiB, process_lineage 10 MiB, scheduled_job 5 MiB, peer 16 MiB, session 4 MiB, canary 4 MiB, network 4 MiB, provenance 4 MiB -- **65 MiB total** (versus the ~62 MB figure below, which predates S0's measurement and is kept here only for the record of what was asked). §4.5's table is updated to match. This lands in S4 (R0a); it does not block S1-S3.
+- **Q2 Novelty horizon: ACCEPTED.** The operator asked "Isn't 24 h short?". The answer given: the horizon is the *minimum* certified memory before a novelty rule may claim "new". It is not the memory length, which the budget sets. A horizon above a family's worst-case span blinds that family during volume spikes. Accepted, to be applied at S3:
   - `service.appeared`: 48 h;
   - `scheduled_job.appeared`: 48 h;
   - `process.lineage.novel_edge`: 6 d, to cover weekly runtime edges; stays below the ~6.9 d worst case.
 
-  Each stays below its family's worst-case certified span. The horizon applies only after narrowing (the default).
+  Each stays below its family's worst-case certified span (re-confirmed against the S0-revised budgets at §15.4). The horizon applies only after narrowing (the default).
 - **Q3 Migration:** fresh per-family stores. This removes M2′ and M4 (§14).
 - **Q4 Legacy store:** quarantine for 31 days, outside the facts tree, then delete.
-- **Q5–Q8:** the recommended defaults (Q5 ignore + deprecation note; Q6 defer; Q7 fixed budget + `history_horizon_short`; Q8 keep the `provenance` store).
+- **Q5, Q7, Q8:** the recommended defaults (Q5 ignore + deprecation note; Q7 fixed budget + `history_horizon_short`; Q8 keep the `provenance` store).
+- **Q6 First/last-seen set: IN SCOPE (operator, 2026-10-05, after G1).** G1 showed that novelty over a narrowed window fabricates "new" for an entity last seen before the floor (§16). The operator chose to pull §5.4 into R0 as **S3b** rather than keep novelty silent under narrowing or accept re-flags. See §17.
 
 ---
 
@@ -638,3 +665,646 @@ The per-family stores sit in new paths. The legacy store is only quarantined (if
 - **Q7:** "fail-closed" was wrong.
 - **Q5:** added that the 5 MB default is written into every `watch.json`.
 - **Q1:** added that budgets are provisional, peer is about 18 MB, and service-presence mining is lost.
+
+---
+
+## 15. Addendum: S0 grounding (2026-10-05)
+
+**Addendum:** 2026-10-05. Step S0 run on branch `feat/fact-store-capacity-2026-10` (base `b951cb7`, which differs from `134e811` only in `docs/`, so every `src` line reference above still holds). Everything below was derived from the code and from §2's already-measured host numbers. No live host measurement was taken; every test and command ran with scratch `XDG_*` directories.
+
+### 15.1 Line references
+
+Re-verified against the branch base: `fact-store.js` (`:19`, `:27`, `:37`, `:44-47`, `:265-270`, `:272-285`, `:290-292`, `:331-333`, `:351-373`, `:380-427`, `:406`), `fact-store-integrity.js` (`:100-118`, `:170-209`, `:179-180`, `:222-223`, `:237-247`, `:276-290`, `:318-323`, `:337`, `:356-359`, `:361-366`, `:393-404`, `:439`, `:445`, `:476`, `:505-511`, `:545`, `:588`), `fact-store-completeness.js` (`:1-16`, `:69-70`, `:83-84`), the six detector loss-list and `hasCompletenessLossAfterAnchor` copies (§3 Leg B), and `daemon.js` (`:984-988`, `:1004-1058`, `:1053`, `:1136-1171`, `:1144`, `:1151`, `:1196-1211`). All hold. One correction: the `readFactPoints` call itself is one line below several of the `readFacts =` seam lines cited in §4.3 (for example `shadow-store.js:300` is the call, `:282` the seam). The inventory below cites the call lines.
+
+### 15.2 Inventory (`grep -a`; plain `grep` misses `canary-baseline.js`, confirmed: it reports `canary-baseline.js` as binary and drops its `readFacts(` call at `:537`)
+
+- **`last_bytecap_evict_ts`, `src` (9 files, 22 lines):**
+  - `fact-store-integrity.js`: `LEDGER_KEYS` `:16`, `createFactIntegrityLedger` `:80`, validation `:182`, `:205`, `clampForward` `:401`, stamp `:439`, comment `:443`, `LOSS_CHANNEL_FIELDS` `:509`, `commonCompletenessFields` `:532`;
+  - `fact-store-completeness.js:4` (`LOSS_TIMESTAMP_FIELDS`);
+  - detector copies: session `:149`, peer `:150`, service `:123`, process-lineage `:93`, persistence `:110`, canary `:86`;
+  - `constraint-store.js`: `LOSS_TS_FIELD_NAMES` `:302`, `unknownFactStoreCompleteness` `:317`, `selectFactStoreCompleteness` `:350`, `renderFactStoreCompletenessText` `:450`.
+- **`last_bytecap_evict_ts`, `test` (12 files):** `fact-store-completeness.test.js` (`:26` loss-channel list, `:106`/`:111` anchor fixtures, `:186-194` "byte-cap eviction degrades completeness"), `constraint-store.test.js` (6 lines, incl. `:566-590`), `fact-store-integrity.test.js:613`, and one `degradedReadResult`-style fixture each in the session, peer, service, process-lineage, persistence, canary, shadow, miner and correlation tests (they use the field as a generic loss marker).
+- **`continuity_oldest_ts`:** `src`: `fact-store-integrity.js:545`, `constraint-store.js:318`, `:351`, `daemon.js:170` (comment). `test`: `fact-store-integrity.test.js:90-128`, `constraint-store.test.js:515-590`, `daemon.test.js:691` (comment). No trust path reads it.
+- **`readFactPoints` call sites, `src` (16), checked against the §4.3 reader list (complete; nothing missing, nothing extra):** session `:694`, peer `:730`, service `:518` and `:916`, process-lineage `:361`, persistence/scheduled-job `:339`, canary `:537`, correlation `incident-correlation.js:313`, active-constraint `daemon.js:524`, daemon history veto `daemon.js:1144`, shadow `shadow-store.js:300`, miner `constraint-miner.js:362`, provenance-warning `tools/provenance-warnings.js:332`, tuning `tuning-store.js:631`, learned status `constraint-store.js:380`, `baseline.js:239`.
+- **`readFactPoints` direct calls, `test`:** `daemon.test.js` 35, `fact-store-integrity.test.js` 30, `fact-store.test.js` 20, `fact-store-completeness.test.js` 17, and one each in the miner, peer, service and session tests.
+- **`appendFactPoints`:** one `src` writer, `daemon.js:1043`/`:1053`. `test`: 263 direct calls across 13 files (`daemon.test.js` 111).
+- **`enforceFactRetention`:** one `src` caller, `fact-store.js:368` (inside `appendFactPoints`). `test`: 74 direct calls across 7 files.
+
+### 15.3 Worst-case tick bytes (pinned)
+
+Computed by running the **real translators** and `normalizeFactPoint` on maximum-length inputs (scratch script, not committed). The ~470 B estimate in §2 was too pessimistic for most families, because the translators bound entity keys well below `MAX_FACT_ENTITY_KEY_LENGTH = 256`: `sanitizeIdentityString` truncates to `MAX_STRING_LENGTH = 64` (`diagnostics-sanitizer.js:23`), and the lineage, session, peer and scheduled-job keys are fixed-length hashes. Canary is the exception: its stat attributes make it the largest record.
+
+| family | max record (B) | markers per tick (B) | entity cap used | **worst B/tick** |
+|---|---:|---:|---:|---:|
+| service | 291 | 251 | 1000 (ceiling; hard clamp 5000 gives 1,455,251) | **291,251** |
+| process_lineage | 251 | 297 | 200 | **50,497** |
+| scheduled_job | 354 | 275 | 200 (clamp) | **71,075** |
+| session | 333 | 530 (census + overflow) | 200 (default, unclamped) | **67,130** |
+| peer | 392 | 933 (VPN census + VPN overflow + Tailscale overflow) | 400 (200 VPN + 200 Tailscale defaults, unclamped) | **157,733** |
+| canary | 501 | 247 | 200 | **100,447** |
+
+Session and peer still use the unclamped defaults (§2); S4 must clamp them or pin these values in T8.
+
+### 15.4 T8 arithmetic, re-run with the pinned values and the Q2 horizons
+
+`required = (H_max / 1 h) × worst B/tick × 1.25`, with `H_max` per family from §12 Q2 (service 48 h, scheduled_job 48 h, process_lineage 6 d) and §4.2 (session 30 h, peer 72 h from correlation, canary 6 h):
+
+| family | H_max | required | §4.5 budget | verdict | minimum MiB-rounded budget |
+|---|---|---:|---:|---|---:|
+| service | 48 h | 17,475,060 B (16.7 MiB) | 16 MiB | **fails** | 18 MiB |
+| process_lineage | 6 d (144 ticks) | 9,089,460 B (8.7 MiB) | 8 MiB | **fails** | 10 MiB |
+| scheduled_job | 48 h | 4,264,500 B (4.07 MiB) | 4 MiB | **fails** (just) | 5 MiB |
+| session | 30 h | 2,517,375 B (2.4 MiB) | 4 MiB | passes | 4 MiB |
+| peer | 72 h | 14,195,970 B (13.5 MiB) | 12 MiB (~18 MiB proposed) | fails at 12, passes at 14+ | 16 MiB |
+| canary | 6 h | 753,353 B (0.7 MiB) | 4 MiB | passes | 4 MiB |
+
+The §4.5 budgets were sized for 24 h novelty horizons. Q2's longer horizons (48 h, 6 d) break T8 for service, process_lineage and scheduled_job, even though the measured max record is smaller than the estimate. Peer needs less than the ~18 MiB proposed. **Revised defaults for S4:** service 18, process_lineage 10, scheduled_job 5, session 4, peer 16, canary 4, network 4, provenance 4: **65 MiB** in total (versus ~62 MiB in Q1). This is an operator item (Q1 follow-up), surfaced at G1; it does not block S1-S3.
+
+**Read-cost decision rule (§4.5).** It does not trip. Worst case with every family at its revised budget, interpolating §2's measurements at ~15 ms/MiB: service 3 reads × 18 MiB ≈ 0.8 s, peer 3 reads (detector, correlation, veto) × 16 MiB ≈ 0.7 s, lineage 2 × 10 MiB ≈ 0.3 s, the rest under 0.3 s, for ~2.1 s per fast tick. That is under T9's 5 s bound. At typical volume most families sit far below budget.
+
+**Linux volume** (§4.6 M2 cost note) is not confirmed: no Linux host is available to this run, and the hard rule forbids live measurement. It stays an estimate.
+
+### 15.5 Decisions
+
+1. **Empty-store floor bound (§4.1 item 2, S0/G1 item).** No new ledger field. Two layers instead:
+   - write side: the future-floor clamp runs on **every** retention pass (prior floor `> nowIso + FUTURE_FACT_TOLERANCE_MS` → `nowIso`, plus `last_continuity_break_ts = nowIso` in the same pass), so a forged far-future floor on an empty store survives at most until the next pass, which stamps a loss;
+   - read side: `buildCompleteness` reports `status: "unknown"` (`degraded_reason: "future_floor"`) whenever the floor is more than `FUTURE_FACT_TOLERANCE_MS` ahead of the read's `nowMs`. That fails closed between the forgery and the next pass.
+   - The non-empty case keeps the in-ledger check (`floor < last_rewrite_newest_ts`, else `invalid`).
+2. **Below-floor records are evicted physically (refinement of §4.1 items 1 and 3).** After a clock rollback, a retention pass can see candidates with `ts <= floor` (appended after the eviction that set the floor). Keeping them would make "every kept record is above the floor" false. A store whose only records are below the floor would then fail the `floor < last_rewrite_newest_ts` validation inside `writeFactIntegrityLedger`, and retention would fail on every pass from then on. So each pass evicts every candidate with `ts <= prior floor` (after the clamp) and counts it as byte-cap eviction. The read filter already hides these records, so dropping them changes no trust outcome. It also makes the floor bound, the suffix assertion and the validation hold by construction.
+3. **Missing ledger over a non-empty store (HIGH-1): first-run carve-out.** `appendFactPoints` writes `facts.jsonl` **before** the first retention pass creates the ledger, so on a genuine first run the ledger is missing while the store is non-empty. Read literally, HIGH-1 would stamp a continuity break on every fresh install. The rule is therefore "missing ledger **and** the store held bytes **before this call's own append**". `appendFactPoints` observes that (ledger missing and `facts.jsonl` absent or empty before appending) and passes it to its internal retention pass. The exported `enforceFactRetention` cannot assert it. A crash between the first append and the first retention pass therefore reads as a lineage break (fail-closed, 31 days degraded), never as a clean bootstrap.
+   - **Superseded (review fold LOW-1/LOW-4, post-S2).** This decision's `appendedToEmptyStore` carve-out could not tell a genuine first run (ENOENT) apart from an evicted-then-emptied store (0 bytes, but WITH history the now-deleted ledger used to certify) whose ledger was separately lost -- both present as "store held 0 bytes before this append". That let the floor reset to `null` with no stamp in the second case, and a later normal append would silently re-certify as intact/`coverage: full` with no trace anything was ever lost (LOW-1). Fix: drop the emptiness clause entirely (`missingLedgerOverExistingStore = ledgerReason === "missing" && live.exists === true`), and resolve the genuine-first-run shape differently -- `appendFactPoints` now runs one retention pass against the **pre-append** store whenever the ledger is missing, strictly before its own append, so the check always sees the true prior state. The `appendedToEmptyStore` parameter is removed; HIGH-1's rule has no exception left. The crash-reads-as-a-lineage-break consequence in the paragraph above is unchanged.
+4. **Q3 = fresh per-family stores, so M4 and M2′ do not apply.** S2 implements no floor derivation for legacy ledgers. The schema bump still goes through `migrateLedgerShape`:
+   - a v1 ledger with `bytecap_evicted_total === 0` → v2 with `bytecap_floor_ts: null` (reads intact; T6);
+   - a v1 ledger with `bytecap_evicted_total > 0` is **not** migrated. It stays v1, fails validation as `invalid`, and takes the existing continuity-break bootstrap: never intact, never a clean `floor: null`. In the shipped slice S5 quarantines the legacy store before any v2 code reads it, so this only ever governs the never-shipped S2 interim state and tests. **G1 question.**
+5. **T1 on HEAD.** `test/fact-store-lockout-e2e.test.js` drives `runDaemonIteration` for 40 hourly structural ticks, plus half-hour fast ticks from tick 26, using the seeded real-volume generator (`test/fixtures/real-volume-tick.js`: 714 records and ~191 KB per tick, against the real 722 records and 185 KB; it omits `provenance.warning`). The 5 MB store starts evicting at tick index 27, the 28th tick. From tick 28 on, it reports all three legs: every structural and fast history read is `degraded` (Leg A); the service, lineage and persistence anchors re-arm on every tick (Leg B); none of them reports coverage (Leg C). It is committed as `todo` (red) in S0 and flips to a normal test in S2. Runtime is about 29 s.
+
+---
+
+## 16. Addendum: S1, S2, and G1 blocker rework (2026-10-05)
+
+**Addendum:** 2026-10-05. S1 and S2 are built on `feat/fact-store-capacity-2026-10`, and the two daybreak G1 blockers are being closed on this branch. Nothing is pushed or merged. Full-suite runs use fresh scratch `XDG_*` directories. After the amended blocker-1 commit: 2088 tests, 2032 pass, 22 fail, 34 skipped, 0 todo; the 22 failures are sandbox-only (17 notifier loopback-listen `EPERM`, 3 tap-token loopback-listen `EPERM`, and 2 live-host provenance checks returning `unknown`).
+
+**Commits.**
+- `4d5eea1`: S0, plus T1 committed as `todo`.
+- `db7e5a8`: S1, the dedupe.
+- `953027a`: tick-aligned eviction and the suffix assertion (T3, T5 eviction half).
+- `4c11f9f`: ledger v2 and the floor. Includes HIGH-1, MEDIUM-3, plausibility, below-floor eviction and the first-run carve-out (T5 ledger half, T6).
+- `0d1fb80`: read-side exclusion, coverage fields, the F2-Tier1 fold-in, and the T4 oracle.
+- `9f3f510`: byte-cap reclassification. T1 turns green.
+
+**T1 after S2/G1 blocker 1.** It passes. From tick 28 on, the 5 MB store evicts on every structural tick. The daemon's history read remains `intact` on structural and fast ticks, and the ordinary service baseline stays established. The three retained-window novelty paths deliberately report no evaluated keys and re-arm through their existing cold-start state under narrowed coverage; this is the safe pre-S3 behavior. Leg D (count rules can't reach 30 samples at 5 MB) still stands, as expected. T2 covers it after S4.
+
+**G1 Blocker 1 disposition (interim S2).** The three retained-window novelty producers now call `factHistoryTrustworthy` with `requireFullCoverage: true`: `service.appeared`, `scheduled_job.appeared`, and `process.lineage.novel_edge`. A narrowed store therefore emits no novelty candidate and re-arms an established detector through its existing cold-start path, matching the pre-S2 byte-cap-loss behavior. The regression is pinned for the daybreak reproduction: an entity present at t0, absent at t1–t3, and present again at t4 must not be called first-seen when t0 is evicted. The inventory found no additional detector that makes this same retained-window first-seen claim; miner, shadow, and correlation already use the interim full-coverage gate, while disappearance/churn/count/deviation paths have different recent-evidence semantics.
+
+This is intentionally an **interim S2** gate. **S3 must not simply lift it by adding a horizon.** G2 must decide whether novelty over a narrowed window may still re-flag an entity whose last sighting was before the floor. The proper durable fix is the §5.4 first/last-seen set (Q6), and that operator decision remains open; a horizon alone cannot recover the missing first/last-seen fact.
+
+**G1 Blocker 2 disposition.** Ledger v2 now persists `age_floor_ts`, the monotonic newest timestamp removed by age retention. Validation requires the floor exactly when `age_evicted_total > 0`, rejects implausible floors against a non-empty committed rewrite, and migrates older v2/v1 shapes only when no age floor is needed; a legacy ledger with recorded age eviction but no recoverable floor fails closed. Retention carries the maximum age floor forward and classifies records reintroduced at or below it after a wall-clock rollback as already age-evicted. Reads exclude both the byte-cap and age floors. Completeness exposes both raw floors and reports `coverage: "narrowed"` with `certified_after_ts = max(bytecap floor, age floor, retention cutoff)` whenever the relevant floor intersects the read window. The two-hour rollback regression pins t0 evicted at t4, then read at t2: t0 remains absent and the result is never `intact`/`full`.
+
+**Deviations from the plan text (each also stated in code comments and commit messages).**
+1. **Below-floor eviction** (§15.5 decision 2): records with `ts <= floor` are evicted physically and counted as byte-cap. The plan only filtered them on read.
+2. **First-run carve-out for HIGH-1** (§15.5 decision 3): `appendFactPoints` observes before appending. "Non-empty" means `bytes > 0 || record_count > 0`, which is stricter than the plan's `record_count > 0`: a file holding only corrupt lines also counts as non-empty.
+3. **`future_floor`.** A new `degraded_reason`; the read reports status `unknown`. It is the empty-store floor bound (§15.5 decision 1). It takes precedence over the in-window-loss attribution; both outcomes are untrusted.
+4. **`continuity_oldest_ts` is removed from `buildCompleteness`, not just from the operator surfaces** (§4.1 item 6). A test pins that no `src` file other than the ledger writer reads `continuity.oldest_ts`.
+5. **`selectFactStoreCompleteness` reports `coverage: "unknown"`** when there is no read to report (fact history never enabled, or a malformed shape), instead of defaulting to `"full"`.
+6. **T3 is store-level.** Each real per-family record order (service; session with overflow; peer VPN plus Tailscale) is produced by the real translators, and the test asserts that no part of a split tick is physically kept or returned. It makes no detector-candidate assertions: with tick-aligned eviction the store can no longer produce a split tick for a detector to read.
+7. **T4 omits the horizon assertion** (`certifiedHorizonOk`, which is S3). The "blind for at most one window after a fast clock is corrected" property is pinned by a dedicated MEDIUM-3 test rather than inside the oracle. The oracle treats a ledger `generation` change as a new lineage (I8); the T6 tests pin the HIGH-1 stamp separately.
+8. **T5's "ineligible horizon" half is deferred to S3.** S2 asserts coverage `narrowed` and an empty certified span instead.
+9. **S1 removed `canary-baseline.js`'s deliberately independent copy** of the re-arm check. Its own comment called that copy defense-in-depth against a widening of the shared helper. The removal follows §4.1 item 7.
+10. **Test fixtures that used `last_bytecap_evict_ts` as a stand-in loss** (the six detector `degradedReadResult` helpers, plus the shadow and miner "future loss is ignored" tests) now use `last_continuity_break_ts` or `last_corrupt_ts`, so they still exercise a real loss channel. Two tests pinned the old trust semantics; both are rewritten with the reason stated in place:
+    - "byte-cap eviction degrades completeness";
+    - "missing-ledger bootstrap over a pre-existing non-empty store reaches intact".
+
+**Review-fold fixes applied before G1 (2026-10-05).** An adversarial review of S0-S2 found six items; all six are fixed on this branch before the G1 gate review runs, each its own atomic commit:
+- **MEDIUM-1.** Reclassifying byte-cap eviction as narrowing widened what the no-anchor path of `factHistoryTrustworthy` trusts. `constraint-miner.js:366`, `shadow-store.js:303` and `incident-correlation.js:323` all call it with no anchor and, on `main`, used to refuse after ANY byte-cap eviction ever (a loss); they would now accept a merely-narrowed read with no horizon of their own to bound what they mine/evaluate over. Fixed with an explicit opt-in on the shared primitive, `opts.requireFullCoverage` (`fact-store-completeness.js`), which those three readers alone pass, with reason `coverage_narrowed`. The daemon's per-family history veto (`daemon.js:1153`, called with no opts at all) and the six watch-tier detectors behind it deliberately do NOT opt in -- they rely on their own retained-union/S3-horizon semantics -- confirmed by a new `daemon.test.js` test that a genuinely NARROWED (not degraded) read still recovers a persisted `session.count_drop` alert. **This corrects §7's claim that "R0b alone is a safe state (it does not fabricate)": R0b alone, unfixed, widened these three non-detector readers' trust beyond what they could support for the span S3's horizons will eventually bound -- a real widening, not merely an "incomplete fix" in the Leg-D sense §7 meant. The six detectors and the daemon veto were never affected; §7's claim holds for them.** See G1 question 8.
+- **LOW-1/LOW-4.** The `appendedToEmptyStore` carve-out (§15.5 decision 3) could not tell a genuine first run (ENOENT) apart from an evicted-then-emptied store (every record byte-cap-evicted, floor set) whose ledger was separately deleted -- both read back as 0 bytes. The carve-out let the floor silently reset to null with no stamp in the second case, certifying the evicted history as intact/`coverage: full` within one more normal tick. Fixed by dropping the carve-out's emptiness clause entirely (`fact-store-integrity.js`'s `missingLedgerOverExistingStore` now requires only `live.exists === true`, with no exception) and having `appendFactPoints` run one retention pass against the TRUE pre-append state whenever the ledger is missing, so the check is never contaminated by the same call's own new data.
+- **LOW-2.** `buildCompleteness` reported `coverage: "full"` whenever there was no ledger at all (missing/unreadable/invalid), because its fallback is a fresh ledger whose floor is always null -- over-claiming that byte-cap eviction never narrowed a store there is no ledger to vouch for either way. Fixed: `coverage: "unknown"` when `ledger === null`, scoped narrowly so a ledger with a merely-unresolvable continuity observation this read still reports its real floor.
+- **LOW-5.** `orderRetentionCandidates` (the T5 non-suffix-eviction test seam) was read straight off `options`, which `appendFactPoints` forwards into `runFactRetention` verbatim -- technically reachable from it too, even though no production caller sets it. Moved behind a separate `internal` parameter that only `enforceFactRetention` populates from its own options.
+- **LOW-6.** `certified_after_ts`'s retention-cutoff term hardcoded `DEFAULT_FACT_RETENTION_MS` rather than the read's own retentionMs. `readFactPoints` now takes a validated `options.retentionMs`, defaulting to the same constant, so every existing caller is unaffected.
+- **Operator decisions (§12).** Q1's S0-revised budgets and Q2's accepted horizons are folded into §4.5's table as the plan's current defaults (not merely a G1-question follow-up); see §4.5 and §12's updated "Operator answers".
+
+**G1 questions.**
+1. **Zero-cap or all-evicted status (§7 S2).** Today such a store reads **`unknown`** (fail-closed), not intact. This was established in code, not decided. The root cause is `observeFactContinuity`: it returns `"unknown"` whenever the committed rewrite was empty and records were appended afterwards (`expectedNewest === null`), so a store that is fully evicted on every pass never reaches `continuity_ok: true`.
+   - For it to read intact with coverage `narrowed`, as the plan leans, that continuity rule must change. The argument for changing it: an empty committed prefix makes all live content a pure append.
+   - Consequence if left as is: a family whose per-tick volume exceeds its budget (`cap_below_tick`) is permanently untrusted. That is an over-freeze, never a fabrication. Pinned by a test.
+2. **Empty-store floor bound.** Is the two-layer answer acceptable: a clamp plus loss stamp on every pass, and a fail-closed `future_floor` read in between? The alternative is a new ledger field holding the last committed pass's `nowIso`.
+3. **v1 ledger that has evicted** → continuity-break bootstrap in the S2 interim (never certified). S5 quarantines it in the shipped slice.
+4. **Below-floor eviction counted as byte-cap.** It bumps `bytecap_evicted_total` and `last_bytecap_evict_ts` after a rollback.
+5. **The first-run carve-out**, and its consequence: a crash between the very first append and the first retention pass reads as a 31-day lineage break.
+6. **Removing canary's independent re-arm copy** (deviation 9).
+7. **For the operator (Q1 follow-up):** the S0 budget revision. Service 18, process_lineage 10, scheduled_job 5 and peer 16 MiB, so 65 MiB in total (§15.4). This lands in S4.
+8. **MEDIUM-1's interim full-coverage gate shape.** Is `requireFullCoverage` (opt-in on `factHistoryTrustworthy`, consumed only by the miner, shadow evaluator and correlation) the right INTERIM shape for S2-S3, or should S3's per-reader horizons for those three specifically be pulled forward rather than shipping a blunter gate first? The gate has no anchor-relative carve-out and no horizon of its own: it refuses outright on ANY narrowing, which is strictly more conservative than any per-reader horizon S3 would set (a reader could still be refused long after its own horizon would have cleared it). The six watch-tier detectors and the daemon's per-family history veto are unaffected either way -- they never called `factHistoryTrustworthy` with an anchor-equivalent widening problem in the first place, since their own re-arm/coverage logic already gates on the loss channels directly, not on this generic check's coverage field.
+
+---
+
+## 17. Addendum: S3b first/last-seen set (2026-10-05)
+
+**Addendum:** 2026-10-05 — G1 blocker 1 (novelty over a narrowed window) plus operator decision Q6 = in scope. Adds step **S3b** between S3 and S4.
+
+- **What:** one compact, trust-bearing seen-set per novelty family (`service`, `scheduled_job`, `process_lineage`): entity key → `{first_seen_ts, last_seen_ts}`, retained 30 days past `last_seen_ts`, bounded by an entry cap with overflow ⇒ that family's novelty goes ineligible (never silently drops an entry).
+- **Fold rule:** folded only from complete, certified, non-future ticks, in the same pass as the fact append (crash-consistent with the fact ledger: a seen-set generation stamp tied to the family ledger lineage; a mismatch or a missing/corrupt set ⇒ cold start for that family's novelty, never "everything is new").
+- **Read rule:** `service.appeared`, `scheduled_job.appeared` and `process.lineage.novel_edge` decide novelty against the seen-set, not the retained fact window. With the seen-set valid, the interim `requireFullCoverage` novelty gate (§16) is lifted for these three rules; without it, the gate stays.
+- **Invariants (new):** I13 eviction from the fact store never changes a seen-set answer; I14 a seen-set that cannot prove continuity yields no novelty claim (re-arm), never a claim.
+- **Tests:** G1's reproduction (entity at t0, absent t1–t3, back at t4, t0 evicted ⇒ no candidate) passes via the seen-set; seen-set loss ⇒ re-arm; partial tick never folded; cap overflow ⇒ ineligible + status reason.
+- **Gate:** covered by G2 (S3b lands before S4).
+
+---
+
+## 18. Addendum: S3 and S3b execution (2026-10-05)
+
+**Addendum:** 2026-10-05. S3 (eligibility horizon) and S3b (first/last-seen set) are built on `feat/fact-store-capacity-2026-10`, plus the two G1 re-gate LOWs. Nothing is pushed. S4 (per-family stores) is **not** started. Every test and command ran with fresh scratch `XDG_*` directories; full suites ran on a `git archive` snapshot of each commit so concurrent edits could not leak in. Baseline before S3: 2089 tests, 2055 pass, 0 fail, 34 skipped (no sandbox failures on this run, unlike §16's 22).
+
+### 18.1 Commits and full-suite totals
+
+| commit | step | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `9581332` | S3: `fact-families.js` registry, `certifiedHorizonOk`, `certifiedReadWindowOk`, daemon-init registry check | 2103 | 2069 | 0 | 34 |
+| `da35bc7` | S3: per-rule horizon gate in the watch-tier producers | 2107 | 2073 | 0 | 34 |
+| `2e9ffdc` | S3: miner/shadow/correlation via `certifiedReadWindowOk`; tuning reports its boundary | 2111 | 2076 | 0 | 34 (one T4 run hit its 120 s timeout under concurrent load; it passes in ~5 s alone and in every later run) |
+| `7656cf5` | S3: daemon per-rule horizon veto, `history_horizon_short`, fixed alert | 2116 | 2082 | 0 | 34 |
+| `30d2b35` | S3: novelty diagnostics `history_certified_after_ts` | 2117 | 2083 | 0 | 34 |
+| `2e79956` | G1 re-gate LOWs (learned status age floor + causes; HANDOFF refs) | 2118 | 2084 | 0 | 34 |
+| `9a306c7` | S3b: seen-set, novelty gate lifted when valid, daemon referent | 2136 | 2102 | 0 | 34 |
+| `d1f96c6` | S3/S3b: novelty horizon measured against the seen-set's certified span (test) | 2137 | 2103 | 0 | 34 |
+
+### 18.2 What landed
+
+**S3.**
+- `src/fact-families.js` (leaf, imports nothing): the closed `FACT_FAMILY_BY_NAME`, `RULE_HORIZONS` (string literals; Q2 horizons: `service.appeared` 48 h, `scheduled_job.appeared` 48 h, `process.lineage.novel_edge` 6 d; the rest per §4.2), `READER_COVERAGE` (miner, shadow, correlation, tuning), `NOVELTY_FAMILIES` (the S3b census shape), and the horizon-short rule id and N. Module-init throws on a duplicate fact_name, an unknown family, a bad horizon, or a novelty family inconsistent with the other tables. `daemon.js` init checks `HISTORY_DEPENDENT_ALERT_RULE_IDS` against `RULE_HORIZONS` in both directions (catches a literal drifting from its constant).
+- `certifiedHorizonOk(read, {nowMs, horizonMs})` in `fact-store-completeness.js`: pure, fail-closed. LOW-2: requires a **valid ledger** (`coverage` is `full` or `narrowed`; `unknown` fails). See deviation 1 for the floor it uses.
+- Per-rule gate in the producers: session (`count_drop` 30 h and `churn` 6 h, independently), peer (spike and drop, 30 h), `service.disappeared` (6 h), canary (`canary_vanished` only, 6 h), the three novelty rules, and correlation. A horizon-short rule emits no candidate and reports no `evaluatedAlertKeys`; the cold-start state machine and the fold run unchanged, so it never re-arms (I5) and resumes on the tick the span recovers. Pinned per detector: persisted lockout stays `false`, `last_folded_ts` advances, the same tick with an older floor evaluates.
+- Non-detector readers: see deviation 3.
+- Daemon: per-rule horizon veto at both `computeCoveredAlerts` passes (deviation 4); `history_horizon_short` on the status record; fixed rule `daemon.fact_history.horizon_short` (deviation 5).
+- Novelty diagnostics carry `history_certified_after_ts` (deviation 7). The sanitizer passes ISO strings and redacts `null`, so the field is omitted rather than null.
+
+**S3b** (`src/novelty-seen-set.js`): per §17, with these concrete rules.
+- **Shape:** `learned/facts/seen-sets/<family>.json` = `{schema_version, family, ledger_generation, ledger_pass_id, certified_since_ts, folded_through_ts, overflow, entries: {key: [first_ts, last_ts]}}`, exact-key validated.
+- **Fold:** by `runFactRetention`, after the ledger finalize, in the same pass as the append, for every novelty family. Complete census ticks only (strict grouping; parity-tested against all three detector groupers, including contradictory, garbled and markerless ticks), `ts <= pass now` only, from candidates above the **prior** pass's floors. Entries expire 30 days past `last_seen`. A fold failure is non-fatal and reported as `seen_set_fold[family].status = "error"`.
+- **Lineage:** the set is *continuous* only if its `ledger_generation` matches the prior and the new ledger and its `ledger_pass_id` equals the prior ledger's `last_committed_pass_id`. Otherwise it is **re-seeded** (deviation 9).
+- **Read:** `readFactPoints({seenSetFamilies})` validates each set against the **same** ledger it just read (generation, committed pass id, no pending pass). Statuses: `valid`, `missing`, `unreadable`, `invalid`, `no_ledger`, `pending_pass`, `lineage_mismatch`, `overflow`. Only `valid` carries entries.
+- **Decision:** novel ⇔ not in the window's prior complete groups **and** not seen-before in the set. The set is folded in the same pass as the append, so the latest tick's own entities are already in it: an entry whose only observation is the latest tick is still novel; any other observation, earlier or later (a future-dated entry surviving a rollback), is a prior sighting. The union only ever suppresses.
+- **Gate lift:** with a valid set the three novelty detectors call `factHistoryTrustworthy` **without** `requireFullCoverage`. Without one (any non-valid status, or an injected read carrying none) the §16 interim gate stays, so under narrowing they re-arm and claim nothing (I14).
+- **Cap:** 20,000 entries per family (§2's host: ~518 services, ~175 lineage edges, ~7 jobs per tick; expected distinct keys over 30 days are hundreds to low thousands; ~2 MB worst file). Overflow writes `{overflow: true, entries: {}}`, which is never valid, and every later pass retries a fresh re-seed. Status reason: `novelty_seen_sets[family].status = "overflow"` on the daemon status record, and the rule shows in `history_horizon_short`.
+- **Invariants pinned by tests:** I13 (the same append sequence under a 10 MiB and a one-tick budget gives identical entries and `certified_since`); I14 (set deleted over a narrowed store → re-arm, no keys, no candidate); the G1 reproduction for all three rules (t0 evicted, returner absent t1-t3, back at t4 → no candidate, **with** `evaluatedAlertKeys` non-empty and no re-arm, plus a control proving the window alone would have called it new); a lost fold write followed by eviction still remembers the entity; partial/garbled/markerless/future ticks are never folded; overflow → not valid → recovery; expiry and scope; day-1 first run → valid, `certified_since: null`.
+- **T1 updated:** at the 5 MB default the three novelty paths now keep evaluating through routine eviction (sets stay `valid` on structural and fast ticks, no anchor re-arms). Before S3b, T1 pinned the S2-interim behavior (re-arm, zero keys).
+
+**G1 re-gate LOWs.**
+- (a) `selectFactStoreCompleteness` no longer strips `age_floor_ts`. The `learned status` text names the actual cause(s): "byte-cap eviction (floor …)" and/or "age retention (floor …)".
+- (b) HANDOFF: Q6 is in scope as S3b; Blocker 2 is `dc117ca`.
+
+### 18.3 Finding: the interim `requireFullCoverage` gate went permanently silent on every host
+
+`coverageFields` reports `narrowed` whenever a byte-cap floor exists at all, or the age floor falls inside the read window. Combined with §16's interim gate:
+- the novelty detectors and correlation read a 31 d window against 30 d retention, so once a store is older than 30 days the age floor is always inside the window and they were silenced for good, on **every** host, with no byte-cap eviction at all;
+- the 3 h shadow soak refused forever after the first byte-cap eviction ever, however old;
+- the miner's unbounded read refused on any age floor, so it never mined after 30 days.
+
+This was never shipped (the branch is unpushed). It is fixed by deviation 3 (readers) and S3b (novelty), and pinned by tests: a store older than 30 days still evaluates novelty; correlation and the miner accept an age-only narrowing; shadow accepts a byte-cap floor older than its window. The interim gate is still the fallback when a set is not valid. In that case a store older than 30 days loses novelty until the next structural pass re-seeds the set and the detector's 6-tick re-establishment completes.
+
+### 18.4 Deviations from the plan text
+
+1. **`certifiedHorizonOk` uses `max(bytecap_floor_ts, age_floor_ts)`**, not the raw byte-cap floor alone. The predicate must never be looser than what `readFactPoints` excludes (both floors since `dc117ca`). In normal operation the age floor sits about 30 days back and never binds. A completeness report with `coverage: "full"` and no floor fields reads as floor-null; a `narrowed` report with no floor fails closed.
+2. **Detector test fixtures** whose hand-built completeness lacked `coverage` now say `coverage: "full"` (a real intact store always reports it). Otherwise the LOW-2 rule makes the horizon fail closed on them.
+3. **Miner, shadow and correlation use `certifiedReadWindowOk`, not the §4.2 horizons.** The plan said: miner = 7 d mining span, shadow = the shadowed constraint's horizon, correlation = 3 d. The task required a replacement for the interim gate that is provably no weaker. The referent, stated: *a store that never byte-evicted, under the same age retention*. The predicate passes exactly when byte-cap eviction is invisible to the reader's own read: no byte-cap floor, or the floor strictly before the window start, or the floor at or below the age floor. The last case is the only way an unbounded read can pass. It is proved on two real stores: whenever it passes, the read returns byte-identical points. Consequences:
+   - The miner's default read is unbounded, so on a byte-evicting store it mines only when the byte-cap floor is at or below the age floor. That is stricter than a 7 d horizon, and pre-S4 it means it never mines on an evicting host (§5 N6 already conceded service-presence mining at default budgets).
+   - Correlation additionally requires its registered 3 d horizon, which can bind on a rolled-back age floor.
+   - An age floor alone never refuses; age retention narrowed every reader on `main` too.
+4. **The daemon per-rule horizon veto landed in S3, not S4.** Computing per-rule eligibility for the I12 signal *is* the veto computation, so it is wired into both `computeCoveredAlerts` passes now as single-read defense in depth. A producer that reports coverage for a horizon-short rule is still frozen (pinned). S4 makes it per family.
+5. **The horizon-short signal is time-based, with N = 24 structural intervals.** `history_horizon_short = {threshold_ms, rules: {rule: {since_ts}}}` is written only when a rule is short over a **valid ledger report**; an untrusted read is a different condition and is reported as such. `since_ts` is carried forward from the previous status record (injectable `readDaemonStatus`). A missing or corrupt prior status, or a future `since_ts`, restarts the clock at now: that can only delay the signal, never raise it early. The fixed rule `daemon.fact_history.horizon_short` (in `FIXED_ALERT_RULE_IDS`) fires in `evaluateAlertRules` once `now - since_ts >= threshold_ms`, from the status record alone, so the CLI's read-only view agrees.
+6. **canary:** the detector gates only `canary_vanished`. `canary.tripped` (positive evidence) and the manifest/store tamper reasons (direct I/O signals) stay ungated. The daemon's horizon veto is rule-level, so `canary.tampered` is vetoed wholesale while canary is horizon-short, mirroring its wholesale `HISTORY_DEPENDENT` inclusion.
+7. **Novelty diagnostics scope:** `history_certified_after_ts` = the valid set's `max(certified_since, now - 30 d)`. Without a valid set it is `certified_after_ts` when narrowed, else the oldest retained point. The field is omitted when no scope is known; it is never null.
+8. **S3b fold source = pre-eviction candidates.** §17 says "complete, certified ticks". The fold uses every candidate above the prior pass's floors *before* this pass's byte-cap eviction, so a tick this pass evicts is still folded. Added memory can only suppress a claim, never create one. It also closes the "tick kept at pass P, fold write lost, evicted at P+1" gap by construction rather than relying on the pass-id check (pinned).
+9. **Re-seed boundary (`certified_since_ts`)** on any loss of continuity (missing, invalid or mismatched set, overflow):
+   - `max(prior byte-cap floor, prior age floor, every loss marker)` when this pass's own continuity observation is ok;
+   - the pass time otherwise (for example a re-bootstrapped ledger);
+   - `null` only on a genuine first run (ENOENT store), or when the lineage never evicted or lost anything, in which case the seed really is complete.
+   Over a narrowed store, memory before the floor is gone; the boundary says so and the novelty horizon is measured from it.
+10. **Novelty horizon referent after S3b:** the valid set's certified span (`noveltyHorizonOk`). `certified_since: null` is eligible, like a never-narrowed store. Without a valid set it is the fact floor, plus the interim full-coverage gate. The daemon uses the **same** predicate (`noveltyRuleEligible`), reading the sets in its own history read, so novelty recovery is not frozen at the 5 MB cap just because the fact floor is under 48 h. Pinned: narrowed store + valid set → a covered `service.appeared` recovers; set lost → frozen and reported.
+11. **Seen-set location** is `learned/facts/seen-sets/<family>.json`. S4 changes only `resolveSeenSetPaths` (and which family ledger the fold and read pair with). **S5/M3 must quarantine or delete legacy seen-set files too:** a generation mismatch already makes them non-valid, but orphaned files under `learned/facts/` break the "iterate the registry, never the filesystem" rule.
+12. **Tuning** reports `fact_history_certified_after_ts` in its mine summary, not per backtest.
+13. **The MEDIUM-1 confirmation fixture** in `daemon.test.js` actually evicted *every* record: its cap was the raw record size, below the normalized size. It now sizes the cap from `normalizeFactPoint` and sits 31 h back so the 30 h horizon is met. The horizon-short case has its own test.
+
+### 18.5 G2 questions
+
+1. **Re-seed boundary (deviation 9).** After a set is lost over a narrowed store and the detector re-establishes, an entity last seen *before* the boundary that returns is claimed new, scoped "not seen since `<boundary>`". The alternative boundary (pass time) only delays eligibility by the horizon; it does not recover the lost memory either. Is a scoped claim acceptable here, or should a re-seeded family stay ineligible for longer, for example until 30 days past the boundary so the set's memory is again the full retention?
+2. **`certifiedReadWindowOk` as the reader policy (deviation 3).** Is "byte-identical to a never-byte-evicted store under the same age retention" the right referent? It is stricter than the plan's 7 d miner horizon, and the miner will not mine on an evicting host until S4 gives service its own budget.
+3. **`canary.tampered` wholesale daemon horizon veto (deviation 6).** It freezes `manifest_unreadable` / `baseline_store_error` recoveries while canary is horizon-short, which at the 4 MiB budget happens only if `cap_below_tick`. Split the veto per reason, or accept?
+4. **Horizon-short signal (deviation 5).** Time-based N × interval, `since_ts` carried in the same-UID-writable status record (can only delay, never raise early). Is that acceptable, or does it need its own ledger-tied state?
+5. **Pre-eviction fold (deviation 8).** It folds ticks the pass then evicts, which were never readable as certified history. That is the safe direction for never-fabricate, but it departs from §17's "certified" wording.
+6. **A pending pass at read makes the set non-valid.** After a crash mid-pass on a narrowed store, the novelty detectors re-arm (6 ticks) rather than trusting a set folded at the previous committed pass. Accept the availability cost?
+7. **Cap and overflow:** 20k entries per family; overflow makes that family's novelty ineligible under narrowing until a re-seed fits. Is the cap right, and should overflow raise its own fixed alert rather than ride on `history_horizon_short`?
+8. **Read cost for T9 (S4).** The daemon and each novelty detector now also parse their seen-set every fast tick: three small files at this host's volume, at most about 2 MB each at the cap. T9 must count them.
+9. **Folding under a continuity break.** A pass whose prefix digest broke (an external edit) still folds that pass's candidates. Injected records can only *suppress* novelty, and that is already within a same-UID attacker's reach. Confirm.
+10. **Trust surface of the set itself.** The set is a new same-UID-writable store that can suppress novelty: forged entries hide a new entity. That is the same `integrity_level` class as everything else in `learned/` (§1 non-goal), but it is a new instance of it. Recorded for G2/G3.
+
+### 18.6 Final state
+
+The final code commit is `d1f96c6`; this addendum and the HANDOFF update follow as a docs-only commit. Full suite on `d1f96c6` (snapshot, fresh scratch `XDG_*`): 2137 tests, 2103 pass, 0 fail, 34 skipped, 0 todo. T1 runtime is about 60 s on this machine both before and after S3b; the seen-set fold and read add roughly 8 %.
+
+**Expected pre-S4 behavior on the current single 5 MB store (Leg D, not a bug).** Once eviction starts (~28 h), the certified span stays near 27 h, below the 30 h horizon of `session.count_drop`, `peer.count_spike` and `peer.count_drop`. So on every real host running this branch, those three rules are permanently horizon-short: `history_horizon_short` lists them, and `daemon.fact_history.horizon_short` fires 24 h later. Novelty is NOT affected, because with a valid seen-set it measures its horizon against the set. S4's per-family budgets (T8) resolve this. Expect it in any S7 soak or status read before S4.
+
+---
+
+## 19. Addendum: S4 and S5 execution (2026-10-05)
+
+**Addendum:** 2026-10-05. S4 (R0a) and S5 (migration) are built on `feat/fact-store-capacity-2026-10`, on top of §18. Nothing is pushed. S6 (CLI consistency) and S7 (soak) are **not** started. Every test and command ran with fresh scratch `XDG_*` directories (`mktemp -d`); `~/.local/state/descartes` was never read or written. Baseline before S4 (`938e2e1`): 2137 tests in §18.6's count plus the S3b review fixes.
+
+### 19.1 Commits and full-suite totals
+
+| commit | step | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `f6cc436` | S4: registry budgets, pinned tick shapes, `familyBudgetFloorBytes` (T8 floor), `resolveFactStoreBudgets`, `requireFactFamily`, `groupFactPointsByFamily`; session/peer/Tailscale hard clamps, `MAX_JOB_LIMIT`; T8 + T12 routing/translator coverage | 2153 | 2119 | 0 | 34 |
+| `bbb9487` | S4: per-family stores, required `family`, routed append + registry sweep, multi-family reads, all 16 readers switched, per-family daemon reads/veto/horizon-short, per-family status block; tests migrated | 2161 | 2127 | 0 | 34 |
+| `5adc7df` | S4: T7 per-family veto matrix (a global-veto mutation fails 13 of 16) | 2177 | 2143 | 0 | 34 |
+| `b06f3b3` | S4: `fact_store_budgets` status, `budget_below_horizon_floor`, `cap_below_tick`, retention-failure status, watch.json `fact_store_budgets` | 2183 | 2149 | 0 | 34 |
+| `9d613a1` | S4: T9 read-cost guard incl. seen-set reads | 2184 | 2150 | 0 | 34 |
+| `031068f` | S5: M2/M3 legacy quarantine (+ daemon wiring) | 2191 | 2157 | 0 | 34 (first run: T4 hit its 120 s timeout under load, 1 fail; rerun on the same tree green) |
+| `02f11e1` | test: T4 timeout 120 s -> 300 s (see deviation 15) | covered by the next run | | | |
+| `06509b5` | S5: Q5 legacy `fact_store_max_bytes` | 2191 | 2157 | 0 | 34 |
+| `430af54` | S5: T10 already-locked-out upgrade | 2192 | 2158 | 0 | 34 |
+| `f65fdf5` | T12 daemon-level per-family append failure | 2193 | 2159 | 0 | 34 |
+| `708e379` | fix: missing `facts.jsonl` under a committed ledger is a continuity break (finding 19.3); absent store never shows `horizon_short_since`; status key set pinned | 2196 | 2162 | 0 | 34 |
+
+### 19.2 What landed
+
+**S4.**
+- **Registry (`fact-families.js`).** Per-family default budgets (the S0-revised 65 MiB), pinned worst-case tick shapes (`entityCap x maxRecordBytes + markerBytes`, §15.3), `FAMILY_HORIZON_MAX_MS`, `familyBudgetFloorBytes` (the T8 invariant, which is also the config floor), `resolveFactStoreBudgets` (rejections reported as `budget_below_horizon_floor` / `invalid`; unknown keys reported, never a family), `requireFactFamily`, `groupFactPointsByFamily` (an unregistered fact_name throws before anything is returned), and reader entries for `active_constraint` and `provenance_warning` (new coverage kind `present_only`). Module init throws if a default budget is below its own invariant.
+- **Clamps (§2).** `tools/sessions.js`, `vpn-peer-status.js`, `tailscale-status.js`: the 200 defaults are now hard upper clamps (`MAX_*`); `tools/scheduled-jobs.js` exports `MAX_JOB_LIMIT`. T8 asserts each pinned entity cap equals the live collector constant, so raising a cap without revisiting the budget fails the suite.
+- **Store.** `learned/facts/<family>/{facts.jsonl,integrity.json,seen-set.json}`. `family` is required on `readFactPoints`/`appendFactPoints`/`enforceFactRetention`/`resolveFactStorePaths`/`resolveFactIntegrityPaths`/`read|writeFactIntegrityLedger`; missing/unknown throws, with no legacy default. `appendFactPoints` refuses an unregistered fact_name or a point of another family before any write. `appendFactPointsByFamily` routes a tick, appends each family with its budget, reports per-family failures without stopping the others, and sweeps retention over every other **existing** registry family store (never the filesystem; a never-created store is not created). `readFactPoints({families})` merges independent per-family reads, with `family_reads`, a combined display completeness, `bytes` and `store_exists`. Only a novelty family's own pass folds (its own) seen-set.
+- **Predicates.** `factHistoryTrustworthy`, `certifiedHorizonOk`, `certifiedReadWindowOk` (and so `ruleEligible`) AND over each family's own read when `family_reads` is present, failing closed on a malformed one. A combined floor never gates (pinned: one family's newer age floor would mask another's byte-cap floor).
+- **Readers (all 16, §15.2).** Detectors on their own family; correlation on `peer`; active-constraint, shadow, miner and tuning on `service`+`network` via the registry; provenance-warning on `provenance`; `learned status` per family (all 8); `baseline.js` per domain.
+- **Daemon.** Per-family structural persist with `watch.json` `fact_store_budgets`; retention sweep on every completed structural tick (even with no points); one history read per family that has a dependent rule of an enabled tier (I9); `historyVetoedRuleIds` per family (unread or untrusted family vetoes its rules) and the per-rule horizon veto on each rule's own family reads, at both `computeCoveredAlerts` passes; horizon-short decided and carried forward per rule; status `fact_store_completeness` (combined + `families`) and `fact_store_budgets` (every registry family).
+- **Tests.** T7 (`fact-store-family-veto.test.js`), T8 and T12 (`fact-families.test.js`, `fact-store.test.js`, `fact-store-status.test.js`), T9 (`fact-store-read-cost.test.js`: ~2.8 s modelled worst case at default budgets, under the 5 s bound). T1 still proves routine eviction never locks out, now per family (deviation 5).
+
+**S5.**
+- **M2** needs no code: new per-family paths start at the missing-ledger bootstrap; nothing is inherited (I8).
+- **M3** (`fact-store-migration.js`): `learned/facts/facts.jsonl`, `integrity.json`, the pre-S4 `seen-sets/`, and stray `facts.jsonl.<pid>.tmp` / `integrity.json.<pid>.tmp` move to `learned/facts-legacy-<iso>/`, beside the facts tree. The marker `learned/facts-legacy.json` records the target **before** anything moves, so a half-done move resumes into the same directory; a legacy file that reappears later (downgrade, then upgrade) gets a new directory. The daemon runs it each tick while a tier is on, never fatally, and reports `fact_store_legacy` (status, moved, deleted, pending with `delete_after_ts`).
+- **Q4.** A quarantine is deleted 31 days after it was taken, only if the marker lists it and its name matches `^facts-legacy-[0-9A-Za-z-]+$`; an unparseable marker deletes nothing.
+- **Q5.** `watch.json`/`learned.json` no longer write the 5 MB default in. The written-in default and invalid values normalize to absent; a deliberate non-default value is preserved and named as deprecated/ignored (`fact_store_deprecations` on the daemon status; a line in `learned status`). The F2-Tier1 pins are rewritten with the reason in place.
+- **T10** (`fact-store-locked-out-upgrade.test.js`): legacy store with an in-window byte-cap marker on a v1 ledger, pre-S4 seen-sets, every watch-tier detector pending on a 20-day-old anchor. Result: quarantined byte-identical and unread; only registry directories under `learned/facts/`; no family ever reads `degraded`; lockout cleared at structural tick 6 (bound 8); session/peer count rules established at tick 29 (bound 32); provenance-warnings still emits `deleted_exe_running`.
+
+### 19.3 Finding: the sweep exposed a deleted-store re-certification (fixed, `708e379`)
+
+`observeFactContinuity` reported a missing `facts.jsonl` as `unknown`. Before S4 that path was only reached together with new points (live count below the committed count, so `broken`). The registry sweep runs retention with **no** new points, so a family file deleted under a ledger that had committed records was rewritten empty and, one pass later, read `intact`, over history that was lost (red test first). The store only ever replaces its file by tmp+rename, so a file gone after a non-empty commit is an external truncation: it now observes `broken` and stamps a continuity break. This touches G1-reviewed integrity code; G2 question 6.
+
+### 19.4 Deviations from the plan text
+
+1. **Status shape.** `fact_store_completeness` stays an object with the combined (worst-status) completeness at the top level, plus `families: {<family>: {..., store: "present"|"absent", bytes, budget_bytes, cap_below_tick?, retention_error?, retention_failing?, horizon_short_since?}}`, rather than a bare per-family map: existing consumers read `.status`.
+2. **A never-created store is left out of the multi-family AND and out of the combined display status.** It holds no history that could hide a counterexample or a prior sighting, and requiring it would silence the miner and shadow on every host with, say, no listening ports. A single-family read of it still reads `unknown`, so the daemon still vetoes that family's rules (T7 pins it). All families absent fails closed. This is a widening relative to §4.3's literal "trust holds only if every family is trusted".
+3. **Clamps over pinning.** Session, VPN-peer and Tailscale limits gained hard clamps equal to their defaults (200); service is pinned to `DEFAULT_SERVICE_CENSUS_CEILING` (1000), with the 5000 hard clamp left an operator choice per Q7.
+4. **Network/provenance config floor = their default budget.** They carry no history-dependent rule, so no H_max exists to derive a T8 floor; an operator value can only raise them.
+5. **T1 forces eviction through a test-only daemon seam, `options.factStoreBudgets`** (status `source: "override"`), because `watch.json` cannot go below the T8 floor and the default budgets would not evict in 40 ticks. The three novelty families are sized to fill after ~27 ticks.
+6. **The daemon's persist DI seam keeps its name `options.appendFactPoints`** but now has the routed `appendFactPointsByFamily` contract.
+7. **`cap_below_tick`, `last_tick_bytes` and the retention-error `since_ts` are carried across fast ticks from the prior status record** (display only; the record is same-UID writable, like `history_horizon_short`).
+8. **`retention_failing`** fires after `HISTORY_HORIZON_SHORT_ALERT_TICKS` (24) structural intervals of failure, or when this tick's read sees the file above budget + one worst-case tick (network/provenance: above budget). Status only; no fixed alert. *(G2 L1, §20.3: as built, the oversize half never ran for network/provenance, which the daemon never history-reads; it now uses a stat of their file.)*
+9. **New status blocks:** `fact_store_budgets`, `fact_store_legacy`, `fact_store_deprecations`. The top-level key set of a clean watch-tier tick is now pinned by a test.
+10. **Seen-set path** is `learned/facts/<family>/seen-set.json` (S4 changed only `resolveSeenSetPaths` plus the per-family fold). A non-novelty family's pass folds nothing.
+11. **Registry reader entries** `active_constraint` and `provenance_warning` (coverage `present_only`), so every non-detector reader takes its families from the registry.
+12. **Migration is tier-gated** (no I/O when both tiers are off, so a fully disabled install keeps the legacy file until a tier is re-enabled). Stray rewrite tmp files are quarantined too.
+13. **An unparseable marker** deletes nothing, but a new quarantine then rewrites the marker, orphaning any older quarantine directory from automatic deletion (disk only, never read).
+14. **Q5 edge:** an operator value of exactly 5 MiB is indistinguishable from the written-in default and is dropped without a notice (the plan's rule). Invalid legacy values are now dropped rather than replaced by the default.
+15. **T4's timeout** is 300 s. It runs in ~15 s alone (the pre-S4 tree took ~28 s, measured back to back), but 90-120 s in the full suite since S4 added store-heavy test files beside it; one run hit 120 s.
+16. **T9 is a cost model**, not a benchmark: it captures the reads a real fast tick makes (watch + learned on, an active constraint present) and costs them at default budgets and full-size seen-sets at §15.4's ~15 ms/MiB. Its reader inventory is pinned. It runs on an empty store, so a future early return on empty points would lower the count silently.
+17. **`learned status`** reads and prints all 8 families (a never-created one as `not observed (no store)`); **`baseline status`** makes one read per domain (5 instead of 1). Both are CLI-only costs. S6's per-rule "would evaluate" rework is not started.
+
+### 19.5 G2 questions (in addition to §18.5, which remain open)
+
+1. **Absent-store exclusion** from the multi-family AND (deviation 2). Accept, or require every family to exist?
+2. **Network/provenance floor = default budget** (deviation 4), or give them an H_max (for example 3 h from the active-constraint freshness and the provenance window)?
+3. **The `options.factStoreBudgets` test seam** ships in `daemon.js`. Keep it, move it behind an env guard, or restructure T1?
+4. **Quarantine marker trust surface.** A forged old `quarantined_ts` deletes a quarantine early; an unparseable marker orphans older quarantines. Bounded to `facts-legacy-*` names and never read, but a new same-UID-writable state file.
+5. **Carried display state** (deviation 7) and `retention_failing` thresholds (deviation 8). Should `retention_failing` raise a fixed alert like `history_horizon_short`?
+6. **The I4 fix (§19.3)** changes G1-reviewed `observeFactContinuity`: a missing file under a committed non-empty ledger is now `broken`. Confirm the semantics, including the crash-with-pending-pass ordering (the check runs before the pending-pass `unknown`).
+7. **Read volume.** With learned on, one fast tick reads service 4x (veto, two detectors, active-constraint) and peer 3x; T9 models ~2.8 s worst case. Accept, or pull tail-read caching forward?
+8. **Combined display status** is over existing stores only; a store that exists but is untrusted still makes it non-intact.
+9. **Q5 exact-5 MiB edge** (deviation 14).
+10. **Clamps** (deviation 3): is a hard 200 cap on sessions and peers acceptable as a collector behavior change (the overflow marker already reports truncation)?
+11. **Per-family sweep under a clock rollback** stamps a future-fact loss in each existing family store whose records are now more than 6 h ahead (same outcome as the single store before; now per family).
+
+### 19.6 Final state
+
+Final code commit `708e379`: **2196 tests, 2162 pass, 0 fail, 34 skipped, 0 todo** (fresh scratch `XDG_*`). S4 and S5 are complete per §7; **next is daybreak G2** (scope §9: per-family `computeCoveredAlerts` veto, family registry, routing, required-`family` reader contract, non-detector reader horizons, plus the S5 quarantine and §19.3), then S6 (CLI consistency) and S7 (soak).
+
+## 20. Addendum: daybreak G2 review rework (2026-10-05)
+
+**Addendum:** 2026-10-05. The daybreak G2 review of §19 returned NEEDS-REWORK: one HIGH, five LOWs, no MEDIUM. Each finding was checked against the code before it was fixed (verify-don't-worship). Every test ran with fresh scratch `XDG_*` directories.
+
+### 20.1 H1: an upgraded install claimed "new" over history it had quarantined (fixed)
+
+**Finding (confirmed).** S5's quarantine moves the legacy single store out of the facts tree, so every family store's first pass then sees no ledger and no `facts.jsonl`. `foldNoveltySeenSets` took that as a genuine first run and seeded `certified_since_ts: null` ("complete since the lineage began"). `noveltyHorizonOk` treats `null` as eligible, which skips the Q2 horizons, and the claim scope became `now - 30 d`. A weekly service, edge or job that was last seen in the quarantined store, and returned after the 6-tick re-arm, would fire `*.appeared` / `novel_edge` "not seen since <30 days ago>". That breaks never-fabricate. Before S5, a v1 legacy ledger re-bootstrapped with a continuity break and was handled correctly.
+
+**Fix.** `legacyFactHistoryEvidence` (`fact-store-migration.js`) is true when the marker `learned/facts-legacy.json` exists (in any state, even unparseable), when any legacy item is still at the facts root (`facts.jsonl`, `integrity.json`, `seen-sets/`, or a stray rewrite tmp file), or when the probe errors. Without the legacy-item check, a quarantine that failed on tick 0 (the daemon reports it and continues) would let the family stores be born `null`, and that value would then be carried forward continuously forever. When a re-seed boundary would be `null` and legacy evidence exists, the fold uses the pass time instead. This covers the first pass, a later re-seed (for example a seen-set lost after the upgrade, whose lineage still began at the upgrade), and the overflow retry. The probe runs only when the boundary is `null` and a re-seed actually uses it, so continuous passes do no extra I/O.
+
+**Consequences, stated.**
+- For 48 h (service, scheduled_job) and 6 d (process lineage) after an upgrade, the novelty rules are horizon-short. They are reported in `history_horizon_short` with `since_ts` = the upgrade tick, and they evaluate nothing.
+- After 24 structural intervals the fixed `daemon.fact_history.horizon_short` alert fires on every upgraded host. It stays raised for the rest of each window: about 1 d for service and scheduled_job, and about 5 d for lineage. This is new operator-visible behaviour (G2 question 1 below).
+- An entity first seen during that window is absorbed into memory without alerting. This is the §4.2 novelty-absorbing window, and it is the honest price of the discarded history.
+- The marker outlives the 31-day quarantine deletion, so any later `null` re-seed on that install also lands at the pass time. That is conservative: it can only delay a claim.
+- A fresh install, with no marker and no legacy item, still seeds `null`. The day-1 test and a new regression guard pin this.
+
+**Tests.** `novelty-seen-set.test.js` covers five kinds of legacy evidence (marker, garbled marker, legacy `facts.jsonl` left after a failed quarantine, `seen-sets/`, stray tmp file). For each it checks that `certified_since_ts` and `scope_ts` equal the first pass, and that the rule is ineligible at +47 h and eligible at +48 h. It also covers a seen-set lost after the upgrade, which re-seeds at the pass time, and the fresh-install guard. **T10** moves its novelty bound to the horizons. Within 8 ticks the lockout clears on all four watch-tier stores and `service.disappeared` evaluates. From tick 1 the three novelty rules are horizon-short with `since_ts` = tick 0, both on `history_horizon_short` and on each family's `horizon_short_since`, and they evaluate nothing. The fixed signal is active by tick 33 and names all three rules. On the final reads, each seen-set is valid, certified from tick 0 and scoped to tick 0; each rule is ineligible 1 ms before its Q2 horizon and eligible at it.
+
+**Not covered (pre-existing, unchanged).** If a whole family store directory is deleted on a host that never had a legacy store, it still re-bootstraps as a genuine first run. No evidence of the lost history survives in that case. The same holds if a same-UID process deletes `learned/facts-legacy.json` (and every legacy item): later `null` re-seeds then get fresh-install semantics. This is the same trust class as §19.5 Q4 and the `integrity_level` caveat; a same-UID process can delete the seen-set or the ledger outright too.
+
+### 20.2 L2: the no-fact-I/O tests only checked the service store (fixed)
+
+**Confirmed.** Seven `daemon.test.js` tests (kill switch off, timed-out structural tick, no `profile.structural`, an active constraint with no fact, a provenance-hang timeout, session and peer with the kill switch off) asserted only that the service store's `facts.jsonl` was absent. A regression that wrote the network, provenance or canary store would have passed. They now call `assertNoFactStoreWritten`, which asserts that `learned/facts/` itself does not exist (ENOENT). All seven pass, so no read path creates the facts tree.
+
+### 20.3 L1: network/provenance `retention_failing` never saw an oversize store (fixed)
+
+**Confirmed.** The oversize check used `familyHistoryReads.get(family).bytes`. `historyFamilies` comes from `RULE_HORIZONS`, which names neither network nor provenance, so for those two families `bytes` was never set and only the 24-interval timer could raise `retention_failing`. Deviation 8's "(network/provenance: above budget)" was untrue as built. For any family without a history read this tick, the status block now sizes the store with `factStoreFileBytes` (`fact-store.js`: one `stat`, no read or parse; `undefined` when the file is absent or cannot be stat'ed). It runs only inside the tier-on block, so a disabled install still does no I/O. Network and provenance have no pinned worst tick, so their threshold is the budget itself. `fact_store_budgets.families.<f>.bytes` is now reported for them too. Test: `fact-store-status.test.js` "G2 L1" grows a network store above its 4 MiB budget between structural ticks; the next fast tick reports `bytes` and `retention_failing`, and an in-budget provenance store and a never-created canary store do not.
+
+### 20.4 L3: the T8 floor assumed a 1 h structural interval (reported, not auto-scaled)
+
+**Confirmed.** `familyBudgetFloorBytes` divided by the constant `BUDGET_STRUCTURAL_INTERVAL_MS` (1 h). `profile.structural.interval_ms` accepts any positive number (`validateDaemonProfile`). At 15 minutes, the default 16 MiB peer store holds about 106 worst-case ticks, about 26 h. That is below the 30 h count-rule horizon and the 72 h correlation horizon, so those rules are permanently horizon-short, and the horizon-short signal was the only sign of it.
+
+**Fix.** `familyBudgetFloorBytes(family, { structuralIntervalMs })` computes the invariant at `min(interval, 1 h)`. Below 1 h the floor scales up (4x at 15 minutes). A slower interval, or a missing or invalid value, keeps the 1 h figure, so the floor never loosens. The daemon's `fact_store_budgets` entry reports `horizon_invariant_unmet: {required_bytes, structural_interval_ms}` when the effective budget is below the floor at the running interval. The family's `fact_store_completeness` entry carries `horizon_invariant_unmet: true`.
+
+**Deliberately not done.** Defaults are not auto-raised and the config floor is not moved:
+- Auto-scaling the defaults to a 15-minute interval would make the default service budget about 4x larger, and T9's read-cost bound is modelled only at the 1 h defaults. Section 4.5's decision rule says to stop and escalate rather than take that cost silently.
+- Raising the config floor to the interval figure would reject an operator's raise that still falls short, and fall back to an even smaller default. That is worse than accepting the raise and reporting it.
+
+The operator restores the invariant by raising `fact_store_budgets`. Tests cover the floor at 15 minutes, 1 h and 2 h and on invalid input (`fact-families.test.js` "G2 L3"), and the status entry at 1 h, at 15 minutes, and after a raise (`fact-store-status.test.js` "G2 L3"). Auto-scaling is left as G2 question 2 (§20.7).
+
+### 20.5 L4: no upper bound on a configured budget (fixed)
+
+**Confirmed.** `resolveFactStoreBudgets` accepted any safe integer at or above the floor. A same-UID `watch.json` with `service: 1e12` left the file, and its four whole-file reads per fast tick, without bound. The oversize check is relative to the budget, so it could never fire either.
+
+**Fix.** `familyBudgetCeilingBytes(family)` is `BUDGET_CEILING_MULTIPLIER` (4) times the family default:
+- service 72 MiB, process_lineage 40 MiB, scheduled_job 20 MiB, peer 64 MiB, and 16 MiB for each of session, canary, network and provenance;
+- a value above the ceiling is clamped to it, keeps `source: "configured"`, and is reported as `clamped: {reason: "budget_above_ceiling", configured_bytes, ceiling_bytes}`;
+- each status entry also carries `ceiling_bytes`.
+
+The value is clamped rather than refused because the operator asked for more, and the ceiling is the closest bounded value. Why 4x:
+- Read cost is bounded at 4x the T9 model. T9 itself still models only the defaults.
+- It is exactly enough to restore the T8 invariant down to a 15-minute structural interval for every family with a horizon (L3), which a test pins.
+
+Tests: `fact-families.test.js` "G2 L4" covers clamping per family, the ceiling being accepted as is, and the coherence with L3. `fact-store-status.test.js` "G2 L4" covers the status entry and an oversize store measured against the clamped budget.
+
+### 20.6 L5: the `options.factStoreBudgets` seam (rejected as a defect; G2 question stays open)
+
+**Not a defect.** The seam is real and does bypass the T8 floor. But `runDaemonIteration`'s only production caller, `runForegroundDaemonLoop`, passes exactly `{ mode: "foreground" }`. Like the roughly 100 other injection keys on `runDaemonIteration` (`readFactPoints`, `appendFactPoints`, `migrateLegacyFactStore`, ...), it is reachable from neither `watch.json`, `learned.json` nor the CLI. Removing it would not close anything: an injected `appendFactPoints` bypasses the floor in exactly the same way. Restructuring T1 or adding an env guard is a test-architecture choice, so §19.5 question 3 stays open for the operator. No new seam was added by this rework; L1's `stat` is called directly.
+
+### 20.7 G2 questions raised by this rework
+
+1. **Post-upgrade horizon-short signal (H1).** Every upgraded host now raises `daemon.fact_history.horizon_short` after 24 structural intervals and holds it for about 1 d (service, scheduled_job) and about 5 d (lineage). Accept it as the honest signal of a discarded history, or suppress the fixed alert for a short-since that equals the upgrade tick? Suppressing would hide a real novelty-absorbing window.
+2. **Auto-scaling budgets to the structural interval (L3).** Keep it report-only (`horizon_invariant_unmet`), or scale the defaults to the interval up to the L4 ceiling, accepting up to 4x read cost?
+3. **Ceiling factor (L4).** Is 4x the default right? It keeps T9's model within 4x and admits a 15-minute interval.
+
+### 20.8 Commits and full-suite totals
+
+Every run used fresh scratch `XDG_*` directories (`mktemp -d`). Baseline before the rework (`1ec2325`): 2196 tests, 2162 pass, 0 fail, 34 skipped.
+
+| commit | finding | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `ae282c8` | H1 | 2203 | 2169 | 0 | 34 |
+| `d8fd52d` | L2 | 2203 | 2169 | 0 | 34 |
+| `cb654c0` | L1 | 2204 | 2170 | 0 | 34 |
+| `d5f38de` | L3 | 2206 | 2172 | 0 | 34 |
+| `fe91927` | L4 + §20.5-§20.8 | 2208 | 2174 | 0 | 34 |
+
+Final state: **2208 tests, 2174 pass, 0 fail, 34 skipped.** Next: the daybreak G2 re-gate, with §18.5, §19.5 (Q3 still open) and §20.7.
+
+## 21. Addendum: daybreak G2 rework (2026-10-05)
+
+**Addendum:** 2026-10-05. The daybreak-blue G2 re-gate reproduced two HIGH findings and the §20.7 interval finding. All three were fixed test-first on the current branch, with one atomic commit per finding. The full-suite sandbox-only loopback/live-host failures are recorded separately from product failures.
+
+### 21.1 HIGH-1: later legacy quarantine revokes continuous novelty certification (fixed, `fb63477`)
+
+The legacy migration marker now carries a monotonic `quarantine_epoch` and its quarantine timestamp. Each seen-set records the epoch and timestamp under which its certification was established. Every fold compares the current marker/evidence with that set: a later quarantine advances `certified_since_ts` to the quarantine time even when the ledger lineage remains continuous. An unreadable or forged marker is handled conservatively by advancing to the current pass once, rather than preserving a null boundary. Epoch and timestamp state survive quarantine deletion/resume.
+
+The regression reproduces daybreak's continuous-null set followed by a legacy store containing `svc-B`: the store is quarantined, the set is no longer null, its scope starts at the quarantine boundary, and `svc-B` is not claimed new before the configured horizon. Fresh installs without legacy evidence retain the null certification.
+
+### 21.2 HIGH-2: carried retention failures remain fixed-alert-active (fixed, `1c0f5d6`)
+
+`daemon.fact_store.retention_failing` is now a fixed alert with one fingerprint per family. It is evaluated from the persisted per-family retention error/failing state on both structural and fast ticks. A carried failure keeps daemon health in `error` and the fixed alert active; only a structural tick whose retention pass genuinely succeeds for that family clears the carried state and recovers the alert. The regression covers structural failure, the next fast tick, and structural recovery.
+
+### 21.3 MEDIUM: interval-scaled budgets and the safe minimum (fixed)
+
+Default horizon-bearing family budgets now scale to the configured structural interval when their existing default is insufficient, bounded by the fixed 4x ceiling. The derived minimum supported interval is `833276 ms` (about 13.9 minutes); daemon profile validation rejects a smaller `structural.interval_ms` with a clear budget-ceiling error. A 15-minute interval is accepted and satisfies every family floor. Tests cover default scaling, the ceiling, validation rejection, daemon cadence, and the resulting absence of the prior permanent horizon-short status.
+
+### 21.4 Verification disposition
+
+The targeted G2 regression suite is green after the three fixes (197 pass, 0 fail). Full `npm test` used fresh `XDG_*` directories on every run. The managed sandbox does not permit the loopback listeners used by notifier/tap tests and does not expose the live-host provenance facts; those are environment failures, not product failures.
+
+| commit | disposition | tests | pass | product fail | sandbox fail | skipped |
+|---|---|---:|---:|---:|---:|---:|
+| `fb63477` | HIGH-1 fixed; sandbox-only failures | 2208 | 2152 | 0 | 22 | 34 |
+| `1c0f5d6` | HIGH-2 fixed; sandbox-only failures | 2209 | 2153 | 0 | 22 | 34 |
+| final G2 medium commit | MEDIUM fixed; sandbox-only failures | 2210 | 2154 | 0 | 22 | 34 |
+
+The final 22 sandbox failures were 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live provenance checks (`unknown` where the host-only test expects `ok`). No G2 regression or other product test failed.
+
+### 21.5 Follow-up G2 re-gate findings (2026-10-05)
+
+The follow-up daybreak-blue re-gate reproduced two gaps in the earlier §21 fixes. The earlier future-timestamp medium remains fixed; the two new gaps were repaired test-first in separate atomic commits, with no push or merge.
+
+1. **HIGH-1 — resumed quarantine with newly discovered root data.** A resumed pass that moves at least one root item advances `quarantine_epoch` and `quarantine_epoch_ts` to that resume pass. The marker records each destination item's move timestamp, and directory deletion waits 31 days from the newest item move (old markers without per-item metadata are extended conservatively at observation). The in-progress quarantine at 2 h, `svc-C` at 60 h, resume at 60 h, and no-claim at 67 h reproduction is green; the >31-day resume retains the newly moved item until its own deadline.
+2. **MEDIUM — unresolved retention alert reassertion.** An active or acknowledged `daemon.fact_store.retention_failing` alert with no successful structural-pass evidence is frozen in the persisted alert store. It is not synthesized as a candidate, so `last_seen`, `last_notified`, cooldown, and notification eligibility do not refresh. The existing HIGH-2 recovery gate remains: only a successful family retention pass authorizes recovery. The tiers-disabled hourly reproduction and the unreadable-status guard are green.
+3. **Prior MEDIUM — future quarantine timestamps (still fixed).** A future marker is advanced and stamped at the clock-correction pass. Any seen-set boundary derived from a future epoch is clamped to that pass, so the registered novelty horizon starts at the correction rather than the future date. The 2099→2026 reproduction remains green.
+
+### 21.6 Follow-up implementation and verification
+
+The resumed-quarantine fix is `a5e87ce` (`fix: reset resumed quarantine epoch and retention`). The retention-alert freeze is committed separately after the fresh-XDG regression run, with the required Claude trailer. No authenticated Git command, push, or merge was performed.
+
+Each full suite uses fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` directories created with `mktemp -d`.
+
+| commit | disposition | tests | pass | product fail | sandbox fail | skipped |
+|---|---|---:|---:|---:|---:|---:|
+| `a5e87ce` | HIGH-1 fixed; sandbox-only failures | 2216 | 2160 | 0 | 22 | 34 |
+| `55c0103` | MEDIUM fixed; sandbox-only failures | 2216 | 2160 | 0 | 22 | 34 |
+
+The sandbox failures are environment-only: 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. The focused migration, seen-set, and fact-store-status files are green, including the earlier HIGH-2 successful-pass recovery test.
+
+### 21.7 Final HIGH-1 correction: every resume is a new discard episode (2026-10-05)
+
+The resume path now advances `quarantine_epoch` and stamps `quarantine_epoch_ts` at the resume pass even when the legacy root is empty. An in-progress marker without complete per-item metadata is therefore treated as unproven. The crash-after-rename reproduction (quarantine at 2 h, `svc-C` moved at 60 h, resume with empty root, detector check at 67 h) is green: the epoch advances to 60 h and `svc-C` is not claimed new.
+
+Fresh-XDG full-suite verification after this correction: **2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped**. The 22 environment failures are 17 notifier-reuse loopback-bind tests, 3 tap-bump loopback-bind tests, and 2 live-host provenance tests (`unknown` instead of `ok`).
+
+## 22. Addendum: S6 execution (2026-10-05)
+
+**Addendum:** 2026-10-05. S6 (CLI consistency, §7) and T11 (§8) are built on `feat/fact-store-capacity-2026-10`, on top of §21. Nothing is pushed. S7 (soak) is not started. Every test and command ran with fresh scratch `XDG_*` directories (`mktemp -d`); `~/.local/state/descartes` was never read or written, and the running daemon was not touched.
+
+### 22.1 Commits and full-suite totals
+
+| commit | step | tests | pass | fail | skipped |
+|---|---|---:|---:|---:|---:|
+| `48991a9` | S6 groundwork: per-rule `ruleEvaluations` from each watch-tier producer (`buildRuleEvaluation`) | 2221 | 2187 | 0 | 34 |
+| `5aa6276` | S6: `baseline status`/`inspect` per rule, family history block, status reasons; T11; Leg E regression | 2232 | 2198 | 0 | 34 |
+| `bfa8d1c` | review L1: peer progress uses the peer lockout's own disposition | 2232 | 2198 | 0 | 34 |
+| `08cb2c0` | review H1 + M1: `latest_census_stale` reason on every rule; T11 independent oracles + new scenarios | 2234 | 2200 | 0 | 34 |
+| `3f44c81` | review M2: horizon-short since only on a live horizon-short gate | 2234 | 2200 | 0 | 34 |
+| `4aa7560` | review M3: recorded interval only within the daemon's bounds; `structural_interval_source` | 2235 | 2201 | 0 | 34 |
+| `370a979` | review L2, L3, L5: mixed domain phase, dead field, no learning reason on a never-created store | 2236 | 2202 | 0 | 34 |
+| `d705987` | review L4: legacy store pending quarantine reported | 2237 | 2203 | 0 | 34 |
+| `7a3d373` | review nit: Leg E fails on its assertion against the pre-S6 `baseline.js` | 2237 | 2203 | 0 | 34 |
+| `4fc0384` | T11 stale-census expectations and daemon active-alert freeze regression (H1 red tests) | 2238 | 2180 | 24 | 34 |
+| `d10243f` | detector freshness gate for session/peer rules; daemon and CLI wiring | 2238 | 2182 | 22 | 34 |
+
+The `bfa8d1c` total equals `5aa6276`'s although that commit adds one test; both are as reported by `node --test` in their runs (not investigated further).
+The `4fc0384` run had two expected product failures (the new stale-census assertions) plus 22 managed-sandbox failures; after `d10243f`, all 22 remaining failures were environment-only: 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.
+
+The 22 managed-sandbox failures recorded in §21 (loopback binds, live-host provenance) did not reproduce in this environment; both runs were 0 fail.
+
+### 22.2 What landed
+
+- **Detectors (`48991a9`).** The six watch-tier producers (service, service-appearance, process-lineage, scheduled-job, session, peer) return an additive `ruleEvaluations: {<rule_id>: {evaluable, gate, history_reason?, evaluatedAlertKeys}}`, built by `buildRuleEvaluation` (`fact-store-completeness.js`) from the values each producer already computes, in its own order: `history_untrusted` (factHistoryTrustworthy), `cold_start_pending` (the persistent lockout), `history_horizon_short` (`ruleHorizonOk` / `noveltyHorizonOk`), then the producer's own readiness gate (`insufficient_complete_history`, `latest_census_stale`, `baseline_warming_up`, `drop_history_not_ready`, `no_complete_census`), else `ok`. The per-rule keys are the producer's own `evaluatedAlertKeys`. The readiness halves of the census predicates are factored out unchanged, so a ready window with zero entities reports as evaluating. No detection, lockout or coverage change: `safeCandidates` reads only `candidates`/`evaluatedAlertKeys`, and the watch-disabled shape is unchanged (pinned).
+- **`baseline status` (`5aa6276`).** For each of the five domains, status runs that domain's producers **read-only** on the same state the daemon's next fast tick sees: the same family reads, the persisted detector stores, one shared `now`, the loaded `watch.json`, and the daemon's own options (`activeFreshnessMs = ACTIVE_FRESHNESS_MULTIPLE x` the structural interval, passed only to the four census producers, as `runDaemonIteration` does). Every write seam is a no-op. Each rule's `phase` comes from its producer's `ruleEvaluations`: `watching`, `still learning — n of 6`, `cannot establish — history untrusted (<reason>)`, `history horizon below minimum (since <ts>)`, the readiness phases, or `not observed (no store)` when the family store was never created (`store_exists === false`). The domain phase is the common rule phase, or `partially watching — k of n rules`. A disabled watch tier reports `disabled` with no fact I/O (the old status read all five families first).
+- **Family history block** (`families.<family>`): `store`, `status`, `coverage`, `certified_after_ts`, `bytecap_floor_ts`, `oldest_certified_ts`, `certified_horizon_ms` (now − max(byte-cap floor, age floor); `null` when never narrowed), the budget (`budget_bytes`, `budget_source`, `floor_bytes`, `budget_rejected`), and for the three novelty families the seen-set's `status`/`certified_since_ts`/`scope_ts`.
+- **Reasons** (per rule, annotations only; they never change a phase): `not_observed_no_store`; `history_horizon_short` (the live gate; since the review (M2) the daemon record's since clock is shown only while that gate holds); `latest_census_stale` (review H1: no complete census within `activeFreshnessMs`, on every rule); `legacy_store_pending_migration` (review L4); `cap_below_tick`, `retention_failing`, `horizon_invariant_unmet` (from `fact_store_budgets.families.<f>` on the daemon's last status record); `budget_below_horizon_floor` (computed live by `resolveFactStoreBudgets` over `watch.json`). `daemon_record` carries the record's `status` (present/absent/unreadable), `ts`, the structural interval used, and `fact_store_legacy` / `fact_store_deprecations`. An absent or unreadable record contributes nothing.
+- **T11** (`test/baseline-status-consistency.test.js`). At each checkpoint, status runs first, then a real daemon fast tick at the same instant (structural forced not-due) with every watch-tier producer observed. Per rule: `watching ⇔` the daemon's producer evaluates; `phase === "watching" ⇔` it evaluates; evaluated keys are set-equal; and `watching ⇒` `factHistoryTrustworthy(read, {anchorTs}).trust ∧ ruleEligible(read, rule, now)` on a fresh read (the shared predicate the daemon's veto uses) and the lockout is clear. Scenarios over the seeded real-volume generator: fresh install (no store); no peer/session collectors (those stores never created while the others watch); clean accumulation through count-rule establishment at ~31 ticks, then a stale census; a 2 h structural interval (freshness parity); forced budgets sized from a probe tick (service narrowed with a valid seen-set and novelty still evaluating; session/peer horizon-short); a corrupt line (history untrusted); the S5 post-upgrade fixture (novelty horizon-short since the upgrade tick, measured against the seen-set). The test asserts the gate matrix was actually exercised per rule, and that `session.churn` watches with zero keys (the generator's session census is empty, I11).
+- **Leg E regression** (same file): after 10 clean ticks the session lockout has cleared but `session.count_drop` is still warming up; the domain must not read `watching`. **Red on the previous `baseline.js`** (it returned `watching`), green now. As first committed, the file imported `BASELINE_STATUS_RULE_IDS` by name, which the old `baseline.js` does not export, so the committed file failed at import there; since `7a3d373` it uses a namespace import, and with `32fc5d7`'s `baseline.js` swapped in the Leg E test fails on its assertion (actual `watching`).
+- **Mutation checks** (run by hand, not committed): status ignoring the recorded interval (freshness parity) fails the 2 h scenario; enabling the producers' real store writes fails the read-only check (a deleted detector store is a state where the producer would write); treating every store as present fails the fresh-install and no-peer scenarios.
+- `baseline.test.js`: the fresh-install expectation is now `not observed (no store)` (reason in place); a disabled-tier test pins no fact read. README's baseline lines describe the per-rule status.
+
+### 22.3 Deviations from the plan text
+
+1. **The shared predicate is the detector's own, not a re-implementation.** §7 S6 says status "derives phase per rule from the shared would-evaluate predicate (pending ∧ trust ∧ horizon ∧ fresh complete latest group)". The cold-start lockout exists as six reviewed copies inside the producers and cannot be called without them, so status runs the producers read-only and reads their per-rule report. `ruleEligible` / `noveltyRuleEligible` are the daemon-side oracle T11 checks against, not a second status computation.
+2. **"Fresh complete latest group" (I11) now applies to all eight watch-tier rules.** The census rules and the session/peer count/churn rules all require a complete census within `activeFreshnessMs`. A stale latest census produces no candidates and no `evaluatedAlertKeys`, so active alerts freeze rather than recover from dead data. Status attaches `latest_census_stale` to every rule and T11 asserts `cannot evaluate — latest complete census is stale` for all 8 rules at 4 h and 240 h. The daemon passes the resolved structural interval to all census-dependent producers; `evaluateSessionChurn` takes the evaluation clock explicitly.
+3. **Scope: the eight watch-tier rules** of the five baseline domains. `canary.tampered` and `correlation.login_kill_proximity` are learned-tier (`descartes learned status`), and correlation's coverage is deliberately empty (§16 era deferral).
+4. **A fresh install reads `not observed (no store)`**, not `still learning — 0 of 6` (§4.4/I11). The cold-start reason (`initial_baseline`) is still reported.
+5. **Re-established but not yet cleared.** A persisted-pending detector whose re-accumulation has reached 6 reads `still learning — 6 of 6` until the daemon's next tick persists the clear, because the producer itself does not evaluate on that tick ("a tick cannot self-heal and alert in the same breath").
+6. **History untrusted is its own phase** (`cannot establish — history untrusted (<reason>)`); the old status called it "still learning".
+7. **The old `cannot establish — census incomplete` domain phase is gone.** It keyed on the latest group being incomplete, which no detector gates on (they use the latest *complete* census). It survives as a `latest_census_incomplete: true` domain flag.
+8. **The structural interval comes from the daemon's last status record** (`profile.structural.interval_ms`, default 1 h): the CLI has no profile of its own. **It is not display-only** (S6 review M3): it sets `activeFreshnessMs`, which decides `latest_census_stale` vs `watching` for every census-dependent rule, as well as the floors shown. Since `4aa7560` a recorded value is accepted only within `validateDaemonProfile`'s bounds (finite, >= `MIN_STRUCTURAL_INTERVAL_MS` = 833 276 ms; the daemon has no upper bound, so neither does status), else the default is used, and `daemon_record.structural_interval_source` names the source (`daemon_record`, `default_no_record`, `default_no_recorded_interval`, `default_recorded_interval_invalid`). Residual: a same-UID forged in-bounds value (e.g. `1e12`) makes status say `watching` where the daemon reads stale, and a missing record on a non-default profile makes status fall back to 1 h; the text output flags any default.
+9. **CLI cost:** six producer runs per status call (the service store is read twice). CLI only; the daemon is unchanged.
+
+### 22.4 G3 questions
+
+1. **Running the producers from the CLI** (read-only, every write seam a no-op, pinned by a snapshot test). Accept, or extract the six lockout copies into one shared pure function first (larger edit to G1/G2-reviewed detectors)?
+2. **Daemon-record inputs** come from a same-UID-writable file, like every other status surface. `cap_below_tick`, `retention_failing` and the horizon-short since clock are display-only; the recorded structural interval is **not** (it sets the census rules' freshness, §22.3 item 8), and is bounds-checked like the daemon's profile. Accept?
+3. **"Would evaluate" vs "would recover".** Status reports what the detector evaluates. The daemon's independent per-family veto (no-anchor trust, `ruleEligible`) can still freeze a recovery the detector reported; T11 shows `watching ⇒ ruleEligible` on every scenario, but status does not separately show the daemon's veto. Add it?
+4. **Canary and correlation** stay out of `baseline status` (learned tier). Add a learned-tier per-rule view to `learned status`?
+5. **(Closed 2026-10-06, S6 review H1.)** The four session/peer rules now have the same detector-side freshness gate. A dead collector stops evaluation and coverage; the daemon freezes, rather than recovers, alerts on a stale census. T11 and the daemon-level active-alert regression cover this behavior.
+
+### 22.5 Final state
+
+Final code commit `d10243f`: **2238 tests, 2182 pass, 22 managed-sandbox failures, 34 skipped, 0 todo** (fresh scratch `XDG_*`; no product failures). S6 H1 is closed. **Next:** S8/G3, with the 22 environment failures listed above.
+
+### 22.6 S6 review rework (2026-10-05)
+
+The S6 review (NEEDS-REWORK) was reworked on the same branch; every test ran with fresh scratch `XDG_*`. Commits and totals are in §22.1.
+
+- **H1 (reworked and closed, `08cb2c0`, `4fc0384`, `d10243f`):** the review first added status disclosure and red T11/daemon regressions, then added the detector-side freshness gate. `evaluateSessionChurn` now takes `now`; all four session/peer rules stop at a stale latest complete census, emit no candidates, and report no recovery coverage. T11 asserts the stale gate at 4 h and 240 h, and the daemon regression keeps an active session count-drop alert active.
+- **M1 (fixed, `08cb2c0`):** T11 adds oracles that do not compare the detector with itself: converse per-gate checks (`history_untrusted ⇒` trust false, `cold_start_pending ⇒` persisted lockout or lost store, `history_horizon_short ⇒ ruleEligible` false), freshness from the test's own record of the newest complete census it wrote (watching census rules are fresh; the stale gate fires only when stale; the reason appears exactly when stale), and the per-rule keys partition each producer's top-level `evaluatedAlertKeys` at every checkpoint (a hand mutation dropping peer spike keys from the top level fails it at `clean h30`). New scenarios reach `history_horizon_short` for `service.disappeared` and `session.churn` (budgets shrunk to ~4 ticks after the lockouts clear), and a partial-census tail (`latest_census_incomplete`, `insufficient_complete_history`, `no_complete_census`). **Still not reached:** `peer.count_drop`'s `drop_history_not_ready` (it needs lockout-complete but marker-incomplete peer ticks after a re-armed anchor over an established drop baseline); no unit test reaches it either.
+- **M2 (fixed, `3f44c81`):** the record's since clock is attached only when the live gate is `history_horizon_short`; the "status reasons" test now asserts a watching rule carries neither the reason nor the since time.
+- **M3 (fixed, `4aa7560`):** bounds and source as in §22.3 item 8. The review cited "Deviation 6"; the display-only wording it meant was §22.4 question 2 and the interval text §22.3 item 8, both corrected.
+- **L1 (fixed, `bfa8d1c`):** status's peer and session completeness now call the detectors' own (newly exported, unchanged) `tickGroupDisposition`, so an invalid-signature peer tick counts toward "n of 6" as it does toward the lockout; a test drives "6 of 6" and then a real daemon tick clearing the lockout.
+- **L2 (fixed, `370a979`):** no watching rule and differing phases read `not watching — <phase>; <phase>`.
+- **L3 (fixed, `370a979`):** `DOMAIN_DEFINITIONS[].required` and three unused imports removed.
+- **L4 (fixed, `d705987`):** `legacy_fact_store: {status: pending_migration, items}` and a `legacy_store_pending_migration` reason while legacy items sit at the facts root (read-only `legacyFactStorePendingItems`: lstat/readdir only; false once quarantined, unlike `legacyFactHistoryEvidence`). Phases unchanged.
+- **L5 (fixed, `370a979`):** the text output shows the cold-start reason only when a rule in the domain is cold-start pending; JSON keeps `cold_start_reason`.
+- **L6 (rejected):** on every path the daemon or status uses, `dropEvaluated` is false only while the baseline is not established. Neither passes `minSampleCount`, so established means >= 30 complete groups; `last_observation` is then always set, `computeZScore` returns a finite number (0 for a non-positive effective stddev), and `mean_before` starts at 0. The other terms are reachable only with a caller-supplied `minSampleCount <= 0`, so `baseline_warming_up` is exact here. Left unchanged rather than editing a reviewed detector for an unreachable branch.
+- **Nit (fixed, `7a3d373`):** see the Leg E bullet in §22.2.
+
+## 23. Addendum: S7 real-host soak (2026-10-06)
+
+**Addendum:** 2026-10-06. S7 ran on `fb77b5d` (no code change). It answers the S7 bullet in §7 with numbers.
+
+**What was run, and why it is neither of the named variants.** The CLI's foreground loop always uses `defaultDaemonProfile()`: a 1 h structural interval, and `--interval` only sets the fast-tick sleep. So 36 structural ticks through the CLI would take 36 h of wall clock. No `test:soak` script or slow T2 test exists either. A scratch driver (not committed) called `runDaemonIteration` from this branch with the following setup:
+- The real fast and structural collectors (no collector injection).
+- The default profile, which means a 1 h structural interval and every family at its default budget.
+- Notifications neutralised three ways: `notifications.json` and `alert-intelligence.json` both `{enabled:false}`, `adjudicateAlerts: false`, and a `deliverNotification` recorder that never sends.
+- An injected `ts`/`now` that advances one simulated hour per structural tick, with 2 fast ticks between structural ticks.
+
+The state came from a `cp -R` copy of `~/.local/state/descartes` and the config directory (without `auth.json`) under `mktemp -d`. All four `XDG_*` variables pointed at the scratch root; `HOME` stayed real so the collectors see the host. Two independent full runs of **264 structural ticks (11 simulated days) + 528 fast ticks** each took about 30 min of wall clock. A third, short run with `learned.json` enabled measured the learned-on read cost. The accelerated clock is the one deviation from a true soak: the collectors see about 7 s of real host activity per simulated hour (see the last bullet).
+
+**Isolation.** These checks held in every run:
+- An fs tripwire on every `fs`/`fs/promises` entry point for the real state and config paths fired 0 times.
+- `lsof` on the driver showed 0 open real-path files.
+- In the real tree, only the installed 0.0.47 launchd daemon's own write set changed (`alerts/alerts.json`, `daemon/stdout.log`, `history/daemon-status.json`, `history/metrics.jsonl`). The installed daemon has no `fact-families.js`.
+- Nothing under the real `learned/` changed: same mtimes and inodes, no `facts-legacy-*`, no per-family directories. `auth.json` was untouched.
+- The launchd daemon was not touched.
+
+**Results (run 1 / run 2, which agree).**
+- **Legacy store.** It was quarantined on tick 1 into `learned/facts-legacy-<iso>/`: `facts.jsonl` (185 KB, 722 records) and `integrity.json`, with `delete_after` set to +31 d. The quarantined files were never read again (0 reads in 792 iterations; only the marker `facts-legacy.json` is read). Seven per-family stores were created. All 792 iterations ended in state `ok`, with 0 storage or retention errors.
+- **Budgets respected.** No family went over its budget, and no family raised `cap_below_tick`, `retention_failing`, `rejected`, `clamped` or `horizon_invariant_unmet`. Peak sizes against budget:
+
+  | Family | Peak / budget | Notes |
+  |---|---|---|
+  | service | 18,833,529 / 18,874,368 B | ~132 KB per tick |
+  | process_lineage | 10,463,108 / 10,485,760 B | ~43 KB per tick |
+  | peer | 0.66 / 16 MiB | |
+  | scheduled_job | 0.69 / 5 MiB | |
+  | provenance | 0.77 / 4 MiB | |
+  | network | 0.51 / 4 MiB | |
+  | session | 0.07 / 4 MiB | |
+
+- **Service evicts every tick once full, and keeps evaluating.** Byte-cap eviction ran on every structural tick from tick 144 to tick 264 (121 of 121 ticks). Lineage did the same from tick 246 (run 1) or 245 (run 2) onward. Through eviction, `baseline status` kept service at `watching` (517 keys evaluated). The family stayed `intact`, coverage `narrowed`, with a certified horizon of 144 h, above the 48 h horizon; lineage's was 245 h, above 6 d.
+- **Watch domains reach "watching".** `baseline status` was checked every 6 ticks through `runBaseline`, and the real CLI was run once at the end under a `Date`-offset preload because the state is dated in the future. The progression:
+  - Tick 1: `history_unknown`, because each new ledger is `unknown` for its first pass.
+  - Tick 2: every family `intact`.
+  - By tick 6: `service.disappeared` and `session.churn` were watching.
+  - By tick 30: `session.count_drop`, `peer.count_spike` and `peer.count_drop` were watching.
+  - By tick 54: `service.appeared` and `scheduled_job.appeared` were watching. Their horizon-short state cleared at tick 49.
+  - By tick 150: `process.lineage.novel_edge` was watching. Its horizon-short state cleared at tick 145.
+  - Final state: all five domains `watching`.
+  - Run 1 only: peer re-warmed for ticks 234-239 after a real `tailscale` probe came back `unable`, which changed the availability signature. That is by design.
+- **`horizon_short` raised, then cleared.** `history_horizon_short` listed the three novelty rules from tick 1 and only lineage from tick 49, and was empty from tick 145. The fixed `daemon.fact_history.horizon_short` alert went active at tick 25 (24 h, "3 rules"), changed to "1 rule" at tick 49, and recovered at tick 145. All of this matches §20.1.
+- **Read cost, against T9's 5 s bound.** Learned off (this host's config), at full stores, one fast tick read 35 files and 76.7 MiB: service ×3, lineage ×2, scheduled_job/session/peer ×2. Measured costs:
+  - readFile I/O alone: p50 24 ms, max 121 ms.
+  - Whole fast tick, including the real collectors: p50 1.1 s, p95 1.4-2.0 s. The maximum was 5.5 s at tick 66, which read only 31 MiB, so that was collector or host contention, not read cost.
+  - A direct read+parse benchmark of that reader set on the final stores: 1.1-1.2 s warm and 2.2 s cold. Service costs ~270 ms per 18 MiB read, matching §15.4's ~15 ms/MiB.
+  - Learned on: 42 reads and 78.1 MiB (peer ×3), with fast ticks of 1.3-1.7 s (one at 3.6 s).
+  - Learned-on structural ticks took 28 s on the first pass (constraint mining over full stores), then 7-12 s. That is not fast-tick cost, but it is new information.
+- **Every alert raised, with its rule_id and why.**
+  - `daemon.fact_history.horizon_short`: the expected upgrade alert above. It re-notifies at every cooldown expiry while active (15 min; every iteration under this clock): 360 recorder calls with `notify:true` over ticks 25-144, none sent. At a real 1 min cadence that would be about 480 notifications over about 5 days on an upgraded host with notifications enabled. The cooldown behaviour is pre-existing; the length of this alert's active window is new (G2 question 1, for G3).
+  - `process.lineage.novel_edge`: 25 alerts in run 1 and 7 in run 2, all from tick 145 on (none while horizon-short). Each recovered on the next structural tick. For every one, the edge's first sighting in both the seen-set (certified since tick 1) and the store equals the alert tick, and no fingerprint repeats. So these are genuine first-seen spawn edges from real concurrent host activity, which the accelerated clock compresses. None of them is an evicted edge flagged again: 2 alerts in run 1 fired after lineage eviction began, and both were genuinely new.
+  - `peer.count_spike`: run 1, tick 248. A real fourth tailscale peer came online (mean 4.2, sd 0.44).
+  - `system.memory.sustained_high`: carried active in the copied state from the live host. It recovered on the first fast tick and re-raised only in the 4-fast-per-hour learned run. This is a sampling artifact of the accelerated clock (20-minute sample spacing), unrelated to this slice.
+  - Nothing else: no `service.*`, `scheduled_job.appeared`, `session.*` or `peer.count_drop` alert.
+- **Minor observations (not blockers).**
+  - On tick 1 only, status shows `cold_start_reason: corrupt_facts` for every domain. `coldStartEntryReason` returns that label whenever there is no store loss, and the persisted label stays `initial_baseline`.
+  - After quarantine, the text status prints `legacy fact store: none` while a quarantine directory remains pending deletion for 31 days.
+
+**Verdict:** S7 passes. The only open items are the G3 operator-noise question on the `horizon_short` notification cadence and the two cosmetic labels above.
+
+## 24. Addendum: G3 quarantine-epoch read closure (2026-10-06)
+
+**Reason for addendum:** daybreak-blue found that migration advances the quarantine epoch on every
+daemon iteration, including a non-structural fast tick, while the seen-set epoch was checked only
+when the next structural retention pass folded it. A stale set could therefore authorize a novelty
+claim and recovery coverage between those two events.
+
+**Closure:** `readNoveltySeenSet` now compares the set's recorded epoch with the current migration
+marker on every read. An epoch mismatch, unreadable marker, pending root migration, or future marker
+marks the set invalid for novelty. The shared novelty eligibility predicate then reports
+`history_horizon_short`, returns no candidates and no recovery coverage, and the daemon veto freezes
+recovery until a later fold re-certifies the set. Ordinary missing sets retain their existing
+full-coverage fallback. The regression covers service appearance, scheduled-job appearance, and
+process-lineage novelty after migration with no intervening append, plus the daemon veto. Focused
+seen-set verification: 36 tests, 36 pass.
+
+### 24.1 G3 confirmation rework (2026-10-06)
+
+Daybreak-blue reproduced the remaining fall-through by combining a lost-fold `lineage_mismatch`
+with a migration performed on a fast tick. The prior read-side check was below the non-valid
+seen-set returns, and the shared predicate recognized only migration-specific statuses; the full
+store could therefore authorize novelty and recovery. The rework moves migration evaluation before
+all seen-set status returns. When no usable set exists, the read compares the current quarantine
+episode with the family read's certified start and fails closed if the episode is newer or its
+marker is unreadable/pending/future. This preserves the ordinary full-store fallback only when the
+store is demonstrably from after the last quarantine.
+
+The shared `noveltyRuleEligible` predicate remains the producer/status/daemon gate. The TDD
+regression covers all three novelty families at candidate, `ruleEvaluations`, and daemon recovery
+levels, and a table-driven read test covers every ordinary non-valid seen-set status. Focused
+verification is 282/282. The fresh-XDG full suite is 2240 total, 2184 pass, 22 managed-sandbox
+environment failures, 34 skipped, 0 todo, with 0 product failures.
+
+### 24.2 G3 final correction: no full-store novelty fallback (2026-10-06)
+
+**Reason:** daybreak's same-epoch loss reproduction showed that a missing or otherwise non-valid
+seen-set could still authorize novelty from full fact-store coverage before a fold re-certified it.
+The fallback is removed entirely. `service.appeared`, `scheduled_job.appeared`, and
+`process.lineage.novel_edge` now require a valid current-epoch seen-set and its certified horizon;
+every other seen-set status is ineligible, emits no candidate or recovery coverage, and carries the
+underlying seen-set status into rule/status reporting. A successful fold re-seeds with its existing
+certified-since boundary rules, and eligibility begins only when the registered horizon is met.
+
+TDD coverage includes the t7/48 h same-epoch loss reproduction (`svc-B`), daemon recovery veto,
+all ordinary and marker/epoch non-valid statuses (with `unreadable` forced by `EISDIR`), and
+47 h/48 h post-fold re-certification checks. Focused novelty/process-lineage/service verification:
+140 tests, 140 pass. Final fresh-XDG `npm test`: **2243 tests, 2187 pass, 22 managed-sandbox
+environment failures, 34 skipped, 0 todo, 0 product failures**. Environment failures are 17
+notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.

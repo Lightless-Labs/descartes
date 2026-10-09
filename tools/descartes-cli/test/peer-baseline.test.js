@@ -6,7 +6,7 @@ import test from "node:test";
 import { alertId, applyAlertCandidates } from "../src/alert-store.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { isSafeEnumString, sanitizeDiagnostics } from "../src/diagnostics-sanitizer.js";
-import { appendFactPoints, readFactPoints } from "../src/fact-store.js";
+import { appendFactPoints, readFactPoints, appendFactPointsByFamily } from "../src/fact-store.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY, factPointsFromTailscaleStatusEvidence } from "../src/fact-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import {
@@ -159,7 +159,9 @@ function flatten(groupsOfPoints) {
 // Fact-store completeness hardening (Slice 5) fixtures, mirroring session-baseline.test.js's
 // intactReadResult/degradedReadResult exactly -- injected via options.readFactPoints so the
 // dedicated cold-start tests below don't need to fabricate real ledger corruption/eviction.
-function intactReadResult(points, completeness = { status: "intact" }) {
+// coverage: "full" -- a real intact store always reports its coverage (fact-store capacity plan S2);
+// since S3 the per-rule eligibility horizon fails closed on a completeness without it (LOW-2).
+function intactReadResult(points, completeness = { status: "intact", coverage: "full" }) {
   return {
     points,
     corrupt_count: 0,
@@ -173,7 +175,7 @@ function degradedReadResult(points, lossTs = tickTs(2)) {
     points,
     corrupt_count: 0,
     schema_invalid_count: 0,
-    completeness: { status: "degraded", last_bytecap_evict_ts: lossTs },
+    completeness: { status: "degraded", last_continuity_break_ts: lossTs },
   };
 }
 
@@ -197,8 +199,8 @@ async function seedAndCompute(paths, points, options = {}) {
   const firstTs = points.reduce((min, p) => Math.min(min, new Date(p.ts).getTime()), Infinity);
   const establishedAnchor = Number.isFinite(firstTs) ? new Date(firstTs - 1).toISOString() : now;
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: establishedAnchor });
-  await appendFactPoints(paths, points, { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, points, { now });
+  await appendFactPointsByFamily(paths, [], { now });
   return computePeerBaselineCandidates(paths, { now, ...options });
 }
 
@@ -315,14 +317,14 @@ test("R8 blocker: a markerless Tailscale overflow is preserved, not folded or ev
   const capped = tailscalePoints(cappedTs, Array.from({ length: 200 }, (_, i) => tailscalePeer(`capped-${i}`)), { truncated: true });
   const cappedGroup = groupPeerFactsByTick(capped)[0];
   assert.equal(cappedGroup.hasOverflow, true, "the markerless Tailscale truncation must remain visible");
-  await appendFactPoints(paths, capped, { now: cappedTs });
+  await appendFactPointsByFamily(paths, capped, { now: cappedTs });
   const cappedResult = await computePeerBaselineCandidates(paths, { now: cappedTs });
   assert.equal(cappedResult.candidates.some((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "a truncated markerless count is not scored as complete");
   assert.equal(cappedResult.evaluatedAlertKeys.includes(alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_MARKERLESS_FINGERPRINT)), false, "a truncated markerless tick cannot evaluate a clear");
   assert.equal((await loadPeerBaselineStore(paths)).state.stats.count, DEFAULT_PEER_MIN_SAMPLE_COUNT, "the capped tick must not be folded into the baseline");
 
   const burstTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
-  await appendFactPoints(paths, tailscalePoints(burstTs, Array.from({ length: 40 }, (_, i) => tailscalePeer(`burst-${i}`))), { now: burstTs });
+  await appendFactPointsByFamily(paths, tailscalePoints(burstTs, Array.from({ length: 40 }, (_, i) => tailscalePeer(`burst-${i}`))), { now: burstTs });
   const burstResult = await computePeerBaselineCandidates(paths, { now: burstTs });
   assert.ok(burstResult.candidates.some((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID), "the later genuine 40-peer burst must still raise");
   assert.equal((await loadPeerBaselineStore(paths)).state.stats.count, DEFAULT_PEER_MIN_SAMPLE_COUNT + 1, "only the genuine burst joins the baseline after the capped tick");
@@ -510,7 +512,7 @@ test("overflow-tick scoring-vs-folding interaction: an overflow tick occurring w
   const { state: stateBefore } = await loadPeerBaselineStore(paths);
 
   const overflowTs = tickTs(31);
-  await appendFactPoints(paths, overflowTick(overflowTs, 200), { now: overflowTs });
+  await appendFactPointsByFamily(paths, overflowTick(overflowTs, 200), { now: overflowTs });
   const { candidates: after } = await computePeerBaselineCandidates(paths, { now: overflowTs });
   const spikeAfter = after.find((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
   assert.ok(spikeAfter, "the candidate must keep re-firing, not disappear, across an intervening overflow tick");
@@ -620,7 +622,7 @@ test("gradual-drift fixture, pinned to a stated realistic rate (~1 new peer/week
         hour += 1;
       }
       const now = tickTs(hour - 1);
-      await appendFactPoints(paths, dayPoints, { now });
+      await appendFactPointsByFamily(paths, dayPoints, { now });
       const { candidates } = await computePeerBaselineCandidates(paths, { now });
       const spikes = candidates.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
       assert.equal(spikes.length, 0, `unexpected peer.count_spike on week ${week} day ${day} (count=${count}): ${JSON.stringify(spikes)}`);
@@ -640,8 +642,8 @@ test("regime-change fixture: a sustained, legitimate shift from N to M>N (e.g. 3
   const M = 5;
   const baselineTicks = [];
   for (let i = 0; i < 40; i += 1) baselineTicks.push(...activeTick(tickTs(i), N));
-  await appendFactPoints(paths, baselineTicks, { now: tickTs(39) });
-  await appendFactPoints(paths, [], { now: tickTs(39) }); // confirm the integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, baselineTicks, { now: tickTs(39) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(39) }); // confirm the integrity ledger to 'intact'
 
   let hour = 40;
   let firedImmediatelyAfterShift = false;
@@ -649,7 +651,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M>N (e.g. 3
   const MAX_ADDITIONAL_TICKS = 20;
   for (let i = 0; i < MAX_ADDITIONAL_TICKS; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, activeTick(ts, M), { now: ts });
+    await appendFactPointsByFamily(paths, activeTick(ts, M), { now: ts });
     const { candidates } = await computePeerBaselineCandidates(paths, { now: ts });
     const fired = candidates.some((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID);
     if (i === 0) firedImmediatelyAfterShift = fired;
@@ -662,7 +664,7 @@ test("regime-change fixture: a sustained, legitimate shift from N to M>N (e.g. 3
 
   for (let i = 0; i < 3; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, activeTick(ts, M), { now: ts });
+    await appendFactPointsByFamily(paths, activeTick(ts, M), { now: ts });
     const { candidates } = await computePeerBaselineCandidates(paths, { now: ts });
     assert.equal(candidates.some((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, `expected sustained recovery, but peer.count_spike re-fired at hour ${hour}`);
     hour += 1;
@@ -882,14 +884,14 @@ test("chronic-degradation-then-recovery sequence: a signature flip from a degrad
   let hour = 0;
   for (let i = 0; i < 35; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, activeTickWithMarker(ts, 1, degradedSignature), { now: ts });
+    await appendFactPointsByFamily(paths, activeTickWithMarker(ts, 1, degradedSignature), { now: ts });
     hour += 1;
   }
 
   let anyFalseFire = false;
   for (let i = 0; i < 35; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, activeTickWithMarker(ts, 5, DEFAULT_SIGNATURE), { now: ts });
+    await appendFactPointsByFamily(paths, activeTickWithMarker(ts, 5, DEFAULT_SIGNATURE), { now: ts });
     const { candidates } = await computePeerBaselineCandidates(paths, { now: ts });
     if (candidates.length > 0) anyFalseFire = true;
     hour += 1;
@@ -897,7 +899,7 @@ test("chronic-degradation-then-recovery sequence: a signature flip from a degrad
   assert.equal(anyFalseFire, false, "the regime flip itself, and the new regime's own re-warm-up, must never fire a false spike or drop");
 
   const finalTs = tickTs(hour);
-  await appendFactPoints(paths, activeTickWithMarker(finalTs, 5, DEFAULT_SIGNATURE), { now: finalTs });
+  await appendFactPointsByFamily(paths, activeTickWithMarker(finalTs, 5, DEFAULT_SIGNATURE), { now: finalTs });
   const { candidates: finalCandidates } = await computePeerBaselineCandidates(paths, { now: finalTs });
   assert.equal(finalCandidates.length, 0, "the fully-established new regime must recover cleanly, firing neither direction on a steady count");
 });
@@ -913,8 +915,8 @@ test("re-emission-every-tick (drop): after a peer.count_drop candidate fires onc
   // seedAndCompute's comment above) -- this fixture drives appendFactPoints/
   // computePeerBaselineCandidates directly.
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, ticks, { now });
-  await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, ticks, { now });
+  await appendFactPointsByFamily(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
   const { candidates: first } = await computePeerBaselineCandidates(paths, { now });
   const { candidates: second } = await computePeerBaselineCandidates(paths, { now });
@@ -989,8 +991,8 @@ test("re-emission-every-tick: after a deviation candidate fires once, a subseque
   // seedAndCompute's comment above) -- this fixture drives appendFactPoints/
   // computePeerBaselineCandidates directly.
   await writePeerBaselineStore(paths, { cold_start_pending: false, last_folded_ts: tickTs(-1) });
-  await appendFactPoints(paths, ticks, { now });
-  await appendFactPoints(paths, [], { now }); // confirm the integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, ticks, { now });
+  await appendFactPointsByFamily(paths, [], { now }); // confirm the integrity ledger to 'intact'
 
   const { candidates: first } = await computePeerBaselineCandidates(paths, { now });
   const { candidates: second } = await computePeerBaselineCandidates(paths, { now });
@@ -1007,7 +1009,7 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   for (let i = 0; i < 5; i += 1) ticks.push(...activeTick(tickTs(i), 2));
   const now = tickTs(4);
   await writeWatchConfig(paths, { enabled: true });
-  await appendFactPoints(paths, ticks, { now });
+  await appendFactPointsByFamily(paths, ticks, { now });
   // Fact-store completeness hardening (Slice 5): confirm the integrity ledger to 'intact' before
   // the repeated-call phase below -- a fresh ledger's first retention pass reads 'unknown'
   // (bootstrap), which would otherwise keep factHistoryTrustworthy returning false and the
@@ -1015,7 +1017,7 @@ test("windowed-recompute idempotency: repeated calls against the SAME unchanged 
   // with unchanged fact-history" below, defeating the very idempotency this test checks. (The
   // store itself is left un-pre-seeded/day-1 on purpose: this test only asserts on write-count and
   // state equality, not on candidates, so day-1 suppression on the first call doesn't affect it.)
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   let writeCount = 0;
   const countingWrite = async (descartesPaths, state) => {
@@ -1146,7 +1148,7 @@ test("computePeerBaselineCandidates: rollback repairs a future anchor and waterm
   const options = {
     minHistoryTickCount: 6,
     minSampleCount: 2,
-    readFactPoints: async () => intactReadResult(points, { status: "intact", last_corrupt_ts: tickTs(100) }),
+    readFactPoints: async () => intactReadResult(points, { status: "intact", coverage: "full", last_corrupt_ts: tickTs(100) }),
   };
   await computePeerBaselineCandidates(paths, { ...options, now: tickTs(0) });
   assert.equal((await loadPeerBaselineStore(paths)).state.last_folded_ts, undefined);
@@ -1369,8 +1371,8 @@ test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-sta
 
   const ticks = [];
   for (let i = 0; i < 5; i += 1) ticks.push(...activeTick(tickTs(i), 2));
-  await appendFactPoints(paths, ticks, { now: tickTs(4) });
-  await appendFactPoints(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
+  await appendFactPointsByFamily(paths, ticks, { now: tickTs(4) });
+  await appendFactPointsByFamily(paths, [], { now: tickTs(4) }); // confirm the shared integrity ledger to 'intact'
 
   // First read post-migration: even against a fully intact, loss-free fact-history ledger, the
   // missing cold_start_* fields default to pending (fail-closed) -- an established-looking store
@@ -1390,7 +1392,7 @@ test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-sta
   let hour = 5;
   for (let i = 0; i < minHistoryTickCount; i += 1) {
     const ts = tickTs(hour);
-    await appendFactPoints(paths, activeTick(ts, 2), { now: ts });
+    await appendFactPointsByFamily(paths, activeTick(ts, 2), { now: ts });
     await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
     hour += 1;
   }
@@ -1402,7 +1404,7 @@ test("migration: a pre-Slice-5 store with no cold_start_* fields at all cold-sta
 
   // And peer.* novelty genuinely resumes afterward.
   const ts = tickTs(hour);
-  await appendFactPoints(paths, activeTick(ts, 200), { now: ts });
+  await appendFactPointsByFamily(paths, activeTick(ts, 200), { now: ts });
   const { candidates: resumed } = await computePeerBaselineCandidates(paths, { now: ts, minHistoryTickCount, minSampleCount });
   assert.equal(resumed.filter((c) => c.rule_id === PEER_COUNT_SPIKE_RULE_ID).length, 1);
 });
@@ -1705,7 +1707,7 @@ test("R8 identity migration: a legacy global peer alert freezes under VPN-only e
   let clear;
   for (let i = 1; i <= 40; i += 1) {
     const ts = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + i);
-    await appendFactPoints(spikePaths, [
+    await appendFactPointsByFamily(spikePaths, [
       ...activeTickWithMarker(ts, 8),
       ...tailscalePoints(ts, Array.from({ length: 40 }, (_, peerIndex) => tailscalePeer(`steady-${i}-${peerIndex}`))),
     ], { now: ts });
@@ -1756,7 +1758,7 @@ test("R8 identity migration mirrors for peer.count_drop: legacy global freezes w
   assert.equal(alerts.find((alert) => alert.id === vpnKey)?.status, "active", "the v2 VPN drop alert must raise");
 
   const clearTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 1);
-  await appendFactPoints(paths, activeTickWithMarker(clearTs, 10), { now: clearTs });
+  await appendFactPointsByFamily(paths, activeTickWithMarker(clearTs, 10), { now: clearTs });
   const clear = await computePeerBaselineCandidates(paths, { now: clearTs });
   assert.equal(clear.candidates.some((candidate) => candidate.id === vpnKey), false, "the v2 VPN drop must clear");
   alerts = applyAlertCandidates(alerts, clear.candidates, {
@@ -1771,8 +1773,38 @@ test("computePeerBaselineCandidates calls the real (default) loadWatchConfig whe
   const paths = await tempPaths();
   let readCalled = false;
   const result = await computePeerBaselineCandidates(paths, {
-    readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args); },
+    readFactPoints: async (...args) => { readCalled = true; return readFactPoints(...args, { family: "peer" }); },
   });
   assert.deepEqual(result.candidates, []);
   assert.equal(readCalled, true, "watch.json's real ENOENT default is enabled:true (watch-by-default slice 1) -- unlike the pre-split default, I/O IS attempted even with nothing injected");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fact-store capacity plan §4.2, step S3: the per-rule eligibility horizon (spike/drop, 30 h each).
+// ---------------------------------------------------------------------------------------------
+
+function narrowedPeerReader(floorTs) {
+  return async (paths, options) => {
+    const read = await readFactPoints(paths, { family: "peer", ...(options) });
+    return { ...read, completeness: { ...read.completeness, coverage: "narrowed", bytecap_floor_ts: floorTs, age_floor_ts: null } };
+  };
+}
+
+test("S3 horizon: a horizon-short peer store reports neither direction and emits nothing, never re-arms, and both directions resume on the tick the span recovers", async () => {
+  const paths = await tempPaths();
+  const flatTicks = [];
+  for (let i = 0; i < 31; i += 1) flatTicks.push(...activeTickWithMarker(tickTs(i), 5));
+  const now = tickTs(30);
+  const baseline = await seedAndCompute(paths, flatTicks, { now });
+  // Merge (R8 identities): a marker-backed tick is evaluated under the source-scoped v2:vpn identity.
+  const both = [alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT), alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT)].sort();
+  assert.deepEqual([...baseline.evaluatedAlertKeys].sort(), both, "control: both directions evaluated with full coverage");
+
+  const short = await computePeerBaselineCandidates(paths, { now, readFactPoints: narrowedPeerReader(tickTs(5)) });
+  assert.deepEqual(short.evaluatedAlertKeys, [], "25 h < 30 h: no coverage for either direction");
+  assert.deepEqual(short.candidates, []);
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false, "no cold-start re-arm (I5)");
+
+  const restored = await computePeerBaselineCandidates(paths, { now, readFactPoints: narrowedPeerReader(tickTs(0)) });
+  assert.deepEqual([...restored.evaluatedAlertKeys].sort(), both, "exactly 30 h: both directions resume on the same tick");
 });

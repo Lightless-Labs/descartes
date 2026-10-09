@@ -51,7 +51,106 @@ peer-baseline upgrade scenario passes (legacy global active + VPN-only stable; n
 raises and clears). Full `npm test` after this change reports 2074 tests / 2018 pass / 22 fail /
 34 skip; the same 20 sandbox loopback and 2 live-process provenance environment failures remain.
 
+## Current continuity — G3 full-store fallback removal (2026-10-06)
+
+The remaining daybreak G3 blocker is fixed locally on `feat/fact-store-capacity-2026-10`. Novelty
+eligibility now requires a valid current-epoch seen-set and its registered certified horizon; the
+full-store eligibility fallback is removed. Missing, unreadable, invalid, no-ledger, pending-pass,
+lineage-mismatch, overflow, epoch mismatch, and unreadable/pending/future marker states all fail
+closed. The read path reports the underlying seen-set status first, while the shared
+`noveltyRuleEligible` predicate is used by the three producers, rule evaluations/status, and daemon
+veto. Non-valid novelty produces no candidates or recovery coverage and carries the seen-set status
+as the rule/status reason until a successful fold re-certifies it. Re-seeding preserves its existing
+non-null post-quarantine certified-since boundary rules.
+
+TDD regressions cover the same-epoch `svc-B` return at t7 (7 h into 48 h), daemon alert freeze, all
+non-valid statuses with a real `EISDIR` unreadable fixture, and successful-fold recovery only at
+the 48 h boundary. Focused novelty/process-lineage/service verification: 140/140 pass. Final
+fresh-XDG `npm test`: 2243 total, 2187 pass, 22 managed-sandbox environment failures, 34 skipped,
+0 todo, 0 product failures. The 22 environment failures are 17 notifier-reuse loopback binds,
+3 tap-bump loopback binds, and 2 live-host provenance checks. No push or merge.
+
+## Current continuity — G3 quarantine-epoch read closure rework (2026-10-06)
+
+The daybreak-blue G3 confirmation blocker is fixed locally on `feat/fact-store-capacity-2026-10`.
+The earlier closure checked the migration marker only after `lineage_mismatch` and other seen-set
+early returns, allowing a stale set to fall through to the full-store novelty fallback. The read
+path now evaluates migration first for every seen-set state. For a missing/invalid set, it also
+rejects the fallback when the current quarantine episode is newer than the family read's certified
+start, or when the marker is unreadable, pending, or future-dated. The existing shared
+`noveltyRuleEligible` predicate remains the single gate used by all three novelty producers,
+rule evaluations/status, and the daemon veto: horizon-short means no candidates, empty recovery
+coverage, and no daemon recovery until a later fold re-certifies the family.
+
+The regression combines `lineage_mismatch` with fast-tick migration for service, scheduled-job,
+and process-lineage novelty at producer/status/daemon level; all active daemon alerts remain
+active. A table-driven audit covers missing, unreadable, invalid, no-ledger, pending-pass,
+lineage-mismatch, and overflow statuses. Focused novelty/baseline/family-veto verification:
+282 tests, 282 pass, 0 fail. Full fresh-XDG `npm test`: 2240 tests, 2184 pass, 22 managed-sandbox
+environment failures, 34 skipped, 0 todo, 0 product failures. The 22 environment failures are
+17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks.
+No push or merge.
+
+## Current continuity — S6 H1 freshness closure (2026-10-06)
+
+The S6 review H1 is closed on `feat/fact-store-capacity-2026-10`. `4fc0384` adds the red T11 stale-census expectations and a daemon-level active `session.count_drop` freeze regression; `d10243f` gives `session.count_drop`, `session.churn`, `peer.count_spike`, and `peer.count_drop` the same `activeFreshnessMs` gate as the census rules. A stale latest complete census now emits no stale-data candidates or `evaluatedAlertKeys`, so alerts freeze and never recover from dead census data. `evaluateSessionChurn` takes the evaluation clock, and baseline status receives the recorded structural interval for all eight census-dependent rules.
+
+Focused detector/daemon/T11 verification: 325 tests, 325 pass, 0 fail, 0 skipped. Full fresh-XDG suite after `d10243f`: 2238 tests, 2182 pass, 22 managed-sandbox failures, 34 skipped, 0 product failures. The 22 environment failures are 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. The prior red-test commit's two product failures were the intended stale-census assertions before the fix. No push or merge. Next: S8/G3.
+
+## Earlier continuity — fact-store capacity S6 built (per-rule `baseline status`, T11); not pushed or merged (2026-10-05)
+
+S6 is done on `feat/fact-store-capacity-2026-10` (plan §22). `48991a9`: the six watch-tier producers report a per-rule `ruleEvaluations` record from their own gates (no detection change). `5aa6276`: `baseline status`/`inspect` run those producers read-only with the daemon's options and report each rule's phase (`watching` exactly when the detector would evaluate), `not observed (no store)` for never-created stores, a per-family certified-history block, and the `cap_below_tick` / `budget_below_horizon_floor` / `history_horizon_short` / `retention_failing` reasons; T11 compares status against a real daemon fast tick per rule over seven scenarios, and a Leg E regression is red on the old status. Full suite (fresh scratch `XDG_*`): 2232 tests, 2198 pass, 0 fail, 34 skipped.
+
+**S6 review rework (plan §22.6):** NEEDS-REWORK reworked in `bfa8d1c`..`7a3d373`. H1: the four session/peer rules have no freshness gate and evaluate on a dead census for up to 31 days (pre-existing detector behaviour); status now flags `latest_census_stale` on every rule, and G3 question 5 asks for a detector freshness gate. M1: T11 has independent oracles (converse gates, test-owned freshness, key partition) and new horizon-short / partial-census scenarios (`drop_history_not_ready` still unreached). M2/M3/L1-L5 fixed; L6 rejected (unreachable on the daemon/status path). Full suite after `7a3d373`: 2237 tests, 2203 pass, 0 fail, 34 skipped. **Next:** S7 soak, then S8/G3 (G3 questions in §22.4, now 5). Do not push.
+
+## Earlier continuity — fact-store capacity S4 + S5 built; follow-up daybreak G2 findings fixed; not pushed or merged (2026-10-05)
+
+The follow-up G2 re-gate is complete on the current branch. The resumed-quarantine HIGH-1 and retention-alert MEDIUM findings are fixed; the earlier future-dated quarantine medium remains fixed. The final conservative resume correction also covers a crash after rename with an empty root and incomplete per-item metadata. Focused migration/seen-set/status tests are green. Final fresh-XDG full suite: 2217 tests, 2161 pass, 0 product failures, 22 managed-sandbox failures, 34 skipped. The 22 are the known 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live-host provenance checks. Nothing has been pushed or merged.
+
+**Follow-up commits:** `a5e87ce` resets a resumed quarantine's epoch to the resume pass and records per-item move timestamps for retention; `55c0103` freezes unresolved retention alerts without re-emitting candidates while preserving recovery only after a successful family pass. Both carry the required Claude trailer.
+
+**G2 rework (plan §20–§21):** the G2 review's two HIGH findings and interval MEDIUM are fixed; the §20 LOW dispositions remain recorded.
+- **H1** `fb63477`: quarantine epochs/timestamps now invalidate continuous-null novelty certification after later legacy evidence.
+- **H2** `1c0f5d6`: carried per-family retention failures keep a fixed alert active across fast ticks and recover only after structural success.
+- **MEDIUM** (final G2 rework commit): default budgets scale to the structural interval up to 4x, and profiles below `833276 ms` are rejected.
+- **H1** `ae282c8`: an upgraded install's novelty seen-set is now certified only from its first pass, because the legacy history was quarantined. Novelty is reported horizon-short for 48 h / 6 d after an upgrade, instead of making a 30-day "new" claim. T10's bound has moved to the horizons.
+- **L2** `d8fd52d`: the no-fact-I/O tests now assert that `learned/facts/` is absent.
+- **L1** `cb654c0`: network/provenance oversize is checked via `stat`.
+- **L3** `d5f38de`: the T8 floor is computed at the structural interval, and `horizon_invariant_unmet` is reported.
+- **L4** `fe91927`: a configured budget above 4x the default is clamped and reported as `budget_above_ceiling`.
+- **L5** rejected: the seam is unreachable in production, like the ~100 other injection keys. §19.5 Q3 stays open.
+
+Full suite (fresh scratch `XDG_*`) after the final G2 rework commit: 2210 tests, 2154 pass, 0 product fail, 22 managed-sandbox failures, 34 skipped. The 22 are 17 notifier-reuse loopback binds, 3 tap-bump loopback binds, and 2 live provenance checks. **Next:** daybreak G2 re-gate.
+
+Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing has been pushed or merged. Plan: `docs/plans/2026-10-05-fact-store-capacity-and-sliding-anchor.md` (§19 is the S4/S5 execution record, deviations and G2 questions; §18 is S3/S3b).
+
+- **S4 (done):** registry budgets/T8 floor/routing + session/peer clamps `f6cc436`; per-family stores (`learned/facts/<family>/`), required `family` everywhere, routed append + registry retention sweep, all 16 readers switched, per-family daemon reads/veto/horizon-short `bbb9487`; T7 `5adc7df`; `fact_store_budgets` status (`budget_below_horizon_floor`, `cap_below_tick`, `retention_failing`) `b06f3b3`; T9 read-cost guard (~2.8 s modelled, bound 5 s) `9d613a1`.
+- **S5 (done):** legacy store + pre-S4 seen-sets quarantined to `learned/facts-legacy-<iso>/`, idempotent, deleted after 31 days `031068f`; Q5 (legacy `fact_store_max_bytes` ignored, a deliberate value named as deprecated) `06509b5`; T10 (lockout clears at tick 6, count rules at tick 29) `430af54`.
+- **Finding (§19.3, fixed `708e379`):** the no-points retention sweep re-certified a family store whose `facts.jsonl` was deleted under a committed ledger as `intact`; a missing file under a non-empty commit is now a continuity break.
+- **Full suite** on `708e379` (fresh scratch `XDG_*`): 2196 tests, 2162 pass, 0 fail, 34 skipped. T4's timeout is now 300 s (I/O contention in the full suite).
+- **Next:** **daybreak G2** with the §18.5 and §19.5 questions; then S6 (CLI per-rule "would evaluate") and S7 (soak). Do not push.
+
+### Earlier on this branch — S3 + S3b (2026-10-05)
+
+- **G1 rework (done):** blocker 1 `ddbc6a6` (interim full-coverage novelty gate), blocker 2 `dc117ca` (persisted monotonic `age_floor_ts`). Q6 (first/last-seen set) was pulled into scope by the operator as **S3b** (§17).
+- **S3 (done):** `fact-families.js` registry + `certifiedHorizonOk` (valid-ledger, max of both floors) `9581332`; per-rule horizon gate in the producers `da35bc7`; miner/shadow/correlation moved off the interim gate onto `certifiedReadWindowOk` (provably identical input to a never-byte-evicted store) `2e9ffdc`; daemon per-rule horizon veto + `history_horizon_short` + fixed alert `daemon.fact_history.horizon_short` `7656cf5`; novelty diagnostics `history_certified_after_ts` `30d2b35`.
+- **G1 re-gate LOWs (done):** `2e79956` (learned status reports `age_floor_ts` and names the narrowing cause; these HANDOFF refs).
+- **S3b (done):** `9a306c7` — `novelty-seen-set.js`; novelty decided against window ∪ seen-set; interim gate lifted only while the set is valid; daemon uses the same novelty predicate. G1 reproduction green for all three novelty rules with the gate lifted.
+- **Finding recorded (§18.3):** the interim `requireFullCoverage` gate silenced novelty/correlation/miner permanently once a store was 30 days old (age floor inside the 31 d window), and shadow after any byte-cap eviction — never shipped, fixed by S3/S3b.
+- **Full suites** (fresh scratch `XDG_*`, on a `git archive` snapshot of each commit): 0 fail at every commit (one run of `2e9ffdc` had T4 cancelled at its 120 s timeout under concurrent load, not a failure; it passes in ~5 s alone); final code commit `d1f96c6`: 2137 tests, 2103 pass, 0 fail, 34 skipped. The earlier "22 sandbox-only failures" no longer reproduce on this machine (baseline 2089 / 2055 pass / 0 fail / 34 skipped).
+- **Expected before S4 (Leg D, §18.6):** on the single 5 MB store the session/peer count rules (30 h) are permanently horizon-short once eviction starts, so `daemon.fact_history.horizon_short` fires after 24 h on real hosts. S4 budgets fix it.
+- **Then (now done, see above):** S4 and S5.
+
 ## Current Status
+
+> **RESUME HERE (2026-10-07) — principle reset + 5 open tracks; local `main` NOT pushed (operator confirmation pending).**
+> - **Operator core principle (2026-10-06):** Descartes LEARNS and ADAPTS — data, context awareness, ability to learn; **no expert-system rule forest** (operator rejected hand-coded tuning R4–R10: thresholds, reboot/wake suppressions, severity guards; R3 notify-once accepted as delivery policy); long memory (31 d) stays; never-fabricate gates are invariants, not behaviour rules. Memory: `no-hand-coded-detection-rules`. Audits of ALL past work vs this principle: `docs/reviews/2026-10-06-learning-principle-audit-{astra,opus}.md` (top offenders: global σ/floor session+peer models, incident-shaped correlation, fixed resource reflexes [0.985 macOS memory ⇒ permanent CRITICAL], adaptation-without-arbitration [novelty recovers after 1 tick; alarmed ticks folded], tuning-loop fired_count bug, dropped context data).
+> - **Plan `docs/plans/2026-10-06-context-aware-learned-baselines.md` — DRAFT v3** (context facts → context vector → context-conditioned EVENT/LEVEL learners in default-on shadow; coverage contract v2; arbitrated adaptation/pending; F class = OS-guaranteed facts narrowed to F1–F4; per-host replacement envelope). Reviews: v1 Astra 16 / Opus 9 → v2 Opus 5 → **v3 Opus 0 BLOCKER + 3 HIGH** (all §6 pending/arbitration: ledger fail-closed has no exit; LEVEL alerts stay active ⇒ notify-once mutes detector; pending data laundered on recover/close) — `docs/reviews/2026-10-07-context-plan-v3-rereview-opus.md`. **NEXT: v4 (fold §6) → Astra + Opus in parallel.** Operator decisions D1–D4: novelty pending-until-explained (+ later federated signature matching as an explanation source); per-host opt-in replacement envelope (doctrine amendment DA1); default-on shadow (DA2); F class allowed with conditions (both reviewers; `docs/reviews/2026-10-06-f-class-opinions.md`). Open: Q5 policy values, Q6 calibration-laptop corpus, Q7/Q8.
+> - **`feat/fact-store-capacity-2026-10`** (worktree `wf_fff34f30-56c-1`, @2dce005, 78 ahead) — R0 S0–S7 complete; **daybreak G3 READY** (after many rounds: seen-set epoch, full-store novelty fallback REMOVED, session/peer stale-census freshness gate). Not merged: cut from b951cb7, will conflict with the watch-fab merge (session/peer-baseline, daemon, alert-store, baseline, HANDOFF) → merge + full suite + short daybreak confirmation on the merged result.
+> - **`harden/root-helper-2026-10`** (@24bf964) — daybreak READY after 9 rounds; Linux-only tests never executed → needs operator OK to push branch for Linux CI.
+> - **`feat/notify-once-2026-10`** (worktree `r3-notify-once`) — R3 episodes; operator chose to keep the episode design after 4 daybreak rounds. Round-4 blockers centre on the one-record-per-alert-id model (simultaneous incidents collapse), singleton/queue machinery, key-set overflow, correlation incident key using first_seen. Direction: first-class per-incident identity (producer fingerprint or per-incident records), drop singleton/queue (two-daemon RMW race is pre-existing on main → own todo), never evict confirmed keys.
+> - **`fix/collector-sources-2026-10`** (worktree `collector-sources`, @3c18739) — H5 (macOS `scutil --nc list` parser matched nothing yet reported ok) + H6 (launchd PATH ⇒ ENOENT counted as complete zero) + binary writer-set trust + incomplete-census freezes; suite 2113/0 incl. live provenance. Open: tmux-only host gets a permanently `partial` session census (never establishes) → per-source census universes (plan C0.1b) ownership/order vs capacity.
+> - Pending operator OKs: push main; merge capacity then push; push root-helper branch for Linux CI.
 
 > **RESUME HERE (2026-10-05, evening) — 4 parallel tracks; local `main` has 2 merges + plan docs, NOT pushed (awaiting operator push confirmation).**
 > - **Merged to local `main`:** `fix/provenance-identity-coverage-2026-10` (honest reconcile clocks + census honesty; IPv6 `[::]` public + address-family-preserving keys; macOS UDP `*:*` tolerated; **identity recovery coverage DEFERRED SAFE-FROZEN** after 4 daybreak rounds — unprivileged census can't prove cross-UID/netns absence; follow-up `todos/2026-10-05-provenance-identity-recovery-coverage.md`, revisit once the root-helper cross-UID census lands) — daybreak **READY**. `fix/watch-fabrication-2026-10` (calibration fabrication fixes: tailscale-unable/overflow, freshness gates, bounded churn, `v2:vpn`/`v2:markerless` peer identities with legacy `global` frozen, honest per-rule `baseline status`) — daybreak 0 blockers; last two status-only MEDIUMs fixed (`65595c9`, `ca216bb`). Merged suite **2113/0/34**.

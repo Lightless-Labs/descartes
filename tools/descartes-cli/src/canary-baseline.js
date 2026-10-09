@@ -9,7 +9,7 @@ import { loadCanaryManifest } from "./canary-manifest.js";
 import { loadLearnedConfig } from "./constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import {
   CANARY_CENSUS_FACT_NAME,
   CANARY_CENSUS_MARKER_ENTITY_KEY,
@@ -80,36 +80,9 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-// Mirrors session-baseline.js's/service-baseline.js's own hasCompletenessLossAfterAnchor exactly
-// (defense-in-depth duplicate of the timestamp-vs-anchor comparison factHistoryTrustworthy already
-// performs internally -- kept as its own local check per those hardened references so a future
-// change to the shared helper's internals cannot silently widen what this detector treats as
-// trustworthy without also updating this local, independently-reviewed comparison).
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 export function normalizeCanaryBaselineState(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -545,7 +518,7 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   // exactly what process-lineage-baseline.js/session-baseline.js/peer-baseline.js/
   // service-baseline.js do for their own candidate computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "canary", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupCanaryFactsByTick(points);
 
@@ -816,7 +789,13 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
     })
     : { vanished: [], evaluatedCanaryIds: new Set() };
   const rawVanished = vanishedWalk.vanished;
-  const outputVanished = coldStartPendingThisTick ? [] : rawVanished;
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; 6 h), applied to the canary_vanished
+  // ABSENCE claim only -- the one history-gated reason under canary.tampered. canary.tripped
+  // (positive evidence) and the manifest/store tamper reasons (direct I/O signals) are not
+  // history claims and stay ungated, exactly as they stay outside the cold-start lockout.
+  const vanishedHorizonOk = ruleHorizonOk(readResult, CANARY_TAMPERED_RULE_ID, nowMs);
+  const vanishedEvaluable = !coldStartPendingThisTick && vanishedHorizonOk;
+  const outputVanished = vanishedEvaluable ? rawVanished : [];
   for (const entry of outputVanished) {
     tamperEntries.push({ reason: "canary_vanished", canary_id: entry.canary_id, kind: entry.kind, last_seen_ts: entry.last_seen_ts });
   }
@@ -942,7 +921,7 @@ export async function computeCanaryBaselineCandidates(descartesPaths, options = 
   // groups + fresh census + this canary established under a verified, still-monitored identity.
   // Present-established canaries are reported too (found clear -> a stale canary_vanished alert can
   // recover, one tick after the canary reappears in the `previous` complete group).
-  if (!coldStartPendingThisTick && manifestReadOk) {
+  if (vanishedEvaluable && manifestReadOk) {
     for (const canaryId of vanishedWalk.evaluatedCanaryIds) {
       evaluatedAlertKeys.add(alertId(CANARY_TAMPERED_RULE_ID, hashCanaryTamperKey(`canary_vanished:${canaryId}`)));
     }

@@ -329,7 +329,11 @@ Structural watching is on by default. It uses `watch.json` and can do these thin
 
 - read its own fact history;
 - run deterministic novelty and statistical detectors;
-- report whether each detector domain is still learning or watching.
+- report, per detector rule, whether it is watching (it would evaluate on the current state) or
+  which gate stops it: still learning, history untrusted, history horizon below minimum, a stale
+  census, or `not observed (no store)` for a family store that was never created. Every rule is
+  also flagged `latest_census_stale` when no recent complete census exists: the session and peer
+  count rules keep evaluating on the last census, so for them the flag is the signal.
 
 The authoring and promotion layer uses `learned.json`. It stays off until a person enables it.
 It can mine candidate rules and provenance and identity baselines. The two switches are
@@ -338,7 +342,7 @@ independent.
 The `baseline` commands report and control structural watching:
 
 ```bash
-descartes baseline status                # show each domain's learning phase
+descartes baseline status                # show each rule's phase and each family's certified history
 descartes baseline status --json
 descartes baseline inspect               # show current established sets
 descartes baseline inspect --domain service --json

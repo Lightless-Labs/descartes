@@ -5,12 +5,27 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords } from "./alert-store.js";
+import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
-import { loadConstraints, loadLearnedConfig, selectFactStoreCompleteness } from "./constraint-store.js";
+import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
-import { appendFactPoints, readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { appendFactPointsByFamily, factStoreFileBytes, readFactPoints } from "./fact-store.js";
+import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.js";
+import { combineFamilyCompleteness } from "./fact-store-integrity.js";
+import { migrateLegacyFactStore } from "./fact-store-migration.js";
+import {
+  FACT_FAMILY_IDS,
+  FAMILY_DEFAULT_BUDGET_BYTES,
+  FAMILY_TICK_SHAPES,
+  familyBudgetCeilingBytes,
+  familyBudgetFloorBytes,
+  MIN_STRUCTURAL_INTERVAL_MS,
+  HISTORY_HORIZON_SHORT_ALERT_TICKS,
+  NOVELTY_FAMILIES,
+  readerFamilies,
+  resolveFactStoreBudgets,
+  RULE_HORIZONS,
+} from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 import {
   factPointsFromNetworkEvidence,
@@ -38,7 +53,7 @@ import { computeScheduledJobBaselineCandidates, SCHEDULED_JOB_APPEARED_RULE_ID }
 import { computeCredentialAccessCandidates, CREDENTIAL_ACCESS_RULE_ID } from "./credential-access-baseline.js";
 import { computeContainmentRecommendationCandidates, containmentRecommendationRuleIds } from "./containment-recommend.js";
 import { buildShadowFactLookup, evaluateAndLogShadowConstraints } from "./shadow-store.js";
-import { appendMetricPoints, parseDurationMs, writeDaemonStatus } from "./history-store.js";
+import { appendMetricPoints, parseDurationMs, readDaemonStatus, writeDaemonStatus } from "./history-store.js";
 import { collectDiskEvidence } from "./tools/disks.js";
 import { collectNetworkEvidence } from "./tools/network.js";
 import { collectProcessEvidence, collectProcessLineageEvidence } from "./tools/processes.js";
@@ -111,6 +126,19 @@ export const HISTORY_DEPENDENT_ALERT_RULE_IDS = new Set([
   CANARY_TAMPERED_RULE_ID,
 ]);
 
+// Fact-store capacity plan §4.3 / I7 (step S3): every history-dependent rule must have a
+// fact-families.js registry entry (families + eligibility horizon), and the registry must name no
+// rule this set does not. The registry is a leaf module and can only hold string literals, so this
+// check -- against the set built from the detectors' own exported constants -- is also what catches
+// a registry literal that has drifted from its constant. Throws at module init, like the
+// duplicate-owner throw in SECURITY_RULE_OWNERSHIP below.
+for (const ruleId of HISTORY_DEPENDENT_ALERT_RULE_IDS) {
+  if (!RULE_HORIZONS.has(ruleId)) throw new Error(`fact-families registry has no horizon entry for history-dependent rule ${ruleId}`);
+}
+for (const ruleId of RULE_HORIZONS.keys()) {
+  if (!HISTORY_DEPENDENT_ALERT_RULE_IDS.has(ruleId)) throw new Error(`fact-families registry names ${ruleId}, which is not a history-dependent rule`);
+}
+
 // BLOCKER-3 (daybreak-blue re-gate round 2, the root of the class -- subsumes BLOCKER-1/BLOCKER-2):
 // global `historyTrust` alone is not enough to authorize recovery. A detector can short-circuit to
 // [] for a reason ORTHOGONAL to history trust: its OWNING tier (watch.json or learned.json) is
@@ -167,7 +195,7 @@ export const AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS = new Set([
 // "witnessed" (authenticated ledger / witness, threat-model steps 3-4), and beyond that
 // interactive-hardware-approval and full attestation (threat-model steps 5-6, out of scope --
 // see plan §12). Consulted by NO trust-decision code path anywhere in this codebase -- it is
-// display/disclosure only, exactly like continuity_oldest_ts (fact-store-integrity.js). Do not
+// display/disclosure only, exactly like the completeness coverage fields (fact-store-integrity.js). Do not
 // add a branch (`=== INTEGRITY_LEVEL_UNPROTECTED_SAME_UID` or any other comparison) that gates
 // trust, suppression, recovery, promotion, or alerting on this value; the only permitted use is
 // unconditionally including it verbatim on an operator-visible status surface.
@@ -260,6 +288,9 @@ export function validateDaemonProfile(profile) {
     }
     if (!isPositiveFiniteNumber(structural.interval_ms)) {
       throw new Error(`Daemon profile structural.interval_ms must be a positive finite number, got: ${JSON.stringify(structural.interval_ms)}`);
+    }
+    if (structural.interval_ms < MIN_STRUCTURAL_INTERVAL_MS) {
+      throw new Error(`Daemon profile structural.interval_ms ${structural.interval_ms}ms is below ${MIN_STRUCTURAL_INTERVAL_MS}ms; required family budget floor exceeds the 4x budget ceiling`);
     }
     if (!isPlainObject(structural.collectors)) {
       throw new Error("Daemon profile structural.collectors must be an object when present");
@@ -521,7 +552,7 @@ async function computeActiveConstraintCandidates(descartesPaths, options) {
   // Pass the SAME resolved nowMs snapshot to the read window AND the lookup staleness — never a bare
   // options.now (undefined in the live loop), which would let readFactPoints take its own, strictly
   // later, Date.now() and exclude a fact that is fresh per this snapshot at the horizon edge.
-  const { points } = await readFacts(descartesPaths, { windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
+  const { points } = await readFacts(descartesPaths, { families: readerFamilies("active_constraint"), windowMs: options.factWindowMs ?? freshnessMs, now: nowMs });
   const factLookup = buildShadowFactLookup(points, { now: nowMs, freshnessMs });
   return evaluateConstraints(activeConstraints, factLookup);
 }
@@ -807,8 +838,10 @@ function ruleIdsForFailedLabel(label, persistedRuleIds) {
 // the pre-fix code already did whenever any restriction applied. Only called when
 // options.evaluateAlerts !== false, so the "no I/O when disabled" invariant (no detector/alert I/O
 // on a disabled tick) is preserved by the caller, unchanged.
-async function computeCoveredAlerts(descartesPaths, options, { historyTrust, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel }) {
-  const historyUntrusted = historyTrust?.trust === false;
+async function computeCoveredAlerts(descartesPaths, options, { historyVetoedRuleIds, failedLabels, alwaysExcludedRuleIds = [], evaluatedByLabel, horizonVetoedRuleIds = new Set(), successfulRetentionFamilies = new Set() }) {
+  // S4 (§4.4, I6): the per-family history veto. Fail closed: a caller that passes no set vetoes every
+  // history-dependent rule.
+  const historyVetoed = historyVetoedRuleIds instanceof Set ? historyVetoedRuleIds : HISTORY_DEPENDENT_ALERT_RULE_IDS;
 
   const readAlerts = options.readAlertRecords ?? readAlertRecords;
   let persistedAlerts = [];
@@ -822,7 +855,14 @@ async function computeCoveredAlerts(descartesPaths, options, { historyTrust, fai
   // §7.7 rule-id-level vetoes (history-untrusted ∪ failed-detector ∪ always-excluded): a rule_id in
   // this set freezes regardless of any coverage report.
   const vetoedRuleIds = new Set([
-    ...(historyUntrusted ? HISTORY_DEPENDENT_ALERT_RULE_IDS : []),
+    // S4 (§4.4): a history-dependent rule freezes when ANY family it reads is untrusted (or was not
+    // read) -- per family, so a loss in one family never freezes another family's recovery.
+    ...historyVetoed,
+    // Fact-store capacity plan §4.4 / I6 (step S3): the per-rule eligibility-horizon veto -- the
+    // daemon's own, independent check (from its own per-family reads, against the same
+    // fact-families.js registry the detectors use), so a detector that forgot its horizon gate still
+    // cannot authorize a recovery off a window too short to evaluate the rule.
+    ...horizonVetoedRuleIds,
     ...alwaysExcludedRuleIds,
   ]);
   for (const label of failedLabels) {
@@ -834,6 +874,10 @@ async function computeCoveredAlerts(descartesPaths, options, { historyTrust, fai
   const covered = fixedAlertIds();
   for (const alert of persistedAlerts) {
     if (vetoedRuleIds.has(alert.rule_id)) continue; // §7.7 veto -> frozen
+    if (alert.rule_id === RETENTION_FAILURE_RULE_ID) {
+      if (successfulRetentionFamilies.has(alert.fingerprint)) covered.add(alert.id);
+      continue; // a fast tick, failed pass, or unreadable status never authorizes recovery
+    }
     if (FIXED_ALERT_RULE_IDS.has(alert.rule_id)) { covered.add(alert.id); continue; } // exempt
     const owner = SECURITY_RULE_OWNERSHIP.get(alert.rule_id);
     if (owner) {
@@ -922,6 +966,26 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
+  // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
+  // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
+  // delete quarantines older than 31 days. Fact I/O only when a tier is on (no I/O when disabled).
+  // Never fatal: a failure is reported on the status record and the move resumes next tick (into the
+  // same directory). The per-family stores themselves start fresh by construction (M2, I8).
+  let factStoreLegacy;
+  if (configSnapshot.watch.enabled || configSnapshot.learned.enabled) {
+    const migrate = options.migrateLegacyFactStore ?? migrateLegacyFactStore;
+    try {
+      const migration = await migrate(descartesPaths, { now: nowMs });
+      if (migration && (migration.status !== "none" || migration.deleted?.length > 0 || migration.pending?.length > 0 || migration.marker)) {
+        factStoreLegacy = migration;
+      }
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)) || "unknown legacy fact-store migration error";
+      console.warn(`[daemon] legacy fact-store quarantine failed this tick (${message}); it is never read, and the move resumes next tick`);
+      factStoreLegacy = { status: "error", error: message };
+    }
+  }
+
   const evidence = await collectDaemonEvidence(profile, options.collectors);
   const points = metricPointsFromEvidence(evidence, { ts });
   // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
@@ -954,6 +1018,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // learned.json, which now gates only the AUTHOR layer below; watch.json defaults ON, unlike
   // learned's default-off), checked before any work is attempted (convention #4) — when
   // disabled, this block reads nothing else and writes nothing.
+  // S4 (fact-store capacity plan §4.5 Config): the per-family budgets for this tick, from the frozen
+  // watch.json snapshot, each validated against its T8 horizon floor (a rejected value falls back to
+  // the default and is reported as `budget_below_horizon_floor`). `options.factStoreBudgets` is a
+  // TEST-ONLY seam (T1 forces routine eviction at real volume) that bypasses that floor -- exactly
+  // why it is not a config path.
+  const budgetResolution = resolveFactStoreBudgets(configSnapshot.watch.fact_store_budgets, { structuralIntervalMs });
+  const effectiveBudgets = options.factStoreBudgets ?? budgetResolution.budgets;
   let structuralEvidence;
   let structuralCollectorStatuses;
   let structuralFacts;
@@ -1034,28 +1105,31 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // — alerting on a novel scheduled job (scheduled_job.appeared) is Slice B's job.
             ...factPointsFromScheduledJobsEvidence(structuralEvidence, { ts }),
           ];
-          if (factPoints.length > 0) {
-            // Finding F4: same isolation as the metric-persist call above -- a storage fault here
-            // must not abort the tick before evaluateAndPersistAlerts, and must not fabricate a
-            // retention outcome that did not happen. Finding F4-B1/F4-B2 re-gate: inline
-            // try/catch, not safeCandidates -- same reasoning as the metric-persist call above,
-            // the error message must survive to feed status.state/storage_write_error below.
-            const appendFacts = options.appendFactPoints ?? appendFactPoints;
-            try {
-              // Finding F2-Tier1 (re-sourced onto watch.json, plan §12.3 fact 3): thread the
-              // operator-configurable fact_store_max_bytes (validated/fail-closed in
-              // watch-store.js's normalizeWatchConfig, which mirrors constraint-store.js's own
-              // normalizeLearnedConfig exactly) into the live call site as options.maxBytes --
-              // this is the only lever an operator has to stop routine bytecap eviction short of
-              // a code change. watchConfig is already loaded and enabled-checked above in this
-              // same structural-tick block; the WATCH-tier fact store is what this cap now
-              // governs, since structural collection/persistence runs under watchConfig.enabled.
-              structuralFacts = await appendFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, maxBytes: watchConfig.fact_store_max_bytes });
-            } catch (error) {
-              structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
-              console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
-              structuralFacts = { written_count: 0, retention: undefined };
+          // Finding F4: same isolation as the metric-persist call above -- a storage fault here must
+          // not abort the tick before evaluateAndPersistAlerts, and must not fabricate a retention
+          // outcome that did not happen. Finding F4-B1/F4-B2 re-gate: inline try/catch, not
+          // safeCandidates -- the error message must survive to feed status.state/
+          // storage_write_error below.
+          //
+          // S4 (fact-store capacity plan §4.3): the tick's points are routed to their family stores
+          // (an unregistered fact_name throws before ANY family is written), each appended with its
+          // own budget (watch.json fact_store_budgets, validated against the T8 floor by
+          // resolveFactStoreBudgets; the legacy single fact_store_max_bytes is ignored, Q5), and every
+          // other existing family store gets a retention pass too -- so this runs on every completed
+          // structural tick, even one that produced no points. One family's append/retention failure
+          // is reported (combined into storage_write_error/retention_error below) and never stops
+          // another family from persisting. The DI seam keeps its historical name.
+          const persistFacts = options.appendFactPoints ?? appendFactPointsByFamily;
+          try {
+            structuralFacts = await persistFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, budgets: effectiveBudgets });
+            if (structuralFacts?.append_error) {
+              structuralFactPersistError = structuralFacts.append_error;
+              console.warn(`[daemon] structural-fact-persist failed for some families this tick (${structuralFactPersistError}); the others persisted`);
             }
+          } catch (error) {
+            structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
+            console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
+            structuralFacts = { written_count: 0, retention: undefined };
           }
 
           // Slice S7a, additive, RE-GATED (watch-by-default slice 1, plan §3.2): shadow-constraint
@@ -1136,19 +1210,90 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const watchConfigForHistory = configSnapshot.watch;
   const learnedConfigForHistory = configSnapshot.learned;
   let factStoreCompleteness;
-  let historyTrust;
+  // Fact-store capacity plan §4.2/§4.4 (step S3): the rules whose eligibility horizon is not met on
+  // the daemon's own read (vetoed from recovery at both persistence passes below), and the subset of
+  // those that are horizon-SHORT on a valid ledger report (the operator signal, I12). Every rule is
+  // vetoed when nothing was read -- already true via historyTrust, restated here so the veto is
+  // self-contained.
+  let horizonVetoedRuleIds = new Set(RULE_HORIZONS.keys());
+  // S4 (§4.4): the per-family history veto -- every history-dependent rule when nothing was read.
+  let historyVetoedRuleIds = new Set(HISTORY_DEPENDENT_ALERT_RULE_IDS);
+  const familyHistoryReads = new Map();
+  const horizonShortRuleIds = new Set();
+  // S3b review LOW-2 (S4: per rule): rules whose tier is on but whose family read could not report
+  // coverage (missing/invalid ledger, or the read threw) -- their horizon-short entry is carried forward.
+  const horizonUnknownRuleIds = new Set();
+  let noveltySeenSets;
   if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
     const readFactsForHistory = options.readFactPoints ?? readFactPoints;
-    let factHistoryReadResult;
-    try {
-      factHistoryReadResult = await readFactsForHistory(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS, now: nowMs });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[daemon] fact-history read failed this tick (${message}); degrading to unknown completeness, not fabricating trust`);
-      factHistoryReadResult = undefined;
+    const tierOff = new Set(tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }));
+    // S4 (fact-store capacity plan §4.3/§4.4, I6, I9): ONE independent read PER FAMILY, and only of
+    // the family stores some history-dependent rule of an ENABLED tier reads (no I/O for a family
+    // whose every dependent rule's tier is off). Each read is that family's own ledger, floors and
+    // (for a novelty family) seen-set -- a loss in one family can no longer freeze another family's
+    // recovery, and a veto can no longer authorize a recovery off a store it never checked.
+    const historyFamilies = [...new Set([...RULE_HORIZONS].filter(([ruleId]) => !tierOff.has(ruleId)).flatMap(([, rule]) => rule.families))];
+    for (const family of historyFamilies) {
+      try {
+        // S3b: the novelty seen-set too, validated against this same family read's ledger, so the
+        // daemon's novelty-rule veto uses the same referent as the detectors (noveltyRuleEligible).
+        familyHistoryReads.set(family, await readFactsForHistory(descartesPaths, {
+          family,
+          windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS,
+          now: nowMs,
+          ...(NOVELTY_FAMILIES.has(family) ? { seenSetFamilies: [family] } : {}),
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[daemon] ${family} fact-history read failed this tick (${message}); degrading that family to unknown completeness, not fabricating trust`);
+        familyHistoryReads.set(family, undefined);
+      }
     }
-    factStoreCompleteness = selectFactStoreCompleteness(factHistoryReadResult?.completeness);
-    historyTrust = factHistoryTrustworthy(factHistoryReadResult ?? {});
+    const familyTrust = new Map(historyFamilies.map((family) => [family, factHistoryTrustworthy(familyHistoryReads.get(family) ?? {})]));
+    factStoreCompleteness = selectFamilyFactStoreCompleteness({
+      // Combined summary over the family stores that EXIST (a never-created store is reported per
+      // family as absent, "not observed (no store)", not folded in as "unknown").
+      completeness: combineFamilyCompleteness((historyFamilies.some((family) => familyHistoryReads.get(family)?.store_exists !== false)
+        ? historyFamilies.filter((family) => familyHistoryReads.get(family)?.store_exists !== false)
+        : historyFamilies).map((family) => familyHistoryReads.get(family)?.completeness ?? { status: "unknown", coverage: "unknown" })),
+      family_reads: Object.fromEntries(historyFamilies.map((family) => [family, familyHistoryReads.get(family) ?? { family }])),
+    });
+    // The per-family history veto (§4.4): a rule is vetoed when ANY family it reads is untrusted --
+    // and a family that was not read (its tier is off, or the read threw) counts as untrusted.
+    historyVetoedRuleIds = new Set([...HISTORY_DEPENDENT_ALERT_RULE_IDS].filter((ruleId) => (RULE_HORIZONS.get(ruleId)?.families ?? [undefined])
+      .some((family) => familyTrust.get(family)?.trust !== true)));
+    // Novelty rules (S3b): the SAME predicate the detectors use -- a valid current-epoch seen-set and
+    // its horizon, nothing else (G3: no full-store fallback). Every other rule: the fact floor.
+    // S3b review MEDIUM-2: correlation's referent is its whole 31 d read window (the same window and
+    // predicate the detector uses -- ruleEligible), not only its 3 d horizon, so a correlation the
+    // detector silenced is vetoed AND reported horizon-short here. S4: evaluated against each of the
+    // rule's OWN family reads (an unread family is ineligible).
+    const ruleEligibleOnFamilies = (ruleId) => RULE_HORIZONS.get(ruleId).families
+      .every((family) => familyHistoryReads.get(family) !== undefined && ruleEligible(familyHistoryReads.get(family), ruleId, nowMs, { readWindowMs: DEFAULT_BASELINE_FACT_WINDOW_MS }));
+    horizonVetoedRuleIds = new Set([...RULE_HORIZONS.keys()].filter((ruleId) => !ruleEligibleOnFamilies(ruleId)));
+    // Display-only per-family seen-set state (the overflow / lineage-mismatch "status reason").
+    const seenSetEntries = historyFamilies.flatMap((family) => Object.entries(familyHistoryReads.get(family)?.seen_sets ?? {}));
+    if (seenSetEntries.length > 0) {
+      noveltySeenSets = Object.fromEntries(seenSetEntries.map(([family, set]) => [family, {
+        status: typeof set?.status === "string" ? set.status : "unknown",
+        entry_count: Number.isSafeInteger(set?.entry_count) ? set.entry_count : 0,
+        certified_since_ts: typeof set?.certified_since_ts === "string" ? set.certified_since_ts : null,
+      }]));
+    }
+    // Horizon-SHORT is reported only over a valid ledger's coverage report: a missing/invalid ledger
+    // or failed read is an untrusted-history condition (reported as such), not a short horizon. S4:
+    // decided PER RULE on the rule's own family reads -- a rule whose family read reports no valid
+    // coverage has UNKNOWN horizon state (its prior entry is carried forward; S3b review LOW-2),
+    // without affecting any other family's rules.
+    // S3b review LOW-3: only rules whose owning tier is running -- a detector that is not evaluating
+    // because its tier is off is not "horizon-short", and must not raise the fixed alert. (The
+    // recovery veto above is unchanged; the tier veto freezes those rules at both passes anyway.)
+    const validCoverage = (family) => ["full", "narrowed"].includes(familyHistoryReads.get(family)?.completeness?.coverage);
+    for (const ruleId of RULE_HORIZONS.keys()) {
+      if (tierOff.has(ruleId)) continue;
+      if (!RULE_HORIZONS.get(ruleId).families.every(validCoverage)) horizonUnknownRuleIds.add(ruleId);
+      else if (horizonVetoedRuleIds.has(ruleId)) horizonShortRuleIds.add(ruleId);
+    }
   } else {
     // BLOCKER-2 (daybreak-blue re-gate, found after the OR fix in 1e9ddaf): when NEITHER tier is
     // enabled, we cannot vouch for fact-history without a fact read we must not do when disabled
@@ -1167,7 +1312,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // computeCoveredAlerts call sites below -- this `{trust:false}` branch is now defense-in-depth
     // for the both-off case specifically, not the only thing protecting it; it remains load-bearing
     // on its own for a genuinely-degraded read when at least one tier IS enabled.
-    historyTrust = { trust: false };
+    historyVetoedRuleIds = new Set(HISTORY_DEPENDENT_ALERT_RULE_IDS);
   }
 
   // Finding F4, THE FABRICATION TRAP: `statusRecord` is built here, BEFORE attempting the disk
@@ -1193,13 +1338,201 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // collectors reported), and use that in-memory record for the rest of the tick regardless of
   // whether the disk write succeeded -- so evaluateAndPersistAlerts (and everything downstream) is
   // still reached, unconditionally, with real data.
+  // Fact-store capacity plan §4.2/§4.4, I12 (step S3): the horizon-short signal. Each short rule's
+  // since_ts is carried forward from the previous status record while it stays short (reset the tick
+  // it recovers), so the FIXED daemon.fact_history.horizon_short alert (alert-store.js) can fire once a
+  // rule has been short for HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals. Time-based, not a
+  // tick counter (S3 deviation): a fast tick re-reads the same history, so wall time since the rule
+  // first went short is the faithful measure of "N consecutive structural ticks". The clock carries
+  // ONLY from a prior status written at most one structural interval ago (S3b review LOW-1): wall
+  // time is a faithful measure only while the daemon was actually ticking, so after downtime (or a
+  // status that cannot be dated) the gap is unobserved and the clock restarts. A prior status that is
+  // missing/unreadable/undated/stale/future-dated, or a since_ts in the future (clock rollback),
+  // restarts the clock at now -- that only DELAYS the signal, and never suppresses the status entry.
+  // Bounded imprecision, stated: a single not-short tick whose own status write failed (and no other
+  // gap) is not seen, so a <= one-interval recovery inside a short run can be bridged.
+  // Read lazily (and at most once): only a tick that actually reports horizon state touches the prior
+  // status, so the tiers-off "no I/O when disabled" path is unchanged.
+  let priorStatusPromise;
+  const readPriorStatusOnce = () => {
+    priorStatusPromise ??= (async () => {
+      try {
+        const readPriorStatus = options.readDaemonStatus ?? readDaemonStatus;
+        return await readPriorStatus(descartesPaths);
+      } catch {
+        return undefined;
+      }
+    })();
+    return priorStatusPromise;
+  };
+  let historyHorizonShort;
+  if (horizonShortRuleIds.size > 0 || horizonUnknownRuleIds.size > 0) {
+    const priorStatus = await readPriorStatusOnce();
+    const priorStatusMs = typeof priorStatus?.ts === "string" ? Date.parse(priorStatus.ts) : Number.NaN;
+    const priorContinuous = Number.isFinite(priorStatusMs) && priorStatusMs <= nowMs && nowMs - priorStatusMs <= structuralIntervalMs;
+    const priorBlockRules = priorStatus?.history_horizon_short?.rules;
+    const priorAnyRules = priorBlockRules && typeof priorBlockRules === "object" && !Array.isArray(priorBlockRules) ? priorBlockRules : undefined;
+    const priorRules = priorContinuous ? priorAnyRules : undefined;
+    const nowIsoForHorizon = new Date(nowMs).toISOString();
+    const rules = {};
+    for (const ruleId of [...horizonShortRuleIds].sort()) {
+      const priorSince = priorRules ? priorRules[ruleId]?.since_ts : undefined;
+      const priorSinceMs = typeof priorSince === "string" ? Date.parse(priorSince) : Number.NaN;
+      rules[ruleId] = { since_ts: Number.isFinite(priorSinceMs) && priorSinceMs <= nowMs ? new Date(priorSinceMs).toISOString() : nowIsoForHorizon };
+    }
+    // S3b review LOW-2, per rule since S4: a rule whose family read is untrusted is WORSE than short,
+    // not a clear. Dropping its entry would let the always-covered fixed alert "recover" and restart
+    // its since clock, so its prior entry is carried forward unchanged (whatever its age -- the rule
+    // is vetoed this tick, so it is not evaluating; LOW-1's continuity gate applies to EXTENDING a
+    // short run, not to holding state through an unknown one). No prior entry stays none: never
+    // fabricated. Only that family's rules are carried; every other family is decided on its own read.
+    for (const ruleId of [...horizonUnknownRuleIds].sort()) {
+      const priorEntry = priorAnyRules?.[ruleId];
+      if (priorEntry && typeof priorEntry === "object" && !Array.isArray(priorEntry)) rules[ruleId] = priorEntry;
+    }
+    if (Object.keys(rules).length > 0) {
+      historyHorizonShort = { threshold_ms: HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs, rules: Object.fromEntries(Object.entries(rules).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) };
+    }
+  }
+
+  // S4 (fact-store capacity plan §4.3-§4.5): the per-family budget/retention status block, for EVERY
+  // registry family (display only; consulted by no trust decision). Computed only when a tier is on
+  // (no I/O otherwise). Per family:
+  //   - budget_bytes / source / floor_bytes / ceiling_bytes, `rejected` ({reason:
+  //     budget_below_horizon_floor | invalid}) when watch.json's value was refused, and `clamped`
+  //     ({reason: budget_above_ceiling}) when it was above the ceiling (G2 L4);
+  //   - `horizon_invariant_unmet` ({required_bytes, structural_interval_ms}) when the effective budget is
+  //     below the T8 invariant at this tick's structural interval (G2 L3: below 1 h it scales up);
+  //   - last_tick_bytes and `cap_below_tick` (live per-tick volume above the effective budget: the
+  //     family is fully evicted every tick), from this structural tick, carried across fast ticks;
+  //   - retention_error with retention_error_since_ts (carried while it keeps failing, cleared by a
+  //     clean structural pass), and `retention_failing` once it has failed for
+  //     HISTORY_HORIZON_SHORT_ALERT_TICKS structural intervals, or once the store (as this tick's read
+  //     saw it, or a stat of its file for a family with no history read) exceeds its budget by more
+  //     than one worst-case tick (network/provenance: none pinned) -- a retention pass that keeps
+  //     failing lets the file, and the read cost, grow without bound (appendFactPoints treats a
+  //     retention throw as non-fatal).
+  // Q5 (fact-store capacity plan §4.5 Config, §12): the legacy single-store cap is IGNORED; a
+  // deliberate operator value (normalization already dropped the written-in 5 MB default and invalid
+  // values) is named here so the operator's decision is never silently discarded.
+  const factStoreDeprecations = [["watch.json", watchConfigForHistory], ["learned.json", learnedConfigForHistory]]
+    .filter(([, config]) => typeof config?.fact_store_max_bytes === "number")
+    .map(([source, config]) => ({
+      key: "fact_store_max_bytes",
+      source,
+      configured_bytes: config.fact_store_max_bytes,
+      status: "ignored",
+      note: "the single fact-store cap is replaced by per-family budgets (watch.json fact_store_budgets, each at or above its horizon floor); this value no longer sizes any store",
+    }));
+  let factStoreBudgetsStatus;
+  let carriedRetentionFailure = false;
+  if (watchConfigForHistory.enabled || learnedConfigForHistory.enabled) {
+    const priorFamilies = (await readPriorStatusOnce())?.fact_store_budgets?.families;
+    const priorOf = (family) => {
+      const entry = priorFamilies && typeof priorFamilies === "object" && !Array.isArray(priorFamilies) ? priorFamilies[family] : undefined;
+      return entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+    };
+    const structuralFamilies = structuralFacts?.families && typeof structuralFacts.families === "object" ? structuralFacts.families : undefined;
+    const families = {};
+    for (const family of FACT_FAMILY_IDS) {
+      const budgetBytes = effectiveBudgets[family] ?? FAMILY_DEFAULT_BUDGET_BYTES.get(family);
+      const entry = {
+        budget_bytes: budgetBytes,
+        source: options.factStoreBudgets ? "override" : budgetResolution.source[family],
+        floor_bytes: familyBudgetFloorBytes(family, { structuralIntervalMs }),
+        ceiling_bytes: familyBudgetCeilingBytes(family),
+        ...(budgetResolution.rejected[family] ? { rejected: budgetResolution.rejected[family] } : {}),
+        ...(budgetResolution.clamped?.[family] ? { clamped: budgetResolution.clamped[family] } : {}),
+      };
+      // G2 L3: the T8 invariant at THIS tick's structural interval (operator-settable). Below 1 h the
+      // same bytes hold fewer hours, so a budget sized at 1 h can leave the family permanently
+      // horizon-short; say so here instead of leaving the horizon-short signal as the only sign.
+      const intervalFloorBytes = familyBudgetFloorBytes(family, { structuralIntervalMs });
+      if (budgetBytes < intervalFloorBytes) entry.horizon_invariant_unmet = { required_bytes: intervalFloorBytes, structural_interval_ms: structuralIntervalMs };
+      const prior = priorOf(family);
+      let lastTickBytes;
+      let retentionError;
+      let retentionSince;
+      let retentionFailing = false;
+      if (structuralFamilies) {
+        const result = structuralFamilies[family];
+        const retentionPassSucceeded = result && typeof result === "object" && !Array.isArray(result)
+          && Object.prototype.hasOwnProperty.call(result, "retention")
+          && result.append_error === undefined;
+        if (Number.isSafeInteger(result?.appended_bytes) && result.written_count > 0) lastTickBytes = result.appended_bytes;
+        if (typeof result?.retention_error === "string" && result.retention_error) {
+          retentionError = result.retention_error;
+          const priorSinceMs = typeof prior.retention_error_since_ts === "string" && prior.retention_error ? Date.parse(prior.retention_error_since_ts) : Number.NaN;
+          retentionSince = Number.isFinite(priorSinceMs) && priorSinceMs <= nowMs ? new Date(priorSinceMs).toISOString() : new Date(nowMs).toISOString();
+        } else if (!retentionPassSucceeded) {
+          // A structural tick that did not return this family's successful retention result (for
+          // example an append error or an injected whole-pass failure) has no authority to clear a
+          // carried failure. Recovery is granted only by a genuinely completed family pass.
+          if (typeof prior.retention_error === "string" && prior.retention_error && typeof prior.retention_error_since_ts === "string") {
+            retentionError = prior.retention_error;
+            retentionSince = prior.retention_error_since_ts;
+          }
+          retentionFailing = prior.retention_failing === true;
+        }
+      } else {
+        if (Number.isSafeInteger(prior.last_tick_bytes)) lastTickBytes = prior.last_tick_bytes;
+        if (typeof prior.retention_error === "string" && prior.retention_error && typeof prior.retention_error_since_ts === "string" && Number.isFinite(Date.parse(prior.retention_error_since_ts))) {
+          retentionError = prior.retention_error;
+          retentionSince = prior.retention_error_since_ts;
+        }
+        retentionFailing = prior.retention_failing === true;
+      }
+      if (lastTickBytes !== undefined) {
+        entry.last_tick_bytes = lastTickBytes;
+        if (lastTickBytes > budgetBytes) entry.cap_below_tick = true;
+      }
+      // G2 L1: a family the daemon made no history read of this tick (network and provenance carry no
+      // history-dependent rule, so they are never read here) is sized by a stat of its file instead,
+      // so the oversize check below runs for every family, not only the history-read ones.
+      let readBytes = familyHistoryReads.get(family)?.bytes;
+      if (!Number.isSafeInteger(readBytes)) readBytes = await factStoreFileBytes(descartesPaths, family);
+      if (Number.isSafeInteger(readBytes)) entry.bytes = readBytes;
+      if (retentionError !== undefined) {
+        entry.retention_error = retentionError;
+        entry.retention_error_since_ts = retentionSince;
+      }
+      const failingFor = retentionSince !== undefined && nowMs - Date.parse(retentionSince) >= HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs;
+      const oversize = Number.isSafeInteger(readBytes) && readBytes > budgetBytes + (FAMILY_TICK_SHAPES.get(family)?.worstTickBytes ?? 0);
+      if (failingFor || oversize || retentionFailing) entry.retention_failing = true;
+      if (entry.retention_error || entry.retention_failing === true) carriedRetentionFailure = true;
+      families[family] = entry;
+    }
+    factStoreBudgetsStatus = { families, ...(budgetResolution.unknown_families ? { unknown_families: budgetResolution.unknown_families } : {}) };
+    // The per-family completeness entries (families the daemon read) carry the same budget state,
+    // plus the earliest horizon-short since_ts among that family's rules.
+    if (factStoreCompleteness?.families) {
+      for (const [family, entry] of Object.entries(factStoreCompleteness.families)) {
+        const budget = families[family];
+        if (!budget) continue;
+        entry.budget_bytes = budget.budget_bytes;
+        if (budget.cap_below_tick) entry.cap_below_tick = true;
+        if (budget.horizon_invariant_unmet) entry.horizon_invariant_unmet = true;
+        if (budget.retention_error) entry.retention_error = budget.retention_error;
+        if (budget.retention_failing) entry.retention_failing = true;
+        const shortSince = Object.entries(historyHorizonShort?.rules ?? {})
+          .filter(([ruleId]) => RULE_HORIZONS.get(ruleId)?.families.includes(family))
+          .map(([, rule]) => rule?.since_ts)
+          .filter((since) => typeof since === "string" && Number.isFinite(Date.parse(since)))
+          .sort()[0];
+        // I11: a never-created store reads "not observed (no store)", never "horizon short since X"
+        // (its rules' carried-forward entries stay on history_horizon_short itself).
+        if (shortSince && entry.store !== "absent") entry.horizon_short_since = shortSince;
+      }
+    }
+  }
+
   const collectorHasError = evidence.some((envelope) => envelope.status === "error")
     || (structuralCollectorStatuses ?? []).some((entry) => entry.status === "error");
   const storageWriteError = combineErrors(metricPersistError, structuralFactPersistError);
   const retentionError = combineErrors(write.retention_error, structuralFacts?.retention_error);
   const statusRecord = {
     ts,
-    state: collectorHasError || storageWriteError || retentionError ? "error" : "ok",
+    state: collectorHasError || storageWriteError || retentionError || carriedRetentionFailure ? "error" : "ok",
     mode: options.mode ?? "foreground",
     profile,
     collector_statuses: evidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool })),
@@ -1209,6 +1542,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
+    ...(factStoreBudgetsStatus ? { fact_store_budgets: factStoreBudgetsStatus } : {}),
+    ...(factStoreLegacy ? { fact_store_legacy: factStoreLegacy } : {}),
+    ...(factStoreDeprecations.length > 0 ? { fact_store_deprecations: factStoreDeprecations } : {}),
+    ...(historyHorizonShort ? { history_horizon_short: historyHorizonShort } : {}),
+    ...(noveltySeenSets ? { novelty_seen_sets: noveltySeenSets } : {}),
     // Component D (trusted-state step-1, §7): an installation MODE, not a per-tick/per-read
     // property, so it is unconditional here (unlike the ...(x ? {...} : {}) spreads above, which
     // are conditional on genuinely-computed-this-tick evidence). Display/disclosure only -- see
@@ -1261,6 +1599,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // exactly the phase-appropriate boundary: containment's own failure cannot retroactively affect
   // a persistence pass that already happened.
   const failedDetectorLabels = new Set();
+  const successfulRetentionFamilies = new Set(
+    Object.entries(structuralFacts?.families ?? {})
+      .filter(([, result]) => result && typeof result === "object" && !Array.isArray(result)
+        && Object.prototype.hasOwnProperty.call(result, "retention")
+        && result.append_error === undefined)
+      .map(([family]) => family),
+  );
   if (options.evaluateAlerts !== false) {
     // Per-detector DI seams (mirrors the file's existing options.<fn> ?? <fn> pattern, e.g.
     // loadLearnedConfig/readFactPoints/adjudicateAlertNotifications above) so a single detector
@@ -1386,9 +1731,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // happens when both tiers are off). A genuine detector failure still forces its family's
     // exclusion via failedLabels on top of all sources, on either call site.
     coveredAlertIds = await computeCoveredAlerts(descartesPaths, options, {
-      historyTrust,
+      historyVetoedRuleIds,
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
+      horizonVetoedRuleIds,
+      successfulRetentionFamilies,
       alwaysExcludedRuleIds: [
         ...(learnedConfigForHistory.enabled ? containmentRecommendationRuleIds() : []),
         ...tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
@@ -1403,6 +1750,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // constraint candidates — matching applyAlertCandidates' recovery semantics (plan
         // section 4 / S-live-1 grounding).
         extraCandidates: mainExtraCandidates,
+        successfulRetentionFamilies,
         // Detector-reported recovery coverage (§8.A): identity-keyed covered set. Freeze-by-default
         // for every coverage-subject family (recover only what a producer reported evaluated this
         // tick), intersected with the §7.7 vetoes (history-untrusted, failed-detector, and this
@@ -1474,9 +1822,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     // I/O) only when both tiers are enabled AND containment succeeds AND nothing else this tick
     // warrants a restriction.
     const containmentCoveredAlertIds = await computeCoveredAlerts(descartesPaths, options, {
-      historyTrust,
+      historyVetoedRuleIds,
       failedLabels: failedDetectorLabels,
       evaluatedByLabel,
+      horizonVetoedRuleIds,
+      successfulRetentionFamilies,
       alwaysExcludedRuleIds: tierVetoedRuleIds({ watchEnabled: watchConfigForHistory.enabled, learnedEnabled: learnedConfigForHistory.enabled }),
     });
     const containmentAlerts = await evaluateAndPersistAlerts(descartesPaths, {
@@ -1485,6 +1835,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       historySummary: mainAlerts.history_summary,
       windowMs: options.alertWindowMs,
       extraCandidates: [...mainAlerts.candidates, ...mainExtraCandidates, ...containmentCandidates],
+      successfulRetentionFamilies,
       // Detector-reported recovery coverage (§8.A), containment pass: same identity-keyed
       // freeze-by-default covered set as the main call, sharing the SAME evaluatedByLabel report (so
       // the detector families re-persisted here keep their coverage), but WITHOUT the main call's
