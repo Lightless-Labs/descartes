@@ -798,7 +798,7 @@ test("A1: corrupt facts, a clock rollback, an incomplete latest census and an em
   const partialLatest = await statusOf(A1_ESTABLISHED_STORE, {
     extraPoints: [{ ts: a1Ts(30.25), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "partial" } }],
   });
-  assert.equal(partialLatest.phase, "watching");
+  assert.equal(partialLatest.phase, "cannot establish — no complete census yet");
 
   const empty = await statusOf(A1_ESTABLISHED_STORE, { readPoints: [] });
   // S6 vocabulary for "stale — no complete census in the fact-history window".

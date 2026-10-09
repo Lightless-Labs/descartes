@@ -1,6 +1,20 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-07
+**Last updated:** 2026-10-09
+
+## Per-source session census — 2026-10-09
+
+After merge commit `107f758` and test commit `6ec21fc`, the session census now derives a canonical
+availability universe from usable (`ok`) multiplexer sources. `not_found_on_known_paths` sources are
+outside the universe; present-but-unusable sources keep the census incomplete. Session fact markers
+carry the universe signature, and session baseline folds/churn readiness are isolated to the current
+signature. A signature change or a not-found transition re-warms the session baseline; incomplete
+latest censuses emit no evaluated keys, so existing alerts freeze rather than recover from fabricated
+zeros. Overflow ticks remain fresh for churn while excluded from the statistical count fold.
+
+The implementation is locally staged for commit after this handoff update. Focused session,
+translator, baseline, status-consistency, rule-evaluation, and upgrade checks pass; the required
+fresh-XDG full suite passes **2,377 total / 2,343 pass / 0 fail / 34 skip**. No push.
 
 ## Main merge — 2026-10-09
 

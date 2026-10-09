@@ -41,6 +41,24 @@ export const MAX_SESSION_ENTITY_LIMIT = 200;
 // and reliable, unlike screen's optional (and locale-formatted) creation-date column, which is
 // deliberately NOT parsed below (see collectScreenSessions/parseScreenLs doc).
 const TMUX_FORMAT = "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}";
+const SESSION_MULTIPLEXER_ORDER = ["tmux", "screen"];
+const NOT_FOUND_STATUS = "not_found_on_known_paths";
+
+function sessionAvailabilitySignature(multiplexers) {
+  const universe = SESSION_MULTIPLEXER_ORDER.filter((name) => multiplexers.some(
+    (mux) => mux.multiplexer === name && mux.status === "ok",
+  ));
+  return universe.length > 0 ? `v1:${universe.join("+")}` : undefined;
+}
+
+function sessionCensusComplete(multiplexers) {
+  const usable = multiplexers.filter((mux) => mux.status === "ok");
+  const incomplete = multiplexers.some((mux) => mux.status !== "ok" && mux.status !== NOT_FOUND_STATUS);
+  // A known-path miss is outside this tick's observable universe. It is neither an incomplete
+  // source nor evidence of a zero; at least one usable source is still required to make a real
+  // census. Any present-but-unusable source remains an incomplete census.
+  return usable.length > 0 && !incomplete;
+}
 
 async function runFixedExecFile(command, args, options = {}) {
   return runResolvedExecFile(command, args, {
@@ -197,11 +215,9 @@ async function collectScreenSessions(options = {}) {
 
 /**
  * Session-census L0 collector (Slice 1). Combines tmux + screen results, bounds the combined
- * entity count at DEFAULT_SESSION_ENTITY_LIMIT (must-fix 5), and computes the overall
- * degrade-not-fabricate envelope status: "unable"/confidence 0 only when NEITHER multiplexer
- * binary is present/usable this tick. A successful read from one multiplexer does not make the
- * census complete when its sibling is missing, untrusted, or unable: the outer envelope becomes
- * a partial warning so the baseline cannot fold a zero as a complete two-source census.
+ * entity count at DEFAULT_SESSION_ENTITY_LIMIT (must-fix 5). The census universe is the set of
+ * present, usable multiplexers. A known-path miss is outside that universe; a present-but-
+ * unusable source keeps the census partial so its missing sessions can never become a zero.
  */
 export async function collectSessionEvidence(options = {}) {
   const cap = Math.min(MAX_SESSION_ENTITY_LIMIT, Math.max(1, Number(options.sessionLimit) || DEFAULT_SESSION_ENTITY_LIMIT));
@@ -220,7 +236,8 @@ export async function collectSessionEvidence(options = {}) {
     }
 
     const anyBinaryAvailable = multiplexers.some((mux) => mux.status === "ok");
-    const censusComplete = multiplexers.every((mux) => mux.status === "ok");
+    const censusComplete = sessionCensusComplete(multiplexers);
+    const availabilitySignature = sessionAvailabilitySignature(multiplexers);
     const truncated = allSessions.length > cap;
 
     return {
@@ -233,6 +250,7 @@ export async function collectSessionEvidence(options = {}) {
       })),
       any_binary_available: anyBinaryAvailable,
       census_state: censusComplete ? "complete" : "partial",
+      ...(availabilitySignature ? { availability_signature: availabilitySignature } : {}),
       total_count: allSessions.length,
       sessions: allSessions.slice(0, cap),
       truncated,

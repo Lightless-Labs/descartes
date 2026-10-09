@@ -79,7 +79,7 @@ export function realVolumeStructuralCollectors({ seed = 20261005, scale = 1 } = 
     "scheduled-jobs": async () => envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs, summary: { unavailable_count: 0 }, truncated: false }),
     sessions: async () => envelope("sessions", "collect_sessions", {
       platform: "darwin",
-      multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "absent" }],
+      multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "not_found_on_known_paths" }],
       any_binary_available: true,
       total_count: 0,
       sessions: [],

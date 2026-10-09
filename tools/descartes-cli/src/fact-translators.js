@@ -722,12 +722,19 @@ function buildSessionOverflowMarkerFactPoint(result, envelope, ts) {
   };
 }
 
-// Every multiplexer must report `ok` for a complete two-source census. A known-path miss,
-// untrusted binary, or execution failure is not evidence of a genuine zero, so all such states
-// remain `partial` and the session baseline cannot fold the tick.
+const SESSION_MULTIPLEXER_ORDER = ["tmux", "screen"];
+const SESSION_NOT_FOUND_STATUS = "not_found_on_known_paths";
+
+// The session census universe is the set of sources that are present and usable this tick. A
+// known-path miss is outside that universe; it is not an incomplete source and never contributes
+// a zero. Any other non-ok status means a source is present but not trustworthy, so the census is
+// partial and the baseline cannot fold it.
 function censusStateFor(result) {
   const multiplexers = Array.isArray(result?.multiplexers) ? result.multiplexers : [];
-  return multiplexers.length === 0 || multiplexers.every((mux) => mux?.status === "ok") ? "complete" : "partial";
+  if (multiplexers.length === 0) return "complete"; // legacy/simplified evidence shape
+  const usable = multiplexers.some((mux) => mux?.status === "ok");
+  const incomplete = multiplexers.some((mux) => mux?.status !== "ok" && mux?.status !== SESSION_NOT_FOUND_STATUS);
+  return usable && !incomplete ? "complete" : "partial";
 }
 
 function binaryAvailabilityFor(result) {
@@ -735,6 +742,14 @@ function binaryAvailabilityFor(result) {
   return result.multiplexers
     .map((mux) => `${mux?.multiplexer ?? "unknown"}:${mux?.status ?? "unknown"}`)
     .join("|");
+}
+
+function sessionAvailabilitySignatureFor(result) {
+  const multiplexers = Array.isArray(result?.multiplexers) ? result.multiplexers : [];
+  const universe = SESSION_MULTIPLEXER_ORDER.filter((name) => multiplexers.some(
+    (mux) => mux?.multiplexer === name && mux?.status === "ok",
+  ));
+  return universe.length > 0 ? `v1:${universe.join("+")}` : undefined;
 }
 
 // Must-fix 1/2: emitted unconditionally on every successful sessions envelope — including a
@@ -748,6 +763,7 @@ function buildSessionCensusMarkerFactPoint(result, envelope, ts) {
     entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
     attributes: {
       census_state: censusStateFor(result),
+      ...(sessionAvailabilitySignatureFor(result) ? { availability_signature: sessionAvailabilitySignatureFor(result) } : {}),
       ...(binaryAvailabilityFor(result) ? { binary_availability: binaryAvailabilityFor(result) } : {}),
     },
     source_envelope_id: envelope.id,
