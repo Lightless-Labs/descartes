@@ -126,6 +126,11 @@ function deliveryUrgency(alert, entry) {
   return 1;
 }
 
+function deliveryConfirmationOrder(alert, entry) {
+  if (entry.storm === true) return 0;
+  return alert.incidents?.[entry.incidentKey]?.confirmed_at ? 1 : 0;
+}
+
 // The daemon has three delivery routes, but one per-tick adapter budget. Build the complete
 // route-qualified due set before any route spends a slot. The first assignment is explicit rather
 // than incidental: it reserves a slot for the highest-severity due work, so a lower-severity retry
@@ -160,6 +165,8 @@ export function buildGlobalDeliveryPlan(evaluation, config = {}) {
     const severity = alertSeverityRank(right.alert.severity) - alertSeverityRank(left.alert.severity);
     if (severity !== 0) return severity;
     if (left.urgency !== right.urgency) return left.urgency - right.urgency;
+    const confirmation = deliveryConfirmationOrder(left.alert, left.entry) - deliveryConfirmationOrder(right.alert, right.entry);
+    if (confirmation !== 0) return confirmation;
     if (left.firstSeenMs !== right.firstSeenMs) return left.firstSeenMs - right.firstSeenMs;
     return deliveryWorkKey(left.route, left.alert, left.entry).localeCompare(deliveryWorkKey(right.route, right.alert, right.entry));
   });

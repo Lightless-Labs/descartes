@@ -712,7 +712,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   // same result.
   for (const [id, alert] of byId) {
     if (alert.incident_state === "incident_storm") {
-      if (!alert.incident_storm_notified_at && !["acknowledged", "suppressed", "recovered"].includes(alert.status)
+      if (!alert.incident_storm_notified_at && !["suppressed", "recovered"].includes(alert.status)
         && !alert.legacy_without_episode && deliveryBackoffEligible(alert, new Date(now).getTime())) {
         if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === INCIDENT_STORM_KEY)) {
           notificationDueIncidents.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: alert.incident_storm_count });

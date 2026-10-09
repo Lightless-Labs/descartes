@@ -427,6 +427,23 @@ test("acknowledging a storm resets suppression, allows a later incident, and can
     incident_count: 257,
   }]);
 
+  await writeAlertRecords(paths, overflowAfterAck.alerts);
+  await recordAlertDeliveryFailure(paths, base.id, {
+    now: "2026-10-09T00:03:00.000Z",
+    reason: "unavailable",
+    incidentKey: "__incident_storm__",
+  });
+  const stormRetry = applyAlertCandidates(await readAlertRecords(paths), [], {
+    now: "2026-10-09T00:04:00.000Z",
+    coveredAlertIds: new Set(),
+  });
+  assert.deepEqual(stormRetry.notification_due_incidents, [{
+    alert_id: base.id,
+    incident_key: "__incident_storm__",
+    storm: true,
+    incident_count: 257,
+  }]);
+
   const acknowledgedAgain = await (async () => {
     await writeAlertRecords(paths, overflowAfterAck.alerts);
     return acknowledgeAlert(paths, base.id, { now: "2026-10-09T00:04:00.000Z" });
