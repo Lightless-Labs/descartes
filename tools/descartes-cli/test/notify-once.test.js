@@ -10,7 +10,7 @@ import {
   writeAlertRecords,
   readAlertRecords,
 } from "../src/alert-store.js";
-import { emitMetricAlertFallbackSignals } from "../src/alert-intelligence.js";
+import { emitMetricAlertFallbackSignals, emitSessionAlertSignals } from "../src/alert-intelligence.js";
 import { buildChurnCandidates } from "../src/session-baseline.js";
 import { buildCredentialAccessCandidates } from "../src/credential-access-baseline.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -64,7 +64,7 @@ test("candidate ordering cannot change per-incident state or current payload", (
 
 test("delivery iterates every due incident under one alert id", async () => {
   const paths = await tempPaths();
-  const applied = applyAlertCandidates([], [candidate("identity-a"), candidate("identity-b")], { now: "2026-10-06T00:00:00.000Z" });
+  const applied = applyAlertCandidates([], [{ ...candidate("identity-a"), rule_id: "system.memory.sustained_high" }, { ...candidate("identity-b"), rule_id: "system.memory.sustained_high" }], { now: "2026-10-06T00:00:00.000Z" });
   await writeAlertRecords(paths, applied.alerts);
   const delivered = [];
   await emitMetricAlertFallbackSignals(paths, applied, {
@@ -86,20 +86,20 @@ test("confirmed incidents are retained and a 257th identity enters a one-notific
   let alerts = [];
   for (let index = 0; index < 256; index += 1) {
     const key = `identity-${index}`;
-    const applied = applyAlertCandidates(alerts, [candidate(key)], { now: `2026-10-06T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z` });
+    const applied = applyAlertCandidates(alerts, [{ ...candidate(key), rule_id: "session.churn" }], { now: `2026-10-06T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z` });
     alerts = applied.alerts;
     await writeAlertRecords(paths, alerts);
     await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-07T00:00:00.000Z", incidentKey: key });
     alerts = await readAlertRecords(paths);
   }
-  const overflow = applyAlertCandidates(alerts, [candidate("identity-256")], { now: "2026-10-08T00:00:00.000Z" });
+  const overflow = applyAlertCandidates(alerts, [{ ...candidate("identity-256"), rule_id: "session.churn" }], { now: "2026-10-08T00:00:00.000Z" });
   assert.equal(overflow.alerts[0].incident_state, "incident_storm");
   assert.equal(Object.keys(overflow.alerts[0].incidents).length, 256);
   assert.equal(overflow.alerts[0].incidents["identity-0"].confirmed_at !== null, true);
   assert.deepEqual(overflow.notification_due_incidents.map((entry) => entry.incident_key), ["__incident_storm__"]);
   await writeAlertRecords(paths, overflow.alerts);
   const delivered = [];
-  await emitMetricAlertFallbackSignals(paths, overflow, {
+  await emitSessionAlertSignals(paths, overflow, {
     now: "2026-10-08T00:01:00.000Z",
     config: { enabled: false, enabled_namespaces: ["metric"] },
     deliverNotification: async (_paths, _decision, metadata) => {

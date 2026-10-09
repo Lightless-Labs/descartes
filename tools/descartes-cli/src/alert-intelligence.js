@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure } from "./alert-store.js";
+import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -94,6 +94,56 @@ async function confirmDeliveryIfPossible(descartesPaths, alert, delivery, option
   }
 }
 
+function incidentEntries(evaluation, field = "notification_due_incidents") {
+  if (Array.isArray(evaluation?.[field])) {
+    return evaluation[field].map((entry) => ({ alertId: entry.alert_id, incidentKey: entry.incident_key, storm: entry.storm === true, incidentCount: entry.incident_count }));
+  }
+  const idField = field === "adjudication_due_incidents" ? "adjudication_due_ids" : "notification_due_ids";
+  const ids = Array.isArray(evaluation?.[idField])
+    ? evaluation[idField]
+    : field === "adjudication_due_incidents" && Array.isArray(evaluation?.notification_due_ids)
+      ? evaluation.notification_due_ids
+      : [];
+  return ids.map((alertId) => ({ alertId, incidentKey: undefined, storm: false }));
+}
+
+function alertForIncident(alert, entry) {
+  const incidentKey = entry.incidentKey ?? alertEpisodeKey(alert);
+  if (incidentKey === INCIDENT_STORM_KEY) {
+    return {
+      ...alert,
+      incident_key: INCIDENT_STORM_KEY,
+      current_incident_key: INCIDENT_STORM_KEY,
+      diagnostics: { ...(alert.diagnostics ?? {}), incident_count: entry.incidentCount ?? alert.incident_storm_count ?? 0 },
+      title: "Descartes: incident storm detected",
+      summary: `${entry.incidentCount ?? alert.incident_storm_count ?? 0} distinct incidents are active under one alert; per-incident notifications are paused until recovery or acknowledgement.`,
+      severity: alert.severity,
+      __incident_key: INCIDENT_STORM_KEY,
+    };
+  }
+  const incident = alert.incidents?.[incidentKey];
+  if (!incident) return { ...alert, __incident_key: incidentKey };
+  return {
+    ...alert,
+    ...incident.payload,
+    severity: incident.severity_max,
+    incident_key: incidentKey,
+    current_incident_key: incidentKey,
+    delivery_failure_count: incident.delivery_failure_count,
+    last_delivery_failure_at: incident.last_delivery_failure_at,
+    delivery_failure_reason: incident.delivery_failure_reason,
+    delivery_failing_since: incident.delivery_failing_since,
+    next_attempt_at: incident.next_attempt_at,
+    last_attempt_at: incident.last_attempt_at,
+    backoff_delay_ms: incident.backoff_delay_ms,
+    __incident_key: incidentKey,
+  };
+}
+
+function incidentKeyForAlert(alert) {
+  return alert?.__incident_key ?? alertEpisodeKey(alert);
+}
+
 async function recordDeliveryFailureIfPossible(descartesPaths, alert, options) {
   try {
     await recordAlertDeliveryFailure(descartesPaths, alert.id, {
@@ -107,7 +157,7 @@ async function recordDeliveryFailureIfPossible(descartesPaths, alert, options) {
   }
 }
 
-async function deliveryStillDue(descartesPaths, alert, now) {
+async function deliveryStillDue(descartesPaths, alert, now, incidentKey = incidentKeyForAlert(alert)) {
   if (!descartesPaths?.stateDir) return true;
   const current = (await readAlertRecords(descartesPaths)).find((entry) => entry.id === alert.id);
   // Pure/unit callers may intentionally provide an evaluation without a persisted alert record.
@@ -115,15 +165,23 @@ async function deliveryStillDue(descartesPaths, alert, now) {
   // already delivered.
   if (!current) return true;
   if (["recovered", "suppressed"].includes(current.status)) return false;
-  const key = alertEpisodeKey(alert);
-  const currentRank = alertSeverityRank(current.severity);
-  const notifiedRank = alertSeverityRank(current.notified_severity_max);
-  if (current.notified_incident_keys?.includes(key) && currentRank <= notifiedRank) return false;
+  if (incidentKey === INCIDENT_STORM_KEY) {
+    if (current.incident_storm_notified_at) return false;
+    return deliveryStillDueForFields(current, now);
+  }
+  const incident = current.incidents?.[incidentKey];
+  if (!incident) return false;
+  const currentRank = alertSeverityRank(incident.severity_max);
+  const notifiedRank = alertSeverityRank(incident.notified_severity);
+  if (incident.confirmed_at && currentRank <= notifiedRank) return false;
+  return deliveryStillDueForFields(incident, now);
+}
+
+function deliveryStillDueForFields(current, now) {
   const nowMs = new Date(now).getTime();
   const lastAttemptMs = current.last_attempt_at ? new Date(current.last_attempt_at).getTime() : NaN;
   if (Number.isFinite(lastAttemptMs) && lastAttemptMs <= nowMs && Number.isFinite(current.backoff_delay_ms)
-    && nowMs < lastAttemptMs + current.backoff_delay_ms && !current.notified_incident_keys?.includes(key)
-    && currentRank <= notifiedRank) return false;
+    && nowMs < lastAttemptMs + current.backoff_delay_ms) return false;
   return true;
 }
 
@@ -582,8 +640,8 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array `notification_due_ids` (a
   // corrupt/foreign evaluation shape) must degrade to "nothing due", not throw ("is not iterable")
   // out of `new Set(...)` and abort the caller's tick.
-  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
-  if (dueIds.size === 0) return { fired: [] };
+  const dueEntries = incidentEntries(evaluation);
+  if (dueEntries.length === 0) return { fired: [] };
 
   // Slice 4b Decision 3b (Fable review MUST-FIX 4): scoped to the LOCALLY-composed allowlist
   // (session-baseline.js's own two ids, plus PEER_COUNT_SPIKE_RULE_ID/PEER_COUNT_DROP_RULE_ID/
@@ -593,9 +651,12 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   //
   // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array `evaluation.alerts` likewise
   // degrades to `[]` rather than throwing ("...filter is not a function") on a corrupt/foreign shape.
-  const dueSessionAlerts = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).filter(
-    (alert) => dueIds.has(alert.id) && ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
-  );
+  const dueSessionAlerts = dueEntries
+    .map((entry) => {
+      const alert = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).find((candidate) => candidate.id === entry.alertId);
+      return alert ? { entry, alert: alertForIncident(alert, entry) } : undefined;
+    })
+    .filter((entry) => entry && (entry.entry.storm === true || ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(entry.alert.rule_id)));
   if (dueSessionAlerts.length === 0) return { fired: [] };
 
   let deliverNotification;
@@ -609,7 +670,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`descartes: emitSessionAlertSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due session-family alerts reported failed`);
-    return { fired: [], failed: dueSessionAlerts.map((dueAlert) => dueAlert.id) };
+    return { fired: [], failed: dueSessionAlerts.map(({ alert }) => alert.id) };
   }
   const now = options.now ?? new Date().toISOString();
 
@@ -629,11 +690,11 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   // canary-scoped special case -- a real daemon-robustness win for the whole family, not just canary.
   const fired = [];
   const failed = [];
-  for (const alert of dueSessionAlerts) {
+  for (const { entry, alert } of dueSessionAlerts) {
     const decision = buildSessionAlertNotificationDecision(alert);
+    const episodeKey = incidentKeyForAlert(alert);
     try {
-      if (!(await deliveryStillDue(descartesPaths, alert, now))) continue;
-      const episodeKey = alertEpisodeKey(alert);
+      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey))) continue;
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       // daybreak-blue #6 (MEDIUM): deliverNotificationDecision RESOLVES (it never throws) with a
       // status enum -- "error"/"unavailable" mean the notification did NOT reach the operator, and
@@ -652,7 +713,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
-      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey: alertEpisodeKey(alert) });
+      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
       failed.push(alert.id);
     }
   }
@@ -670,6 +731,14 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
 // does not widen to any other rule_id; session/peer identity stays hashed/counts-only.
 function buildSessionAlertNotificationDecision(alert) {
   const diagnostics = alert?.diagnostics ?? {};
+  if (alert?.incident_key === INCIDENT_STORM_KEY) {
+    return {
+      notify: true,
+      severity: alert.severity === "critical" ? "critical" : "warning",
+      title: alert.title,
+      body: alert.summary,
+    };
+  }
   if (alert?.rule_id === SESSION_COUNT_DROP_RULE_ID) {
     return {
       notify: true,
@@ -919,14 +988,16 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
 
   // daybreak-blue #7 (MEDIUM) point 2 precedent, applied here too: a corrupt/foreign evaluation
   // shape degrades to "nothing due", not a throw that aborts the caller's tick.
-  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
-  if (dueIds.size === 0) return { fired: [] };
+  const dueEntries = incidentEntries(evaluation);
+  if (dueEntries.length === 0) return { fired: [] };
 
-  const dueMetricAlerts = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).filter((alert) => {
-    if (!dueIds.has(alert.id)) return false;
+  const dueMetricAlerts = dueEntries.map((entry) => {
+    const alert = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).find((candidate) => candidate.id === entry.alertId);
+    if (!alert) return undefined;
+    const incidentAlert = alertForIncident(alert, entry);
     const { namespace, hardExcluded } = classifyAlertNamespace(alert?.rule_id);
-    return !hardExcluded && namespace === "metric";
-  });
+    return !entry.storm && !hardExcluded && namespace === "metric" ? { entry, alert: incidentAlert } : undefined;
+  }).filter(Boolean);
   if (dueMetricAlerts.length === 0) return { fired: [] };
 
   let deliverNotification;
@@ -935,7 +1006,7 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`descartes: emitMetricAlertFallbackSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due metric-family alerts reported failed`);
-    return { fired: [], failed: dueMetricAlerts.map((a) => a.id) };
+    return { fired: [], failed: dueMetricAlerts.map(({ alert }) => alert.id) };
   }
   const now = options.now ?? new Date().toISOString();
 
@@ -943,16 +1014,16 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
   // emitSessionAlertSignals' own FIX-B loop above.
   const fired = [];
   const failed = [];
-  for (const alert of dueMetricAlerts) {
+  for (const { entry, alert } of dueMetricAlerts) {
     const decision = {
       notify: true,
       severity: alert.severity === "critical" ? "critical" : "warning",
       title: alert.title,
       body: alert.summary || alert.title,
     };
+    const episodeKey = incidentKeyForAlert(alert);
     try {
-      if (!(await deliveryStillDue(descartesPaths, alert, now))) continue;
-      const episodeKey = alertEpisodeKey(alert);
+      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey))) continue;
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
         await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
@@ -965,7 +1036,7 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
-      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey: alertEpisodeKey(alert) });
+      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
       failed.push(alert.id);
     }
   }
@@ -1327,11 +1398,14 @@ function hashPromptText(text) {
 export async function adjudicateAlertNotifications(descartesPaths, evaluation, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
-  const dueIds = evaluation?.adjudication_due_ids ?? evaluation?.notification_due_ids ?? [];
+  const dueEntries = incidentEntries(evaluation, "adjudication_due_incidents");
   if (!config.enabled) return { status: "disabled", decisions: [] };
-  if (dueIds.length === 0) return { status: "no_due_alerts", decisions: [] };
+  if (dueEntries.length === 0) return { status: "no_due_alerts", decisions: [] };
 
-  const dueAlerts = (evaluation.alerts ?? []).filter((alert) => dueIds.includes(alert.id));
+  const dueAlerts = dueEntries.map((entry) => {
+    const alert = (evaluation.alerts ?? []).find((candidate) => candidate.id === entry.alertId);
+    return alert ? alertForIncident(alert, entry) : undefined;
+  }).filter(Boolean);
 
   // S13 must-fix 4: namespace/eligibility filter applied BEFORE any rate-limit accounting. When
   // alerts are due but none are LLM-eligible (all un-consented / hard-excluded / un-templated),
@@ -1586,17 +1660,18 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const rawText = contentToText(finalAssistantMessage.content).trim();
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
         let delivery;
+        const incidentKey = incidentKeyForAlert(alert);
+        const episodeKey = incidentKey;
         if (decision.notify) {
-          if (!(await deliveryStillDue(descartesPaths, alert, now))) throw new Error("delivery_no_longer_due");
+          if (!(await deliveryStillDue(descartesPaths, alert, now, incidentKey))) throw new Error("delivery_no_longer_due");
           deliveryAttempted = true;
-          const episodeKey = alertEpisodeKey(alert);
           delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
         }
         if (decision.notify) {
           if (!deliveryWasSuccessful(delivery)) {
-            await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey: alertEpisodeKey(alert) });
+            await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey, incidentKey });
           }
-          await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey: alertEpisodeKey(alert), incidentKey: alertEpisodeKey(alert) });
+          await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey });
         }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
@@ -1617,14 +1692,15 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           prompt_hash: hashPromptText(promptText),
           prompt_template_version: ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
           decision,
-          adjudication: { notify: decision.notify, episode_key: alertEpisodeKey(alert) },
+          adjudication: { notify: decision.notify, episode_key: incidentKeyForAlert(alert), incident_key: incidentKeyForAlert(alert) },
           delivery,
         });
         if (appended && !decision.notify) {
           await recordAlertAdjudication(descartesPaths, alert.id, {
             now,
             severity: alert.severity,
-            episodeKey: alertEpisodeKey(alert),
+            episodeKey: incidentKeyForAlert(alert),
+            incidentKey: incidentKeyForAlert(alert),
             notify: false,
           });
         }
@@ -1633,7 +1709,8 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           await recordDeliveryFailureIfPossible(descartesPaths, alert, {
             now,
             reason: error instanceof Error ? error.message : String(error),
-            episodeKey: alertEpisodeKey(alert),
+            episodeKey: incidentKeyForAlert(alert),
+            incidentKey: incidentKeyForAlert(alert),
           });
         }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {

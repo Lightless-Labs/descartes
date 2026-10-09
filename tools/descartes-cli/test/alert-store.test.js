@@ -334,7 +334,7 @@ test("acknowledgement suppresses persistence but not a later severity escalation
   assert.equal(escalated.alerts[0].notified_severity_max, "warning");
 });
 
-test("legacy active records with last_notified are due until audit evidence proves delivery", () => {
+test("legacy active records without episode metadata remain silent", () => {
   const legacy = {
     id: "alert_legacy",
     rule_id: "system.memory.sustained_high",
@@ -349,13 +349,13 @@ test("legacy active records with last_notified are due until audit evidence prov
   };
 
   const persistent = applyAlertCandidates([legacy], [{ ...legacy }], { now: "2026-05-28T05:00:00.000Z" });
-  assert.deepEqual(persistent.notification_due_ids, ["alert_legacy"]);
+  assert.deepEqual(persistent.notification_due_ids, []);
   assert.equal(persistent.alerts[0].episode_started_at, "2026-05-28T05:00:00.000Z");
   assert.equal(persistent.alerts[0].episode_notified_at, null);
   assert.equal(persistent.alerts[0].notified_severity_max, null);
 
   const escalated = applyAlertCandidates(persistent.alerts, [{ ...persistent.alerts[0], severity: "critical" }], { now: "2026-05-28T05:01:00.000Z" });
-  assert.deepEqual(escalated.notification_due_ids, ["alert_legacy"]);
+  assert.deepEqual(escalated.notification_due_ids, []);
 });
 
 test("legacy Oct-1 delivery cannot prove Oct-3 current activation", async () => {
@@ -379,7 +379,7 @@ test("legacy Oct-1 delivery cannot prove Oct-3 current activation", async () => 
   const [migrated] = await readAlertRecords(paths);
   assert.equal(migrated.episode_started_at, null);
   const upgraded = applyAlertCandidates([migrated], [{ ...migrated }], { now: "2026-10-03T00:06:00.000Z" });
-  assert.deepEqual(upgraded.notification_due_ids, [legacy.id]);
+  assert.deepEqual(upgraded.notification_due_ids, []);
   assert.equal(upgraded.alerts[0].episode_started_at, "2026-10-03T00:06:00.000Z");
   assert.equal(migrated.last_notified, "2026-10-01T00:01:00.000Z", "legacy field is retained as history, never used as proof");
 });
