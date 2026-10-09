@@ -4,9 +4,10 @@
 
 ## Notify-once daybreak rework fixes — 2026-10-09 — local, not pushed
 
-Fixed the current `feat/notify-once-2026-10` findings in four atomic commits:
+Fixed the current `feat/notify-once-2026-10` findings in six atomic commits:
 `a981547` (global delivery ordering), `eff179b` (acknowledgement resets storm suppression),
-`819e54d` (clock-safe segment retention), and `f9152c4` (dated-segment audit documentation).
+`819e54d` (clock-safe segment retention), `f9152c4` (dated-segment audit documentation),
+`bdfaf65` (validation record), and `41f4ae0` (post-ack retry/comparator hardening).
 The global per-tick queue collects route-qualified deterministic/session, metric, and LLM work,
 sorts severity first then new/escalated work then oldest-unconfirmed, reserves the first slot for
 the highest-severity item, and invokes routes in assignment order. A 10,000-tick bounded-progress
@@ -14,9 +15,11 @@ property and the eight-warning-session plus critical-memory reproduction pass.
 
 Acknowledgement now closes the storm episode, retains old keys as acknowledged history, permits
 later incidents and escalations under normal rules, and emits a fresh storm notification only for
-a new post-ack overflow. Audit retention uses a monotonic anchor plus the newest dated segment,
-re-stats size/mtime before unlink, and skips writer races. Audit reconstruction stably merges all
-records by timestamp. README now documents the dated UTC segment design.
+a new post-ack overflow. Post-ack storm delivery retries remain eligible while acknowledged.
+Global ordering explicitly places unconfirmed work before confirmed work within the same tier.
+Audit retention uses a monotonic anchor plus the newest dated segment, re-stats size/mtime before
+unlink, and skips writer races. Audit reconstruction stably merges all records by timestamp. README
+now documents the dated UTC segment design.
 
 Focused alert-intelligence, daemon, alert-store, and notification-delivery suites pass 356/356.
 Fresh-XDG `npm test` reports 2382 total / 2326 pass / 22 environment failures / 34 skipped /
