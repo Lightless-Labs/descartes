@@ -38,9 +38,9 @@ monopolize the daemon or block another route.
 
 ## Verification
 
-- Focused notify-once suites: alert-store 25/25, alert-intelligence 144/144,
-  notification-delivery 18/18, and the containment/fact-store regressions 2/2.
-- Fresh-XDG `npm test`: 2,376 total, 2,320 passing, 22 environment failures, 34 skipped, 0 todo.
+- Focused alert-intelligence suite: 148/148. The combined alert-store,
+  alert-intelligence, notification-delivery, containment, and fact-store suites pass 243/243.
+- Fresh-XDG `npm test`: 2,386 total, 2,330 passing, 22 environment failures, 34 skipped, 0 todo.
   The failures are 17 sandbox notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump
   loopback `listen EPERM` tests, and 2 live-host macOS provenance checks returning `unknown` instead
   of `ok`; no product-behavior failures remain.

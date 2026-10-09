@@ -2,6 +2,19 @@
 
 **Last updated:** 2026-10-09
 
+## Notify-once deferred LLM-route failure fix — 2026-10-09 — local, not pushed
+
+The three early-return paths for degraded, unreadable, or unavailable LLM-route dependencies now
+return their accumulated `delivery_outcomes`, so the daemon's single batched alert-store write
+records the failure and applies ordinary retry backoff. A three-tick unreadable-audit regression
+verifies the first failure is persisted, the next tick is skipped during backoff, and a later due
+tick retries. Focused alert-intelligence verification passes 148/148; the combined alert-store,
+alert-intelligence, notification-delivery, containment, and fact-store suites pass 243/243.
+Fresh-XDG `npm test` reports 2,386 total / 2,330 passing / 22 environment failures / 34 skipped /
+0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`, 3 tap-bump loopback
+`listen EPERM`, and 2 live-host macOS provenance checks returning `unknown` instead of `ok`; no
+product-behavior failures were observed.
+
 ## Notify-once daybreak rework follow-up — 2026-10-09 — local, not pushed
 
 Closed the remaining review findings on `feat/notify-once-2026-10` in three atomic commits:

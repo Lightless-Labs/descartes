@@ -1688,7 +1688,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     } else {
       console.warn(`descartes: alert intelligence audit writes are still failing at ${auditFile}; skipping adjudication this tick (zero LLM calls) until a write succeeds again`);
       await failEligibleRoute("llm_route_audit_unavailable");
-      return { status: "audit_write_degraded", decisions: [], excluded };
+      return { status: "audit_write_degraded", decisions: [], excluded, delivery_outcomes: deliveryOutcomes };
     }
   }
 
@@ -1712,7 +1712,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   } catch (error) {
     console.warn(`descartes: alert intelligence audit read failed (${errorLabel(error)}); skipping adjudication this tick (budget cannot be computed)`);
     await failEligibleRoute("llm_route_audit_unavailable");
-    return { status: "audit_unavailable", decisions: [], excluded };
+    return { status: "audit_unavailable", decisions: [], excluded, delivery_outcomes: deliveryOutcomes };
   }
   const historical = partitionRecentAuditCounts(audit, now);
   // RUNNING per-class counters, seeded from trailing-hour audit history and incremented as calls
@@ -1737,7 +1737,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   } catch (error) {
     console.warn(`descartes: alert intelligence session/delivery module load failed (${errorLabel(error)}); skipping adjudication this tick (zero LLM calls)`);
     await failEligibleRoute("llm_route_dependencies_unavailable");
-    return { status: "dependencies_unavailable", decisions: [], excluded };
+    return { status: "dependencies_unavailable", decisions: [], excluded, delivery_outcomes: deliveryOutcomes };
   }
 
   const records = [];

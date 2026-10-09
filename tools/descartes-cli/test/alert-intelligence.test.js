@@ -1373,6 +1373,43 @@ test("S13 I/O hardening: a non-ENOENT budget-seed audit read failure (audit path
   assert.deepEqual(result.decisions, []);
 });
 
+test("an unreadable LLM audit records a delivery failure and applies backoff across daemon ticks", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(auditFile, { recursive: true });
+  const config = normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 3, critical_reservation: 0 });
+  const candidate = alert({ id: "alert_audit_retry", rule_id: "system.memory.sustained_high" });
+  const ticks = [
+    "2026-10-09T00:00:00.000Z",
+    "2026-10-09T00:00:30.000Z",
+    "2026-10-09T00:01:01.000Z",
+  ];
+
+  let evaluation = applyAlertCandidates([], [candidate], { now: ticks[0] });
+  await writeAlertRecords(paths, evaluation.alerts);
+
+  const first = await deliverDueAlertNotifications(paths, evaluation, { now: ticks[0], config });
+  let persisted = (await readAlertRecords(paths))[0];
+  assert.equal(first.alertIntelligence.status, "audit_unavailable");
+  assert.equal(first.items.length, 1);
+  assert.equal(persisted.incidents.default.delivery_failure_count, 1);
+  assert.equal(persisted.incidents.default.last_attempt_at, ticks[0]);
+  assert.equal(persisted.incidents.default.next_attempt_at, "2026-10-09T00:01:00.000Z");
+
+  evaluation = applyAlertCandidates(await readAlertRecords(paths), [candidate], { now: ticks[1] });
+  const second = await deliverDueAlertNotifications(paths, evaluation, { now: ticks[1], config });
+  persisted = (await readAlertRecords(paths))[0];
+  assert.equal(second.items.length, 0, "the failed LLM route must honor persisted backoff on the next tick");
+  assert.equal(persisted.incidents.default.delivery_failure_count, 1);
+
+  evaluation = applyAlertCandidates(await readAlertRecords(paths), [candidate], { now: ticks[2] });
+  const third = await deliverDueAlertNotifications(paths, evaluation, { now: ticks[2], config });
+  persisted = (await readAlertRecords(paths))[0];
+  assert.equal(third.alertIntelligence.status, "audit_unavailable");
+  assert.equal(third.items.length, 1, "the failure becomes due again only after backoff expires");
+  assert.equal(persisted.incidents.default.delivery_failure_count, 2);
+});
+
 test("S13 I/O hardening: an appendAuditRecord failure does not crash adjudicate, BREAKS after the first failure (does not continue to a second due alert), and surfaces audit_write_degraded (never 'ok')", async () => {
   const paths = await tempPaths();
   await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
