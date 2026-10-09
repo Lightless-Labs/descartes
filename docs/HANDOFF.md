@@ -8,8 +8,8 @@ The current `fix/collector-sources-2026-10` re-gate is implemented locally in at
 `4c9cb40` (fail-closed binary ownership/ACL trust, operator-path docs, and cache removal),
 `8ed5a83` (malformed tmux/screen output makes the source partial), `6ba7d80` (v2 session-universe
 count/churn identities, persistent multiplexer-disappearance status, and tmux+screen → screen
-re-warm regression), and `f1830c6` (nonzero screen output with malformed rows remains partial).
-No push or merge.
+re-warm regression), `f1830c6` (nonzero screen output with malformed rows remains partial), and
+`f668599` (version daemon fixtures with explicit census universes). No push or merge.
 
 Binary trust no longer performs group-membership resolution. Every realpath'd file/ancestor must be
 root/daemon-owned, not group/other-writable, and ACL-free; ACL probe uncertainty is untrusted with
@@ -17,7 +17,10 @@ an operator `trusted_binary_paths` remediation hint. Session count/churn coverag
 (`v2:tmux`, `v2:screen`, `v2:tmux+screen`), while legacy identities freeze. Baseline status carries
 `binary_availability` and reports `source_not_observed: <multiplexer> since <ts>` while a previously
 observed source remains a known-path miss. Focused resolver, session collector, session baseline,
-and baseline suites are green; the fresh-XDG full suite remains to be run for final accounting.
+baseline, daemon, and upgrade suites are green. The fresh-XDG full suite reports 2,383 total / 2,327
+pass / 22 fail / 34 skip; all 22 failures are sandbox/live-host environment failures: 20 loopback
+`listen EPERM` failures and 2 live macOS provenance checks returning `unknown` because process
+inspection is restricted. No changed-behavior failures remain.
 
 ## Per-source session census — 2026-10-09
 
@@ -29,14 +32,14 @@ signature. A signature change or a not-found transition re-warms the session bas
 latest censuses emit no evaluated keys, so existing alerts freeze rather than recover from fabricated
 zeros. Overflow ticks remain fresh for churn while excluded from the statistical count fold.
 
-The implementation is locally staged for commit after this handoff update. Focused session,
-translator, baseline, status-consistency, rule-evaluation, and upgrade checks pass; the required
-fresh-XDG full suite passes **2,377 total / 2,343 pass / 0 fail / 34 skip**. No push.
+The implementation is committed locally. Focused session, translator, baseline, status-consistency,
+rule-evaluation, daemon, and upgrade checks pass; the required fresh-XDG full suite has the totals
+reported above. No push.
 
 ## Main merge — 2026-10-09
 
 Merged local `main` at `b60efc8` into `fix/collector-sources-2026-10`. The conflict resolution
-retains collector binary writer-set trust and operator-trusted path threading, incomplete session/VPN
+retains strict collector binary trust and operator-trusted path threading, incomplete session/VPN
 census handling, Tailscale provenance, per-family fact-store migration/budgets, peer availability
 regime vetoes, and the capacity branch's freshness/rule-evaluation surfaces. The fresh-XDG full
 suite reached 2,330 passing, 9 failing, and 34 skipped; the failures are centered on the known
@@ -50,11 +53,11 @@ fixed locally and have not been pushed or merged. Atomic commits for this task a
 (provenance process-table output bound), `44540d9` (effective writer-set binary trust and wrapper
 rejection), `bdbc560` (incomplete session/VPN census handling and finite Tailscale IDs), and
 `5897fb2` (operator-trusted path threading through daemon, Pi, and all resolver-backed collectors).
-The writer-set policy expands group writers using macOS `dscl`/primary-group users or Linux
-`getent`, caches membership per tick, rejects unresolved membership, and applies to every ancestor;
-operator-trusted absolute paths remain an explicit override. Script wrappers are rejected unless the
-exact path is operator-trusted, so a trusted wrapper cannot substitute for a rejected downstream
-binary. Tailscale untrusted evidence retains the offending component, reason, and override hint.
+The earlier writer-set policy was superseded by strict root/daemon ownership, mode-bit, and ACL
+checks on every ancestor; group membership is not resolved. Operator-trusted absolute paths remain
+an explicit override. Script wrappers are rejected unless the exact path is operator-trusted, so a
+trusted wrapper cannot substitute for a rejected downstream binary. Tailscale untrusted evidence
+retains the offending component, reason, and override hint.
 
 Validation: the required fresh-XDG full `npm test` run with host access passed **2113/2113, 0
 failures, 34 skips, 2147 total**. The two live macOS provenance regressions pass outside the
