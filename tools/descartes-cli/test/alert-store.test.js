@@ -388,6 +388,54 @@ test("acknowledgement suppresses persistence but not a later severity escalation
   assert.equal(escalated.alerts[0].notified_severity_max, "warning");
 });
 
+test("acknowledging a storm resets suppression, allows a later incident, and can notify a new overflow", async () => {
+  const paths = await tempPaths();
+  const base = {
+    id: "alert_canary_storm_ack",
+    rule_id: "canary.tripped",
+    fingerprint: "canary-hash",
+    severity: "critical",
+    title: "Canary tripped",
+    summary: "Canary evidence changed.",
+    diagnostics: { canary_id_hash: "canary-hash", trip_reason: "changed" },
+  };
+  const initial = applyAlertCandidates([], Array.from({ length: 257 }, (_, index) => ({
+    ...base,
+    incident_key: `before-ack-${index}`,
+  })), { now: "2026-10-09T00:00:00.000Z" });
+  assert.equal(initial.alerts[0].incident_state, "incident_storm");
+  await writeAlertRecords(paths, initial.alerts);
+
+  const acknowledged = await acknowledgeAlert(paths, base.id, { now: "2026-10-09T00:01:00.000Z" });
+  assert.equal(acknowledged.incident_state, "normal");
+  assert.equal(acknowledged.incident_key_overflow, false);
+  assert.equal(Object.values(acknowledged.incidents).every((incident) => incident.status === "acknowledged"), true);
+
+  const oneNew = applyAlertCandidates([acknowledged], [{ ...base, incident_key: "after-ack-1" }], { now: "2026-10-09T00:02:00.000Z" });
+  assert.equal(oneNew.alerts[0].incident_state, "normal");
+  assert.deepEqual(oneNew.notification_due_incidents, [{ alert_id: base.id, incident_key: "after-ack-1" }]);
+
+  const overflowAfterAck = applyAlertCandidates([acknowledged], Array.from({ length: 257 }, (_, index) => ({
+    ...base,
+    incident_key: `after-ack-overflow-${index}`,
+  })), { now: "2026-10-09T00:03:00.000Z" });
+  assert.equal(overflowAfterAck.alerts[0].incident_state, "incident_storm");
+  assert.deepEqual(overflowAfterAck.notification_due_incidents, [{
+    alert_id: base.id,
+    incident_key: "__incident_storm__",
+    storm: true,
+    incident_count: 257,
+  }]);
+
+  const acknowledgedAgain = await (async () => {
+    await writeAlertRecords(paths, overflowAfterAck.alerts);
+    return acknowledgeAlert(paths, base.id, { now: "2026-10-09T00:04:00.000Z" });
+  })();
+  const following = applyAlertCandidates([acknowledgedAgain], [{ ...base, incident_key: "following-ack" }], { now: "2026-10-09T00:05:00.000Z" });
+  assert.equal(following.alerts[0].incident_state, "normal");
+  assert.deepEqual(following.notification_due_incidents, [{ alert_id: base.id, incident_key: "following-ack" }]);
+});
+
 test("legacy active records without episode metadata remain silent", () => {
   const legacy = {
     id: "alert_legacy",

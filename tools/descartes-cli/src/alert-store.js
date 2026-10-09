@@ -626,7 +626,8 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
     for (const key of [...incidentCandidates.keys()].sort()) {
       const candidate = incidentCandidates.get(key);
       const previousIncident = next.incidents[key];
-      if (!previousIncident && Object.keys(next.incidents).length >= MAX_LIVE_INCIDENTS) {
+      const liveIncidentCount = Object.values(next.incidents).filter((incident) => !["acknowledged", "recovered", "suppressed"].includes(incident.status)).length;
+      if (!previousIncident && liveIncidentCount >= MAX_LIVE_INCIDENTS) {
         overflowCount += 1;
         continue;
       }
@@ -655,7 +656,11 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         ...incident,
         last_seen: now,
         severity_max: alertSeverityRank(payload.severity) > incidentSeverityRank(incident) ? payload.severity : incident.severity_max,
-        status: "active",
+        // Acknowledgement closes the current incident episode for the alert, but the producer may
+        // continue reporting the same old keys. Keep those old keys acknowledged so they do not
+        // consume the post-ack live-key budget or re-notify; genuinely new keys and escalations
+        // remain active and are due under the normal rules.
+        status: base.status === "acknowledged" && previousIncident && !severityEscalated ? previousIncident.status : "active",
         payload: candidatePayload(selectedCandidate),
       };
       const newIncident = !previousIncident;
@@ -673,10 +678,11 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
     if (overflowCount > 0) {
       next.incident_state = "incident_storm";
       next.incident_key_overflow = true;
-      next.incident_storm_count = Math.max(next.incident_storm_count ?? 0, Object.keys(next.incidents).length + overflowCount);
+      const liveIncidentCount = Object.values(next.incidents).filter((incident) => !["acknowledged", "recovered", "suppressed"].includes(incident.status)).length;
+      next.incident_storm_count = Math.max(next.incident_storm_count ?? 0, liveIncidentCount + overflowCount);
       dueForAlert.length = 0;
       adjudicationForAlert.length = 0;
-      if (!next.incident_storm_notified_at && !["acknowledged", "suppressed"].includes(next.status) && !next.legacy_without_episode
+      if (!next.incident_storm_notified_at && !["suppressed", "recovered"].includes(next.status) && !next.legacy_without_episode
         && deliveryBackoffEligible(next, new Date(now).getTime())) {
         dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
       }
@@ -922,7 +928,27 @@ export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
   const updated = alerts.map((alert) => {
     if (alert.id !== alertId) return alert;
     found = true;
-    return normalizeAlertRecord({ ...alert, status: "acknowledged", acknowledged_at: now });
+    return normalizeAlertRecord({
+      ...alert,
+      status: "acknowledged",
+      acknowledged_at: now,
+      // Acknowledging a storm ends suppression for this episode. Existing keys are retained as
+      // acknowledged history, while a later producer key is a normal new incident and may notify.
+      incident_state: "normal",
+      incident_key_overflow: false,
+      incident_storm_count: 0,
+      incident_storm_notified_at: null,
+      incident_storm_failure_count: 0,
+      next_attempt_at: null,
+      last_attempt_at: null,
+      backoff_delay_ms: null,
+      incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, {
+        ...incident,
+        status: ["recovered", "suppressed"].includes(incident.status) ? incident.status : "acknowledged",
+        next_attempt_at: null,
+        backoff_delay_ms: null,
+      }])),
+    });
   });
   if (!found) throw new Error(`Alert not found: ${alertId}`);
   return (await writeAlertRecordsUnlocked(descartesPaths, updated)).find((alert) => alert.id === alertId);
