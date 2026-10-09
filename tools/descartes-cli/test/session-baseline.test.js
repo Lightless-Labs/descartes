@@ -64,12 +64,15 @@ function sessionPoint(ts, entityKey, fingerprint = "abababababababab") {
   };
 }
 
-function censusMarkerPoint(ts, state = "complete") {
+function censusMarkerPoint(ts, state = "complete", availabilitySignature) {
   return {
     ts,
     fact_name: "session.presence",
     entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
-    attributes: { census_state: state },
+    attributes: {
+      census_state: state,
+      ...(availabilitySignature === undefined ? {} : { availability_signature: availabilitySignature }),
+    },
     source_envelope_id: "sessions",
     source_tool: "collect_sessions",
     sensitivity: "operational",
@@ -221,6 +224,45 @@ test("groupSessionFactsByTick: orders tick-groups ascending by ts regardless of 
   const points = flatten([completeTick(tickTs(2), 1), completeTick(tickTs(0), 1), completeTick(tickTs(1), 1)]);
   const groups = groupSessionFactsByTick(points);
   assert.deepEqual(groups.map((g) => g.ts), [tickTs(0), tickTs(1), tickTs(2)]);
+});
+
+test("groupSessionFactsByTick carries the session availability signature into the regime", () => {
+  const groups = groupSessionFactsByTick([
+    ...completeTick(tickTs(0), 1).slice(0, 1),
+    censusMarkerPoint(tickTs(0), "complete", "v1:tmux"),
+  ]);
+  assert.equal(groups[0].availabilitySignature, "v1:tmux");
+});
+
+test("session baseline re-warms when tmux becomes not-found and does not evaluate the old alert", async () => {
+  const paths = await tempPaths();
+  const baseline = [];
+  for (let i = 0; i < 30; i += 1) {
+    baseline.push(...completeTick(tickTs(i), 20).slice(0, 20));
+    baseline.push(censusMarkerPoint(tickTs(i), "complete", "v1:tmux+screen"));
+  }
+  const first = await seedAndCompute(paths, baseline);
+  assert.ok(first.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")));
+
+  const regimeMarker = censusMarkerPoint(tickTs(30), "partial");
+  regimeMarker.attributes.binary_availability = "tmux:not_found_on_known_paths|screen:not_found_on_known_paths";
+  const regimeChange = [regimeMarker];
+  await appendFactPointsByFamily(paths, regimeChange, { now: tickTs(30) });
+  const changed = await computeSessionBaselineCandidates(paths, { now: tickTs(30) });
+  assert.deepEqual(changed.candidates, []);
+  assert.deepEqual(changed.evaluatedAlertKeys, []);
+  assert.equal(changed.ruleEvaluations[SESSION_COUNT_DROP_RULE_ID].gate, "cold_start_pending");
+});
+
+test("an untrusted-present multiplexer census is incomplete and cannot fold a zero", async () => {
+  const paths = await tempPaths();
+  const baseline = [];
+  for (let i = 0; i < 3; i += 1) baseline.push(...completeTick(tickTs(i), 2).slice(0, 2), censusMarkerPoint(tickTs(i), "complete", "v1:tmux"));
+  await seedAndCompute(paths, baseline, { minSampleCount: 1 });
+  await appendFactPointsByFamily(paths, [censusMarkerPoint(tickTs(3), "partial", "v1:tmux")], { now: tickTs(3) });
+  const result = await computeSessionBaselineCandidates(paths, { now: tickTs(3), minSampleCount: 1 });
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+  assert.equal(result.ruleEvaluations[SESSION_CHURN_RULE_ID].gate, "no_complete_census");
 });
 
 // ---------------------------------------------------------------------------------------------

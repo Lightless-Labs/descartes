@@ -809,7 +809,8 @@ test("factPointsFromSessionEvidence: emits a complete census marker on every suc
   const marker = points.find((p) => p.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY);
   assert.ok(marker, "expected a census marker fact point");
   assert.equal(marker.fact_name, "session.presence");
-  assert.equal(marker.attributes.census_state, "partial");
+  assert.equal(marker.attributes.census_state, "complete");
+  assert.equal(marker.attributes.availability_signature, "v1:tmux");
   assert.equal(marker.confidence, 0);
   // A known-path miss is incomplete and must not be mistaken for a complete zero.
   const nonMarkerPoints = points.filter((p) => p.entity_key !== SESSION_CENSUS_MARKER_ENTITY_KEY);
@@ -825,7 +826,8 @@ test("factPointsFromSessionEvidence: a genuinely zero-session tick (EXACT-ZERO, 
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
   assert.equal(points.length, 1, "expected exactly the census marker, no session facts");
   assert.equal(points[0].entity_key, SESSION_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(points[0].attributes.census_state, "partial");
+  assert.equal(points[0].attributes.census_state, "complete");
+  assert.equal(points[0].attributes.availability_signature, "v1:tmux");
 });
 
 test("factPointsFromSessionEvidence: census_state is 'partial' when ANY multiplexer reports 'unable' (must-fix 2)", () => {
@@ -837,6 +839,7 @@ test("factPointsFromSessionEvidence: census_state is 'partial' when ANY multiple
   const points = factPointsFromSessionEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === SESSION_CENSUS_MARKER_ENTITY_KEY);
   assert.equal(marker.attributes.census_state, "partial");
+  assert.equal(marker.attributes.availability_signature, "v1:tmux");
 });
 
 test("factPointsFromSessionEvidence: census marker defaults to 'complete' when result.multiplexers is absent (legacy/simplified evidence shape)", () => {
