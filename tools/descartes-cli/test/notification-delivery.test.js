@@ -284,12 +284,13 @@ test("native macOS helper resolution reports invalid configured helpers as unava
   assert.match(record.reason, /not an executable file/);
 });
 
-test("delivery audit writes dated UTC append-only segments and reads the legacy file first", async () => {
+test("delivery audit writes dated UTC append-only segments and reads all records chronologically", async () => {
   const paths = await tempPaths();
   const { auditFile } = resolveNotificationDeliveryPaths(paths);
   await fs.mkdir(path.dirname(auditFile), { recursive: true });
   await fs.writeFile(auditFile, `${JSON.stringify({ ts: "2026-10-01T00:00:00.000Z", status: "legacy", payload: { title: "legacy" } })}\n`);
   await fs.writeFile(path.join(path.dirname(auditFile), "notification-delivery.jsonl.migrated.archive"), `${JSON.stringify({ ts: "2026-10-02T00:00:00.000Z", status: "legacy", payload: { title: "legacy-archive" } })}\n`);
+  await fs.writeFile(path.join(path.dirname(auditFile), "notification-delivery-2026-10-04.jsonl"), `${JSON.stringify({ ts: "2026-10-04T00:00:00.000Z", status: "dated", payload: { title: "dated-before-legacy" } })}\n`);
   await deliverNotificationDecision(paths, { notify: true, title: "Alert newest", body: "Body" }, {
     config: { enabled: true, channel: "cli" }, now: "2026-10-06T00:20:00.000Z",
   });
@@ -297,7 +298,7 @@ test("delivery audit writes dated UTC append-only segments and reads the legacy 
     config: { enabled: true, channel: "cli" }, now: "2026-10-07T00:20:00.000Z",
   });
   const audit = await readNotificationDeliveryAudit(paths);
-  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["legacy", "legacy-archive", "Alert newest", "Alert later"]);
+  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["legacy", "legacy-archive", "dated-before-legacy", "Alert newest", "Alert later"]);
   assert.equal((await fs.readFile(path.join(path.dirname(auditFile), "notification-delivery-2026-10-06.jsonl"), "utf8")).split("\n").filter(Boolean).length, 1);
   assert.equal((await fs.readFile(path.join(path.dirname(auditFile), "notification-delivery-2026-10-07.jsonl"), "utf8")).split("\n").filter(Boolean).length, 1);
   assert.deepEqual((await fs.readdir(path.dirname(auditFile))).filter((name) => name.endsWith(".archive")), ["notification-delivery.jsonl.migrated.archive"]);
@@ -314,6 +315,8 @@ test("retention deletes only whole old segments, including orphan archives, and 
   const previous = path.join(dir, "notification-delivery-2026-10-08.jsonl");
   await fs.writeFile(old, row("2026-09-01T00:00:00.000Z", "old-segment"));
   await fs.writeFile(archive, row("2026-09-01T00:01:00.000Z", "old-archive"));
+  await fs.utimes(old, new Date("2026-09-01T00:00:00.000Z"), new Date("2026-09-01T00:00:00.000Z"));
+  await fs.utimes(archive, new Date("2026-09-01T00:01:00.000Z"), new Date("2026-09-01T00:01:00.000Z"));
   await fs.writeFile(previous, row("2026-10-08T00:00:00.000Z", "previous-day"));
   await deliverNotificationDecision(paths, { notify: true, title: "current-day", body: "Body" }, {
     config: { enabled: true, channel: "cli" }, now: "2026-10-09T00:02:00.000Z", retentionMs: 7 * 24 * 60 * 60 * 1000,
@@ -340,5 +343,59 @@ test("concurrent append during retention is not lost and a post-append crash lea
   }));
   assert.equal(hookCalled, true, "the append must race during retention");
   const audit = await readNotificationDeliveryAudit(paths);
-  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["crash row", "racing append"]);
+  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["racing append", "crash row"]);
+});
+
+test("retention keeps a segment with a recent mtime even when its records are old", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveNotificationDeliveryPaths(paths);
+  const dir = path.dirname(auditFile);
+  const old = path.join(dir, "notification-delivery-2026-09-01.jsonl");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(old, `${JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", status: "delivered", payload: { title: "old-record" } })}\n`);
+  await fs.utimes(old, new Date("2026-10-08T23:59:00.000Z"), new Date("2026-10-08T23:59:00.000Z"));
+  await deliverNotificationDecision(paths, { notify: true, title: "current", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-09T00:00:00.000Z",
+    retentionMs: 7 * 24 * 60 * 60 * 1000,
+  });
+  await fs.access(old);
+});
+
+test("retention re-stats before unlink and skips a segment modified by a paused writer", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveNotificationDeliveryPaths(paths);
+  const dir = path.dirname(auditFile);
+  const old = path.join(dir, "notification-delivery-2026-09-01.jsonl");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(old, `${JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", status: "delivered", payload: { title: "old-record" } })}\n`);
+  let pausedWriterRan = false;
+  await deliverNotificationDecision(paths, { notify: true, title: "current", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-09T00:00:00.000Z",
+    retentionMs: 7 * 24 * 60 * 60 * 1000,
+    beforeAuditRetention: async ({ auditDir }) => {
+      if (pausedWriterRan) return;
+      pausedWriterRan = true;
+      await fs.appendFile(old, `${JSON.stringify({ ts: "2026-10-09T00:00:01.000Z", status: "delivered", payload: { title: "paused-writer" } })}\n`);
+    },
+  });
+  assert.equal(pausedWriterRan, true);
+  await fs.access(old);
+  assert.equal((await readNotificationDeliveryAudit(paths)).some((entry) => entry.payload?.title === "paused-writer"), true);
+});
+
+test("retention uses the newest dated segment as the rollback-safe current day", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveNotificationDeliveryPaths(paths);
+  const dir = path.dirname(auditFile);
+  const futureNamed = path.join(dir, "notification-delivery-2026-10-09.jsonl");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(futureNamed, `${JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", status: "delivered", payload: { title: "future-named" } })}\n`);
+  await deliverNotificationDecision(paths, { notify: true, title: "rolled-back", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-09-02T00:00:00.000Z",
+    retentionMs: 0,
+  });
+  await fs.access(futureNamed);
 });

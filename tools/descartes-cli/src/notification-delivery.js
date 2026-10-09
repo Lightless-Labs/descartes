@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -245,6 +246,7 @@ export const MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS = 1000;
 // The old row-count rotation constant remains exported for source compatibility only. Delivery
 // audit retention is now segment-based, never row-count-based.
 export const DEFAULT_NOTIFICATION_DELIVERY_AUDIT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const retentionClockAnchors = new Map();
 
 function parseAuditRecords(contents) {
   return contents.split("\n").filter((line) => line.trim()).map((line) => {
@@ -303,9 +305,12 @@ async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {})
   const retentionMs = Number.isFinite(options.retentionMs) && options.retentionMs >= 0
     ? options.retentionMs
     : DEFAULT_NOTIFICATION_DELIVERY_AUDIT_RETENTION_MS;
-  const nowDay = utcDay(now);
-  const protectedDays = new Set([nowDay, previousUtcDay(nowDay)]);
-  const cutoffMs = new Date(now).getTime() - retentionMs;
+  const wallNowMs = new Date(now).getTime();
+  const currentMonotonicMs = performance.now();
+  const previousAnchor = retentionClockAnchors.get(auditDir);
+  const anchor = previousAnchor ?? { wallMs: wallNowMs, monotonicMs: currentMonotonicMs };
+  retentionClockAnchors.set(auditDir, anchor);
+  const monotonicNowMs = Math.max(wallNowMs, anchor.wallMs + (currentMonotonicMs - anchor.monotonicMs));
   let entries;
   try {
     entries = await fs.readdir(auditDir, { withFileTypes: true });
@@ -313,12 +318,20 @@ async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {})
     if (error?.code === "ENOENT") return;
     throw error;
   }
+  const candidates = [];
   for (const entry of entries) {
     if (!entry.isFile() || path.join(auditDir, entry.name) === auditFile) continue;
     const segmentMatch = /^notification-delivery-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(entry.name);
     const archive = isOrphanArchive(entry.name);
     if (!segmentMatch && !archive) continue;
     const file = path.join(auditDir, entry.name);
+    let initialStat;
+    try {
+      initialStat = await fs.stat(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
     let records = [];
     try {
       records = await readAuditFile(file);
@@ -327,22 +340,38 @@ async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {})
       throw error;
     }
     const timestamps = records.map((record) => Date.parse(record.ts)).filter(Number.isFinite);
-    let fileNewestMs;
-    if (timestamps.length > 0) {
-      fileNewestMs = Math.max(...timestamps);
-    } else {
-      try {
-        fileNewestMs = (await fs.stat(file)).mtimeMs;
-      } catch (error) {
-        if (error?.code === "ENOENT") continue;
-        throw error;
-      }
-    }
+    const datedDayMs = segmentMatch ? Date.parse(`${segmentMatch[1]}T00:00:00.000Z`) : Number.NaN;
+    candidates.push({ file, segmentMatch, records, timestamps, initialStat, datedDayMs });
+  }
+  const newestSegmentMs = candidates.flatMap(({ datedDayMs, timestamps }) => [datedDayMs, ...timestamps])
+    .filter(Number.isFinite)
+    .reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY);
+  const effectiveNowMs = Math.max(monotonicNowMs, newestSegmentMs);
+  const effectiveNow = new Date(effectiveNowMs).toISOString();
+  const nowDay = utcDay(effectiveNow);
+  const protectedDays = new Set([nowDay, previousUtcDay(nowDay)]);
+  const cutoffMs = effectiveNowMs - retentionMs;
+
+  // Snapshot all candidates before a paused writer can race the unlink phase. appendDeliveryAudit
+  // passes this hook only for tests and diagnostics; production callers leave it undefined.
+  await options.beforeAuditRetention?.({ auditDir, segmentFile: options.segmentFile, now });
+
+  for (const { file, segmentMatch, timestamps, initialStat } of candidates) {
+    const fileNewestMs = timestamps.length > 0 ? Math.max(...timestamps) : initialStat.mtimeMs;
     const datedDay = segmentMatch?.[1];
     const protectedByDay = datedDay ? protectedDays.has(datedDay) : timestamps.some((ts) => protectedDays.has(new Date(ts).toISOString().slice(0, 10)));
     // Delete only a whole file whose newest evidence is outside retention. Current and previous
     // UTC-day segments are always protected, even with a zero-day test/operator retention value.
     if (!protectedByDay && fileNewestMs < cutoffMs) {
+      let latestStat;
+      try {
+        latestStat = await fs.stat(file);
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        throw error;
+      }
+      if (latestStat.mtimeMs !== initialStat.mtimeMs || latestStat.size !== initialStat.size) continue;
+      if (latestStat.mtimeMs >= monotonicNowMs - retentionMs) continue;
       try { await fs.unlink(file); } catch (error) { if (error?.code !== "ENOENT") throw error; }
     }
   }
@@ -355,8 +384,7 @@ async function appendDeliveryAudit(descartesPaths, record, options = {}) {
   // fs.appendFile opens and closes this dated segment for every row. There is no shared descriptor,
   // inode rename, read/modify/write, compaction, or replacement window for a concurrent writer.
   await fs.appendFile(segmentFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  await options.beforeAuditRetention?.({ segmentFile, auditDir, now: record.ts });
-  await pruneNotificationDeliveryAudit(descartesPaths, record.ts, options);
+  await pruneNotificationDeliveryAudit(descartesPaths, record.ts, { ...options, segmentFile });
   return record;
 }
 
@@ -364,7 +392,15 @@ export async function readNotificationDeliveryAudit(descartesPaths) {
   const files = await auditFilesInReadOrder(descartesPaths);
   const records = [];
   for (const file of files) records.push(...await readAuditFile(file));
-  return records;
+  return records.map((record, index) => ({ record, index, ts: Date.parse(record?.ts) }))
+    .sort((left, right) => {
+      const leftValid = Number.isFinite(left.ts);
+      const rightValid = Number.isFinite(right.ts);
+      if (leftValid && rightValid && left.ts !== right.ts) return left.ts - right.ts;
+      if (leftValid !== rightValid) return leftValid ? -1 : 1;
+      return left.index - right.index;
+    })
+    .map(({ record }) => record);
 }
 
 export async function deliverNotificationDecision(descartesPaths, decision, options = {}) {
