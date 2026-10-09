@@ -37,16 +37,104 @@ test("one alert id represents simultaneous incidents as a set and notifies each 
   const paths = await tempPaths();
   const first = applyAlertCandidates([], [candidate("identity-a"), candidate("identity-b")], { now: "2026-10-06T00:00:00.000Z" });
   assert.deepEqual(first.notification_due_ids, ["alert_shared"]);
+  assert.deepEqual(first.notification_due_incidents.map((entry) => entry.incident_key).sort(), ["identity-a", "identity-b"]);
+  assert.deepEqual(Object.keys(first.alerts[0].incidents).sort(), ["identity-a", "identity-b"]);
   await writeAlertRecords(paths, first.alerts);
-  await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-06T00:01:00.000Z", incidentKey: "identity-a", episodeKey: "identity-b" });
+  await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-06T00:01:00.000Z", incidentKey: "identity-a" });
 
   const second = applyAlertCandidates(await readAlertRecords(paths), [candidate("identity-a"), candidate("identity-b")], { now: "2026-10-06T00:02:00.000Z" });
   assert.deepEqual(second.notification_due_ids, ["alert_shared"], "identity B remains due after identity A is confirmed");
+  assert.deepEqual(second.notification_due_incidents.map((entry) => entry.incident_key), ["identity-b"]);
   await writeAlertRecords(paths, second.alerts);
-  await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-06T00:03:00.000Z", incidentKey: "identity-b", episodeKey: "identity-b" });
+  await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-06T00:03:00.000Z", incidentKey: "identity-b" });
   const quiet = applyAlertCandidates(await readAlertRecords(paths), [candidate("identity-b"), candidate("identity-a")], { now: "2026-10-06T00:04:00.000Z" });
   assert.deepEqual(quiet.notification_due_ids, []);
   assert.deepEqual((quiet.alerts[0].notified_incident_keys ?? []).sort(), ["identity-a", "identity-b"]);
+  assert.equal(quiet.alerts[0].incidents["identity-a"].confirmed_at, "2026-10-06T00:01:00.000Z");
+  assert.equal(quiet.alerts[0].incidents["identity-b"].confirmed_at, "2026-10-06T00:03:00.000Z");
+});
+
+test("candidate ordering cannot change per-incident state or current payload", () => {
+  const candidates = [candidate("identity-a", "warning"), { ...candidate("identity-b", "critical"), summary: "B" }];
+  const forward = applyAlertCandidates([], candidates, { now: "2026-10-06T00:00:00.000Z" });
+  const reverse = applyAlertCandidates([], [...candidates].reverse(), { now: "2026-10-06T00:00:00.000Z" });
+  assert.deepEqual(reverse.alerts, forward.alerts);
+  assert.deepEqual(reverse.notification_due_incidents, forward.notification_due_incidents);
+});
+
+test("delivery iterates every due incident under one alert id", async () => {
+  const paths = await tempPaths();
+  const applied = applyAlertCandidates([], [candidate("identity-a"), candidate("identity-b")], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const delivered = [];
+  await emitMetricAlertFallbackSignals(paths, applied, {
+    now: "2026-10-06T00:01:00.000Z",
+    config: { enabled: false, enabled_namespaces: ["metric"] },
+    deliverNotification: async (_paths, _decision, metadata) => {
+      delivered.push(metadata.episodeKey);
+      return { status: "cli_only" };
+    },
+  });
+  assert.deepEqual(delivered, ["identity-a", "identity-b"]);
+  const persisted = (await readAlertRecords(paths))[0];
+  assert.equal(persisted.incidents["identity-a"].confirmed_at !== null, true);
+  assert.equal(persisted.incidents["identity-b"].confirmed_at !== null, true);
+});
+
+test("confirmed incidents are retained and a 257th identity enters a one-notification storm state", async () => {
+  const paths = await tempPaths();
+  let alerts = [];
+  for (let index = 0; index < 256; index += 1) {
+    const key = `identity-${index}`;
+    const applied = applyAlertCandidates(alerts, [candidate(key)], { now: `2026-10-06T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z` });
+    alerts = applied.alerts;
+    await writeAlertRecords(paths, alerts);
+    await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-07T00:00:00.000Z", incidentKey: key });
+    alerts = await readAlertRecords(paths);
+  }
+  const overflow = applyAlertCandidates(alerts, [candidate("identity-256")], { now: "2026-10-08T00:00:00.000Z" });
+  assert.equal(overflow.alerts[0].incident_state, "incident_storm");
+  assert.equal(Object.keys(overflow.alerts[0].incidents).length, 256);
+  assert.equal(overflow.alerts[0].incidents["identity-0"].confirmed_at !== null, true);
+  assert.deepEqual(overflow.notification_due_incidents.map((entry) => entry.incident_key), ["__incident_storm__"]);
+  await writeAlertRecords(paths, overflow.alerts);
+  const delivered = [];
+  await emitMetricAlertFallbackSignals(paths, overflow, {
+    now: "2026-10-08T00:01:00.000Z",
+    config: { enabled: false, enabled_namespaces: ["metric"] },
+    deliverNotification: async (_paths, _decision, metadata) => {
+      delivered.push(metadata.episodeKey);
+      return { status: "cli_only" };
+    },
+  });
+  assert.deepEqual(delivered, ["__incident_storm__"]);
+  const replay = applyAlertCandidates(await readAlertRecords(paths), [candidate("identity-0")], { now: "2026-10-08T00:02:00.000Z" });
+  assert.deepEqual(replay.notification_due_incidents, []);
+});
+
+test("a lost confirmation write causes redelivery, never silence", async () => {
+  const paths = await tempPaths();
+  const applied = applyAlertCandidates([], [candidate("identity-a")], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-06T00:01:00.000Z", incidentKey: "identity-a" });
+  // Simulate the confirmation write being lost after the external notification succeeded.
+  await writeAlertRecords(paths, applied.alerts);
+  const replay = applyAlertCandidates(await readAlertRecords(paths), [candidate("identity-a")], { now: "2026-10-06T00:02:00.000Z" });
+  assert.deepEqual(replay.notification_due_incidents.map((entry) => entry.incident_key), ["identity-a"]);
+});
+
+test("a legacy active record without episode metadata is not notified", () => {
+  const legacy = {
+    id: "alert_legacy_no_episode",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Memory high",
+    first_seen: "2026-10-01T00:00:00.000Z",
+    last_seen: "2026-10-01T00:00:00.000Z",
+  };
+  const result = applyAlertCandidates([legacy], [{ ...legacy, incident_key: "default" }], { now: "2026-10-06T00:00:00.000Z" });
+  assert.deepEqual(result.notification_due_incidents, []);
 });
 
 test("a stale second evaluation cannot deliver an already-confirmed notification", async () => {
