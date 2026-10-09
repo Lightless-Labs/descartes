@@ -4,28 +4,31 @@
 
 ## Notify-once daybreak rework fixes — 2026-10-09 — local, not pushed
 
-Fixed the current `feat/notify-once-2026-10` findings in six atomic commits:
-`a981547` (global delivery ordering), `eff179b` (acknowledgement resets storm suppression),
-`819e54d` (clock-safe segment retention), `f9152c4` (dated-segment audit documentation),
-`bdfaf65` (validation record), and `41f4ae0` (post-ack retry/comparator hardening).
-The global per-tick queue collects route-qualified deterministic/session, metric, and LLM work,
-sorts severity first then new/escalated work then oldest-unconfirmed, reserves the first slot for
-the highest-severity item, and invokes routes in assignment order. A 10,000-tick bounded-progress
-property and the eight-warning-session plus critical-memory reproduction pass.
+Fixed the current `feat/notify-once-2026-10` findings in three atomic commits:
+`bf25f22` (post-ack retry eligibility), `1e1228e` (unbounded globally ordered delivery with
+route-local circuit breakers), and `3477227` (byte-capped audit retention and documentation).
 
-Acknowledgement now closes the storm episode, retains old keys as acknowledged history, permits
-later incidents and escalations under normal rules, and emits a fresh storm notification only for
-a new post-ack overflow. Post-ack storm delivery retries remain eligible while acknowledged.
-Global ordering explicitly places unconfirmed work before confirmed work within the same tier.
-Audit retention uses a monotonic anchor plus the newest dated segment, re-stats size/mtime before
-unlink, and skips writer races. Audit reconstruction stably merges all records by timestamp. README
-now documents the dated UTC segment design.
+Acknowledged alerts no longer reject retries for failed incidents that arrived after the
+acknowledgement; the old acknowledged episode remains suppressed, while new incidents and
+escalations remain due. Notification delivery now visits every route-qualified due item in global
+severity-descending, new/escalated-before-retry, oldest-first order. There is no per-tick delivery
+cap, planner slice, or reserved slot. A failing or unavailable route opens only that route's
+per-tick breaker; skipped items receive normal failure/backoff state, and deterministic routes keep
+progressing when the LLM route is unavailable. Tests cover eight LLM criticals versus a fresh
+deterministic critical across three ticks, 256 failing deterministic incidents, and 10,000 modeled
+failing ticks.
 
-Focused alert-intelligence, daemon, alert-store, and notification-delivery suites pass 356/356.
-Fresh-XDG `npm test` reports 2382 total / 2326 pass / 22 environment failures / 34 skipped /
-0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`, 3 tap-bump loopback
-`listen EPERM`, and 2 live-host macOS provenance checks returning `unknown` instead of `ok`.
-No product-behavior failures were observed. No push or merge.
+Notification audit retention now uses only a 50 MiB total-byte cap, deletes whole segments oldest
+by filename while over cap, never deletes the segment written by the current process in that tick,
+and re-stats before unlinking. There is no wall-clock expiry. Residual: after a clock rollback and
+under cap pressure, a rollback-dated segment may be considered oldest by filename. README documents
+this residual.
+
+Focused alert-intelligence (146/146), notification-delivery (21/21), and the relevant alert-store
+and daemon regressions pass. Fresh-XDG `npm test` reports 2346 total / 2290 pass / 22 environment
+failures / 34 skipped / 0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`,
+3 tap-bump loopback `listen EPERM`, and 2 live-host macOS provenance checks returning `unknown`
+instead of `ok`; no product-behavior failures were observed. No push or merge.
 
 ## R3 notify-once daybreak rework — 2026-10-09 — local, not pushed
 
