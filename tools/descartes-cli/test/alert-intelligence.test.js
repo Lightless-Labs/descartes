@@ -171,7 +171,7 @@ test("global delivery order puts a new deterministic critical ahead of older fai
 });
 
 test("failing routes remain bounded across 10,000 modeled ticks", async () => {
-  const paths = {};
+  const paths = await tempPaths();
   const alerts = [{
     id: "alert_0", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical",
     first_seen: "2026-10-09T00:00:00.000Z",
@@ -180,6 +180,7 @@ test("failing routes remain bounded across 10,000 modeled ticks", async () => {
       confirmed_at: null, status: "active", payload: { severity: "critical", title: "Alert", summary: "Alert", diagnostics: {} },
     } },
   }];
+  await writeAlertRecords(paths, alerts);
   const evaluation = { alerts, notification_due_incidents: [{ alert_id: "alert_0", incident_key: "incident-0" }] };
   let calls = 0;
   const originalWarn = console.warn;
@@ -195,7 +196,62 @@ test("failing routes remain bounded across 10,000 modeled ticks", async () => {
   } finally {
     console.warn = originalWarn;
   }
-  assert.equal(calls, 10_000, "a failing route may stall at most one delivery per tick");
+  assert(calls > 0);
+  assert(calls < 1_000, `persisted backoff must bound retries across 10,000 ticks; got ${calls}`);
+});
+
+test("a persisted failing session route batches 256 skips and still delivers a metric critical promptly", async () => {
+  const paths = await tempPaths();
+  const sessionAlerts = Array.from({ length: 256 }, (_, index) => ({
+    id: `session_retry_${String(index).padStart(3, "0")}`,
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: `session-${index}`,
+    incident_key: `session-${index}`,
+    severity: "critical",
+    title: "Session count deviation",
+    summary: "Session count dropped.",
+    diagnostics: { observed_count: 0, mean_before: 4, z_score: -8, confidence_state: "high" },
+  }));
+  const metricAlert = {
+    id: "metric_retry_critical",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    incident_key: "metric",
+    severity: "critical",
+    title: "Critical memory pressure",
+    summary: "Memory stayed high.",
+    diagnostics: {},
+  };
+  const applied = applyAlertCandidates([], [...sessionAlerts, metricAlert], { now: "2026-10-09T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const evaluation = {
+    alerts: applied.alerts,
+    notification_due_incidents: applied.notification_due_incidents,
+  };
+  const calls = [];
+  const storeWrites = [];
+  const started = performance.now();
+  const result = await deliverDueAlertNotifications(paths, evaluation, {
+    now: "2026-10-09T00:00:00.000Z",
+    config: { enabled: false, enabled_namespaces: ["metric"] },
+    onAlertStoreWrite: (outcomes) => storeWrites.push(outcomes),
+    deliverNotification: async (_paths, _decision, options) => {
+      calls.push(options.alertId);
+      if (options.alertId.startsWith("session_retry_")) return { status: "error" };
+      return { status: "delivered" };
+    },
+  });
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(result.metricAlertFallback.fired.includes("metric_retry_critical"), true);
+  assert.equal(calls.includes("metric_retry_critical"), true);
+  assert(elapsedMs < 1_000, `the healthy metric route took ${elapsedMs.toFixed(1)}ms`);
+  assert.equal(storeWrites.length, 1, "one alert-store transaction must persist the whole delivery phase");
+  assert.equal(storeWrites[0].length, 257, "the transaction includes the failed route item and every breaker skip");
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.length, 257);
+  assert.equal(persisted.find((alert) => alert.id === "metric_retry_critical").incidents.metric.confirmed_at, "2026-10-09T00:00:00.000Z");
+  assert.equal(persisted.filter((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID).every((alert) => alert.incidents[Object.keys(alert.incidents)[0]].delivery_failure_count === 1), true);
 });
 
 // Frozen, byte-for-byte copy of the pre-S13 alertIntelligencePrompt implementation (including the

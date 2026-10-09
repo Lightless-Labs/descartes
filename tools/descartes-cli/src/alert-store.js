@@ -945,6 +945,125 @@ export async function recordAlertDeliveryFailures(descartesPaths, failures, opti
   return { recorded: true, alerts: written };
 }
 
+// Delivery is planned against one alert-store snapshot per daemon tick. Apply every external
+// delivery outcome to that in-memory snapshot, then commit the resulting alert set once. This is
+// deliberately separate from recordAlertDeliveryFailure(s), whose read-modify-write API remains
+// useful to standalone callers but would turn a route breaker into one full-store transaction per
+// skipped item.
+export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, options = {}) {
+  const entries = Array.isArray(outcomes) ? outcomes : [];
+  if (entries.length === 0) return { recorded: false };
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const updated = new Map((await readAlertRecords(descartesPaths)).map((alert) => [alert.id, alert]));
+  let recorded = false;
+
+  for (const outcome of entries) {
+    const alert = updated.get(outcome.alertId);
+    if (!alert || ["recovered", "suppressed"].includes(alert.status)) continue;
+    const incidentKey = outcome.incidentKey ?? outcome.episodeKey ?? alertEpisodeKey(alert);
+    if (outcome.status === "adjudication") {
+      const incident = alert.incidents?.[incidentKey];
+      if (!incident) continue;
+      recorded = true;
+      updated.set(alert.id, syncAlertProjection({
+        ...alert,
+        incidents: {
+          ...alert.incidents,
+          [incidentKey]: {
+            ...incident,
+            adjudicated_at: now,
+            adjudication: { notify: outcome.notify === true, severity: outcome.severity ?? incident.severity_max },
+          },
+        },
+      }));
+      continue;
+    }
+    if (outcome.status === "success") {
+      if (incidentKey === INCIDENT_STORM_KEY) {
+        recorded = true;
+        updated.set(alert.id, syncAlertProjection({
+          ...alert,
+          incident_storm_notified_at: now,
+          last_notified: now,
+          last_attempt_at: now,
+          delivery_failure_count: 0,
+          last_delivery_failure_at: null,
+          delivery_failure_reason: null,
+          delivery_failing_since: null,
+          next_attempt_at: null,
+          backoff_delay_ms: null,
+        }));
+        continue;
+      }
+      const incident = alert.incidents?.[incidentKey];
+      if (!incident) continue;
+      recorded = true;
+      const currentRank = incident.notified_severity === null || incident.notified_severity === undefined ? -1 : alertSeverityRank(incident.notified_severity);
+      const nextSeverity = outcome.severity ?? incident.severity_max ?? alert.severity;
+      const nextRank = alertSeverityRank(nextSeverity);
+      updated.set(alert.id, syncAlertProjection({
+        ...alert,
+        incidents: {
+          ...alert.incidents,
+          [incidentKey]: {
+            ...incident,
+            confirmed_at: now,
+            notified_severity: nextRank >= currentRank ? nextSeverity : incident.notified_severity,
+            delivery_failure_count: 0,
+            last_delivery_failure_at: null,
+            delivery_failure_reason: null,
+            delivery_failing_since: null,
+            next_attempt_at: null,
+            last_attempt_at: now,
+            backoff_delay_ms: null,
+          },
+        },
+      }));
+      continue;
+    }
+    if (outcome.status !== "failure") continue;
+    if (incidentKey === INCIDENT_STORM_KEY) {
+      recorded = true;
+      const count = (alert.incident_storm_failure_count ?? 0) + 1;
+      const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+      updated.set(alert.id, normalizeAlertRecord({
+        ...alert,
+        incident_storm_failure_count: count,
+        next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        last_attempt_at: now,
+        backoff_delay_ms: delay,
+        delivery_failure_reason: String(outcome.reason ?? "delivery_failed").slice(0, 240),
+      }));
+      continue;
+    }
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) continue;
+    recorded = true;
+    const count = incident.delivery_failure_count + 1;
+    const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+    updated.set(alert.id, syncAlertProjection({
+      ...alert,
+      incidents: {
+        ...alert.incidents,
+        [incidentKey]: {
+          ...incident,
+          delivery_failure_count: count,
+          last_delivery_failure_at: now,
+          last_attempt_at: now,
+          backoff_delay_ms: delay,
+          delivery_failure_reason: String(outcome.reason ?? "delivery_failed").slice(0, 240),
+          delivery_failing_since: incident.delivery_failing_since ?? now,
+          next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        },
+      },
+    }));
+  }
+  if (!recorded) return { recorded: false };
+  await options.onStoreWrite?.(entries);
+  const written = await writeAlertRecordsUnlocked(descartesPaths, [...updated.values()]);
+  return { recorded: true, alerts: written };
+}
+
 export async function recordAlertAdjudication(descartesPaths, alertIdValue, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const alerts = await readAlertRecords(descartesPaths);

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures } from "./alert-store.js";
+import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures, recordAlertDeliveryOutcomes } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -216,9 +216,9 @@ async function recordRouteFailuresForItems(descartesPaths, items, now, reason) {
   })), { now });
 }
 
-async function deliveryStillDue(descartesPaths, alert, now, incidentKey = incidentKeyForAlert(alert)) {
+async function deliveryStillDue(descartesPaths, alert, now, incidentKey = incidentKeyForAlert(alert), alertRecords) {
   if (!descartesPaths?.stateDir) return true;
-  const current = (await readAlertRecords(descartesPaths)).find((entry) => entry.id === alert.id);
+  const current = (alertRecords ?? await readAlertRecords(descartesPaths)).find((entry) => entry.id === alert.id);
   // Pure/unit callers may intentionally provide an evaluation without a persisted alert record.
   // The daemon path always has one; only a persisted record can prove that a stale evaluation was
   // already delivered.
@@ -721,6 +721,9 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
 
   let deliverNotification;
   const now = options.now ?? new Date().toISOString();
+  const deferAlertStoreUpdates = options.deferAlertStoreUpdates === true;
+  const alertRecords = options.alertRecords;
+  const deliveryOutcomes = [];
   try {
     // daybreak-blue #7 (MEDIUM) point 1: this dynamic import is an unguarded await on the
     // production path (it only runs when the DI seam, options.deliverNotification, is absent). A
@@ -731,9 +734,13 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`descartes: emitSessionAlertSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due session-family alerts reported failed`);
-    await recordRouteFailuresForItems(descartesPaths, dueSessionAlerts, now, `session_route_unavailable:${message}`);
+    if (deferAlertStoreUpdates) {
+      deliveryOutcomes.push(...dueSessionAlerts.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: `session_route_unavailable:${message}` })));
+    } else {
+      await recordRouteFailuresForItems(descartesPaths, dueSessionAlerts, now, `session_route_unavailable:${message}`);
+    }
     const failed = dueSessionAlerts.map(({ alert }) => alert.id);
-    return { fired: [], failed, route_failed: true };
+    return { fired: [], failed, route_failed: true, delivery_outcomes: deliveryOutcomes };
   }
 
   // Reliability fix (canary v0 finalization, FIX-B): this loop was previously a bare, unguarded
@@ -764,7 +771,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
     const decision = buildSessionAlertNotificationDecision(alert);
     const episodeKey = incidentKeyForAlert(alert);
     try {
-      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey))) continue;
+      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey, alertRecords))) continue;
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       // daybreak-blue #6 (MEDIUM): deliverNotificationDecision RESOLVES (it never throws) with a
       // status enum -- "error"/"unavailable" mean the notification did NOT reach the operator, and
@@ -774,23 +781,30 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       // and stays `fired`, matching this function's pre-existing "only a throw means failed"
       // contract for those.
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
-        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
+        if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: delivery?.status });
+        else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
         failed.push(alert.id);
         routeFailed = true;
       } else {
-        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
+        if (deferAlertStoreUpdates && deliveryWasSuccessful(delivery)) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "success", severity: alert.severity });
+        else await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
         fired.push(alert.id);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
-      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
+      if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: message });
+      else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
       failed.push(alert.id);
       routeFailed = true;
     }
   }
-  await recordRouteFailuresForItems(descartesPaths, skipped, now, "session_route_circuit_open");
-  return { fired, failed, route_failed: routeFailed };
+  if (deferAlertStoreUpdates) {
+    deliveryOutcomes.push(...skipped.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: "session_route_circuit_open" })));
+  } else {
+    await recordRouteFailuresForItems(descartesPaths, skipped, now, "session_route_circuit_open");
+  }
+  return { fired, failed, route_failed: routeFailed, delivery_outcomes: deliveryOutcomes };
 }
 
 // Counts/hash-only body (must-fix 3) for every branch EXCEPT service.disappeared: every field
@@ -1075,14 +1089,21 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
 
   let deliverNotification;
   const now = options.now ?? new Date().toISOString();
+  const deferAlertStoreUpdates = options.deferAlertStoreUpdates === true;
+  const alertRecords = options.alertRecords;
+  const deliveryOutcomes = [];
   try {
     deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`descartes: emitMetricAlertFallbackSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due metric-family alerts reported failed`);
-    await recordRouteFailuresForItems(descartesPaths, dueMetricAlerts, now, `metric_route_unavailable:${message}`);
+    if (deferAlertStoreUpdates) {
+      deliveryOutcomes.push(...dueMetricAlerts.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: `metric_route_unavailable:${message}` })));
+    } else {
+      await recordRouteFailuresForItems(descartesPaths, dueMetricAlerts, now, `metric_route_unavailable:${message}`);
+    }
     const failed = dueMetricAlerts.map(({ alert }) => alert.id);
-    return { fired: [], failed, route_failed: true };
+    return { fired: [], failed, route_failed: true, delivery_outcomes: deliveryOutcomes };
   }
 
   // Same "one alert's delivery failure must degrade, never abort the tick" discipline as
@@ -1106,27 +1127,34 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     };
     const episodeKey = incidentKeyForAlert(alert);
     try {
-      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey))) continue;
+      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey, alertRecords))) continue;
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
-        await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
+        if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: delivery?.status });
+        else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
         failed.push(alert.id);
         routeFailed = true;
       }
       else {
-        await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
+        if (deferAlertStoreUpdates && deliveryWasSuccessful(delivery)) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "success", severity: alert.severity });
+        else await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
         fired.push(alert.id);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
-      await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
+      if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: message });
+      else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
       failed.push(alert.id);
       routeFailed = true;
     }
   }
-  await recordRouteFailuresForItems(descartesPaths, skipped, now, "metric_route_circuit_open");
-  return { fired, failed, route_failed: routeFailed };
+  if (deferAlertStoreUpdates) {
+    deliveryOutcomes.push(...skipped.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: "metric_route_circuit_open" })));
+  } else {
+    await recordRouteFailuresForItems(descartesPaths, skipped, now, "metric_route_circuit_open");
+  }
+  return { fired, failed, route_failed: routeFailed, delivery_outcomes: deliveryOutcomes };
 }
 
 function collectDueDeliveryItems(evaluation, config, options = {}) {
@@ -1185,6 +1213,7 @@ function appendRouteResult(target, result) {
 export async function deliverDueAlertNotifications(descartesPaths, evaluation, options = {}) {
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
   const now = options.now ?? new Date().toISOString();
+  const alertRecords = options.alertRecords ?? (descartesPaths?.stateDir ? await readAlertRecords(descartesPaths) : undefined);
   const items = collectDueDeliveryItems(evaluation, config, {
     sessionEnabled: options.deliverSessionAlerts !== false,
     metricEnabled: options.deliverMetricAlertFallback !== false,
@@ -1199,11 +1228,12 @@ export async function deliverDueAlertNotifications(descartesPaths, evaluation, o
   const emitSession = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
   const emitMetric = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
+  const deliveryOutcomes = [];
 
   for (const item of items) {
     const target = results[item.route];
     if (breakers.has(item.route)) {
-      await recordRouteFailureForItem(descartesPaths, item, now, `${item.route}_route_circuit_open`);
+      deliveryOutcomes.push({ alertId: item.alert.id, incidentKey: incidentKeyForAlert(item.alert), status: "failure", reason: `${item.route}_route_circuit_open` });
       target.failed.push(item.alert.id);
       continue;
     }
@@ -1213,23 +1243,42 @@ export async function deliverDueAlertNotifications(descartesPaths, evaluation, o
     let result;
     try {
       if (item.route === "session") {
-        result = await emitSession(descartesPaths, singleEvaluation, { now, deliverNotification: options.deliverNotification });
+        result = await emitSession(descartesPaths, singleEvaluation, {
+          now, deliverNotification: options.deliverNotification, deferAlertStoreUpdates: true, alertRecords,
+        });
       } else if (item.route === "metric") {
-        result = await emitMetric(descartesPaths, singleEvaluation, { now, config, deliverNotification: options.deliverNotification });
+        result = await emitMetric(descartesPaths, singleEvaluation, {
+          now, config, deliverNotification: options.deliverNotification, deferAlertStoreUpdates: true, alertRecords,
+        });
       } else {
-        result = await adjudicate(descartesPaths, singleEvaluation, { now, config, deliverNotification: options.deliverNotification, createSession: options.createSession, appendAuditRecord: options.appendAuditRecord });
+        result = await adjudicate(descartesPaths, singleEvaluation, {
+          now, config, deliverNotification: options.deliverNotification, createSession: options.createSession,
+          appendAuditRecord: options.appendAuditRecord, deferAlertStoreUpdates: true, alertRecords,
+        });
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: ${item.route}-alert-delivery route failed for alert ${item.alert.id}: ${reason}`);
-      await recordRouteFailureForItem(descartesPaths, item, now, reason);
+      deliveryOutcomes.push({ alertId: item.alert.id, incidentKey: incidentKeyForAlert(item.alert), status: "failure", reason });
       target.failed.push(item.alert.id);
       target.route_failed = true;
       breakers.add(item.route);
       continue;
     }
     appendRouteResult(target, result);
+    deliveryOutcomes.push(...(result?.delivery_outcomes ?? []));
     if (target.route_failed) breakers.add(item.route);
+  }
+
+  if (deliveryOutcomes.length > 0 && descartesPaths?.stateDir) {
+    try {
+      await recordAlertDeliveryOutcomes(descartesPaths, deliveryOutcomes, {
+        now,
+        onStoreWrite: options.onAlertStoreWrite,
+      });
+    } catch (error) {
+      console.warn(`descartes: batched alert delivery state update failed: ${error?.message ?? error}`);
+    }
   }
 
   return {
@@ -1594,6 +1643,9 @@ function hashPromptText(text) {
 // residual to <=1 per heal-cycle/restart -- documented, not silently accepted.
 export async function adjudicateAlertNotifications(descartesPaths, evaluation, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const deferAlertStoreUpdates = options.deferAlertStoreUpdates === true;
+  const alertRecords = options.alertRecords;
+  const deliveryOutcomes = [];
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
   const dueEntries = incidentEntries(evaluation, "adjudication_due_incidents");
   if (!config.enabled) return { status: "disabled", decisions: [] };
@@ -1618,7 +1670,11 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   const doAppendAuditRecord = options.appendAuditRecord ?? appendAuditRecord;
 
   const failEligibleRoute = async (reason) => {
-    await recordRouteFailuresForItems(descartesPaths, eligibleAlerts.map((alert) => ({ alert })), now, reason);
+    if (deferAlertStoreUpdates) {
+      deliveryOutcomes.push(...eligibleAlerts.map((alert) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason })));
+    } else {
+      await recordRouteFailuresForItems(descartesPaths, eligibleAlerts.map((alert) => ({ alert })), now, reason);
+    }
   };
 
   // S13 I/O hardening -- probe-heal: see the module comment above this function for the full
@@ -1873,15 +1929,17 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const incidentKey = incidentKeyForAlert(alert);
         const episodeKey = incidentKey;
         if (decision.notify) {
-          if (!(await deliveryStillDue(descartesPaths, alert, now, incidentKey))) throw new Error("delivery_no_longer_due");
+          if (!(await deliveryStillDue(descartesPaths, alert, now, incidentKey, alertRecords))) throw new Error("delivery_no_longer_due");
           delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
         }
         if (decision.notify) {
           if (!deliveryWasSuccessful(delivery)) {
-            await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey, incidentKey });
+            if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey, status: "failure", reason: delivery?.status ?? "delivery_failed" });
+            else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey, incidentKey });
             routeFailed = true;
-          }
-          await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey });
+          } else if (deferAlertStoreUpdates) {
+            deliveryOutcomes.push({ alertId: alert.id, incidentKey, status: "success", severity: alert.severity });
+          } else await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey });
         }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
@@ -1906,20 +1964,23 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           delivery,
         });
         if (appended && !decision.notify) {
-          await recordAlertAdjudication(descartesPaths, alert.id, {
-            now,
-            severity: alert.severity,
-            episodeKey: incidentKeyForAlert(alert),
+          if (deferAlertStoreUpdates) deliveryOutcomes.push({
+            alertId: alert.id,
             incidentKey: incidentKeyForAlert(alert),
+            status: "adjudication",
             notify: false,
+            severity: alert.severity,
+          });
+          else await recordAlertAdjudication(descartesPaths, alert.id, {
+            now, severity: alert.severity, episodeKey: incidentKeyForAlert(alert),
+            incidentKey: incidentKeyForAlert(alert), notify: false,
           });
         }
       } catch (error) {
-        await recordDeliveryFailureIfPossible(descartesPaths, alert, {
-          now,
-          reason: error instanceof Error ? error.message : String(error),
-          episodeKey: incidentKeyForAlert(alert),
-          incidentKey: incidentKeyForAlert(alert),
+        const reason = error instanceof Error ? error.message : String(error);
+        if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason });
+        else await recordDeliveryFailureIfPossible(descartesPaths, alert, {
+          now, reason, episodeKey: incidentKeyForAlert(alert), incidentKey: incidentKeyForAlert(alert),
         });
         routeFailed = true;
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
@@ -1963,7 +2024,11 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     }
   }
 
-  await recordRouteFailuresForItems(descartesPaths, skipped, now, "llm_route_circuit_open");
+  if (deferAlertStoreUpdates) {
+    deliveryOutcomes.push(...skipped.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: "llm_route_circuit_open" })));
+  } else {
+    await recordRouteFailuresForItems(descartesPaths, skipped, now, "llm_route_circuit_open");
+  }
 
   let budgetExhausted;
   if (droppedTotal > 0) {
@@ -1992,5 +2057,5 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   const status = auditWriteFailed
     ? "audit_write_degraded"
     : records.length === 0 && droppedTotal > 0 ? "rate_limited" : "ok";
-  return { status, decisions: records, excluded, dropped_total: droppedTotal, dropped_critical: droppedCritical, budget_exhausted: budgetExhausted, route_failed: routeFailed };
+  return { status, decisions: records, excluded, dropped_total: droppedTotal, dropped_critical: droppedCritical, budget_exhausted: budgetExhausted, route_failed: routeFailed, delivery_outcomes: deliveryOutcomes };
 }
