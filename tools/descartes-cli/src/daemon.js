@@ -73,7 +73,6 @@ import { collectSystemEvidence } from "./tools/system.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
-import { KNOWN_COLLECTOR_BINARIES, loadContentHashCache, persistContentHashCache } from "./tools/binary-resolver.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -81,6 +80,7 @@ export const DEFAULT_DAEMON_INTERVAL_MS = 60 * 1000;
 export const DEFAULT_DAEMON_PROCESS_LIMIT = 5;
 export const DEFAULT_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_STRUCTURAL_TICK_DEADLINE_MS = 45 * 1000;
+const LEGACY_CONTENT_PIN_FILE = "binary-content-pins.json";
 // Slice B (Codex-hardening): a structural fact (service.presence / network.listening_port.owner)
 // unobserved for more than this many STRUCTURAL cycles is treated as stale ("no live claim") by the
 // active + shadow-soak constraint eval, instead of reading its last value as current for up to the
@@ -930,6 +930,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  try {
+    await fs.unlink(path.join(descartesPaths.stateDir, "daemon", LEGACY_CONTENT_PIN_FILE));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[daemon] legacy binary content-pin cleanup failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
   // Slice B (Codex-hardening): one freshness horizon, derived from the RESOLVED profile's structural
   // interval (not options.profile, which may be undefined when defaulted), threaded into BOTH the
   // live-active and shadow-soak constraint evals so they apply the identical staleness bound.
@@ -975,16 +982,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  // Collector subprocesses receive only explicitly configured trusted paths. Binary content
-  // hashes are retained by the resolver so an in-place rewrite of a trusted inode is refused,
-  // including after a daemon restart or a move to another pinned path.
-  const contentHashCache = options.contentHashCache ?? await loadContentHashCache(descartesPaths, {
-    trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
-    binaries: KNOWN_COLLECTOR_BINARIES,
-  });
   const collectorOptions = {
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
-    contentHashCache,
   };
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
@@ -1939,11 +1938,6 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     : delivered?.metricAlertFallback
       ?? (alertIntelligenceConfig?.enabled && options.deliverMetricAlertFallback !== false ? { fired: [], skipped: "intelligence_enabled" } : undefined);
   const alertIntelligence = delivered?.alertIntelligence;
-  try {
-    await (options.persistContentHashCache ?? persistContentHashCache)(descartesPaths, contentHashCache);
-  } catch (error) {
-    console.warn(`[daemon] binary content-pin persistence failed (${error instanceof Error ? error.message : String(error)}); current-tick pins remain in memory only`);
-  }
   return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 

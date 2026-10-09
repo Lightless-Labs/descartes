@@ -166,6 +166,25 @@ test("foreground daemon iteration writes metric history and daemon status", asyn
   assert(summary.metrics.some((metric) => metric.metric_name === "system.memory.used_fraction"));
 });
 
+test("daemon iteration removes the legacy binary content-pin file", async () => {
+  const paths = await tempPaths();
+  const legacyFile = path.join(paths.stateDir, "daemon", "binary-content-pins.json");
+  await fs.mkdir(path.dirname(legacyFile), { recursive: true });
+  await fs.writeFile(legacyFile, "legacy pin state");
+
+  await runDaemonIteration(paths, {
+    collectors: {
+      system: async () => envelope("system-overview", "collect_system", { load_average: [0, 0, 0], uptime_seconds: 1, memory: { used_fraction: 0, free_bytes: 1 }, swap: { used_bytes: 0 } }),
+      processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+      disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+    },
+    ts: "2026-05-24T00:00:00.000Z",
+    now: "2026-05-24T00:00:00.000Z",
+  });
+
+  await assert.rejects(() => fs.access(legacyFile), { code: "ENOENT" });
+});
+
 // Component D (trusted-state step-1, §7): the honest integrity_level label. Additive-only, a
 // LABEL not a trust decision -- covered here as (a) the in-memory statusRecord returned by
 // runDaemonIteration and (b) the same field surviving the real writeDaemonStatus tmp+rename

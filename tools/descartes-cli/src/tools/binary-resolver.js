@@ -1,10 +1,7 @@
 import {
-  mkdir as defaultMkdir,
   readFile as defaultReadFile,
   realpath as defaultRealpath,
-  rename as defaultRename,
   stat as defaultStat,
-  writeFile as defaultWriteFile,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
@@ -20,10 +17,6 @@ const LINUX_ACL_ATTRIBUTES = ["system.posix_acl_access", "system.posix_acl_defau
 
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
 export const UNTRUSTED_BINARY = "untrusted_binary";
-
-export const MAX_CONTENT_PIN_ENTRIES = 256;
-export const CONTENT_PIN_SCHEMA_VERSION = 1;
-export const CONTENT_PIN_STORE_NAME = "binary-content-pins.json";
 
 export const KNOWN_COLLECTOR_BINARIES = Object.freeze([
   "VBoxManage", "codesign", "colima", "container", "crontab", "df", "docker", "id", "incus",
@@ -134,13 +127,6 @@ function asUid(value) {
   return Number.isInteger(uid) && uid >= 0 ? uid : undefined;
 }
 
-function parseDsclAttribute(stdout, attribute) {
-  const prefix = `${attribute}:`;
-  const line = String(stdout ?? "").split(/\r?\n/).find((candidate) => candidate.trim().startsWith(prefix));
-  if (!line) return undefined;
-  return line.trim().slice(prefix.length).trim();
-}
-
 function dsclAttributeEvidence(stdout, attribute) {
   const lines = String(stdout ?? "").split(/\r?\n/).map((line) => line.trim());
   const prefix = `${attribute}:`;
@@ -163,7 +149,7 @@ function parseDsclAttributes(stdout, attribute) {
 export function parseDsclGroupMembership(stdout) {
   const evidence = dsclAttributeEvidence(stdout, "GroupMembership");
   if (evidence.present) return evidence.value.split(/\s+/).filter(Boolean);
-  return evidence.explicitAbsent ? [] : undefined;
+  return undefined;
 }
 
 export function parseDsclPrimaryGroupList(stdout, gid) {
@@ -198,12 +184,14 @@ function parseDsclUniqueId(stdout) {
 }
 
 function parseMacOsNode(stdout) {
-  return parseDsclAttribute(stdout, "AppleMetaNodeLocation");
+  const evidence = dsclAttributeEvidence(stdout, "AppleMetaNodeLocation");
+  return evidence.present ? evidence.value : undefined;
 }
 
 function parseMacOsNestedGroups(stdout) {
-  const value = parseDsclAttribute(stdout, "NestedGroups");
-  return value === undefined ? [] : value.split(/\s+/).filter(Boolean);
+  const evidence = dsclAttributeEvidence(stdout, "NestedGroups");
+  if (evidence.present) return evidence.value.split(/\s+/).filter(Boolean);
+  return evidence.explicitAbsent ? [] : undefined;
 }
 
 export function parseMacOsSearchPath(stdout) {
@@ -230,7 +218,7 @@ function localAuthenticationSearchPolicy(stdout) {
 }
 
 function isLocalMacOsNode(node) {
-  return node === undefined || node === "/Local/Default" || node === "local";
+  return node === "/Local/Default";
 }
 
 function validLocalRecordName(name) {
@@ -292,7 +280,8 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   if (!groupName || !validLocalRecordName(groupName)) return unresolvedGroupMembership();
 
   const fullRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`]);
-  if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(fullRecord.stdout)) || parseMacOsNestedGroups(fullRecord.stdout).length > 0) {
+  const nestedGroups = fullRecord.error ? undefined : parseMacOsNestedGroups(fullRecord.stdout);
+  if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(fullRecord.stdout)) || !nestedGroups || nestedGroups.length > 0) {
     return unresolvedGroupMembership();
   }
   const fullMembership = parseDsclGroupMembership(fullRecord.stdout);
@@ -372,122 +361,7 @@ function normalizeAclStatus(result) {
   return status === "present" || status === "absent" ? status : "unknown";
 }
 
-function contentIdentity(stat) {
-  if (stat?.dev === undefined || stat?.ino === undefined) return undefined;
-  return `${String(stat.dev)}:${String(stat.ino)}`;
-}
-
-function cachedContentHash(cache, identity) {
-  if (!identity) return undefined;
-  return cache instanceof Map ? cache.get(identity) : cache?.[identity];
-}
-
-function saveContentHash(cache, identity, value) {
-  if (!identity) return;
-  if (cache instanceof Map) cache.set(identity, value);
-  else if (cache && typeof cache === "object") cache[identity] = value;
-}
-
-export function resolveBinaryContentPinStorePaths(descartesPaths) {
-  const dir = path.join(descartesPaths.stateDir, "daemon");
-  return { dir, file: path.join(dir, CONTENT_PIN_STORE_NAME) };
-}
-
-function normalizeContentPin(value) {
-  if (!value || typeof value !== "object" || !/^[0-9a-f]{64}$/.test(String(value.sha256 ?? value.hash ?? ""))) return undefined;
-  return {
-    size: value.size ?? null,
-    mtime: value.mtime ?? null,
-    sha256: String(value.sha256 ?? value.hash),
-  };
-}
-
-function contentPinEntries(cache) {
-  if (cache instanceof Map) return [...cache.entries()];
-  if (!cache || typeof cache !== "object") return [];
-  return Object.entries(cache);
-}
-
-async function presentContentPinIdentities({
-  platform,
-  trustedBinaryPaths,
-  homeDir,
-  username,
-  binaries,
-  realpathFn,
-  statFn,
-}) {
-  const present = new Set();
-  for (const binary of binaries ?? []) {
-    for (const candidate of candidatePaths(binary, platform, { trustedBinaryPaths, homeDir, username })) {
-      const real = await safeRealpath(realpathFn, candidate);
-      if (!real.path) continue;
-      const result = await safeStat(statFn, real.path);
-      // Retain a pin for any inode that is still present at a known candidate, even if a
-      // transient mode change makes it non-executable. Dropping it in that state would allow
-      // the same inode to be re-pinned after executability is restored.
-      if (result.stat) {
-        const identity = contentIdentity(result.stat);
-        if (identity) present.add(identity);
-      }
-    }
-  }
-  return present;
-}
-
-export async function loadContentHashCache(descartesPaths, {
-  platform = process.platform,
-  trustedBinaryPaths = [],
-  homeDir,
-  username,
-  binaries = KNOWN_COLLECTOR_BINARIES,
-  maxEntries = MAX_CONTENT_PIN_ENTRIES,
-  realpathFn = defaultRealpath,
-  statFn = defaultStat,
-} = {}) {
-  const cache = new Map();
-  const { file } = resolveBinaryContentPinStorePaths(descartesPaths);
-  try {
-    const parsed = JSON.parse(await defaultReadFile(file, "utf8"));
-    if (parsed?.version !== CONTENT_PIN_SCHEMA_VERSION || !parsed?.pins || typeof parsed.pins !== "object") return cache;
-    for (const [identity, value] of Object.entries(parsed.pins).slice(-maxEntries)) {
-      const pin = normalizeContentPin(value);
-      if (pin && /^.+:.+$/.test(identity)) cache.set(identity, pin);
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") return cache;
-  }
-
-  const present = await presentContentPinIdentities({
-    platform,
-    trustedBinaryPaths,
-    homeDir,
-    username,
-    binaries,
-    realpathFn,
-    statFn,
-  });
-  for (const identity of cache.keys()) {
-    if (!present.has(identity)) cache.delete(identity);
-  }
-  return cache;
-}
-
-export async function persistContentHashCache(descartesPaths, cache, { maxEntries = MAX_CONTENT_PIN_ENTRIES } = {}) {
-  const { dir, file } = resolveBinaryContentPinStorePaths(descartesPaths);
-  const entries = contentPinEntries(cache)
-    .map(([identity, value]) => [identity, normalizeContentPin(value)])
-    .filter(([, value]) => value !== undefined)
-    .slice(-maxEntries);
-  await defaultMkdir(dir, { recursive: true, mode: 0o700 });
-  const tempFile = `${file}.${process.pid}.tmp`;
-  await defaultWriteFile(tempFile, JSON.stringify({ version: CONTENT_PIN_SCHEMA_VERSION, pins: Object.fromEntries(entries) }, null, 2), { mode: 0o600 });
-  await defaultRename(tempFile, file);
-}
-
-async function readAndRecordContent(readFileFn, resolvedPath, stat, contentHashCache) {
-  const identity = contentIdentity(stat);
-  if (!identity) return { error: "content_identity_unavailable" };
+async function readContent(readFileFn, resolvedPath) {
   let contents;
   try {
     contents = await readFileFn(resolvedPath);
@@ -496,13 +370,6 @@ async function readAndRecordContent(readFileFn, resolvedPath, stat, contentHashC
   }
   const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(String(contents));
   const hash = createHash("sha256").update(bytes).digest("hex");
-  const previous = cachedContentHash(contentHashCache, identity);
-  if (previous && (previous.sha256 ?? previous.hash) !== hash) return { error: "content_changed_in_place" };
-  saveContentHash(contentHashCache, identity, {
-    size: stat?.size,
-    mtime: stat?.mtimeMs ?? stat?.mtimeNs,
-    sha256: hash,
-  });
   return { contents, hash };
 }
 
@@ -565,7 +432,6 @@ async function inspectTrustedPath(resolvedPath, {
   operatorTrusted = false,
   groupWriterUidsFn = loadGroupWriterUids,
   groupWriterCache = {},
-  contentHashCache,
   aclCheckFn = detectAclStatus,
   execFileAsync = execFileAsyncDefault,
 } = {}) {
@@ -578,7 +444,7 @@ async function inspectTrustedPath(resolvedPath, {
   // An explicit operator path is an escape hatch for ownership/mode policy only. It is still
   // realpath-resolved and must be a regular executable, and the identity is rechecked before exec.
   if (operatorTrusted) {
-    const content = await readAndRecordContent(readFileFn, resolvedPath, fileResult.stat, contentHashCache);
+    const content = await readContent(readFileFn, resolvedPath);
     if (content.error) return trustFailure({ resolvedPath, component: resolvedPath, reason: content.error });
     return {
       status: "resolved",
@@ -644,7 +510,7 @@ async function inspectTrustedPath(resolvedPath, {
     }
   }
 
-  const content = await readAndRecordContent(readFileFn, resolvedPath, fileResult.stat, contentHashCache);
+  const content = await readContent(readFileFn, resolvedPath);
   if (content.error) {
     return trustFailure({ resolvedPath, component: resolvedPath, reason: content.error === "content_read_failed" ? "script_probe_failed" : content.error, sameUidWritableComponents, acceptedSystemAccounts });
   }
@@ -686,7 +552,6 @@ export async function resolveCollectorBinary(binary, {
   readFileFn = defaultReadFile,
   groupWriterUidsFn = loadGroupWriterUids,
   groupWriterCache = {},
-  contentHashCache,
   execFileAsync = execFileAsyncDefault,
   aclCheckFn = detectAclStatus,
 } = {}) {
@@ -697,7 +562,6 @@ export async function resolveCollectorBinary(binary, {
 
   const configuredPaths = new Set(trustedBinaryPaths.filter((candidate) => typeof candidate === "string" && path.isAbsolute(candidate)));
   const candidates = candidatePaths(name, platform, { trustedBinaryPaths, homeDir, username });
-  const effectiveContentHashCache = contentHashCache ?? new Map();
   let firstUntrusted;
   let firstResolvedUntrusted;
 
@@ -718,7 +582,6 @@ export async function resolveCollectorBinary(binary, {
       operatorTrusted,
       groupWriterUidsFn,
       groupWriterCache,
-      contentHashCache: effectiveContentHashCache,
       execFileAsync,
       aclCheckFn,
     });
@@ -782,18 +645,16 @@ async function reverifyResolvedBinary(resolution, options) {
     && (current.stat.dev !== original.dev || current.stat.ino !== original.ino)) {
     return { ...resolution, status: UNTRUSTED_BINARY, trust_verdict: UNTRUSTED_BINARY, trust_reason: "file_identity_changed", offending_component: real.path, path: undefined };
   }
-  const content = await readAndRecordContent(
+  const content = await readContent(
     options.readFileFn ?? defaultReadFile,
     real.path,
-    current.stat,
-    options.contentHashCache ?? new Map(),
   );
-  if (content.error || (resolution.content_hash && content.hash !== resolution.content_hash)) {
+  if (content.error) {
     return {
       ...resolution,
       status: UNTRUSTED_BINARY,
       trust_verdict: UNTRUSTED_BINARY,
-      trust_reason: content.error ?? "content_changed_in_place",
+      trust_reason: content.error,
       offending_component: real.path,
       path: undefined,
     };
