@@ -387,10 +387,15 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
     processes: collectors.processes ?? collectProcessEvidence,
     disks: collectors.disks ?? collectDiskEvidence,
   };
+  const collectorOptions = {
+    ...options,
+    trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    groupWriterCache: options.groupWriterCache ?? {},
+  };
   const evidence = [];
-  if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system(options));
-  if (profile.collectors.processes?.enabled) evidence.push(await activeCollectors.processes({ limit: profile.collectors.processes.limit ?? DEFAULT_DAEMON_PROCESS_LIMIT, ...options }));
-  if (profile.collectors.disks?.enabled) evidence.push(await activeCollectors.disks(options));
+  if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system(collectorOptions));
+  if (profile.collectors.processes?.enabled) evidence.push(await activeCollectors.processes({ limit: profile.collectors.processes.limit ?? DEFAULT_DAEMON_PROCESS_LIMIT, ...collectorOptions }));
+  if (profile.collectors.disks?.enabled) evidence.push(await activeCollectors.disks(collectorOptions));
   return evidence;
 }
 
@@ -422,20 +427,21 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     canary: collectors.canary ?? (() => collectCanaryEvidence([])),
     "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
   };
-  const evidence = [];
-  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(options));
-  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network(options));
-  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"](options));
-  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance(options));
   const collectorOptions = {
     ...options,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    groupWriterCache: options.groupWriterCache ?? {},
   };
+  const evidence = [];
+  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(collectorOptions));
+  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network(collectorOptions));
+  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"](collectorOptions));
+  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance(collectorOptions));
   if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
   if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
-  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"](options));
-  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary(options));
-  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"](options));
+  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"](collectorOptions));
+  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary(collectorOptions));
+  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"](collectorOptions));
   return evidence;
 }
 
@@ -970,10 +976,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  // Collector subprocesses receive only explicitly configured trusted paths. Binary trust is
-  // intentionally local to each realpath/stat/ACL inspection; no group-membership cache exists.
+  // Collector subprocesses receive only explicitly configured trusted paths. Group membership
+  // is resolved from local sources and cached in one fresh object shared by every collector in
+  // this daemon tick; the object is discarded before the next iteration.
   const collectorOptions = {
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+    groupWriterCache: {},
   };
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and

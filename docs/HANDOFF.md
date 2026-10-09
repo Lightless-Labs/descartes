@@ -2,6 +2,27 @@
 
 **Last updated:** 2026-10-09
 
+## Group-aware collector binary trust — 2026-10-09
+
+Updated the binary resolver after `4c9cb40` to accept group-writable path components only when the
+effective owning-group UID set is a subset of `{root, daemon UID}`. macOS resolves group membership
+from local `dscl .` group/user records and rejects nested or non-local groups; Linux parses
+`/etc/group` and `/etc/passwd` directly and rejects any non-`files` group source in `nsswitch.conf`.
+ACL presence or detection failure remains untrusted, wrappers remain rejected unless explicitly
+operator-trusted, and `trusted_binary_paths` remains the unusual-setup override. Group membership
+is cached in one object shared by all resolver-backed collectors during each daemon tick.
+
+Host verification: `/usr/bin/dscl . -read /Groups/admin GroupMembership` returned
+`root _mbsetupuser thomas`; `/usr/bin/dscl . -list /Users PrimaryGroupID` returned no users with
+primary group 80. The local admin group therefore has writer UIDs `[0, 248, 502]`, so this host's
+`tmux` (`/opt/homebrew/Cellar/tmux/3.6a/bin/tmux`, offending `/opt/homebrew/Cellar`) and
+`tailscale` (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`, offending `/Applications`)
+both correctly resolve `untrusted_binary` with `writer_set_not_subset_allowed`; the conditional
+single-user `{root, current user}` case is covered by deterministic tests and resolves trusted.
+
+Focused resolver tests pass 24/24. Fresh-XDG host-access `npm test` passes **2358/2358, 0 failures,
+34 skipped, 2392 total**. No push or merge.
+
 ## macOS ACL parser regression — 2026-10-09
 
 Fixed the live macOS provenance regression locally on `fix/collector-sources-2026-10`. The

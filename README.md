@@ -79,6 +79,9 @@ guessing, so it never fabricates a "first time seen" claim. Positive-evidence de
 (credential access, canaries) are not gated this way and fire on any matching metadata change,
 benign or not. See [current limits](#current-limits).
 
+Collector execution refuses a path component when an untrusted principal could replace it, including through
+an unverified local group membership or ACL.
+
 The durable core will move to Rust over time. The current CLI uses Node.js, because this
 lets the tool ship quickly. The CLI includes the agent harness and the subscription login.
 
@@ -208,15 +211,18 @@ Collector subprocesses never use the ambient `PATH`: each bare binary name is re
 pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
 the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
 and checks the file plus every ancestor directory to `/`. A component is trusted only when its
-owner is `root` or the daemon UID, neither the group-write nor other-write mode bit is set, and
-ACL state is known to be absent. Group membership is deliberately not resolved: a group-writable
-component is rejected even when its members appear harmless, and an ACL probe that cannot establish
-absence is rejected. Same-UID owner writability is inside Descartes' current trust boundary and is
-recorded in provenance. Shell wrappers are rejected unless explicitly operator-trusted, so a
-trusted wrapper can never authorize an untrusted downstream binary. An offending component, ACL
-uncertainty, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
-recheck produces `untrusted_binary`; the collector does not execute it and the census remains
-incomplete. The recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU window.
+not `root` or the daemon UID, it is other-writable, its ACL is present or cannot be proved absent,
+or a group-writable component's effective membership cannot be verified from local sources or
+includes another UID, because an unverified or foreign writer could replace the collector. macOS
+membership uses local `dscl` records and Linux membership uses `/etc/group`, `/etc/passwd`, and a
+local-only `nsswitch.conf` check, so a single-user Homebrew tree and `/Applications/Tailscale.app`
+work without configuration when their admin group contains only root and the daemon user. Same-UID
+owner writability is inside Descartes' current trust boundary and is recorded in provenance. Shell
+wrappers are rejected unless explicitly operator-trusted, so a trusted wrapper can never authorize an
+untrusted downstream binary. An offending component, ACL uncertainty, stat failure, or binary
+replacement detected by the immediate pre-exec `(dev, ino)` recheck produces `untrusted_binary`; the
+collector does not execute it and the census remains incomplete. The recheck narrows but cannot
+eliminate the residual resolution-to-exec TOCTOU window.
 
 An operator may explicitly accept a non-standard absolute executable by listing it in
 `$XDG_CONFIG_HOME/descartes/watch.json`:
@@ -230,8 +236,8 @@ An operator may explicitly accept a non-standard absolute executable by listing 
 Each configured entry is still realpath-resolved and checked as a regular executable before use,
 and evidence reports it as `operator_trusted`; this explicit override accepts the operator's
 responsibility for ownership, write bits, and ACLs. This is important for single-user Homebrew
-installs whose `/opt/homebrew` tree may be owned or group-managed outside the daemon trust model:
-add the exact executable to `trusted_binary_paths` when that installation is intentionally trusted.
+installs with unusual ownership or group arrangements; the exact executable may be added to
+`trusted_binary_paths` when the operator intentionally accepts that responsibility.
 A miss on known paths is `not_found_on_known_paths`: it contributes no zero for that source and
 removes it from the current session universe. If another multiplexer remains usable, the reduced
 universe can still be a complete census; baseline status continues to report the previously seen

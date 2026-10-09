@@ -16,11 +16,15 @@ daemon user's `~/.nix-profile/bin`, and `/etc/profiles/per-user/<user>/bin`), Ni
 locations, Homebrew locations on macOS, and the macOS `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
 CLI path. The resolver follows
 symlinks, requires a regular executable, and checks the file plus every ancestor directory to `/`:
-only root or the daemon UID may own each component, and group/world-writable components are
-rejected. Same-UID owner writability is accepted within the current trust boundary but recorded as
-provenance. A failed check is `untrusted_binary`, is never executed, and leaves the source census
-incomplete. The immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual
-resolution-to-exec TOCTOU window. Operators may list explicit absolute escape-hatch paths in
+only root or the daemon UID may own each component; other-write is rejected; ACL presence or ACL
+detection failure is rejected; and group-write is accepted only when the owning group's effective
+members, resolved from local sources, are a subset of `{root, daemon UID}`. macOS uses local `dscl`
+records and rejects nested or non-local groups; Linux parses `/etc/group` and `/etc/passwd` directly
+and rejects a `group:` nsswitch line that can consult directory services. Same-UID owner writability
+is accepted within the current trust boundary but recorded as provenance. A failed check is
+`untrusted_binary`, is never executed, and leaves the source census incomplete. The immediate
+pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU
+window. Operators may list explicit absolute escape-hatch paths in
 `watch.json` under `trusted_binary_paths`; those entries still need realpath + regular-file
 validation and are reported as `operator_trusted`. Evidence records the requested binary, resolved
 absolute path, trust verdict, and any offending component. If no known candidate is usable, the

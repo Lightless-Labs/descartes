@@ -6,7 +6,11 @@ import { promisify } from "node:util";
 
 const execFileAsyncDefault = promisify(execFile);
 const MACOS_LS = "/bin/ls";
+const MACOS_DSCL = "/usr/bin/dscl";
 const LINUX_XATTR_COMMANDS = ["/usr/bin/getfattr", "/bin/getfattr"];
+const LINUX_NSSWITCH = "/etc/nsswitch.conf";
+const LINUX_GROUP = "/etc/group";
+const LINUX_PASSWD = "/etc/passwd";
 
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
 export const UNTRUSTED_BINARY = "untrusted_binary";
@@ -92,7 +96,7 @@ function missing(error) {
   return error?.code === "ENOENT" || error?.code === "ENOTDIR";
 }
 
-function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [] }) {
+function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [], writerUids = [] }) {
   return {
     status: UNTRUSTED_BINARY,
     path: undefined,
@@ -101,6 +105,7 @@ function trustFailure({ resolvedPath, component, reason, sameUidWritableComponen
     offending_component: component,
     trust_reason: reason,
     same_uid_writable_components: sameUidWritableComponents,
+    writer_uids: writerUids,
     operator_override_hint: "Review this absolute path and add it to trusted_binary_paths in watch.json only if the operator accepts the risk.",
   };
 }
@@ -110,6 +115,98 @@ function asUid(value) {
   return Number.isInteger(uid) && uid >= 0 ? uid : undefined;
 }
 
+function parseDsclAttribute(stdout, attribute) {
+  const prefix = `${attribute}:`;
+  const line = String(stdout ?? "").split(/\r?\n/).find((candidate) => candidate.trim().startsWith(prefix));
+  if (!line) return undefined;
+  return line.trim().slice(prefix.length).trim();
+}
+
+export function parseDsclGroupMembership(stdout) {
+  const value = parseDsclAttribute(stdout, "GroupMembership");
+  return value === undefined ? undefined : value.split(/\s+/).filter(Boolean);
+}
+
+export function parseDsclPrimaryGroupList(stdout, gid) {
+  return String(stdout ?? "").split(/\r?\n/).flatMap((line) => {
+    const fields = line.trim().split(/\s+/);
+    return fields.length >= 2 && fields.at(-1) === String(gid) ? [fields[0]] : [];
+  });
+}
+
+export function parseDsclGroupList(stdout, gid) {
+  const matches = String(stdout ?? "").split(/\r?\n/).flatMap((line) => {
+    const fields = line.trim().split(/\s+/);
+    return fields.length >= 2 && fields.at(-1) === String(gid) ? [fields[0]] : [];
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function parseDsclUniqueId(stdout) {
+  return asUid(parseDsclAttribute(stdout, "UniqueID") ?? String(stdout ?? "").trim());
+}
+
+function parseMacOsNode(stdout) {
+  return parseDsclAttribute(stdout, "AppleMetaNodeLocation");
+}
+
+function parseMacOsNestedGroups(stdout) {
+  const value = parseDsclAttribute(stdout, "NestedGroups");
+  return value === undefined ? [] : value.split(/\s+/).filter(Boolean);
+}
+
+function isLocalMacOsNode(node) {
+  return node === undefined || node === "/Local/Default" || node === "local";
+}
+
+function validLocalRecordName(name) {
+  return typeof name === "string" && name.length > 0 && !/[\0/\s]/.test(name);
+}
+
+export function parseLinuxNsswitchGroupSources(stdout) {
+  const line = String(stdout ?? "").split(/\r?\n/).map((candidate) => candidate.replace(/#.*/, "").trim())
+    .find((candidate) => /^group\s*:/.test(candidate));
+  if (!line) return undefined;
+  return line.slice(line.indexOf(":") + 1).trim().split(/\s+/).filter((token) => token && !/^\[.*\]$/.test(token));
+}
+
+function parseLinuxGroupFile(stdout, gid) {
+  const matches = [];
+  for (const rawLine of String(stdout ?? "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const fields = line.split(":");
+    if (fields.length < 4 || !fields[0] || asUid(fields[2]) === undefined) {
+      if (fields.length >= 3 && asUid(fields[2]) === gid) return undefined;
+      continue;
+    }
+    if (asUid(fields[2]) !== gid) continue;
+    const members = fields[3] ? fields[3].split(",").filter(Boolean) : [];
+    if (members.some((member) => !validLocalRecordName(member))) return undefined;
+    matches.push({ name: fields[0], members });
+  }
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function parseLinuxPasswdFile(stdout, gid) {
+  const users = new Map();
+  for (const rawLine of String(stdout ?? "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const fields = line.split(":");
+    if (fields.length < 7 || !validLocalRecordName(fields[0])) return undefined;
+    const uid = asUid(fields[2]);
+    const primaryGid = asUid(fields[3]);
+    if (uid === undefined || primaryGid === undefined || users.has(fields[0])) return undefined;
+    users.set(fields[0], { uid, primary: primaryGid === gid });
+  }
+  return users;
+}
+
+function hasNonLocalLinuxGroupSource(sources) {
+  return !Array.isArray(sources) || sources.length === 0 || sources.some((source) => source !== "files");
+}
+
 async function execLookup(execFileAsync, command, args) {
   try {
     const result = await execFileAsync(command, args, { timeout: 2000, maxBuffer: 256 * 1024 });
@@ -117,6 +214,87 @@ async function execLookup(execFileAsync, command, args) {
   } catch (error) {
     return { error };
   }
+}
+
+async function readLocalText(readLocalFileFn, target) {
+  try {
+    const value = await readLocalFileFn(target, { encoding: "utf8" });
+    return { text: String(value) };
+  } catch (error) {
+    return { error };
+  }
+}
+
+function unresolvedGroupMembership() {
+  return { error: "group_membership_unverifiable" };
+}
+
+async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
+  const numericGid = asUid(gid);
+  if (numericGid === undefined) return unresolvedGroupMembership();
+
+  const groupList = await execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Groups", "PrimaryGroupID"]);
+  const groupName = groupList.error ? undefined : parseDsclGroupList(groupList.stdout, numericGid);
+  if (!groupName || !validLocalRecordName(groupName)) return unresolvedGroupMembership();
+
+  const fullRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`]);
+  if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(fullRecord.stdout)) || parseMacOsNestedGroups(fullRecord.stdout).length > 0) {
+    return unresolvedGroupMembership();
+  }
+
+  const [membership, primaryUsers] = await Promise.all([
+    execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "GroupMembership"]),
+    execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Users", "PrimaryGroupID"]),
+  ]);
+  const supplementaryNames = membership.error ? undefined : parseDsclGroupMembership(membership.stdout);
+  if (!supplementaryNames || primaryUsers.error) return unresolvedGroupMembership();
+  const primaryNames = parseDsclPrimaryGroupList(primaryUsers.stdout, numericGid);
+  const names = [...new Set([...supplementaryNames, ...primaryNames])];
+  if (names.some((name) => !validLocalRecordName(name))) return unresolvedGroupMembership();
+
+  const uidResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "UniqueID"])));
+  const uids = uidResults.map((result) => result.error ? undefined : parseDsclUniqueId(result.stdout));
+  return uids.every((uid) => uid !== undefined) ? { uids } : unresolvedGroupMembership();
+}
+
+async function loadLinuxGroupWriterUids(gid, { readLocalFileFn }) {
+  const numericGid = asUid(gid);
+  if (numericGid === undefined) return unresolvedGroupMembership();
+  const [nsswitch, groupFile, passwdFile] = await Promise.all([
+    readLocalText(readLocalFileFn, LINUX_NSSWITCH),
+    readLocalText(readLocalFileFn, LINUX_GROUP),
+    readLocalText(readLocalFileFn, LINUX_PASSWD),
+  ]);
+  if (nsswitch.error || groupFile.error || passwdFile.error) return unresolvedGroupMembership();
+  const sources = parseLinuxNsswitchGroupSources(nsswitch.text);
+  if (hasNonLocalLinuxGroupSource(sources)) return unresolvedGroupMembership();
+  const group = parseLinuxGroupFile(groupFile.text, numericGid);
+  const users = parseLinuxPasswdFile(passwdFile.text, numericGid);
+  if (!group || !users) return unresolvedGroupMembership();
+
+  const names = [...new Set([...group.members, ...[...users.entries()].filter(([, user]) => user.primary).map(([name]) => name)])];
+  if (names.some((name) => !users.has(name))) return unresolvedGroupMembership();
+  return { uids: names.map((name) => users.get(name).uid) };
+}
+
+async function loadGroupWriterUids(gid, {
+  platform,
+  cache = {},
+  execFileAsync = execFileAsyncDefault,
+  readLocalFileFn = defaultReadFile,
+} = {}) {
+  const numericGid = asUid(gid);
+  if (numericGid === undefined) return unresolvedGroupMembership();
+  cache.groupWriterUids ??= new Map();
+  if (cache.groupWriterUids.has(numericGid)) return cache.groupWriterUids.get(numericGid);
+
+  const result = platform === "darwin"
+    ? await loadMacOsGroupWriterUids(numericGid, { execFileAsync })
+    : platform === "linux"
+      ? await loadLinuxGroupWriterUids(numericGid, { readLocalFileFn })
+      : unresolvedGroupMembership();
+  cache.groupWriterUids.set(numericGid, result);
+  return result;
 }
 
 function normalizeAclStatus(result) {
@@ -171,6 +349,9 @@ async function inspectTrustedPath(resolvedPath, {
   expectedUid,
   platform = process.platform,
   operatorTrusted = false,
+  groupWriterUidsFn = loadGroupWriterUids,
+  groupWriterCache = {},
+  readLocalFileFn = defaultReadFile,
   aclCheckFn = detectAclStatus,
   execFileAsync = execFileAsyncDefault,
 } = {}) {
@@ -206,15 +387,29 @@ async function inspectTrustedPath(resolvedPath, {
       return trustFailure({ resolvedPath, component, reason: "foreign_owner", sameUidWritableComponents });
     }
     const mode = Number(result.stat.mode);
+    let writerUids = [];
     if ((mode & 0o020) !== 0) {
-      return trustFailure({ resolvedPath, component, reason: "group_writable", sameUidWritableComponents });
+      const groupResult = await groupWriterUidsFn(result.stat.gid, {
+        platform,
+        cache: groupWriterCache,
+        execFileAsync,
+        readLocalFileFn,
+      });
+      if (!groupResult || groupResult.error || !Array.isArray(groupResult.uids)) {
+        return trustFailure({ resolvedPath, component, reason: groupResult?.error ?? "group_membership_unverifiable", sameUidWritableComponents, writerUids });
+      }
+      writerUids = [...new Set(groupResult.uids)];
+      const allowed = writerUids.every((uid) => uid === 0 || (expectedUid !== undefined && uid === expectedUid));
+      if (!allowed) {
+        return trustFailure({ resolvedPath, component, reason: "writer_set_not_subset_allowed", sameUidWritableComponents, writerUids });
+      }
     }
     if ((mode & 0o002) !== 0) {
-      return trustFailure({ resolvedPath, component, reason: "other_writable", sameUidWritableComponents });
+      return trustFailure({ resolvedPath, component, reason: "other_writable", sameUidWritableComponents, writerUids });
     }
     const aclStatus = normalizeAclStatus(await aclCheckFn(component, { platform, stat: result.stat, execFileAsync }));
     if (aclStatus !== "absent") {
-      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents });
+      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids });
     }
     if ((mode & 0o200) !== 0 && ownerUid === expectedUid) {
       sameUidWritableComponents.push(component);
@@ -244,9 +439,11 @@ async function inspectTrustedPath(resolvedPath, {
 /**
  * Resolve a collector command without consulting PATH. Candidates are realpath-resolved and a
  * normal candidate is accepted only when the executable and every directory up to / is owned by
- * root or the daemon UID, has no group/other write bit, and has no extended ACL. ACL uncertainty,
- * foreign ownership, and write bits fail closed. Same-UID owner writability is intentionally
- * accepted and recorded in same_uid_writable_components.
+ * root or the daemon UID, has no other-write bit, has no extended ACL, and any group-writable
+ * component's locally resolved effective member set is contained in {root, daemon UID}. Group
+ * membership is read from local platform sources only and is cached for the caller's tick. ACL
+ * uncertainty, foreign ownership, unresolved membership, and write bits fail closed. Same-UID
+ * owner writability is intentionally accepted and recorded in same_uid_writable_components.
  */
 export async function resolveCollectorBinary(binary, {
   platform = process.platform,
@@ -257,6 +454,9 @@ export async function resolveCollectorBinary(binary, {
   homeDir,
   username,
   readFileFn = defaultReadFile,
+  readLocalFileFn = defaultReadFile,
+  groupWriterUidsFn = loadGroupWriterUids,
+  groupWriterCache = {},
   execFileAsync = execFileAsyncDefault,
   aclCheckFn = detectAclStatus,
 } = {}) {
@@ -284,6 +484,9 @@ export async function resolveCollectorBinary(binary, {
       expectedUid,
       platform,
       operatorTrusted,
+      groupWriterUidsFn,
+      groupWriterCache,
+      readLocalFileFn,
       execFileAsync,
       aclCheckFn,
     });

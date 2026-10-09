@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { candidatePaths, parseMacOsAclStatus, resolveCollectorBinary, runResolvedExecFile } from "../src/tools/binary-resolver.js";
+import {
+  candidatePaths,
+  parseMacOsAclStatus,
+  resolveCollectorBinary,
+  runResolvedExecFile,
+} from "../src/tools/binary-resolver.js";
 
 function regularExecutable(mode = 0o100755) {
   return { mode, uid: 0, dev: 1, ino: 2, isFile: () => true };
@@ -8,6 +13,10 @@ function regularExecutable(mode = 0o100755) {
 
 function directory(mode = 0o40755, uid = 0) {
   return { mode, uid, dev: 1, ino: 3, isDirectory: () => true };
+}
+
+function groupWritableDirectory(gid, uid = 0) {
+  return { ...directory(0o40775, uid), gid };
 }
 
 function trustedStats(filePath, { file = regularExecutable(), ancestors = {} } = {}) {
@@ -180,7 +189,7 @@ test("resolveCollectorBinary rejects an owner-writable executable owned by anoth
   assert.equal(resolution.trust_reason, "foreign_owner");
 });
 
-test("resolveCollectorBinary rejects a group-writable ancestor without resolving group membership", async () => {
+test("resolveCollectorBinary trusts a macOS group-writable Homebrew ancestor when the local group is root plus the daemon", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
     realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
@@ -188,38 +197,173 @@ test("resolveCollectorBinary rejects a group-writable ancestor without resolving
       ancestors: {
         "/opt": directory(),
         "/opt/homebrew": directory(),
-        "/opt/homebrew/bin": { ...directory(0o40775, 0), gid: 80 },
+        "/opt/homebrew/bin": groupWritableDirectory(80),
       },
     }),
     readFileFn: readableBinary,
     aclCheckFn: aclAbsent,
-    expectedUid: 501,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas UniqueID") return { stdout: "UniqueID: 502\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
   });
 
-  assert.equal(resolution.status, "untrusted_binary", JSON.stringify(resolution));
-  assert.equal(resolution.offending_component, "/opt/homebrew/bin");
-  assert.equal(resolution.trust_reason, "group_writable");
+  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
+  assert.equal(resolution.path, "/opt/homebrew/bin/tmux");
 });
 
-test("resolveCollectorBinary rejects a group-writable ancestor with a second admin and exposes the operator override", async () => {
+test("resolveCollectorBinary rejects a macOS group-writable ancestor when the local group has another user", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
     realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     statFn: trustedStats("/opt/homebrew/bin/tmux", {
       ancestors: {
         "/opt/homebrew": directory(),
-        "/opt/homebrew/bin": { ...directory(0o40775, 0), gid: 80 },
+        "/opt/homebrew/bin": groupWritableDirectory(80),
       },
     }),
     readFileFn: readableBinary,
     aclCheckFn: aclAbsent,
-    expectedUid: 501,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas UniqueID") return { stdout: "UniqueID: 502\n" };
+      if (args.join(" ") === ". -read /Users/other UniqueID") return { stdout: "UniqueID: 503\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
   });
 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.offending_component, "/opt/homebrew/bin");
-  assert.equal(resolution.trust_reason, "group_writable");
+  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
+  assert.deepEqual(resolution.writer_uids, [0, 502, 503]);
   assert.match(resolution.operator_override_hint, /trusted_binary_paths/);
+});
+
+test("resolveCollectorBinary rejects a macOS nested group as unverifiable", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nNestedGroups: nested-uuid\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
+});
+
+test("resolveCollectorBinary rejects a macOS non-local group node as unverifiable", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /LDAPv3/example\nGroupMembership: root thomas\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
+});
+
+test("resolveCollectorBinary trusts a Linux group-writable ancestor from local files only", async () => {
+  const localFiles = {
+    "/etc/nsswitch.conf": "passwd: files\ngroup: files\n",
+    "/etc/group": "root:x:0:\nadmin:x:80:root,daemon\n",
+    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
+  };
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "linux",
+    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/usr/local/bin/tmux", {
+      ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) },
+      file: { ...regularExecutable(), uid: 0, gid: 80 },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    readLocalFileFn: async (target) => localFiles[target],
+    expectedUid: 501,
+  });
+
+  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
+});
+
+test("resolveCollectorBinary rejects Linux directory-service groups even when local files are safe", async () => {
+  const localFiles = {
+    "/etc/nsswitch.conf": "passwd: files\ngroup: files sss\n",
+    "/etc/group": "admin:x:80:root,daemon\n",
+    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
+  };
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "linux",
+    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/usr/local/bin/tmux", {
+      ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    readLocalFileFn: async (target) => localFiles[target],
+    expectedUid: 501,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
+});
+
+test("resolveCollectorBinary caches group membership within the supplied tick cache", async () => {
+  const localFiles = {
+    "/etc/nsswitch.conf": "group: files\n",
+    "/etc/group": "admin:x:80:root,daemon\n",
+    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
+  };
+  const groupWriterCache = {};
+  let reads = 0;
+  const options = {
+    platform: "linux",
+    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/usr/local/bin/tmux", {
+      ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    readLocalFileFn: async (target) => { reads += 1; return localFiles[target]; },
+    expectedUid: 501,
+    groupWriterCache,
+  };
+
+  assert.equal((await resolveCollectorBinary("tmux", options)).status, "resolved");
+  assert.equal((await resolveCollectorBinary("tmux", options)).status, "resolved");
+  assert.equal(reads, 3);
 });
 
 test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitute for a rejected direct binary", async () => {
@@ -245,12 +389,23 @@ test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitu
     },
     readFileFn: async (target) => target === wrapper ? "#!/bin/sh\n/Applications/Tailscale.app/Contents/MacOS/Tailscale\n" : "mach-o",
     aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas UniqueID") return { stdout: "UniqueID: 501\n" };
+      if (args.join(" ") === ". -read /Users/other UniqueID") return { stdout: "UniqueID: 503\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
     expectedUid: 501,
   });
 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.offending_component, "/Applications");
-  assert.equal(resolution.trust_reason, "group_writable");
+  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
 });
 
 test("resolveCollectorBinary resolves symlinks before checking a world-writable target ancestor", async () => {
