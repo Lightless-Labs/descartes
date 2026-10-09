@@ -2,6 +2,23 @@
 
 **Last updated:** 2026-10-09
 
+## Daybreak re-gate — 2026-10-09
+
+The current `fix/collector-sources-2026-10` re-gate is implemented locally in atomic commits
+`4c9cb40` (fail-closed binary ownership/ACL trust, operator-path docs, and cache removal),
+`8ed5a83` (malformed tmux/screen output makes the source partial), `6ba7d80` (v2 session-universe
+count/churn identities, persistent multiplexer-disappearance status, and tmux+screen → screen
+re-warm regression), and `f1830c6` (nonzero screen output with malformed rows remains partial).
+No push or merge.
+
+Binary trust no longer performs group-membership resolution. Every realpath'd file/ancestor must be
+root/daemon-owned, not group/other-writable, and ACL-free; ACL probe uncertainty is untrusted with
+an operator `trusted_binary_paths` remediation hint. Session count/churn coverage is universe-scoped
+(`v2:tmux`, `v2:screen`, `v2:tmux+screen`), while legacy identities freeze. Baseline status carries
+`binary_availability` and reports `source_not_observed: <multiplexer> since <ts>` while a previously
+observed source remains a known-path miss. Focused resolver, session collector, session baseline,
+and baseline suites are green; the fresh-XDG full suite remains to be run for final accounting.
+
 ## Per-source session census — 2026-10-09
 
 After merge commit `107f758` and test commit `6ec21fc`, the session census now derives a canonical
