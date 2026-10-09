@@ -2,6 +2,16 @@
 
 **Last updated:** 2026-10-09
 
+## macOS ACL parser regression — 2026-10-09
+
+Fixed the live macOS provenance regression locally on `fix/collector-sources-2026-10`. The
+`ls -led` ACL parser now accepts setuid/setgid/sticky mode characters, treats `@` as an xattr
+marker without implying an ACL, and treats only a `+` mode suffix followed by valid numbered ACE
+lines as ACL-present; malformed ACL output remains `acl_unknown` and therefore untrusted. Added
+real-shape fixtures for plain files, setuid files, xattr-marked directories, and ACL files with
+ACE lines. The two live macOS provenance tests pass 2/2 outside the restricted sandbox. Fresh-XDG
+full `npm test` passes **2353/2353, 0 failures, 34 skipped, 2387 total**. No push or merge.
+
 ## Daybreak re-gate — 2026-10-09
 
 The current `fix/collector-sources-2026-10` re-gate is implemented locally in atomic commits

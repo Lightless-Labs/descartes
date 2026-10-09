@@ -124,18 +124,32 @@ function normalizeAclStatus(result) {
   return status === "present" || status === "absent" ? status : "unknown";
 }
 
-function macOsAclStatus(stdout) {
-  const line = String(stdout ?? "").split("\n").find((candidate) => candidate.trim());
+export function parseMacOsAclStatus(stdout) {
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  const firstLineIndex = lines.findIndex((candidate) => candidate.trim());
+  const line = firstLineIndex === -1 ? undefined : lines[firstLineIndex];
   if (!line) return "unknown";
   const mode = line.trim().split(/\s+/)[0];
-  if (!/^[bcdlps-][rwx-]{9}[+@]?$/.test(mode)) return "unknown";
-  return mode.endsWith("+") ? "present" : "absent";
+  const match = /^([bcdlps-][rwxXsStT-]{9})([+@])?$/.exec(mode);
+  if (!match) return "unknown";
+  if (match[2] !== "+") return "absent";
+
+  // `ls -led` prints one numbered ACE per line after the mode line. A `+` without
+  // an ACE is not a trustworthy ACL observation, so retain the fail-closed result
+  // for truncated or otherwise malformed command output.
+  const aceLines = lines
+    .slice(firstLineIndex + 1)
+    .map((candidate) => candidate.trim())
+    .filter(Boolean);
+  return aceLines.length > 0 && aceLines.every((candidate) => /^\d+:\s+\S+\s+(?:allow|deny)\b/.test(candidate))
+    ? "present"
+    : "unknown";
 }
 
 async function detectAclStatus(component, { platform, execFileAsync = execFileAsyncDefault } = {}) {
   if (platform === "darwin") {
     const result = await execLookup(execFileAsync, MACOS_LS, ["-led", component]);
-    return result.error ? "unknown" : macOsAclStatus(result.stdout);
+    return result.error ? "unknown" : parseMacOsAclStatus(result.stdout);
   }
   if (platform === "linux") {
     for (const command of LINUX_XATTR_COMMANDS) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { candidatePaths, resolveCollectorBinary, runResolvedExecFile } from "../src/tools/binary-resolver.js";
+import { candidatePaths, parseMacOsAclStatus, resolveCollectorBinary, runResolvedExecFile } from "../src/tools/binary-resolver.js";
 
 function regularExecutable(mode = 0o100755) {
   return { mode, uid: 0, dev: 1, ino: 2, isFile: () => true };
@@ -25,6 +25,25 @@ function trustedStats(filePath, { file = regularExecutable(), ancestors = {} } =
 
 const readableBinary = async () => Buffer.from("not a script");
 const aclAbsent = async () => "absent";
+
+test("parseMacOsAclStatus recognizes a plain file from real ls -led output as ACL-free", () => {
+  assert.equal(parseMacOsAclStatus("-rwxr-xr-x  1 root  wheel  170816 Oct  9 16:27 /usr/bin/tool\n"), "absent");
+});
+
+test("parseMacOsAclStatus accepts setuid permission bits in real ls -led output", () => {
+  assert.equal(parseMacOsAclStatus("-rwsr-xr-x   1 root  wheel  170816 Nov 22  2025 /bin/ps\n"), "absent");
+});
+
+test("parseMacOsAclStatus treats an xattr-marked directory as ACL-free", () => {
+  assert.equal(parseMacOsAclStatus("drwxr-xr-x@ 39 root  wheel 1248 Nov 22  2025 /bin\n"), "absent");
+});
+
+test("parseMacOsAclStatus recognizes a plus-marked ACL and its numbered ACE lines", () => {
+  assert.equal(parseMacOsAclStatus(
+    "-rw-r--r--+  1 thomas  wheel  0 Oct  9 16:27 /tmp/file\n"
+      + " 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA000001F6 allow read,write,execute,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity\n",
+  ), "present");
+});
 
 test("resolveCollectorBinary uses only pinned absolute candidates and accepts a regular executable", async () => {
   const seen = [];
