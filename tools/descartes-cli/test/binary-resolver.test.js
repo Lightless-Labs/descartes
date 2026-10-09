@@ -554,6 +554,60 @@ test("resolveCollectorBinary rejects a macOS nested group as unverifiable", asyn
   assert.equal(resolution.trust_reason, "group_membership_unverifiable");
 });
 
+test("resolveCollectorBinary rejects a partial macOS group record when AppleMetaNodeLocation is omitted", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt": directory(), "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "GroupMembership: root thomas\nNo such key: GroupMembers\nNo such key: NestedGroups\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
+});
+
+test("resolveCollectorBinary rejects a partial macOS group record when NestedGroups is omitted", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt": directory(), "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nNo such key: GroupMembers\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
+});
+
 test("resolveCollectorBinary rejects a macOS non-local group node as unverifiable", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
