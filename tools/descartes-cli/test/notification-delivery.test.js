@@ -334,3 +334,31 @@ test("audit rotation rereads rows appended by another process", async () => {
   const audit = await readNotificationDeliveryAudit(paths);
   assert.ok(audit.some((entry) => entry.payload?.title === "external row"));
 });
+
+test("audit rotation preserves an append racing between the snapshot read and rename", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(auditFile), { recursive: true });
+  const seed = Array.from({ length: MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS }, (_, index) => JSON.stringify({
+    ts: new Date(Date.UTC(2026, 9, 9, 0, 3, index)).toISOString(),
+    status: "skipped",
+    reason: "filler",
+    channel: "cli",
+    payload: { title: `filler ${index}`, body: "Body" },
+  })).join("\n");
+  await fs.writeFile(auditFile, `${seed}\n`);
+
+  let hookCalled = false;
+  const external = { ts: "2026-10-09T00:04:59.000Z", status: "delivered", channel: "cli", payload: { title: "racing append", body: "Body" } };
+  await deliverNotificationDecision(paths, { notify: false, title: "rotating row", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-09T00:05:00.000Z",
+    beforeAuditRotation: async () => {
+      hookCalled = true;
+      await fs.appendFile(auditFile, `${JSON.stringify(external)}\n`);
+    },
+  });
+  assert.equal(hookCalled, true, "the append must race after the snapshot read and before rename");
+  const audit = await readNotificationDeliveryAudit(paths);
+  assert.ok(audit.some((entry) => entry.payload?.title === "racing append"));
+});

@@ -243,7 +243,38 @@ function commandForPayload(channel, payload, options = {}) {
 export const MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS = 1000;
 const deliveryAuditCache = new Map();
 
-async function appendDeliveryAudit(descartesPaths, record) {
+function parseAuditRecords(contents) {
+  return contents.split("\n").filter(Boolean).map((line) => {
+    try { return JSON.parse(line); } catch { return undefined; }
+  }).filter(Boolean);
+}
+
+function sameFailureRecord(previous, record) {
+  const failure = ["error", "unavailable", "disabled"].includes(record.status);
+  return failure && previous && previous.status === record.status
+    && previous.channel === record.channel
+    && previous.reason === record.reason
+    && JSON.stringify(previous.payload ?? {}) === JSON.stringify(record.payload ?? {});
+}
+
+function compactAuditRecords(records, ts) {
+  if (records.length <= MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS && records[0]?.status !== "summary") return records;
+  const hasSummary = records[0]?.status === "summary";
+  const previousSummary = hasSummary ? records[0] : undefined;
+  const rawRecords = hasSummary ? records.slice(1) : records;
+  const dropCount = Math.max(0, rawRecords.length - (MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS - 1));
+  const dropped = rawRecords.slice(0, dropCount);
+  return [{
+    ts,
+    status: "summary",
+    reason: "audit_rotation",
+    dropped_count: (previousSummary?.dropped_count ?? 0) + dropped.length,
+    first_dropped_ts: dropped[0]?.ts,
+    last_dropped_ts: dropped.at(-1)?.last_ts ?? dropped.at(-1)?.ts,
+  }, ...rawRecords.slice(dropCount)];
+}
+
+async function appendDeliveryAudit(descartesPaths, record, options = {}) {
   const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
   await ensureParent(auditFile);
   // The daemon and `alerts notifications test` are legitimate independent writers. Refresh the
@@ -251,48 +282,55 @@ async function appendDeliveryAudit(descartesPaths, record) {
   // appended by the other process.
   let records = [];
   try {
-    records = (await fs.readFile(auditFile, "utf8")).split("\n").filter(Boolean).map((line) => {
-      try { return JSON.parse(line); } catch { return undefined; }
-    }).filter(Boolean);
+    records = parseAuditRecords(await fs.readFile(auditFile, "utf8"));
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
   deliveryAuditCache.set(auditFile, records);
   const previous = records.at(-1);
-  const failure = ["error", "unavailable", "disabled"].includes(record.status);
-  const sameFailure = failure && previous && previous.status === record.status
-    && previous.channel === record.channel
-    && previous.reason === record.reason
-    && JSON.stringify(previous.payload ?? {}) === JSON.stringify(record.payload ?? {});
+  const sameFailure = sameFailureRecord(previous, record);
   const next = sameFailure
     ? { ...previous, last_ts: record.ts, repeat_count: (previous.repeat_count ?? 1) + 1 }
     : record;
-  if (sameFailure) records[records.length - 1] = next;
-  else records.push(next);
-  if (records.length > MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS) {
-    const hasSummary = records[0]?.status === "summary";
-    const previousSummary = hasSummary ? records[0] : undefined;
-    const rawRecords = hasSummary ? records.slice(1) : records;
-    const dropCount = rawRecords.length - (MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS - 1);
-    const dropped = rawRecords.slice(0, dropCount);
-    records = [{
-      ts: record.ts,
-      status: "summary",
-      reason: "audit_rotation",
-      dropped_count: (previousSummary?.dropped_count ?? 0) + dropped.length,
-      first_dropped_ts: dropped[0]?.ts,
-      last_dropped_ts: dropped.at(-1)?.last_ts ?? dropped.at(-1)?.ts,
-    }, ...rawRecords.slice(dropCount)];
-  }
-  deliveryAuditCache.set(auditFile, records);
-  if (!sameFailure && records.length <= MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS && records[0]?.status !== "summary") {
-    await fs.appendFile(auditFile, `${JSON.stringify(next)}\n`, { mode: 0o600 });
+  const prospective = sameFailure ? [...records.slice(0, -1), next] : [...records, next];
+  const needsRotation = sameFailure || prospective.length > MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS || prospective[0]?.status === "summary";
+  if (!needsRotation) {
+    deliveryAuditCache.set(auditFile, prospective);
+    if (!sameFailure) await fs.appendFile(auditFile, `${JSON.stringify(next)}\n`, { mode: 0o600 });
     return next;
   }
-  const tmp = `${auditFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tmp, `${records.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
-  await fs.rename(tmp, auditFile);
-  return next;
+
+  // Rotation boundary: let appenders that already opened the current path finish on this inode,
+  // while appenders that open the path afterward get a fresh file. Never rewrite the current path
+  // from the stale pre-rename snapshot.
+  if (!sameFailure) await options.beforeAuditRotation?.({ auditFile });
+  const archiveFile = `${auditFile}.${process.pid}.${crypto.randomUUID()}.archive`;
+  try {
+    await fs.rename(auditFile, archiveFile);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  let archivedRecords = [];
+  try {
+    archivedRecords = parseAuditRecords(await fs.readFile(archiveFile, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const archivedPrevious = archivedRecords.at(-1);
+  const archivedSameFailure = sameFailureRecord(archivedPrevious, record);
+  const archivedNext = archivedSameFailure
+    ? { ...archivedPrevious, last_ts: record.ts, repeat_count: (archivedPrevious.repeat_count ?? 1) + 1 }
+    : record;
+  const compacted = compactAuditRecords(
+    archivedSameFailure ? [...archivedRecords.slice(0, -1), archivedNext] : [...archivedRecords, archivedNext],
+    record.ts,
+  );
+  // Append the compacted result instead of replacing the path: a new writer may have created a
+  // fresh current file while the old inode was being compacted, and its rows must survive too.
+  await fs.appendFile(auditFile, `${compacted.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
+  try { await fs.unlink(archiveFile); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  deliveryAuditCache.set(auditFile, compacted);
+  return archivedNext;
 }
 
 export async function readNotificationDeliveryAudit(descartesPaths) {
@@ -320,24 +358,25 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const config = options.config ?? await readNotificationDeliveryConfig(descartesPaths);
   const payload = normalizeNotificationPayload(decision, options);
+  const append = (record) => appendDeliveryAudit(descartesPaths, record, options);
   if (decision?.notify !== true) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "skipped", reason: "notify_false", channel: config.channel, payload });
+    return append({ ts: now, status: "skipped", reason: "notify_false", channel: config.channel, payload });
   }
   if (!config.enabled) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "disabled", channel: config.channel, payload });
+    return append({ ts: now, status: "disabled", channel: config.channel, payload });
   }
   const commandSpec = commandForPayload(config.channel, payload, { ...options, config });
   if (!commandSpec) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "cli_only", channel: config.channel, payload });
+    return append({ ts: now, status: "cli_only", channel: config.channel, payload });
   }
   if (commandSpec.unavailable) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "unavailable", channel: config.channel, reason: commandSpec.unavailable, payload });
+    return append({ ts: now, status: "unavailable", channel: config.channel, reason: commandSpec.unavailable, payload });
   }
 
   const runner = options.runner ?? execFileAsync;
   try {
     await runner(commandSpec.command, commandSpec.args, { timeout: options.timeoutMs ?? 5000, maxBuffer: 1024 * 64 });
-    return appendDeliveryAudit(descartesPaths, {
+    return append({
       ts: now,
       status: "delivered",
       channel: config.channel,
@@ -352,7 +391,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
     // follow-up). Only a spawn failure (`open` itself unrunnable — a string `error.code` like ENOENT)
     // or a timeout/kill is a real error.
     if (commandSpec.best_effort_status && typeof error?.code === "number") {
-      return appendDeliveryAudit(descartesPaths, {
+      return append({
         ts: now,
         status: "delivered",
         delivery_confidence: "best_effort",
@@ -361,7 +400,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
         payload,
       });
     }
-    return appendDeliveryAudit(descartesPaths, {
+    return append({
       ts: now,
       status: "error",
       channel: config.channel,
