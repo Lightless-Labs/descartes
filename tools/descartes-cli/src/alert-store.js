@@ -716,6 +716,10 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
     }
     if (alert.legacy_without_episode) continue;
     for (const [key, incident] of Object.entries(alert.incidents ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
+      // A candidate that was never attempted is not a persisted retry. New/unconfirmed work is
+      // still surfaced by the current candidate group above; this fallback is specifically for an
+      // already-attempted delivery that failed and then disappeared from detector output.
+      if (!(incident.delivery_failure_count > 0 || incident.last_attempt_at)) continue;
       if (!notificationDueForIncident(alert, incident, { nowMs: new Date(now).getTime() })) continue;
       if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === key)) {
         notificationDueIncidents.push({ alert_id: id, incident_key: key });

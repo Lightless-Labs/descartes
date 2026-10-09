@@ -1851,18 +1851,29 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       lockTimeoutMs: options.lockTimeoutMs,
       lockRetryMs: options.lockRetryMs,
     });
+    const finalAlertsById = new Map((containmentAlerts.alerts ?? []).map((alert) => [alert.id, alert]));
+    const dueEntryStillApplies = (entry) => {
+      const finalAlert = finalAlertsById.get(entry.alert_id);
+      if (!finalAlert || ["recovered", "suppressed"].includes(finalAlert.status)) return false;
+      if (entry.storm) return finalAlert.incident_state === "incident_storm";
+      const incident = finalAlert.incidents?.[entry.incident_key];
+      return Boolean(incident && !["recovered", "suppressed"].includes(incident.status));
+    };
     alerts = {
       ...containmentAlerts,
       // The second persistence pass must not hide ordinary alerts that were due in the first
-      // phase; containment adds to the same delivery set rather than replacing it.
+      // phase; containment adds to the same delivery set rather than replacing it. Filter against
+      // the second pass's final persisted state so an entry from the first pass cannot resurrect a
+      // recommendation that the containment pass recovered in the same tick.
       notification_due_ids: [...new Set([
         ...(mainAlerts.notification_due_ids ?? []),
         ...(containmentAlerts.notification_due_ids ?? []),
-      ])],
+      ].filter((id) => [...(mainAlerts.notification_due_incidents ?? []), ...(containmentAlerts.notification_due_incidents ?? [])]
+        .some((entry) => entry.alert_id === id && dueEntryStillApplies(entry))))],
       notification_due_incidents: [...new Map([
         ...(mainAlerts.notification_due_incidents ?? []),
         ...(containmentAlerts.notification_due_incidents ?? []),
-      ].map((entry) => [`${entry.alert_id}\0${entry.incident_key}`, entry])).values()],
+      ].filter(dueEntryStillApplies).map((entry) => [`${entry.alert_id}\0${entry.incident_key}`, entry])).values()],
       adjudication_due_incidents: [...new Map([
         ...(mainAlerts.adjudication_due_incidents ?? []),
         ...(containmentAlerts.adjudication_due_incidents ?? []),

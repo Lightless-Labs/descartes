@@ -178,7 +178,7 @@ test("G2 HIGH-2: carried retention failure stays fixed-alert-active across fast 
   assert.equal(recovered.status.state, "ok");
 });
 
-test("G2 MEDIUM re-gate: an unresolved retention alert freezes without refresh while both tiers stay disabled", async () => {
+test("G2 MEDIUM re-gate: an unresolved retention alert freezes while failed delivery retries with both tiers disabled", async () => {
   const paths = await tempPaths();
   const failingPersist = async (descartesPaths, points, options) => {
     const result = await appendFactPointsByFamily(descartesPaths, points, options);
@@ -201,7 +201,7 @@ test("G2 MEDIUM re-gate: an unresolved retention alert freezes without refresh w
     const result = await tick(paths, hour);
     const current = result.alerts.alerts.find((alert) => alert.rule_id === alertId && alert.fingerprint === "service");
     assert.deepEqual({ last_seen: current.last_seen, last_notified: current.last_notified, cooldown_until: current.cooldown_until }, frozenFields);
-    assert.equal(result.alerts.notification_due_ids.includes(current.id), false);
+    assert.equal(result.alerts.notification_due_ids.includes(current.id), true, "the persisted failed delivery remains due even when detector coverage is excluded");
     assert.equal(result.alerts.candidates.some((candidate) => candidate.rule_id === alertId && candidate.fingerprint === "service"), false);
     assert.equal(current.status, "active");
   }
