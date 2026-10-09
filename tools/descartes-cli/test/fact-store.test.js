@@ -7,6 +7,8 @@ import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
 import { normalizeMetricPoint } from "../src/history-store.js";
 import {
   appendFactPoints,
+  appendFactPointsByFamily,
+  factStoreExists,
   DEFAULT_FACT_MAX_BYTES,
   DEFAULT_FACT_RETENTION_MS,
   enforceFactRetention,
@@ -22,6 +24,8 @@ import {
   resolveFactStorePaths,
 } from "../src/fact-store.js";
 import { readFactIntegrityLedger } from "../src/fact-store-integrity.js";
+import { FACT_FAMILY_IDS } from "../src/fact-families.js";
+import { certifiedReadWindowOk, factHistoryTrustworthy } from "../src/fact-store-completeness.js";
 
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-fact-store-test-"));
@@ -34,12 +38,46 @@ async function tempPaths() {
   });
 }
 
-test("resolveFactStorePaths points at stateDir/learned/facts/facts.jsonl with no double-nesting, passes the Pi-owned path guard", async () => {
+test("resolveFactStorePaths points at stateDir/learned/facts/<family>/facts.jsonl (S4 per-family stores), passes the Pi-owned path guard", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
-  assert.equal(storePaths.dir, path.join(paths.stateDir, "learned", "facts"));
-  assert.equal(storePaths.factsFile, path.join(paths.stateDir, "learned", "facts", "facts.jsonl"));
+  const storePaths = resolveFactStorePaths(paths, "service");
+  assert.equal(storePaths.dir, path.join(paths.stateDir, "learned", "facts", "service"));
+  assert.equal(storePaths.factsFile, path.join(paths.stateDir, "learned", "facts", "service", "facts.jsonl"));
   assert.doesNotThrow(() => assertNoPiOwnedPath({ factsFile: storePaths.factsFile }));
+  assert.equal(resolveFactStorePaths(paths, "peer").factsFile, path.join(paths.stateDir, "learned", "facts", "peer", "facts.jsonl"));
+});
+
+// T12 (fact-store capacity plan §8, I7): no legacy single-store default -- a call with no family, or
+// an unknown one, throws instead of silently reading/writing a store nobody else uses.
+test("T12: readFactPoints / appendFactPoints / enforceFactRetention / the path helpers throw with no family or an unknown family", async () => {
+  const paths = await tempPaths();
+  const point = { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts: "2026-07-10T00:00:00.000Z" };
+  for (const bad of [undefined, "", "facts", "../service", "seen-sets"]) {
+    const family = bad === undefined ? {} : { family: bad };
+    await assert.rejects(() => readFactPoints(paths, { ...family }), /famil/);
+    await assert.rejects(() => appendFactPoints(paths, [point], { ...family }), /famil/);
+    await assert.rejects(() => enforceFactRetention(paths, { ...family }), /famil/);
+    assert.throws(() => resolveFactStorePaths(paths, bad), /famil/);
+  }
+  await assert.rejects(() => readFactPoints(paths, { family: "service", families: ["service"] }), /exactly one/);
+  await assert.rejects(() => readFactPoints(paths, { families: [] }), /non-empty/);
+  await assert.rejects(() => readFactPoints(paths, { families: ["service", "nope"] }), /unknown fact family/);
+  // Nothing was created by any of the refused calls.
+  await assert.rejects(() => fs.stat(path.join(paths.stateDir, "learned", "facts")), { code: "ENOENT" });
+});
+
+test("T12: appendFactPoints refuses (before any write) an unregistered fact_name or a point of another family", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-07-10T00:00:00.000Z";
+  await assert.rejects(() => appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts },
+    { fact_name: "peer.seen", entity_key: "x", attributes: {}, ts },
+  ], { family: "service", now: ts }), /unregistered fact_name/);
+  await assert.rejects(() => appendFactPoints(paths, [
+    { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts },
+    { fact_name: "network.listening_port.owner", entity_key: "tcp:22", attributes: {}, ts },
+  ], { family: "service", now: ts }), /cannot be appended to the service store/);
+  await assert.rejects(() => fs.stat(resolveFactStorePaths(paths, "service").dir), { code: "ENOENT" });
 });
 
 test("DEFAULT_FACT_RETENTION_MS/DEFAULT_FACT_MAX_BYTES are their own constants, not aliases of history-store's", () => {
@@ -108,9 +146,9 @@ test("appendFactPoints/readFactPoints round-trip", async () => {
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" }, ts },
     { fact_name: "service.presence", entity_key: "postgres", attributes: { running: "false" }, ts },
-  ], { ts, now });
+  ], { family: "service", ts, now });
 
-  const { points, corrupt_count } = await readFactPoints(paths, { now });
+  const { points, corrupt_count } = await readFactPoints(paths, { family: "service", now });
   assert.equal(corrupt_count, 0);
   assert.equal(points.length, 2);
   assert.deepEqual(points.map((p) => p.entity_key).sort(), ["nginx", "postgres"]);
@@ -118,21 +156,21 @@ test("appendFactPoints/readFactPoints round-trip", async () => {
 
 test("appendFactPoints uses injected now as the explicit timestamp default", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: {} }], { now: "2026-07-10T00:00:00.000Z" });
-  const { points } = await readFactPoints(paths, { now: "2026-07-10T00:00:00.000Z" });
+  await appendFactPoints(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: {} }], { family: "service", now: "2026-07-10T00:00:00.000Z" });
+  const { points } = await readFactPoints(paths, { family: "service", now: "2026-07-10T00:00:00.000Z" });
   assert.equal(points[0].ts, "2026-07-10T00:00:00.000Z");
 });
 
 test("readFactPoints returns an empty result on ENOENT", async () => {
   const paths = await tempPaths();
-  const { points, corrupt_count } = await readFactPoints(paths);
+  const { points, corrupt_count } = await readFactPoints(paths, { family: "service" });
   assert.deepEqual(points, []);
   assert.equal(corrupt_count, 0);
 });
 
 test("readFactPoints skips corrupt lines and counts parseable schema-invalid records separately", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, [
     JSON.stringify({ ts: "2026-07-10T00:00:00.000Z", fact_name: "service.presence", entity_key: "nginx", attributes: {} }),
@@ -141,7 +179,7 @@ test("readFactPoints skips corrupt lines and counts parseable schema-invalid rec
     "",
   ].join("\n"));
 
-  const { points, corrupt_count, schema_invalid_count } = await readFactPoints(paths);
+  const { points, corrupt_count, schema_invalid_count } = await readFactPoints(paths, { family: "service" });
   assert.equal(corrupt_count, 1);
   assert.equal(schema_invalid_count, 1);
   assert.equal(points.length, 1);
@@ -154,12 +192,12 @@ test("enforceFactRetention drops points older than retentionMs and keeps the fil
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "old", attributes: {}, ts: "2026-07-09T00:00:00.000Z" },
     { fact_name: "service.presence", entity_key: "fresh", attributes: {}, ts: "2026-07-10T00:00:00.000Z" },
-  ], { now: base, retentionMs: 23 * 60 * 60 * 1000 });
+  ], { family: "service", now: base, retentionMs: 23 * 60 * 60 * 1000 });
 
-  const retention = await enforceFactRetention(paths, { now: base, retentionMs: 23 * 60 * 60 * 1000 });
+  const retention = await enforceFactRetention(paths, { family: "service", now: base, retentionMs: 23 * 60 * 60 * 1000 });
   assert.equal(retention.kept_count, 1);
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { family: "service" });
   assert.deepEqual(points.map((p) => p.entity_key), ["fresh"]);
 });
 
@@ -170,9 +208,9 @@ test("enforceFactRetention enforces maxBytes by keeping the newest records", asy
     { fact_name: "service.presence", entity_key: "one", attributes: {}, ts: new Date(base).toISOString() },
     { fact_name: "service.presence", entity_key: "two", attributes: {}, ts: new Date(base + 1000).toISOString() },
     { fact_name: "service.presence", entity_key: "three", attributes: {}, ts: new Date(base + 2000).toISOString() },
-  ], { now: base + 3000, maxBytes: 200 });
+  ], { family: "service", now: base + 3000, maxBytes: 200 });
 
-  const { points } = await readFactPoints(paths);
+  const { points } = await readFactPoints(paths, { family: "service" });
   assert(points.length >= 1);
   assert.equal(points.at(-1).entity_key, "three");
   assert(!points.some((p) => p.entity_key === "one"));
@@ -180,13 +218,13 @@ test("enforceFactRetention enforces maxBytes by keeping the newest records", asy
 
 test("enforceFactRetention rewrites the file atomically (tmp file appears then is renamed)", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts: "2026-07-10T00:00:00.000Z" },
-  ], { now: "2026-07-10T00:00:00.000Z" });
+  ], { family: "service", now: "2026-07-10T00:00:00.000Z" });
 
   const before = await fs.readFile(storePaths.factsFile, "utf8");
-  await enforceFactRetention(paths, { now: "2026-07-10T00:00:01.000Z", retentionMs: 60_000 });
+  await enforceFactRetention(paths, { family: "service", now: "2026-07-10T00:00:01.000Z", retentionMs: 60_000 });
   const after = await fs.readFile(storePaths.factsFile, "utf8");
   assert.equal(before, after); // unchanged content, but file must still exist post-rename (proves rename succeeded)
 
@@ -207,20 +245,20 @@ test("enforceFactRetention throws on a non-finite/negative retentionMs or maxByt
   const ts = "2026-07-10T00:00:00.000Z";
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts },
-  ], { ts, now: ts });
+  ], { family: "service", ts, now: ts });
 
-  await assert.rejects(() => enforceFactRetention(paths, { now: ts, retentionMs: "garbage" }), /retentionMs/);
-  await assert.rejects(() => enforceFactRetention(paths, { now: ts, retentionMs: NaN }), /retentionMs/);
-  await assert.rejects(() => enforceFactRetention(paths, { now: ts, retentionMs: -1 }), /retentionMs/);
-  await assert.rejects(() => enforceFactRetention(paths, { now: ts, maxBytes: NaN }), /maxBytes/);
-  await assert.rejects(() => enforceFactRetention(paths, { now: ts, maxBytes: -1 }), /maxBytes/);
+  await assert.rejects(() => enforceFactRetention(paths, { family: "service", now: ts, retentionMs: "garbage" }), /retentionMs/);
+  await assert.rejects(() => enforceFactRetention(paths, { family: "service", now: ts, retentionMs: NaN }), /retentionMs/);
+  await assert.rejects(() => enforceFactRetention(paths, { family: "service", now: ts, retentionMs: -1 }), /retentionMs/);
+  await assert.rejects(() => enforceFactRetention(paths, { family: "service", now: ts, maxBytes: NaN }), /maxBytes/);
+  await assert.rejects(() => enforceFactRetention(paths, { family: "service", now: ts, maxBytes: -1 }), /maxBytes/);
 
   // None of the rejected calls may have touched the store -- no silent erasure.
-  const { points } = await readFactPoints(paths, { now: ts });
+  const { points } = await readFactPoints(paths, { family: "service", now: ts });
   assert.equal(points.length, 1);
 
   // Zero remains valid (a deliberate evict-everything/keep-nothing sweep), fully accounted.
-  const retention = await enforceFactRetention(paths, { now: ts, retentionMs: 0, maxBytes: 0 });
+  const retention = await enforceFactRetention(paths, { family: "service", now: ts, retentionMs: 0, maxBytes: 0 });
   assert.equal(retention.kept_count, 0);
 });
 
@@ -320,15 +358,15 @@ test("appendFactPoints propagates an over-cap point as a whole-batch abort (mirr
   await assert.rejects(() => appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: {}, ts },
     { fact_name: "x".repeat(MAX_FACT_NAME_LENGTH + 1), entity_key: "postgres", attributes: {}, ts },
-  ], { ts, now: ts }));
+  ], { family: "service", ts, now: ts }));
 
-  const { points } = await readFactPoints(paths, { now: ts });
+  const { points } = await readFactPoints(paths, { family: "service", now: ts });
   assert.equal(points.length, 0); // neither point in the batch was written
 });
 
 test("readFactPoints counts a disk record with over-cap attributes as schema_invalid rather than throwing or silently accepting it", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   const oversizedAttributes = Object.fromEntries(Array.from({ length: MAX_FACT_ATTRIBUTE_COUNT + 1 }, (_, i) => [`key${i}`, "v"]));
   await fs.writeFile(storePaths.factsFile, [
@@ -336,7 +374,7 @@ test("readFactPoints counts a disk record with over-cap attributes as schema_inv
     JSON.stringify({ ts: "2026-07-10T00:00:01.000Z", fact_name: "service.presence", entity_key: "oversized", attributes: oversizedAttributes }),
   ].join("\n"));
 
-  const { points, schema_invalid_count } = await readFactPoints(paths);
+  const { points, schema_invalid_count } = await readFactPoints(paths, { family: "service" });
   assert.equal(schema_invalid_count, 1);
   assert.equal(points.length, 1);
   assert.equal(points[0].entity_key, "nginx");
@@ -354,8 +392,18 @@ test("readFactPoints counts a disk record with over-cap attributes as schema_inv
 
 test("F4-B2: a retention failure after a successful append does not throw -- appendFactPoints reports the real written_count plus a retention_error, and the records genuinely reached disk", async () => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
+
+  const ts = "2026-07-10T00:00:00.000Z";
+  // LOW-1/LOW-4 (review fold): a missing ledger now also runs a retention pass BEFORE
+  // appendFactPoints' own append (fact-store.js), so this store must already have an established
+  // ledger before the EISDIR trap is set up below -- otherwise the trap would catch that pre-pass
+  // instead, and the whole call would throw before any append happens at all (a different,
+  // separately-covered failure mode: no append means no fabricated written_count to guard
+  // against). A no-op append (empty factPoints) is enough to run one clean retention pass and
+  // establish a valid ledger with nothing in it.
+  await appendFactPoints(paths, [], { family: "service", ts, now: ts });
 
   // enforceFactRetention's own fs.writeFile(tmpFile, ...) (fact-store.js:~309-310) runs BEFORE it
   // ever touches the integrity ledger -- so pre-creating a DIRECTORY at that exact
@@ -364,13 +412,12 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
   const retentionTmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
   await fs.mkdir(retentionTmpFile);
 
-  const ts = "2026-07-10T00:00:00.000Z";
   const factPoints = [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
     { fact_name: "service.presence", entity_key: "postgres.service", attributes: { running: "true" } },
   ];
 
-  const result = await appendFactPoints(paths, factPoints, { ts, now: ts });
+  const result = await appendFactPoints(paths, factPoints, { family: "service", ts, now: ts });
 
   assert.equal(result.written_count, 2, "the append genuinely succeeded before retention ran -- the real count must be reported, never a fabricated 0");
   assert.equal(result.retention, undefined, "no genuine retention outcome exists on this failure -- must not synthesize one");
@@ -378,7 +425,7 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
 
   // The records really are on disk -- readFactPoints reads facts.jsonl directly, unaffected by
   // (and not blocked by) the still-failing retention tmp path.
-  const { points } = await readFactPoints(paths, { now: ts });
+  const { points } = await readFactPoints(paths, { family: "service", now: ts });
   assert.equal(points.length, 2);
 });
 
@@ -398,8 +445,14 @@ test("F4-B2: a retention failure after a successful append does not throw -- app
 
 test("F4-B2 empty-message edge: a retention failure with NO message still surfaces a non-empty retention_error -- appendFactPoints reports the real written_count and the records genuinely reached disk", async (t) => {
   const paths = await tempPaths();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
+
+  const ts = "2026-07-10T00:00:00.000Z";
+  // LOW-1/LOW-4 (review fold): establish a valid ledger first -- see the identical comment in the
+  // EISDIR test above. Otherwise the mock below would also fail appendFactPoints' own pre-append
+  // pass (ledger still missing at this point), and the whole call would throw before any append.
+  await appendFactPoints(paths, [], { family: "service", ts, now: ts });
 
   const retentionTmpFile = `${storePaths.factsFile}.${process.pid}.tmp`;
   const originalWriteFile = fs.writeFile.bind(fs);
@@ -408,13 +461,12 @@ test("F4-B2 empty-message edge: a retention failure with NO message still surfac
     return originalWriteFile(file, data, opts);
   });
 
-  const ts = "2026-07-10T00:00:00.000Z";
   const factPoints = [
     { fact_name: "service.presence", entity_key: "nginx.service", attributes: { running: "false" } },
     { fact_name: "service.presence", entity_key: "postgres.service", attributes: { running: "true" } },
   ];
 
-  const result = await appendFactPoints(paths, factPoints, { ts, now: ts });
+  const result = await appendFactPoints(paths, factPoints, { family: "service", ts, now: ts });
 
   assert.equal(result.written_count, 2, "the append genuinely succeeded before retention ran -- the real count must be reported, never a fabricated 0");
   assert.equal(result.retention, undefined, "no genuine retention outcome exists on this failure -- must not synthesize one");
@@ -425,7 +477,7 @@ test("F4-B2 empty-message edge: a retention failure with NO message still surfac
 
   // The records really are on disk -- readFactPoints reads facts.jsonl directly, unaffected by
   // (and not blocked by) the still-failing retention tmp path.
-  const { points } = await readFactPoints(paths, { now: ts });
+  const { points } = await readFactPoints(paths, { family: "service", now: ts });
   assert.equal(points.length, 2);
 });
 
@@ -449,13 +501,13 @@ test("enforceFactRetention drops a future-dated fact (beyond FUTURE_FACT_TOLERAN
   // than this unrelated first-run ambiguity.
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: now },
-  ], { now });
-  await enforceFactRetention(paths, { now });
+  ], { family: "service", now });
+  await enforceFactRetention(paths, { family: "service", now });
 
   const written = await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "real", attributes: {}, ts: now },
     { fact_name: "service.presence", entity_key: "future", attributes: {}, ts: future },
-  ], { now });
+  ], { family: "service", now });
   assert.equal(written.written_count, 2, "both records genuinely reach disk on append -- the wedge fix is a RETENTION-time drop, not an append-time rejection");
   assert.equal(written.retention.future_fact_dropped_count, 1);
   assert.equal(written.retention.kept_count, 2); // baseline (prior pass) + real
@@ -464,7 +516,7 @@ test("enforceFactRetention drops a future-dated fact (beyond FUTURE_FACT_TOLERAN
   // "fresh incident, post-fix" shape (plan §"Fix 0", "Recovery shape this produces"): the future
   // fact never reaches last_rewrite_newest_ts, so there is no wedge at all -- the read degrades
   // immediately via the new loss channel, not "unknown".
-  const read = await readFactPoints(paths, { now });
+  const read = await readFactPoints(paths, { family: "service", now });
   assert.deepEqual(read.points.map((p) => p.entity_key).sort(), ["baseline", "real"]);
   assert.equal(read.completeness.status, "degraded");
   assert.equal(read.completeness.degraded_reason, "future_fact");
@@ -472,7 +524,7 @@ test("enforceFactRetention drops a future-dated fact (beyond FUTURE_FACT_TOLERAN
   assert.equal(read.completeness.future_fact_dropped_total, 1);
   assert.deepEqual(read.completeness.future_loss_fields, []); // stamped at real now, not itself future
 
-  const { ledger } = await readFactIntegrityLedger(paths);
+  const { ledger } = await readFactIntegrityLedger(paths, "service");
   assert.equal(ledger.future_fact_dropped_total, 1);
   assert.equal(ledger.last_future_fact_ts, now);
   assert.equal(ledger.continuity.last_rewrite_newest_ts, now, "the dropped future record must never reach the continuity anchor");
@@ -491,7 +543,7 @@ test("enforceFactRetention's sum-invariant holds across kept + age-evicted + byt
     { fact_name: "service.presence", entity_key: "old", attributes: {}, ts: old },
     { fact_name: "service.presence", entity_key: "kept", attributes: {}, ts: kept },
     { fact_name: "service.presence", entity_key: "future", attributes: {}, ts: future },
-  ], { now, retentionMs });
+  ], { family: "service", now, retentionMs });
 
   const retention = written.retention;
   assert.equal(retention.kept_count + retention.age_evicted_count + retention.bytecap_evicted_count + retention.future_fact_dropped_count, 3);
@@ -510,16 +562,16 @@ test("a record within FUTURE_FACT_TOLERANCE_MS of now is NOT treated as a future
   // continuity_ok resolves to true, independent of fix 0.
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: now },
-  ], { now });
-  await enforceFactRetention(paths, { now });
+  ], { family: "service", now });
+  await enforceFactRetention(paths, { family: "service", now });
 
   const written = await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "near-future", attributes: {}, ts: withinTolerance },
-  ], { now });
+  ], { family: "service", now });
   assert.equal(written.retention.future_fact_dropped_count, 0);
   assert.equal(written.retention.kept_count, 2); // baseline (prior pass) + near-future
 
-  const read = await readFactPoints(paths, { now });
+  const read = await readFactPoints(paths, { family: "service", now });
   assert.equal(read.completeness.status, "intact");
   assert.equal(read.completeness.degraded_reason, "none");
 });
@@ -551,16 +603,16 @@ test("a pre-existing (ts===now) future-fact incident wedges continuity for exact
   // Pass A: baseline real fact.
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "baseline", attributes: {}, ts: t0 },
-  ], { now: t0 });
+  ], { family: "service", now: t0 });
 
   // Pass A2 (the poisoning tick): daemon.js derives BOTH ts and now from the same stepped-forward
   // clock, so fix 0's write-time filter does not catch this -- tsMs === nowMs, never beyond
   // nowMs+tol relative to its own (poisoned) now.
   const poisoned = await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "poisoned", attributes: {}, ts: tFutureIncident },
-  ], { now: tFutureIncident });
+  ], { family: "service", now: tFutureIncident });
   assert.equal(poisoned.retention.future_fact_dropped_count, 0, "ts===now this tick -- fix 0's write-time filter cannot catch a same-tick clock excursion");
-  const { ledger: afterPoison } = await readFactIntegrityLedger(paths);
+  const { ledger: afterPoison } = await readFactIntegrityLedger(paths, "service");
   assert.equal(afterPoison.continuity.last_rewrite_newest_ts, tFutureIncident, "the poisoned future fact IS committed as the continuity anchor by this pass -- this is the wedge fix 0's recovery path must resolve");
 
   // Pass B (transitional): clock restored to real time. This append-triggering pass's OWN
@@ -570,17 +622,17 @@ test("a pre-existing (ts===now) future-fact incident wedges continuity for exact
   // own output (tReal + tol is nowhere near tFutureIncident).
   const transitional = await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "recovery-b", attributes: {}, ts: tReal },
-  ], { now: tReal });
+  ], { family: "service", now: tReal });
   assert.equal(transitional.retention.future_fact_dropped_count, 1, "this pass's real nowMs now catches the far-future record");
 
-  const readAfterB = await readFactPoints(paths, { now: tReal });
+  const readAfterB = await readFactPoints(paths, { family: "service", now: tReal });
   // Honest, bounded-but-not-yet-resolved: NOT "intact" (a real loss occurred and is not yet
   // provably continuous), and the plan's own simplified "resolves the same pass" framing does
   // not hold for this incident shape -- this is a deviation from the plan's prose, not from its
   // governing invariant (never fabricate intact; never stay wedged forever). See deviations_from_spec.
   assert.equal(readAfterB.completeness.status, "unknown");
   assert.notEqual(readAfterB.completeness.status, "intact");
-  const { ledger: afterB } = await readFactIntegrityLedger(paths);
+  const { ledger: afterB } = await readFactIntegrityLedger(paths, "service");
   assert.equal(afterB.last_future_fact_ts, tReal, "the marker is stamped at THIS pass's real now, never the record's own claimed future ts");
   assert.equal(afterB.continuity.last_rewrite_newest_ts, tReal, "pass B's OWN committed output is future-fact-free -- the anchor is no longer poisoned going forward");
 
@@ -589,9 +641,9 @@ test("a pre-existing (ts===now) future-fact incident wedges continuity for exact
   // now-clean last_rewrite_newest_ts -- genuinely "ok", not via any recovery special-case.
   await appendFactPoints(paths, [
     { fact_name: "service.presence", entity_key: "recovery-c", attributes: {}, ts: tReal2 },
-  ], { now: tReal2 });
+  ], { family: "service", now: tReal2 });
 
-  const readAfterC = await readFactPoints(paths, { now: tReal2 });
+  const readAfterC = await readFactPoints(paths, { family: "service", now: tReal2 });
   assert.equal(readAfterC.completeness.continuity_ok, true);
   assert.equal(readAfterC.completeness.status, "degraded"); // the future-fact loss is real and within window
   assert.equal(readAfterC.completeness.degraded_reason, "future_fact");
@@ -616,21 +668,21 @@ test("Fix 1: a forward-dated last_corrupt_ts marker (stamped alongside the same-
   // Baseline: one real fact, two clean passes -> continuity_ok:true.
   await appendFactPoints(paths, [
     { ts: t0, fact_name: "service.presence", entity_key: "baseline", attributes: {} },
-  ], { now: t0 });
-  await enforceFactRetention(paths, { now: t0 });
+  ], { family: "service", now: t0 });
+  await enforceFactRetention(paths, { family: "service", now: t0 });
 
   // The poisoning tick: BOTH anomalies land in the SAME forward-clock pass -- a genuine corrupt
   // line already on disk (manually injected, simulating an unrelated concurrent loss) AND a
   // future-dated fact whose ts===now this pass (so fix 0's write-time filter cannot catch it,
   // exactly like the plain future-fact wedge test above). This pass's own nowIso is itself the
   // poisoned tFutureIncident, so last_corrupt_ts gets stamped at that SAME forward-dated value.
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.appendFile(storePaths.factsFile, [
     "not-json",
     JSON.stringify({ ts: tFutureIncident, fact_name: "service.presence", entity_key: "poisoned", attributes: {} }),
   ].join("\n") + "\n");
-  await enforceFactRetention(paths, { now: tFutureIncident });
-  const afterPoison = await readFactIntegrityLedger(paths);
+  await enforceFactRetention(paths, { family: "service", now: tFutureIncident });
+  const afterPoison = await readFactIntegrityLedger(paths, "service");
   assert.equal(afterPoison.ledger.last_corrupt_ts, tFutureIncident, "the corrupt-loss marker is genuinely stamped at the poisoned nowIso this pass");
   assert.equal(afterPoison.ledger.corrupt_dropped_total, 1);
   assert.equal(afterPoison.ledger.continuity.last_rewrite_newest_ts, tFutureIncident);
@@ -642,8 +694,8 @@ test("Fix 1: a forward-dated last_corrupt_ts marker (stamped alongside the same-
   // it. This is precisely the case the clamp exists for.
   await appendFactPoints(paths, [
     { ts: tReal, fact_name: "service.presence", entity_key: "recovery-b", attributes: {} },
-  ], { now: tReal });
-  const afterClampPass = await readFactIntegrityLedger(paths);
+  ], { family: "service", now: tReal });
+  const afterClampPass = await readFactIntegrityLedger(paths, "service");
   assert.equal(afterClampPass.ledger.last_corrupt_ts, tReal, "Fix 1: the forward-dated marker is clamped down to THIS pass's real nowIso");
   assert.equal(afterClampPass.ledger.last_future_fact_ts, tReal);
   // Never-fabricate / never-erase: the loss itself (the totals) must be completely unaffected by
@@ -651,16 +703,16 @@ test("Fix 1: a forward-dated last_corrupt_ts marker (stamped alongside the same-
   assert.equal(afterClampPass.ledger.corrupt_dropped_total, 1, "the clamp must NEVER erase a genuine loss -- only pull its marker forward-of-now down to nowIso");
   assert.equal(afterClampPass.ledger.future_fact_dropped_total, 1);
 
-  const readAfterClampPass = await readFactPoints(paths, { now: tReal });
+  const readAfterClampPass = await readFactPoints(paths, { family: "service", now: tReal });
   assert.equal(readAfterClampPass.completeness.status, "unknown"); // one transitional pass, as in the plain wedge test above
 
   // The following append-triggering pass resolves continuity genuinely (not via any
   // recovery/promotion special-case -- see the plain wedge test's own commentary).
   await appendFactPoints(paths, [
     { ts: tReal2, fact_name: "service.presence", entity_key: "recovery-c", attributes: {} },
-  ], { now: tReal2 });
+  ], { family: "service", now: tReal2 });
 
-  const readAfterC = await readFactPoints(paths, { now: tReal2 });
+  const readAfterC = await readFactPoints(paths, { family: "service", now: tReal2 });
   assert.equal(readAfterC.completeness.continuity_ok, true);
   assert.equal(readAfterC.completeness.status, "degraded"); // both clamped/stamped markers (tReal) are real, in-window losses
   // Both markers are now real (non-future) timestamps relative to tReal2 -- no future_loss_fields.
@@ -669,15 +721,154 @@ test("Fix 1: a forward-dated last_corrupt_ts marker (stamped alongside the same-
   // Acceptance #10: bounded to one window for a WINDOWED read, once the clock is corrected and
   // that read's own asOfMs advances past the clamped timestamp plus the window.
   const shortWindowMs = 1000;
-  const stillWithinWindow = await readFactPoints(paths, { now: new Date(Date.parse(tReal) + shortWindowMs).toISOString(), windowMs: shortWindowMs });
+  const stillWithinWindow = await readFactPoints(paths, { family: "service", now: new Date(Date.parse(tReal) + shortWindowMs).toISOString(), windowMs: shortWindowMs });
   assert.equal(stillWithinWindow.completeness.status, "degraded");
-  const agedOut = await readFactPoints(paths, { now: new Date(Date.parse(tReal) + shortWindowMs + 1).toISOString(), windowMs: shortWindowMs });
+  const agedOut = await readFactPoints(paths, { family: "service", now: new Date(Date.parse(tReal) + shortWindowMs + 1).toISOString(), windowMs: shortWindowMs });
   assert.equal(agedOut.completeness.status, "intact", "bounded to exactly one window once the clamped timestamp ages out of a WINDOWED read");
 
   // Acceptance #9/#12 (corrected from the plan's simplified prose): the CLI's unwindowed path
   // (no windowMs, asOfMs=-Infinity) has no upper age bound on any loss channel -- this stays
   // "degraded" indefinitely across further passes, with no ledger reset. This is honest
   // (unrelated to and unchanged by this revision), not a self-recovery claim.
-  const unwindowedFarFuture = await readFactPoints(paths, { now: new Date(Date.parse(tReal) + 365 * 24 * 60 * 60 * 1000).toISOString() });
+  const unwindowedFarFuture = await readFactPoints(paths, { family: "service", now: new Date(Date.parse(tReal) + 365 * 24 * 60 * 60 * 1000).toISOString() });
   assert.equal(unwindowedFarFuture.completeness.status, "degraded");
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// S4 (fact-store capacity plan §4.3, T12): routed append, the registry-driven retention sweep, and
+// multi-family reads.
+// ---------------------------------------------------------------------------------------------
+
+const S4_TS = "2026-07-10T00:00:00.000Z";
+const servicePoint = (key, ts = S4_TS) => ({ fact_name: "service.presence", entity_key: key, attributes: {}, ts });
+const networkPoint = (key, ts = S4_TS) => ({ fact_name: "network.listening_port.owner", entity_key: key, attributes: {}, ts });
+
+test("S4: appendFactPointsByFamily routes each point to its own family store, with its own ledger", async () => {
+  const paths = await tempPaths();
+  const result = await appendFactPointsByFamily(paths, [servicePoint("nginx"), networkPoint("tcp:22"), servicePoint("sshd")], { now: S4_TS });
+  assert.equal(result.written_count, 3);
+  assert.deepEqual(Object.keys(result.families).sort(), ["network", "service"]);
+  assert.equal(result.families.service.written_count, 2);
+  assert.equal(result.families.service.budget_bytes, 18 * 1024 * 1024);
+  assert.ok(result.families.service.appended_bytes > 0);
+  const service = await readFactPoints(paths, { family: "service", now: S4_TS });
+  const network = await readFactPoints(paths, { family: "network", now: S4_TS });
+  assert.deepEqual(service.points.map((point) => point.entity_key).sort(), ["nginx", "sshd"]);
+  assert.deepEqual(network.points.map((point) => point.entity_key), ["tcp:22"]);
+  const serviceLedger = (await readFactIntegrityLedger(paths, "service")).ledger;
+  const networkLedger = (await readFactIntegrityLedger(paths, "network")).ledger;
+  assert.notEqual(serviceLedger.generation, networkLedger.generation, "each family store has its own ledger lineage");
+  for (const family of ["session", "peer", "canary", "process_lineage", "scheduled_job", "provenance"]) {
+    assert.equal(await factStoreExists(paths, family), false, `${family}: a family with no points is never created`);
+  }
+});
+
+test("S4/T12: an unregistered fact_name anywhere in the batch throws before ANY family store is written", async () => {
+  const paths = await tempPaths();
+  await assert.rejects(() => appendFactPointsByFamily(paths, [servicePoint("nginx"), { fact_name: "peer.seen", entity_key: "x", attributes: {}, ts: S4_TS }], { now: S4_TS }), /unregistered fact_name/);
+  for (const family of FACT_FAMILY_IDS) assert.equal(await factStoreExists(paths, family), false);
+});
+
+test("S4/T12: a family store with no new points still age-evicts (the sweep), and one family's append failure is reported while the others persist", async () => {
+  const paths = await tempPaths();
+  const day = 24 * 60 * 60 * 1000;
+  const t0 = Date.parse(S4_TS);
+  await appendFactPointsByFamily(paths, [servicePoint("old", new Date(t0).toISOString()), networkPoint("tcp:22", new Date(t0).toISOString())], { now: new Date(t0).toISOString() });
+  // 31 days later only the service family produces points; the network store must still age-evict.
+  const later = new Date(t0 + 31 * day).toISOString();
+  const swept = await appendFactPointsByFamily(paths, [servicePoint("new", later)], { now: later });
+  assert.equal(swept.families.network.written_count, 0);
+  assert.equal(swept.families.network.retention.age_evicted_count, 1, "network had no new points but was still age-evicted");
+  assert.equal((await readFactPoints(paths, { family: "network", now: later })).points.length, 0);
+  // Break the network store's append (its facts.jsonl becomes a directory): service still persists.
+  const networkFile = resolveFactStorePaths(paths, "network").factsFile;
+  await fs.rm(networkFile, { force: true });
+  await fs.mkdir(path.join(networkFile, "blocker"), { recursive: true });
+  const partial = await appendFactPointsByFamily(paths, [servicePoint("after", later), networkPoint("tcp:80", later)], { now: later });
+  assert.match(partial.append_error, /^network: /);
+  assert.equal(partial.families.network.written_count, 0);
+  assert.equal(partial.families.service.written_count, 1);
+  assert.ok((await readFactPoints(paths, { family: "service", now: later })).points.some((point) => point.entity_key === "after"));
+});
+
+test("S4/T12: a directory under learned/facts/ that is not a registry family is ignored by the sweep and by every read", async () => {
+  const paths = await tempPaths();
+  const bogusDir = path.join(paths.stateDir, "learned", "facts", "bogus");
+  await fs.mkdir(bogusDir, { recursive: true });
+  const bogusLine = `${JSON.stringify(servicePoint("planted"))}\n`;
+  await fs.writeFile(path.join(bogusDir, "facts.jsonl"), bogusLine);
+  await appendFactPointsByFamily(paths, [servicePoint("nginx")], { now: S4_TS });
+  const swept = await appendFactPointsByFamily(paths, [], { now: S4_TS });
+  assert.deepEqual(Object.keys(swept.families), ["service"]);
+  assert.equal(await fs.readFile(path.join(bogusDir, "facts.jsonl"), "utf8"), bogusLine, "never touched");
+  const all = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now: S4_TS });
+  assert.deepEqual(all.points.map((point) => point.entity_key), ["nginx"]);
+  assert.deepEqual(Object.keys(all.family_reads).sort(), [...FACT_FAMILY_IDS].sort());
+});
+
+test("S4: a multi-family read merges points, reports each family's own read, and a never-created store reads store_exists:false", async () => {
+  const paths = await tempPaths();
+  await appendFactPointsByFamily(paths, [servicePoint("nginx", "2026-07-10T00:00:02.000Z"), networkPoint("tcp:22", "2026-07-10T00:00:01.000Z")], { now: "2026-07-10T00:00:02.000Z" });
+  await appendFactPointsByFamily(paths, [], { now: "2026-07-10T00:00:02.000Z" });
+  const read = await readFactPoints(paths, { families: ["service", "network", "peer"], now: "2026-07-10T00:00:02.000Z" });
+  assert.deepEqual(read.points.map((point) => point.entity_key), ["tcp:22", "nginx"], "merged and ts-sorted");
+  assert.equal(read.family_reads.service.completeness.status, "intact");
+  assert.equal(read.family_reads.peer.store_exists, false);
+  assert.equal(read.family_reads.peer.completeness.status, "unknown");
+  // The combined summary is over the stores that EXIST (a never-created one is reported per family as
+  // absent, not folded in as "unknown"), and a never-created store holds no history to vouch for, so
+  // it is left out of the trust AND as well.
+  assert.equal(read.completeness.status, "intact");
+  assert.equal(factHistoryTrustworthy(read).trust, true);
+  // Trust holds only if EVERY existing family read is trusted: corrupt the network store.
+  await fs.appendFile(resolveFactStorePaths(paths, "network").factsFile, "not-json\n");
+  const degraded = await readFactPoints(paths, { families: ["service", "network", "peer"], now: "2026-07-10T00:00:02.000Z" });
+  assert.equal(degraded.family_reads.service.completeness.status, "intact");
+  assert.equal(factHistoryTrustworthy(degraded).trust, false);
+  assert.notEqual(degraded.completeness.status, "intact", "combined: the worst existing family status");
+  assert.equal(degraded.completeness.status, degraded.family_reads.network.completeness.status);
+  // Every family absent: nothing to vouch for -> fail closed.
+  const none = await readFactPoints(paths, { families: ["peer", "canary"], now: "2026-07-10T00:00:02.000Z" });
+  assert.equal(factHistoryTrustworthy(none).trust, false);
+  assert.equal(none.completeness.status, "unknown");
+});
+
+test("S4: multi-family predicates AND over each family's own completeness -- one family's newer age floor never masks another family's byte-cap floor", () => {
+  const nowMs = Date.parse("2026-08-10T00:00:00.000Z");
+  const familyRead = (completeness) => ({ corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", ...completeness } });
+  // service: byte-cap floor 10 d ago, age floor 31 d ago (an unbounded read sees the floor);
+  // network: age floor 5 d ago. Combined floors (newest each) would read bytecap <= age and PASS.
+  const service = familyRead({ coverage: "narrowed", bytecap_floor_ts: new Date(nowMs - 10 * 86_400_000).toISOString(), age_floor_ts: new Date(nowMs - 31 * 86_400_000).toISOString() });
+  const network = familyRead({ coverage: "narrowed", bytecap_floor_ts: null, age_floor_ts: new Date(nowMs - 5 * 86_400_000).toISOString() });
+  const combinedOnly = { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "narrowed", bytecap_floor_ts: service.completeness.bytecap_floor_ts, age_floor_ts: network.completeness.age_floor_ts } };
+  assert.equal(certifiedReadWindowOk(combinedOnly, { nowMs }), true, "precondition: the combined floors alone would pass");
+  const multi = { ...combinedOnly, family_reads: { service, network } };
+  assert.equal(certifiedReadWindowOk(multi, { nowMs }), false, "per-family AND refuses");
+  assert.equal(certifiedReadWindowOk({ ...combinedOnly, family_reads: { network } }, { nowMs }), true);
+  // Malformed family_reads fails closed.
+  for (const bad of [null, [], {}, { service: null }, { service: { family_reads: {} } }]) {
+    assert.equal(certifiedReadWindowOk({ ...combinedOnly, family_reads: bad }, { nowMs }), false);
+    assert.equal(factHistoryTrustworthy({ ...combinedOnly, family_reads: bad }).trust, false);
+  }
+});
+
+// S4 sweep x I4 (external truncation stays a continuity break): the sweep now runs retention over a
+// family store with NO new points, so a facts.jsonl deleted under a ledger that had committed records
+// must not be re-certified as an empty intact store two passes later -- it is a lineage break
+// (stamped, degraded for the window), exactly like an external truncation caught by the prefix check.
+test("S4/I4: a family facts.jsonl deleted under a ledger that committed records is a continuity break on the next sweep -- never re-certified intact", async () => {
+  const paths = await tempPaths();
+  const t0 = "2026-07-10T00:00:00.000Z";
+  await appendFactPointsByFamily(paths, [servicePoint("nginx", t0), networkPoint("tcp:22", t0)], { now: t0 });
+  await appendFactPointsByFamily(paths, [], { now: t0 });
+  assert.equal((await readFactPoints(paths, { family: "network", now: t0 })).completeness.status, "intact");
+  await fs.rm(resolveFactStorePaths(paths, "network").factsFile);
+  const t1 = "2026-07-10T01:00:00.000Z";
+  await appendFactPointsByFamily(paths, [servicePoint("nginx", t1)], { now: t1 });
+  for (let pass = 0; pass < 2; pass += 1) await appendFactPointsByFamily(paths, [], { now: t1 });
+  const read = await readFactPoints(paths, { family: "network", now: t1 });
+  assert.notEqual(read.completeness.status, "intact", "deleted history is never re-certified");
+  assert.equal(read.completeness.last_continuity_break_ts, t1);
+  assert.equal((await readFactPoints(paths, { family: "service", now: t1 })).completeness.status, "intact", "the other family is unaffected");
 });

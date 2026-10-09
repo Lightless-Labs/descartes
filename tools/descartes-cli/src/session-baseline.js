@@ -31,7 +31,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { SESSION_CENSUS_MARKER_ENTITY_KEY, SESSION_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 // Slice 4b (observed-incident collectors plan), Decision 4 / Fable review MUST-FIX 5: the four
 // pure Welford/EWMA/z-score primitives + DEFAULT_BASELINE_FACT_WINDOW_MS were extracted into
@@ -157,31 +157,9 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 export function normalizeSessionBaselineState(raw) {
   const base = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -386,7 +364,7 @@ export function isSessionChurnObservationGroup(group) {
  *     on censusState === "complete", never as an else-catch-all, so an "unknown" tick can never
  *     slip through as trusted.
  */
-function tickGroupDisposition(group) {
+export function tickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
   if (group.censusState === "complete") return "complete";
   if (group.censusState === "partial") return "partial";
@@ -520,15 +498,29 @@ export const DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
  *     "excluding entities it skipped as ... stale / unevaluable"), are NOT reported — so the daemon
  *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
  */
+function sessionCensusReadiness(groups, { nowMs, freshnessMs = DEFAULT_SESSION_FRESHNESS_FALLBACK_MS } = {}) {
+  const completeGroups = groups.filter((group) => group.censusState === "complete");
+  if (completeGroups.length === 0) return { gate: "no_complete_census", completeGroups };
+  if (!Number.isFinite(nowMs)) return { gate: "ok", completeGroups };
+  const latestMs = new Date(completeGroups[completeGroups.length - 1].ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale", completeGroups };
+  return { gate: "ok", completeGroups };
+}
+
 export function evaluateSessionChurn(points = [], {
+  nowMs,
+  freshnessMs = DEFAULT_SESSION_FRESHNESS_FALLBACK_MS,
   lookbackTicks = DEFAULT_SESSION_CHURN_LOOKBACK_TICKS,
   structuralIntervalMs = DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS,
   activeFreshnessMs,
   maxObservationAgeMs,
 } = {}) {
   const groups = groupSessionFactsByTick(points);
-  const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length === 0) return { churnEntries: [], evaluatedEntityKeys: [] };
+  const censusReadiness = sessionCensusReadiness(groups, { nowMs, freshnessMs });
+  const { completeGroups } = censusReadiness;
+  // `ready` (S6, I11): churn evaluates whenever at least one fresh complete census tick exists --
+  // with zero tracked sessions it evaluates and finds nothing, which is still "watching".
+  if (censusReadiness.gate !== "ok") return { churnEntries: [], evaluatedEntityKeys: [], ready: false, gate: censusReadiness.gate };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
   const resolvedStructuralIntervalMs = Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
@@ -640,7 +632,7 @@ export function evaluateSessionChurn(points = [], {
       churnEntries.push({ entity_key: entityKey, prior_fingerprint: older.fingerprint, current_fingerprint: newer.fingerprint });
     }
   }
-  return { churnEntries, evaluatedEntityKeys };
+  return { churnEntries, evaluatedEntityKeys, ready: true, gate: "ok" };
 }
 
 /**
@@ -747,7 +739,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // `points`) so factHistoryTrustworthy can see corrupt_count/schema_invalid_count/completeness —
   // exactly what process-lineage-baseline.js does for computeProcessLineageBaselineCandidates.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "session", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupSessionFactsByTick(points);
 
@@ -884,7 +876,26 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // Detector-reported recovery coverage (§8.C, session recipe): the whole-fn coldStartPendingThisTick
   // gate freezes BOTH rules -- nothing was evaluated this tick, so report an empty coverage set (the
   // daemon then freezes every owned session identity, never fabricating a recovery).
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
+  if (coldStartPendingThisTick) {
+    return {
+      candidates: [],
+      evaluatedAlertKeys: [],
+      ruleEvaluations: {
+        [SESSION_COUNT_DROP_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick, baselineSamples: { count: windowed.stats.count, required: minSampleCount } }),
+        [SESSION_CHURN_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick }),
+      },
+    };
+  }
+
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3): PER RULE -- count_drop is
+  // statistical (30 h) and churn a fingerprint diff (6 h). A horizon-short rule emits no candidate
+  // and reports no coverage (so a persisted alert freezes rather than recovering off a window too
+  // short to evaluate it), and nothing else changes: the lockout and the fold above already ran, so
+  // the rule resumes on the very tick its certified span recovers.
+  const dropHorizonOk = ruleHorizonOk(readResult, SESSION_COUNT_DROP_RULE_ID, nowMs);
+  const churnHorizonOk = ruleHorizonOk(readResult, SESSION_CHURN_RULE_ID, nowMs);
+  const censusReadiness = sessionCensusReadiness(currentGroups, { nowMs, freshnessMs });
+  const censusFresh = censusReadiness.gate === "ok";
 
   const candidates = [];
   const evaluatedAlertKeys = [];
@@ -894,25 +905,28 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
   // — including ticks where nothing new was folded — so applyAlertCandidates never spuriously
   // "recovers" an active session.count_drop just because this source skipped a redundant write.
-  const dropCandidate = dropFresh
-    ? buildCountDropCandidate(
-      { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-      { deviationSigma, criticalSigma },
-    )
-    : undefined;
-  if (dropCandidate) candidates.push(dropCandidate);
+  const dropCandidate = buildCountDropCandidate(
+    { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
+    { deviationSigma, criticalSigma },
+  );
+  if (dropCandidate && dropFresh && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
   // against the latest complete tick -- exactly the preconditions buildCountDropCandidate itself
   // requires before it can fire OR find-clear. A provisional (warm-up) window reaches no verdict, so
   // "global" is NOT reported and any persisted count_drop freezes rather than falsely recovering.
+  // Merge note (watch-fabrication A2 x capacity S6): BOTH freshness gates apply -- the latest
+  // complete census must be fresh (censusFresh, shared with churn and reported to `baseline status`)
+  // AND the scored observation itself must be fresh (dropFresh): the Welford window skips overflow
+  // ticks, so its last_observation can be older than a fresh complete-but-overflow latest census.
   const dropObservation = windowed.last_observation;
-  const dropEvaluated = dropFresh
-    && windowed.confidence_state === "established"
+  const dropScorable = windowed.confidence_state === "established"
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
-  if (dropEvaluated) evaluatedAlertKeys.push(alertId(SESSION_COUNT_DROP_RULE_ID, "global"));
+  const dropEvaluated = dropFresh && dropScorable;
+  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] : [];
+  evaluatedAlertKeys.push(...dropKeys);
 
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
   const currentPoints = points.filter((point) => currentGroupTimestamps.has(point.ts));
@@ -921,16 +935,37 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // evaluateSessionChurn. Each evaluated key (whether it churned or was clear) is reported so the
   // daemon can recover a now-stable session's persisted churn alert; skipped/stale/ambiguous entities
   // are absent, so their alerts freeze.
-  // A2 freshness gate for churn: evaluateSessionChurn anchors on the latest complete tick-group (by
-  // the same censusState === "complete" filter it uses); when that tick is stale, churn freezes.
-  const churnCompleteGroups = currentGroups.filter((group) => group.censusState === "complete");
-  const churnFresh = churnCompleteGroups.length > 0
-    && isFreshTs(churnCompleteGroups[churnCompleteGroups.length - 1].ts, nowMs, freshnessMs);
-  const { churnEntries, evaluatedEntityKeys } = churnFresh
-    ? evaluateSessionChurn(currentPoints, { structuralIntervalMs, activeFreshnessMs: freshnessMs })
-    : { churnEntries: [], evaluatedEntityKeys: [] };
-  candidates.push(...buildChurnCandidates(churnEntries));
-  for (const entityKey of evaluatedEntityKeys) evaluatedAlertKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+  // A2 (watch-fabrication) + S6 (capacity): churn freezes on a stale/absent complete census through
+  // evaluateSessionChurn's own readiness gate (sessionCensusReadiness, the same predicate the
+  // count_drop gate above uses), and is bounded by the A3 structural-time lookback inside it.
+  let churnReady = false;
+  const churnKeys = [];
+  if (churnHorizonOk) {
+    const { churnEntries, evaluatedEntityKeys, ready, gate } = evaluateSessionChurn(currentPoints, {
+      nowMs, freshnessMs, structuralIntervalMs, activeFreshnessMs: freshnessMs,
+    });
+    churnReady = ready && gate === "ok";
+    candidates.push(...buildChurnCandidates(churnEntries));
+    for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+  }
+  evaluatedAlertKeys.push(...churnKeys);
 
-  return { candidates, evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, built from the gates
+  // above (display only; the daemon reads only candidates/evaluatedAlertKeys).
+  const ruleEvaluations = {
+    [SESSION_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
+      historyTrust, coldStartPendingThisTick, horizonOk: dropHorizonOk,
+      baselineSamples: { count: windowed.stats.count, required: minSampleCount },
+      readinessGate: censusReadiness.gate === "latest_census_stale" || (dropScorable && !dropFresh)
+        ? "latest_census_stale"
+        : dropEvaluated && censusFresh ? "ok" : "baseline_warming_up",
+      evaluatedAlertKeys: dropKeys,
+    }),
+    [SESSION_CHURN_RULE_ID]: buildRuleEvaluation({
+      historyTrust, coldStartPendingThisTick, horizonOk: churnHorizonOk,
+      readinessGate: censusReadiness.gate === "latest_census_stale" ? "latest_census_stale" : churnReady ? "ok" : "no_complete_census",
+      evaluatedAlertKeys: churnKeys,
+    }),
+  };
+  return { candidates, evaluatedAlertKeys, ruleEvaluations };
 }

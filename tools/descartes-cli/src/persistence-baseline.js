@@ -23,7 +23,8 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, noveltySeenSetStatus, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   SCHEDULED_JOB_CENSUS_FACT_NAME,
   SCHEDULED_JOB_PRESENCE_FACT_NAME,
@@ -104,31 +105,9 @@ async function readJsonFile(file) {
   }
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 // [REVIEW 2026-08-21, must-fix] Exact-schema validation, mirroring
 // process-lineage-baseline.js's isValidProcessLineageBaselineStoreShape/
@@ -244,6 +223,8 @@ export function detectScheduledJobAppearances(groups = [], options = {}) {
   const appearances = [];
   for (const entityKey of latest.entityKeys) {
     if (historical.has(entityKey)) continue;
+    // S3b (§17): a valid seen-set's prior sighting suppresses the claim (union only suppresses).
+    if (seenBeforeTick(options.seenEntries, entityKey, latest.ts)) continue;
     appearances.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return appearances;
@@ -268,18 +249,27 @@ export function hashScheduledJobEntityKey(entityKey) {
 // census knowledge of this tick" the recipe names; latest-only entities MUST be included because a
 // candidate's own identity is required in the evaluated set (§8.B). Returns [] if any gate fails
 // (the coldStartPendingThisTick short-circuit is applied by the caller, above and beyond this).
-export function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
+// S6 (I11): the readiness gates above, factored out unchanged so the per-rule status report names
+// WHICH gate stopped the rule (a ready window with zero jobs still evaluates).
+function scheduledJobEvaluationReadiness(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_SCHEDULED_JOB_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minHistoryTickCount + 1) return [];
+  if (completeGroups.length < minHistoryTickCount + 1) return { gate: "insufficient_complete_history" };
 
   const latest = completeGroups[completeGroups.length - 1];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return [];
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale" };
+  return { gate: "ok", completeGroups };
+}
+
+export function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
+  const readiness = scheduledJobEvaluationReadiness(groups, options);
+  if (readiness.gate !== "ok") return [];
+  const { completeGroups } = readiness;
 
   const evaluated = new Set();
   for (const group of completeGroups) {
@@ -292,12 +282,17 @@ export function scheduledJobEvaluatedEntityKeys(groups = [], options = {}) {
 // hash-only shape, NOT service.disappeared's scoped 2026-07-24 cleartext-name exception. A future
 // operator sign-off can flip this to carry a sanitized job_kind/job_source/job_name, exactly as
 // noted in the plan — this default is a one-line follow-up away, not a redesign.
-export function buildScheduledJobAppearedCandidates(entries = []) {
+// Fact-store capacity plan §4.2 (step S3): a novelty claim carries its scope. history_certified_after_ts
+// turns "not seen in this host's recent history" into "not seen since <ts>" -- the start of the
+// certified memory the claim was decided against (noveltyHistoryScopeTs, fact-store-completeness.js).
+// Omitted (never null: the sanitizer redacts null) only when no scope is known.
+export function buildScheduledJobAppearedCandidates(entries = [], { historyCertifiedAfterTs } = {}) {
   return entries.map((entry) => {
     const entityKeyHash = hashScheduledJobEntityKey(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
       entity_key_hash: entityKeyHash,
       first_seen_ts: entry.first_seen_ts,
+      ...(typeof historyCertifiedAfterTs === "string" ? { history_certified_after_ts: historyCertifiedAfterTs } : {}),
     });
     return {
       id: alertId(SCHEDULED_JOB_APPEARED_RULE_ID, entityKeyHash),
@@ -336,7 +331,7 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   const minHistoryTickCount = options.minHistoryTickCount ?? DEFAULT_SCHEDULED_JOB_MIN_HISTORY_TICK_COUNT;
 
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "scheduled_job", windowMs, now: options.now, seenSetFamilies: ["scheduled_job"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupScheduledJobFactsByTick(points);
 
@@ -355,7 +350,17 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  // Novelty over a narrowed window (daybreak G1 blocker 1): with a VALID seen-set (S3b, §17) the
+  // memory survives byte-cap eviction (I13) and novelty is decided against it, so narrowing is no
+  // longer a trust loss here. WITHOUT one (missing, invalid, lineage mismatch, pending pass,
+  // overflow, or an injected read that carries none) the interim S2 gate stays: a narrowed window is
+  // untrusted and re-arms through the existing cold-start path (I14: no claim without continuity).
+  const seenSet = validNoveltySeenSet(readResult, SCHEDULED_JOB_APPEARED_RULE_ID);
+  const historyTrust = factHistoryTrustworthy(readResult, {
+    anchorTs: persistedState.cold_start_since_ts,
+    nowMs,
+    requireFullCoverage: !seenSet,
+  });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
   // previously computed only after `appearances`, purely to gate the store WRITE) and added as a
@@ -396,16 +401,20 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
   }
 
   const detectionOptions = { nowMs, freshnessMs, minHistoryTickCount };
-  const appearances = coldStartPendingThisTick ? [] : detectScheduledJobAppearances(currentGroups, detectionOptions);
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 48 h). Never an input
+  // to the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = noveltyRuleEligible(readResult, SCHEDULED_JOB_APPEARED_RULE_ID, nowMs);
+  const evaluable = !coldStartPendingThisTick && horizonOk;
+  const appearances = evaluable ? detectScheduledJobAppearances(currentGroups, { ...detectionOptions, seenEntries: seenSet?.entries }) : [];
 
   // Detector-reported recovery coverage (§8.B/§8.C): the alert identities this detector genuinely
   // evaluated this tick. Gated by the SAME coldStartPendingThisTick short-circuit that zeroes
   // `appearances`, then by detectScheduledJobAppearances' own readiness gates (via the sibling
   // predicate). Empty when the detector could not evaluate — the daemon then freezes any persisted
   // scheduled_job.appeared alert instead of fabricating a recovery.
-  const evaluatedAlertKeys = (coldStartPendingThisTick
-    ? []
-    : scheduledJobEvaluatedEntityKeys(currentGroups, detectionOptions))
+  const evaluatedAlertKeys = (evaluable
+    ? scheduledJobEvaluatedEntityKeys(currentGroups, detectionOptions)
+    : [])
     .map((entityKey) => alertId(SCHEDULED_JOB_APPEARED_RULE_ID, hashScheduledJobEntityKey(entityKey)));
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
@@ -434,5 +443,16 @@ export async function computeScheduledJobBaselineCandidates(descartesPaths, opti
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildScheduledJobAppearedCandidates(appearances), evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [SCHEDULED_JOB_APPEARED_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      horizonReason: noveltySeenSetStatus(readResult, SCHEDULED_JOB_APPEARED_RULE_ID),
+      readinessGate: scheduledJobEvaluationReadiness(currentGroups, detectionOptions).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  return { candidates: buildScheduledJobAppearedCandidates(appearances, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, SCHEDULED_JOB_APPEARED_RULE_ID) }), evaluatedAlertKeys, ruleEvaluations };
 }

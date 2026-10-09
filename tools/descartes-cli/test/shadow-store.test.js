@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints, enforceFactRetention } from "../src/fact-store.js";
+import { enforceFactRetention, appendFactPointsByFamily } from "../src/fact-store.js";
 import { buildConstraintTarget, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import { evaluateConstraints } from "../src/constraint-eval.js";
 import {
@@ -163,7 +163,7 @@ test("evaluateAndLogShadowConstraints ignores non-shadow constraints (draft/acti
     shadowConstraint({ id: "c.review-ready", status: "review-ready" }),
     shadowConstraint({ id: "c.retired", status: "retired" }),
   ]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } },
   ], { now: "2026-07-10T00:00:00.000Z" });
 
@@ -176,10 +176,10 @@ test("evaluateAndLogShadowConstraints appends exactly one record per shadow cons
   const paths = await tempPaths();
   const now = "2026-07-10T00:00:00.000Z";
   await writeConstraints(paths, [shadowConstraint()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } },
   ], { now });
-  await enforceFactRetention(paths, { now });
+  await enforceFactRetention(paths, { family: "service", now });
 
   const result = await evaluateAndLogShadowConstraints(paths, { now });
   assert.equal(result.evaluated_count, 1);
@@ -193,11 +193,16 @@ test("evaluateAndLogShadowConstraints appends exactly one record per shadow cons
   assert.equal(records[0].actual, "false");
 });
 
-test("evaluateAndLogShadowConstraints skips untrustworthy history (degraded, unknown, or corrupt) without advancing a candidate", async () => {
+test("evaluateAndLogShadowConstraints skips untrustworthy history (degraded, unknown, corrupt, or narrowed) without advancing a candidate", async () => {
   const cases = [
     ["degraded", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded" } }],
     ["unknown", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "unknown" } }],
     ["corrupt", { corrupt_count: 1, schema_invalid_count: 0, completeness: { status: "intact" } }],
+    // MEDIUM-1 (review fold): the shadow evaluator's interim requireFullCoverage gate refuses a
+    // narrowed (byte-cap-evicted) store even though its status is "intact" -- a missing
+    // historical exercise can look falsely safe just as an outright loss could. S3 replaces this
+    // with the same horizon as the constraint it shadows.
+    ["narrowed coverage", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "narrowed" } }],
   ];
 
   for (const [label, readResult] of cases) {
@@ -235,7 +240,11 @@ test("evaluateAndLogShadowConstraints keeps normal behavior for intact history a
       schema_invalid_count: 0,
       completeness: {
         status: "intact",
-        last_bytecap_evict_ts: new Date(nowMs + 1).toISOString(),
+        // MEDIUM-1 (review fold): evaluateAndLogShadowConstraints now requires full coverage, not
+        // just an intact status (requireFullCoverage). This fixture is testing future-loss
+        // tolerance, not narrowing, so it stays "full".
+        coverage: "full",
+        last_corrupt_ts: new Date(nowMs + 1).toISOString(),
       },
     }),
   });
@@ -254,7 +263,7 @@ test("evaluateAndLogShadowConstraints excludes degraded facts (owner_known:\"fal
     expected: { comparator: "eq", value: "postgres" },
   });
   await writeConstraints(paths, [portConstraint]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     {
       fact_name: "network.listening_port.owner",
       entity_key: "tcp:0.0.0.0:5432",
@@ -272,7 +281,7 @@ test("evaluateAndLogShadowConstraints never writes to constraints.json (read-onl
   const paths = await tempPaths();
   const now = "2026-07-10T00:00:00.000Z";
   await writeConstraints(paths, [shadowConstraint()]);
-  await appendFactPoints(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }], { now });
+  await appendFactPointsByFamily(paths, [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "true" } }], { now });
 
   await evaluateAndLogShadowConstraints(paths, { now });
 
@@ -442,10 +451,10 @@ test("Slice B: evaluateAndLogShadowConstraints (the SHADOW-SOAK path) applies th
   const paths = await tempPaths();
   const factTs = "2026-07-10T00:00:00.000Z";
   await writeConstraints(paths, [shadowConstraint()]);
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" } }, // would FIRE (expected "true") if fresh
   ], { ts: factTs, now: factTs }); // stamp ts old (options.ts), now=ts so append-time retention keeps it
-  await enforceFactRetention(paths, { now: factTs });
+  await enforceFactRetention(paths, { family: "service", now: factTs });
 
   const staleNow = new Date(Date.parse(factTs) + 4 * 60 * 60 * 1000).toISOString(); // 4h later
   const freshnessMs = 3 * 60 * 60 * 1000;
@@ -567,4 +576,31 @@ test("descartes learned soak never sets any constraint to status:\"active\"", as
   const { constraints } = await loadConstraints(paths);
   assert(constraints.every((c) => c.status !== "active"), "S7a must never write status:\"active\"");
   assert.equal(constraints[0].status, "review-ready", "review-ready is the terminal state in S7a");
+});
+
+// Fact-store capacity plan S3: the shadow evaluator's narrowing gate is certifiedReadWindowOk over
+// its own (3 h) read window. The interim requireFullCoverage gate refused on ANY byte-cap floor
+// ever recorded -- permanently, on every host whose store once filled -- even one far older than the
+// window the soak actually reads.
+test("S3: evaluateAndLogShadowConstraints soaks when the byte-cap floor is older than its read window, and refuses when the floor is inside it", async () => {
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const now = new Date(nowMs).toISOString();
+  const freshnessMs = 3 * 60 * 60 * 1000;
+  const run = async (bytecapFloorMs) => {
+    const paths = await tempPaths();
+    await writeConstraints(paths, [shadowConstraint()]);
+    return evaluateAndLogShadowConstraints(paths, {
+      now,
+      freshnessMs,
+      readFactPoints: async () => ({
+        points: [{ fact_name: "service.presence", entity_key: "nginx", attributes: { running: "false" }, ts: now }],
+        corrupt_count: 0,
+        schema_invalid_count: 0,
+        completeness: { status: "intact", coverage: "narrowed", bytecap_floor_ts: new Date(bytecapFloorMs).toISOString(), age_floor_ts: null },
+      }),
+    });
+  };
+  assert.equal((await run(nowMs - freshnessMs - 1)).appended_count, 1, "a floor strictly before the window start is invisible to the soak");
+  assert.equal((await run(nowMs - freshnessMs)).appended_count, 0, "a floor exactly at the window start could hide an exercise at the start: refused");
+  assert.equal((await run(nowMs - 60 * 60 * 1000)).appended_count, 0, "a floor inside the window: refused");
 });

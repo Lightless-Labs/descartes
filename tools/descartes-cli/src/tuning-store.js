@@ -40,6 +40,7 @@ import {
 } from "./constraint-store.js";
 import { sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
+import { readerFamilies } from "./fact-families.js";
 import { parseDurationMs } from "./history-store.js";
 import { readNotificationDeliveryAudit } from "./notification-delivery.js";
 import { buildShadowFactLookup, readShadowRecords } from "./shadow-store.js";
@@ -628,7 +629,7 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
     safeReadSignal(() => readShadow(descartesPaths), "shadow-violations.jsonl"),
     safeReadSignal(() => readIntelligenceConfig(descartesPaths), "alert-intelligence.json"),
     safeReadSignal(() => loadConstraintsFn(descartesPaths), "constraints.json"),
-    safeReadSignal(() => readFacts(descartesPaths, { windowMs: options.windowMs, now: runtime.now }), "facts.jsonl"),
+    safeReadSignal(() => readFacts(descartesPaths, { families: readerFamilies("tuning_miner"), windowMs: options.windowMs, now: runtime.now }), "facts.jsonl"),
   ]);
 
   const calibrationReport = computeCalibrationReport(alerts, auditRecords, deliveryRecords, shadowResult?.records, {
@@ -652,6 +653,13 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
     new_drafts: merge.new_count,
     updated_drafts: merge.updated_count,
     unchanged_drafts: merge.unchanged_count,
+    // Fact-store capacity plan S3 (fact-families.js READER_COVERAGE "tuning_miner", report_only):
+    // tuning makes no absence/novelty claim, so narrowing does not gate it -- but the backtest's
+    // fact window is only as wide as the store certifies, so say where it starts (null = no floor:
+    // nothing was narrowed). Display only.
+    fact_history_certified_after_ts: typeof factsResult?.completeness?.certified_after_ts === "string"
+      ? factsResult.completeness.certified_after_ts
+      : null,
   };
   if (options.json) output(JSON.stringify({ learned_tuning_mine: summary }, null, 2));
   else output(renderMineSummary(mined.length, merge));

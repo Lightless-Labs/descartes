@@ -425,3 +425,24 @@ test("evaluateAlerts never writes; evaluateAndPersistAlerts does", async () => {
   const afterWrite = await readAlertRecords(paths);
   assert(afterWrite.some((alert) => alert.rule_id === "system.memory.sustained_high"), "evaluateAndPersistAlerts must persist to disk");
 });
+
+// Fact-store capacity plan §4.2/I12 (step S3): the horizon-short fixed rule.
+test("S3: daemon.fact_history.horizon_short is a FIXED rule matching fact-families.js, driven only by the status record's history_horizon_short block", async () => {
+  const { HISTORY_HORIZON_SHORT_RULE_ID } = await import("../src/fact-families.js");
+  const { FIXED_ALERT_RULE_IDS: fixed, evaluateAlertRules: evaluate } = await import("../src/alert-store.js");
+  assert.ok(fixed.has(HISTORY_HORIZON_SHORT_RULE_ID));
+  const now = "2026-10-05T12:00:00.000Z";
+  const threshold = 24 * 60 * 60 * 1000;
+  const status = (rules, thresholdMs = threshold) => ({ ts: now, state: "ok", history_horizon_short: { threshold_ms: thresholdMs, rules } });
+  const fired = (daemonStatus) => evaluate({ point_count: 1, metrics: [] }, daemonStatus, { now }).filter((c) => c.rule_id === HISTORY_HORIZON_SHORT_RULE_ID);
+  const atThreshold = new Date(Date.parse(now) - threshold).toISOString();
+  const justUnder = new Date(Date.parse(now) - threshold + 1).toISOString();
+  assert.equal(fired(status({ "service.appeared": { since_ts: justUnder } })).length, 0);
+  const signal = fired(status({ "service.appeared": { since_ts: atThreshold }, "session.churn": { since_ts: justUnder } }));
+  assert.equal(signal.length, 1);
+  assert.equal(signal[0].diagnostics.rule_ids, "service.appeared", "only the overdue rule is named");
+  assert.equal(fired(undefined).length, 0);
+  assert.equal(fired({ ts: now, state: "ok" }).length, 0);
+  assert.equal(fired(status({ "service.appeared": { since_ts: "garbage" } })).length, 0);
+  assert.equal(fired(status({ "service.appeared": { since_ts: atThreshold } }, "nope")).length, 0, "a malformed block vouches for nothing");
+});

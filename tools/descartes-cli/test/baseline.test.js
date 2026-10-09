@@ -54,6 +54,13 @@ function assertWatchingImpliesRules(domains, label = "") {
   }
 }
 
+// Merge (S6 vocabulary): the per-rule record status reports for `ruleId` within `domain`.
+function ruleOf(domain, ruleId) {
+  const rule = domain.rules.find((entry) => entry.rule_id === ruleId);
+  assert.ok(rule, `${domain.domain}: status reports ${ruleId}`);
+  return rule;
+}
+
 // ---------------------------------------------------------------------------------------------
 // A1 (2026-10 calibration review) fixtures: status-vs-detector consistency. `baseline status` must
 // never say "watching" for a domain whose detector, run over the SAME fact-history, store and
@@ -161,6 +168,36 @@ const A1_SCENARIOS = [
   },
 ];
 
+// Merge (watch-fabrication x fact-store capacity): `baseline status` now runs the real detectors
+// read-only (S6), and each detector reads its OWN family with the capacity-era completeness fields
+// (coverage + floors for the eligibility horizon, a valid seen-set for the novelty rules). An injected
+// read must therefore look like a real un-narrowed per-family read: coverage "full" with no floor (so
+// every horizon is met -- day-1 behaviour) and, when the caller asks for seen-sets, a valid set
+// certified since the lineage began, folded from the same points. Everything the A1/A3/R2/MEDIUM
+// fixtures below vary (status, loss timestamps, corrupt lines, points) passes through unchanged.
+function stubFamilyRead(points, completeness = { status: "intact" }, { corruptCount = 0 } = {}) {
+  return async (_paths, readOptions = {}) => {
+    const seenSets = {};
+    for (const family of readOptions.seenSetFamilies ?? []) {
+      const entries = new Map();
+      for (const point of points) {
+        if (String(point.entity_key).includes("census-marker")) continue;
+        const tsMs = Date.parse(point.ts);
+        const prior = entries.get(point.entity_key);
+        entries.set(point.entity_key, { firstMs: prior ? Math.min(prior.firstMs, tsMs) : tsMs, lastMs: prior ? Math.max(prior.lastMs, tsMs) : tsMs });
+      }
+      seenSets[family] = { status: "valid", certified_since_ts: null, entries };
+    }
+    return {
+      points,
+      corrupt_count: corruptCount,
+      schema_invalid_count: 0,
+      completeness: { coverage: "full", bytecap_floor_ts: null, age_floor_ts: null, ...completeness },
+      ...(Object.keys(seenSets).length > 0 ? { seen_sets: seenSets } : {}),
+    };
+  };
+}
+
 async function tempPaths() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-baseline-test-"));
   return resolveDescartesPaths({
@@ -177,7 +214,11 @@ function capture() {
   return { values, output: (value) => values.push(value) };
 }
 
-test("baseline status on a fresh install is watch-on and reports every domain still learning", async () => {
+// S6 (fact-store capacity plan §4.4, I11): rewritten. A fresh install has never created any family
+// store, so every domain (and every rule in it) reads "not observed (no store)", not "still learning
+// -- 0 of 6": nothing has been observed for it to learn from, and its detectors evaluate nothing. The
+// cold-start reason is still reported from the (fresh, pending) detector stores.
+test("baseline status on a fresh install is watch-on and reports every domain not observed (no store)", async () => {
   const paths = await tempPaths();
   const result = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z" });
 
@@ -190,10 +231,16 @@ test("baseline status on a fresh install is watch-on and reports every domain st
     "process-lineage",
   ]);
   for (const domain of result.domains) {
-    // R2: session/peer show the binding 30-sample count requirement (see the dedicated R2 test).
-    assert.equal(domain.phase, domain.domain === "session" || domain.domain === "peer" ? "still learning — 0 of 30" : "still learning — 0 of 6");
+    assert.equal(domain.phase, "not observed (no store)");
     assert.equal(domain.cold_start_reason, "initial_baseline");
+    for (const rule of domain.rules) {
+      assert.equal(rule.phase, "not observed (no store)");
+      assert.equal(rule.watching, false);
+      assert.ok(rule.reasons.includes("not_observed_no_store"));
+    }
   }
+  assert.deepEqual(Object.keys(result.families).sort(), ["peer", "process_lineage", "scheduled_job", "service", "session"]);
+  for (const family of Object.values(result.families)) assert.equal(family.store, "absent");
 });
 
 test("baseline status renders human and JSON forms", async () => {
@@ -201,14 +248,18 @@ test("baseline status renders human and JSON forms", async () => {
   const human = capture();
   await runBaseline(paths, ["status"], { output: human.output, now: "2026-09-27T12:00:00.000Z" });
   assert.match(human.values[0], /Structural watching: enabled/);
-  assert.match(human.values[0], /service: still learning — 0 of 6/);
-  assert.match(human.values[0], /process-lineage: still learning — 0 of 6/);
+  assert.match(human.values[0], /service: not observed \(no store\)/);
+  assert.match(human.values[0], /service\.disappeared: not observed \(no store\)/);
+  assert.match(human.values[0], /process-lineage: not observed \(no store\)/);
+  // L5: the cold-start reason is rendered only beside a rule that is actually cold-start pending; a
+  // store that was never created is not "learning" (the JSON keeps cold_start_reason).
+  assert.doesNotMatch(human.values[0], /initial_baseline/);
 
   const json = capture();
   await runBaseline(paths, ["status", "--json"], { output: json.output, now: "2026-09-27T12:00:00.000Z" });
   const parsed = JSON.parse(json.values[0]);
   assert.equal(parsed.watch_config.enabled, true);
-  assert.equal(parsed.domains[0].phase, "still learning — 0 of 6");
+  assert.equal(parsed.domains[0].phase, "not observed (no store)");
 });
 
 test("baseline inspect is live, supports a domain filter, and exposes the recomputation note", async () => {
@@ -293,7 +344,7 @@ test("baseline status uses the persisted daemon structural interval for freshnes
   await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
   await writeDaemonStatus(paths, { profile: { structural: { interval_ms: 2 * A1_HOUR_MS } } });
   const points = a1Points(31);
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const result = await buildBaselineStatus(paths, { now: a1Ts(34), readFactPoints });
   assert.equal(result.domains.find((domain) => domain.domain === "session").phase, "watching");
 });
@@ -311,7 +362,7 @@ test("baseline status keeps rule coverage honest on overflow ticks", async () =>
     { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.overflow-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { overflow: "true" } },
     { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } },
   );
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const result = await buildBaselineStatus(paths, { now: a1Ts(31.5), readFactPoints });
   const session = result.domains.find((domain) => domain.domain === "session");
   const peer = result.domains.find((domain) => domain.domain === "peer");
@@ -334,7 +385,7 @@ test("baseline status uses the detector's markerless session-churn observation f
     { ts: a1Ts(3), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-new" } },
     { ts: a1Ts(3), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
   ];
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const now = a1Ts(3);
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const detector = await computeSessionBaselineCandidates(paths, { now, readFactPoints, writeSessionBaselineStore: async () => {} });
@@ -342,7 +393,11 @@ test("baseline status uses the detector's markerless session-churn observation f
   const churnKey = alertId(SESSION_CHURN_RULE_ID, entityKey);
   assert.equal(session.evaluated_alert_keys.includes(churnKey), true, "status must report the same churn identity as the detector");
   assert.equal(session.evaluated_alert_keys.includes(churnKey), detector.evaluatedAlertKeys.includes(churnKey));
-  assert.match(session.phase, /^watching \(churn\)/, "status must say watching when the churn detector has a fresh pair");
+  // S6 vocabulary: per-rule phases; the domain reads partial coverage (count_drop is still warming up).
+  assert.equal(ruleOf(session, SESSION_CHURN_RULE_ID).phase, "watching", "status must say watching when the churn detector has a fresh pair");
+  assert.equal(ruleOf(session, SESSION_CHURN_RULE_ID).watching, true);
+  assert.equal(ruleOf(session, SESSION_COUNT_DROP_RULE_ID).watching, false);
+  assert.match(session.phase, /^partially watching — 1 of 2 rules$/);
 });
 
 for (const scenario of A1_SCENARIOS) {
@@ -351,7 +406,7 @@ for (const scenario of A1_SCENARIOS) {
     await writeSessionBaselineStore(paths, scenario.store);
     await writePeerBaselineStore(paths, scenario.store);
     const points = a1Points(scenario.tickCount);
-    const readFactPoints = async () => ({ points, corrupt_count: scenario.corruptCount ?? 0, schema_invalid_count: 0, completeness: scenario.completeness });
+    const readFactPoints = stubFamilyRead(points, scenario.completeness, { corruptCount: scenario.corruptCount ?? 0 });
     const now = new Date(A1_BASE_MS + scenario.nowHour * A1_HOUR_MS).toISOString();
 
     const status = await buildBaselineStatus(paths, { now, readFactPoints });
@@ -386,7 +441,10 @@ for (const scenario of A1_SCENARIOS) {
       const expectedWatching = domain === "session" ? (scenario.expectSessionWatching ?? scenario.expectWatching) : scenario.expectWatching;
       assert.equal(hasCoverage, expectedWatching, `sanity: ${domain} detector coverage for this scenario`);
       if (scenario.name.includes("count baseline is still provisional") && domain === "session") {
-        assert.match(reported.phase, /^watching \(churn\); count baseline still learning — 10 of 30$/);
+        // S6 vocabulary: churn watches; count_drop shows its binding 30-sample requirement (R2).
+        assert.match(reported.phase, /^partially watching — 1 of 2 rules$/);
+        assert.equal(ruleOf(reported, SESSION_CHURN_RULE_ID).phase, "watching");
+        assert.equal(ruleOf(reported, SESSION_COUNT_DROP_RULE_ID).phase, "still learning — 10 of 30");
       }
     }
   });
@@ -425,7 +483,7 @@ test("A3 repro: an established markerless peer baseline whose only current tick 
   // out of that exemption (overflowCanBeScored), so this tick is unscorable, not merely unfolded.
   points.push({ ts: overflowTs, fact_name: "peer.presence", entity_key: "peer.overflow-marker.v1", source_envelope_id: "tailscale-status", attributes: { overflow: "true" } });
 
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const now = a1Ts(30.5);
   const noWrite = async () => {};
 
@@ -441,7 +499,11 @@ test("A3 repro: an established markerless peer baseline whose only current tick 
   assert.deepEqual(peer.watching_rules, []);
   assert.deepEqual(peer.evaluated_alert_keys, []);
   assert.equal(peer.phase.startsWith("watching"), false, `status must not claim watching coverage; got "${peer.phase}"`);
-  assert.match(peer.phase, /^not evaluating — /, "status must give an explicit, honest reason instead of fabricating watching");
+  // S6 vocabulary: every rule names the gate that stopped it -- spike has no scorable observation on
+  // the truncated tick; drop has no marker-complete history to establish on.
+  assert.ok(peer.rules.every((rule) => !rule.watching), "no peer rule may claim watching");
+  assert.match(peer.phase, /^not watching — /, "status must give an explicit, honest reason instead of fabricating watching");
+  assert.match(ruleOf(peer, PEER_COUNT_SPIKE_RULE_ID).phase, /^not evaluating — /, "spike: an explicit, honest reason");
   assertWatchingImpliesRules(status.domains);
 });
 
@@ -477,7 +539,7 @@ test("A3: once genuinely established and fresh, every domain (not just session/p
     );
   }
 
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const status = await buildBaselineStatus(paths, { now: a1Ts(30.5), readFactPoints });
   const byDomain = Object.fromEntries(status.domains.map((domain) => [domain.domain, domain]));
 
@@ -531,7 +593,7 @@ test("MEDIUM repro: an established disappearance store does not hide behind a pe
 
   const serviceKey = "service.example.unit";
   const points = serviceCensusPoints(serviceKey, 4, a1Ts);
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const now = a1Ts(3.5);
   const noWrite = async () => {};
 
@@ -543,7 +605,10 @@ test("MEDIUM repro: an established disappearance store does not hide behind a pe
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const service = status.domains.find((domain) => domain.domain === "service");
 
-  assert.match(service.phase, /^watching \(disappeared\); appeared still learning — \d+ of 6$/, service.phase);
+  // S6 vocabulary: per-rule phases (each producer gates on its own store).
+  assert.match(service.phase, /^partially watching — 1 of 2 rules$/, service.phase);
+  assert.equal(ruleOf(service, SERVICE_DISAPPEARED_RULE_ID).phase, "watching");
+  assert.match(ruleOf(service, SERVICE_APPEARED_RULE_ID).phase, /^still learning — \d+ of 6$/);
   assert.deepEqual(service.watching_rules, [SERVICE_DISAPPEARED_RULE_ID]);
   assert.deepEqual(service.evaluated_alert_keys, disappearedDetector.evaluatedAlertKeys, "status must mirror the real disappearance detector's coverage");
   assertWatchingImpliesRules(status.domains);
@@ -556,7 +621,7 @@ test("MEDIUM converse: an established appearance store does not hide behind a pe
 
   const serviceKey = "service.example.unit";
   const points = serviceCensusPoints(serviceKey, 4, a1Ts);
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const now = a1Ts(3.5);
   const noWrite = async () => {};
 
@@ -568,7 +633,10 @@ test("MEDIUM converse: an established appearance store does not hide behind a pe
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const service = status.domains.find((domain) => domain.domain === "service");
 
-  assert.match(service.phase, /^watching \(appeared\); disappeared still learning — \d+ of 6$/, service.phase);
+  // S6 vocabulary: per-rule phases (each producer gates on its own store).
+  assert.match(service.phase, /^partially watching — 1 of 2 rules$/, service.phase);
+  assert.equal(ruleOf(service, SERVICE_APPEARED_RULE_ID).phase, "watching");
+  assert.match(ruleOf(service, SERVICE_DISAPPEARED_RULE_ID).phase, /^still learning — \d+ of 6$/);
   assert.deepEqual(service.watching_rules, [SERVICE_APPEARED_RULE_ID]);
   assert.deepEqual(service.evaluated_alert_keys, appearedDetector.evaluatedAlertKeys, "status must mirror the real appearance detector's coverage");
   assertWatchingImpliesRules(status.domains);
@@ -587,12 +655,15 @@ test("MEDIUM: the pending rule's reported progress is the real re-accumulation c
 
   const serviceKey = "service.example.unit";
   const points = serviceCensusPoints(serviceKey, 4, a1Ts);
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const now = a1Ts(3.5);
 
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const service = status.domains.find((domain) => domain.domain === "service");
-  assert.equal(service.phase, "watching (disappeared); appeared still learning — 2 of 6");
+  // S6 vocabulary: the blocked rule's own phase carries its real re-accumulation count.
+  assert.equal(service.phase, "partially watching — 1 of 2 rules");
+  assert.equal(ruleOf(service, SERVICE_DISAPPEARED_RULE_ID).phase, "watching");
+  assert.equal(ruleOf(service, SERVICE_APPEARED_RULE_ID).phase, "still learning — 2 of 6");
   // The reported progress/required must match what the phase string says -- the BLOCKED rule's
   // own lockout re-accumulation count (2 of 6), never the domain's aggregate complete-census-tick
   // count (4 of 4, which would silently disagree with "2 of 6" in the very same status object).
@@ -606,7 +677,7 @@ test("A1: a still-pending lockout that has accumulated its post-anchor ticks say
   const [scenario] = A1_SCENARIOS;
   await writeSessionBaselineStore(paths, scenario.store);
   const points = a1Points(scenario.tickCount);
-  const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: scenario.completeness });
+  const readFactPoints = stubFamilyRead(points, scenario.completeness);
   const status = await buildBaselineStatus(paths, { now: new Date(A1_BASE_MS + scenario.nowHour * A1_HOUR_MS).toISOString(), readFactPoints });
   const session = status.domains.find((entry) => entry.domain === "session");
   assert.equal(session.cold_start_pending, true);
@@ -620,19 +691,23 @@ test("A1: untrustworthy history and a stale census each report their own reason,
   const points = a1Points(31);
   const degraded = await buildBaselineStatus(degradedPaths, {
     now: a1Ts(30.5),
-    readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded", last_bytecap_evict_ts: a1Ts(29) } }),
+    readFactPoints: stubFamilyRead(points, { status: "degraded", last_bytecap_evict_ts: a1Ts(29) }),
   });
   const degradedSession = degraded.domains.find((entry) => entry.domain === "session");
-  assert.equal(degradedSession.phase, "locked out — fact history untrustworthy (history_degraded)");
+  // S6 vocabulary for the "locked out — fact history untrustworthy (...)" phase.
+  assert.equal(degradedSession.phase, "cannot establish — history untrusted (history_degraded)");
+  assert.ok(degradedSession.rules.every((rule) => !rule.watching && rule.gate === "history_untrusted"));
   assert.equal(degradedSession.history_trust, "history_degraded");
 
   const stalePaths = await tempPaths();
   await writeSessionBaselineStore(stalePaths, A1_ESTABLISHED_STORE);
   const stale = await buildBaselineStatus(stalePaths, {
     now: a1Ts(34),
-    readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } }),
+    readFactPoints: stubFamilyRead(points, { status: "intact" }),
   });
-  assert.match(stale.domains.find((entry) => entry.domain === "session").phase, /^stale — /);
+  const staleSession = stale.domains.find((entry) => entry.domain === "session");
+  assert.equal(staleSession.phase, "cannot evaluate — latest complete census is stale");
+  assert.ok(staleSession.rules.every((rule) => !rule.watching && rule.reasons.includes("latest_census_stale")));
 });
 
 test("A1: corrupt facts, a clock rollback, an incomplete latest census and an empty window each get their own non-watching phase", async () => {
@@ -642,16 +717,22 @@ test("A1: corrupt facts, a clock rollback, an incomplete latest census and an em
     await writeSessionBaselineStore(paths, store);
     const result = await buildBaselineStatus(paths, {
       now: a1Ts(nowHour),
-      readFactPoints: async () => ({ points: readPoints, corrupt_count: corruptCount, schema_invalid_count: 0, completeness: { status: "intact" } }),
+      readFactPoints: stubFamilyRead(readPoints, { status: "intact" }, { corruptCount: corruptCount }),
     });
     return result.domains.find((entry) => entry.domain === "session");
   };
 
   const corrupt = await statusOf(A1_ESTABLISHED_STORE, { corruptCount: 1 });
-  assert.equal(corrupt.phase, "locked out — fact history untrustworthy (corrupt_facts_this_tick)");
+  // S6 vocabulary for the "locked out — fact history untrustworthy (...)" phase.
+  assert.equal(corrupt.phase, "cannot establish — history untrusted (corrupt_facts_this_tick)");
+  assert.ok(corrupt.rules.every((rule) => !rule.watching));
 
   const rollback = await statusOf({ cold_start_pending: false, last_folded_ts: a1Ts(40) });
-  assert.equal(rollback.phase, "locked out — fact history untrustworthy (clock_rollback)");
+  // S6 vocabulary: the detector re-arms its lockout on the clock rollback (anchor reset to now), so
+  // status reports locked out with progress restarting at 0 -- never "6 of 6" off the old store.
+  assert.equal(rollback.phase, "locked out — the cold-start lockout re-arms this tick");
+  assert.equal(rollback.complete_ticks, 0);
+  assert.ok(rollback.rules.every((rule) => !rule.watching && rule.reasons.includes("lockout_rearming")));
 
   const partialLatest = await statusOf(A1_ESTABLISHED_STORE, {
     extraPoints: [{ ts: a1Ts(30.25), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "partial" } }],
@@ -659,16 +740,23 @@ test("A1: corrupt facts, a clock rollback, an incomplete latest census and an em
   assert.equal(partialLatest.phase, "watching");
 
   const empty = await statusOf(A1_ESTABLISHED_STORE, { readPoints: [] });
-  assert.equal(empty.phase, "stale — no complete census in the fact-history window");
+  // S6 vocabulary for "stale — no complete census in the fact-history window".
+  assert.ok(empty.rules.every((rule) => !rule.watching));
+  assert.equal(ruleOf(empty, SESSION_CHURN_RULE_ID).phase, "cannot establish — no complete census yet");
 });
 
-test("R2: on a fresh install the count rules (session, peer) show progress toward the 30-sample count baseline, the binding requirement; the census domains keep N of 6", async () => {
+test("R2: on a fresh install the count rules (session, peer) show progress toward the 30-sample count baseline, the binding requirement; the census rules keep N of 6", async () => {
+  // S6: with no family store at all a fresh install reads "not observed (no store)" (tested above);
+  // R2 is about the first observed (still empty) family stores, so each read reports a present store.
   const paths = await tempPaths();
-  const result = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z" });
+  const result = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z", readFactPoints: stubFamilyRead([], { status: "intact" }) });
+  const countRules = new Set([SESSION_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID]);
   for (const domain of result.domains) {
-    const countRule = domain.domain === "session" || domain.domain === "peer";
-    assert.equal(domain.phase, countRule ? "still learning — 0 of 30" : "still learning — 0 of 6", domain.domain);
-    assert.equal(domain.required_ticks, countRule ? 30 : 6, domain.domain);
+    for (const rule of domain.rules) {
+      assert.equal(rule.watching, false, rule.rule_id);
+      assert.equal(rule.phase, countRules.has(rule.rule_id) ? "still learning — 0 of 30" : "still learning — 0 of 6", rule.rule_id);
+      if (countRules.has(rule.rule_id)) assert.deepEqual(rule.baseline_samples, { count: 0, required: 30 }, rule.rule_id);
+    }
   }
 });
 
@@ -686,20 +774,26 @@ test("R2: during a lockout the count rules show whichever requirement has more t
     const points = a1Points(tickCount);
     const result = await buildBaselineStatus(paths, {
       now: a1Ts(tickCount - 0.5),
-      readFactPoints: async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } }),
+      readFactPoints: stubFamilyRead(points, { status: "intact" }),
     });
     return Object.fromEntries(result.domains.map((domain) => [domain.domain, domain]));
   };
 
   // 10 complete ticks, 3 after the anchor: lockout needs 3 more, the count baseline 20 more.
+  // S6 vocabulary: asserted per count rule (session.churn has no count baseline -- it shows the lockout).
+  const countRuleIds = { session: [SESSION_COUNT_DROP_RULE_ID], peer: [PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_DROP_RULE_ID] };
   const countBinding = await statusFor(10, 6);
   for (const domain of ["session", "peer"]) {
-    assert.equal(countBinding[domain].phase, "still learning — 10 of 30", domain);
-    assert.equal(countBinding[domain].required_ticks, 30, domain);
+    for (const ruleId of countRuleIds[domain]) {
+      assert.equal(ruleOf(countBinding[domain], ruleId).phase, "still learning — 10 of 30", ruleId);
+      assert.deepEqual(ruleOf(countBinding[domain], ruleId).baseline_samples, { count: 10, required: 30 }, ruleId);
+    }
   }
+  assert.equal(ruleOf(countBinding.session, SESSION_CHURN_RULE_ID).phase, "still learning — 3 of 6");
   // 31 complete ticks (count baseline already met), 2 after the anchor: the lockout binds.
   const lockoutBinding = await statusFor(31, 28);
   for (const domain of ["session", "peer"]) {
+    for (const rule of lockoutBinding[domain].rules) assert.equal(rule.phase, "still learning — 2 of 6", rule.rule_id);
     assert.equal(lockoutBinding[domain].phase, "still learning — 2 of 6", domain);
     assert.equal(lockoutBinding[domain].required_ticks, 6, domain);
   }
@@ -730,5 +824,19 @@ test("an explicit learned disable does not disable default-on watch", async () =
 
   const status = await buildBaselineStatus(paths, { now: "2026-09-27T12:00:00.000Z" });
   assert.equal(status.watch_config.enabled, true);
-  assert.match(status.domains[0].phase, /^still learning/);
+  // S6: no store exists yet (nothing was observed), but the domain is NOT "disabled".
+  assert.equal(status.domains[0].phase, "not observed (no store)");
+});
+
+test("baseline status with watch disabled reports every rule disabled and reads no fact store", async () => {
+  const paths = await tempPaths();
+  await writeWatchConfig(paths, { enabled: false }, { now: "2026-09-27T11:00:00.000Z" });
+  const status = await buildBaselineStatus(paths, {
+    now: "2026-09-27T12:00:00.000Z",
+    readFactPoints: async () => { throw new Error("a disabled watch tier must not read fact history"); },
+  });
+  for (const domain of status.domains) {
+    assert.equal(domain.phase, "disabled");
+    for (const rule of domain.rules) assert.equal(rule.phase, "disabled");
+  }
 });

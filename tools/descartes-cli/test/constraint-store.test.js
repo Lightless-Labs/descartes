@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
-import { appendFactPoints, DEFAULT_FACT_MAX_BYTES, resolveFactStorePaths } from "../src/fact-store.js";
+import { appendFactPoints, DEFAULT_FACT_MAX_BYTES, resolveFactStorePaths, appendFactPointsByFamily } from "../src/fact-store.js";
 import { isSafeEnumString } from "../src/diagnostics-sanitizer.js";
 import {
   DEFAULT_SOAK_DAYS,
@@ -23,6 +23,7 @@ import {
   resolveConstraintStorePaths,
   retireActiveConstraint,
   runLearnedConfigCommand,
+  selectFactStoreCompleteness,
   validateConstraint,
   writeConstraints,
   writeLearnedConfig,
@@ -380,44 +381,37 @@ test("loadLearnedConfig fails closed to disabled (does not throw) when learned.j
   assert.equal(config.enabled, false);
 });
 
-// --- Finding F2-Tier1: configurable fact-store byte cap (fact_store_max_bytes) ---
-// Mirrors enforceFactRetention's existing BLOCKER #1 finite/non-negative validation pattern
-// (fact-store.js:216-221): a bad configured value must never silently disable capping, so
-// normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES on anything that is not a
-// finite, positive number, rather than passing the bad value through or leaving it unset.
+// --- fact_store_max_bytes: DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5);
+// mirrors watch-store.test.js. learned.json's copy never reached the store after watch-by-default
+// slice 1; it is now dropped when it is the written-in 5 MB default (or invalid) and preserved only
+// as a deliberate operator value, which status names as deprecated/ignored. (Replaces the F2-Tier1
+// "fail closed to DEFAULT_FACT_MAX_BYTES" pins.) ---
 
-test("normalizeLearnedConfig accepts a valid finite positive fact_store_max_bytes override", () => {
-  const config = normalizeLearnedConfig({ fact_store_max_bytes: 1024 });
-  assert.equal(config.fact_store_max_bytes, 1024);
+test("normalizeLearnedConfig preserves a deliberate (non-default) operator fact_store_max_bytes so status can name it as deprecated", () => {
+  assert.equal(normalizeLearnedConfig({ fact_store_max_bytes: 1024 }).fact_store_max_bytes, 1024);
 });
 
-test("normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES when fact_store_max_bytes is missing", () => {
-  const config = normalizeLearnedConfig({});
-  assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+test("normalizeLearnedConfig no longer writes in a fact_store_max_bytes default, and drops the written-in 5 MB default", () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizeLearnedConfig({}), "fact_store_max_bytes"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizeLearnedConfig({ fact_store_max_bytes: DEFAULT_FACT_MAX_BYTES }), "fact_store_max_bytes"), false);
 });
 
 for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, "garbage", null]) {
-  test(`normalizeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES on invalid fact_store_max_bytes: ${String(badValue)}`, () => {
-    const config = normalizeLearnedConfig({ fact_store_max_bytes: badValue });
-    assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  test(`normalizeLearnedConfig drops an invalid legacy fact_store_max_bytes: ${String(badValue)}`, () => {
+    assert.equal(Object.prototype.hasOwnProperty.call(normalizeLearnedConfig({ fact_store_max_bytes: badValue }), "fact_store_max_bytes"), false);
   });
 }
 
-test("writeLearnedConfig/loadLearnedConfig round-trip a valid fact_store_max_bytes override", async () => {
+test("writeLearnedConfig/loadLearnedConfig round-trip a deliberate operator fact_store_max_bytes; a written-in default or invalid value is not written back", async () => {
   const paths = await tempPaths();
   await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: 2048 });
-
-  const reread = await loadLearnedConfig(paths);
-  assert.equal(reread.fact_store_max_bytes, 2048);
-});
-
-test("writeLearnedConfig fails closed to DEFAULT_FACT_MAX_BYTES when given an invalid fact_store_max_bytes", async () => {
-  const paths = await tempPaths();
-  const written = await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: -5 });
-  assert.equal(written.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
-
-  const reread = await loadLearnedConfig(paths);
-  assert.equal(reread.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  assert.equal((await loadLearnedConfig(paths)).fact_store_max_bytes, 2048);
+  const other = await tempPaths();
+  for (const value of [DEFAULT_FACT_MAX_BYTES, -5]) {
+    const written = await writeLearnedConfig(other, { enabled: true, fact_store_max_bytes: value });
+    assert.equal(Object.prototype.hasOwnProperty.call(written, "fact_store_max_bytes"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(await loadLearnedConfig(other), "fact_store_max_bytes"), false);
+  }
 });
 
 // --- descartes learned enable | disable | status (CLI) — the kill switch is operationally
@@ -490,13 +484,13 @@ test("descartes learned enable/disable/status --json print machine-readable payl
 test("descartes learned status --json includes counts-and-timestamps-only fact-store completeness", async () => {
   const paths = await tempPaths();
   const now = "2026-07-11T00:00:00.000Z";
-  await appendFactPoints(paths, [{
+  await appendFactPointsByFamily(paths, [{
     ts: now,
     fact_name: "service.presence",
     entity_key: "nginx",
     attributes: {},
   }], { now });
-  await appendFactPoints(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now });
 
   const lines = [];
   await runLearnedConfigCommand(paths, "status", ["--json"], { output: (line) => lines.push(line) });
@@ -508,13 +502,24 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   // last_continuity_break_ts) are no longer stripped, plus the new future-fact channel/
   // reporting fields (last_future_fact_ts, future_fact_dropped_total, degraded_reason,
   // future_loss_fields). No existing field is removed or renamed.
+  // Fact-store capacity plan (2026-10-05, §4.1 item 6): continuity_oldest_ts is REPLACED by the R0b
+  // coverage fields (bytecap_floor_ts, certified_after_ts, oldest_certified_ts, coverage) -- it only
+  // ever moved older and could predate the retained facts, so it over-claimed retained history.
+  // G1 re-gate LOW (fact-store capacity plan §18): ADDITIVE -- age_floor_ts is no longer stripped
+  // (the age floor narrows coverage too; G1 Blocker 2).
+  // S4 (fact-store capacity plan §4.3/§4.4): ADDITIVE -- `families` carries the same fields per family
+  // store (plus store present/absent and bytes); the top level is the combined summary.
   assert.deepEqual(Object.keys(completeness).sort(), [
     "age_evicted_total",
+    "age_floor_ts",
     "bytecap_evicted_total",
+    "bytecap_floor_ts",
+    "certified_after_ts",
     "continuity_ok",
-    "continuity_oldest_ts",
     "corrupt_dropped_total",
+    "coverage",
     "degraded_reason",
+    "families",
     "first_degraded_ts",
     "future_fact_dropped_total",
     "future_loss_fields",
@@ -523,6 +528,7 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
     "last_corrupt_ts",
     "last_future_fact_ts",
     "last_schema_invalid_ts",
+    "oldest_certified_ts",
     "schema_invalid_dropped_total",
     "status",
   ].sort());
@@ -534,7 +540,10 @@ test("descartes learned status --json includes counts-and-timestamps-only fact-s
   assert.equal(completeness.first_degraded_ts, null);
   assert.equal(completeness.continuity_ok, true);
   assert.equal(completeness.last_bytecap_evict_ts, null);
-  assert.equal(completeness.continuity_oldest_ts, now);
+  assert.equal(completeness.bytecap_floor_ts, null);
+  assert.equal(completeness.age_floor_ts, null);
+  assert.equal(completeness.certified_after_ts, null);
+  assert.equal(completeness.coverage, "full");
   assert.equal(completeness.last_corrupt_ts, null);
   assert.equal(completeness.last_schema_invalid_ts, null);
   assert.equal(completeness.last_continuity_break_ts, null);
@@ -555,7 +564,9 @@ test("descartes learned status --json degrades to unknown when fact history was 
   assert.equal(completeness.status, "unknown");
   assert.equal(completeness.continuity_ok, null);
   assert.equal(completeness.last_bytecap_evict_ts, null);
-  assert.equal(completeness.continuity_oldest_ts, null);
+  assert.equal(completeness.bytecap_floor_ts, null);
+  assert.equal(completeness.certified_after_ts, null);
+  assert.equal(completeness.oldest_certified_ts, null);
   assert.equal(completeness.degraded_reason, "continuity_unknown");
   assert.deepEqual(completeness.future_loss_fields, []);
 });
@@ -563,21 +574,23 @@ test("descartes learned status --json degrades to unknown when fact history was 
 // Finding F2-Tier1: coverage-loss reporting. Real (not hand-authored-fixture) sustained
 // bytecap eviction pressure via appendFactPoints -> enforceFactRetention, so an operator can
 // SEE via `descartes learned status --json` when normal eviction is degrading novelty coverage
-// (last_bytecap_evict_ts stamped, continuity_oldest_ts advancing) rather than only observing a
+// (last_bytecap_evict_ts stamped, the byte-cap floor advancing) rather than only observing a
 // cumulative lifetime bytecap_evicted_total with no sense of "is this happening right now".
-test("descartes learned status --json surfaces last_bytecap_evict_ts and continuity_oldest_ts once bytecap eviction is real and ongoing", async () => {
+// Updated by the fact-store capacity plan (2026-10-05, §4.1 item 6): continuity_oldest_ts is
+// replaced by the R0b coverage fields; the floor is the newest evicted ts and coverage reads
+// "narrowed".
+test("descartes learned status --json surfaces last_bytecap_evict_ts and the byte-cap floor / coverage once bytecap eviction is real and ongoing", async () => {
   const paths = await tempPaths();
   const day1 = "2026-07-11T00:00:00.000Z";
   const day2 = "2026-07-12T00:00:00.000Z";
 
   // Tiny (but not zero) maxBytes forces routine bytecap eviction while still keeping room for
   // exactly the single newest record (a maxBytes too small to keep even one record would evict
-  // everything, leaving continuity_oldest_ts null -- not the sustained-but-nonempty pressure
-  // this finding is about).
-  await appendFactPoints(paths, [
+  // everything -- not the sustained-but-nonempty pressure this finding is about).
+  await appendFactPointsByFamily(paths, [
     { ts: day1, fact_name: "service.presence", entity_key: "one", attributes: {} },
   ], { now: day1, maxBytes: 150 });
-  await appendFactPoints(paths, [
+  await appendFactPointsByFamily(paths, [
     { ts: day2, fact_name: "service.presence", entity_key: "two", attributes: {} },
   ], { now: day2, maxBytes: 150 });
 
@@ -587,7 +600,9 @@ test("descartes learned status --json surfaces last_bytecap_evict_ts and continu
 
   assert.equal(completeness.bytecap_evicted_total > 0, true);
   assert.equal(completeness.last_bytecap_evict_ts, day2);
-  assert.equal(typeof completeness.continuity_oldest_ts, "string");
+  assert.equal(completeness.bytecap_floor_ts, day1);
+  assert.equal(completeness.coverage, "narrowed");
+  assert.equal(typeof completeness.certified_after_ts, "string");
 });
 
 // Fix 2 (trusted-state step-1 revision, "R1 made signable"): the review's core undiscoverability
@@ -602,11 +617,11 @@ test("descartes learned status (non-JSON) explains a degraded status with its re
   // window regardless of when this test runs (a fixed past date, e.g. "2026-07-11", would fall
   // outside a 31-day real-clock window and the read would resolve "intact" instead).
   const now = new Date().toISOString();
-  const storePaths = resolveFactStorePaths(paths);
+  const storePaths = resolveFactStorePaths(paths, "service");
   await fs.mkdir(storePaths.dir, { recursive: true });
   await fs.writeFile(storePaths.factsFile, "not-json\n");
-  await appendFactPoints(paths, [], { now });
-  await appendFactPoints(paths, [], { now }); // second clean pass -> continuity_ok:true, status: degraded (not unknown)
+  await appendFactPointsByFamily(paths, [], { now });
+  await appendFactPointsByFamily(paths, [], { now }); // second clean pass -> continuity_ok:true, status: degraded (not unknown)
 
   const lines = [];
   await runLearnedConfigCommand(paths, "status", [], { output: (line) => lines.push(line) });
@@ -622,15 +637,20 @@ test("descartes learned status (non-JSON) explains a degraded status with its re
   // (which includes "unknown", not just "degraded" -- a fresh/never-written store benefits from
   // the same explanation).
   const intactPaths = await tempPaths();
-  await appendFactPoints(intactPaths, [
+  await appendFactPointsByFamily(intactPaths, [
     { ts: now, fact_name: "service.presence", entity_key: "one", attributes: {} },
   ], { now });
-  await appendFactPoints(intactPaths, [], { now }); // second clean pass -> continuity_ok:true, intact
+  await appendFactPointsByFamily(intactPaths, [], { now }); // second clean pass -> continuity_ok:true, intact
   const intactLines = [];
   await runLearnedConfigCommand(intactPaths, "status", [], { output: (line) => intactLines.push(line) });
   assert.equal(intactLines.length, 1);
-  assert.ok(intactLines[0].endsWith("Fact-store completeness: intact"), intactLines[0]);
-  assert.equal(intactLines[0].split("Fact-store completeness:").length, 2, "no extra 'Reason:'/last_*_ts lines when the status needs no explanation");
+  // S4 (fact-store capacity plan §4.3/§4.4): the combined line is followed by one line per family
+  // store -- the populated one intact, every never-created one "not observed (no store)" (I11) --
+  // and still no 'Reason:'/last_*_ts explanation when nothing needs explaining.
+  assert.match(intactLines[0], /Fact-store completeness: intact\n  service: intact\n/);
+  assert.match(intactLines[0], /  peer: not observed \(no store\)/);
+  assert.equal(intactLines[0].split("Fact-store completeness:").length, 2);
+  assert.doesNotMatch(intactLines[0], /Reason:|last_[a-z_]+_ts:/, "no extra 'Reason:'/last_*_ts lines when the status needs no explanation");
 });
 
 test("descartes learned status never mutates learned.json (read-only)", async () => {
@@ -1077,4 +1097,54 @@ test("retireActiveConstraint/applyApprovedRetune: the only call site in src/ is 
   // to reference the call form is tuning-authority.js's dispatch.
   const nonDefinitionCallers = callers.filter((file) => file !== "constraint-store.js");
   assert.deepEqual(nonDefinitionCallers, ["tuning-authority.js"], `expected the only external caller to be tuning-authority.js, found: ${JSON.stringify(callers)}`);
+});
+
+// G1 re-gate LOW (fact-store capacity plan §18): the learned-status surface reports age_floor_ts and
+// names the ACTUAL narrowing cause(s), instead of stripping the age floor and labeling every
+// narrowing "byte-cap".
+test("G1 LOW: learned status reports the age floor and names each narrowing cause (age retention, byte-cap, or both)", async () => {
+  const base = { status: "intact", coverage: "narrowed", certified_after_ts: "2026-09-05T00:00:00.000Z", last_bytecap_evict_ts: null, bytecap_floor_ts: null, age_floor_ts: null };
+  assert.equal(selectFactStoreCompleteness({ ...base, age_floor_ts: "2026-09-04T00:00:00.000Z" }).age_floor_ts, "2026-09-04T00:00:00.000Z");
+  assert.equal(selectFactStoreCompleteness({ ...base, age_floor_ts: "garbage" }).age_floor_ts, null);
+
+  // A real store older than the retention window: the oldest record is AGE-evicted (never byte-cap),
+  // and the learned-status read (31 d window, wall clock) sees that age floor inside its window.
+  const day = 24 * 60 * 60 * 1000;
+  const nowMs = Date.now();
+  const oldTs = new Date(nowMs - 30.5 * day).toISOString();
+  const newTs = new Date(nowMs).toISOString();
+  const ageOnly = await tempPaths();
+  await appendFactPointsByFamily(ageOnly, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
+  await appendFactPointsByFamily(ageOnly, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs });
+  await appendFactPointsByFamily(ageOnly, [], { now: newTs });
+  const lines = [];
+  const result = await runLearnedConfigCommand(ageOnly, "status", [], { output: (line) => lines.push(line) });
+  assert.equal(result.fact_store_completeness.age_floor_ts, oldTs);
+  assert.equal(result.fact_store_completeness.bytecap_floor_ts, null);
+  const text = lines.join("\n");
+  assert.match(text, /Coverage: narrowed by age retention \(floor /, "an age-only narrowing is attributed to age retention");
+  assert.doesNotMatch(text, /byte-cap eviction/, "and never mislabeled as byte-cap");
+
+  // Both causes at once are both named.
+  const both = await tempPaths();
+  await appendFactPointsByFamily(both, [{ ts: oldTs, fact_name: "service.presence", entity_key: "old", attributes: {} }], { now: oldTs });
+  const midTs = new Date(nowMs - day).toISOString();
+  await appendFactPointsByFamily(both, [{ ts: midTs, fact_name: "service.presence", entity_key: "mid", attributes: {} }], { now: midTs });
+  await appendFactPointsByFamily(both, [{ ts: newTs, fact_name: "service.presence", entity_key: "new", attributes: {} }], { now: newTs, maxBytes: 150 });
+  const bothLines = [];
+  await runLearnedConfigCommand(both, "status", [], { output: (line) => bothLines.push(line) });
+  assert.match(bothLines.join("\n"), /narrowed by byte-cap eviction \(floor .*\) and age retention \(floor /);
+});
+
+test("Q5: descartes learned status names a deliberate legacy fact_store_max_bytes as deprecated and ignored (and says nothing when it is absent)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true, fact_store_max_bytes: 2048 });
+  const lines = [];
+  await runLearnedConfigCommand(paths, "status", [], { output: (line) => lines.push(line) });
+  assert.match(lines[0], /fact_store_max_bytes: 2048 \(deprecated, ignored/);
+  const quiet = await tempPaths();
+  await writeLearnedConfig(quiet, { enabled: true });
+  const quietLines = [];
+  await runLearnedConfigCommand(quiet, "status", [], { output: (line) => quietLines.push(line) });
+  assert.doesNotMatch(quietLines[0], /fact_store_max_bytes/);
 });

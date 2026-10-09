@@ -38,6 +38,9 @@ import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_PEER_ENTITY_LIMIT = 200;
+// Fact-store capacity plan §2/S4: hard UPPER clamp (the peer fact family's budget invariant, T8, is
+// sized against it together with MAX_TAILSCALE_PEER_ENTITY_LIMIT).
+export const MAX_PEER_ENTITY_LIMIT = 200;
 
 // Bounded `last -n <N>` (must-fix 3, fixture-pinned): an unbounded `last` can return months of
 // wtmp history, which would flood fact-history and evict other collectors' facts out of the
@@ -392,7 +395,7 @@ function dedupeKey(remoteUser, remoteHost) {
  * "unable"/confidence 0 only when every source degraded.
  */
 export async function collectVpnPeerStatusEvidence(options = {}) {
-  const cap = Math.max(1, Number(options.peerLimit) || DEFAULT_PEER_ENTITY_LIMIT);
+  const cap = Math.min(MAX_PEER_ENTITY_LIMIT, Math.max(1, Number(options.peerLimit) || DEFAULT_PEER_ENTITY_LIMIT));
 
   return timedEnvelope(async () => {
     const platform = options.platform ?? process.platform;
