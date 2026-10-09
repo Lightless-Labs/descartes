@@ -214,6 +214,16 @@ async function collectScreenSessions(options = {}) {
 
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   const parsed = parseScreenLs(text);
+  if (parsed.malformed_count > 0) {
+    return {
+      multiplexer: "screen",
+      status: "partial",
+      sessions: parsed.sessions,
+      malformed_count: parsed.malformed_count,
+      command: probe.command,
+      binary: probe.binary,
+    };
+  }
   if (probe.status === "ok" || parsed.no_sockets || parsed.sessions.length > 0) {
     return {
       multiplexer: "screen",

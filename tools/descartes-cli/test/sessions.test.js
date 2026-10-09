@@ -234,6 +234,19 @@ test("screen -ls exits non-zero even though sessions genuinely exist (pinned ver
   assert.equal(envelope.result.sessions[0].attached, true);
 });
 
+test("malformed screen output is partial even when the command exits non-zero", async () => {
+  const envelope = await collectSessionEvidence({
+    runFixedExecFile: fakeExec({
+      tmux: enoent(),
+      screen: failure({ code: 1, stdout: "corrupt-row-with-a-real-session-hidden\n" }),
+    }),
+  });
+  const screen = envelope.result.multiplexers.find((mux) => mux.multiplexer === "screen");
+  assert.equal(screen.status, "partial");
+  assert.equal(screen.malformed_count, 1);
+  assert.equal(envelope.result.census_state, "partial");
+});
+
 test("malformed/truncated tmux output makes that source partial instead of authorizing a complete census", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({
