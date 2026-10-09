@@ -894,6 +894,57 @@ export async function recordAlertDeliveryFailure(descartesPaths, alertIdValue, o
   return { recorded: true, alert: written.find((alert) => alert.id === alertIdValue) };
 }
 
+export async function recordAlertDeliveryFailures(descartesPaths, failures, options = {}) {
+  const entries = Array.isArray(failures) ? failures : [];
+  if (entries.length === 0) return { recorded: false };
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const alerts = await readAlertRecords(descartesPaths);
+  const updated = new Map(alerts.map((alert) => [alert.id, alert]));
+  let recorded = false;
+  for (const failure of entries) {
+    const alert = updated.get(failure.alertId);
+    if (!alert || ["recovered", "suppressed"].includes(alert.status)) continue;
+    const incidentKey = failure.incidentKey ?? failure.episodeKey ?? alertEpisodeKey(alert);
+    if (incidentKey === INCIDENT_STORM_KEY) {
+      recorded = true;
+      const count = (alert.incident_storm_failure_count ?? 0) + 1;
+      const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+      updated.set(alert.id, normalizeAlertRecord({
+        ...alert,
+        incident_storm_failure_count: count,
+        next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        last_attempt_at: now,
+        backoff_delay_ms: delay,
+      }));
+      continue;
+    }
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) continue;
+    recorded = true;
+    const count = incident.delivery_failure_count + 1;
+    const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+    updated.set(alert.id, syncAlertProjection({
+      ...alert,
+      incidents: {
+        ...alert.incidents,
+        [incidentKey]: {
+          ...incident,
+          delivery_failure_count: count,
+          last_delivery_failure_at: now,
+          last_attempt_at: now,
+          backoff_delay_ms: delay,
+          delivery_failure_reason: String(failure.reason ?? options.reason ?? "delivery_failed").slice(0, 240),
+          delivery_failing_since: incident.delivery_failing_since ?? now,
+          next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        },
+      },
+    }));
+  }
+  if (!recorded) return { recorded: false };
+  const written = await writeAlertRecordsUnlocked(descartesPaths, [...updated.values()]);
+  return { recorded: true, alerts: written };
+}
+
 export async function recordAlertAdjudication(descartesPaths, alertIdValue, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const alerts = await readAlertRecords(descartesPaths);
