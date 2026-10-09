@@ -235,9 +235,15 @@ test("groupSessionFactsByTick carries the session availability signature into th
   assert.equal(groups[0].availabilitySignature, "v1:tmux");
 });
 
-test("groupSessionFactsByTick rejects signatures outside the closed v1/v2 multiplexer universe", () => {
-  const groups = groupSessionFactsByTick([censusMarkerPoint(tickTs(0), "complete", "v1:screen+screen")]);
-  assert.equal(groups[0].availabilitySignature, SESSION_AVAILABILITY_SIGNATURE_INVALID);
+test("groupSessionFactsByTick accepts exactly the three emitted v1 multiplexer signatures", () => {
+  for (const signature of ["v1:tmux", "v1:screen", "v1:tmux+screen"]) {
+    const groups = groupSessionFactsByTick([censusMarkerPoint(tickTs(0), "complete", signature)]);
+    assert.equal(groups[0].availabilitySignature, signature);
+  }
+  for (const signature of ["v2:tmux", "v2:screen", "v2:tmux+screen", "v1:screen+screen"]) {
+    const groups = groupSessionFactsByTick([censusMarkerPoint(tickTs(0), "complete", signature)]);
+    assert.equal(groups[0].availabilitySignature, SESSION_AVAILABILITY_SIGNATURE_INVALID, signature);
+  }
 });
 
 test("session baseline re-warms when tmux becomes not-found and does not evaluate the old alert", async () => {
@@ -741,6 +747,32 @@ test("session.churn non-fire: pre-existing-history-at-first-run (upgrade-day sto
   const firstPostDeployTick = [censusMarkerPoint(tickTs(48), "complete")]; // e1 absent this tick, but the marker exists now
   const churn = detectSessionChurn([...legacyPoints, ...firstPostDeployTick]);
   assert.deepEqual(churn, [], "no upgrade-day storm: legacy markerless history must never fire on first run");
+});
+
+test("session.churn legacy identity is frozen: 31 complete signatureless ticks never emit churn or legacy coverage", async () => {
+  const paths = await tempPaths();
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [];
+  for (let hour = 0; hour < 30; hour += 1) {
+    points.push(sessionPoint(tickTs(hour), entityKey, "fp-stable"));
+    points.push({
+      ts: tickTs(hour),
+      fact_name: "session.presence",
+      entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+      attributes: { census_state: "complete" },
+    });
+  }
+  points.push(sessionPoint(tickTs(30), entityKey, "fp-changed"));
+  points.push({
+    ts: tickTs(30),
+    fact_name: "session.presence",
+    entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: "complete" },
+  });
+
+  const result = await seedAndCompute(paths, points, { now: tickTs(30) });
+  assert.deepEqual(result.candidates.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID), []);
+  assert.equal(result.evaluatedAlertKeys.some((key) => key.includes("session.churn") && key.endsWith(entityKey)), false);
 });
 
 test("session.churn: a partial tick-group's own point is excluded from the pool (must-fix 2), but flanking complete observations still churn-compare correctly", () => {

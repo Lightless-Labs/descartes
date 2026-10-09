@@ -55,7 +55,7 @@ export { emptyWelfordStats, foldWelford, updateEwma, computeZScore, DEFAULT_BASE
 export { SESSION_CENSUS_MARKER_ENTITY_KEY };
 
 const SESSION_FACT_NAME = "session.presence";
-const SESSION_AVAILABILITY_SIGNATURE_PATTERN = /^v[12]:(?:tmux|screen|tmux\+screen)$/;
+const SESSION_AVAILABILITY_SIGNATURE_PATTERN = /^v1:(?:tmux|screen|tmux\+screen)$/;
 export const SESSION_AVAILABILITY_SIGNATURE_INVALID = Symbol("session-availability-signature-invalid");
 export const SESSION_COUNT_LEGACY_FINGERPRINT = "global";
 
@@ -634,6 +634,10 @@ export function evaluateSessionChurn(points = [], {
   if (censusReadiness.gate !== "ok") return { churnEntries: [], evaluatedEntityKeys: [], ready: false, gate: censusReadiness.gate };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
+  const currentAvailabilitySignature = completeGroups[completeGroups.length - 1].availabilitySignature;
+  if (typeof currentAvailabilitySignature !== "string" || !SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(currentAvailabilitySignature)) {
+    return { churnEntries: [], evaluatedEntityKeys: [], ready: false, gate: "no_complete_census" };
+  }
   const resolvedStructuralIntervalMs = Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
     ? structuralIntervalMs
     : Number.isFinite(activeFreshnessMs) && activeFreshnessMs > 0
@@ -647,7 +651,6 @@ export function evaluateSessionChurn(points = [], {
   const lookbackBoundMs = new Date(completeGroups[Math.max(0, completeGroups.length - 1 - lookbackTicks)].ts).getTime();
 
   const byEntity = new Map();
-  const currentAvailabilitySignature = completeGroups[completeGroups.length - 1].availabilitySignature;
   for (const group of groups) {
     // "partial" and "unknown" groups are both excluded here (an undercounted OR garbled census
     // could drop/misattribute an entity's point mid-comparison). "overflow" (flood-capped) groups
@@ -1069,8 +1072,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       nowMs, freshnessMs, structuralIntervalMs, activeFreshnessMs: freshnessMs,
     });
     churnReady = ready && gate === "ok";
-    candidates.push(...buildChurnCandidates(churnEntries, { availabilitySignature: observedAvailabilitySignature }));
     if (typeof observedAvailabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(observedAvailabilitySignature)) {
+      candidates.push(...buildChurnCandidates(churnEntries, { availabilitySignature: observedAvailabilitySignature }));
       for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, sessionChurnFingerprintForAvailabilitySignature(entityKey, observedAvailabilitySignature)));
     }
   }
