@@ -169,7 +169,14 @@ async function collectTmuxSessions(options = {}) {
 
   if (probe.status === "ok") {
     const parsed = parseTmuxSessions(probe.stdout);
-    return { multiplexer: "tmux", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command, binary: probe.binary };
+    return {
+      multiplexer: "tmux",
+      status: parsed.malformed_count > 0 ? "partial" : "ok",
+      sessions: parsed.sessions,
+      malformed_count: parsed.malformed_count,
+      command: probe.command,
+      binary: probe.binary,
+    };
   }
   if (isBinaryNotFound(probe)) {
     return { multiplexer: "tmux", status: "not_found_on_known_paths", sessions: [], command: probe.command, binary: probe.binary };
@@ -208,7 +215,14 @@ async function collectScreenSessions(options = {}) {
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   const parsed = parseScreenLs(text);
   if (probe.status === "ok" || parsed.no_sockets || parsed.sessions.length > 0) {
-    return { multiplexer: "screen", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command, binary: probe.binary };
+    return {
+      multiplexer: "screen",
+      status: parsed.malformed_count > 0 ? "partial" : "ok",
+      sessions: parsed.sessions,
+      malformed_count: parsed.malformed_count,
+      command: probe.command,
+      binary: probe.binary,
+    };
   }
   return { multiplexer: "screen", status: "unable", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
@@ -235,7 +249,7 @@ export async function collectSessionEvidence(options = {}) {
       }
     }
 
-    const anyBinaryAvailable = multiplexers.some((mux) => mux.status === "ok");
+    const anyBinaryAvailable = multiplexers.some((mux) => mux.status === "ok" || mux.status === "partial");
     const censusComplete = sessionCensusComplete(multiplexers);
     const availabilitySignature = sessionAvailabilitySignature(multiplexers);
     const truncated = allSessions.length > cap;
@@ -245,6 +259,7 @@ export async function collectSessionEvidence(options = {}) {
       multiplexers: multiplexers.map((mux) => ({
         multiplexer: mux.multiplexer,
         status: mux.status,
+        malformed_count: mux.malformed_count ?? 0,
         ...(mux.error ? { error: mux.error } : {}),
         binary_provenance: binaryProvenance(mux.binary),
       })),
@@ -264,7 +279,8 @@ export async function collectSessionEvidence(options = {}) {
     confidence: result.census_state === "complete" ? 1 : result.any_binary_available ? 0.5 : 0,
     reviewHint: result.census_state === "complete"
       ? "none"
-      : result.multiplexers.find((mux) => mux.status !== "ok")?.status === "untrusted_binary" ? "untrusted_binary" : "missing_permission",
+      : result.multiplexers.some((mux) => (mux.malformed_count ?? 0) > 0) ? "malformed_output"
+        : result.multiplexers.find((mux) => mux.status !== "ok")?.status === "untrusted_binary" ? "untrusted_binary" : "missing_permission",
     tool: "collect_sessions",
     target: `cap=${result.cap}`,
   }));

@@ -308,7 +308,7 @@ export function binaryProvenance(probe) {
     trust_verdict: binary?.trust_verdict,
     offending_component: binary?.offending_component,
     trust_reason: binary?.trust_reason,
-    operator_override_hint: binary?.operator_override_hint,
+    ...(binary?.operator_override_hint ? { operator_override_hint: binary.operator_override_hint } : {}),
     same_uid_writable_components: binary?.same_uid_writable_components ?? [],
   };
 }

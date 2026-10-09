@@ -234,16 +234,19 @@ test("screen -ls exits non-zero even though sessions genuinely exist (pinned ver
   assert.equal(envelope.result.sessions[0].attached, true);
 });
 
-test("malformed/truncated tmux output degrades gracefully: well-formed lines still parsed, envelope stays ok", async () => {
+test("malformed/truncated tmux output makes that source partial instead of authorizing a complete census", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({
       tmux: ok(["main\t3\t1\t1720000000", "###garbage###"].join("\n")),
       screen: enoent(),
     }),
   });
-  assert.equal(envelope.status, "ok");
-  assert.equal(envelope.confidence, 1);
-  assert.equal(envelope.result.census_state, "complete");
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.confidence, 0.5);
+  assert.equal(envelope.result.census_state, "partial");
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "tmux").status, "partial");
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "tmux").malformed_count, 1);
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "screen").malformed_count, 0);
   assert.equal(envelope.result.sessions.length, 1);
 });
 
