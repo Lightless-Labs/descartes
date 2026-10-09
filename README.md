@@ -232,8 +232,10 @@ and evidence reports it as `operator_trusted`; this explicit override accepts th
 responsibility for ownership, write bits, and ACLs. This is important for single-user Homebrew
 installs whose `/opt/homebrew` tree may be owned or group-managed outside the daemon trust model:
 add the exact executable to `trusted_binary_paths` when that installation is intentionally trusted.
-A miss on known paths is `not_found_on_known_paths`, which is incomplete/unknown evidence—not proof
-that software is not installed and never a complete zero in a census.
+A miss on known paths is `not_found_on_known_paths`: it contributes no zero for that source and
+removes it from the current session universe. If another multiplexer remains usable, the reduced
+universe can still be a complete census; baseline status continues to report the previously seen
+source as absent for as long as it remains unobserved.
 
 For the full list, see `docs/reference/collectors.md`.
 

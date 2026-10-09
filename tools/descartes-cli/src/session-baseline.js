@@ -55,8 +55,21 @@ export { emptyWelfordStats, foldWelford, updateEwma, computeZScore, DEFAULT_BASE
 export { SESSION_CENSUS_MARKER_ENTITY_KEY };
 
 const SESSION_FACT_NAME = "session.presence";
-const SESSION_AVAILABILITY_SIGNATURE_PATTERN = /^v1:(?:tmux|screen)(?:\+screen)?$/;
+const SESSION_AVAILABILITY_SIGNATURE_PATTERN = /^v[12]:(?:tmux|screen|tmux\+screen)$/;
 export const SESSION_AVAILABILITY_SIGNATURE_INVALID = Symbol("session-availability-signature-invalid");
+export const SESSION_COUNT_LEGACY_FINGERPRINT = "global";
+
+export function sessionCountFingerprintForAvailabilitySignature(availabilitySignature) {
+  return typeof availabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(availabilitySignature)
+    ? `v2:${availabilitySignature.slice(3)}`
+    : SESSION_COUNT_LEGACY_FINGERPRINT;
+}
+
+export function sessionChurnFingerprintForAvailabilitySignature(entityKey, availabilitySignature) {
+  return typeof availabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(availabilitySignature)
+    ? `${sessionCountFingerprintForAvailabilitySignature(availabilitySignature)}:${entityKey}`
+    : entityKey;
+}
 
 export const SESSION_COUNT_DROP_RULE_ID = "session.count_drop";
 export const SESSION_CHURN_RULE_ID = "session.churn";
@@ -323,6 +336,7 @@ export function groupSessionFactsByTick(points = []) {
         hasOverflow: false,
         censusState: undefined,
         availabilitySignature: undefined,
+        binaryAvailability: undefined,
         censusMarkerSeen: false,
         points: [],
       });
@@ -356,6 +370,11 @@ export function groupSessionFactsByTick(points = []) {
       group.availabilitySignature = group.censusMarkerSeen && markerSignature !== group.availabilitySignature
         ? SESSION_AVAILABILITY_SIGNATURE_INVALID
         : markerSignature;
+      const rawBinaryAvailability = point.attributes?.binary_availability;
+      const markerBinaryAvailability = typeof rawBinaryAvailability === "string" ? rawBinaryAvailability : undefined;
+      group.binaryAvailability = group.censusMarkerSeen && markerBinaryAvailability !== group.binaryAvailability
+        ? undefined
+        : markerBinaryAvailability;
       group.censusMarkerSeen = true;
       continue;
     }
@@ -363,6 +382,48 @@ export function groupSessionFactsByTick(points = []) {
     group.points.push(point);
   }
   return [...byTs.values()].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+}
+
+const SESSION_MULTIPLEXER_NAMES = ["tmux", "screen"];
+
+function binaryAvailabilityStatuses(value) {
+  if (typeof value !== "string") return undefined;
+  const statuses = new Map();
+  for (const entry of value.split("|")) {
+    const separator = entry.indexOf(":");
+    if (separator <= 0) return undefined;
+    statuses.set(entry.slice(0, separator), entry.slice(separator + 1));
+  }
+  return statuses;
+}
+
+/**
+ * Reports a known multiplexer that was observed and then disappeared from the current census.
+ * The reason remains present while consecutive marker ticks continue to report the source as a
+ * known-path miss; a source that was never observed is not called missing.
+ */
+export function sessionSourceDisappearanceReasons(groups = []) {
+  const reasons = [];
+  for (const source of SESSION_MULTIPLEXER_NAMES) {
+    let absentSince;
+    let observed = false;
+    for (const group of groups) {
+      const statuses = binaryAvailabilityStatuses(group.binaryAvailability);
+      const status = statuses?.get(source);
+      if (!status) {
+        absentSince = undefined;
+        continue;
+      }
+      if (status === "not_found_on_known_paths") {
+        if (observed && absentSince === undefined) absentSince = group.ts;
+      } else {
+        observed = true;
+        absentSince = undefined;
+      }
+    }
+    if (absentSince !== undefined) reasons.push(`source_not_observed: ${source} since ${absentSince}`);
+  }
+  return reasons;
 }
 
 // Churn can use markerless legacy observations, but must exclude any tick whose census explicitly
@@ -702,7 +763,7 @@ export function detectSessionChurn(points = [], options = {}) {
 // shape exactly.
 // ---------------------------------------------------------------------------------------------
 
-export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIATION_SIGMA, criticalSigma = DEFAULT_CRITICAL_SIGMA } = {}) {
+export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIATION_SIGMA, criticalSigma = DEFAULT_CRITICAL_SIGMA, fingerprint = SESSION_COUNT_LEGACY_FINGERPRINT } = {}) {
   if (state?.confidence_state !== "established") return undefined;
   const obs = state.last_observation;
   if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
@@ -718,9 +779,9 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIAT
     confidence_state: state.confidence_state,
   });
   return {
-    id: alertId(SESSION_COUNT_DROP_RULE_ID, "global"),
+    id: alertId(SESSION_COUNT_DROP_RULE_ID, fingerprint),
     rule_id: SESSION_COUNT_DROP_RULE_ID,
-    fingerprint: "global",
+    fingerprint,
     severity,
     title: "Session count deviation",
     summary: "Resident tmux/screen session count deviated significantly below its established baseline.",
@@ -729,17 +790,18 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIAT
   };
 }
 
-export function buildChurnCandidates(churnEntries = []) {
+export function buildChurnCandidates(churnEntries = [], { availabilitySignature } = {}) {
   return churnEntries.map((entry) => {
+    const fingerprint = sessionChurnFingerprintForAvailabilitySignature(entry.entity_key, availabilitySignature);
     const diagnostics = sanitizeDiagnostics({
       entity_key: entry.entity_key,
       prior_fingerprint: entry.prior_fingerprint,
       current_fingerprint: entry.current_fingerprint,
     });
     return {
-      id: alertId(SESSION_CHURN_RULE_ID, entry.entity_key),
+      id: alertId(SESSION_CHURN_RULE_ID, fingerprint),
       rule_id: SESSION_CHURN_RULE_ID,
-      fingerprint: entry.entity_key,
+      fingerprint,
       severity: "warning",
       title: "Session churn detected",
       summary: "A tracked session's creation fingerprint changed between observations (possible kill-then-resurrect).",
@@ -966,11 +1028,12 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
   // — including ticks where nothing new was folded — so applyAlertCandidates never spuriously
   // "recovers" an active session.count_drop just because this source skipped a redundant write.
+  const countFingerprint = sessionCountFingerprintForAvailabilitySignature(observedAvailabilitySignature);
   const dropCandidate = buildCountDropCandidate(
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-    { deviationSigma, criticalSigma },
+    { deviationSigma, criticalSigma, fingerprint: countFingerprint },
   );
-  if (dropCandidate && dropFresh && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
+  if (dropCandidate && countFingerprint !== SESSION_COUNT_LEGACY_FINGERPRINT && dropFresh && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
   // against the latest complete tick -- exactly the preconditions buildCountDropCandidate itself
@@ -985,8 +1048,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
-  const dropEvaluated = dropFresh && dropScorable;
-  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] : [];
+  const dropEvaluated = countFingerprint !== SESSION_COUNT_LEGACY_FINGERPRINT && dropFresh && dropScorable;
+  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(SESSION_COUNT_DROP_RULE_ID, countFingerprint)] : [];
   evaluatedAlertKeys.push(...dropKeys);
 
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
@@ -1006,8 +1069,10 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       nowMs, freshnessMs, structuralIntervalMs, activeFreshnessMs: freshnessMs,
     });
     churnReady = ready && gate === "ok";
-    candidates.push(...buildChurnCandidates(churnEntries));
-    for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+    candidates.push(...buildChurnCandidates(churnEntries, { availabilitySignature: observedAvailabilitySignature }));
+    if (typeof observedAvailabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(observedAvailabilitySignature)) {
+      for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, sessionChurnFingerprintForAvailabilitySignature(entityKey, observedAvailabilitySignature)));
+    }
   }
   evaluatedAlertKeys.push(...churnKeys);
 
