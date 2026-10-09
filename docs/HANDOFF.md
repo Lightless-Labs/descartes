@@ -2,6 +2,28 @@
 
 **Last updated:** 2026-10-09
 
+## Notify-once daybreak rework fixes — 2026-10-09 — local, not pushed
+
+Fixed the current `feat/notify-once-2026-10` findings in four atomic commits:
+`a981547` (global delivery ordering), `eff179b` (acknowledgement resets storm suppression),
+`819e54d` (clock-safe segment retention), and `f9152c4` (dated-segment audit documentation).
+The global per-tick queue collects route-qualified deterministic/session, metric, and LLM work,
+sorts severity first then new/escalated work then oldest-unconfirmed, reserves the first slot for
+the highest-severity item, and invokes routes in assignment order. A 10,000-tick bounded-progress
+property and the eight-warning-session plus critical-memory reproduction pass.
+
+Acknowledgement now closes the storm episode, retains old keys as acknowledged history, permits
+later incidents and escalations under normal rules, and emits a fresh storm notification only for
+a new post-ack overflow. Audit retention uses a monotonic anchor plus the newest dated segment,
+re-stats size/mtime before unlink, and skips writer races. Audit reconstruction stably merges all
+records by timestamp. README now documents the dated UTC segment design.
+
+Focused alert-intelligence, daemon, alert-store, and notification-delivery suites pass 356/356.
+Fresh-XDG `npm test` reports 2382 total / 2326 pass / 22 environment failures / 34 skipped /
+0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`, 3 tap-bump loopback
+`listen EPERM`, and 2 live-host macOS provenance checks returning `unknown` instead of `ok`.
+No product-behavior failures were observed. No push or merge.
+
 ## R3 notify-once daybreak rework — 2026-10-09 — local, not pushed
 
 On branch `feat/notify-once-2026-10`, the daybreak-blue findings are closed in four local commits:
