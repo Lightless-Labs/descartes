@@ -2,33 +2,26 @@
 
 **Last updated:** 2026-10-09
 
-## Notify-once daybreak rework fixes — 2026-10-09 — local, not pushed
+## Notify-once daybreak rework follow-up — 2026-10-09 — local, not pushed
 
-Fixed the current `feat/notify-once-2026-10` findings in three atomic commits:
-`bf25f22` (post-ack retry eligibility), `1e1228e` (unbounded globally ordered delivery with
-route-local circuit breakers), and `3477227` (byte-capped audit retention and documentation).
+Closed the remaining review findings on `feat/notify-once-2026-10` in three atomic commits:
+`ad08a0c` (batch alert delivery state per daemon tick), `8b26f4b` (count and prune the legacy
+notification audit file), and `da51024` (final plan design). The earlier notify-once commits
+`bf25f22`, `1e1228e`, and `3477227` remain the preceding local history.
 
-Acknowledged alerts no longer reject retries for failed incidents that arrived after the
-acknowledgement; the old acknowledged episode remains suppressed, while new incidents and
-escalations remain due. Notification delivery now visits every route-qualified due item in global
-severity-descending, new/escalated-before-retry, oldest-first order. There is no per-tick delivery
-cap, planner slice, or reserved slot. A failing or unavailable route opens only that route's
-per-tick breaker; skipped items receive normal failure/backoff state, and deterministic routes keep
-progressing when the LLM route is unavailable. Tests cover eight LLM criticals versus a fresh
-deterministic critical across three ticks, 256 failing deterministic incidents, and 10,000 modeled
-failing ticks.
+Delivery now reads the alert store once at the start of the delivery phase and collects every
+success, failure, route-breaker skip, and LLM `notify:false` adjudication update in memory before a
+single alert-store transaction. The route-local breaker still permits healthy routes to progress:
+the persisted regression covers 256 failing session criticals plus one metric critical, verifies
+the metric delivery stays under one second, and observes exactly one store write. The 10,000-tick
+regression now uses a real persisted store and its normal retry backoff. Notification retention
+counts the legacy `notification-delivery.jsonl` as the oldest segment under the 50 MiB byte cap.
 
-Notification audit retention now uses only a 50 MiB total-byte cap, deletes whole segments oldest
-by filename while over cap, never deletes the segment written by the current process in that tick,
-and re-stats before unlinking. There is no wall-clock expiry. Residual: after a clock rollback and
-under cap pressure, a rollback-dated segment may be considered oldest by filename. README documents
-this residual.
-
-Focused alert-intelligence (146/146), notification-delivery (21/21), and the relevant alert-store
-and daemon regressions pass. Fresh-XDG `npm test` reports 2346 total / 2290 pass / 22 environment
-failures / 34 skipped / 0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`,
-3 tap-bump loopback `listen EPERM`, and 2 live-host macOS provenance checks returning `unknown`
-instead of `ok`; no product-behavior failures were observed. No push or merge.
+Focused alert-store, alert-intelligence, notification-delivery, and notify-once suites pass
+207/207. Fresh-XDG `npm test` reports 2,385 total / 2,329 passing / 22 environment failures /
+34 skipped / 0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`, 3 tap-bump
+loopback `listen EPERM`, and 2 live-host macOS provenance checks returning `unknown` instead of
+`ok`; no product-behavior failures were observed. No push or merge.
 
 ## R3 notify-once daybreak rework — 2026-10-09 — local, not pushed
 
