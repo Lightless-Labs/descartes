@@ -1,34 +1,33 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-06
+**Last updated:** 2026-10-09
 
-## R3 notify-once architecture simplification — 2026-10-06 — local delivery work
+## R3 notify-once incident records — 2026-10-09 — local, not pushed
 
-On branch `feat/notify-once-2026-10`, alert delivery is now single-daemon-owned. The daemon acquires
-`daemon.singleton` with O_EXCL metadata (PID, process-start identity when available, boot identity
-when available, and nonce); a second daemon refuses to start. Linux stale ownership is reclaimed only
-when the owner is provably gone. macOS without a process-start identity refuses to guess and prints
-the exact file the operator may clear after verifying that no daemon remains. Bounded waits use a
-monotonic clock, never wall-clock deadlines.
+On branch `feat/notify-once-2026-10`, alert delivery now persists first-class incident records under
+each alert id. `incidents[incident_key]` stores first/last seen, maximum and notified severity,
+confirmation, delivery-failure/backoff state, and status. Candidate application groups and sorts
+incident keys deterministically; delivery iterates due incidents and confirms each one independently.
+Alert-level active/recovered/acknowledged status and detector recovery coverage remain unchanged.
 
-The per-delivery alert-store lock, takeover guard, and delivery claim are removed. The daemon is
-the sole alert-state writer. CLI acknowledgements append to `state/alerts/commands.jsonl` while the
-daemon owns the singleton; the daemon applies the queue on its next tick. If no daemon is running,
-the CLI acquires the same singleton and applies the command directly.
+Confirmed incident keys are retained while an alert is active. At 256 live keys, the alert enters
+explicit `incident_storm` state (operator policy (O)): it emits one count-bearing storm notification
+and suppresses per-key notifications until recovery or acknowledgement. The storm itself uses the
+same retry/backoff and at-least-once delivery rules. Legacy records without episode metadata remain
+silent. A lost confirmation write can duplicate a later delivery but cannot create silence; this is
+covered by a regression test.
 
-Episodes are bounded sets of incident keys (`notified_incident_keys` plus observed episode keys), so
-multiple simultaneous identities under one alert id are retained. Session churn, credential metadata
-changes, and containment recommendations now carry incident identities. New incident keys and
-severity escalation bypass backoff; backoff stores `last_attempt_at + delay`, and a future timestamp
-from rollback is eligible immediately. Delivery remains explicitly at-least-once across a crash
-after external delivery and before confirmation: duplicates are acceptable, silence is not. The
-notification audit rotates all result types with a retained summary.
+The daemon singleton and CLI command queue introduced by the earlier slice were removed. `alerts ack`
+uses the existing direct persistence path. Concurrent daemons are an unsupported configuration; the
+pre-existing alert-store read-modify-write lost-update race is deliberately not fixed here and is
+tracked in [`todos/2026-10-09-alert-store-concurrent-writers.md`](../todos/2026-10-09-alert-store-concurrent-writers.md).
+The correlation detector now anchors each join on the correlated incident's own first-seen tick and
+incident key, so churn A→B then B→C cannot collapse. Notification audit append/rotation rereads the
+file and retains rows appended by another process.
 
-Focused singleton, queue, alert-store, notify-once, producer, notification, intelligence, alerts,
-and daemon suites are green locally. Fresh-XDG `npm test` completed with 2,115 passing, 22
-environment failures, 34 skipped, and 2,171 total. The failures are 20 sandbox loopback
-`listen EPERM` tests and 2 live-host macOS provenance checks returning `unknown` instead of `ok`;
-no changed-behavior failures were observed. No push or merge is authorized.
+The combined focused run reached 369/372 before the final three regressions were fixed; the targeted
+regression suites then completed 67/67. Full fresh-XDG `npm test` is still required before handoff.
+No push or merge is authorized.
 
 ## Review-fix update — 2026-10-05
 

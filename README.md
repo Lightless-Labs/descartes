@@ -277,17 +277,19 @@ descartes alerts notifications setup --channel desktop
 Ordinary alert delivery is episode-based: a newly active alert notifies once, a persistent alert
 stays quiet, and only an escalation above the highest severity already notified in that episode
 notifies again. De-escalation is silent. Recovery rearms the alert for one notification on its next
-activation, and an acknowledgement does not suppress a later incident or severity escalation. An
-active episode is a bounded set of incident keys, not a single current key, so simultaneous
-identities under one alert id are all represented. A candidate whose key has not been notified is
-due; the retained set is capped at 256 keys and overflow remains notify-safe. Episode notification
-state is committed only after the delivery adapter returns a successful result (`delivered` or the
-explicit local `cli_only` result); disabled, unavailable, skipped, thrown, timed-out, and
-budget-rejected work stays due for retry. Delivery failures store `last_attempt_at` plus a delay
-(1 minute, doubling to 1 hour); a future last-attempt timestamp from clock rollback is eligible
-immediately. Crash after external delivery but before confirmation is explicitly at-least-once: a
-duplicate is acceptable, silence is not. Delivery audit rows are bounded for every result type by
-rotation with a retained summary.
+activation, and an acknowledgement does not suppress a later incident or severity escalation.
+Each alert row persists an incident map, `incident_key -> { first_seen, last_seen, severity_max,
+notified_severity, confirmed_at, delivery_failure_count, next_attempt_at, status }`, so simultaneous
+incidents under one alert id are independently due, delivered, confirmed, and retried. Legacy rows
+without episode metadata are never notified until a new episode is observed.
+
+The live map retains confirmed keys and is bounded at 256 keys. (O) If a 257th live identity arrives,
+the alert enters explicit `incident_storm` state, emits one storm notification with the count, and
+stops per-key notifications until recovery or operator acknowledgement. Delivery state is committed
+only after the adapter returns a successful result (`delivered` or the explicit local `cli_only`
+result); failures remain due subject to rollback-safe exponential backoff. Crash after external
+delivery but before confirmation is explicitly at-least-once: a duplicate is acceptable, silence is
+not. Delivery audit rows are bounded for every result type by rotation with a retained summary.
 
 The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
 diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
@@ -312,21 +314,12 @@ is:
   their stable producer identity.
 
 LLM adjudication is separate from delivery. A completed `notify:false` result records adjudication
-for the current episode but never marks the operator as notified. On upgrade, a record missing
-`episode_started_at` cannot prove current-activation delivery and is notified once; older audit rows
-are never promoted. The daemon is the sole alert-state writer. CLI mutations such as `alerts ack`
-append to `state/alerts/commands.jsonl` and print that they are queued while the daemon owns the
-singleton; if no daemon is running, the CLI acquires that same singleton and applies the command
-directly.
-
-At daemon start, Descartes creates `daemon.singleton` with O_EXCL metadata: PID, process-start
-identity when available, boot identity when available, and a nonce. A second daemon refuses to
-start. Linux stale ownership is reclaimed only when the owner is provably gone. On macOS, when no
-process-start identity is available, Descartes refuses to guess and prints the exact file to clear
-after the operator verifies that no daemon remains. Bounded waits use a monotonic clock; wall-clock
-timestamps are not used for singleton staleness or wait deadlines. A crash after external delivery
-but before confirmation remains at-least-once by design: the next daemon run may repeat the
-notification, but it will not silently lose it.
+for the current incident but never marks the operator as notified. On upgrade, a record missing
+`episode_started_at` cannot prove current-activation delivery and is not notified. `alerts ack`
+uses the existing direct-write path. Multiple concurrent daemons are unsupported; the alert store's
+pre-existing read-modify-write lost-update boundary is documented in
+[`todos/2026-10-09-alert-store-concurrent-writers.md`](todos/2026-10-09-alert-store-concurrent-writers.md).
+The notification audit rereads before append/rotation so rows from the CLI and daemon are retained.
 Unknown/foreign severities are preserved and rank above `critical` for escalation comparison. The
 `adjudication.budget_exhausted` meta-signal is separate and keeps its own one-hour notification window.
 
