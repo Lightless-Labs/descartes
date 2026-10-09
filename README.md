@@ -208,7 +208,7 @@ The collectors cover many areas:
 - VPN and peer status: WireGuard, macOS VPN services, and Tailscale.
 
 Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
-pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
+fixed, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
 the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
 and checks the file plus every ancestor directory to `/`. A normal component is trusted only when
 it is owned by `root` or the daemon UID, has no ACL, and has no group- or other-write bit. Linux
@@ -216,22 +216,23 @@ rejects every group-writable or other-writable component as `untrusted_binary` w
 `group_writable`; it does not consult account databases to establish group trust. macOS may accept
 a group-writable component only after complete local `dscl` resolution proves that every writer is
 root, the daemon UID, or a local UID below 501 whose `AuthenticationAuthority` is absent or only
-`DisabledUser`. Any failed or partial macOS search-policy, group-membership, GroupMembers,
-primary-GID, or AuthenticationAuthority lookup fails closed. Same-UID owner writability is inside
-Descartes' current trust boundary and is recorded in provenance. Shell wrappers are rejected unless
+`DisabledUser`. Every consumed macOS `dscl` attribute must be explicitly evidenced: `NestedGroups`
+may be absent only for an explicit `No such key: NestedGroups`, while `AppleMetaNodeLocation` must
+be present and equal `/Local/Default`; other missing or partial search-policy, group-membership,
+GroupMembers, primary-GID, `UniqueID`, or `AuthenticationAuthority` evidence fails closed.
+Same-UID owner writability is inside Descartes' current trust boundary and is recorded in provenance.
+Shell wrappers are rejected unless
 explicitly operator-trusted, so a trusted wrapper can never authorize an untrusted downstream
-binary. The resolver records a SHA-256 content hash for each trusted resolved binary keyed only by
-its `(dev, ino)` file identity, with size and mtime metadata; any later sighting of that inode
-under any pinned path must match the pin or is refused as `content_changed_in_place`. A genuinely
-new inode, such as a Homebrew upgrade, is evaluated fresh. An offending component,
+binary. The resolver records a SHA-256 content hash for each resolved binary as informational
+provenance only; it is not persisted and never gates trust. An offending component,
 ACL uncertainty, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
 recheck produces `untrusted_binary`; the collector does not execute it and the census remains
-incomplete. The bounded pin map is persisted in the daemon state directory and pruned to inodes
-still present on known pinned paths. The recheck narrows but cannot eliminate the residual
-resolution-to-exec TOCTOU window.
+incomplete. The recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU
+window.
 
 Accepted residual: a former member of any accepted component group can retain that group's GID in
-processes started before removal; multi-admin or directory-bound Macs fail closed.
+processes started before removal and could modify an accepted binary in place; multi-admin or
+directory-bound Macs fail closed.
 
 An operator may explicitly accept a non-standard absolute executable by listing it in
 `$XDG_CONFIG_HOME/descartes/watch.json`:

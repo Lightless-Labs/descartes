@@ -10,7 +10,7 @@ Normal `descartes triage` is model-led: the model chooses among these guarded to
 
 Collector subprocesses do not consult the ambient `PATH` (important for launchd, whose daemon
 environment may not contain user-installed tools). A shared resolver checks regular executable
-files in a pinned platform allowlist: `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`,
+files in a fixed platform allowlist: `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`,
 `/usr/local/sbin`, the standard Nix profile locations (`/nix/var/nix/profiles/default/bin`, the
 daemon user's `~/.nix-profile/bin`, and `/etc/profiles/per-user/<user>/bin`), NixOS and Snap
 locations, Homebrew locations on macOS, and the macOS `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
@@ -21,19 +21,18 @@ rejected. On Linux, any group-write or other-write is rejected as `untrusted_bin
 `group_writable`; Linux no longer consults account databases for group trust. On macOS, group-write
 is accepted only when complete local `dscl` resolution proves every writer is root, the daemon UID,
 or a local UID below 501 whose `AuthenticationAuthority` is absent or only `DisabledUser`.
-Failures or partial results from search policy, GroupMembership, GroupMembers, primary-GID listings,
-or AuthenticationAuthority fail closed; nested or non-local groups are rejected. Same-UID owner
-writability is accepted within the current trust boundary but recorded as provenance. The resolver
-records a SHA-256 content hash for each trusted resolved binary keyed only by `(dev, ino)`, with
-size and mtime metadata, and refuses `content_changed_in_place` when content changes while that
-identity stays the same, even if the inode is later seen under another pinned path. A genuinely
-new inode, such as a Homebrew upgrade into a new Cellar directory, is evaluated fresh. A failed
-check is `untrusted_binary`, is never executed, and leaves the source census incomplete. The
-bounded pin map is persisted in the daemon state directory and pruned to inodes still present on
-known pinned paths. The
-immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual resolution-to-exec
-TOCTOU window. Accepted residual: a former member of any accepted component group can retain that
-group's GID in processes started before removal; multi-admin or directory-bound Macs fail closed.
+Every consumed macOS `dscl` attribute must be explicitly evidenced. Failures or partial results from
+CSPSearchPath, AppleMetaNodeLocation, GroupMembership, GroupMembers, primary-GID listings, UniqueID,
+or AuthenticationAuthority fail closed. NestedGroups is treated as empty only when dscl explicitly
+reports `No such key: NestedGroups`; AppleMetaNodeLocation must be present and equal `/Local/Default`.
+Nested or non-local groups are rejected. Same-UID owner writability is
+accepted within the current trust boundary but recorded as provenance. The resolver records a
+SHA-256 content hash for each resolved binary as informational provenance only; it is not persisted
+and never gates trust. A failed check is `untrusted_binary`, is never executed, and leaves the
+source census incomplete. The immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate
+the residual resolution-to-exec TOCTOU window. Accepted residual: a former member of any accepted
+component group can retain that group's GID in processes started before removal and could modify an
+accepted binary in place; multi-admin or directory-bound Macs fail closed.
 Operators may list explicit absolute escape-hatch paths in
 `watch.json` under `trusted_binary_paths`; those entries still need realpath + regular-file
 validation and are reported as `operator_trusted`. Evidence records the requested binary, resolved

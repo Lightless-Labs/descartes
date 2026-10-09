@@ -2,23 +2,26 @@
 
 **Last updated:** 2026-10-09
 
-## Collector-source daybreak blockers — 2026-10-09 — local, not pushed
+## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
-Closed the two daybreak blockers in atomic commits `d351e22` (TDD regressions and persistence
-coverage), `6ae16ca` (implementation), `d9d38c2` (README/reference residual corrections),
-`f30d304` (present-inode pruning regression), and `cb6f600` (present-inode pin retention).
-macOS dscl trust now requires explicit evidence for every relevant attribute; silent omissions,
-including `UniqueID: 400` without an `AuthenticationAuthority` line, fail closed. An explicitly
-reported `No such key: AuthenticationAuthority` is the only accepted absent-authority evidence.
-Content pins are keyed only by `(dev, ino)`, store `{size, mtime, sha256}`, survive daemon restarts
-under `stateDir/daemon`, are bounded to 256 entries, and prune inodes no longer present on known
-pinned paths. A changed inode's content is refused even after it moves to another pinned path;
-new inodes are evaluated fresh. The residual now says that a former member of any accepted
-component group can retain that group's GID in processes started before removal.
+Removed the content-hash pin map, daemon persistence, `contentHashCache` plumbing, and the
+content-change trust gate in atomic commits `e7914db` (red tests), `f194b7c`
+(implementation), and `11f1fd2` (macOS dscl stdout/stderr compatibility). Existing legacy pin
+files are deleted when the daemon loads. SHA-256 remains only as non-gating binary provenance.
+The immediate pre-exec `(dev, ino)` identity check remains. macOS group resolution now requires
+explicit evidence for every consumed dscl attribute: `NestedGroups` can be empty only after an
+explicit `No such key: NestedGroups`, `AppleMetaNodeLocation` must be present and `/Local/Default`,
+and missing `GroupMembership`, `UniqueID`, or other required evidence fails closed. The accepted
+residual remains that a former member of an accepted component group can retain its GID in a
+pre-existing process and modify an accepted binary in place.
 
-Validation: focused resolver/persistence suite passes **38/38**. The required full fresh-XDG host-
-access `npm test` passes **2414/2414, 0 failures, 34 skips, 2448 total**, including live
-provenance. No push or merge.
+Focused resolver tests pass **36/36**; daemon tests pass **201/201**. Final fresh-XDG host-access
+`npm test` passes **2413/2413, 0 failures, 34 skips, 2447 total**, including live provenance.
+The sandbox-only run had **2391 passing, 22 environment failures, 34 skips, 2447 total**: 17
+notifier-reuse and 3 tap-bump loopback `listen EPERM` failures, plus 2 live provenance checks
+blocked by sandbox process inspection. Live host resolution remains `resolved/trusted` for tmux
+(`/opt/homebrew/Cellar/tmux/3.6a/bin/tmux`) and tailscale
+(`/Applications/Tailscale.app/Contents/MacOS/Tailscale`). No push or merge.
 
 ## Collector-source + notify-once merge — 2026-10-09 — local, not pushed
 
@@ -122,8 +125,8 @@ NSS, `/etc/group`, `/etc/passwd`, or userdb membership for trust. macOS retains 
 `dscl` group trust, fails closed on failed or partial lookups, and accepts low-UID system accounts
 only when `AuthenticationAuthority` is absent or only `DisabledUser`. The accepted supplementary-
 GID residual is documented in the README, collector reference, and resolver comment. Trusted
-resolved binaries now carry SHA-256 content hashes; a same-`(dev, ino)` content change is refused
-as `content_changed_in_place`, while a new path/inode is evaluated fresh.
+resolved binaries carried SHA-256 content hashes in that superseded slice; the current branch
+retains the hash only as non-gating provenance and evaluates content changes without a pin.
 
 Focused resolver tests pass 34/34; resolver-adjacent session/Tailscale/VPN integration tests pass
 117/117. Full fresh-XDG host-access `npm test` passes **2369/2369, 0 failures, 34 skips, 2403
