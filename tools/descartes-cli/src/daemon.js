@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
+import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -920,6 +920,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
+  // One shared budget covers every notification adapter path in this daemon tick. Delivery
+  // functions create this shape for direct callers/tests, but the daemon passes one object so
+  // session, metric, and model-routed notifications cannot each spend a separate cap.
+  const deliveryBudget = { remaining: MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK, attempted: 0 };
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
   // Slice B (Codex-hardening): one freshness horizon, derived from the RESOLVED profile's structural
   // interval (not options.profile, which may be undefined when defaulted), threaded into BOTH the
@@ -1901,7 +1905,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const sessionAlertDelivery = alerts && !alertPersistenceError && options.deliverSessionAlerts !== false
     ? await safeCandidates(
         "session-alert-delivery",
-        () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification }),
+        () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, deliveryBudget }),
         undefined,
       )
     : undefined;
@@ -1926,13 +1930,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   const metricAlertFallback = alerts && !alertPersistenceError && options.deliverMetricAlertFallback !== false
     ? await safeCandidates(
         "metric-alert-fallback",
-        () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig }),
+        () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig, deliveryBudget }),
         undefined,
       )
     : undefined;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
   const alertIntelligence = alerts && !alertPersistenceError && options.adjudicateAlerts !== false
-    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig })
+    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig, deliveryBudget })
     : undefined;
   return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
 }

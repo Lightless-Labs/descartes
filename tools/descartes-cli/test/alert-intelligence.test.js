@@ -69,6 +69,73 @@ function alert(overrides = {}) {
   };
 }
 
+test("delivery attempts are capped per tick, prioritize a new critical incident, and eventually reach all failed incidents", async () => {
+  const paths = await tempPaths();
+  const candidates = Array.from({ length: 255 }, (_, index) => ({
+    id: `alert_retry_${String(index).padStart(3, "0")}`,
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: `incident-${index}`,
+    incident_key: `incident-${index}`,
+    severity: "warning",
+    title: "Session count deviation",
+    summary: "Session count dropped.",
+    diagnostics: { observed_count: 1, mean_before: 4, z_score: -3, confidence_state: "high" },
+  }));
+  candidates.push({
+    id: "alert_retry_critical",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: "critical",
+    incident_key: "critical",
+    severity: "critical",
+    title: "Critical session count deviation",
+    summary: "Session count collapsed.",
+    diagnostics: { observed_count: 0, mean_before: 4, z_score: -8, confidence_state: "high" },
+  });
+  const applied = applyAlertCandidates([], candidates, { now: "2026-10-09T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const firstTickCalls = [];
+  const firstTick = await emitSessionAlertSignals(paths, {
+    alerts: applied.alerts,
+    notification_due_incidents: applied.notification_due_incidents,
+  }, {
+    now: "2026-10-09T00:00:00.000Z",
+    deliverNotification: async (_paths, _decision, options) => {
+      firstTickCalls.push(options.alertId);
+      return { status: "error" };
+    },
+  });
+  assert.equal(firstTick.failed.length, 8, "256 due failed incidents must spend at most eight attempts in one tick");
+  assert.equal(firstTickCalls[0], "alert_retry_critical", "critical delivery is prioritized over older warnings");
+
+  const eventualCandidates = [...candidates.slice(0, 15), candidates.at(-1)];
+  const eventualApplied = applyAlertCandidates([], eventualCandidates, { now: "2026-10-09T00:00:00.000Z" });
+  const attempted = [];
+  const firstAttempt = new Set();
+  const delivery = async (_paths, _decision, options) => {
+    attempted.push(options.alertId);
+    if (!firstAttempt.has(options.alertId)) {
+      firstAttempt.add(options.alertId);
+      return { status: "error" };
+    }
+    return { status: "delivered" };
+  };
+
+  await writeAlertRecords(paths, eventualApplied.alerts);
+  let nowMs = Date.parse("2026-10-09T00:00:00.000Z");
+  for (let tick = 0; tick < 20 && firstAttempt.size < eventualCandidates.length; tick += 1) {
+    const result = await emitSessionAlertSignals(paths, {
+      alerts: await readAlertRecords(paths),
+      notification_due_incidents: eventualApplied.notification_due_incidents,
+    }, {
+      now: new Date(nowMs).toISOString(),
+      deliverNotification: delivery,
+    });
+    assert(result.failed.length + result.fired.length <= 8, "one tick must attempt at most eight deliveries");
+    nowMs += 60_000;
+  }
+  assert.equal(firstAttempt.size, eventualCandidates.length, "every failed incident eventually receives an attempt");
+});
+
 // Frozen, byte-for-byte copy of the pre-S13 alertIntelligencePrompt implementation (including the
 // exact context key order and helper field selection), used ONLY as a golden reference for the
 // byte-identity test below. Do not "clean up" to reuse alert-intelligence.js internals -- the point

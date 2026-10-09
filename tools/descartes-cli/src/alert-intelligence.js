@@ -73,6 +73,40 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
+// Operator policy (O): notification delivery is deliberately bounded independently of the model
+// budget. Eight adapter attempts fit comfortably inside the daemon's fast tick even when every
+// adapter reaches its five-second timeout; entries beyond the cap remain due in alert-store.js.
+export const MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK = 8;
+
+function deliveryBudgetFor(options = {}) {
+  if (options.deliveryBudget && typeof options.deliveryBudget === "object") return options.deliveryBudget;
+  return { remaining: MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK, attempted: 0 };
+}
+
+function takeDeliverySlot(budget) {
+  if (!Number.isFinite(budget.remaining) || budget.remaining <= 0) return false;
+  budget.remaining -= 1;
+  budget.attempted = (Number.isFinite(budget.attempted) ? budget.attempted : 0) + 1;
+  return true;
+}
+
+function dueIncidentFirstSeenMs(alert, entry) {
+  const ts = entry.incidentKey === INCIDENT_STORM_KEY
+    ? alert.first_seen
+    : alert.incidents?.[entry.incidentKey]?.first_seen ?? alert.first_seen;
+  const ms = Date.parse(ts);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+function compareDueAlerts(left, right) {
+  const severity = alertSeverityRank(right.alert.severity) - alertSeverityRank(left.alert.severity);
+  if (severity !== 0) return severity;
+  const firstSeen = dueIncidentFirstSeenMs(left.alert, left.entry) - dueIncidentFirstSeenMs(right.alert, right.entry);
+  if (firstSeen !== 0) return firstSeen;
+  const leftKey = `${left.alert.id}\0${left.entry.incidentKey ?? ""}`;
+  const rightKey = `${right.alert.id}\0${right.entry.incidentKey ?? ""}`;
+  return leftKey.localeCompare(rightKey);
+}
 
 function deliveryWasSuccessful(delivery) {
   return delivery?.status === "delivered" || delivery?.status === "cli_only" || delivery?.status === "recorded" || delivery?.delivered === true;
@@ -586,7 +620,7 @@ async function hasRecentBudgetExhaustedNotification(descartesPaths, now, windowM
 // loop, a session, or the alert-intelligence rate limiter above -- and carries counts only, never
 // a dropped alert's title/diagnostics, so no un-consented data rides the notification channel this
 // very gate protects.
-async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, droppedCritical, deliverNotification }) {
+async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, droppedCritical, deliverNotification, deliveryBudget }) {
   if (await hasRecentBudgetExhaustedNotification(descartesPaths, now)) {
     // budget_exhausted is a meta-signal, not an alert episode; it intentionally retains its own
     // one-hour delivery window.
@@ -599,6 +633,7 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
     title: "Descartes alert intelligence budget exhausted",
     body: `${droppedTotal} alert${droppedTotal === 1 ? "" : "s"} (${droppedCritical} critical) not adjudicated this hour.`,
   };
+  if (!takeDeliverySlot(deliveryBudget)) return { fired: false, reason: "tick_delivery_budget" };
   await deliverNotification(descartesPaths, decision, { now, ruleId: BUDGET_EXHAUSTED_RULE_ID });
   return { fired: true };
 }
@@ -656,7 +691,8 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       const alert = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).find((candidate) => candidate.id === entry.alertId);
       return alert ? { entry, alert: alertForIncident(alert, entry) } : undefined;
     })
-    .filter((entry) => entry && (entry.entry.storm === true || ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(entry.alert.rule_id)));
+    .filter((entry) => entry && (entry.entry.storm === true || ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(entry.alert.rule_id)))
+    .sort(compareDueAlerts);
   if (dueSessionAlerts.length === 0) return { fired: [] };
 
   let deliverNotification;
@@ -673,6 +709,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
     return { fired: [], failed: dueSessionAlerts.map(({ alert }) => alert.id) };
   }
   const now = options.now ?? new Date().toISOString();
+  const deliveryBudget = deliveryBudgetFor(options);
 
   // Reliability fix (canary v0 finalization, FIX-B): this loop was previously a bare, unguarded
   // `await deliverNotification(...)` -- a PRE-EXISTING general pattern shared by every rule_id in
@@ -690,11 +727,16 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   // canary-scoped special case -- a real daemon-robustness win for the whole family, not just canary.
   const fired = [];
   const failed = [];
+  let deferred = 0;
   for (const { entry, alert } of dueSessionAlerts) {
     const decision = buildSessionAlertNotificationDecision(alert);
     const episodeKey = incidentKeyForAlert(alert);
     try {
       if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey))) continue;
+      if (!takeDeliverySlot(deliveryBudget)) {
+        deferred += 1;
+        break;
+      }
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       // daybreak-blue #6 (MEDIUM): deliverNotificationDecision RESOLVES (it never throws) with a
       // status enum -- "error"/"unavailable" mean the notification did NOT reach the operator, and
@@ -717,7 +759,7 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       failed.push(alert.id);
     }
   }
-  return { fired, failed };
+  return { fired, failed, deferred };
 }
 
 // Counts/hash-only body (must-fix 3) for every branch EXCEPT service.disappeared: every field
@@ -997,7 +1039,7 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     const incidentAlert = alertForIncident(alert, entry);
     const { namespace, hardExcluded } = classifyAlertNamespace(alert?.rule_id);
     return !entry.storm && !hardExcluded && namespace === "metric" ? { entry, alert: incidentAlert } : undefined;
-  }).filter(Boolean);
+  }).filter(Boolean).sort(compareDueAlerts);
   if (dueMetricAlerts.length === 0) return { fired: [] };
 
   let deliverNotification;
@@ -1009,11 +1051,13 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     return { fired: [], failed: dueMetricAlerts.map(({ alert }) => alert.id) };
   }
   const now = options.now ?? new Date().toISOString();
+  const deliveryBudget = deliveryBudgetFor(options);
 
   // Same "one alert's delivery failure must degrade, never abort the tick" discipline as
   // emitSessionAlertSignals' own FIX-B loop above.
   const fired = [];
   const failed = [];
+  let deferred = 0;
   for (const { entry, alert } of dueMetricAlerts) {
     const decision = {
       notify: true,
@@ -1024,6 +1068,10 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
     const episodeKey = incidentKeyForAlert(alert);
     try {
       if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey))) continue;
+      if (!takeDeliverySlot(deliveryBudget)) {
+        deferred += 1;
+        break;
+      }
       const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
         await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
@@ -1040,7 +1088,7 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
       failed.push(alert.id);
     }
   }
-  return { fired, failed };
+  return { fired, failed, deferred };
 }
 
 // Slice 6 (observed-incident collectors plan) Decision 3, must-fix 3/1, defense-in-depth: re-runs
@@ -1397,6 +1445,7 @@ function hashPromptText(text) {
 // residual to <=1 per heal-cycle/restart -- documented, not silently accepted.
 export async function adjudicateAlertNotifications(descartesPaths, evaluation, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const deliveryBudget = deliveryBudgetFor(options);
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
   const dueEntries = incidentEntries(evaluation, "adjudication_due_incidents");
   if (!config.enabled) return { status: "disabled", decisions: [] };
@@ -1664,10 +1713,14 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         const episodeKey = incidentKey;
         if (decision.notify) {
           if (!(await deliveryStillDue(descartesPaths, alert, now, incidentKey))) throw new Error("delivery_no_longer_due");
-          deliveryAttempted = true;
-          delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
+          if (!takeDeliverySlot(deliveryBudget)) {
+            delivery = { status: "deferred", reason: "tick_delivery_budget" };
+          } else {
+            deliveryAttempted = true;
+            delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
+          }
         }
-        if (decision.notify) {
+        if (decision.notify && delivery?.status !== "deferred") {
           if (!deliveryWasSuccessful(delivery)) {
             await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey, incidentKey });
           }
@@ -1755,7 +1808,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   let budgetExhausted;
   if (droppedTotal > 0) {
     try {
-      budgetExhausted = await emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, droppedCritical, deliverNotification });
+      budgetExhausted = await emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, droppedCritical, deliverNotification, deliveryBudget });
     } catch (error) {
       // Reliability remediation: emitBudgetExhaustedSignal is a PURE NOTIFICATION -- it only
       // touches notification-delivery.jsonl (the cooldown read in hasRecentBudgetExhaustedNotification
