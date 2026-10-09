@@ -186,6 +186,37 @@ test("findKillSideAnchors: empty alert history yields zero anchors, no throw", (
   assert.deepEqual(findKillSideAnchors([], { now: dayTs(0) }), []);
 });
 
+test("correlation uses each persisted incident's own tick for the join and identity", () => {
+  const firstAnchorTs = dayTs(1, 2);
+  const secondAnchorTs = dayTs(1, 3);
+  const alert = killSideAlertRecord(SESSION_CHURN_RULE_ID, dayTs(0), {
+    fingerprint: "global",
+  });
+  alert.episode_started_at = dayTs(0);
+  alert.incidents = {
+    "churn:A->B": { first_seen: firstAnchorTs, severity_max: "warning" },
+    "churn:B->C": { first_seen: secondAnchorTs, severity_max: "warning" },
+  };
+
+  const anchors = findKillSideAnchors([alert], { now: dayTs(1, 13) });
+  assert.deepEqual(anchors.map((anchor) => anchor.incident_key), ["churn:A->B", "churn:B->C"]);
+  assert.deepEqual(anchors.map((anchor) => anchor.anchor_tick_ts), [firstAnchorTs, secondAnchorTs]);
+
+  const peerPoints = [
+    ...regularPeerPoints("peer.ssh.1111111111111111", -3, 0),
+    peerPoint(firstAnchorTs, "peer.ssh.aaaaaaaaaaaaaaaa"),
+    peerPoint(secondAnchorTs, "peer.ssh.bbbbbbbbbbbbbbbb"),
+  ];
+  const firstMatches = findQualifyingPeerObservations(peerPoints, anchors[0], { windowMs: 30 * 60 * 1000 });
+  const secondMatches = findQualifyingPeerObservations(peerPoints, anchors[1], { windowMs: 30 * 60 * 1000 });
+  assert.equal(firstMatches.length, 1);
+  assert.equal(secondMatches.length, 1);
+
+  const firstCandidate = buildCorrelationCandidate(anchors[0], rankAndSelectBestPeer(firstMatches).best, 1);
+  const secondCandidate = buildCorrelationCandidate(anchors[1], rankAndSelectBestPeer(secondMatches).best, 1);
+  assert.notEqual(firstCandidate.incident_key, secondCandidate.incident_key);
+});
+
 // ---------------------------------------------------------------------------------------------
 // computeCorrelationCandidates: full deterministic join, gated by learned.json.
 // ---------------------------------------------------------------------------------------------

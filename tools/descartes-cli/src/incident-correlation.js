@@ -83,10 +83,12 @@ function tsMs(value) {
 }
 
 /**
- * Kill-side anchors (Decision 1): every alert-history row (ANY status -- active, recovered,
- * acknowledged, suppressed) whose rule_id is session.count_drop/session.churn (Slice 4) and whose
- * first_seen falls within lookbackMs of now. Reads alert-HISTORY only -- callers pass the output
- * of readAlertRecords(descartesPaths), never a tick's own in-memory candidate array.
+ * Kill-side anchors (Decision 1): every persisted incident (ANY alert status -- active, recovered,
+ * acknowledged, suppressed) whose rule_id is session.count_drop/session.churn and whose own
+ * first_seen falls within lookbackMs of now. An alert can contain several incidents, so the
+ * incident map—not the alert's episode_started_at/first_seen projection—is the source of the
+ * anchor tick. Reads alert-HISTORY only -- callers pass the output of readAlertRecords(), never a
+ * tick's own in-memory candidate array.
  */
 export function findKillSideAnchors(alertRecords = [], { now, lookbackMs = DEFAULT_CORRELATION_LOOKBACK_MS } = {}) {
   const nowMs = tsMs(now);
@@ -95,19 +97,32 @@ export function findKillSideAnchors(alertRecords = [], { now, lookbackMs = DEFAU
   const anchors = [];
   for (const alert of alertRecords ?? []) {
     if (!KILL_SIDE_RULE_IDS.has(alert?.rule_id)) continue;
-    const firstSeenMs = tsMs(alert.first_seen);
-    if (firstSeenMs === undefined) continue;
-    const ageMs = nowMs - firstSeenMs;
-    if (ageMs < 0 || ageMs > lookbackMs) continue;
-    anchors.push({
-      alert_id: alert.id,
-      rule_id: alert.rule_id,
-      fingerprint: alert.fingerprint ?? "global",
-      first_seen: alert.first_seen,
-      anchor_tick_ts: alert.episode_started_at ?? alert.first_seen,
-      first_seen_ms: firstSeenMs,
-      severity: KNOWN_SEVERITIES.has(alert.severity) ? alert.severity : "warning",
-    });
+    const incidents = alert.incidents && typeof alert.incidents === "object" && !Array.isArray(alert.incidents)
+      ? Object.entries(alert.incidents)
+      : [];
+    const sourceIncidents = incidents.length > 0
+      ? incidents
+      : [[alert.current_incident_key ?? alert.incident_key ?? "legacy", {
+        first_seen: alert.first_seen,
+        severity_max: alert.severity,
+      }]];
+    for (const [incidentKey, incident] of sourceIncidents) {
+      const anchorTickTs = incident?.first_seen;
+      const firstSeenMs = tsMs(anchorTickTs);
+      if (firstSeenMs === undefined) continue;
+      const ageMs = nowMs - firstSeenMs;
+      if (ageMs < 0 || ageMs > lookbackMs) continue;
+      anchors.push({
+        alert_id: alert.id,
+        rule_id: alert.rule_id,
+        fingerprint: alert.fingerprint ?? "global",
+        incident_key: incidentKey,
+        first_seen: anchorTickTs,
+        anchor_tick_ts: anchorTickTs,
+        first_seen_ms: firstSeenMs,
+        severity: KNOWN_SEVERITIES.has(incident?.severity_max) ? incident.severity_max : (KNOWN_SEVERITIES.has(alert.severity) ? alert.severity : "warning"),
+      });
+    }
   }
   return anchors;
 }
@@ -255,7 +270,7 @@ export function buildCorrelationCandidate(anchor, bestPeer, poolSize) {
   const proximitySeconds = Math.round(bestPeer.delta_ms / 1000);
   const fingerprint = `${anchor.fingerprint}__${peerEntityKey}`;
   const incident_key = createHash("sha256")
-    .update(`correlation.login_kill_proximity.incident:${anchor.rule_id}\0${anchor.anchor_tick_ts ?? anchor.first_seen}\0${peerEntityKey}`)
+    .update(`correlation.login_kill_proximity.incident:${anchor.rule_id}\0${anchor.incident_key ?? "legacy"}\0${anchor.anchor_tick_ts ?? anchor.first_seen}\0${peerEntityKey}`)
     .digest("hex")
     .slice(0, 16);
 
