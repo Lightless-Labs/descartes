@@ -272,6 +272,30 @@ test("resolveCollectorBinary trusts a macOS admin group containing root, a non-a
   assert.deepEqual(binaryProvenance(resolution).accepted_system_accounts, [{ name: "_mbsetupuser", uid: 248 }]);
 });
 
+test("resolveCollectorBinary rejects a partial macOS GroupMembership lookup even when the full record named writers", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas attacker\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") throw new Error("partial dscl attribute read");
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
+});
+
 test("resolveCollectorBinary rejects a macOS uid-below-501 account with ShadowHash authentication", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
@@ -519,12 +543,7 @@ test("resolveCollectorBinary rejects a macOS non-local group node as unverifiabl
   assert.equal(resolution.trust_reason, "group_membership_unverifiable");
 });
 
-test("resolveCollectorBinary trusts a Linux group-writable ancestor from local files only", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files\ngroup: files\n",
-    "/etc/group": "root:x:0:\nadmin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
+test("resolveCollectorBinary rejects every Linux group-writable component", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "linux",
     realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
@@ -534,184 +553,11 @@ test("resolveCollectorBinary trusts a Linux group-writable ancestor from local f
     }),
     readFileFn: readableBinary,
     aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => localFiles[target],
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
-});
-
-test("resolveCollectorBinary rejects Linux directory-service groups even when local files are safe", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files\ngroup: files sss\n",
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", {
-      ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) },
-    }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => localFiles[target],
     expectedUid: 501,
   });
 
   assert.equal(resolution.status, "untrusted_binary");
-  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
-});
-
-test("resolveCollectorBinary rejects a non-local passwd source even when group is files-only", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files sss\ngroup: files\n",
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", { ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) } }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => localFiles[target],
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "untrusted_binary");
-  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
-});
-
-test("resolveCollectorBinary rejects a non-local initgroups source even when passwd and group are files-only", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files\ngroup: files\ninitgroups: files sss\n",
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", { ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) } }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => localFiles[target],
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "untrusted_binary");
-  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
-});
-
-test("resolveCollectorBinary accepts files systemd as local NSS sources for all group databases", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files systemd\ngroup: files systemd\ninitgroups: files systemd\n",
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", { ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) } }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => localFiles[target],
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
-});
-
-test("resolveCollectorBinary rejects NSS action clauses that change the default lookup semantics", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files\ngroup: files [NOTFOUND=return]\n",
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", { ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) } }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => localFiles[target],
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "untrusted_binary");
-  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
-});
-
-test("resolveCollectorBinary uses local files when nsswitch.conf is absent and no directory-service config exists", async () => {
-  const localFiles = {
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const readLocalFileFn = async (target) => {
-    if (target in localFiles) return localFiles[target];
-    throw Object.assign(new Error("missing"), { code: "ENOENT" });
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", { ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) } }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn,
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
-});
-
-test("resolveCollectorBinary rejects missing nsswitch.conf when an sssd config is present", async () => {
-  const localFiles = {
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-    "/etc/sssd/sssd.conf": "[sssd]\nservices = nss, pam\n",
-  };
-  const readLocalFileFn = async (target) => {
-    if (target in localFiles) return localFiles[target];
-    throw Object.assign(new Error("missing"), { code: "ENOENT" });
-  };
-  const resolution = await resolveCollectorBinary("tmux", {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", { ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) } }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn,
-    expectedUid: 501,
-  });
-
-  assert.equal(resolution.status, "untrusted_binary");
-  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
-});
-
-test("resolveCollectorBinary caches group membership within the supplied tick cache", async () => {
-  const localFiles = {
-    "/etc/nsswitch.conf": "passwd: files\ngroup: files\n",
-    "/etc/group": "admin:x:80:root,daemon\n",
-    "/etc/passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:501:80:daemon:/var/empty:/usr/bin/false\n",
-  };
-  const groupWriterCache = {};
-  let reads = 0;
-  const options = {
-    platform: "linux",
-    realpathFn: async (candidate) => candidate === "/usr/local/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
-    statFn: trustedStats("/usr/local/bin/tmux", {
-      ancestors: { "/usr": directory(), "/usr/local": directory(), "/usr/local/bin": groupWritableDirectory(80) },
-    }),
-    readFileFn: readableBinary,
-    aclCheckFn: aclAbsent,
-    readLocalFileFn: async (target) => { reads += 1; return localFiles[target]; },
-    expectedUid: 501,
-    groupWriterCache,
-  };
-
-  assert.equal((await resolveCollectorBinary("tmux", options)).status, "resolved");
-  assert.equal((await resolveCollectorBinary("tmux", options)).status, "resolved");
-  assert.equal(reads, 3);
+  assert.equal(resolution.trust_reason, "group_writable");
 });
 
 test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitute for a rejected direct binary", async () => {
@@ -870,4 +716,68 @@ test("runResolvedExecFile rechecks the resolved file identity immediately before
   assert.equal(result.status, "untrusted_binary");
   assert.equal(calls.length, 0);
   assert.equal(result.binary.trust_reason, "file_identity_changed");
+});
+
+test("runResolvedExecFile refuses an in-place content change on the same file identity", async () => {
+  const calls = [];
+  let readCount = 0;
+  const result = await runResolvedExecFile("tmux", ["list-sessions"], {
+    platform: "linux",
+    realpathFn: async (candidate) => candidate,
+    statFn: async (candidate) => {
+      if (candidate === "/usr/bin/tmux") return { ...regularExecutable(), uid: 1000, size: 4, mtimeMs: 10 };
+      if (candidate === "/usr/bin") return directory(0o40755, 0);
+      if (candidate === "/usr") return directory(0o40755, 0);
+      if (candidate === "/") return directory(0o40755, 0);
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    },
+    readFileFn: async () => Buffer.from(readCount++ === 0 ? "good" : "evil"),
+    aclCheckFn: aclAbsent,
+    expectedUid: 1000,
+    execFileAsync: async (...args) => {
+      calls.push(args);
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  assert.equal(result.status, "untrusted_binary");
+  assert.equal(calls.length, 0);
+  assert.equal(result.binary.trust_reason, "content_changed_in_place");
+});
+
+test("resolveCollectorBinary evaluates a brew-upgrade path with a new inode independently", async () => {
+  let version = "3.6a";
+  const contentHashCache = new Map();
+  const statFn = async (target) => {
+    if (target === "/opt/homebrew/bin/tmux") {
+      return { ...regularExecutable(), uid: 0, dev: 1, ino: version === "3.6a" ? 2 : 99, size: 4, mtimeMs: 10 };
+    }
+    if (target.startsWith("/opt/homebrew/Cellar/") || target === "/opt/homebrew/bin") return directory(0o40755, 0);
+    if (target === "/opt/homebrew" || target === "/opt") return directory(0o40755, 0);
+    if (target === "/") return directory(0o40755, 0);
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  };
+  const realpathFn = async (target) => {
+    if (target === "/opt/homebrew/bin/tmux") return `/opt/homebrew/Cellar/tmux/${version}/bin/tmux`;
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  };
+  const readFileFn = async () => Buffer.from(version);
+  const options = {
+    platform: "darwin",
+    realpathFn,
+    statFn,
+    readFileFn,
+    aclCheckFn: aclAbsent,
+    expectedUid: 0,
+    contentHashCache,
+  };
+
+  const first = await resolveCollectorBinary("tmux", options);
+  version = "3.6b";
+  const second = await resolveCollectorBinary("tmux", options);
+
+  assert.equal(first.status, "resolved", JSON.stringify(first));
+  assert.equal(second.status, "resolved", JSON.stringify(second));
+  assert.notEqual(first.resolved_path, second.resolved_path);
+  assert.notEqual(first.file_stat.ino, second.file_stat.ino);
 });
