@@ -2,6 +2,23 @@
 
 **Last updated:** 2026-10-09
 
+## Collector-source daybreak blockers — 2026-10-09 — local, not pushed
+
+Closed the two daybreak blockers in atomic commits `d351e22` (TDD regressions and persistence
+coverage), `6ae16ca` (implementation), and `d9d38c2` (README/reference residual corrections).
+macOS dscl trust now requires explicit evidence for every relevant attribute; silent omissions,
+including `UniqueID: 400` without an `AuthenticationAuthority` line, fail closed. An explicitly
+reported `No such key: AuthenticationAuthority` is the only accepted absent-authority evidence.
+Content pins are keyed only by `(dev, ino)`, store `{size, mtime, sha256}`, survive daemon restarts
+under `stateDir/daemon`, are bounded to 256 entries, and prune inodes no longer present on known
+pinned paths. A changed inode's content is refused even after it moves to another pinned path;
+new inodes are evaluated fresh. The residual now says that a former member of any accepted
+component group can retain that group's GID in processes started before removal.
+
+Validation: focused resolver/persistence suite passes **38/38**. The required full fresh-XDG host-
+access `npm test` passes **2414/2414, 0 failures, 34 skips, 2448 total**, including live
+provenance. No push or merge.
+
 ## Collector-source + notify-once merge — 2026-10-09 — local, not pushed
 
 Merged `main` with `--no-ff` into `fix/collector-sources-2026-10`. Conflict resolution retains
