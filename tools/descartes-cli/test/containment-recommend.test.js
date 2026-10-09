@@ -264,6 +264,38 @@ test("computeContainmentRecommendationCandidates: both gates ON + an active trig
   assert.equal(JSON.stringify(candidates).includes("redacted"), false);
 });
 
+test("computeContainmentRecommendationCandidates: a due incident uses its own key and payload, not the alert projection", async () => {
+  const paths = await tempPaths();
+  const alert = {
+    ...activeCanaryTrippedAlert("abcdef0123456789"),
+    current_incident_key: "incident-a",
+    incidents: {
+      "incident-a": {
+        severity_max: "warning",
+        confirmed_at: "2026-08-21T00:01:00.000Z",
+        payload: { severity: "warning", title: "A", summary: "A", diagnostics: { canary_id_hash: "abcdef0123456789" } },
+      },
+      "incident-b": {
+        severity_max: "critical",
+        confirmed_at: null,
+        payload: { severity: "critical", title: "B", summary: "B", diagnostics: { canary_id_hash: "0123456789abcdef" } },
+      },
+    },
+  };
+  const candidates = await computeContainmentRecommendationCandidates(paths, {
+    loadLearnedConfig: async () => ({ enabled: true }),
+    readContainmentRecommendConfig: async () => ({ enabled: true }),
+    evaluation: {
+      alerts: [alert],
+      notification_due_ids: [alert.id],
+      notification_due_incidents: [{ alert_id: alert.id, incident_key: "incident-b" }],
+    },
+  });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].incident_key, "incident-b");
+  assert.equal(candidates[0].diagnostics.target_repr, "0123456789abcdef");
+});
+
 test("computeContainmentRecommendationCandidates: the opt-in OFF ⇒ zero candidates, structurally, even with the trigger active and learned.json ON", async () => {
   const paths = await tempPaths();
   const candidates = await computeContainmentRecommendationCandidates(paths, {
