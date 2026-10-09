@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -243,23 +242,13 @@ function commandForPayload(channel, payload, options = {}) {
 }
 
 export const MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS = 1000;
-// The old row-count rotation constant remains exported for source compatibility only. Delivery
-// audit retention is now segment-based, never row-count-based.
-export const DEFAULT_NOTIFICATION_DELIVERY_AUDIT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-const retentionClockAnchors = new Map();
+// Operator policy (O): retain complete dated audit segments up to this total byte cap.
+export const MAX_NOTIFICATION_DELIVERY_AUDIT_BYTES = 50 * 1024 * 1024;
 
 function parseAuditRecords(contents) {
   return contents.split("\n").filter((line) => line.trim()).map((line) => {
     try { return JSON.parse(line); } catch { return undefined; }
   }).filter(Boolean);
-}
-
-function utcDay(ts) {
-  return normalizeIso(ts, "audit timestamp").slice(0, 10);
-}
-
-function previousUtcDay(day) {
-  return new Date(Date.parse(`${day}T00:00:00.000Z`) - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
 function datedSegmentFile(auditDir, day) {
@@ -302,15 +291,9 @@ async function auditFilesInReadOrder(descartesPaths) {
 
 async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {}) {
   const { auditDir, auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const retentionMs = Number.isFinite(options.retentionMs) && options.retentionMs >= 0
-    ? options.retentionMs
-    : DEFAULT_NOTIFICATION_DELIVERY_AUDIT_RETENTION_MS;
-  const wallNowMs = new Date(now).getTime();
-  const currentMonotonicMs = performance.now();
-  const previousAnchor = retentionClockAnchors.get(auditDir);
-  const anchor = previousAnchor ?? { wallMs: wallNowMs, monotonicMs: currentMonotonicMs };
-  retentionClockAnchors.set(auditDir, anchor);
-  const monotonicNowMs = Math.max(wallNowMs, anchor.wallMs + (currentMonotonicMs - anchor.monotonicMs));
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes >= 0
+    ? options.maxBytes
+    : MAX_NOTIFICATION_DELIVERY_AUDIT_BYTES;
   let entries;
   try {
     entries = await fs.readdir(auditDir, { withFileTypes: true });
@@ -332,54 +315,44 @@ async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {})
       if (error?.code === "ENOENT") continue;
       throw error;
     }
-    let records = [];
-    try {
-      records = await readAuditFile(file);
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
-      throw error;
-    }
-    const timestamps = records.map((record) => Date.parse(record.ts)).filter(Number.isFinite);
-    const datedDayMs = segmentMatch ? Date.parse(`${segmentMatch[1]}T00:00:00.000Z`) : Number.NaN;
-    candidates.push({ file, segmentMatch, records, timestamps, initialStat, datedDayMs });
+    candidates.push({ file, name: entry.name, initialStat });
   }
-  const newestSegmentMs = candidates.flatMap(({ datedDayMs, timestamps }) => [datedDayMs, ...timestamps])
-    .filter(Number.isFinite)
-    .reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY);
-  const effectiveNowMs = Math.max(monotonicNowMs, newestSegmentMs);
-  const effectiveNow = new Date(effectiveNowMs).toISOString();
-  const nowDay = utcDay(effectiveNow);
-  const protectedDays = new Set([nowDay, previousUtcDay(nowDay)]);
-  const cutoffMs = effectiveNowMs - retentionMs;
+  candidates.sort((left, right) => left.name.localeCompare(right.name));
+  let totalBytes = candidates.reduce((sum, candidate) => sum + candidate.initialStat.size, 0);
 
   // Snapshot all candidates before a paused writer can race the unlink phase. appendDeliveryAudit
   // passes this hook only for tests and diagnostics; production callers leave it undefined.
   await options.beforeAuditRetention?.({ auditDir, segmentFile: options.segmentFile, now });
 
-  for (const { file, segmentMatch, timestamps, initialStat } of candidates) {
-    const fileNewestMs = timestamps.length > 0 ? Math.max(...timestamps) : initialStat.mtimeMs;
-    const datedDay = segmentMatch?.[1];
-    const protectedByDay = datedDay ? protectedDays.has(datedDay) : timestamps.some((ts) => protectedDays.has(new Date(ts).toISOString().slice(0, 10)));
-    // Delete only a whole file whose newest evidence is outside retention. Current and previous
-    // UTC-day segments are always protected, even with a zero-day test/operator retention value.
-    if (!protectedByDay && fileNewestMs < cutoffMs) {
-      let latestStat;
-      try {
-        latestStat = await fs.stat(file);
-      } catch (error) {
-        if (error?.code === "ENOENT") continue;
-        throw error;
+  for (const { file, initialStat } of candidates) {
+    if (totalBytes <= maxBytes) break;
+    // Never remove the dated segment this process appended during this tick, even if a wall-clock
+    // rollback made its name sort before older segments.
+    if (file === options.segmentFile) continue;
+    let latestStat;
+    try {
+      latestStat = await fs.stat(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        totalBytes -= initialStat.size;
+        continue;
       }
-      if (latestStat.mtimeMs !== initialStat.mtimeMs || latestStat.size !== initialStat.size) continue;
-      if (latestStat.mtimeMs >= monotonicNowMs - retentionMs) continue;
-      try { await fs.unlink(file); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+      throw error;
+    }
+    if (latestStat.mtimeMs !== initialStat.mtimeMs || latestStat.size !== initialStat.size) continue;
+    try {
+      await fs.unlink(file);
+      totalBytes -= latestStat.size;
+    } catch (error) {
+      if (error?.code === "ENOENT") totalBytes -= latestStat.size;
+      else throw error;
     }
   }
 }
 
 async function appendDeliveryAudit(descartesPaths, record, options = {}) {
   const { auditDir } = resolveNotificationDeliveryPaths(descartesPaths);
-  const segmentFile = datedSegmentFile(auditDir, utcDay(record.ts));
+  const segmentFile = datedSegmentFile(auditDir, normalizeIso(record.ts, "audit timestamp").slice(0, 10));
   await ensureParent(segmentFile);
   // fs.appendFile opens and closes this dated segment for every row. There is no shared descriptor,
   // inode rename, read/modify/write, compaction, or replacement window for a concurrent writer.

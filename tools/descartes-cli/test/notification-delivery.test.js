@@ -304,28 +304,26 @@ test("delivery audit writes dated UTC append-only segments and reads all records
   assert.deepEqual((await fs.readdir(path.dirname(auditFile))).filter((name) => name.endsWith(".archive")), ["notification-delivery.jsonl.migrated.archive"]);
 });
 
-test("retention deletes only whole old segments, including orphan archives, and protects current and previous UTC days", async () => {
+test("retention deletes oldest-by-name segments until the total byte cap is satisfied", async () => {
   const paths = await tempPaths();
   const { auditFile } = resolveNotificationDeliveryPaths(paths);
   const dir = path.dirname(auditFile);
   await fs.mkdir(dir, { recursive: true });
   const row = (ts, title) => `${JSON.stringify({ ts, status: "delivered", channel: "cli", payload: { title, body: "Body" } })}\n`;
-  const old = path.join(dir, "notification-delivery-2026-09-01.jsonl");
-  const archive = path.join(dir, "notification-delivery.jsonl.old.archive");
-  const previous = path.join(dir, "notification-delivery-2026-10-08.jsonl");
-  await fs.writeFile(old, row("2026-09-01T00:00:00.000Z", "old-segment"));
-  await fs.writeFile(archive, row("2026-09-01T00:01:00.000Z", "old-archive"));
-  await fs.utimes(old, new Date("2026-09-01T00:00:00.000Z"), new Date("2026-09-01T00:00:00.000Z"));
-  await fs.utimes(archive, new Date("2026-09-01T00:01:00.000Z"), new Date("2026-09-01T00:01:00.000Z"));
-  await fs.writeFile(previous, row("2026-10-08T00:00:00.000Z", "previous-day"));
+  const oldest = path.join(dir, "notification-delivery-2026-09-01.jsonl");
+  const middle = path.join(dir, "notification-delivery-2026-09-02.jsonl");
+  await fs.writeFile(oldest, row("2026-09-01T00:00:00.000Z", "oldest"));
+  await fs.writeFile(middle, row("2026-09-02T00:00:00.000Z", "middle"));
+  // The actual audit row includes bounded-delivery metadata, so leave a small margin above two
+  // fixture-row sizes: enough for middle + current, but not enough for oldest + middle + current.
+  const cap = (await fs.stat(middle)).size * 2 + 64;
   await deliverNotificationDecision(paths, { notify: true, title: "current-day", body: "Body" }, {
-    config: { enabled: true, channel: "cli" }, now: "2026-10-09T00:02:00.000Z", retentionMs: 7 * 24 * 60 * 60 * 1000,
+    config: { enabled: true, channel: "cli" }, now: "2026-10-09T00:02:00.000Z", maxBytes: cap,
   });
   const audit = await readNotificationDeliveryAudit(paths);
-  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["previous-day", "current-day"]);
-  await assert.rejects(() => fs.access(old));
-  await assert.rejects(() => fs.access(archive));
-  await fs.access(previous);
+  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["middle", "current-day"]);
+  await assert.rejects(() => fs.access(oldest));
+  await fs.access(middle);
   await fs.access(path.join(dir, "notification-delivery-2026-10-09.jsonl"));
 });
 
@@ -346,18 +344,16 @@ test("concurrent append during retention is not lost and a post-append crash lea
   assert.deepEqual(audit.map((entry) => entry.payload?.title), ["racing append", "crash row"]);
 });
 
-test("retention keeps a segment with a recent mtime even when its records are old", async () => {
+test("retention has no wall-clock expiry and removes a segment only for byte pressure", async () => {
   const paths = await tempPaths();
   const { auditFile } = resolveNotificationDeliveryPaths(paths);
   const dir = path.dirname(auditFile);
   const old = path.join(dir, "notification-delivery-2026-09-01.jsonl");
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(old, `${JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", status: "delivered", payload: { title: "old-record" } })}\n`);
-  await fs.utimes(old, new Date("2026-10-08T23:59:00.000Z"), new Date("2026-10-08T23:59:00.000Z"));
   await deliverNotificationDecision(paths, { notify: true, title: "current", body: "Body" }, {
     config: { enabled: true, channel: "cli" },
-    now: "2026-10-09T00:00:00.000Z",
-    retentionMs: 7 * 24 * 60 * 60 * 1000,
+    now: "2026-10-09T00:00:00.000Z", maxBytes: 10_000,
   });
   await fs.access(old);
 });
@@ -373,7 +369,7 @@ test("retention re-stats before unlink and skips a segment modified by a paused 
   await deliverNotificationDecision(paths, { notify: true, title: "current", body: "Body" }, {
     config: { enabled: true, channel: "cli" },
     now: "2026-10-09T00:00:00.000Z",
-    retentionMs: 7 * 24 * 60 * 60 * 1000,
+    maxBytes: 1,
     beforeAuditRetention: async ({ auditDir }) => {
       if (pausedWriterRan) return;
       pausedWriterRan = true;
@@ -385,17 +381,17 @@ test("retention re-stats before unlink and skips a segment modified by a paused 
   assert.equal((await readNotificationDeliveryAudit(paths)).some((entry) => entry.payload?.title === "paused-writer"), true);
 });
 
-test("retention uses the newest dated segment as the rollback-safe current day", async () => {
+test("retention never deletes the segment written by the current process tick", async () => {
   const paths = await tempPaths();
   const { auditFile } = resolveNotificationDeliveryPaths(paths);
   const dir = path.dirname(auditFile);
-  const futureNamed = path.join(dir, "notification-delivery-2026-10-09.jsonl");
+  const rollbackNamed = path.join(dir, "notification-delivery-2026-09-01.jsonl");
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(futureNamed, `${JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", status: "delivered", payload: { title: "future-named" } })}\n`);
+  await fs.writeFile(rollbackNamed, `${JSON.stringify({ ts: "2026-09-01T00:00:00.000Z", status: "delivered", payload: { title: "rollback-existing" } })}\n`);
+  const existingSize = (await fs.stat(rollbackNamed)).size;
   await deliverNotificationDecision(paths, { notify: true, title: "rolled-back", body: "Body" }, {
     config: { enabled: true, channel: "cli" },
-    now: "2026-09-02T00:00:00.000Z",
-    retentionMs: 0,
+    now: "2026-09-01T00:00:00.000Z", maxBytes: existingSize,
   });
-  await fs.access(futureNamed);
+  await fs.access(rollbackNamed);
 });

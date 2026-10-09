@@ -290,10 +290,12 @@ only after the adapter returns a successful result (`delivered` or the explicit 
 result); failures remain due subject to rollback-safe exponential backoff. Crash after external
 delivery but before confirmation is explicitly at-least-once: a duplicate is acceptable, silence is
 not. Delivery audit records use append-only UTC date segments, such as
-`notification-delivery-2026-10-09.jsonl`. Retention removes only whole old segments, protects the
-current and previous UTC days, re-checks file metadata before unlinking, and keeps recent writes
-safe across clock rollback and writer races. The audit reader merges legacy files, archives, and
-dated segments by record timestamp in stable chronological order.
+`notification-delivery-2026-10-09.jsonl`. Retention is governed only by a 50 MiB total-byte cap:
+it removes whole segments oldest by filename while over the cap, never the segment written by the
+current process during that tick, and re-checks file metadata before unlinking. There is no
+wall-clock expiry. Residual: under cap pressure after a clock rollback, a rollback-dated segment
+may be considered oldest by filename. The audit reader merges legacy files, archives, and dated
+segments by record timestamp in stable chronological order.
 
 The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
 diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
