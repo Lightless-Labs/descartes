@@ -877,7 +877,7 @@ test("content pins persist across daemon restarts and discard inodes no longer p
     binaries: ["tmux"],
     realpathFn: async (candidate) => candidate === "/pinned/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     statFn: async (target) => target === "/pinned/tmux"
-      ? { ...regularExecutable(), dev: 7, ino: 11 }
+      ? { ...regularExecutable(0o100644), dev: 7, ino: 11 }
       : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
   });
 
