@@ -701,6 +701,7 @@ export function buildCountSpikeCandidate(state, { deviationSigma = DEFAULT_PEER_
     id: alertId(PEER_COUNT_SPIKE_RULE_ID, fingerprint),
     rule_id: PEER_COUNT_SPIKE_RULE_ID,
     fingerprint,
+    incident_key: "default",
     // MUST-FIX 1: capped at "warning" unconditionally — never "critical" in v0.
     severity: "warning",
     title: "Peer count deviation",
@@ -741,6 +742,7 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_PEER_D
     id: alertId(PEER_COUNT_DROP_RULE_ID, fingerprint),
     rule_id: PEER_COUNT_DROP_RULE_ID,
     fingerprint,
+    incident_key: "default",
     // Decision 0 (plan pinned), mirrors peer.count_spike's own MUST-FIX-1 cap: severity is
     // HARDCODED "warning" -- never escalates to "critical" in v0, regardless of z magnitude.
     // Peer-count variance dynamics remain an untuned PROVISIONAL surface for BOTH directions.

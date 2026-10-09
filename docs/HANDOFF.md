@@ -2,6 +2,99 @@
 
 **Last updated:** 2026-10-09
 
+## Collector-source + notify-once merge — 2026-10-09 — local, not pushed
+
+Merged `main` with `--no-ff` into `fix/collector-sources-2026-10`. Conflict resolution retains
+both histories in this handoff. Collector-source behavior remains the branch version: strict
+binary trust, incomplete-census freezes, per-source session census universes, versioned session
+identities, and legacy churn freeze. Main's per-incident `incident_key` producers and delivery
+changes are retained; session churn re-applies its transition key (`churn:<entity>:<prior>:<current>`)
+on top of the branch's versioned session alert identity, and session count-drop retains its
+versioned identity. Session and peer count deviations explicitly use the stable `default` incident
+within their respective versioned alert identities; the other main producers retain their incident
+keys unchanged.
+
+Validation after conflict resolution: fresh-XDG host-access `npm test` passes **2410/2410, 0
+failures, 34 skips, 2444 total**. The focused live provenance files pass **74/74, 0 failures**,
+including both live macOS provenance checks. No test failures required classification or repair;
+the suite's intentional fault-injection `ENOSPC`/degraded-path diagnostics were expected and
+their tests passed. No push.
+
+## Notify-once deferred LLM-route failure fix — 2026-10-09 — local, not pushed
+
+The three early-return paths for degraded, unreadable, or unavailable LLM-route dependencies now
+return their accumulated `delivery_outcomes`, so the daemon's single batched alert-store write
+records the failure and applies ordinary retry backoff. A three-tick unreadable-audit regression
+verifies the first failure is persisted, the next tick is skipped during backoff, and a later due
+tick retries. Focused alert-intelligence verification passes 148/148; the combined alert-store,
+alert-intelligence, notification-delivery, containment, and fact-store suites pass 243/243.
+Fresh-XDG `npm test` reports 2,386 total / 2,330 passing / 22 environment failures / 34 skipped /
+0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`, 3 tap-bump loopback
+`listen EPERM`, and 2 live-host macOS provenance checks returning `unknown` instead of `ok`; no
+product-behavior failures were observed.
+
+## Notify-once daybreak rework follow-up — 2026-10-09 — local, not pushed
+
+Closed the remaining review findings on `feat/notify-once-2026-10` in three atomic commits:
+`ad08a0c` (batch alert delivery state per daemon tick), `8b26f4b` (count and prune the legacy
+notification audit file), and `da51024` (final plan design). The earlier notify-once commits
+`bf25f22`, `1e1228e`, and `3477227` remain the preceding local history.
+
+Delivery now reads the alert store once at the start of the delivery phase and collects every
+success, failure, route-breaker skip, and LLM `notify:false` adjudication update in memory before a
+single alert-store transaction. The route-local breaker still permits healthy routes to progress:
+the persisted regression covers 256 failing session criticals plus one metric critical, verifies
+the metric delivery stays under one second, and observes exactly one store write. The 10,000-tick
+regression now uses a real persisted store and its normal retry backoff. Notification retention
+counts the legacy `notification-delivery.jsonl` as the oldest segment under the 50 MiB byte cap.
+
+Focused alert-store, alert-intelligence, notification-delivery, and notify-once suites pass
+207/207. Fresh-XDG `npm test` reports 2,385 total / 2,329 passing / 22 environment failures /
+34 skipped / 0 todo. The 22 failures are 17 notifier-reuse loopback `listen EPERM`, 3 tap-bump
+loopback `listen EPERM`, and 2 live-host macOS provenance checks returning `unknown` instead of
+`ok`; no product-behavior failures were observed. No push or merge.
+
+## R3 notify-once daybreak rework — 2026-10-09 — local, not pushed
+
+On branch `feat/notify-once-2026-10`, the daybreak-blue findings are closed in four local commits:
+`93cd13e`, `5fc6cfe`, `8d1910b`, and `afdfeeb`. Alert delivery now persists first-class incident
+records under each alert id. `incidents[incident_key]` stores first/last seen, maximum and notified
+severity, confirmation, delivery-failure/backoff state, and status. Candidate application groups and
+sorts incident keys deterministically; delivery iterates due incidents and confirms each one
+independently. Alert-level active/recovered/acknowledged status and detector recovery coverage remain
+unchanged.
+
+Confirmed incident keys are retained while an alert is active. At 256 live keys, the alert enters
+explicit `incident_storm` state (operator policy (O)): it emits one count-bearing storm notification,
+suppresses per-key notifications and adjudications until recovery or acknowledgement, and retries
+the storm after a failed delivery without another overflow. Due-ness is computed over all persisted
+active incidents, including failed incidents whose keys are absent from the current tick or excluded
+by detector coverage. Delivery work is capped at 8 attempts per daemon tick (operator policy (O)),
+prioritizing severity descending then oldest unconfirmed work; deferred entries remain due and are
+eventually attempted. Legacy records without episode metadata are suppressed only for the upgrade
+episode; recovery clears that compatibility marker so a fresh incident notifies. A lost confirmation
+write can duplicate a later delivery but cannot create silence; these paths are covered by regression
+tests.
+
+The daemon singleton and CLI command queue introduced by the earlier slice were removed. `alerts ack`
+uses the existing direct persistence path. Concurrent daemons are an unsupported configuration; the
+pre-existing alert-store read-modify-write lost-update race is deliberately not fixed here and is
+tracked in [`todos/2026-10-09-alert-store-concurrent-writers.md`](../todos/2026-10-09-alert-store-concurrent-writers.md).
+The correlation detector now anchors each join on the correlated incident's own first-seen tick and
+incident key, so churn A→B then B→C cannot collapse. Containment recommendations consume each
+incident-level due entry rather than the alert's preferred projection; the final containment pass
+filters stale due entries after same-tick recovery. Notification delivery audit uses dated UTC
+append-only JSONL segments, reads the legacy file and orphan archives before dated segments, and
+retains/deletes only whole old segments without rewriting or renaming an append target.
+
+Focused suites pass: alert-store 25/25, alert-intelligence 144/144, notification-delivery 18/18,
+and containment/fact-store regressions 2/2. Fresh-XDG `npm test` completed with 2,376 total,
+2,320 passing, 22 environment failures, 34 skipped, and 0 todo. The 22 failures are 17 sandbox
+notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump loopback `listen EPERM` tests, and
+2 live-host macOS provenance checks returning `unknown` instead of `ok`; no product-behavior
+failures remain.
+No push or merge is authorized.
+
 ## Collector source trust rework — 2026-10-09
 
 Implemented the daybreak gate-5 decision locally in `c4eea62` (red TDD contract) and
@@ -255,6 +348,15 @@ Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing h
 - **Then (now done, see above):** S4 and S5.
 
 ## Current Status
+
+> **RESUME HERE (2026-10-09 late) — main has capacity + notify-once; plan at v5; collector-sources in gate; root-helper CI red.**
+> - **Pushed to origin/main (b60efc8):** provenance + watch-fab + **fact-store capacity** (G3 READY; merge 1169d40 + status fix b60efc8, daybreak READY).
+> - **Local main, NOT pushed:** **notify-once (R3) merged (fe4302b)** — per-incident records under each alert id, independent delivery/confirmation, storm mode (one notification, ack resets), global severity order with per-route per-tick circuit breaker (no per-tick cap), retries over all persisted incidents incl. post-ack, legacy ⇒ notify once, dated byte-capped audit segments; daybreak READY after 10 rounds (final backoff fix 2fc3149 not separately gated yet). Pre-existing alert-store concurrent-writer race tracked in `todos/2026-10-09-alert-store-concurrent-writers.md`. Push needs operator OK.
+> - **`fix/collector-sources-2026-10`** (worktree `collector-sources`): H5/H6 + binary trust (macOS: local-group trust incl. non-authenticating system accounts e.g. `_mbsetupuser`, ACL fail-closed, GUID members, local-only search policy, content-hash pin; LINUX: strict — no group-writable trust) + per-source session census universes (versioned identities, legacy frozen). **Accepted residual (documented):** on macOS a process that held the admin GID before removal keeps write access until it exits. In daybreak gate 6. Must merge new main (R3) before final gate.
+> - **Plan `docs/plans/2026-10-06-context-aware-learned-baselines.md` DRAFT v5** — operator D5 (2026-10-09): NO ratification/approval/config chores; adaptation earned automatically, reversible, notified; incumbents only quarantine alarmed ticks + novelty pending (successors are the exit). Reviews: Opus v5 0 BLOCKER / 3 HIGH (`docs/reviews/2026-10-09-context-plan-v5-review-opus.md`); Astra v5 running. **Agreed: after v5 reviews, no further revision rounds unless a BLOCKER — remaining items go to an open-items addendum — then START C0/C2 (context data collection; calendar-time long pole).**
+> - **REMIND OPERATOR (when convenient):** root-helper branch Linux CI build #279 failed (buildkite.com/la-bande-a-bonnot/descartes/builds/279); no Buildkite token locally — needs the failing step log or a read token. Main build #280 was pending.
+> - **Release caveat:** don't cut a release before notify-once is pushed (capacity's post-upgrade `horizon_short` alert would otherwise re-notify every 15 min for days).
+> - Codex note: Homebrew codex 0.162.0 lacks the `/opt/homebrew/bin/codex-code-mode-host` link; invoke `/opt/homebrew/Caskroom/codex/0.162.0/bin/codex` directly (or `brew reinstall --cask codex`).
 
 > **RESUME HERE (2026-10-07) — principle reset + 5 open tracks; local `main` NOT pushed (operator confirmation pending).**
 > - **Operator core principle (2026-10-06):** Descartes LEARNS and ADAPTS — data, context awareness, ability to learn; **no expert-system rule forest** (operator rejected hand-coded tuning R4–R10: thresholds, reboot/wake suppressions, severity guards; R3 notify-once accepted as delivery policy); long memory (31 d) stays; never-fabricate gates are invariants, not behaviour rules. Memory: `no-hand-coded-detection-rules`. Audits of ALL past work vs this principle: `docs/reviews/2026-10-06-learning-principle-audit-{astra,opus}.md` (top offenders: global σ/floor session+peer models, incident-shaped correlation, fixed resource reflexes [0.985 macOS memory ⇒ permanent CRITICAL], adaptation-without-arbitration [novelty recovers after 1 tick; alarmed ticks folded], tuning-loop fired_count bug, dropped context data).

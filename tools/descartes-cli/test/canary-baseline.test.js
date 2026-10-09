@@ -328,6 +328,14 @@ test("builds critical hash-keyed candidates with sanitized diagnostics", () => {
   assert.notEqual(candidate.fingerprint, "credential.bak");
   assert.match(candidate.id, /^alert_[0-9a-f]{16}$/);
   assert.equal(candidate.diagnostics.canary_id, "credential.bak");
+  const [consecutiveTrip] = buildCanaryTrippedCandidates([{
+    canary_id: "credential.bak",
+    kind: "credential-file",
+    trip_reason: "executed",
+    tripped_at_ts: ts(3),
+    last_seen_ts: ts(2),
+  }]);
+  assert.notEqual(candidate.incident_key, consecutiveTrip.incident_key, "observed consecutive trips get distinct producer episode keys");
   const [unsafe] = buildCanaryTrippedCandidates([{ canary_id: "!!!", kind: "credential-file", trip_reason: "executed" }]);
   assert.notEqual(unsafe.diagnostics.canary_id, "!!!");
 });

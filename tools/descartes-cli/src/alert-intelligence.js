@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
+import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures, recordAlertDeliveryOutcomes } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -72,6 +73,176 @@ const ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS = [
 ];
 
 export const DEFAULT_ALERT_INTELLIGENCE_MAX_CALLS_PER_HOUR = 3;
+
+function dueIncidentFirstSeenMs(alert, entry) {
+  const ts = entry.incidentKey === INCIDENT_STORM_KEY
+    ? alert.first_seen
+    : alert.incidents?.[entry.incidentKey]?.first_seen ?? alert.first_seen;
+  const ms = Date.parse(ts);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+function compareDueAlerts(left, right) {
+  const severity = alertSeverityRank(right.alert.severity) - alertSeverityRank(left.alert.severity);
+  if (severity !== 0) return severity;
+  const firstSeen = dueIncidentFirstSeenMs(left.alert, left.entry) - dueIncidentFirstSeenMs(right.alert, right.entry);
+  if (firstSeen !== 0) return firstSeen;
+  const leftKey = `${left.alert.id}\0${left.entry.incidentKey ?? ""}`;
+  const rightKey = `${right.alert.id}\0${right.entry.incidentKey ?? ""}`;
+  return leftKey.localeCompare(rightKey);
+}
+
+function deliveryUrgency(alert, entry) {
+  if (entry.storm === true) return 0;
+  const incident = alert.incidents?.[entry.incidentKey];
+  if (!incident) return 0;
+  const current = alertSeverityRank(incident.severity_max ?? alert.severity);
+  const notified = alertSeverityRank(incident.notified_severity);
+  if (!incident.last_attempt_at || current > notified) return 0;
+  return 1;
+}
+
+function deliveryWorkKey(route, alert, entry) {
+  return `${route}\0${alert.id}\0${entry.incidentKey ?? alertEpisodeKey(alert)}`;
+}
+
+function compareGlobalDeliveryItems(left, right) {
+  const severity = alertSeverityRank(right.alert.severity) - alertSeverityRank(left.alert.severity);
+  if (severity !== 0) return severity;
+  if (left.urgency !== right.urgency) return left.urgency - right.urgency;
+  if (left.firstSeenMs !== right.firstSeenMs) return left.firstSeenMs - right.firstSeenMs;
+  return deliveryWorkKey(left.route, left.alert, left.entry).localeCompare(deliveryWorkKey(right.route, right.alert, right.entry));
+}
+
+function deliveryWasSuccessful(delivery) {
+  return delivery?.status === "delivered" || delivery?.status === "cli_only" || delivery?.status === "recorded" || delivery?.delivered === true;
+}
+
+async function confirmDeliveryIfPossible(descartesPaths, alert, delivery, options) {
+  if (!deliveryWasSuccessful(delivery)) return false;
+  try {
+    await confirmAlertDelivery(descartesPaths, alert.id, {
+      now: options.now,
+      severity: alert.severity,
+      episodeKey: options.episodeKey ?? alertEpisodeKey(alert),
+      incidentKey: options.incidentKey ?? alertEpisodeKey(alert),
+    });
+    return true;
+  } catch (error) {
+    console.warn(`descartes: confirmed delivery state update failed for alert ${alert.id}: ${error?.message ?? error}`);
+    return false;
+  }
+}
+
+function incidentEntries(evaluation, field = "notification_due_incidents") {
+  if (Array.isArray(evaluation?.[field])) {
+    return evaluation[field].map((entry) => ({ alertId: entry.alert_id, incidentKey: entry.incident_key, storm: entry.storm === true, incidentCount: entry.incident_count }));
+  }
+  const idField = field === "adjudication_due_incidents" ? "adjudication_due_ids" : "notification_due_ids";
+  const ids = Array.isArray(evaluation?.[idField])
+    ? evaluation[idField]
+    : field === "adjudication_due_incidents" && Array.isArray(evaluation?.notification_due_ids)
+      ? evaluation.notification_due_ids
+      : [];
+  return ids.map((alertId) => ({ alertId, incidentKey: undefined, storm: false }));
+}
+
+function alertForIncident(alert, entry) {
+  const incidentKey = entry.incidentKey ?? alertEpisodeKey(alert);
+  if (incidentKey === INCIDENT_STORM_KEY) {
+    return {
+      ...alert,
+      incident_key: INCIDENT_STORM_KEY,
+      current_incident_key: INCIDENT_STORM_KEY,
+      diagnostics: { ...(alert.diagnostics ?? {}), incident_count: entry.incidentCount ?? alert.incident_storm_count ?? 0 },
+      title: "Descartes: incident storm detected",
+      summary: `${entry.incidentCount ?? alert.incident_storm_count ?? 0} distinct incidents are active under one alert; per-incident notifications are paused until recovery or acknowledgement.`,
+      severity: alert.severity,
+      __incident_key: INCIDENT_STORM_KEY,
+    };
+  }
+  const incident = alert.incidents?.[incidentKey];
+  if (!incident) return { ...alert, __incident_key: incidentKey };
+  return {
+    ...alert,
+    ...incident.payload,
+    severity: incident.severity_max,
+    incident_key: incidentKey,
+    current_incident_key: incidentKey,
+    delivery_failure_count: incident.delivery_failure_count,
+    last_delivery_failure_at: incident.last_delivery_failure_at,
+    delivery_failure_reason: incident.delivery_failure_reason,
+    delivery_failing_since: incident.delivery_failing_since,
+    next_attempt_at: incident.next_attempt_at,
+    last_attempt_at: incident.last_attempt_at,
+    backoff_delay_ms: incident.backoff_delay_ms,
+    __incident_key: incidentKey,
+  };
+}
+
+function incidentKeyForAlert(alert) {
+  return alert?.__incident_key ?? alertEpisodeKey(alert);
+}
+
+async function recordDeliveryFailureIfPossible(descartesPaths, alert, options) {
+  if (!descartesPaths?.stateDir) return;
+  try {
+    await recordAlertDeliveryFailure(descartesPaths, alert.id, {
+      now: options.now,
+      reason: options.reason,
+      episodeKey: options.episodeKey ?? alertEpisodeKey(alert),
+      incidentKey: options.incidentKey ?? alertEpisodeKey(alert),
+    });
+  } catch (error) {
+    console.warn(`descartes: delivery failure status update failed for alert ${alert.id}: ${error?.message ?? error}`);
+  }
+}
+
+async function recordRouteFailureForItem(descartesPaths, item, now, reason) {
+  await recordDeliveryFailureIfPossible(descartesPaths, item.alert, {
+    now,
+    reason,
+    episodeKey: incidentKeyForAlert(item.alert),
+    incidentKey: incidentKeyForAlert(item.alert),
+  });
+}
+
+async function recordRouteFailuresForItems(descartesPaths, items, now, reason) {
+  if (!descartesPaths?.stateDir || items.length === 0) return;
+  await recordAlertDeliveryFailures(descartesPaths, items.map(({ alert }) => ({
+    alertId: alert.id,
+    incidentKey: incidentKeyForAlert(alert),
+    reason,
+  })), { now });
+}
+
+async function deliveryStillDue(descartesPaths, alert, now, incidentKey = incidentKeyForAlert(alert), alertRecords) {
+  if (!descartesPaths?.stateDir) return true;
+  const current = (alertRecords ?? await readAlertRecords(descartesPaths)).find((entry) => entry.id === alert.id);
+  // Pure/unit callers may intentionally provide an evaluation without a persisted alert record.
+  // The daemon path always has one; only a persisted record can prove that a stale evaluation was
+  // already delivered.
+  if (!current) return true;
+  if (["recovered", "suppressed"].includes(current.status)) return false;
+  if (incidentKey === INCIDENT_STORM_KEY) {
+    if (current.incident_storm_notified_at) return false;
+    return deliveryStillDueForFields(current, now);
+  }
+  const incident = current.incidents?.[incidentKey];
+  if (!incident) return false;
+  const currentRank = alertSeverityRank(incident.severity_max);
+  const notifiedRank = alertSeverityRank(incident.notified_severity);
+  if (incident.confirmed_at && currentRank <= notifiedRank) return false;
+  return deliveryStillDueForFields(incident, now);
+}
+
+function deliveryStillDueForFields(current, now) {
+  const nowMs = new Date(now).getTime();
+  const lastAttemptMs = current.last_attempt_at ? new Date(current.last_attempt_at).getTime() : NaN;
+  if (Number.isFinite(lastAttemptMs) && lastAttemptMs <= nowMs && Number.isFinite(current.backoff_delay_ms)
+    && nowMs < lastAttemptMs + current.backoff_delay_ms) return false;
+  return true;
+}
 
 // S13 must-fix 2: a critical-severity call is guaranteed a slot out of max_calls_per_hour so a
 // burst of non-critical (e.g. learned-artifact) findings cannot starve a real emergency
@@ -476,6 +647,8 @@ async function hasRecentBudgetExhaustedNotification(descartesPaths, now, windowM
 // very gate protects.
 async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, droppedCritical, deliverNotification }) {
   if (await hasRecentBudgetExhaustedNotification(descartesPaths, now)) {
+    // budget_exhausted is a meta-signal, not an alert episode; it intentionally retains its own
+    // one-hour delivery window.
     return { fired: false, reason: "cooldown" };
   }
   const severity = droppedCritical > 0 ? "critical" : "warning";
@@ -509,13 +682,13 @@ async function emitBudgetExhaustedSignal(descartesPaths, { now, droppedTotal, dr
 //     unrelated fail-closed namespace;
 //   - the decision handed to deliverNotificationDecision is hand-built and deterministic — never
 //     a session, never an LLM call;
-//   - reuses the notification_due_ids/cooldown state applyAlertCandidates already computed for
+//   - reuses the notification_due_ids/episode state applyAlertCandidates already computed for
 //     every candidate (including these two rule_ids) inside evaluateAndPersistAlerts — no new
-//     cooldown machinery. Correction, load-bearing (must-fix 3): applyAlertCandidates stamps
-//     last_notified/cooldown_until on a candidate even when nothing is actually delivered
-//     downstream — that stamp reflects only that the candidate was processed, not that any
-//     human-visible delivery happened. This function's own tests assert on an actual call into
-//     (or mock of) deliverNotificationDecision, never merely on the cooldown/last_notified fields;
+//     episode machinery. Correction, load-bearing (must-fix 3): applyAlertCandidates stamps
+//     episode notification state on a candidate even when nothing is actually delivered downstream
+//     — that stamp reflects only that the candidate was processed, not that any human-visible
+//     delivery happened. This function's own tests assert on an actual call into (or mock of)
+//     deliverNotificationDecision, never merely on persisted episode fields;
 //   - the delivered body is counts/hash-only for session.*/peer.* — never a raw session/peer
 //     identity, matching the sanitized diagnostics shape those candidate builders already produce.
 //     EXCEPTION (operator decision, 2026-07-24, scoped to service.disappeared ONLY): the delivered
@@ -526,8 +699,8 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array `notification_due_ids` (a
   // corrupt/foreign evaluation shape) must degrade to "nothing due", not throw ("is not iterable")
   // out of `new Set(...)` and abort the caller's tick.
-  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
-  if (dueIds.size === 0) return { fired: [] };
+  const dueEntries = incidentEntries(evaluation);
+  if (dueEntries.length === 0) return { fired: [] };
 
   // Slice 4b Decision 3b (Fable review MUST-FIX 4): scoped to the LOCALLY-composed allowlist
   // (session-baseline.js's own two ids, plus PEER_COUNT_SPIKE_RULE_ID/PEER_COUNT_DROP_RULE_ID/
@@ -537,12 +710,20 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   //
   // daybreak-blue #7 (MEDIUM) point 2, defense-in-depth: a non-array `evaluation.alerts` likewise
   // degrades to `[]` rather than throwing ("...filter is not a function") on a corrupt/foreign shape.
-  const dueSessionAlerts = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).filter(
-    (alert) => dueIds.has(alert.id) && ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id),
-  );
+  const dueSessionAlerts = dueEntries
+    .map((entry) => {
+      const alert = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).find((candidate) => candidate.id === entry.alertId);
+      return alert ? { entry, alert: alertForIncident(alert, entry) } : undefined;
+    })
+    .filter((entry) => entry && (entry.entry.storm === true || ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(entry.alert.rule_id)))
+    .sort(compareDueAlerts);
   if (dueSessionAlerts.length === 0) return { fired: [] };
 
   let deliverNotification;
+  const now = options.now ?? new Date().toISOString();
+  const deferAlertStoreUpdates = options.deferAlertStoreUpdates === true;
+  const alertRecords = options.alertRecords;
+  const deliveryOutcomes = [];
   try {
     // daybreak-blue #7 (MEDIUM) point 1: this dynamic import is an unguarded await on the
     // production path (it only runs when the DI seam, options.deliverNotification, is absent). A
@@ -553,9 +734,14 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`descartes: emitSessionAlertSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due session-family alerts reported failed`);
-    return { fired: [], failed: dueSessionAlerts.map((dueAlert) => dueAlert.id) };
+    if (deferAlertStoreUpdates) {
+      deliveryOutcomes.push(...dueSessionAlerts.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: `session_route_unavailable:${message}` })));
+    } else {
+      await recordRouteFailuresForItems(descartesPaths, dueSessionAlerts, now, `session_route_unavailable:${message}`);
+    }
+    const failed = dueSessionAlerts.map(({ alert }) => alert.id);
+    return { fired: [], failed, route_failed: true, delivery_outcomes: deliveryOutcomes };
   }
-  const now = options.now ?? new Date().toISOString();
 
   // Reliability fix (canary v0 finalization, FIX-B): this loop was previously a bare, unguarded
   // `await deliverNotification(...)` -- a PRE-EXISTING general pattern shared by every rule_id in
@@ -573,10 +759,20 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   // canary-scoped special case -- a real daemon-robustness win for the whole family, not just canary.
   const fired = [];
   const failed = [];
-  for (const alert of dueSessionAlerts) {
+  const skipped = [];
+  let routeFailed = false;
+  for (let index = 0; index < dueSessionAlerts.length; index += 1) {
+    const { entry, alert } = dueSessionAlerts[index];
+    if (routeFailed) {
+      skipped.push({ entry, alert });
+      failed.push(alert.id);
+      continue;
+    }
     const decision = buildSessionAlertNotificationDecision(alert);
+    const episodeKey = incidentKeyForAlert(alert);
     try {
-      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
+      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey, alertRecords))) continue;
+      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
       // daybreak-blue #6 (MEDIUM): deliverNotificationDecision RESOLVES (it never throws) with a
       // status enum -- "error"/"unavailable" mean the notification did NOT reach the operator, and
       // must not be reported as fired. Every other resolved status ("recorded"/"delivered"/
@@ -584,18 +780,31 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
       // intentional non-failure outcome -- "disabled"/"cli_only" are config states, not failures --
       // and stays `fired`, matching this function's pre-existing "only a throw means failed"
       // contract for those.
-      if (delivery?.status === "error" || delivery?.status === "unavailable") {
+      if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
+        if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: delivery?.status });
+        else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
         failed.push(alert.id);
+        routeFailed = true;
       } else {
+        if (deferAlertStoreUpdates && deliveryWasSuccessful(delivery)) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "success", severity: alert.severity });
+        else await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
         fired.push(alert.id);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic alert notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
+      if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: message });
+      else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
       failed.push(alert.id);
+      routeFailed = true;
     }
   }
-  return { fired, failed };
+  if (deferAlertStoreUpdates) {
+    deliveryOutcomes.push(...skipped.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: "session_route_circuit_open" })));
+  } else {
+    await recordRouteFailuresForItems(descartesPaths, skipped, now, "session_route_circuit_open");
+  }
+  return { fired, failed, route_failed: routeFailed, delivery_outcomes: deliveryOutcomes };
 }
 
 // Counts/hash-only body (must-fix 3) for every branch EXCEPT service.disappeared: every field
@@ -609,6 +818,14 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
 // does not widen to any other rule_id; session/peer identity stays hashed/counts-only.
 function buildSessionAlertNotificationDecision(alert) {
   const diagnostics = alert?.diagnostics ?? {};
+  if (alert?.incident_key === INCIDENT_STORM_KEY) {
+    return {
+      notify: true,
+      severity: alert.severity === "critical" ? "critical" : "warning",
+      title: alert.title,
+      body: alert.summary,
+    };
+  }
   if (alert?.rule_id === SESSION_COUNT_DROP_RULE_ID) {
     return {
       notify: true,
@@ -858,48 +1075,218 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
 
   // daybreak-blue #7 (MEDIUM) point 2 precedent, applied here too: a corrupt/foreign evaluation
   // shape degrades to "nothing due", not a throw that aborts the caller's tick.
-  const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
-  if (dueIds.size === 0) return { fired: [] };
+  const dueEntries = incidentEntries(evaluation);
+  if (dueEntries.length === 0) return { fired: [] };
 
-  const dueMetricAlerts = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).filter((alert) => {
-    if (!dueIds.has(alert.id)) return false;
+  const dueMetricAlerts = dueEntries.map((entry) => {
+    const alert = (Array.isArray(evaluation?.alerts) ? evaluation.alerts : []).find((candidate) => candidate.id === entry.alertId);
+    if (!alert) return undefined;
+    const incidentAlert = alertForIncident(alert, entry);
     const { namespace, hardExcluded } = classifyAlertNamespace(alert?.rule_id);
-    return !hardExcluded && namespace === "metric";
-  });
+    return !entry.storm && !hardExcluded && namespace === "metric" ? { entry, alert: incidentAlert } : undefined;
+  }).filter(Boolean).sort(compareDueAlerts);
   if (dueMetricAlerts.length === 0) return { fired: [] };
 
   let deliverNotification;
+  const now = options.now ?? new Date().toISOString();
+  const deferAlertStoreUpdates = options.deferAlertStoreUpdates === true;
+  const alertRecords = options.alertRecords;
+  const deliveryOutcomes = [];
   try {
     deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`descartes: emitMetricAlertFallbackSignals notification-delivery module load failed (${message}); degrading this tick (zero deliveries), all due metric-family alerts reported failed`);
-    return { fired: [], failed: dueMetricAlerts.map((a) => a.id) };
+    if (deferAlertStoreUpdates) {
+      deliveryOutcomes.push(...dueMetricAlerts.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: `metric_route_unavailable:${message}` })));
+    } else {
+      await recordRouteFailuresForItems(descartesPaths, dueMetricAlerts, now, `metric_route_unavailable:${message}`);
+    }
+    const failed = dueMetricAlerts.map(({ alert }) => alert.id);
+    return { fired: [], failed, route_failed: true, delivery_outcomes: deliveryOutcomes };
   }
-  const now = options.now ?? new Date().toISOString();
 
   // Same "one alert's delivery failure must degrade, never abort the tick" discipline as
   // emitSessionAlertSignals' own FIX-B loop above.
   const fired = [];
   const failed = [];
-  for (const alert of dueMetricAlerts) {
+  const skipped = [];
+  let routeFailed = false;
+  for (let index = 0; index < dueMetricAlerts.length; index += 1) {
+    const { entry, alert } = dueMetricAlerts[index];
+    if (routeFailed) {
+      skipped.push({ entry, alert });
+      failed.push(alert.id);
+      continue;
+    }
     const decision = {
       notify: true,
       severity: alert.severity === "critical" ? "critical" : "warning",
       title: alert.title,
       body: alert.summary || alert.title,
     };
+    const episodeKey = incidentKeyForAlert(alert);
     try {
-      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id });
-      if (delivery?.status === "error" || delivery?.status === "unavailable") failed.push(alert.id);
-      else fired.push(alert.id);
+      if (!(await deliveryStillDue(descartesPaths, alert, now, episodeKey, alertRecords))) continue;
+      const delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
+      if (delivery?.status === "error" || delivery?.status === "unavailable" || delivery?.status === "disabled" || delivery?.status === "skipped") {
+        if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: delivery?.status });
+        else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status, episodeKey });
+        failed.push(alert.id);
+        routeFailed = true;
+      }
+      else {
+        if (deferAlertStoreUpdates && deliveryWasSuccessful(delivery)) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "success", severity: alert.severity });
+        else await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey: episodeKey });
+        fired.push(alert.id);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`descartes: deterministic metric-fallback notification delivery failed for alert ${alert.id} (rule_id=${alert.rule_id}): ${message}; skipping this delivery, continuing the tick`);
+      if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: episodeKey, status: "failure", reason: message });
+      else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: message, episodeKey, incidentKey: episodeKey });
       failed.push(alert.id);
+      routeFailed = true;
     }
   }
-  return { fired, failed };
+  if (deferAlertStoreUpdates) {
+    deliveryOutcomes.push(...skipped.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: "metric_route_circuit_open" })));
+  } else {
+    await recordRouteFailuresForItems(descartesPaths, skipped, now, "metric_route_circuit_open");
+  }
+  return { fired, failed, route_failed: routeFailed, delivery_outcomes: deliveryOutcomes };
+}
+
+function collectDueDeliveryItems(evaluation, config, options = {}) {
+  const alerts = Array.isArray(evaluation?.alerts) ? evaluation.alerts : [];
+  const byId = new Map(alerts.map((alert) => [alert.id, alert]));
+  const items = [];
+  const seen = new Set();
+  const add = (field, routeFor) => {
+    for (const entry of incidentEntries(evaluation, field)) {
+      const baseAlert = byId.get(entry.alertId);
+      if (!baseAlert) continue;
+      const alert = alertForIncident(baseAlert, entry);
+      const route = routeFor(alert, entry);
+      if (!route) continue;
+      const key = deliveryWorkKey(route, alert, entry);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ route, alert, entry, firstSeenMs: dueIncidentFirstSeenMs(alert, entry), urgency: deliveryUrgency(alert, entry) });
+    }
+  };
+
+  if (options.sessionEnabled !== false) {
+    add("notification_due_incidents", (alert, entry) => entry.storm === true || ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id) ? "session" : undefined);
+  }
+  const metricFallbackEnabled = options.metricEnabled !== false
+    && !config.enabled && !config.unavailable && !config.corrupt
+    && normalizeEnabledNamespaces(config.enabled_namespaces).includes("metric");
+  if (metricFallbackEnabled) {
+    add("notification_due_incidents", (alert, entry) => {
+      const { namespace, hardExcluded } = classifyAlertNamespace(alert.rule_id);
+      return !entry.storm && !hardExcluded && namespace === "metric" ? "metric" : undefined;
+    });
+  }
+  if (options.llmEnabled !== false && config.enabled) {
+    add("adjudication_due_incidents", (alert) => classifyAlertEligibility(alert, config).eligible ? "llm" : undefined);
+  }
+  return items.sort(compareGlobalDeliveryItems);
+}
+
+function appendRouteResult(target, result) {
+  if (!result) return;
+  target.fired.push(...(result.fired ?? []));
+  target.failed.push(...(result.failed ?? []));
+  target.decisions.push(...(result.decisions ?? []));
+  target.dropped_total += result.dropped_total ?? 0;
+  target.dropped_critical += result.dropped_critical ?? 0;
+  target.route_failed ||= result.route_failed === true || ["audit_unavailable", "audit_write_degraded", "dependencies_unavailable"].includes(result.status);
+  target.status = result.status ?? target.status;
+}
+
+// One ordered stream owns the tick. It does not reserve or slice work: every route-qualified due
+// item is visited in severity/new-or-escalated/oldest order. Circuit breakers are route-local, so a
+// failed notifier or unavailable model can skip only its own remaining work while other routes keep
+// making progress. Skips are persisted as ordinary delivery failures, which gives them backoff and
+// prevents a broken route from being selected forever without spending another timeout.
+export async function deliverDueAlertNotifications(descartesPaths, evaluation, options = {}) {
+  const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
+  const now = options.now ?? new Date().toISOString();
+  const alertRecords = options.alertRecords ?? (descartesPaths?.stateDir ? await readAlertRecords(descartesPaths) : undefined);
+  const items = collectDueDeliveryItems(evaluation, config, {
+    sessionEnabled: options.deliverSessionAlerts !== false,
+    metricEnabled: options.deliverMetricAlertFallback !== false,
+    llmEnabled: options.adjudicateAlerts !== false,
+  });
+  const results = {
+    session: { fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
+    metric: { fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
+    llm: { status: config.enabled ? "no_due_alerts" : "disabled", fired: [], failed: [], decisions: [], dropped_total: 0, dropped_critical: 0, route_failed: false },
+  };
+  const breakers = new Set();
+  const emitSession = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
+  const emitMetric = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
+  const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
+  const deliveryOutcomes = [];
+
+  for (const item of items) {
+    const target = results[item.route];
+    if (breakers.has(item.route)) {
+      deliveryOutcomes.push({ alertId: item.alert.id, incidentKey: incidentKeyForAlert(item.alert), status: "failure", reason: `${item.route}_route_circuit_open` });
+      target.failed.push(item.alert.id);
+      continue;
+    }
+    const singleEvaluation = item.route === "llm"
+      ? { ...evaluation, alerts: [item.alert], adjudication_due_incidents: [{ alert_id: item.alert.id, incident_key: item.entry.incidentKey }] }
+      : { ...evaluation, alerts: [item.alert], notification_due_incidents: [{ alert_id: item.alert.id, incident_key: item.entry.incidentKey, storm: item.entry.storm, incident_count: item.entry.incidentCount }] };
+    let result;
+    try {
+      if (item.route === "session") {
+        result = await emitSession(descartesPaths, singleEvaluation, {
+          now, deliverNotification: options.deliverNotification, deferAlertStoreUpdates: true, alertRecords,
+        });
+      } else if (item.route === "metric") {
+        result = await emitMetric(descartesPaths, singleEvaluation, {
+          now, config, deliverNotification: options.deliverNotification, deferAlertStoreUpdates: true, alertRecords,
+        });
+      } else {
+        result = await adjudicate(descartesPaths, singleEvaluation, {
+          now, config, deliverNotification: options.deliverNotification, createSession: options.createSession,
+          appendAuditRecord: options.appendAuditRecord, deferAlertStoreUpdates: true, alertRecords,
+        });
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`descartes: ${item.route}-alert-delivery route failed for alert ${item.alert.id}: ${reason}`);
+      deliveryOutcomes.push({ alertId: item.alert.id, incidentKey: incidentKeyForAlert(item.alert), status: "failure", reason });
+      target.failed.push(item.alert.id);
+      target.route_failed = true;
+      breakers.add(item.route);
+      continue;
+    }
+    appendRouteResult(target, result);
+    deliveryOutcomes.push(...(result?.delivery_outcomes ?? []));
+    if (target.route_failed) breakers.add(item.route);
+  }
+
+  if (deliveryOutcomes.length > 0 && descartesPaths?.stateDir) {
+    try {
+      await recordAlertDeliveryOutcomes(descartesPaths, deliveryOutcomes, {
+        now,
+        onStoreWrite: options.onAlertStoreWrite,
+      });
+    } catch (error) {
+      console.warn(`descartes: batched alert delivery state update failed: ${error?.message ?? error}`);
+    }
+  }
+
+  return {
+    items,
+    sessionAlertDelivery: items.some((item) => item.route === "session") ? results.session : undefined,
+    metricAlertFallback: items.some((item) => item.route === "metric") ? results.metric : undefined,
+    alertIntelligence: results.llm,
+  };
 }
 
 // Slice 6 (observed-incident collectors plan) Decision 3, must-fix 3/1, defense-in-depth: re-runs
@@ -1256,12 +1643,18 @@ function hashPromptText(text) {
 // residual to <=1 per heal-cycle/restart -- documented, not silently accepted.
 export async function adjudicateAlertNotifications(descartesPaths, evaluation, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const deferAlertStoreUpdates = options.deferAlertStoreUpdates === true;
+  const alertRecords = options.alertRecords;
+  const deliveryOutcomes = [];
   const config = options.config ?? await readAlertIntelligenceConfig(descartesPaths);
-  const dueIds = evaluation?.notification_due_ids ?? [];
+  const dueEntries = incidentEntries(evaluation, "adjudication_due_incidents");
   if (!config.enabled) return { status: "disabled", decisions: [] };
-  if (dueIds.length === 0) return { status: "no_due_alerts", decisions: [] };
+  if (dueEntries.length === 0) return { status: "no_due_alerts", decisions: [] };
 
-  const dueAlerts = (evaluation.alerts ?? []).filter((alert) => dueIds.includes(alert.id));
+  const dueAlerts = dueEntries.map((entry) => {
+    const alert = (evaluation.alerts ?? []).find((candidate) => candidate.id === entry.alertId);
+    return alert ? alertForIncident(alert, entry) : undefined;
+  }).filter(Boolean);
 
   // S13 must-fix 4: namespace/eligibility filter applied BEFORE any rate-limit accounting. When
   // alerts are due but none are LLM-eligible (all un-consented / hard-excluded / un-templated),
@@ -1276,6 +1669,14 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   const { auditFile } = resolveAlertIntelligencePaths(descartesPaths);
   const doAppendAuditRecord = options.appendAuditRecord ?? appendAuditRecord;
 
+  const failEligibleRoute = async (reason) => {
+    if (deferAlertStoreUpdates) {
+      deliveryOutcomes.push(...eligibleAlerts.map((alert) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason })));
+    } else {
+      await recordRouteFailuresForItems(descartesPaths, eligibleAlerts.map((alert) => ({ alert })), now, reason);
+    }
+  };
+
   // S13 I/O hardening -- probe-heal: see the module comment above this function for the full
   // ENOSPC-leak rationale. If a PRIOR invocation's append failed for this exact audit path, do not
   // blindly resume calling the LLM -- writes may still be failing. Spend exactly one cheap probe
@@ -1286,7 +1687,8 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
       auditWriteDegradedPaths.delete(auditFile);
     } else {
       console.warn(`descartes: alert intelligence audit writes are still failing at ${auditFile}; skipping adjudication this tick (zero LLM calls) until a write succeeds again`);
-      return { status: "audit_write_degraded", decisions: [], excluded };
+      await failEligibleRoute("llm_route_audit_unavailable");
+      return { status: "audit_write_degraded", decisions: [], excluded, delivery_outcomes: deliveryOutcomes };
     }
   }
 
@@ -1309,7 +1711,8 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     audit = await readBudgetAuditRecordsStrict(descartesPaths, now);
   } catch (error) {
     console.warn(`descartes: alert intelligence audit read failed (${errorLabel(error)}); skipping adjudication this tick (budget cannot be computed)`);
-    return { status: "audit_unavailable", decisions: [], excluded };
+    await failEligibleRoute("llm_route_audit_unavailable");
+    return { status: "audit_unavailable", decisions: [], excluded, delivery_outcomes: deliveryOutcomes };
   }
   const historical = partitionRecentAuditCounts(audit, now);
   // RUNNING per-class counters, seeded from trailing-hour audit history and incremented as calls
@@ -1333,13 +1736,16 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     deliverNotification = options.deliverNotification ?? (await import("./notification-delivery.js")).deliverNotificationDecision;
   } catch (error) {
     console.warn(`descartes: alert intelligence session/delivery module load failed (${errorLabel(error)}); skipping adjudication this tick (zero LLM calls)`);
-    return { status: "dependencies_unavailable", decisions: [], excluded };
+    await failEligibleRoute("llm_route_dependencies_unavailable");
+    return { status: "dependencies_unavailable", decisions: [], excluded, delivery_outcomes: deliveryOutcomes };
   }
 
   const records = [];
   let droppedTotal = 0;
   let droppedCritical = 0;
   let auditWriteFailed = false;
+  let routeFailed = false;
+  const skipped = [];
 
   // S13 must-fix 3, drop site 1 ("fully-exhausted early path"): if the trailing hour (plus nothing
   // yet made this invocation) already meets/exceeds the hard cap, every eligible alert -- critical
@@ -1351,7 +1757,12 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
     droppedTotal = orderedAlerts.length;
     droppedCritical = orderedAlerts.filter((alert) => alert.severity === "critical").length;
   } else {
-    for (const alert of orderedAlerts) {
+    for (let alertIndex = 0; alertIndex < orderedAlerts.length; alertIndex += 1) {
+      const alert = orderedAlerts[alertIndex];
+      if (routeFailed) {
+        skipped.push({ alert });
+        continue;
+      }
       const isCritical = alert.severity === "critical";
       const totalSoFar = runningCritical + runningNonCritical;
       // S13 must-fix 2 INVARIANT: total LLM calls in the trailing hour (+ this invocation) must
@@ -1514,9 +1925,22 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
         }
         const rawText = contentToText(finalAssistantMessage.content).trim();
         const decision = normalizeAlertNotificationDecision(parseDecisionJson(rawText));
-        const delivery = decision.notify
-          ? await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id })
-          : undefined;
+        let delivery;
+        const incidentKey = incidentKeyForAlert(alert);
+        const episodeKey = incidentKey;
+        if (decision.notify) {
+          if (!(await deliveryStillDue(descartesPaths, alert, now, incidentKey, alertRecords))) throw new Error("delivery_no_longer_due");
+          delivery = await deliverNotification(descartesPaths, decision, { now, alertId: alert.id, ruleId: alert.rule_id, episodeKey });
+        }
+        if (decision.notify) {
+          if (!deliveryWasSuccessful(delivery)) {
+            if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey, status: "failure", reason: delivery?.status ?? "delivery_failed" });
+            else await recordDeliveryFailureIfPossible(descartesPaths, alert, { now, reason: delivery?.status ?? "delivery_failed", episodeKey, incidentKey });
+            routeFailed = true;
+          } else if (deferAlertStoreUpdates) {
+            deliveryOutcomes.push({ alertId: alert.id, incidentKey, status: "success", severity: alert.severity });
+          } else await confirmDeliveryIfPossible(descartesPaths, alert, delivery, { now, episodeKey, incidentKey });
+        }
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
           alert_id: alert.id,
@@ -1536,9 +1960,29 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
           prompt_hash: hashPromptText(promptText),
           prompt_template_version: ALERT_INTELLIGENCE_PROMPT_TEMPLATE_VERSION,
           decision,
+          adjudication: { notify: decision.notify, episode_key: incidentKeyForAlert(alert), incident_key: incidentKeyForAlert(alert) },
           delivery,
         });
+        if (appended && !decision.notify) {
+          if (deferAlertStoreUpdates) deliveryOutcomes.push({
+            alertId: alert.id,
+            incidentKey: incidentKeyForAlert(alert),
+            status: "adjudication",
+            notify: false,
+            severity: alert.severity,
+          });
+          else await recordAlertAdjudication(descartesPaths, alert.id, {
+            now, severity: alert.severity, episodeKey: incidentKeyForAlert(alert),
+            incidentKey: incidentKeyForAlert(alert), notify: false,
+          });
+        }
       } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (deferAlertStoreUpdates) deliveryOutcomes.push({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason });
+        else await recordDeliveryFailureIfPossible(descartesPaths, alert, {
+          now, reason, episodeKey: incidentKeyForAlert(alert), incidentKey: incidentKeyForAlert(alert),
+        });
+        routeFailed = true;
         appended = await safeAppendAuditRecord(doAppendAuditRecord, descartesPaths, {
           ts: now,
           alert_id: alert.id,
@@ -1561,6 +2005,7 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
 
       if (appended) {
         records.push(appended);
+        if (routeFailed) continue;
         continue;
       }
 
@@ -1574,8 +2019,15 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
       auditWriteDegradedPaths.add(auditFile);
       auditWriteFailed = true;
       console.warn(`descartes: alert intelligence audit append failed for alert ${alert.id}; halting further LLM calls this tick and latching audit writes as degraded at ${auditFile}`);
+      for (let index = alertIndex + 1; index < orderedAlerts.length; index += 1) skipped.push({ alert: orderedAlerts[index] });
       break;
     }
+  }
+
+  if (deferAlertStoreUpdates) {
+    deliveryOutcomes.push(...skipped.map(({ alert }) => ({ alertId: alert.id, incidentKey: incidentKeyForAlert(alert), status: "failure", reason: "llm_route_circuit_open" })));
+  } else {
+    await recordRouteFailuresForItems(descartesPaths, skipped, now, "llm_route_circuit_open");
   }
 
   let budgetExhausted;
@@ -1605,5 +2057,5 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   const status = auditWriteFailed
     ? "audit_write_degraded"
     : records.length === 0 && droppedTotal > 0 ? "rate_limited" : "ok";
-  return { status, decisions: records, excluded, dropped_total: droppedTotal, dropped_critical: droppedCritical, budget_exhausted: budgetExhausted };
+  return { status, decisions: records, excluded, dropped_total: droppedTotal, dropped_critical: droppedCritical, budget_exhausted: budgetExhausted, route_failed: routeFailed, delivery_outcomes: deliveryOutcomes };
 }

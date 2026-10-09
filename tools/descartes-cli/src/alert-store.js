@@ -5,7 +5,16 @@ import { buildHistorySummary, readDaemonStatus } from "./history-store.js";
 
 export const DEFAULT_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
+export const DELIVERY_BACKOFF_BASE_MS = 60_000;
+export const DELIVERY_BACKOFF_CAP_MS = 60 * 60 * 1000;
+export const MAX_LIVE_INCIDENTS = 256;
+export const INCIDENT_STORM_KEY = "__incident_storm__";
 export const RETENTION_FAILURE_RULE_ID = "daemon.fact_store.retention_failing";
+
+// Retained as a compatibility export for the historical alert-config constraint and callers that
+// import the old symbol. Alert delivery no longer uses this value: episode state below is the only
+// notification policy for ordinary alerts. The budget_exhausted meta-signal keeps its own one-hour
+// delivery window in alert-intelligence.js.
 
 export function resolveAlertStorePaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "alerts");
@@ -53,6 +62,23 @@ function pushCandidate(candidates, candidate) {
     evidence_refs: ["history-summary"],
     ...candidate,
   });
+}
+
+function normalizeIncidentKey(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (/^[A-Za-z0-9._:-]{1,128}$/.test(text)) return text;
+  return `sha256:${crypto.createHash("sha256").update(text).digest("hex")}`;
+}
+
+function normalizeIncidentKeyList(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(normalizeIncidentKey).filter(Boolean))];
+}
+
+export function alertEpisodeKey(alertOrCandidate = {}) {
+  return normalizeIncidentKey(alertOrCandidate.current_incident_key ?? alertOrCandidate.incident_key) ?? "default";
 }
 
 // The complete, static set of rule_ids evaluateAlertRules() can ever produce. Used to scope
@@ -253,20 +279,144 @@ export function normalizeAlertRecord(record) {
   const fingerprint = String(record.fingerprint ?? "global");
   const firstSeen = normalizeIso(record.first_seen ?? record.last_seen ?? new Date().toISOString(), "first_seen");
   const lastSeen = normalizeIso(record.last_seen ?? firstSeen, "last_seen");
+  const status = ["active", "recovered", "acknowledged", "suppressed"].includes(record.status) ? record.status : "active";
+  const lastNotified = record.last_notified ? normalizeIso(record.last_notified, "last_notified") : null;
+  const episodeNotifiedAt = record.episode_notified_at ? normalizeIso(record.episode_notified_at, "episode_notified_at") : null;
+  const normalizedCurrentIncidentKey = normalizeIncidentKey(record.current_incident_key ?? record.incident_key) ?? "default";
+  const legacyWithoutEpisode = record.legacy_without_episode === true
+    || (!record.episode_started_at && !record.episode_notified_at && !record.current_incident_key && !record.incident_key && !record.incidents);
+  const legacyPayload = {
+    severity: record.severity,
+    title: record.title,
+    summary: record.summary,
+    evidence_refs: record.evidence_refs,
+    diagnostics: record.diagnostics,
+  };
+  const rawIncidents = record.incidents && typeof record.incidents === "object" && !Array.isArray(record.incidents)
+    ? record.incidents
+    : {};
+  const incidents = {};
+  const singleLegacyProjection = Object.keys(rawIncidents).length === 1;
+  for (const [rawKey, rawIncident] of Object.entries(rawIncidents)) {
+    const key = normalizeIncidentKey(rawKey);
+    if (!key || !rawIncident || typeof rawIncident !== "object") continue;
+    const fallback = rawKey === normalizedCurrentIncidentKey ? legacyPayload : {};
+    const compatibilityCurrent = singleLegacyProjection && rawKey === normalizedCurrentIncidentKey;
+    const compatibilityLastAttempt = compatibilityCurrent && record.last_attempt_at && record.last_attempt_at !== rawIncident.last_attempt_at ? record.last_attempt_at : rawIncident.last_attempt_at;
+    const compatibilityBackoff = compatibilityCurrent && Number.isFinite(record.backoff_delay_ms) && record.backoff_delay_ms !== rawIncident.backoff_delay_ms ? record.backoff_delay_ms : rawIncident.backoff_delay_ms;
+    const compatibilityNextAttempt = compatibilityCurrent && record.next_attempt_at && record.next_attempt_at !== rawIncident.next_attempt_at ? record.next_attempt_at : rawIncident.next_attempt_at;
+    const compatibilityNotifiedSeverity = compatibilityCurrent && record.notified_severity_max && record.notified_severity_max !== rawIncident.notified_severity ? record.notified_severity_max : undefined;
+    const compatibilityConfirmedAt = compatibilityCurrent && episodeNotifiedAt && episodeNotifiedAt !== rawIncident.confirmed_at ? episodeNotifiedAt : undefined;
+    const incidentFirstSeen = normalizeIso(rawIncident.first_seen ?? record.episode_started_at ?? firstSeen, "incident.first_seen");
+    const incidentLastSeen = normalizeIso(rawIncident.last_seen ?? record.last_seen ?? incidentFirstSeen, "incident.last_seen");
+    const severityMax = rawIncident.severity_max ?? rawIncident.severity ?? fallback.severity ?? record.severity ?? "warning";
+    const topConfirmsCurrent = rawKey === normalizedCurrentIncidentKey && episodeNotifiedAt
+      && (normalizeIncidentKeyList(record.notified_incident_keys).length === 0 || normalizeIncidentKeyList(record.notified_incident_keys).includes(rawKey));
+    const notifiedSeverity = compatibilityNotifiedSeverity ?? rawIncident.notified_severity ?? rawIncident.notified_severity_max ?? (topConfirmsCurrent ? record.notified_severity_max : null);
+    incidents[key] = {
+      first_seen: incidentFirstSeen,
+      last_seen: incidentLastSeen,
+      severity_max: String(severityMax),
+      notified_severity: notifiedSeverity === null || notifiedSeverity === undefined ? null : String(notifiedSeverity),
+      confirmed_at: compatibilityConfirmedAt ? normalizeIso(compatibilityConfirmedAt, "incident.confirmed_at") : (rawIncident.confirmed_at ? normalizeIso(rawIncident.confirmed_at, "incident.confirmed_at") : (rawIncident.episode_notified_at ? normalizeIso(rawIncident.episode_notified_at, "incident.episode_notified_at") : (topConfirmsCurrent ? episodeNotifiedAt : null))),
+      delivery_failure_count: Number.isInteger(rawIncident.delivery_failure_count) && rawIncident.delivery_failure_count > 0 ? rawIncident.delivery_failure_count : 0,
+      next_attempt_at: compatibilityNextAttempt ? normalizeIso(compatibilityNextAttempt, "incident.next_attempt_at") : null,
+      backoff_delay_ms: Number.isFinite(compatibilityBackoff) && compatibilityBackoff > 0 ? Math.min(compatibilityBackoff, DELIVERY_BACKOFF_CAP_MS) : null,
+      status: ["active", "recovered", "acknowledged", "suppressed"].includes(rawIncident.status) ? rawIncident.status : "active",
+      last_attempt_at: compatibilityLastAttempt ? normalizeIso(compatibilityLastAttempt, "incident.last_attempt_at") : null,
+      last_delivery_failure_at: rawIncident.last_delivery_failure_at ? normalizeIso(rawIncident.last_delivery_failure_at, "incident.last_delivery_failure_at") : null,
+      delivery_failure_reason: rawIncident.delivery_failure_reason ? String(rawIncident.delivery_failure_reason) : null,
+      delivery_failing_since: rawIncident.delivery_failing_since ? normalizeIso(rawIncident.delivery_failing_since, "incident.delivery_failing_since") : null,
+      adjudicated_at: rawIncident.adjudicated_at ? normalizeIso(rawIncident.adjudicated_at, "incident.adjudicated_at") : null,
+      adjudication: rawIncident.adjudication && typeof rawIncident.adjudication === "object" && !Array.isArray(rawIncident.adjudication)
+        ? { notify: rawIncident.adjudication.notify === true, severity: rawIncident.adjudication.severity === undefined ? undefined : String(rawIncident.adjudication.severity) }
+        : null,
+      payload: {
+        severity: String(rawIncident.payload?.severity ?? rawIncident.severity ?? fallback.severity ?? record.severity ?? "warning"),
+        title: String(rawIncident.payload?.title ?? rawIncident.title ?? fallback.title ?? record.title ?? ruleId),
+        summary: String(rawIncident.payload?.summary ?? rawIncident.summary ?? fallback.summary ?? record.summary ?? ""),
+        evidence_refs: Array.isArray(rawIncident.payload?.evidence_refs ?? rawIncident.evidence_refs ?? fallback.evidence_refs) ? (rawIncident.payload?.evidence_refs ?? rawIncident.evidence_refs ?? fallback.evidence_refs).map(String).slice(0, 16) : [],
+        diagnostics: rawIncident.payload?.diagnostics ?? rawIncident.diagnostics ?? fallback.diagnostics ?? {},
+      },
+    };
+  }
+  // Migrate the prior single-episode representation to one incident without treating an old
+  // record as proof that the current activation was delivered. A record with no episode marker is
+  // deliberately tagged legacy_without_episode and remains silent until the alert recovers.
+  if (Object.keys(incidents).length === 0 && (record.episode_started_at || record.current_incident_key || record.incident_key || record.episode_notified_at)) {
+    const key = normalizedCurrentIncidentKey;
+    const notifiedKeys = normalizeIncidentKeyList(record.notified_incident_keys);
+    if (notifiedKeys.length === 0 && episodeNotifiedAt) notifiedKeys.push(key);
+    incidents[key] = {
+      first_seen: record.episode_started_at ?? firstSeen,
+      last_seen: lastSeen,
+      severity_max: String(record.severity ?? "warning"),
+      notified_severity: notifiedKeys.includes(key) ? (record.notified_severity_max ?? record.severity ?? null) : null,
+      confirmed_at: notifiedKeys.includes(key) ? episodeNotifiedAt : null,
+      delivery_failure_count: Number.isInteger(record.delivery_failure_count) && record.delivery_failure_count > 0 ? record.delivery_failure_count : 0,
+      next_attempt_at: record.next_attempt_at ? normalizeIso(record.next_attempt_at, "next_attempt_at") : null,
+      backoff_delay_ms: Number.isFinite(record.backoff_delay_ms) && record.backoff_delay_ms > 0 ? Math.min(record.backoff_delay_ms, DELIVERY_BACKOFF_CAP_MS) : null,
+      status: status === "recovered" ? "recovered" : "active",
+      last_attempt_at: record.last_attempt_at ? normalizeIso(record.last_attempt_at, "last_attempt_at") : null,
+      last_delivery_failure_at: record.last_delivery_failure_at ? normalizeIso(record.last_delivery_failure_at, "last_delivery_failure_at") : null,
+      delivery_failure_reason: record.delivery_failure_reason ? String(record.delivery_failure_reason) : null,
+      delivery_failing_since: record.delivery_failing_since ? normalizeIso(record.delivery_failing_since, "delivery_failing_since") : null,
+      adjudicated_at: record.adjudicated_at ? normalizeIso(record.adjudicated_at, "adjudicated_at") : null,
+      adjudication: record.adjudication,
+      payload: legacyPayload,
+    };
+  }
+  const notifiedIncidentKeys = [...new Set([
+    ...normalizeIncidentKeyList(record.notified_incident_keys),
+    ...Object.entries(incidents).filter(([, incident]) => incident.confirmed_at).map(([key]) => key),
+  ])];
+  const notifiedSeverityMax = record.notified_severity_max === undefined || record.notified_severity_max === null
+    ? null
+    : String(record.notified_severity_max);
+  const incidentState = record.incident_state === "incident_storm" ? "incident_storm" : "normal";
   return {
     id: String(record.id ?? alertId(ruleId, fingerprint)),
     rule_id: ruleId,
     fingerprint,
-    status: ["active", "recovered", "acknowledged", "suppressed"].includes(record.status) ? record.status : "active",
-    severity: ["info", "warning", "critical"].includes(record.severity) ? record.severity : "warning",
+    incident_key: normalizeIncidentKey(record.incident_key),
+    current_incident_key: Object.hasOwn(incidents, normalizedCurrentIncidentKey) ? normalizedCurrentIncidentKey : (Object.keys(incidents).sort()[0] ?? normalizeIncidentKey(record.current_incident_key ?? record.incident_key)),
+    episode_incident_keys: Object.keys(incidents).sort(),
+    notified_incident_keys: notifiedIncidentKeys,
+    incident_key_overflow: record.incident_key_overflow === true || incidentState === "incident_storm",
+    incidents,
+    incident_state: incidentState,
+    incident_storm_count: Number.isInteger(record.incident_storm_count) && record.incident_storm_count > 0 ? record.incident_storm_count : 0,
+    incident_storm_notified_at: record.incident_storm_notified_at ? normalizeIso(record.incident_storm_notified_at, "incident_storm_notified_at") : null,
+    incident_storm_failure_count: Number.isInteger(record.incident_storm_failure_count) && record.incident_storm_failure_count > 0 ? record.incident_storm_failure_count : 0,
+    legacy_without_episode: legacyWithoutEpisode,
+    status,
+    severity: record.severity === undefined || record.severity === null ? "warning" : String(record.severity),
     title: String(record.title ?? ruleId),
     summary: String(record.summary ?? ""),
     evidence_refs: Array.isArray(record.evidence_refs) ? record.evidence_refs.map(String).slice(0, 16) : [],
     first_seen: firstSeen,
     last_seen: lastSeen,
-    last_notified: record.last_notified ? normalizeIso(record.last_notified, "last_notified") : null,
+    last_notified: lastNotified,
     cooldown_until: record.cooldown_until ? normalizeIso(record.cooldown_until, "cooldown_until") : null,
     acknowledged_at: record.acknowledged_at ? normalizeIso(record.acknowledged_at, "acknowledged_at") : null,
+    // A missing episode_started_at is meaningful legacy state: it cannot prove delivery after
+    // the current activation and must remain missing until applyAlertCandidates starts the upgrade
+    // episode. Never synthesize first_seen here.
+    episode_started_at: record.episode_started_at ? normalizeIso(record.episode_started_at, "episode_started_at") : null,
+    notified_severity_max: notifiedSeverityMax,
+    episode_notified_at: episodeNotifiedAt,
+    adjudicated_at: record.adjudicated_at ? normalizeIso(record.adjudicated_at, "adjudicated_at") : null,
+    adjudicated_episode_key: normalizeIncidentKey(record.adjudicated_episode_key),
+    adjudication: record.adjudication && typeof record.adjudication === "object" && !Array.isArray(record.adjudication)
+      ? { notify: record.adjudication.notify === true, severity: record.adjudication.severity === undefined ? undefined : String(record.adjudication.severity) }
+      : null,
+    delivery_failure_count: Number.isInteger(record.delivery_failure_count) && record.delivery_failure_count > 0 ? record.delivery_failure_count : 0,
+    last_delivery_failure_at: record.last_delivery_failure_at ? normalizeIso(record.last_delivery_failure_at, "last_delivery_failure_at") : null,
+    delivery_failure_reason: record.delivery_failure_reason ? String(record.delivery_failure_reason) : null,
+    delivery_failing_since: record.delivery_failing_since ? normalizeIso(record.delivery_failing_since, "delivery_failing_since") : null,
+    next_attempt_at: record.next_attempt_at ? normalizeIso(record.next_attempt_at, "next_attempt_at") : null,
+    last_attempt_at: record.last_attempt_at ? normalizeIso(record.last_attempt_at, "last_attempt_at") : null,
+    backoff_delay_ms: Number.isFinite(record.backoff_delay_ms) && record.backoff_delay_ms > 0 ? Math.min(record.backoff_delay_ms, DELIVERY_BACKOFF_CAP_MS) : null,
     diagnostics: record.diagnostics && typeof record.diagnostics === "object" && !Array.isArray(record.diagnostics) ? record.diagnostics : {},
   };
 }
@@ -305,7 +455,7 @@ export async function readAlertRecords(descartesPaths) {
   }
 }
 
-export async function writeAlertRecords(descartesPaths, alerts) {
+async function writeAlertRecordsUnlocked(descartesPaths, alerts) {
   await ensureAlertDir(descartesPaths);
   const { alertsFile } = resolveAlertStorePaths(descartesPaths);
   const normalized = alerts.map(normalizeAlertRecord).sort((left, right) => {
@@ -314,26 +464,120 @@ export async function writeAlertRecords(descartesPaths, alerts) {
     return right.last_seen.localeCompare(left.last_seen);
   });
   const payload = JSON.stringify({ version: 1, alerts: normalized }, null, 2);
-  const tmpFile = `${alertsFile}.${process.pid}.tmp`;
+  const tmpFile = `${alertsFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(tmpFile, payload, { mode: 0o600 });
   await fs.rename(tmpFile, alertsFile);
   return normalized;
 }
 
-function notificationDue(alert, nowMs) {
-  if (["acknowledged", "suppressed", "recovered"].includes(alert.status)) return false;
-  if (!alert.last_notified) return true;
-  const cooldownMs = alert.cooldown_until ? new Date(alert.cooldown_until).getTime() : undefined;
-  return Number.isFinite(cooldownMs) ? nowMs >= cooldownMs : false;
+export async function writeAlertRecords(descartesPaths, alerts) {
+  return writeAlertRecordsUnlocked(descartesPaths, alerts);
+}
+
+const ALERT_SEVERITY_RANK = { info: 0, warning: 1, critical: 2 };
+export function alertSeverityRank(severity) {
+  return Object.hasOwn(ALERT_SEVERITY_RANK, severity) ? ALERT_SEVERITY_RANK[severity] : 3;
+}
+
+function deliveryBackoffEligible(alert, nowMs) {
+  if (!Number.isFinite(nowMs)) return true;
+  const lastAttemptMs = alert.last_attempt_at ? new Date(alert.last_attempt_at).getTime() : NaN;
+  const delayMs = Number.isFinite(alert.backoff_delay_ms) ? alert.backoff_delay_ms : undefined;
+  if (!Number.isFinite(lastAttemptMs) || !Number.isFinite(delayMs)) {
+    if (!alert.next_attempt_at) return true;
+    const nextAttemptMs = new Date(alert.next_attempt_at).getTime();
+    return !Number.isFinite(nextAttemptMs) || nextAttemptMs <= nowMs;
+  }
+  // A future last-attempt timestamp is a clock rollback artifact. It must never suppress a retry.
+  if (lastAttemptMs > nowMs) return true;
+  return nowMs >= lastAttemptMs + delayMs;
+}
+
+function incidentSeverityRank(incident) {
+  return alertSeverityRank(incident?.severity_max ?? incident?.payload?.severity);
+}
+
+function candidatePayload(candidate) {
+  return {
+    severity: String(candidate.severity ?? "warning"),
+    title: String(candidate.title ?? candidate.rule_id ?? "Alert"),
+    summary: String(candidate.summary ?? ""),
+    evidence_refs: Array.isArray(candidate.evidence_refs) ? candidate.evidence_refs.map(String).slice(0, 16) : [],
+    diagnostics: candidate.diagnostics && typeof candidate.diagnostics === "object" && !Array.isArray(candidate.diagnostics) ? candidate.diagnostics : {},
+  };
+}
+
+function stableCandidate(left, right) {
+  const leftRank = alertSeverityRank(left.severity);
+  const rightRank = alertSeverityRank(right.severity);
+  if (leftRank !== rightRank) return leftRank > rightRank ? left : right;
+  const leftText = JSON.stringify({ title: left.title ?? "", summary: left.summary ?? "", diagnostics: left.diagnostics ?? {}, evidence_refs: left.evidence_refs ?? [] });
+  const rightText = JSON.stringify({ title: right.title ?? "", summary: right.summary ?? "", diagnostics: right.diagnostics ?? {}, evidence_refs: right.evidence_refs ?? [] });
+  return leftText.localeCompare(rightText) <= 0 ? left : right;
+}
+
+function syncAlertProjection(alert) {
+  const keys = Object.keys(alert.incidents ?? {}).sort();
+  const preferredKey = keys.reduce((selected, key) => {
+    if (!selected) return key;
+    const selectedIncident = alert.incidents[selected];
+    const incident = alert.incidents[key];
+    if (incidentSeverityRank(incident) !== incidentSeverityRank(selectedIncident)) {
+      return incidentSeverityRank(incident) > incidentSeverityRank(selectedIncident) ? key : selected;
+    }
+    return key.localeCompare(selected) < 0 ? key : selected;
+  }, undefined) ?? "default";
+  const current = alert.incidents?.[preferredKey];
+  const allIncidents = Object.values(alert.incidents ?? {});
+  const confirmed = allIncidents.filter((incident) => incident.confirmed_at);
+  const notified = [...new Set(confirmed.map((incident) => incident.notified_severity).filter(Boolean))]
+    .sort((left, right) => alertSeverityRank(right) - alertSeverityRank(left));
+  const payload = current?.payload ?? {};
+  const stormRetry = alert.incident_state === "incident_storm";
+  return normalizeAlertRecord({
+    ...alert,
+    incident_key: preferredKey === "default" ? null : preferredKey,
+    current_incident_key: preferredKey,
+    episode_incident_keys: keys,
+    notified_incident_keys: confirmed.map((incident) => keys.find((key) => alert.incidents[key] === incident)).filter(Boolean),
+    severity: allIncidents.reduce((max, incident) => incidentSeverityRank(incident) > alertSeverityRank(max) ? incident.severity_max : max, "info"),
+    title: payload.title ?? alert.title,
+    summary: payload.summary ?? alert.summary,
+    evidence_refs: payload.evidence_refs ?? alert.evidence_refs,
+    diagnostics: payload.diagnostics ?? alert.diagnostics,
+    first_seen: alert.first_seen,
+    last_seen: alert.last_seen,
+    last_notified: confirmed.map((incident) => incident.confirmed_at).sort().at(-1) ?? null,
+    notified_severity_max: notified[0] ?? null,
+    episode_notified_at: confirmed.map((incident) => incident.confirmed_at).sort().at(-1) ?? null,
+    delivery_failure_count: stormRetry ? alert.delivery_failure_count ?? 0 : current?.delivery_failure_count ?? 0,
+    last_delivery_failure_at: stormRetry ? alert.last_delivery_failure_at ?? null : current?.last_delivery_failure_at ?? null,
+    delivery_failure_reason: stormRetry ? alert.delivery_failure_reason ?? null : current?.delivery_failure_reason ?? null,
+    delivery_failing_since: stormRetry ? alert.delivery_failing_since ?? null : current?.delivery_failing_since ?? null,
+    next_attempt_at: stormRetry ? alert.next_attempt_at ?? null : current?.next_attempt_at ?? null,
+    last_attempt_at: stormRetry ? alert.last_attempt_at ?? null : current?.last_attempt_at ?? null,
+    backoff_delay_ms: stormRetry ? alert.backoff_delay_ms ?? null : current?.backoff_delay_ms ?? null,
+    incident_storm_failure_count: alert.incident_storm_failure_count ?? 0,
+    adjudicated_at: current?.adjudicated_at ?? null,
+    adjudicated_episode_key: current?.adjudicated_at ? preferredKey : null,
+    adjudication: current?.adjudication ?? null,
+  });
+}
+
+function notificationDueForIncident(alert, incident, { newIncident = false, severityEscalated = false, nowMs } = {}) {
+  if (!incident || ["suppressed", "recovered"].includes(alert.status) || ["suppressed", "recovered"].includes(incident.status)) return false;
+  if (newIncident || severityEscalated) return true;
+  if (alert.status === "acknowledged" && incident.status === "acknowledged") return false;
+  if (incident.confirmed_at && incidentSeverityRank(incident) <= alertSeverityRank(incident.notified_severity)) return false;
+  return deliveryBackoffEligible({ last_attempt_at: incident.last_attempt_at, backoff_delay_ms: incident.backoff_delay_ms }, nowMs);
 }
 
 export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
-  const nowMs = new Date(now).getTime();
-  const cooldownMs = options.cooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
   const byId = new Map(existingAlerts.map((alert) => [alert.id, normalizeAlertRecord(alert)]));
   const activeCandidateIds = new Set(candidates.map((candidate) => candidate.id));
-  const notificationDueIds = [];
+  const notificationDueIncidents = [];
+  const adjudicationDueIncidents = [];
   // Detector-reported recovery coverage (§8.A): the covered set is keyed on alert IDENTITY
   // (alert.id = alertId(rule_id, fingerprint)), not rule_id, so recovery is authorized per persisted
   // alert rather than per family. undefined means "unrestricted", i.e. today's exact behavior: any
@@ -344,31 +588,108 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
   // recover the specific alert identities it actually has full visibility into this call.
   const coveredAlertIds = options.coveredAlertIds;
 
+  const grouped = new Map();
   for (const candidate of candidates) {
-    const current = byId.get(candidate.id);
-    const base = current ?? normalizeAlertRecord({
-      ...candidate,
-      status: "active",
-      first_seen: now,
-      last_seen: now,
-    });
-    const nextStatus = base.status === "acknowledged" || base.status === "suppressed" ? base.status : "active";
-    const next = normalizeAlertRecord({
+    if (!candidate?.id) continue;
+    const key = alertEpisodeKey(candidate);
+    const byIncident = grouped.get(candidate.id) ?? new Map();
+    const prior = byIncident.get(key);
+    byIncident.set(key, prior ? stableCandidate(prior, candidate) : candidate);
+    grouped.set(candidate.id, byIncident);
+  }
+
+  for (const id of [...grouped.keys()].sort()) {
+    const incidentCandidates = grouped.get(id);
+    const current = byId.get(id);
+    const firstCandidate = [...incidentCandidates.values()].sort((left, right) => alertEpisodeKey(left).localeCompare(alertEpisodeKey(right)))[0];
+    const newEpisode = !current || current.status === "recovered"
+      || (!current.episode_started_at && !["acknowledged", "suppressed"].includes(current.status));
+    const base = newEpisode
+      ? normalizeAlertRecord({ ...firstCandidate, status: "active", first_seen: now, last_seen: now, episode_started_at: now, incidents: {}, legacy_without_episode: current?.legacy_without_episode === true })
+      : normalizeAlertRecord(current);
+    const next = {
       ...base,
-      ...candidate,
-      status: nextStatus,
+      status: base.status === "acknowledged" || base.status === "suppressed" ? base.status : "active",
       first_seen: base.first_seen,
       last_seen: now,
-      acknowledged_at: nextStatus === "acknowledged" ? base.acknowledged_at : null,
-      last_notified: base.last_notified,
-      cooldown_until: base.cooldown_until,
-    });
-    if (notificationDue(next, nowMs)) {
-      next.last_notified = now;
-      next.cooldown_until = new Date(nowMs + cooldownMs).toISOString();
-      notificationDueIds.push(next.id);
+      episode_started_at: newEpisode ? now : base.episode_started_at,
+      acknowledged_at: base.status === "acknowledged" ? base.acknowledged_at : null,
+      incidents: newEpisode ? {} : { ...base.incidents },
+      incident_state: newEpisode ? "normal" : base.incident_state,
+      incident_storm_count: newEpisode ? 0 : base.incident_storm_count,
+      incident_storm_notified_at: newEpisode ? null : base.incident_storm_notified_at,
+      legacy_without_episode: newEpisode ? base.legacy_without_episode : base.legacy_without_episode,
+    };
+    let overflowCount = 0;
+    const dueForAlert = [];
+    const adjudicationForAlert = [];
+    for (const key of [...incidentCandidates.keys()].sort()) {
+      const candidate = incidentCandidates.get(key);
+      const previousIncident = next.incidents[key];
+      const liveIncidentCount = Object.values(next.incidents).filter((incident) => !["acknowledged", "recovered", "suppressed"].includes(incident.status)).length;
+      if (!previousIncident && liveIncidentCount >= MAX_LIVE_INCIDENTS) {
+        overflowCount += 1;
+        continue;
+      }
+      const payload = candidatePayload(candidate);
+      const incident = previousIncident ?? {
+        first_seen: now,
+        last_seen: now,
+        severity_max: payload.severity,
+        notified_severity: null,
+        confirmed_at: null,
+        delivery_failure_count: 0,
+        next_attempt_at: null,
+        backoff_delay_ms: null,
+        status: "active",
+        last_attempt_at: null,
+        last_delivery_failure_at: null,
+        delivery_failure_reason: null,
+        delivery_failing_since: null,
+        adjudicated_at: null,
+        adjudication: null,
+        payload,
+      };
+      const severityEscalated = incidentSeverityRank({ severity_max: payload.severity }) > incidentSeverityRank(previousIncident);
+      const selectedCandidate = candidate;
+      next.incidents[key] = {
+        ...incident,
+        last_seen: now,
+        severity_max: alertSeverityRank(payload.severity) > incidentSeverityRank(incident) ? payload.severity : incident.severity_max,
+        // Acknowledgement closes the current incident episode for the alert, but the producer may
+        // continue reporting the same old keys. Keep those old keys acknowledged so they do not
+        // consume the post-ack live-key budget or re-notify; genuinely new keys and escalations
+        // remain active and are due under the normal rules.
+        status: base.status === "acknowledged" && previousIncident && !severityEscalated ? previousIncident.status : "active",
+        payload: candidatePayload(selectedCandidate),
+      };
+      const newIncident = !previousIncident;
+      const legacySuppressed = next.legacy_without_episode;
+      if (next.incident_state !== "incident_storm" && !legacySuppressed && notificationDueForIncident(next, next.incidents[key], { newIncident, severityEscalated, nowMs: new Date(now).getTime() })) {
+        dueForAlert.push({ alert_id: id, incident_key: key });
+      }
+      const sameNegativeAdjudication = next.incidents[key].adjudication?.notify === false
+        && next.incidents[key].adjudication?.severity === next.incidents[key].severity_max;
+      if (next.incident_state !== "incident_storm" && !legacySuppressed && !sameNegativeAdjudication && (newIncident || severityEscalated || dueForAlert.some((entry) => entry.incident_key === key))) {
+        adjudicationForAlert.push({ alert_id: id, incident_key: key });
+      }
     }
-    byId.set(next.id, next);
+
+    if (overflowCount > 0) {
+      next.incident_state = "incident_storm";
+      next.incident_key_overflow = true;
+      const liveIncidentCount = Object.values(next.incidents).filter((incident) => !["acknowledged", "recovered", "suppressed"].includes(incident.status)).length;
+      next.incident_storm_count = Math.max(next.incident_storm_count ?? 0, liveIncidentCount + overflowCount);
+      dueForAlert.length = 0;
+      adjudicationForAlert.length = 0;
+      if (!next.incident_storm_notified_at && !["suppressed", "recovered"].includes(next.status) && !next.legacy_without_episode
+        && deliveryBackoffEligible(next, new Date(now).getTime())) {
+        dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
+      }
+    }
+    notificationDueIncidents.push(...dueForAlert);
+    adjudicationDueIncidents.push(...adjudicationForAlert);
+    byId.set(id, syncAlertProjection(next));
   }
 
   for (const [id, alert] of byId) {
@@ -378,13 +699,51 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         ...alert,
         status: "recovered",
         last_seen: now,
+        legacy_without_episode: false,
+        incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, { ...incident, status: "recovered" }])),
       }));
+    }
+  }
+
+  // Retry scanning is deliberately independent of the current candidate groups. Detector
+  // unavailability, an empty candidate set, or a recovery-coverage veto must not make an active
+  // alert forget a failed incident whose persisted backoff has expired. Run this after recovery so
+  // an alert covered by a genuinely empty detector pass is not reported due and recovered in the
+  // same result.
+  for (const [id, alert] of byId) {
+    if (alert.incident_state === "incident_storm") {
+      if (!alert.incident_storm_notified_at && !["suppressed", "recovered"].includes(alert.status)
+        && !alert.legacy_without_episode && deliveryBackoffEligible(alert, new Date(now).getTime())) {
+        if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === INCIDENT_STORM_KEY)) {
+          notificationDueIncidents.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: alert.incident_storm_count });
+        }
+      }
+      continue;
+    }
+    if (alert.legacy_without_episode) continue;
+    for (const [key, incident] of Object.entries(alert.incidents ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
+      // A candidate that was never attempted is not a persisted retry. New/unconfirmed work is
+      // still surfaced by the current candidate group above; this fallback is specifically for an
+      // already-attempted delivery that failed and then disappeared from detector output.
+      if (!(incident.delivery_failure_count > 0 || incident.last_attempt_at)) continue;
+      if (!notificationDueForIncident(alert, incident, { nowMs: new Date(now).getTime() })) continue;
+      if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === key)) {
+        notificationDueIncidents.push({ alert_id: id, incident_key: key });
+      }
+      const sameNegativeAdjudication = incident.adjudication?.notify === false
+        && incident.adjudication?.severity === incident.severity_max;
+      if (!sameNegativeAdjudication && !adjudicationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === key)) {
+        adjudicationDueIncidents.push({ alert_id: id, incident_key: key });
+      }
     }
   }
 
   return {
     alerts: [...byId.values()],
-    notification_due_ids: notificationDueIds,
+    notification_due_incidents: notificationDueIncidents.sort((left, right) => `${left.alert_id}\0${left.incident_key}`.localeCompare(`${right.alert_id}\0${right.incident_key}`)),
+    notification_due_ids: [...new Set(notificationDueIncidents.map((entry) => entry.alert_id))],
+    adjudication_due_incidents: adjudicationDueIncidents.sort((left, right) => `${left.alert_id}\0${left.incident_key}`.localeCompare(`${right.alert_id}\0${right.incident_key}`)),
+    adjudication_due_ids: [...new Set(adjudicationDueIncidents.map((entry) => entry.alert_id))],
   };
 }
 
@@ -399,7 +758,7 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
   const [historySummary, daemonStatus, existing] = await Promise.all([
     options.historySummary ? Promise.resolve(options.historySummary) : buildHistorySummary(descartesPaths, { now, windowMs: options.windowMs ?? DEFAULT_ALERT_WINDOW_MS, limit: options.limit }),
     options.daemonStatus ? Promise.resolve(options.daemonStatus) : readDaemonStatus(descartesPaths),
-    readAlertRecords(descartesPaths),
+    options.existingAlerts ? Promise.resolve(options.existingAlerts) : readAlertRecords(descartesPaths),
   ]);
   const candidates = evaluateAlertRules(historySummary, daemonStatus, { now, thresholds: options.thresholds });
   const extraCandidates = Array.isArray(options.extraCandidates) ? options.extraCandidates : [];
@@ -428,13 +787,308 @@ export async function evaluateAlerts(descartesPaths, options = {}) {
     candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") }
   );
   const applied = applyAlertCandidates(existing, mergedCandidates, { now, cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
-  return { alerts: applied.alerts, candidates: currentCandidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids };
+  return { alerts: applied.alerts, candidates: currentCandidates, history_summary: historySummary, daemon_status: daemonStatus ?? null, notification_due_ids: applied.notification_due_ids, notification_due_incidents: applied.notification_due_incidents, adjudication_due_ids: applied.adjudication_due_ids, adjudication_due_incidents: applied.adjudication_due_incidents };
 }
 
 export async function evaluateAndPersistAlerts(descartesPaths, options = {}) {
+  // Candidate computation and history reads happen before this read-modify-write. The latest
+  // snapshot is re-read before writing, but this path remains intentionally unlocked: concurrent
+  // alert-store writers are an existing unsupported boundary documented in todos/.
   const evaluated = await evaluateAlerts(descartesPaths, options);
-  const alerts = await writeAlertRecords(descartesPaths, evaluated.alerts);
-  return { ...evaluated, alerts };
+    const candidates = [...(evaluated.candidates ?? []), ...(Array.isArray(options.extraCandidates) ? options.extraCandidates : [])]
+    .map((candidate) => candidate?.id ? candidate : { ...candidate, id: alertId(candidate.rule_id, candidate.fingerprint ?? "global") });
+  const latest = await readAlertRecords(descartesPaths);
+  const applied = applyAlertCandidates(latest, candidates, { now: options.now ?? new Date().toISOString(), cooldownMs: options.cooldownMs, coveredAlertIds: options.coveredAlertIds });
+  const alerts = await writeAlertRecordsUnlocked(descartesPaths, applied.alerts);
+  return { ...evaluated, alerts, notification_due_ids: applied.notification_due_ids, notification_due_incidents: applied.notification_due_incidents, adjudication_due_ids: applied.adjudication_due_ids, adjudication_due_incidents: applied.adjudication_due_incidents };
+}
+
+export async function confirmAlertDelivery(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const alerts = await readAlertRecords(descartesPaths);
+  let confirmed = false;
+  const updated = alerts.map((alert) => {
+    if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+    const incidentKey = options.incidentKey ?? options.episodeKey ?? alertEpisodeKey(alert);
+    if (incidentKey === INCIDENT_STORM_KEY) {
+      confirmed = true;
+      return syncAlertProjection({
+        ...alert,
+        incident_storm_notified_at: now,
+        last_notified: now,
+        last_attempt_at: now,
+        delivery_failure_count: 0,
+        last_delivery_failure_at: null,
+        delivery_failure_reason: null,
+        delivery_failing_since: null,
+        next_attempt_at: null,
+        backoff_delay_ms: null,
+      });
+    }
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) return alert;
+    confirmed = true;
+    const currentRank = incident.notified_severity === null || incident.notified_severity === undefined ? -1 : alertSeverityRank(incident.notified_severity);
+    const nextSeverity = options.severity ?? incident.severity_max ?? alert.severity;
+    const nextRank = alertSeverityRank(nextSeverity);
+    const updatedIncident = {
+      ...incident,
+      confirmed_at: now,
+      notified_severity: nextRank >= currentRank ? nextSeverity : incident.notified_severity,
+      delivery_failure_count: 0,
+      last_delivery_failure_at: null,
+      delivery_failure_reason: null,
+      delivery_failing_since: null,
+      next_attempt_at: null,
+      last_attempt_at: now,
+      backoff_delay_ms: null,
+    };
+    return syncAlertProjection({
+      ...alert,
+      incidents: { ...alert.incidents, [incidentKey]: updatedIncident },
+    });
+  });
+  if (!confirmed) return { confirmed: false };
+  const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+  return { confirmed: true, alert: written.find((alert) => alert.id === alertIdValue) };
+}
+
+export async function recordAlertDeliveryFailure(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const alerts = await readAlertRecords(descartesPaths);
+  let recorded = false;
+  const updated = alerts.map((alert) => {
+    if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+    const incidentKey = options.incidentKey ?? options.episodeKey ?? alertEpisodeKey(alert);
+    if (incidentKey === INCIDENT_STORM_KEY) {
+      recorded = true;
+      const count = (alert.incident_storm_failure_count ?? 0) + 1;
+      const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+      return normalizeAlertRecord({ ...alert, incident_storm_failure_count: count, next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(), last_attempt_at: now, backoff_delay_ms: delay });
+    }
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) return alert;
+    recorded = true;
+    const count = incident.delivery_failure_count + 1;
+    const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+    const nextAttemptMs = new Date(now).getTime() + delay;
+    return syncAlertProjection({
+      ...alert,
+      incidents: {
+        ...alert.incidents,
+        [incidentKey]: {
+          ...incident,
+          delivery_failure_count: count,
+          last_delivery_failure_at: now,
+          last_attempt_at: now,
+          backoff_delay_ms: delay,
+          delivery_failure_reason: String(options.reason ?? "delivery_failed").slice(0, 240),
+          delivery_failing_since: incident.delivery_failing_since ?? now,
+          next_attempt_at: new Date(nextAttemptMs).toISOString(),
+        },
+      },
+    });
+  });
+  if (!recorded) return { recorded: false };
+  const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+  return { recorded: true, alert: written.find((alert) => alert.id === alertIdValue) };
+}
+
+export async function recordAlertDeliveryFailures(descartesPaths, failures, options = {}) {
+  const entries = Array.isArray(failures) ? failures : [];
+  if (entries.length === 0) return { recorded: false };
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const alerts = await readAlertRecords(descartesPaths);
+  const updated = new Map(alerts.map((alert) => [alert.id, alert]));
+  let recorded = false;
+  for (const failure of entries) {
+    const alert = updated.get(failure.alertId);
+    if (!alert || ["recovered", "suppressed"].includes(alert.status)) continue;
+    const incidentKey = failure.incidentKey ?? failure.episodeKey ?? alertEpisodeKey(alert);
+    if (incidentKey === INCIDENT_STORM_KEY) {
+      recorded = true;
+      const count = (alert.incident_storm_failure_count ?? 0) + 1;
+      const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+      updated.set(alert.id, normalizeAlertRecord({
+        ...alert,
+        incident_storm_failure_count: count,
+        next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        last_attempt_at: now,
+        backoff_delay_ms: delay,
+      }));
+      continue;
+    }
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) continue;
+    recorded = true;
+    const count = incident.delivery_failure_count + 1;
+    const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+    updated.set(alert.id, syncAlertProjection({
+      ...alert,
+      incidents: {
+        ...alert.incidents,
+        [incidentKey]: {
+          ...incident,
+          delivery_failure_count: count,
+          last_delivery_failure_at: now,
+          last_attempt_at: now,
+          backoff_delay_ms: delay,
+          delivery_failure_reason: String(failure.reason ?? options.reason ?? "delivery_failed").slice(0, 240),
+          delivery_failing_since: incident.delivery_failing_since ?? now,
+          next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        },
+      },
+    }));
+  }
+  if (!recorded) return { recorded: false };
+  const written = await writeAlertRecordsUnlocked(descartesPaths, [...updated.values()]);
+  return { recorded: true, alerts: written };
+}
+
+// Delivery is planned against one alert-store snapshot per daemon tick. Apply every external
+// delivery outcome to that in-memory snapshot, then commit the resulting alert set once. This is
+// deliberately separate from recordAlertDeliveryFailure(s), whose read-modify-write API remains
+// useful to standalone callers but would turn a route breaker into one full-store transaction per
+// skipped item.
+export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, options = {}) {
+  const entries = Array.isArray(outcomes) ? outcomes : [];
+  if (entries.length === 0) return { recorded: false };
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const updated = new Map((await readAlertRecords(descartesPaths)).map((alert) => [alert.id, alert]));
+  let recorded = false;
+
+  for (const outcome of entries) {
+    const alert = updated.get(outcome.alertId);
+    if (!alert || ["recovered", "suppressed"].includes(alert.status)) continue;
+    const incidentKey = outcome.incidentKey ?? outcome.episodeKey ?? alertEpisodeKey(alert);
+    if (outcome.status === "adjudication") {
+      const incident = alert.incidents?.[incidentKey];
+      if (!incident) continue;
+      recorded = true;
+      updated.set(alert.id, syncAlertProjection({
+        ...alert,
+        incidents: {
+          ...alert.incidents,
+          [incidentKey]: {
+            ...incident,
+            adjudicated_at: now,
+            adjudication: { notify: outcome.notify === true, severity: outcome.severity ?? incident.severity_max },
+          },
+        },
+      }));
+      continue;
+    }
+    if (outcome.status === "success") {
+      if (incidentKey === INCIDENT_STORM_KEY) {
+        recorded = true;
+        updated.set(alert.id, syncAlertProjection({
+          ...alert,
+          incident_storm_notified_at: now,
+          last_notified: now,
+          last_attempt_at: now,
+          delivery_failure_count: 0,
+          last_delivery_failure_at: null,
+          delivery_failure_reason: null,
+          delivery_failing_since: null,
+          next_attempt_at: null,
+          backoff_delay_ms: null,
+        }));
+        continue;
+      }
+      const incident = alert.incidents?.[incidentKey];
+      if (!incident) continue;
+      recorded = true;
+      const currentRank = incident.notified_severity === null || incident.notified_severity === undefined ? -1 : alertSeverityRank(incident.notified_severity);
+      const nextSeverity = outcome.severity ?? incident.severity_max ?? alert.severity;
+      const nextRank = alertSeverityRank(nextSeverity);
+      updated.set(alert.id, syncAlertProjection({
+        ...alert,
+        incidents: {
+          ...alert.incidents,
+          [incidentKey]: {
+            ...incident,
+            confirmed_at: now,
+            notified_severity: nextRank >= currentRank ? nextSeverity : incident.notified_severity,
+            delivery_failure_count: 0,
+            last_delivery_failure_at: null,
+            delivery_failure_reason: null,
+            delivery_failing_since: null,
+            next_attempt_at: null,
+            last_attempt_at: now,
+            backoff_delay_ms: null,
+          },
+        },
+      }));
+      continue;
+    }
+    if (outcome.status !== "failure") continue;
+    if (incidentKey === INCIDENT_STORM_KEY) {
+      recorded = true;
+      const count = (alert.incident_storm_failure_count ?? 0) + 1;
+      const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+      updated.set(alert.id, normalizeAlertRecord({
+        ...alert,
+        incident_storm_failure_count: count,
+        next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        last_attempt_at: now,
+        backoff_delay_ms: delay,
+        delivery_failure_reason: String(outcome.reason ?? "delivery_failed").slice(0, 240),
+      }));
+      continue;
+    }
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) continue;
+    recorded = true;
+    const count = incident.delivery_failure_count + 1;
+    const delay = Math.min(DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_BASE_MS * (2 ** Math.min(count - 1, 16)));
+    updated.set(alert.id, syncAlertProjection({
+      ...alert,
+      incidents: {
+        ...alert.incidents,
+        [incidentKey]: {
+          ...incident,
+          delivery_failure_count: count,
+          last_delivery_failure_at: now,
+          last_attempt_at: now,
+          backoff_delay_ms: delay,
+          delivery_failure_reason: String(outcome.reason ?? "delivery_failed").slice(0, 240),
+          delivery_failing_since: incident.delivery_failing_since ?? now,
+          next_attempt_at: new Date(new Date(now).getTime() + delay).toISOString(),
+        },
+      },
+    }));
+  }
+  if (!recorded) return { recorded: false };
+  await options.onStoreWrite?.(entries);
+  const written = await writeAlertRecordsUnlocked(descartesPaths, [...updated.values()]);
+  return { recorded: true, alerts: written };
+}
+
+export async function recordAlertAdjudication(descartesPaths, alertIdValue, options = {}) {
+  const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  const alerts = await readAlertRecords(descartesPaths);
+  let recorded = false;
+  const updated = alerts.map((alert) => {
+    if (alert.id !== alertIdValue || ["recovered", "suppressed"].includes(alert.status)) return alert;
+    const incidentKey = options.incidentKey ?? options.episodeKey ?? alertEpisodeKey(alert);
+    const incident = alert.incidents?.[incidentKey];
+    if (!incident) return alert;
+    recorded = true;
+    return syncAlertProjection({
+      ...alert,
+      incidents: {
+        ...alert.incidents,
+        [incidentKey]: {
+          ...incident,
+          adjudicated_at: now,
+          adjudication: { notify: options.notify === true, severity: options.severity ?? incident.severity_max },
+        },
+      },
+    });
+  });
+  if (!recorded) return { recorded: false };
+  const written = await writeAlertRecordsUnlocked(descartesPaths, updated);
+  return { recorded: true, alert: written.find((alert) => alert.id === alertIdValue) };
 }
 
 export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
@@ -444,8 +1098,28 @@ export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
   const updated = alerts.map((alert) => {
     if (alert.id !== alertId) return alert;
     found = true;
-    return normalizeAlertRecord({ ...alert, status: "acknowledged", acknowledged_at: now });
+    return normalizeAlertRecord({
+      ...alert,
+      status: "acknowledged",
+      acknowledged_at: now,
+      // Acknowledging a storm ends suppression for this episode. Existing keys are retained as
+      // acknowledged history, while a later producer key is a normal new incident and may notify.
+      incident_state: "normal",
+      incident_key_overflow: false,
+      incident_storm_count: 0,
+      incident_storm_notified_at: null,
+      incident_storm_failure_count: 0,
+      next_attempt_at: null,
+      last_attempt_at: null,
+      backoff_delay_ms: null,
+      incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, {
+        ...incident,
+        status: ["recovered", "suppressed"].includes(incident.status) ? incident.status : "acknowledged",
+        next_attempt_at: null,
+        backoff_delay_ms: null,
+      }])),
+    });
   });
   if (!found) throw new Error(`Alert not found: ${alertId}`);
-  return (await writeAlertRecords(descartesPaths, updated)).find((alert) => alert.id === alertId);
+  return (await writeAlertRecordsUnlocked(descartesPaths, updated)).find((alert) => alert.id === alertId);
 }

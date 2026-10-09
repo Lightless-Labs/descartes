@@ -345,16 +345,36 @@ export async function computeContainmentRecommendationCandidates(descartesPaths,
   // ("is not iterable") out of `new Set(...)` or the for-of loop below and abort the daemon tick.
   const dueIds = new Set(Array.isArray(evaluation?.notification_due_ids) ? evaluation.notification_due_ids : []);
   const alerts = Array.isArray(evaluation?.alerts) ? evaluation.alerts : [];
+  const hasIncidentDueEntries = Array.isArray(evaluation?.notification_due_incidents);
+  const dueEntries = hasIncidentDueEntries
+    ? evaluation.notification_due_incidents.map((entry) => ({
+      alertId: entry?.alert_id,
+      incidentKey: entry?.incident_key,
+      storm: entry?.storm === true,
+    }))
+    : [...dueIds].map((alertId) => ({ alertId, incidentKey: undefined, storm: false }));
 
   const candidates = [];
-  for (const alert of alerts) {
-    if (alert?.status !== RECOMMENDATION_TRIGGER_STATUS || !dueIds.has(alert?.id)) continue;
-    const recommendation = mapAlertToRecommendation(alert);
+  for (const entry of dueEntries) {
+    const alert = alerts.find((candidate) => candidate?.id === entry.alertId);
+    if (alert?.status !== RECOMMENDATION_TRIGGER_STATUS || entry.storm) continue;
+    const incidentKey = entry.incidentKey ?? alert.current_incident_key ?? alert.incident_key ?? "default";
+    const incident = alert.incidents?.[incidentKey];
+    const trigger = incident
+      ? {
+        ...alert,
+        ...incident.payload,
+        severity: incident.severity_max,
+        incident_key: incidentKey,
+        current_incident_key: incidentKey,
+      }
+      : alert;
+    const recommendation = mapAlertToRecommendation(trigger);
     if (!recommendation) continue;
 
     // All persisted identity-bearing fields are derived from fixed rule IDs and validated hashes;
     // the triggering alert's arbitrary id/fingerprint never crosses this boundary verbatim.
-    const triggerRef = hashReference(alert.id ?? `${recommendation.trigger_rule_id}:${recommendation.target_repr}`);
+    const triggerRef = hashReference(`${alert.id ?? recommendation.trigger_rule_id}:${incidentKey}`);
     const fingerprint = hashReference(`${recommendation.trigger_rule_id}:${recommendation.target_repr}`);
     const diagnostics = sanitizeDiagnostics({
       trigger_rule_id: recommendation.trigger_rule_id,
@@ -368,6 +388,9 @@ export async function computeContainmentRecommendationCandidates(descartesPaths,
       id: alertId(recommendation.rule_id, fingerprint),
       rule_id: recommendation.rule_id,
       fingerprint,
+      // Recommendations inherit the triggering incident. Consecutive incidents under one
+      // trigger alert therefore create distinct recommendation notifications too.
+      incident_key: incidentKey,
       severity: "warning",
       title: `Descartes containment recommendation: ${recommendation.verb}`,
       summary: `RECOMMEND-ONLY: consider ${recommendation.verb}. Descartes will not act on this.`,

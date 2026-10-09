@@ -785,6 +785,9 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIAT
     id: alertId(SESSION_COUNT_DROP_RULE_ID, fingerprint),
     rule_id: SESSION_COUNT_DROP_RULE_ID,
     fingerprint,
+    // Count deviation is a LEVEL-style stable incident; the versioned census universe lives in
+    // the alert fingerprint, while notify-once keeps one incident within that alert identity.
+    incident_key: "default",
     severity,
     title: "Session count deviation",
     summary: "Resident tmux/screen session count deviated significantly below its established baseline.",
@@ -805,6 +808,9 @@ export function buildChurnCandidates(churnEntries = [], { availabilitySignature 
       id: alertId(SESSION_CHURN_RULE_ID, fingerprint),
       rule_id: SESSION_CHURN_RULE_ID,
       fingerprint,
+      // The transition, not the stable session identity, is the incident. This lets A→B→C
+      // remain two distinct notifications under the same alert id.
+      incident_key: `churn:${entry.entity_key}:${entry.prior_fingerprint}:${entry.current_fingerprint}`,
       severity: "warning",
       title: "Session churn detected",
       summary: "A tracked session's creation fingerprint changed between observations (possible kill-then-resurrect).",

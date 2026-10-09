@@ -1103,6 +1103,7 @@ test("candidate shape matches the existing extraCandidates sources (buildCountDr
   assert.ok(spike);
   assert.equal(typeof spike.id, "string");
   assert.equal(spike.fingerprint, PEER_COUNT_MARKERLESS_FINGERPRINT);
+  assert.equal(spike.incident_key, "default");
   assert.equal(typeof spike.title, "string");
   assert.equal(typeof spike.summary, "string");
   assert.equal(typeof spike.diagnostics, "object");
