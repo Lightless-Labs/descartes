@@ -253,6 +253,7 @@ test("resolveCollectorBinary trusts a macOS admin group containing root, a non-a
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root _mbsetupuser thomas\nPrimaryGroupID: 80\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root _mbsetupuser thomas\n" };
@@ -276,12 +277,13 @@ test("resolveCollectorBinary rejects a macOS uid-below-501 account with ShadowHa
     platform: "darwin",
     realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
     statFn: trustedStats("/opt/homebrew/bin/tmux", {
-      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+      ancestors: { "/opt": directory(), "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
     }),
     readFileFn: readableBinary,
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser thomas\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root olduser thomas\n" };
@@ -300,6 +302,113 @@ test("resolveCollectorBinary rejects a macOS uid-below-501 account with ShadowHa
   assert.deepEqual(resolution.writer_uids, [0, 400, 502]);
 });
 
+test("resolveCollectorBinary rejects every low-UID macOS account authority except absent or DisabledUser", async () => {
+  for (const authority of [";LocalCachedUser;", ";ApplePasswordServer;", ";ShadowHash;", ";Kerberos;", ";Unknown;"]) {
+    const resolution = await resolveCollectorBinary("tmux", {
+      platform: "darwin",
+      realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+      statFn: trustedStats("/opt/homebrew/bin/tmux", {
+        ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+      }),
+      readFileFn: readableBinary,
+      aclCheckFn: aclAbsent,
+      execFileAsync: async (command, args) => {
+        assert.equal(command, "/usr/bin/dscl");
+        if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
+        if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+        if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser\n" };
+        if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root olduser\n" };
+        if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
+        if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+        if (args.join(" ") === ". -read /Users/olduser AuthenticationAuthority UniqueID") return { stdout: `UniqueID: 400\nAuthenticationAuthority: ${authority}\n` };
+        throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+      },
+      expectedUid: 502,
+    });
+
+    assert.equal(resolution.status, "untrusted_binary", authority);
+    assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed", authority);
+  }
+});
+
+test("resolveCollectorBinary accepts a low-UID macOS account disabled by AuthenticationAuthority", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt": directory(), "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default /BSD/local\n" };
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root disabled\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root disabled\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/disabled AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 400\nAuthenticationAuthority: ;DisabledUser;\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
+  assert.deepEqual(resolution.accepted_system_accounts, [{ name: "disabled", uid: 400 }]);
+});
+
+test("resolveCollectorBinary includes macOS GroupMembers GUIDs and rejects an extra resolved local user", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nGroupMembers: GUID-ATTACKER\n" };
+      if (args.join(" ") === ". -search /Users GeneratedUID GUID-ATTACKER") return { stdout: "attacker GeneratedUID: GUID-ATTACKER\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
+      if (args.join(" ") === ". -read /Users/attacker AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\nAuthenticationAuthority: ;ShadowHash;\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
+  assert.deepEqual(resolution.writer_uids, [0, 502, 503]);
+});
+
+test("resolveCollectorBinary fails closed with directory_bound when macOS authentication search policy is not local-only", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default /LDAPv3/example.com\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "directory_bound");
+});
+
 test("resolveCollectorBinary rejects a macOS uid-at-or-above-501 extra user even without authentication authority", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
@@ -311,6 +420,7 @@ test("resolveCollectorBinary rejects a macOS uid-at-or-above-501 extra user even
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
@@ -343,6 +453,7 @@ test("resolveCollectorBinary rejects a macOS group-writable ancestor when the lo
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nPrimaryGroupID: 80\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
@@ -373,6 +484,7 @@ test("resolveCollectorBinary rejects a macOS nested group as unverifiable", asyn
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nNestedGroups: nested-uuid\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
@@ -395,6 +507,7 @@ test("resolveCollectorBinary rejects a macOS non-local group node as unverifiabl
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /LDAPv3/example\nGroupMembership: root thomas\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
@@ -626,6 +739,7 @@ test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitu
     aclCheckFn: aclAbsent,
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };

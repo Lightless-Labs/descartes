@@ -178,12 +178,52 @@ function parseMacOsNestedGroups(stdout) {
   return value === undefined ? [] : value.split(/\s+/).filter(Boolean);
 }
 
+export function parseMacOsSearchPath(stdout) {
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim().startsWith("CSPSearchPath:"));
+  if (start < 0) return undefined;
+  const first = lines[start].trim().slice("CSPSearchPath:".length).trim();
+  const paths = first ? first.split(/\s+/) : [];
+  for (const line of lines.slice(start + 1)) {
+    const value = line.trim();
+    if (!value) continue;
+    if (!value.startsWith("/")) break;
+    paths.push(value);
+  }
+  return paths;
+}
+
+function localAuthenticationSearchPolicy(stdout) {
+  const paths = parseMacOsSearchPath(stdout);
+  return Array.isArray(paths)
+    && paths.length > 0
+    && paths.includes("/Local/Default")
+    && paths.every((value) => value === "/Local/Default" || value === "/BSD/local");
+}
+
 function isLocalMacOsNode(node) {
   return node === undefined || node === "/Local/Default" || node === "local";
 }
 
 function validLocalRecordName(name) {
   return typeof name === "string" && name.length > 0 && !/[\0/\s]/.test(name);
+}
+
+function parseDsclGroupMembers(stdout) {
+  const value = parseDsclAttribute(stdout, "GroupMembers");
+  return value === undefined ? [] : value.split(/\s+/).filter(Boolean);
+}
+
+function parseDsclSearchUser(stdout, guid) {
+  const matches = String(stdout ?? "").split(/\r?\n/).flatMap((line) => {
+    const match = /^(\S+)\s+GeneratedUID:\s*(\S+)\s*$/.exec(line.trim());
+    return match && match[2] === guid ? [match[1]] : [];
+  });
+  return matches.length === 1 && validLocalRecordName(matches[0]) ? matches[0] : undefined;
+}
+
+function onlyDisabledUserAuthorities(authorities) {
+  return authorities.length === 0 || authorities.every((value) => /^(?:;DisabledUser;)(?:\s+;DisabledUser;)*$/.test(value.trim()));
 }
 
 function parseNsswitchAction(token) {
@@ -301,6 +341,11 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   const numericGid = asUid(gid);
   if (numericGid === undefined) return unresolvedGroupMembership();
 
+  const searchPolicy = await execLookup(execFileAsync, MACOS_DSCL, ["/Search", "-read", "/", "CSPSearchPath"]);
+  if (searchPolicy.error || !localAuthenticationSearchPolicy(searchPolicy.stdout)) {
+    return { error: "directory_bound" };
+  }
+
   const groupList = await execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Groups", "PrimaryGroupID"]);
   const groupName = groupList.error ? undefined : parseDsclGroupList(groupList.stdout, numericGid);
   if (!groupName || !validLocalRecordName(groupName)) return unresolvedGroupMembership();
@@ -309,15 +354,21 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(fullRecord.stdout)) || parseMacOsNestedGroups(fullRecord.stdout).length > 0) {
     return unresolvedGroupMembership();
   }
+  const groupGuids = parseDsclGroupMembers(fullRecord.stdout);
+  const guidNames = await Promise.all(groupGuids.map(async (guid) => {
+    const result = await execLookup(execFileAsync, MACOS_DSCL, [".", "-search", "/Users", "GeneratedUID", guid]);
+    return result.error ? undefined : parseDsclSearchUser(result.stdout, guid);
+  }));
+  if (guidNames.some((name) => name === undefined)) return unresolvedGroupMembership();
 
   const [membership, primaryUsers] = await Promise.all([
     execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "GroupMembership"]),
     execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Users", "PrimaryGroupID"]),
   ]);
   const supplementaryNames = membership.error ? undefined : parseDsclGroupMembership(membership.stdout);
-  if (!supplementaryNames || primaryUsers.error) return unresolvedGroupMembership();
+  if (primaryUsers.error) return unresolvedGroupMembership();
   const primaryNames = parseDsclPrimaryGroupList(primaryUsers.stdout, numericGid);
-  const names = [...new Set([...supplementaryNames, ...primaryNames])];
+  const names = [...new Set([...(supplementaryNames ?? []), ...guidNames, ...primaryNames])];
   if (names.some((name) => !validLocalRecordName(name))) return unresolvedGroupMembership();
 
   const userResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "AuthenticationAuthority", "UniqueID"])));
@@ -330,7 +381,7 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
       name: names[index],
       uid,
       authentication_authorities: authenticationAuthorities,
-      authenticating: authenticationAuthorities.some((value) => /ShadowHash|Kerberos/i.test(value)),
+      authenticating: !onlyDisabledUserAuthorities(authenticationAuthorities),
     };
   });
   if (principals.some((principal) => principal === undefined)) return unresolvedGroupMembership();
