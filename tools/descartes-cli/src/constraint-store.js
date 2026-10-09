@@ -3,6 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { MAX_STRING_LENGTH, sanitizeIdentityString } from "./diagnostics-sanitizer.js";
 import { DEFAULT_FACT_MAX_BYTES, readFactPoints } from "./fact-store.js";
+import { COMPLETENESS_LOSS_TIMESTAMP_FIELDS } from "./fact-store-completeness.js";
+import { FACT_FAMILY_IDS } from "./fact-families.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS } from "./welford-stats.js";
 
 export const SCHEMA_VERSION = 1;
@@ -216,16 +218,23 @@ export async function writeConstraints(descartesPaths, constraints) {
 // instead of naming it via the round-tripped, always-present field below). Zero is deliberately
 // NOT accepted here (unlike enforceFactRetention's own >= 0) -- a configured cap must be a
 // genuine byte budget, not a way to silently zero out capacity through this surface.
-function normalizeFactStoreMaxBytes(value) {
-  const num = Number(value);
-  return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
+//
+// DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5): the per-family stores ignore
+// this key (watch-by-default slice 1 had already moved the live cap to watch.json). Every pre-S4 write
+// filled in DEFAULT_FACT_MAX_BYTES, so that value (and any invalid one) normalizes to ABSENT and is
+// never written in again; a deliberate, non-default operator value is preserved so status can name
+// it as deprecated/ignored. Mirrors watch-store.js's twin.
+function normalizeLegacyFactStoreMaxBytes(value) {
+  const num = typeof value === "number" ? value : Number.NaN;
+  return Number.isFinite(num) && num > 0 && num !== DEFAULT_FACT_MAX_BYTES ? num : undefined;
 }
 
 export function normalizeLearnedConfig(config = {}) {
+  const legacyMaxBytes = normalizeLegacyFactStoreMaxBytes(config.fact_store_max_bytes);
   return {
     enabled: config.enabled === true,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
-    fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
+    ...(legacyMaxBytes !== undefined ? { fact_store_max_bytes: legacyMaxBytes } : {}),
   };
 }
 
@@ -295,11 +304,23 @@ function renderLearnedConfigStatus(config, configFile) {
   const lines = [`Learned emission: ${config.enabled ? "enabled" : "disabled"}`];
   lines.push(`Config path: ${configFile}`);
   if (config.updated_at) lines.push(`Last updated: ${config.updated_at}`);
+  // Q5 (fact-store capacity plan §4.5 Config): a deliberate legacy cap is named, never silently dropped.
+  if (typeof config.fact_store_max_bytes === "number") {
+    lines.push(`fact_store_max_bytes: ${config.fact_store_max_bytes} (deprecated, ignored -- per-family fact_store_budgets in watch.json size the fact stores)`);
+  }
   return lines.join("\n");
 }
 
-const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "none"];
-const LOSS_TS_FIELD_NAMES = ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"];
+const DEGRADED_REASONS = ["this_read_loss", "in_window_loss", "future_loss", "continuity_break", "continuity_unknown", "future_fact", "future_floor", "none"];
+// LOW-2 (review fold): "unknown" is now also what a real read reports when there is no ledger at
+// all (buildCompleteness, fact-store-integrity.js) -- not only the no-read-to-report case here.
+// Either way, COVERAGE_VALUES itself still only validates "full"/"narrowed"; a genuine "unknown"
+// falls through this selector's own invalid-value fallback to "unknown" below.
+const COVERAGE_VALUES = ["full", "narrowed"];
+// The loss channels, from the single shared definition (fact-store-completeness.js). Since R0b
+// (fact-store capacity plan §4.1 item 4) last_bytecap_evict_ts is NOT among them: byte-cap eviction
+// narrows coverage (reported via bytecap_floor_ts/certified_after_ts/coverage), it is not a loss.
+const LOSS_TS_FIELD_NAMES = COMPLETENESS_LOSS_TIMESTAMP_FIELDS;
 
 function unknownFactStoreCompleteness() {
   return {
@@ -315,7 +336,16 @@ function unknownFactStoreCompleteness() {
     // tick, right now" and see how much history is actually retained, not just a cumulative
     // lifetime total.
     last_bytecap_evict_ts: null,
-    continuity_oldest_ts: null,
+    // R0b coverage reporting (fact-store capacity plan §4.1 items 3/6): replaces the F2-Tier1
+    // continuity_oldest_ts, which only ever moved older and could predate the retained facts (an
+    // over-claim). Display only; no trust-decision path consults these here.
+    bytecap_floor_ts: null,
+    // G1 re-gate LOW (fact-store capacity plan §18): the age floor narrows coverage too (G1
+    // Blocker 2 fix), so it is reported alongside the byte-cap floor rather than stripped.
+    age_floor_ts: null,
+    certified_after_ts: null,
+    oldest_certified_ts: null,
+    coverage: "unknown",
     // Fix 2 (trusted-state step-1 revision, "R1 made signable"): additive surfacing fields, plus
     // the two loss-ts fields (last_corrupt_ts/last_schema_invalid_ts/last_continuity_break_ts)
     // this selector used to strip -- an operator diagnosing a degraded store needs to see WHICH
@@ -348,7 +378,11 @@ export function selectFactStoreCompleteness(completeness) {
     first_degraded_ts: typeof completeness.first_degraded_ts === "string" ? completeness.first_degraded_ts : null,
     continuity_ok: [true, false, null].includes(completeness.continuity_ok) ? completeness.continuity_ok : null,
     last_bytecap_evict_ts: isNullableTimestampString(completeness.last_bytecap_evict_ts) ? completeness.last_bytecap_evict_ts : null,
-    continuity_oldest_ts: isNullableTimestampString(completeness.continuity_oldest_ts) ? completeness.continuity_oldest_ts : null,
+    bytecap_floor_ts: isNullableTimestampString(completeness.bytecap_floor_ts) ? completeness.bytecap_floor_ts : null,
+    age_floor_ts: isNullableTimestampString(completeness.age_floor_ts) ? completeness.age_floor_ts : null,
+    certified_after_ts: isNullableTimestampString(completeness.certified_after_ts) ? completeness.certified_after_ts : null,
+    oldest_certified_ts: isNullableTimestampString(completeness.oldest_certified_ts) ? completeness.oldest_certified_ts : null,
+    coverage: COVERAGE_VALUES.includes(completeness.coverage) ? completeness.coverage : "unknown",
     // Fix 2: no longer stripped, plus the new future-fact channel/reporting fields.
     last_corrupt_ts: isNullableTimestampString(completeness.last_corrupt_ts) ? completeness.last_corrupt_ts : null,
     last_schema_invalid_ts: isNullableTimestampString(completeness.last_schema_invalid_ts) ? completeness.last_schema_invalid_ts : null,
@@ -375,13 +409,40 @@ export function selectFactStoreCompleteness(completeness) {
 // windowed status (selectFactStoreCompleteness above) so an out-of-window or future-dated loss
 // stays visible even when the windowed status itself reads "intact" -- windowing alone would
 // hide old losses from view, and surfacing alone would leave the windowed status meaningless.
+//
+// S4 (fact-store capacity plan §4.3/§4.4): every registry family store is read (each against its
+// own ledger) and reported PER FAMILY under `families`, alongside the combined (worst-status)
+// summary at the top level. A family store that was never created reports `store: "absent"`
+// (rendered "not observed (no store)"), never "unknown"/"still learning".
 async function readFactStoreCompleteness(descartesPaths) {
   try {
-    const readResult = await readFactPoints(descartesPaths, { windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS });
-    return selectFactStoreCompleteness(readResult?.completeness);
+    const readResult = await readFactPoints(descartesPaths, { families: [...FACT_FAMILY_IDS], windowMs: DEFAULT_BASELINE_FACT_WINDOW_MS });
+    return selectFamilyFactStoreCompleteness(readResult);
   } catch {
     return unknownFactStoreCompleteness();
   }
+}
+
+/**
+ * S4: the per-family status shape shared by `descartes learned status` and the daemon status record:
+ * the combined completeness (selectFactStoreCompleteness of the multi-family read's combined
+ * completeness) plus `families: {<family>: {...selected completeness, store: "present"|"absent",
+ * bytes}}` for each family read. Display only.
+ */
+export function selectFamilyFactStoreCompleteness(readResult) {
+  const combined = selectFactStoreCompleteness(readResult?.completeness);
+  const familyReads = readResult?.family_reads && typeof readResult.family_reads === "object" && !Array.isArray(readResult.family_reads)
+    ? readResult.family_reads
+    : readResult?.family ? { [readResult.family]: readResult } : {};
+  const families = {};
+  for (const [family, read] of Object.entries(familyReads)) {
+    families[family] = {
+      ...selectFactStoreCompleteness(read?.completeness),
+      store: read?.store_exists === false ? "absent" : "present",
+      bytes: Number.isSafeInteger(read?.bytes) ? read.bytes : 0,
+    };
+  }
+  return { ...combined, families };
 }
 
 /**
@@ -441,15 +502,39 @@ export async function runLearnedConfigCommand(descartesPaths, subcommand, args, 
 // (selectFactStoreCompleteness, above) is still the primary/complete surface, this is a
 // human-readable summary of the same fields, shown only when there is something to explain.
 function renderFactStoreCompletenessText(completeness) {
-  const lines = [`Fact-store completeness: ${completeness.status}`];
+  const lines = [renderFamilyCompletenessText("Fact-store completeness", completeness)];
+  // S4: one block per family store; a never-created store is "not observed (no store)".
+  for (const [family, entry] of Object.entries(completeness.families ?? {})) {
+    lines.push(entry.store === "absent"
+      ? `  ${family}: not observed (no store)`
+      : renderFamilyCompletenessText(`  ${family}`, entry).split("\n").map((line, index) => (index === 0 ? line : `  ${line}`)).join("\n"));
+  }
+  return lines.join("\n");
+}
+
+function renderFamilyCompletenessText(label, completeness) {
+  const lines = [`${label}: ${completeness.status}`];
   if (completeness.status !== "intact") {
     lines.push(`  Reason: ${completeness.degraded_reason}`);
     if (completeness.future_loss_fields.length > 0) {
       lines.push(`  Future-dated (untrustworthy clock) fields: ${completeness.future_loss_fields.join(", ")}`);
     }
-    for (const field of ["last_corrupt_ts", "last_schema_invalid_ts", "last_bytecap_evict_ts", "last_continuity_break_ts", "last_future_fact_ts"]) {
+    // Loss channels only (R0b: byte-cap eviction is not one; it is reported as coverage below).
+    for (const field of ["last_corrupt_ts", "last_schema_invalid_ts", "last_continuity_break_ts", "last_future_fact_ts"]) {
       if (completeness[field] !== null) lines.push(`  ${field}: ${completeness[field]}`);
     }
+  }
+  if (completeness.coverage === "narrowed") {
+    // G1 re-gate LOW (fact-store capacity plan §18): name the ACTUAL cause(s). Coverage narrows by
+    // byte-cap eviction (bytecap_floor_ts) and/or by age retention whose floor falls inside the
+    // read window (age_floor_ts) -- labeling every narrowing "byte-cap" misdirected an operator
+    // whose store was merely older than the retention window.
+    const causes = [];
+    if (completeness.bytecap_floor_ts !== null) {
+      causes.push(`byte-cap eviction (floor ${completeness.bytecap_floor_ts}; last eviction ${completeness.last_bytecap_evict_ts})`);
+    }
+    if (completeness.age_floor_ts !== null) causes.push(`age retention (floor ${completeness.age_floor_ts})`);
+    lines.push(`  Coverage: narrowed by ${causes.length > 0 ? causes.join(" and ") : "an unreported cause"} (certified after ${completeness.certified_after_ts})`);
   }
   return lines.join("\n");
 }

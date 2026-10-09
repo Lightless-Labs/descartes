@@ -25,7 +25,7 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, ruleHorizonOk } from "./fact-store-completeness.js";
 import { PEER_CENSUS_MARKER_ENTITY_KEY, PEER_OVERFLOW_ENTITY_KEY } from "./fact-translators.js";
 import { DEFAULT_BASELINE_FACT_WINDOW_MS, computeZScore, emptyWelfordStats, foldWelford, updateEwma } from "./welford-stats.js";
 
@@ -183,31 +183,9 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 function normalizeStatsShape(rawStats) {
   const stats = rawStats && typeof rawStats === "object" && !Array.isArray(rawStats) ? rawStats : {};
@@ -478,7 +456,7 @@ export function groupPeerFactsByTick(points = []) {
  *   - "overflow": PEER_OVERFLOW_ENTITY_KEY-marked — its true count is only bucketed, never exact.
  *   - "complete": every other tick-group, including a genuine (or false, per MUST-FIX 2) zero.
  */
-function tickGroupDisposition(group) {
+export function tickGroupDisposition(group) {
   if (availabilitySignatureHasIncompleteSource(group?.availabilitySignature)) return "unknown";
   return group.hasOverflow ? "overflow" : "complete";
 }
@@ -490,6 +468,14 @@ function tickGroupDisposition(group) {
 // historical score-but-never-fold behavior.
 function overflowCanBeScored(group) {
   return !(group.hasOverflow && group.hasTailscaleOverflow);
+}
+
+function peerCensusReadiness(groups, { nowMs, freshnessMs = DEFAULT_PEER_FRESHNESS_FALLBACK_MS } = {}) {
+  const completeGroups = groups.filter((group) => tickGroupDisposition(group) === "complete");
+  if (completeGroups.length === 0 || !Number.isFinite(nowMs)) return { gate: "ok", completeGroups };
+  const latestMs = new Date(completeGroups[completeGroups.length - 1].ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale", completeGroups };
+  return { gate: "ok", completeGroups };
 }
 
 // Slice 4c (§2b): deliberately NOT unified with tickGroupDisposition above. Extending that
@@ -809,7 +795,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // exactly what process-lineage-baseline.js/session-baseline.js do for their own candidate
   // computations.
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "peer", windowMs, now: options.now });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupPeerFactsByTick(points);
 
@@ -961,16 +947,36 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   // (re)armed this tick, or history is untrusted), this detector evaluated NOTHING it can vouch
   // for -- report empty coverage so any persisted peer.count_spike/peer.count_drop alert FREEZES
   // (never fabricate a recovery), exactly as it already emits zero candidates.
-  if (coldStartPendingThisTick) return { candidates: [], evaluatedAlertKeys: [] };
+  if (coldStartPendingThisTick) {
+    return {
+      candidates: [],
+      evaluatedAlertKeys: [],
+      ruleEvaluations: {
+        [PEER_COUNT_SPIKE_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick, baselineSamples: { count: windowed.stats.count, required: minSampleCount } }),
+        [PEER_COUNT_DROP_RULE_ID]: buildRuleEvaluation({ historyTrust, coldStartPendingThisTick, baselineSamples: { count: windowedDrop.stats.count, required: minSampleCount } }),
+      },
+    };
+  }
 
   // Re-emission every tick (load-bearing, mirrors session-baseline.js's own Decision 3): built
   // fresh from `windowed`/`windowedDrop` on EVERY call — including ticks where nothing new was
   // folded — so applyAlertCandidates never spuriously "recovers" an active peer.count_spike/
   // peer.count_drop just because this source skipped a redundant write.
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3), per direction (both 30 h,
+  // MIN_SAMPLE_COUNT). A horizon-short direction emits no candidate and reports no coverage; the
+  // lockout/fold above are untouched, so it resumes on the tick its certified span recovers.
+  const spikeHorizonOk = ruleHorizonOk(readResult, PEER_COUNT_SPIKE_RULE_ID, nowMs);
+  const dropHorizonOk = ruleHorizonOk(readResult, PEER_COUNT_DROP_RULE_ID, nowMs);
+  const censusReadiness = peerCensusReadiness(currentGroups, { nowMs, freshnessMs });
+  const censusFresh = censusReadiness.gate === "ok";
   const candidates = [];
-  // A2 freshness gate, per direction, on the tick each direction actually SCORES: spike scores the
-  // most recent tick-group (overflow included -- score-but-never-fold); drop scores the latest
-  // marker-complete one. A stale scored tick freezes that direction (no candidate, no coverage).
+  // Merge note (watch-fabrication A2 x capacity S6): BOTH freshness gates apply per direction --
+  // the latest complete census must be fresh (censusFresh, the S6 stale-census freeze reported to
+  // `baseline status`) AND the tick each direction actually SCORES must be fresh: spike scores the
+  // most recent tick-group (overflow included -- score-but-never-fold, except an unscorable
+  // markerless Tailscale overflow); drop scores the latest marker-complete one. A stale scored tick
+  // freezes that direction (no candidate, no coverage). Identities are the R8 source-scoped
+  // v2:vpn / v2:markerless fingerprints, never the legacy "global" (which stays frozen).
   const spikeFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
   const dropFresh = isFreshTs(windowedDrop.last_observation?.ts, nowMs, freshnessMs);
   const currentFingerprint = peerCountFingerprintForAvailabilitySignature(currentGroups.at(-1)?.availabilitySignature);
@@ -980,7 +986,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
       { deviationSigma, fingerprint: currentFingerprint },
     )
     : undefined;
-  if (spikeCandidate) candidates.push(spikeCandidate);
+  if (spikeCandidate && spikeHorizonOk && censusFresh) candidates.push(spikeCandidate);
   const dropCandidate = dropFresh
     ? buildCountDropCandidate(
       { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
@@ -1002,7 +1008,7 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
         && groupMs > new Date(persistedState.cold_start_since_ts).getTime()
         && groupMs < scoredDropMs;
     }).length >= minHistoryTickCount);
-  if (dropCandidate && dropRecoveryReady) candidates.push(dropCandidate);
+  if (dropCandidate && dropRecoveryReady && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
 
   // Detector-reported recovery coverage (plan §8.B/§8.C, peer recipe). evaluatedAlertKeys = the
   // alert identities this detector GENUINELY evaluated this tick -- every family it had
@@ -1018,13 +1024,42 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     too few marker-complete ticks have re-accumulated since the cold-start anchor (a
   //     count_drop-only warm-up the spike direction does not share), so gating drop on
   //     windowedDrop.confidence_state alone would fabricate a recovery.
-  const evaluatedAlertKeys = [];
-  //   - both: additionally only when the scored tick is FRESH (A2) -- a stale tick is not evaluated.
-  if (spikeFresh && windowed.confidence_state === "established") {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint));
-  }
-  if (dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady) {
-    evaluatedAlertKeys.push(alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint));
-  }
-  return { candidates, evaluatedAlertKeys };
+  //   - both: additionally only when the latest complete census AND the scored tick are FRESH (A2/S6)
+  //     and the rule's eligibility horizon is met (S3) -- a stale tick is not evaluated.
+  const spikeEvaluated = spikeFresh && windowed.confidence_state === "established";
+  const dropEvaluated = dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady;
+  const spikeKeys = spikeEvaluated && spikeHorizonOk && censusFresh ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : [];
+  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : [];
+  const evaluatedAlertKeys = [...spikeKeys, ...dropKeys];
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  // Readiness order: stale census, warm-up, no scorable observation (e.g. a markerless Tailscale
+  // overflow truncation), stale scored tick, then (drop only) post-anchor drop history.
+  const directionGate = (state, fresh) => {
+    if (censusReadiness.gate === "latest_census_stale") return "latest_census_stale";
+    if (state.confidence_state !== "established") return "baseline_warming_up";
+    if (!state.last_observation) return "no_scorable_observation";
+    if (!fresh) return "latest_census_stale";
+    return "ok";
+  };
+  const spikeGate = directionGate(windowed, spikeFresh);
+  const dropBaseGate = directionGate(windowedDrop, dropFresh);
+  const ruleEvaluations = {
+    [PEER_COUNT_SPIKE_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk: spikeHorizonOk,
+      readinessGate: spikeGate,
+      baselineSamples: { count: windowed.stats.count, required: minSampleCount },
+      evaluatedAlertKeys: spikeKeys,
+    }),
+    [PEER_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk: dropHorizonOk,
+      baselineSamples: { count: windowedDrop.stats.count, required: minSampleCount },
+      readinessGate: dropBaseGate !== "ok" ? dropBaseGate : dropRecoveryReady ? "ok" : "drop_history_not_ready",
+      evaluatedAlertKeys: dropKeys,
+    }),
+  };
+  return { candidates, evaluatedAlertKeys, ruleEvaluations };
 }

@@ -6,7 +6,8 @@ import test from "node:test";
 import { evaluateConstraints } from "../src/constraint-eval.js";
 import { SEED_CONSTRAINTS, loadConstraints, writeConstraints } from "../src/constraint-store.js";
 import { isFixedLengthHexHash, isSafeEnumString } from "../src/diagnostics-sanitizer.js";
-import { appendFactPoints, enforceFactRetention, readFactPoints } from "../src/fact-store.js";
+import { enforceFactRetention, readFactPoints, appendFactPointsByFamily } from "../src/fact-store.js";
+import { FACT_FAMILY_IDS } from "../src/fact-families.js";
 import {
   MINED_FAMILIES,
   MINED_ID_PREFIX,
@@ -463,8 +464,8 @@ test("constraint-miner.js never imports the pi-harness/alert-intelligence LLM to
 test("descartes learned mine writes drafts to constraints.json, preserves existing SEED_CONSTRAINTS, and prints a summary", async () => {
   const paths = await tempPaths();
   await writeConstraints(paths, SEED_CONSTRAINTS);
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { family: "service", now: BASE_TS + 8 * DAY_MS });
 
   const lines = [];
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: (line) => lines.push(line) });
@@ -483,8 +484,8 @@ test("descartes learned mine writes drafts to constraints.json, preserves existi
 
 test("descartes learned mine --json prints a machine-readable summary", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { family: "service", now: BASE_TS + 8 * DAY_MS });
 
   const lines = [];
   await runLearned(paths, ["mine", "--json"], { now: BASE_TS + 8 * DAY_MS, output: (line) => lines.push(line) });
@@ -496,11 +497,16 @@ test("descartes learned mine --json prints a machine-readable summary", async ()
   assert.equal(payload.learned_mine.updated_drafts, 0);
 });
 
-test("descartes learned mine mints zero drafts when fact-history is degraded, unknown, or corrupt", async () => {
+test("descartes learned mine mints zero drafts when fact-history is degraded, unknown, corrupt, or narrowed", async () => {
   const cases = [
     ["degraded", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "degraded" } }],
     ["unknown", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "unknown" } }],
     ["corrupt", { corrupt_count: 1, schema_invalid_count: 0, completeness: { status: "intact" } }],
+    // MEDIUM-1 (review fold): the miner's interim requireFullCoverage gate refuses a narrowed
+    // (byte-cap-evicted) store even though its status is "intact" -- a truncated history can hide
+    // counterexamples just as an outright loss could. S3 replaces this with the miner's own
+    // mining-span horizon.
+    ["narrowed coverage", { corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "narrowed" } }],
   ];
 
   for (const [label, readResult] of cases) {
@@ -531,7 +537,11 @@ test("descartes learned mine keeps normal behavior for intact history and ignore
       schema_invalid_count: 0,
       completeness: {
         status: "intact",
-        last_bytecap_evict_ts: new Date(nowMs + 1).toISOString(),
+        // MEDIUM-1 (review fold): runLearned's mining path now requires full coverage, not just
+        // an intact status (requireFullCoverage). This fixture is testing future-loss tolerance,
+        // not narrowing, so it stays "full".
+        coverage: "full",
+        last_corrupt_ts: new Date(nowMs + 1).toISOString(),
       },
     }),
     output: () => {},
@@ -544,8 +554,8 @@ test("descartes learned mine keeps normal behavior for intact history and ignore
 
 test("descartes learned mine re-run does not duplicate drafts (idempotent CLI round-trip)", async () => {
   const paths = await tempPaths();
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  await enforceFactRetention(paths, { now: BASE_TS + 8 * DAY_MS });
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  await enforceFactRetention(paths, { family: "service", now: BASE_TS + 8 * DAY_MS });
 
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: () => {} });
   await runLearned(paths, ["mine"], { now: BASE_TS + 8 * DAY_MS, output: () => {} });
@@ -558,8 +568,8 @@ test("descartes learned mine re-run does not duplicate drafts (idempotent CLI ro
 test("descartes learned mine reads facts via readFactPoints and honors --window", async () => {
   const paths = await tempPaths();
   // A fact-history window explicitly narrower than the mined span should exclude the older samples.
-  await appendFactPoints(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
-  const { points } = await readFactPoints(paths, { now: BASE_TS + 8 * DAY_MS, windowMs: DAY_MS }); // only ~last day
+  await appendFactPointsByFamily(paths, stableServiceHistory(), { now: BASE_TS + 8 * DAY_MS });
+  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS], now: BASE_TS + 8 * DAY_MS, windowMs: DAY_MS }); // only ~last day
   assert(points.length < 3);
 });
 
@@ -612,4 +622,28 @@ test("MUST-FIX 4(b): a MIXED fact-history (stable service.presence + stable peer
   const candidates = mineConstraintCandidates(factHistory, [], { now: BASE_TS + 8 * DAY_MS });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].family, "service-presence");
+});
+
+// Fact-store capacity plan S3: the miner's narrowing gate is certifiedReadWindowOk. For its default
+// UNBOUNDED read that admits exactly two shapes -- no byte-cap floor, or a byte-cap floor at or below
+// the age floor (everything it removed, retention removed too) -- and it no longer refuses on the
+// age floor alone (the interim requireFullCoverage gate did: no mining ever again once a store was
+// 30 days old).
+test("S3: learned mine mints over an age-narrowed store and over byte-cap narrowing subsumed by the age floor, but not over a recent byte-cap floor", async () => {
+  const nowMs = BASE_TS + 8 * DAY_MS;
+  const run = async (completeness) => {
+    const paths = await tempPaths();
+    await writeConstraints(paths, []);
+    await runLearned(paths, ["mine"], {
+      now: nowMs,
+      readFactPoints: async () => ({ points: stableServiceHistory(), corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", ...completeness } }),
+      output: () => {},
+    });
+    return (await loadConstraints(paths)).constraints.length;
+  };
+  const iso = (ms) => new Date(ms).toISOString();
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: null, age_floor_ts: iso(nowMs - 30 * DAY_MS) }), 1, "age floor alone: mines");
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: iso(nowMs - 31 * DAY_MS), age_floor_ts: iso(nowMs - 30 * DAY_MS) }), 1, "byte-cap floor <= age floor: mines");
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: iso(nowMs - 2 * DAY_MS), age_floor_ts: iso(nowMs - 30 * DAY_MS) }), 0, "a recent byte-cap floor can hide counterexamples: refused");
+  assert.equal(await run({ coverage: "narrowed", bytecap_floor_ts: iso(nowMs - 2 * DAY_MS), age_floor_ts: null }), 0, "a byte-cap floor with no age floor: refused for an unbounded read");
 });

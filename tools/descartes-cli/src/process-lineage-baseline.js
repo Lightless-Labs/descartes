@@ -9,7 +9,8 @@ import { loadWatchConfig } from "./watch-store.js";
 import { coldStartEntryReason } from "./cold-start-reason.js";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
 import { readFactPoints } from "./fact-store.js";
-import { factHistoryTrustworthy } from "./fact-store-completeness.js";
+import { buildRuleEvaluation, factHistoryTrustworthy, hasCompletenessLossAfterAnchor, noveltyHistoryScopeTs, noveltyRuleEligible, noveltySeenSetStatus, validNoveltySeenSet } from "./fact-store-completeness.js";
+import { seenBeforeTick } from "./novelty-seen-set.js";
 import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
@@ -87,31 +88,9 @@ function isValidIsoTimestamp(value) {
   return typeof value === "string" && value.length > 0 && Number.isFinite(new Date(value).getTime());
 }
 
-const COMPLETENESS_LOSS_TIMESTAMP_FIELDS = [
-  "last_corrupt_ts",
-  "last_schema_invalid_ts",
-  "last_bytecap_evict_ts",
-  "last_continuity_break_ts",
-  // BLOCKER 2 (daybreak re-gate): see fact-store-completeness.js's LOSS_TIMESTAMP_FIELDS for the
-  // full rationale -- last_future_fact_ts is always stamped with the real pass nowIso (never the
-  // record's own claimed future ts), so including it here is safe (no permanent lockout) and
-  // necessary (an anchor-relative trust check that omits it can be fooled once the marker ages
-  // out of the read window).
-  "last_future_fact_ts",
-];
-
-function hasCompletenessLossAfterAnchor(readResult, anchorTs, nowMs) {
-  const completeness = readResult?.completeness;
-  if (!completeness || typeof completeness !== "object" || Array.isArray(completeness)) return false;
-  const anchorMs = isValidIsoTimestamp(anchorTs) ? new Date(anchorTs).getTime() : -Infinity;
-  const upperBoundMs = Number.isFinite(nowMs) ? nowMs : Infinity;
-  return COMPLETENESS_LOSS_TIMESTAMP_FIELDS.some((field) => {
-    const timestamp = completeness[field];
-    if (timestamp === undefined || timestamp === null) return false;
-    const timestampMs = new Date(timestamp).getTime();
-    return !Number.isFinite(timestampMs) || (timestampMs > anchorMs && timestampMs <= upperBoundMs);
-  });
-}
+// The loss-channel list and the cold-start re-arm check (hasCompletenessLossAfterAnchor) live in
+// fact-store-completeness.js since the fact-store capacity plan's S1 (2026-10-05): one shared
+// definition instead of six hand-maintained detector copies, so a loss-channel change is one edit.
 
 // FABRICATION fix (deception/anomaly-detector review -- schema-invalid-store trust pattern):
 // JSON.parse succeeding is NOT sufficient to trust a persisted store. A parseable-but-wrong-shape
@@ -261,18 +240,24 @@ export function groupProcessLineageFactsByTick(points = []) {
 // undefined when it is not (too little complete history, or a stale latest complete census) --
 // exactly the two cases where detection itself returns []. No detection-logic change: this is the
 // same filter/length/freshness test that was inline before.
-function readyLineageCompleteGroups(groups = [], options = {}) {
+// S6 (I11): the same gates, naming WHICH one stopped the rule for the per-rule status report.
+function lineageEvaluationReadiness(groups = [], options = {}) {
   const {
     nowMs = Date.now(),
     freshnessMs = DEFAULT_LINEAGE_FRESHNESS_FALLBACK_MS,
     minHistoryTickCount = DEFAULT_LINEAGE_MIN_HISTORY_TICK_COUNT,
   } = options;
   const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length < minHistoryTickCount + 1) return undefined;
+  if (completeGroups.length < minHistoryTickCount + 1) return { gate: "insufficient_complete_history" };
   const latest = completeGroups[completeGroups.length - 1];
   const latestMs = new Date(latest.ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return undefined;
-  return completeGroups;
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale" };
+  return { gate: "ok", completeGroups };
+}
+
+function readyLineageCompleteGroups(groups = [], options = {}) {
+  const readiness = lineageEvaluationReadiness(groups, options);
+  return readiness.gate === "ok" ? readiness.completeGroups : undefined;
 }
 
 export function detectNovelProcessLineageEdges(groups = [], options = {}) {
@@ -288,6 +273,8 @@ export function detectNovelProcessLineageEdges(groups = [], options = {}) {
   const novel = [];
   for (const entityKey of latest.entityKeys) {
     if (historical.has(entityKey)) continue;
+    // S3b (§17): a valid seen-set's prior sighting suppresses the claim (union only suppresses).
+    if (seenBeforeTick(options.seenEntries, entityKey, latest.ts)) continue;
     novel.push({ entity_key: entityKey, first_seen_ts: latest.ts });
   }
   return novel;
@@ -323,12 +310,17 @@ function hashLineageEdgeEntityKey(entityKey) {
     .slice(0, 16);
 }
 
-export function buildNovelEdgeCandidates(entries = []) {
+// Fact-store capacity plan §4.2 (step S3): a novelty claim carries its scope. history_certified_after_ts
+// turns "not seen in this host's recent history" into "not seen since <ts>" -- the start of the
+// certified memory the claim was decided against (noveltyHistoryScopeTs, fact-store-completeness.js).
+// Omitted (never null: the sanitizer redacts null) only when no scope is known.
+export function buildNovelEdgeCandidates(entries = [], { historyCertifiedAfterTs } = {}) {
   return entries.map((entry) => {
     const entityKeyHash = hashLineageEdgeEntityKey(entry.entity_key);
     const diagnostics = sanitizeDiagnostics({
       entity_key_hash: entityKeyHash,
       first_seen_ts: entry.first_seen_ts,
+      ...(typeof historyCertifiedAfterTs === "string" ? { history_certified_after_ts: historyCertifiedAfterTs } : {}),
     });
     return {
       id: alertId(PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, entityKeyHash),
@@ -358,7 +350,7 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
 
   const windowMs = options.baselineFactWindowMs ?? DEFAULT_BASELINE_FACT_WINDOW_MS;
   const readFacts = options.readFactPoints ?? readFactPoints;
-  const readResult = await readFacts(descartesPaths, { windowMs, now: options.now });
+  const readResult = await readFacts(descartesPaths, { family: "process_lineage", windowMs, now: options.now, seenSetFamilies: ["process_lineage"] });
   const { points, corrupt_count: corruptFactCount } = readResult;
   const groups = groupProcessLineageFactsByTick(points);
 
@@ -405,7 +397,17 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
   const persistedAnchorMissingOrFuture = (persistedState.cold_start_pending && !isValidIsoTimestamp(persistedState.cold_start_since_ts))
     || (isValidIsoTimestamp(persistedState.cold_start_since_ts)
       && new Date(persistedState.cold_start_since_ts).getTime() > nowMs);
-  const historyTrust = factHistoryTrustworthy(readResult, { anchorTs: persistedState.cold_start_since_ts, nowMs });
+  // Novelty over a narrowed window (daybreak G1 blocker 1): with a VALID seen-set (S3b, §17) the
+  // memory survives byte-cap eviction (I13) and novelty is decided against it, so narrowing is no
+  // longer a trust loss here. WITHOUT one (missing, invalid, lineage mismatch, pending pass,
+  // overflow, or an injected read that carries none) the interim S2 gate stays: a narrowed window is
+  // untrusted and re-arms through the existing cold-start path (I14: no claim without continuity).
+  const seenSet = validNoveltySeenSet(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID);
+  const historyTrust = factHistoryTrustworthy(readResult, {
+    anchorTs: persistedState.cold_start_since_ts,
+    nowMs,
+    requireFullCoverage: !seenSet,
+  });
   const completenessLossAfterAnchor = hasCompletenessLossAfterAnchor(readResult, persistedState.cold_start_since_ts, nowMs);
   // Security-sweep F4 fix (2026-09-04 daybreak review): hoisted ABOVE enteringColdStart (was
   // previously computed only after `novel`, purely to gate the store WRITE) and added as a 5th
@@ -458,13 +460,17 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     }
   }
 
-  const novel = coldStartPendingThisTick ? [] : detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
+  // Eligibility horizon (fact-store capacity plan §4.2, step S3; operator Q2: 6 d). Never an input to
+  // the lockout above (I5); a horizon-short tick emits nothing and reports no coverage.
+  const horizonOk = noveltyRuleEligible(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID, nowMs);
+  const evaluable = !coldStartPendingThisTick && horizonOk;
+  const novel = evaluable ? detectNovelProcessLineageEdges(currentGroups, { nowMs, freshnessMs, minHistoryTickCount, seenEntries: seenSet?.entries }) : [];
   // §8.B/§8.C coverage: reported from the SAME state the detector already computed (currentGroups +
   // the readiness predicate), zeroed under coldStartPendingThisTick exactly as `novel` is -- never a
   // change to detection logic, cold-start lockout, or completeness gates.
-  const evaluatedAlertKeys = coldStartPendingThisTick
-    ? []
-    : computeEvaluatedProcessLineageEdgeKeys(currentGroups, { nowMs, freshnessMs, minHistoryTickCount });
+  const evaluatedAlertKeys = evaluable
+    ? computeEvaluatedProcessLineageEdgeKeys(currentGroups, { nowMs, freshnessMs, minHistoryTickCount })
+    : [];
 
   // F4 fix: lastFoldedWasFuture is now computed earlier (above, as an enteringColdStart arming
   // term) -- only lastFoldedMs/effectiveLastFoldedTs (the fold-forward bookkeeping) are still
@@ -492,5 +498,16 @@ export async function computeProcessLineageBaselineCandidates(descartesPaths, op
     await writeStore(descartesPaths, nextState);
   }
 
-  return { candidates: buildNovelEdgeCandidates(novel), evaluatedAlertKeys };
+  // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
+  const ruleEvaluations = {
+    [PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID]: buildRuleEvaluation({
+      historyTrust,
+      coldStartPendingThisTick,
+      horizonOk,
+      horizonReason: noveltySeenSetStatus(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID),
+      readinessGate: lineageEvaluationReadiness(currentGroups, { nowMs, freshnessMs, minHistoryTickCount }).gate,
+      evaluatedAlertKeys,
+    }),
+  };
+  return { candidates: buildNovelEdgeCandidates(novel, { historyCertifiedAfterTs: noveltyHistoryScopeTs(readResult, PROCESS_LINEAGE_NOVEL_EDGE_RULE_ID) }), evaluatedAlertKeys, ruleEvaluations };
 }

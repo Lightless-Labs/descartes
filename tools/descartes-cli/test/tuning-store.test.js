@@ -674,3 +674,21 @@ test("runLearnedTuningList: lists candidates regardless of learned.json enable s
   const payload = JSON.parse(lines[0]);
   assert.equal(payload.learned_tuning_list.candidates.length, 1);
 });
+
+// Fact-store capacity plan S3 (fact-families.js READER_COVERAGE "tuning_miner", report_only):
+// tuning is not gated by narrowing (it makes no absence/novelty claim) but reports where its fact
+// window's certified history starts; null when nothing was narrowed.
+test("runLearnedTuningMine reports the fact history's certified boundary (null when not narrowed)", async () => {
+  const paths = await tempPaths();
+  await writeLearnedConfig(paths, { enabled: true });
+  const now = "2026-07-10T00:00:00.000Z";
+  const certified = "2026-07-08T00:00:00.000Z";
+  const narrowed = await runLearnedTuningMine(paths, [], {
+    output: () => {},
+    now,
+    readFactPoints: async () => ({ points: [], corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact", coverage: "narrowed", certified_after_ts: certified } }),
+  });
+  assert.equal(narrowed.fact_history_certified_after_ts, certified);
+  const full = await runLearnedTuningMine(paths, [], { output: () => {}, now });
+  assert.equal(full.fact_history_certified_after_ts, null);
+});

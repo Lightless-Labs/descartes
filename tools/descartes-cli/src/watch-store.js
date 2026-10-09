@@ -34,13 +34,30 @@ function normalizeIso(ts, field = "timestamp") {
   return date.toISOString();
 }
 
-// Mirrors constraint-store.js's own normalizeFactStoreMaxBytes exactly (fail closed to
-// DEFAULT_FACT_MAX_BYTES on anything that is not a finite, positive number) -- kept as an
-// independent copy rather than a shared import so watch.json and learned.json stay two fully
-// independent files, per this module's own header note above.
-function normalizeFactStoreMaxBytes(value) {
-  const num = Number(value);
-  return Number.isFinite(num) && num > 0 ? num : DEFAULT_FACT_MAX_BYTES;
+// DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5): the single shared-store cap
+// is replaced by per-family `fact_store_budgets` and is IGNORED by the store. Every pre-S4 write
+// filled in DEFAULT_FACT_MAX_BYTES, so that exact value is the written-in default, not an operator
+// choice: it (and any invalid value) normalizes to ABSENT -- never written in again -- while a
+// deliberate, non-default operator value is preserved so status can name it as deprecated/ignored
+// instead of silently discarding the operator's decision. Independent copy of constraint-store.js's
+// learned.json twin, per this module's header note.
+function normalizeLegacyFactStoreMaxBytes(value) {
+  const num = typeof value === "number" ? value : Number.NaN;
+  return Number.isFinite(num) && num > 0 && num !== DEFAULT_FACT_MAX_BYTES ? num : undefined;
+}
+
+// S4 (fact-store capacity plan §4.5 Config): the per-family budget map. Only its SHAPE is normalized
+// here (a plain object of at most 32 short keys with primitive values); each value is validated
+// against its family's T8 horizon floor by fact-families.js resolveFactStoreBudgets at use, so a
+// rejected value stays visible to the status surfaces (`budget_below_horizon_floor`) instead of
+// being silently rewritten away. Absent (or not a plain object) -> absent: every family default.
+const MAX_FACT_STORE_BUDGET_KEYS = 32;
+function normalizeFactStoreBudgetsConfig(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value)
+    .filter(([key, entry]) => key.length > 0 && key.length <= 64 && (entry === null || ["number", "string", "boolean"].includes(typeof entry)))
+    .slice(0, MAX_FACT_STORE_BUDGET_KEYS);
+  return Object.fromEntries(entries);
 }
 
 function normalizeTrustedBinaryPaths(value) {
@@ -56,7 +73,8 @@ export function normalizeWatchConfig(config = {}) {
     // any other junk value all normalize to `true`.
     enabled: config.enabled !== false,
     updated_at: config.updated_at ? normalizeIso(config.updated_at, "updated_at") : undefined,
-    fact_store_max_bytes: normalizeFactStoreMaxBytes(config.fact_store_max_bytes),
+    ...(normalizeLegacyFactStoreMaxBytes(config.fact_store_max_bytes) !== undefined ? { fact_store_max_bytes: normalizeLegacyFactStoreMaxBytes(config.fact_store_max_bytes) } : {}),
+    ...(normalizeFactStoreBudgetsConfig(config.fact_store_budgets) ? { fact_store_budgets: normalizeFactStoreBudgetsConfig(config.fact_store_budgets) } : {}),
     // Explicit absolute paths are an operator escape hatch for binaries whose ownership/mode
     // cannot satisfy the normal trust boundary. binary-resolver.js still realpath- and
     // regular-executable-checks every selected entry before it can run.

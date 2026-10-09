@@ -15,6 +15,7 @@ import {
   parseWgInterfaceList,
   parseWgPeerList,
   parseWhoOutput,
+  MAX_PEER_ENTITY_LIMIT,
 } from "../src/tools/vpn-peer-status.js";
 
 const SRC_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "tools", "vpn-peer-status.js");
@@ -571,4 +572,19 @@ test("a peer count at or below the cap is never marked truncated", async () => {
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: scriptedExec(script), peerLimit: cap });
   assert.equal(envelope.result.peers.length, cap);
   assert.equal(envelope.result.truncated, false);
+});
+
+// Fact-store capacity plan §2/S4: the peer cap is a hard UPPER clamp (T8 sizes the peer budget on it).
+test("an options.peerLimit above MAX_PEER_ENTITY_LIMIT is clamped down to it", async () => {
+  const pubkeys = Array.from({ length: MAX_PEER_ENTITY_LIMIT + 20 }, (_, i) => `key-${i}`).join("\n");
+  const script = baseScript({
+    [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+  });
+  const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: scriptedExec(script), peerLimit: 100_000 });
+  assert.equal(envelope.result.cap, MAX_PEER_ENTITY_LIMIT);
+  assert.equal(envelope.result.peers.length, MAX_PEER_ENTITY_LIMIT);
+  assert.equal(envelope.result.truncated, true);
 });

@@ -119,42 +119,39 @@ test("loadWatchConfig on ENOENT (file absent) still does not mark corrupt:true -
   assert.equal(config.corrupt, undefined);
 });
 
-// --- fact_store_max_bytes / updated_at: normalizeWatchConfig mirrors normalizeLearnedConfig's
-// shape exactly (plan §12.3 fact 3), so the daemon's structural-append path can source
-// options.maxBytes from watchConfig instead of learnedConfig. ---
+// --- fact_store_max_bytes: DEPRECATED by S4 (fact-store capacity plan §4.5 Config, operator Q5). The
+// single shared-store cap is replaced by per-family `fact_store_budgets`; the legacy key is IGNORED by
+// the store and reported as deprecated in status. Every pre-S4 write filled in the 5 MB default, so
+// that exact value is the written-in default, never an operator choice: normalization drops it (and
+// any invalid value) instead of writing it in again, and preserves only a deliberate, non-default
+// operator value -- so status can name it rather than silently discard the operator's decision.
+// (These tests replace the F2-Tier1 "fail closed to DEFAULT_FACT_MAX_BYTES" pins.) ---
 
-test("normalizeWatchConfig accepts a valid finite positive fact_store_max_bytes override", () => {
-  const config = normalizeWatchConfig({ fact_store_max_bytes: 1024 });
-  assert.equal(config.fact_store_max_bytes, 1024);
+test("normalizeWatchConfig preserves a deliberate (non-default) operator fact_store_max_bytes so status can name it as deprecated", () => {
+  assert.equal(normalizeWatchConfig({ fact_store_max_bytes: 1024 }).fact_store_max_bytes, 1024);
 });
 
-test("normalizeWatchConfig fails closed to DEFAULT_FACT_MAX_BYTES when fact_store_max_bytes is missing", () => {
-  const config = normalizeWatchConfig({});
-  assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+test("normalizeWatchConfig no longer writes in a fact_store_max_bytes default, and drops the written-in 5 MB default", () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizeWatchConfig({}), "fact_store_max_bytes"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizeWatchConfig({ fact_store_max_bytes: DEFAULT_FACT_MAX_BYTES }), "fact_store_max_bytes"), false);
 });
 
 for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, "garbage", null]) {
-  test(`normalizeWatchConfig fails closed to DEFAULT_FACT_MAX_BYTES on invalid fact_store_max_bytes: ${String(badValue)}`, () => {
-    const config = normalizeWatchConfig({ fact_store_max_bytes: badValue });
-    assert.equal(config.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  test(`normalizeWatchConfig drops an invalid legacy fact_store_max_bytes: ${String(badValue)}`, () => {
+    assert.equal(Object.prototype.hasOwnProperty.call(normalizeWatchConfig({ fact_store_max_bytes: badValue }), "fact_store_max_bytes"), false);
   });
 }
 
-test("writeWatchConfig/loadWatchConfig round-trip a valid fact_store_max_bytes override", async () => {
+test("writeWatchConfig/loadWatchConfig round-trip a deliberate operator fact_store_max_bytes; a written-in default or invalid value is not written back", async () => {
   const paths = await tempPaths();
   await writeWatchConfig(paths, { enabled: true, fact_store_max_bytes: 2048 });
-
-  const reread = await loadWatchConfig(paths);
-  assert.equal(reread.fact_store_max_bytes, 2048);
-});
-
-test("writeWatchConfig fails closed to DEFAULT_FACT_MAX_BYTES when given an invalid fact_store_max_bytes", async () => {
-  const paths = await tempPaths();
-  const written = await writeWatchConfig(paths, { enabled: true, fact_store_max_bytes: -5 });
-  assert.equal(written.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
-
-  const reread = await loadWatchConfig(paths);
-  assert.equal(reread.fact_store_max_bytes, DEFAULT_FACT_MAX_BYTES);
+  assert.equal((await loadWatchConfig(paths)).fact_store_max_bytes, 2048);
+  const other = await tempPaths();
+  for (const value of [DEFAULT_FACT_MAX_BYTES, -5]) {
+    const written = await writeWatchConfig(other, { enabled: true, fact_store_max_bytes: value });
+    assert.equal(Object.prototype.hasOwnProperty.call(written, "fact_store_max_bytes"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(await loadWatchConfig(other), "fact_store_max_bytes"), false);
+  }
 });
 
 test("writeWatchConfig stamps updated_at and normalizeWatchConfig round-trips a valid ISO updated_at", async () => {

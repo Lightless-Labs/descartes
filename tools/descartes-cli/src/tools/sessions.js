@@ -32,6 +32,10 @@ import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_SESSION_ENTITY_LIMIT = 200;
+// Fact-store capacity plan §2/S4: the per-tick session cap is a hard UPPER clamp, not just a default --
+// the session fact family's budget invariant (fact-families.js, T8) is sized against it, so an
+// options.sessionLimit above it must not make the per-tick volume (and so the budget) unbounded.
+export const MAX_SESSION_ENTITY_LIMIT = 200;
 
 // tmux's #{session_created} format variable is a Unix epoch-seconds integer — locale-independent
 // and reliable, unlike screen's optional (and locale-formatted) creation-date column, which is
@@ -200,7 +204,7 @@ async function collectScreenSessions(options = {}) {
  * a partial warning so the baseline cannot fold a zero as a complete two-source census.
  */
 export async function collectSessionEvidence(options = {}) {
-  const cap = Math.max(1, Number(options.sessionLimit) || DEFAULT_SESSION_ENTITY_LIMIT);
+  const cap = Math.min(MAX_SESSION_ENTITY_LIMIT, Math.max(1, Number(options.sessionLimit) || DEFAULT_SESSION_ENTITY_LIMIT));
 
   return timedEnvelope(async () => {
     const platform = options.platform ?? process.platform;
