@@ -58,8 +58,6 @@ import { collectSystemEvidence } from "./tools/system.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
-import { acquireDaemonSingleton } from "./daemon-singleton.js";
-import { applyQueuedAlertCommands } from "./alert-command-queue.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -875,9 +873,6 @@ function deepFreeze(value) {
 }
 
 export async function runDaemonIteration(descartesPaths, options = {}) {
-  // The daemon is the sole alert-state writer. CLI mutations are append-only commands and are
-  // consumed before the next evaluation while the runDaemon singleton is held.
-  await applyQueuedAlertCommands(descartesPaths, { now: options.ts ?? new Date().toISOString() });
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
@@ -1509,6 +1504,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         ...(mainAlerts.notification_due_ids ?? []),
         ...(containmentAlerts.notification_due_ids ?? []),
       ])],
+      notification_due_incidents: [...new Map([
+        ...(mainAlerts.notification_due_incidents ?? []),
+        ...(containmentAlerts.notification_due_incidents ?? []),
+      ].map((entry) => [`${entry.alert_id}\0${entry.incident_key}`, entry])).values()],
+      adjudication_due_incidents: [...new Map([
+        ...(mainAlerts.adjudication_due_incidents ?? []),
+        ...(containmentAlerts.adjudication_due_incidents ?? []),
+      ].map((entry) => [`${entry.alert_id}\0${entry.incident_key}`, entry])).values()],
+      adjudication_due_ids: [...new Set([
+        ...(mainAlerts.adjudication_due_ids ?? []),
+        ...(containmentAlerts.adjudication_due_ids ?? []),
+      ])],
     };
     if (alerts?.persistence_status === "lock_unavailable") {
       alertPersistenceError = alerts.persistence_error;
@@ -1988,7 +1995,7 @@ export async function runForegroundDaemonLoop(descartesPaths, options = {}) {
   const shouldStop = options.shouldStop ?? (() => false);
 
   do {
-    const result = await iterate(descartesPaths, { mode: "foreground", singleton: options.singleton });
+    const result = await iterate(descartesPaths, { mode: "foreground" });
     output(JSON.stringify({ status: "ok", points_written: result.points.length, ts: result.status.ts }));
     if (options.once || shouldStop()) break;
     await sleeper(options.intervalMs, undefined, { ref: true });
@@ -2022,7 +2029,6 @@ export async function runDaemon(descartesPaths, args) {
     return;
   }
 
-  const singleton = await acquireDaemonSingleton(descartesPaths);
   let stopping = false;
   const stop = () => {
     stopping = true;
@@ -2033,13 +2039,11 @@ export async function runDaemon(descartesPaths, args) {
     await runForegroundDaemonLoop(descartesPaths, {
       intervalMs: options.intervalMs,
       once: options.once,
-      singleton,
       shouldStop: () => stopping,
     });
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
-    await singleton.release();
     if (stopping) await writeDaemonStatus(descartesPaths, { state: "stopped", mode: "foreground" });
   }
 }
