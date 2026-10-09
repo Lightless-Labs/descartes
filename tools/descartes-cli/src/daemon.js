@@ -80,6 +80,7 @@ export const DEFAULT_DAEMON_INTERVAL_MS = 60 * 1000;
 export const DEFAULT_DAEMON_PROCESS_LIMIT = 5;
 export const DEFAULT_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_STRUCTURAL_TICK_DEADLINE_MS = 45 * 1000;
+const LEGACY_CONTENT_PIN_FILE = "binary-content-pins.json";
 // Slice B (Codex-hardening): a structural fact (service.presence / network.listening_port.owner)
 // unobserved for more than this many STRUCTURAL cycles is treated as stale ("no live claim") by the
 // active + shadow-soak constraint eval, instead of reading its last value as current for up to the
@@ -381,16 +382,20 @@ export function metricPointsFromEvidence(evidence, options = {}) {
   return points;
 }
 
-export async function collectDaemonEvidence(profile = defaultDaemonProfile(), collectors = {}) {
+export async function collectDaemonEvidence(profile = defaultDaemonProfile(), collectors = {}, options = {}) {
   const activeCollectors = {
     system: collectors.system ?? collectSystemEvidence,
     processes: collectors.processes ?? collectProcessEvidence,
     disks: collectors.disks ?? collectDiskEvidence,
   };
+  const collectorOptions = {
+    ...options,
+    trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+  };
   const evidence = [];
-  if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system());
-  if (profile.collectors.processes?.enabled) evidence.push(await activeCollectors.processes({ limit: profile.collectors.processes.limit ?? DEFAULT_DAEMON_PROCESS_LIMIT }));
-  if (profile.collectors.disks?.enabled) evidence.push(await activeCollectors.disks());
+  if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system(collectorOptions));
+  if (profile.collectors.processes?.enabled) evidence.push(await activeCollectors.processes({ limit: profile.collectors.processes.limit ?? DEFAULT_DAEMON_PROCESS_LIMIT, ...collectorOptions }));
+  if (profile.collectors.disks?.enabled) evidence.push(await activeCollectors.disks(collectorOptions));
   return evidence;
 }
 
@@ -398,7 +403,7 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
  * Sibling to collectDaemonEvidence for the slower structural (services/network/scheduled-jobs)
  * cadence — identical enabled-flag/injectable-collectors pattern, stable evidence ordering.
  */
-export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}) {
+export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
   const activeCollectors = {
     services: collectors.services ?? collectServiceEvidence,
     network: collectors.network ?? collectNetworkEvidence,
@@ -422,16 +427,20 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     canary: collectors.canary ?? (() => collectCanaryEvidence([])),
     "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
   };
+  const collectorOptions = {
+    ...options,
+    trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+  };
   const evidence = [];
-  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services());
-  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network());
-  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"]());
-  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance());
-  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions());
-  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"]());
-  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"]());
-  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary());
-  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"]());
+  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(collectorOptions));
+  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network(collectorOptions));
+  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"](collectorOptions));
+  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance(collectorOptions));
+  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
+  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
+  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"](collectorOptions));
+  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary(collectorOptions));
+  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"](collectorOptions));
   return evidence;
 }
 
@@ -921,6 +930,24 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   validateDaemonProfile(profile);
   const ts = options.ts ?? new Date().toISOString();
   const nowMs = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+  try {
+    await fs.unlink(path.join(descartesPaths.stateDir, "daemon", LEGACY_CONTENT_PIN_FILE));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[daemon] legacy binary content-pin cleanup failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
+  try {
+    const daemonStateDir = path.join(descartesPaths.stateDir, "daemon");
+    const entries = await fs.readdir(daemonStateDir);
+    await Promise.all(entries
+      .filter((entry) => entry.startsWith(`${LEGACY_CONTENT_PIN_FILE}.`) && entry.endsWith(".tmp"))
+      .map((entry) => fs.unlink(path.join(daemonStateDir, entry))));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[daemon] orphaned binary content-pin tmp cleanup failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
   // Slice B (Codex-hardening): one freshness horizon, derived from the RESOLVED profile's structural
   // interval (not options.profile, which may be undefined when defaulted), threaded into BOTH the
   // live-active and shadow-soak constraint evals so they apply the identical staleness bound.
@@ -966,6 +993,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
+  const collectorOptions = {
+    trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+  };
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
   // delete quarantines older than 31 days. Fact I/O only when a tier is on (no I/O when disabled).
@@ -986,7 +1016,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
   }
 
-  const evidence = await collectDaemonEvidence(profile, options.collectors);
+  const evidence = await collectDaemonEvidence(profile, options.collectors, collectorOptions);
   const points = metricPointsFromEvidence(evidence, { ts });
   // Finding F4: isolated so a storage fault (ENOSPC/EACCES/EROFS) on this tick's metric persist
   // degrades this tick's write result to an honest zero rather than aborting the entire tick
@@ -1053,7 +1083,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           };
         }
         const outcome = await withDeadline(
-          collectStructuralEvidence(structuralProfile, structuralCollectors),
+          collectStructuralEvidence(structuralProfile, structuralCollectors, collectorOptions),
           deadlineMs,
           () => STRUCTURAL_TICK_TIMED_OUT,
         );

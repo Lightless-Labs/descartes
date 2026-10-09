@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { createEvidenceTools } from "../src/pi-harness.js";
 import { resolveDescartesPaths } from "../src/paths.js";
+import { writeWatchConfig } from "../src/watch-store.js";
 import { assertSafeTriageToolNames, TRIAGE_TOOL_NAMES } from "../src/tool-policy.js";
 import { MAX_WINDOW_MINUTES } from "../src/tools/logs.js";
 
@@ -119,6 +120,28 @@ test("inspect_runtime_provenance's executor threads paths into resolveProvenance
   assert.equal(envelope.result.resolved.pid, process.pid);
   assert.equal(envelope.result.privilege.mechanism, "unprivileged");
   assert.equal(envelope.result.privilege.elevated_used, false);
+});
+
+test("collector tools honor configured operator-trusted binaries loaded from watch.json", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-pi-harness-trusted-binary-test-"));
+  const paths = resolveDescartesPaths({
+    HOME: root,
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    XDG_DATA_HOME: path.join(root, "data"),
+    XDG_STATE_HOME: path.join(root, "state"),
+    XDG_CACHE_HOME: path.join(root, "cache"),
+  });
+  const fakeTailscale = path.join(root, "tailscale");
+  await fs.writeFile(fakeTailscale, "#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ BackendState: 'Running', Peer: {} }));\n", { mode: 0o755 });
+  await fs.chmod(fakeTailscale, 0o755);
+  await writeWatchConfig(paths, { trusted_binary_paths: [fakeTailscale] });
+
+  const tailscaleTool = createEvidenceTools(paths).find((tool) => tool.name === "collect_tailscale_status");
+  const toolResult = await tailscaleTool.execute("test-call-id", {});
+
+  assert.equal(toolResult.details.status, "ok");
+  assert.equal(toolResult.details.result.backend_state, "Running");
+  assert.equal(toolResult.details.result.binary_provenance.trust_verdict, "operator_trusted");
 });
 
 // F7 fix B: derive_findings must only ever see evidence this session's own collector tool calls

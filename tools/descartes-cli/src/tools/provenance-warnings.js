@@ -32,6 +32,7 @@ import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { readFile as fsReadFile } from "node:fs/promises";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { alertId } from "../alert-store.js";
 import { loadLearnedConfig } from "../constraint-store.js";
 import { sanitizeDiagnostics, sanitizeIdentityString } from "../diagnostics-sanitizer.js";
@@ -72,21 +73,13 @@ export const PUBLIC_BIND_RULE_ID = "provenance.socket.public_bind_no_supervisor"
 export const DEFAULT_PROVENANCE_FACT_WINDOW_MS = 3 * 60 * 60 * 1000; // 3 hours
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 512 * 1024,
-    });
-    return { status: "ok", stdout, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "unable",
-      error: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      command: { argv, read_only: true },
-    };
-  }
+  const result = await runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 512 * 1024,
+    execFileAsync,
+  });
+  return { ...result, status: result.status === "ok" ? "ok" : (result.availability ?? "unable") };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -574,7 +567,7 @@ export async function collectProvenanceWarningsEvidence(options = {}) {
       let executableInfo;
       if (narrowed) {
         narrowedCandidateCount += 1;
-        executableInfo = await resolveExeInfo(pid);
+        executableInfo = await resolveExeInfo(pid, options);
       }
 
       // Reuses detectWarnings verbatim so severity/confidence/message stay the canonical S3

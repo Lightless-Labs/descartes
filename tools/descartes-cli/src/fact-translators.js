@@ -722,15 +722,34 @@ function buildSessionOverflowMarkerFactPoint(result, envelope, ts) {
   };
 }
 
-// Must-fix 2: "partial" iff ANY multiplexer this tick reported status "unable" — "absent"
-// (genuinely not installed) does NOT count as partial. `result.multiplexers` is the real
-// collector's per-mux status array (tools/sessions.js's collectSessionEvidence); a fixture that
-// omits it entirely (e.g. legacy/simplified test evidence) degrades to "complete" rather than
-// throwing — an absent multiplexers array carries no evidence of degradation either way.
+const SESSION_MULTIPLEXER_ORDER = ["tmux", "screen"];
+const SESSION_NOT_FOUND_STATUS = "not_found_on_known_paths";
+
+// The session census universe is the set of sources that are present and usable this tick. A
+// known-path miss is outside that universe; it is not an incomplete source and never contributes
+// a zero. Any other non-ok status means a source is present but not trustworthy, so the census is
+// partial and the baseline cannot fold it.
 function censusStateFor(result) {
   const multiplexers = Array.isArray(result?.multiplexers) ? result.multiplexers : [];
-  const anyUnable = multiplexers.some((mux) => mux?.status === "unable");
-  return anyUnable ? "partial" : "complete";
+  if (multiplexers.length === 0) return "complete"; // legacy/simplified evidence shape
+  const usable = multiplexers.some((mux) => mux?.status === "ok");
+  const incomplete = multiplexers.some((mux) => mux?.status !== "ok" && mux?.status !== SESSION_NOT_FOUND_STATUS);
+  return usable && !incomplete ? "complete" : "partial";
+}
+
+function binaryAvailabilityFor(result) {
+  if (!Array.isArray(result?.multiplexers)) return undefined;
+  return result.multiplexers
+    .map((mux) => `${mux?.multiplexer ?? "unknown"}:${mux?.status ?? "unknown"}`)
+    .join("|");
+}
+
+function sessionAvailabilitySignatureFor(result) {
+  const multiplexers = Array.isArray(result?.multiplexers) ? result.multiplexers : [];
+  const universe = SESSION_MULTIPLEXER_ORDER.filter((name) => multiplexers.some(
+    (mux) => mux?.multiplexer === name && mux?.status === "ok",
+  ));
+  return universe.length > 0 ? `v1:${universe.join("+")}` : undefined;
 }
 
 // Must-fix 1/2: emitted unconditionally on every successful sessions envelope — including a
@@ -744,6 +763,8 @@ function buildSessionCensusMarkerFactPoint(result, envelope, ts) {
     entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
     attributes: {
       census_state: censusStateFor(result),
+      ...(sessionAvailabilitySignatureFor(result) ? { availability_signature: sessionAvailabilitySignatureFor(result) } : {}),
+      ...(binaryAvailabilityFor(result) ? { binary_availability: binaryAvailabilityFor(result) } : {}),
     },
     source_envelope_id: envelope.id,
     source_tool: envelope.trace?.tool,
@@ -760,7 +781,9 @@ function buildSessionCensusMarkerFactPoint(result, envelope, ts) {
  * (session-baseline.js), which consumes this fact-history rather than emitting candidates here.
  */
 export function factPointsFromSessionEvidence(evidence, { ts } = {}) {
-  const envelope = (evidence ?? []).find((e) => e.id === "sessions" && e.status !== "unable");
+  const envelope = (evidence ?? []).find((e) => e.id === "sessions"
+    && e.result
+    && (e.status !== "unable" || Array.isArray(e.result.multiplexers)));
   if (!envelope) return [];
   const sessions = envelope.result?.sessions ?? [];
 
@@ -814,12 +837,13 @@ export const PEER_CENSUS_MARKER_ENTITY_KEY = "peer.census-marker.v1";
 // 5 fixed source keys vpn-peer-status.js's envelope always produces (sources.{ssh_who,ssh_last,
 // wireguard,vpn_services,established_inbound}.status). Grounded against tools/vpn-peer-status.js's
 // real closed status vocabulary (confirmed by direct read): "ok" | "partial" | "absent" |
-// "missing_permission" | "unable" | "not_applicable" (not every source can emit every value --
+// "not_found_on_known_paths" | "untrusted_binary" | "missing_permission" | "unable" |
+// "not_applicable" (not every source can emit every value --
 // e.g. only wireguard emits "partial", only vpn_services emits "not_applicable" -- but the bucket
 // function below is defensive against ANY future status literal, mapping anything outside this
 // closed set to "unknown" rather than embedding an unrecognized raw string).
 const CLOSED_PEER_SOURCE_STATUS_VALUES = new Set([
-  "ok", "partial", "absent", "missing_permission", "unable", "not_applicable",
+  "ok", "partial", "absent", "not_found_on_known_paths", "untrusted_binary", "missing_permission", "unable", "not_applicable",
 ]);
 
 function normalizedSourceStatus(status) {
@@ -972,7 +996,9 @@ function buildPeerOverflowMarkerFactPoint(result, envelope, ts) {
  * fact-history; alerting on unattributed/odd-hour peer logins is deferred to Slice 4/6.
  */
 export function factPointsFromVpnPeerEvidence(evidence, { ts } = {}) {
-  const envelope = (evidence ?? []).find((e) => e.id === "vpn-peer-status" && e.status !== "unable");
+  const envelope = (evidence ?? []).find((e) => e.id === "vpn-peer-status"
+    && e.result
+    && (e.status !== "unable" || e.result.sources));
   if (!envelope) return [];
   const peers = envelope.result?.peers ?? [];
 

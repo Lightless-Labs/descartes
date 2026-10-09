@@ -20,6 +20,21 @@ function enoent() {
   return failure({ code: "ENOENT", error: "spawn tmux ENOENT" });
 }
 
+function untrusted() {
+  return {
+    status: "untrusted_binary",
+    error: "untrusted",
+    command: { argv: ["tmux"], read_only: true },
+    binary: {
+      binary: "tmux",
+      status: "untrusted_binary",
+      resolved_path: "/tmp/unsafe/tmux",
+      trust_verdict: "untrusted_binary",
+      offending_component: "/tmp/unsafe",
+    },
+  };
+}
+
 // Injects distinct fakes per binary name so a single test can simulate any combination of
 // tmux/screen behavior without a real tmux/screen installation (plan §2's local testability
 // model — mirrors provenance-warnings.js's own options.runFixedExecFile DI convention).
@@ -125,7 +140,7 @@ test("parseScreenLs skips a malformed line but still parses a well-formed siblin
 
 // --- collectSessionEvidence: degrade-not-fabricate ---
 
-test("neither tmux nor screen present -> envelope is unable/confidence:0, NEVER a fabricated zero-sessions ok", async () => {
+test("tmux/screen ENOENT is not-found-on-known-paths -> envelope is unable/confidence:0, NEVER a fabricated zero-sessions ok", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({ tmux: enoent(), screen: enoent() }),
   });
@@ -133,20 +148,41 @@ test("neither tmux nor screen present -> envelope is unable/confidence:0, NEVER 
   assert.equal(envelope.confidence, 0);
   assert.equal(envelope.review_hint, "missing_permission");
   assert.equal(envelope.result.any_binary_available, false);
-  assert.deepEqual(envelope.result.multiplexers.map((m) => m.status), ["absent", "absent"]);
+  assert.deepEqual(envelope.result.multiplexers.map((m) => m.status), ["not_found_on_known_paths", "not_found_on_known_paths"]);
 });
 
-test("tmux absent, screen present with genuinely zero sessions -> ok/empty, distinguishable from the neither-binary-present case", async () => {
+test("an untrusted tmux binary is incomplete, never executed as a zero-session source, and remains in census provenance", async () => {
+  const envelope = await collectSessionEvidence({
+    runFixedExecFile: fakeExec({ tmux: untrusted(), screen: enoent() }),
+  });
+  assert.equal(envelope.status, "unable");
+  assert.equal(envelope.confidence, 0);
+  const tmux = envelope.result.multiplexers.find((entry) => entry.multiplexer === "tmux");
+  assert.equal(tmux.status, "untrusted_binary");
+  assert.deepEqual(tmux.binary_provenance, {
+    requested_binary: "tmux",
+    resolved_path: "/tmp/unsafe/tmux",
+    trust_verdict: "untrusted_binary",
+    offending_component: "/tmp/unsafe",
+    trust_reason: undefined,
+    same_uid_writable_components: [],
+  });
+});
+
+test("tmux absent, screen present with genuinely zero sessions -> complete screen-only census", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({ tmux: enoent(), screen: ok("No Sockets found in /run/screen/S-user.\n") }),
   });
   assert.equal(envelope.status, "ok");
   assert.equal(envelope.confidence, 1);
+  assert.equal(envelope.review_hint, "none");
+  assert.equal(envelope.result.census_state, "complete");
+  assert.equal(envelope.result.availability_signature, "v1:screen");
   assert.deepEqual(envelope.result.sessions, []);
   assert.equal(envelope.result.total_count, 0);
 });
 
-test("tmux present with no server running (its own genuine-zero-sessions signal) -> ok/empty, not unable", async () => {
+test("tmux present with no server running and screen absent -> complete tmux-only zero census", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({
       tmux: failure({ code: 1, stderr: "no server running on /tmp/tmux-501/default\n" }),
@@ -154,7 +190,20 @@ test("tmux present with no server running (its own genuine-zero-sessions signal)
     }),
   });
   assert.equal(envelope.status, "ok");
+  assert.equal(envelope.confidence, 1);
+  assert.equal(envelope.result.census_state, "complete");
+  assert.equal(envelope.result.availability_signature, "v1:tmux");
   assert.deepEqual(envelope.result.sessions, []);
+});
+
+test("a present but untrusted screen binary keeps the tmux universe incomplete", async () => {
+  const envelope = await collectSessionEvidence({
+    runFixedExecFile: fakeExec({ tmux: ok(""), screen: untrusted() }),
+  });
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.result.census_state, "partial");
+  assert.equal(envelope.result.availability_signature, "v1:tmux");
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "screen").status, "untrusted_binary");
 });
 
 test("both tmux and screen present with real sessions -> combined, per-multiplexer-tagged session list", async () => {
@@ -166,6 +215,7 @@ test("both tmux and screen present with real sessions -> combined, per-multiplex
   });
   assert.equal(envelope.status, "ok");
   assert.equal(envelope.result.total_count, 2);
+  assert.equal(envelope.result.availability_signature, "v1:tmux+screen");
   const multiplexers = envelope.result.sessions.map((s) => s.multiplexer).sort();
   assert.deepEqual(multiplexers, ["screen", "tmux"]);
 });
@@ -179,18 +229,37 @@ test("screen -ls exits non-zero even though sessions genuinely exist (pinned ver
     }),
   });
   assert.equal(envelope.status, "ok");
+  assert.equal(envelope.confidence, 1);
   assert.equal(envelope.result.sessions.length, 1);
   assert.equal(envelope.result.sessions[0].attached, true);
 });
 
-test("malformed/truncated tmux output degrades gracefully: well-formed lines still parsed, envelope stays ok", async () => {
+test("malformed screen output is partial even when the command exits non-zero", async () => {
+  const envelope = await collectSessionEvidence({
+    runFixedExecFile: fakeExec({
+      tmux: enoent(),
+      screen: failure({ code: 1, stdout: "corrupt-row-with-a-real-session-hidden\n" }),
+    }),
+  });
+  const screen = envelope.result.multiplexers.find((mux) => mux.multiplexer === "screen");
+  assert.equal(screen.status, "partial");
+  assert.equal(screen.malformed_count, 1);
+  assert.equal(envelope.result.census_state, "partial");
+});
+
+test("malformed/truncated tmux output makes that source partial instead of authorizing a complete census", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({
       tmux: ok(["main\t3\t1\t1720000000", "###garbage###"].join("\n")),
       screen: enoent(),
     }),
   });
-  assert.equal(envelope.status, "ok");
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.confidence, 0.5);
+  assert.equal(envelope.result.census_state, "partial");
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "tmux").status, "partial");
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "tmux").malformed_count, 1);
+  assert.equal(envelope.result.multiplexers.find((mux) => mux.multiplexer === "screen").malformed_count, 0);
   assert.equal(envelope.result.sessions.length, 1);
 });
 
@@ -207,17 +276,29 @@ test("permission-denied on tmux (no recognizable no-server message) + screen abs
   assert.equal(tmuxEntry.status, "unable");
 });
 
-test("permission-denied on tmux only, screen ok -> overall ok (partial degrade recorded, not fabricated as failure)", async () => {
+test("permission-denied on tmux only, screen ok -> overall warning and incomplete census", async () => {
   const envelope = await collectSessionEvidence({
     runFixedExecFile: fakeExec({
       tmux: failure({ code: "EACCES", stderr: "permission denied" }),
       screen: ok(["There are screens on:", "\t1.foo\t(Attached)", "1 Socket in /x."].join("\n")),
     }),
   });
-  assert.equal(envelope.status, "ok");
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.confidence, 0.5);
+  assert.notEqual(envelope.review_hint, "none");
   const tmuxEntry = envelope.result.multiplexers.find((m) => m.multiplexer === "tmux");
   assert.equal(tmuxEntry.status, "unable");
   assert.equal(envelope.result.sessions.length, 1);
+});
+
+test("untrusted tmux plus screen zero keeps the census partial instead of authorizing a zero", async () => {
+  const envelope = await collectSessionEvidence({
+    runFixedExecFile: fakeExec({ tmux: untrusted(), screen: ok("No Sockets found in /run/screen/S-user.\n") }),
+  });
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.confidence, 0.5);
+  assert.notEqual(envelope.review_hint, "none");
+  assert.deepEqual(envelope.result.sessions, []);
 });
 
 // --- Flood cap (must-fix 5) ---

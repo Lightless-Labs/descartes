@@ -2,11 +2,12 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
 
-async function collectSwap() {
+async function collectSwap(options = {}) {
   if (process.platform === "linux") {
     try {
       const meminfo = await fs.readFile("/proc/meminfo", "utf8");
@@ -26,7 +27,14 @@ async function collectSwap() {
 
   if (process.platform === "darwin") {
     try {
-      const { stdout } = await execFileAsync("sysctl", ["vm.swapusage"], { timeout: 2000, maxBuffer: 1024 * 64 });
+      const result = await runResolvedExecFile("sysctl", ["vm.swapusage"], {
+        ...options,
+        timeout: 2000,
+        maxBuffer: 1024 * 64,
+        execFileAsync,
+      });
+      if (result.status !== "ok") return { unable: result.error, status: result.availability ?? "unable", source: "sysctl vm.swapusage" };
+      const { stdout } = result;
       const total = stdout.match(/total = ([\d.]+)([MG])/)?.slice(1, 3);
       const used = stdout.match(/used = ([\d.]+)([MG])/)?.slice(1, 3);
       const free = stdout.match(/free = ([\d.]+)([MG])/)?.slice(1, 3);
@@ -49,12 +57,12 @@ async function collectSwap() {
   return { unable: `unsupported platform: ${process.platform}` };
 }
 
-export async function collectSystemEvidence() {
+export async function collectSystemEvidence(options = {}) {
   return timedEnvelope(async () => {
     const cpus = os.cpus();
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
-    const swap = await collectSwap();
+    const swap = await collectSwap(options);
 
     return {
       hostname: os.hostname(),

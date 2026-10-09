@@ -111,7 +111,7 @@ function fastCollectorFakes() {
 // truncated service enumeration, an "unable" session multiplexer).
 const PARTIAL_COLLECTORS = {
   service: ["services", (envelope) => ({ ...envelope, result: { ...envelope.result, truncated: true } })],
-  session: ["sessions", (envelope) => ({ ...envelope, result: { ...envelope.result, multiplexers: [{ multiplexer: "tmux", status: "unable" }, { multiplexer: "screen", status: "absent" }] } })],
+  session: ["sessions", (envelope) => ({ ...envelope, result: { ...envelope.result, multiplexers: [{ multiplexer: "tmux", status: "ok" }, { multiplexer: "screen", status: "unable" }] } })],
 };
 
 function scenarioRig({ scale = 0.05, disabledCollectors = [], factStoreBudgets, structuralIntervalMs = HOUR_MS } = {}) {
@@ -509,13 +509,12 @@ test("Leg E regression: a domain whose lockout cleared but whose count rule is s
   assert.match(session.phase, /^partially watching — 1 of 2 rules$/);
 });
 
-test("L1: peer re-accumulation progress counts what the peer lockout counts (an invalid-signature tick is lockout-complete)", { timeout: 120_000 }, async () => {
+test("L1: peer re-accumulation progress excludes invalid-signature ticks from lockout progress", { timeout: 120_000 }, async () => {
   const paths = await tempPaths("peer-progress");
   const rig = scenarioRig();
   for (let hour = 0; hour <= 2; hour += 1) await rig.structural(paths, hour);
-  // Peer ticks whose census marker carries a garbled availability signature: the peer lockout's base
-  // tickGroupDisposition (overflow-vs-complete) counts them; only count_drop's stricter disposition
-  // excludes them.
+  // Peer ticks whose census marker carries a garbled availability signature are untrusted and must
+  // be excluded from both the lockout progress and the count baseline.
   for (let hour = 3; hour <= 6; hour += 1) {
     const ts = iso(BASE_MS + hour * HOUR_MS);
     await appendFactPoints(paths, [
@@ -527,12 +526,11 @@ test("L1: peer re-accumulation progress counts what the peer lockout counts (an 
   assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, true, "precondition: the peer lockout is still persisted pending");
   const status = await buildBaselineStatus(paths, { now: nowIso });
   const peer = status.domains.find((domain) => domain.domain === "peer");
-  // h1..h6 are strictly after the h0 anchor: six lockout-complete ticks, so the detector clears on its
-  // next tick (deviation 5: "6 of 6" until the clear is persisted).
-  assert.equal(peer.complete_ticks, 6);
-  // Merge (watch-fabrication R2): the garbled-signature ticks never fold into either count baseline,
-  // so the 30-sample count baseline (0 of 30), not the cleared 6-tick lockout, is the binding
-  // requirement each peer rule's phase shows; the lockout's own progress stays complete_ticks (6).
+  // Only h0..h2 are trusted before the invalid-signature tail, so two post-anchor ticks are the
+  // progress that remains visible after the fail-closed disposition veto.
+  assert.equal(peer.complete_ticks, 2);
+  // The garbled-signature ticks never fold into either count baseline, so the 30-sample count
+  // baseline (0 of 30) remains the binding requirement.
   for (const rule of peer.rules) {
     assert.equal(rule.phase, "still learning — 0 of 30", rule.rule_id);
     assert.deepEqual(rule.baseline_samples, { count: 0, required: 30 }, rule.rule_id);
@@ -540,7 +538,7 @@ test("L1: peer re-accumulation progress counts what the peer lockout counts (an 
   }
   const observed = await rig.fastTick(paths, nowIso);
   assert.ok(observed.get("peer"), "the daemon ran the peer producer");
-  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, false, "the detector cleared the lockout on those six ticks");
+  assert.equal((await loadPeerBaselineStore(paths)).state.cold_start_pending, true, "the detector keeps the lockout pending without six trusted ticks");
 });
 
 test("status reasons: budget_below_horizon_floor from watch.json; cap_below_tick and retention_failing from the daemon record; a stale record's horizon-short since is ignored on a watching rule; status never writes", async () => {

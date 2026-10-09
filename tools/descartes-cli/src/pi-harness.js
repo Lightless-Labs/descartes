@@ -28,6 +28,7 @@ import { deriveFindings } from "./tools/findings.js";
 import { readSamplingArtifactEvidence, sampleDimensionEvidence } from "./tools/sampling.js";
 import { selectTriageModel } from "./model-selection.js";
 import { assertSafeTriageToolNames, TRIAGE_TOOL_NAMES } from "./tool-policy.js";
+import { loadWatchConfig } from "./watch-store.js";
 
 function jsonToolResult(value) {
   return {
@@ -44,6 +45,12 @@ export function createEvidenceTools(paths) {
   // evidence" fabrication vector -- see evidence-freeze.js's documented "not itself a host-state
   // collector" contract for derive_findings, which this registry now actually enforces).
   const evidenceRegistry = new Map();
+  let collectorConfigPromise;
+  async function collectorOptions() {
+    collectorConfigPromise ??= loadWatchConfig(paths).catch(() => ({}));
+    const config = await collectorConfigPromise;
+    return { trustedBinaryPaths: config.trusted_binary_paths ?? [] };
+  }
   function registerEvidence(bundle) {
     if (bundle?.id) evidenceRegistry.set(bundle.id, bundle);
     if (Array.isArray(bundle?.evidence)) {
@@ -59,7 +66,7 @@ export function createEvidenceTools(paths) {
       description: "Collect read-only OS, CPU/load, memory, swap, uptime, and host identity evidence.",
       parameters: Type.Object({}),
       executionMode: "parallel",
-      execute: async () => jsonToolResult(registerEvidence(await collectSystemEvidence())),
+      execute: async () => jsonToolResult(registerEvidence(await collectSystemEvidence(await collectorOptions()))),
     }),
     defineTool({
       name: "collect_processes",
@@ -67,7 +74,7 @@ export function createEvidenceTools(paths) {
       description: "Collect read-only top CPU and memory process evidence using the process table.",
       parameters: Type.Object({ limit: Type.Optional(Type.Number({ minimum: 1, maximum: 25 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectProcessEvidence({ limit: params.limit ?? 10 }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectProcessEvidence({ limit: params.limit ?? 10, ...(await collectorOptions()) }))),
     }),
     defineTool({
       name: "collect_disks",
@@ -75,7 +82,7 @@ export function createEvidenceTools(paths) {
       description: "Collect read-only filesystem space and inode usage evidence.",
       parameters: Type.Object({}),
       executionMode: "parallel",
-      execute: async () => jsonToolResult(registerEvidence(await collectDiskEvidence())),
+      execute: async () => jsonToolResult(registerEvidence(await collectDiskEvidence(await collectorOptions()))),
     }),
     defineTool({
       name: "collect_network_basics",
@@ -89,6 +96,7 @@ export function createEvidenceTools(paths) {
       execute: async (_id, params) => jsonToolResult(registerEvidence(await collectNetworkEvidence({
         checkDnsReachability: params.check_dns_reachability ?? true,
         socketLimit: params.socket_limit ?? 50,
+        ...(await collectorOptions()),
       }))),
     }),
     defineTool({
@@ -98,7 +106,7 @@ export function createEvidenceTools(paths) {
       parameters: Type.Object({ service_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })) }),
       executionMode: "parallel",
       execute: async (_id, params) => {
-        const envelope = registerEvidence(await collectServiceEvidence({ serviceLimit: params.service_limit ?? 80 }));
+        const envelope = registerEvidence(await collectServiceEvidence({ serviceLimit: params.service_limit ?? 80, ...(await collectorOptions()) }));
         // F3 gap fix (must-fix 1): collectServiceEvidence's `result.services_census` is the
         // AUTHORITATIVE, up-to-~1000-entry census that feeds the daemon's service-baseline
         // machinery (tools/services.js's DEFAULT_SERVICE_CENSUS_CEILING) -- it must never reach
@@ -125,6 +133,7 @@ export function createEvidenceTools(paths) {
         windowMinutes: params.window_minutes ?? 30,
         eventLimit: params.event_limit ?? 80,
         includeSecurity: params.include_security ?? true,
+        ...(await collectorOptions()),
       }))),
     }),
     defineTool({
@@ -143,6 +152,7 @@ export function createEvidenceTools(paths) {
         hostLimit: params.host_limit ?? 40,
         includeStopped: params.include_stopped ?? true,
         collectStats: params.collect_stats ?? true,
+        ...(await collectorOptions()),
       }))),
     }),
     defineTool({
@@ -151,7 +161,7 @@ export function createEvidenceTools(paths) {
       description: "Collect bounded read-only VM runtime and inventory evidence for Tart, Lima, Multipass, VirtualBox, libvirt/virsh, Parallels, VMware, UTM, Podman machine, Incus/LXD VMs, Proxmox, Xen, and direct VM-like processes where available. No VM actions are taken.",
       parameters: Type.Object({ vm_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectVmEvidence({ vmLimit: params.vm_limit ?? 80 }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectVmEvidence({ vmLimit: params.vm_limit ?? 80, ...(await collectorOptions()) }))),
     }),
     defineTool({
       name: "collect_scheduled_jobs",
@@ -167,6 +177,7 @@ export function createEvidenceTools(paths) {
         jobLimit: params.job_limit ?? 80,
         includeSystem: params.include_system ?? true,
         includeUser: params.include_user ?? true,
+        ...(await collectorOptions()),
       }))),
     }),
     defineTool({
@@ -181,6 +192,7 @@ export function createEvidenceTools(paths) {
       execute: async (_id, params) => jsonToolResult(registerEvidence(await collectTimeSyncEvidence({
         checkOffset: params.check_offset ?? false,
         server: params.server,
+        ...(await collectorOptions()),
       }))),
     }),
     defineTool({
@@ -195,6 +207,7 @@ export function createEvidenceTools(paths) {
       execute: async (_id, params) => jsonToolResult(registerEvidence(await collectCertificateEvidence({
         warningDays: params.warning_days ?? 30,
         certificateLimit: params.certificate_limit ?? 80,
+        ...(await collectorOptions()),
       }))),
     }),
     defineTool({
@@ -203,7 +216,10 @@ export function createEvidenceTools(paths) {
       description: "Collect read-only tmux/screen session inventory for the invoking user: session name, attached/detached state, window count, and creation time where the multiplexer exposes it. Same-UID only — does not enumerate other users' sessions.",
       parameters: Type.Object({ session_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectSessionEvidence({ sessionLimit: params.session_limit ?? DEFAULT_SESSION_ENTITY_LIMIT }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectSessionEvidence({
+        sessionLimit: params.session_limit ?? DEFAULT_SESSION_ENTITY_LIMIT,
+        ...(await collectorOptions()),
+      }))),
     }),
     defineTool({
       name: "collect_vpn_peer_status",
@@ -211,7 +227,10 @@ export function createEvidenceTools(paths) {
       description: "Collect a read-only baseline of VPN/SSH peer identity: SSH login census (who) and bounded recent history (last -n), WireGuard peers/endpoints/latest-handshakes (status only, never keys), and macOS VPN service state. No traffic content is inspected, no privilege is escalated, and no host actions are taken.",
       parameters: Type.Object({ peer_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectVpnPeerStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_PEER_ENTITY_LIMIT }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectVpnPeerStatusEvidence({
+        peerLimit: params.peer_limit ?? DEFAULT_PEER_ENTITY_LIMIT,
+        ...(await collectorOptions()),
+      }))),
     }),
     defineTool({
       name: "collect_tailscale_status",
@@ -219,7 +238,7 @@ export function createEvidenceTools(paths) {
       description: "Collect a read-only baseline of Tailscale/tailnet peer identity from local daemon state (`tailscale status --json`): node presence, exit-node role, handshake recency. No traffic content is inspected, no admin/control-plane API is called, no privilege is escalated, and no host actions are taken.",
       parameters: Type.Object({ peer_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectTailscaleStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectTailscaleStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT, ...(await collectorOptions()) }))),
     }),
     defineTool({
       name: "inspect_process",
@@ -227,7 +246,7 @@ export function createEvidenceTools(paths) {
       description: "Inspect one process by PID using read-only process table facts, redacted command lines, parent summary, and child summaries.",
       parameters: Type.Object({ pid: Type.Number({ minimum: 1 }) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await inspectProcessEvidence({ pid: params.pid }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await inspectProcessEvidence({ pid: params.pid, ...(await collectorOptions()) }))),
     }),
     defineTool({
       name: "inspect_parent_tree",
@@ -238,7 +257,7 @@ export function createEvidenceTools(paths) {
         max_depth: Type.Optional(Type.Number({ minimum: 1, maximum: 64 })),
       }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await inspectParentTreeEvidence({ pid: params.pid, maxDepth: params.max_depth ?? 16 }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await inspectParentTreeEvidence({ pid: params.pid, maxDepth: params.max_depth ?? 16, ...(await collectorOptions()) }))),
     }),
     defineTool({
       name: "inspect_runtime_provenance",
@@ -250,7 +269,10 @@ export function createEvidenceTools(paths) {
         container: Type.Optional(Type.String()),
       }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await resolveProvenance({ pid: params.pid, port: params.port, container: params.container }, { paths }))),
+      execute: async (_id, params) => jsonToolResult(registerEvidence(await resolveProvenance(
+        { pid: params.pid, port: params.port, container: params.container },
+        { paths, ...(await collectorOptions()) },
+      ))),
     }),
     defineTool({
       name: "sample_dimension",
@@ -281,7 +303,7 @@ export function createEvidenceTools(paths) {
       description: "Collect the full first-slice read-only resource-pressure evidence bundle and deterministic findings.",
       parameters: Type.Object({}),
       executionMode: "parallel",
-      execute: async () => jsonToolResult(registerEvidence(await collectAllEvidence())),
+      execute: async () => jsonToolResult(registerEvidence(await collectAllEvidence(await collectorOptions()))),
     }),
     defineTool({
       name: "derive_findings",

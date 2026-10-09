@@ -10,12 +10,14 @@
 // exposes a service, or touches certificates/keys. `status --json` is read-only and prints no
 // private key or auth material.
 //
-// Degrade-not-fabricate: ENOENT means the binary is absent; a parsed logged-out backend state is
+// Degrade-not-fabricate: a miss on pinned known paths (including ENOENT) means the binary is
+// not_found_on_known_paths; a parsed logged-out backend state is
 // a truthful zero; malformed output and all other failures are unable. Permission failures are
 // documented as elevation candidates, but this collector never escalates.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -25,23 +27,17 @@ export const DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 export const MAX_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 512 * 1024,
-    });
-    return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "error",
-      code: error?.code,
-      stdout: error?.stdout ?? "",
-      stderr: error?.stderr ?? "",
-      error: error instanceof Error ? error.message : String(error),
-      command: { argv, read_only: true },
-    };
-  }
+  return runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 512 * 1024,
+    execFileAsync,
+  });
+}
+
+function probeOptions(options, overrides = {}) {
+  const { runFixedExecFile: _injectedRunner, ...resolverOptions } = options;
+  return { ...resolverOptions, ...overrides };
 }
 
 function isPermissionDenied(probe) {
@@ -99,6 +95,10 @@ function resultForFailure(status, probe, extra = {}) {
     elevation_candidate: status === "missing_permission",
     error: probe?.error,
     command: probe?.command,
+    binary_provenance: binaryProvenance(probe?.binary),
+    ...(status === "untrusted_binary" ? {
+      operator_override_hint: "Review the offending component and add the exact absolute Tailscale executable to trusted_binary_paths in watch.json only if the operator accepts the risk.",
+    } : {}),
     ...extra,
   };
 }
@@ -114,11 +114,12 @@ export async function collectTailscaleStatusEvidence(options = {}) {
 
   return timedEnvelope(async () => {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;
-    const probe = await runExec("tailscale", ["status", "--json"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+    const probe = await runExec("tailscale", ["status", "--json"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
-    if (probe.code === "ENOENT") return resultForFailure("absent", probe, { cap });
+    if (isBinaryNotFound(probe)) return resultForFailure("not_found_on_known_paths", probe, { cap });
     if (probe.status !== "ok") {
-      return resultForFailure(isPermissionDenied(probe) ? "missing_permission" : "unable", probe, { cap });
+      const status = isBinaryUntrusted(probe) ? "untrusted_binary" : isPermissionDenied(probe) ? "missing_permission" : "unable";
+      return resultForFailure(status, probe, { cap });
     }
 
     let parsed;
@@ -144,6 +145,7 @@ export async function collectTailscaleStatusEvidence(options = {}) {
         cap,
         elevation_candidate: false,
         command: probe.command,
+        binary_provenance: binaryProvenance(probe.binary),
       };
     }
 
@@ -160,14 +162,15 @@ export async function collectTailscaleStatusEvidence(options = {}) {
       cap,
       elevation_candidate: false,
       command: probe.command,
+      binary_provenance: binaryProvenance(probe.binary),
     };
   }, (result) => evidenceEnvelope({
     id: "tailscale-status",
-    status: result.status === "ok" ? "ok" : "unable",
+    status: result.status === "ok" ? "ok" : result.status === "untrusted_binary" ? "warning" : "unable",
     source: "tailscale_status",
     result,
     confidence: result.status === "ok" ? 1 : 0,
-    reviewHint: result.status === "missing_permission" ? "missing_permission" : "none",
+    reviewHint: result.status === "untrusted_binary" ? "untrusted_binary" : result.status === "missing_permission" ? "missing_permission" : "none",
     tool: "collect_tailscale_status",
     target: `cap=${result.cap ?? cap}`,
   }));

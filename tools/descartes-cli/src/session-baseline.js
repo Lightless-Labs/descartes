@@ -55,6 +55,21 @@ export { emptyWelfordStats, foldWelford, updateEwma, computeZScore, DEFAULT_BASE
 export { SESSION_CENSUS_MARKER_ENTITY_KEY };
 
 const SESSION_FACT_NAME = "session.presence";
+const SESSION_AVAILABILITY_SIGNATURE_PATTERN = /^v1:(?:tmux|screen|tmux\+screen)$/;
+export const SESSION_AVAILABILITY_SIGNATURE_INVALID = Symbol("session-availability-signature-invalid");
+export const SESSION_COUNT_LEGACY_FINGERPRINT = "global";
+
+export function sessionCountFingerprintForAvailabilitySignature(availabilitySignature) {
+  return typeof availabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(availabilitySignature)
+    ? `v2:${availabilitySignature.slice(3)}`
+    : SESSION_COUNT_LEGACY_FINGERPRINT;
+}
+
+export function sessionChurnFingerprintForAvailabilitySignature(entityKey, availabilitySignature) {
+  return typeof availabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(availabilitySignature)
+    ? `${sessionCountFingerprintForAvailabilitySignature(availabilitySignature)}:${entityKey}`
+    : entityKey;
+}
 
 export const SESSION_COUNT_DROP_RULE_ID = "session.count_drop";
 export const SESSION_CHURN_RULE_ID = "session.churn";
@@ -140,6 +155,7 @@ function freshSessionBaselineState() {
     cold_start_pending: true,
     cold_start_reason: undefined,
     cold_start_since_ts: undefined,
+    availability_signature: undefined,
   };
 }
 
@@ -203,6 +219,10 @@ export function normalizeSessionBaselineState(raw) {
     cold_start_pending: base.cold_start_pending !== false,
     cold_start_reason: typeof base.cold_start_reason === "string" ? base.cold_start_reason : undefined,
     cold_start_since_ts: typeof base.cold_start_since_ts === "string" ? base.cold_start_since_ts : undefined,
+    availability_signature: typeof base.availability_signature === "string"
+      && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(base.availability_signature)
+      ? base.availability_signature
+      : undefined,
   };
 }
 
@@ -289,7 +309,7 @@ export async function writeSessionBaselineStore(descartesPaths, state) {
  * Groups session.presence fact points by their shared `ts` (one structural tick = one shared ts
  * string, confirmed against daemon.js's runDaemonIteration — every translator call within one
  * iteration receives the identical `ts`). Returns tick-groups ORDERED ascending by ts, each
- * `{ ts, count, hasOverflow, censusState, points }`:
+ * `{ ts, count, hasOverflow, censusState, availabilitySignature, points }`:
  *   - `count` excludes both the overflow-marker entity AND the census-marker entity (must-fixes
  *     1/2 — the marker is never counted as a session).
  *   - `hasOverflow` is true iff this tick-group carries the SESSION_OVERFLOW_ENTITY_KEY marker.
@@ -310,7 +330,16 @@ export function groupSessionFactsByTick(points = []) {
   for (const point of points ?? []) {
     if (!point || point.fact_name !== SESSION_FACT_NAME || typeof point.ts !== "string") continue;
     if (!byTs.has(point.ts)) {
-      byTs.set(point.ts, { ts: point.ts, count: 0, hasOverflow: false, censusState: undefined, censusMarkerSeen: false, points: [] });
+      byTs.set(point.ts, {
+        ts: point.ts,
+        count: 0,
+        hasOverflow: false,
+        censusState: undefined,
+        availabilitySignature: undefined,
+        binaryAvailability: undefined,
+        censusMarkerSeen: false,
+        points: [],
+      });
     }
     const group = byTs.get(point.ts);
     if (point.entity_key === SESSION_OVERFLOW_ENTITY_KEY) {
@@ -324,6 +353,12 @@ export function groupSessionFactsByTick(points = []) {
       // degrade to the fail-closed "unknown" disposition, not the max-trust one.
       const rawState = point.attributes?.census_state;
       const markerState = rawState === "complete" ? "complete" : rawState === "partial" ? "partial" : "unknown";
+      const rawSignature = point.attributes?.availability_signature;
+      const markerSignature = rawSignature === undefined
+        ? undefined
+        : typeof rawSignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(rawSignature)
+          ? rawSignature
+          : SESSION_AVAILABILITY_SIGNATURE_INVALID;
       // Security-sweep F3 fix (2026-09-04 daybreak review): a SECOND census marker landing in this
       // SAME tick whose classified state differs from the first is CONTRADICTORY in-tick evidence
       // -- record order (attacker-controlled if facts.jsonl is hand-edited/corrupted) must never
@@ -332,6 +367,14 @@ export function groupSessionFactsByTick(points = []) {
       // "unknown" markers) is NOT a contradiction and must not downgrade/suppress a benign
       // double-write.
       group.censusState = group.censusMarkerSeen && markerState !== group.censusState ? "unknown" : markerState;
+      group.availabilitySignature = group.censusMarkerSeen && markerSignature !== group.availabilitySignature
+        ? SESSION_AVAILABILITY_SIGNATURE_INVALID
+        : markerSignature;
+      const rawBinaryAvailability = point.attributes?.binary_availability;
+      const markerBinaryAvailability = typeof rawBinaryAvailability === "string" ? rawBinaryAvailability : undefined;
+      group.binaryAvailability = group.censusMarkerSeen && markerBinaryAvailability !== group.binaryAvailability
+        ? undefined
+        : markerBinaryAvailability;
       group.censusMarkerSeen = true;
       continue;
     }
@@ -339,6 +382,48 @@ export function groupSessionFactsByTick(points = []) {
     group.points.push(point);
   }
   return [...byTs.values()].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+}
+
+const SESSION_MULTIPLEXER_NAMES = ["tmux", "screen"];
+
+function binaryAvailabilityStatuses(value) {
+  if (typeof value !== "string") return undefined;
+  const statuses = new Map();
+  for (const entry of value.split("|")) {
+    const separator = entry.indexOf(":");
+    if (separator <= 0) return undefined;
+    statuses.set(entry.slice(0, separator), entry.slice(separator + 1));
+  }
+  return statuses;
+}
+
+/**
+ * Reports a known multiplexer that was observed and then disappeared from the current census.
+ * The reason remains present while consecutive marker ticks continue to report the source as a
+ * known-path miss; a source that was never observed is not called missing.
+ */
+export function sessionSourceDisappearanceReasons(groups = []) {
+  const reasons = [];
+  for (const source of SESSION_MULTIPLEXER_NAMES) {
+    let absentSince;
+    let observed = false;
+    for (const group of groups) {
+      const statuses = binaryAvailabilityStatuses(group.binaryAvailability);
+      const status = statuses?.get(source);
+      if (!status) {
+        absentSince = undefined;
+        continue;
+      }
+      if (status === "not_found_on_known_paths") {
+        if (observed && absentSince === undefined) absentSince = group.ts;
+      } else {
+        observed = true;
+        absentSince = undefined;
+      }
+    }
+    if (absentSince !== undefined) reasons.push(`source_not_observed: ${source} since ${absentSince}`);
+  }
+  return reasons;
 }
 
 // Churn can use markerless legacy observations, but must exclude any tick whose census explicitly
@@ -366,10 +451,28 @@ export function isSessionChurnObservationGroup(group) {
  */
 export function tickGroupDisposition(group) {
   if (group.hasOverflow) return "overflow";
+  if (group.availabilitySignature === SESSION_AVAILABILITY_SIGNATURE_INVALID) return "unknown";
   if (group.censusState === "complete") return "complete";
   if (group.censusState === "partial") return "partial";
   if (group.censusState === undefined) return "markerless";
   return "unknown";
+}
+
+function sessionRegimeGroups(groups = []) {
+  // Overflow groups carry a trustworthy census marker for freshness/churn, but are excluded from
+  // the statistical fold below. Use the latest complete census marker to identify the regime so an
+  // overflow tick cannot make an otherwise fresh session census appear stale.
+  const censusGroups = groups.filter((group) =>
+    group.censusState === "complete" && group.availabilitySignature !== SESSION_AVAILABILITY_SIGNATURE_INVALID,
+  );
+  const latestCensus = censusGroups[censusGroups.length - 1];
+  const availabilitySignature = latestCensus?.availabilitySignature;
+  const completeGroups = groups.filter((group) => tickGroupDisposition(group) === "complete");
+  return {
+    availabilitySignature,
+    completeGroups: completeGroups.filter((group) => group.availabilitySignature === availabilitySignature),
+    censusGroups: censusGroups.filter((group) => group.availabilitySignature === availabilitySignature),
+  };
 }
 
 /**
@@ -383,7 +486,7 @@ export function tickGroupDisposition(group) {
  * (complete) tick-group's own evaluation (plan-text nice-to-have ii, decided+tested).
  */
 export function computeWindowedSessionStats(groups, { stddevFloor = DEFAULT_STDDEV_FLOOR, ewmaAlpha = DEFAULT_EWMA_ALPHA, minSampleCount = DEFAULT_MIN_SAMPLE_COUNT } = {}) {
-  const completeGroups = groups.filter((group) => tickGroupDisposition(group) === "complete");
+  const { completeGroups } = sessionRegimeGroups(groups);
   const mostRecentGroup = groups.length > 0 ? groups[groups.length - 1] : undefined;
   const hasOverflowNow = mostRecentGroup ? tickGroupDisposition(mostRecentGroup) === "overflow" : false;
 
@@ -499,12 +602,20 @@ export const DEFAULT_SESSION_STRUCTURAL_INTERVAL_MS = 60 * 60 * 1000;
  *     freezes any persisted churn alert for such an entity rather than fabricating a recovery.
  */
 function sessionCensusReadiness(groups, { nowMs, freshnessMs = DEFAULT_SESSION_FRESHNESS_FALLBACK_MS } = {}) {
-  const completeGroups = groups.filter((group) => group.censusState === "complete");
-  if (completeGroups.length === 0) return { gate: "no_complete_census", completeGroups };
-  if (!Number.isFinite(nowMs)) return { gate: "ok", completeGroups };
-  const latestMs = new Date(completeGroups[completeGroups.length - 1].ts).getTime();
-  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale", completeGroups };
-  return { gate: "ok", completeGroups };
+  const latestGroup = groups[groups.length - 1];
+  const latestDisposition = latestGroup ? tickGroupDisposition(latestGroup) : undefined;
+  // A present-but-unusable source is an incomplete latest census. Do not reuse the preceding
+  // complete tick to clear an alert or report coverage while the current source is untrusted.
+  if (latestDisposition === "partial" || latestDisposition === "unknown") {
+    return { gate: "no_complete_census", completeGroups: [] };
+  }
+  const { completeGroups, censusGroups } = sessionRegimeGroups(groups);
+  if (censusGroups.length === 0) return { gate: "no_complete_census", completeGroups: censusGroups };
+  if (!Number.isFinite(nowMs)) return { gate: "ok", completeGroups: censusGroups };
+  const latestCensus = censusGroups[censusGroups.length - 1];
+  const latestMs = new Date(latestCensus.ts).getTime();
+  if (!(nowMs - latestMs <= freshnessMs)) return { gate: "latest_census_stale", completeGroups: censusGroups };
+  return { gate: "ok", completeGroups: censusGroups };
 }
 
 export function evaluateSessionChurn(points = [], {
@@ -523,6 +634,10 @@ export function evaluateSessionChurn(points = [], {
   if (censusReadiness.gate !== "ok") return { churnEntries: [], evaluatedEntityKeys: [], ready: false, gate: censusReadiness.gate };
   const latestCompleteTs = completeGroups[completeGroups.length - 1].ts;
   const latestCompleteMs = new Date(latestCompleteTs).getTime();
+  const currentAvailabilitySignature = completeGroups[completeGroups.length - 1].availabilitySignature;
+  if (typeof currentAvailabilitySignature !== "string" || !SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(currentAvailabilitySignature)) {
+    return { churnEntries: [], evaluatedEntityKeys: [], ready: false, gate: "no_complete_census" };
+  }
   const resolvedStructuralIntervalMs = Number.isFinite(structuralIntervalMs) && structuralIntervalMs > 0
     ? structuralIntervalMs
     : Number.isFinite(activeFreshnessMs) && activeFreshnessMs > 0
@@ -544,6 +659,7 @@ export function evaluateSessionChurn(points = [], {
     // exists to catch. This intentionally differs from the count-drop fold, which excludes both
     // partial AND overflow groups.
     if (!isSessionChurnObservationGroup(group)) continue; // must-fix 2 + unknown-disposition hardening
+    if (group.availabilitySignature !== currentAvailabilitySignature) continue; // regime isolation
     for (const point of group.points) {
       const fingerprint = point.attributes?.created_at_fingerprint;
       const list = byEntity.get(point.entity_key) ?? [];
@@ -650,7 +766,7 @@ export function detectSessionChurn(points = [], options = {}) {
 // shape exactly.
 // ---------------------------------------------------------------------------------------------
 
-export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIATION_SIGMA, criticalSigma = DEFAULT_CRITICAL_SIGMA } = {}) {
+export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIATION_SIGMA, criticalSigma = DEFAULT_CRITICAL_SIGMA, fingerprint = SESSION_COUNT_LEGACY_FINGERPRINT } = {}) {
   if (state?.confidence_state !== "established") return undefined;
   const obs = state.last_observation;
   if (!obs || !Number.isFinite(obs.z_score) || !Number.isFinite(obs.mean_before)) return undefined;
@@ -666,9 +782,12 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIAT
     confidence_state: state.confidence_state,
   });
   return {
-    id: alertId(SESSION_COUNT_DROP_RULE_ID, "global"),
+    id: alertId(SESSION_COUNT_DROP_RULE_ID, fingerprint),
     rule_id: SESSION_COUNT_DROP_RULE_ID,
-    fingerprint: "global",
+    fingerprint,
+    // Count deviation is a LEVEL-style stable incident; the versioned census universe lives in
+    // the alert fingerprint, while notify-once keeps one incident within that alert identity.
+    incident_key: "default",
     severity,
     title: "Session count deviation",
     summary: "Resident tmux/screen session count deviated significantly below its established baseline.",
@@ -677,17 +796,18 @@ export function buildCountDropCandidate(state, { deviationSigma = DEFAULT_DEVIAT
   };
 }
 
-export function buildChurnCandidates(churnEntries = []) {
+export function buildChurnCandidates(churnEntries = [], { availabilitySignature } = {}) {
   return churnEntries.map((entry) => {
+    const fingerprint = sessionChurnFingerprintForAvailabilitySignature(entry.entity_key, availabilitySignature);
     const diagnostics = sanitizeDiagnostics({
       entity_key: entry.entity_key,
       prior_fingerprint: entry.prior_fingerprint,
       current_fingerprint: entry.current_fingerprint,
     });
     return {
-      id: alertId(SESSION_CHURN_RULE_ID, entry.entity_key),
+      id: alertId(SESSION_CHURN_RULE_ID, fingerprint),
       rule_id: SESSION_CHURN_RULE_ID,
-      fingerprint: entry.entity_key,
+      fingerprint,
       // The transition, not the stable session identity, is the incident. This lets A→B→C
       // remain two distinct notifications under the same alert id.
       incident_key: `churn:${entry.entity_key}:${entry.prior_fingerprint}:${entry.current_fingerprint}`,
@@ -754,6 +874,12 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     const groupMs = new Date(group.ts).getTime();
     return Number.isFinite(groupMs) && groupMs <= nowMs;
   });
+  const latestGroup = currentGroups[currentGroups.length - 1];
+  const observedAvailabilitySignature = latestGroup && typeof latestGroup.availabilitySignature === "string"
+    ? latestGroup.availabilitySignature
+    : latestGroup ? undefined : persistedState.availability_signature;
+  const regimeChanged = persistedState.availability_signature !== undefined
+    && observedAvailabilitySignature !== persistedState.availability_signature;
 
   // BOUNDED fix, ported from process-lineage-baseline.js's persistent cold-start lockout
   // (fact-store completeness hardening plan, Slice 4 — session-baseline.js did not have this
@@ -804,6 +930,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     || persistedAnchorMissingOrFuture
     || completenessLossAfterAnchor
     || lastFoldedWasFuture
+    || regimeChanged
     || (!persistedState.cold_start_pending && !historyTrust.trust);
 
   // Gate THIS tick's detection using the state as it stood BEFORE any update below — a tick cannot
@@ -826,7 +953,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     // or re-ordered tick can never double count, and so re-establishment cannot be satisfied by
     // ticks that already existed before the reset.
     const sinceMs = persistedState.cold_start_since_ts ? new Date(persistedState.cold_start_since_ts).getTime() : Infinity;
-    const reestablishedTickCount = currentGroups.filter((group) => {
+    const reestablishedTickCount = sessionRegimeGroups(currentGroups).completeGroups.filter((group) => {
       const groupMs = new Date(group.ts).getTime();
       return tickGroupDisposition(group) === "complete" && groupMs > sinceMs && groupMs <= nowMs;
     }).length;
@@ -846,7 +973,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
 
   const coldStartStateChanged = nextColdStartPending !== persistedState.cold_start_pending
     || nextColdStartReason !== persistedState.cold_start_reason
-    || nextColdStartSinceTs !== persistedState.cold_start_since_ts;
+    || nextColdStartSinceTs !== persistedState.cold_start_since_ts
+    || observedAvailabilitySignature !== persistedState.availability_signature;
   if (newGroups.length > 0 || coldStartStateChanged || lastFoldedWasFuture) {
     let skippedOverflow = persistedState.skipped_overflow_tick_count;
     let skippedPartial = persistedState.skipped_partial_tick_count;
@@ -871,6 +999,7 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       cold_start_pending: nextColdStartPending,
       cold_start_reason: nextColdStartReason,
       cold_start_since_ts: nextColdStartSinceTs,
+      availability_signature: observedAvailabilitySignature,
     };
     const writeStore = options.writeSessionBaselineStore ?? writeSessionBaselineStore;
     await writeStore(descartesPaths, nextState);
@@ -908,11 +1037,12 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
   // Re-emission every tick (load-bearing, Decision 3): built fresh from `windowed` on EVERY call
   // — including ticks where nothing new was folded — so applyAlertCandidates never spuriously
   // "recovers" an active session.count_drop just because this source skipped a redundant write.
+  const countFingerprint = sessionCountFingerprintForAvailabilitySignature(observedAvailabilitySignature);
   const dropCandidate = buildCountDropCandidate(
     { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
-    { deviationSigma, criticalSigma },
+    { deviationSigma, criticalSigma, fingerprint: countFingerprint },
   );
-  if (dropCandidate && dropFresh && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
+  if (dropCandidate && countFingerprint !== SESSION_COUNT_LEGACY_FINGERPRINT && dropFresh && dropHorizonOk && censusFresh) candidates.push(dropCandidate);
   // count_drop coverage (§8.C): the singleton "global" identity was GENUINELY EVALUATED this tick
   // iff the Welford window is ESTABLISHED (past warm-up) and a finite z-score verdict was reached
   // against the latest complete tick -- exactly the preconditions buildCountDropCandidate itself
@@ -927,8 +1057,8 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     && Boolean(dropObservation)
     && Number.isFinite(dropObservation.z_score)
     && Number.isFinite(dropObservation.mean_before);
-  const dropEvaluated = dropFresh && dropScorable;
-  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(SESSION_COUNT_DROP_RULE_ID, "global")] : [];
+  const dropEvaluated = countFingerprint !== SESSION_COUNT_LEGACY_FINGERPRINT && dropFresh && dropScorable;
+  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(SESSION_COUNT_DROP_RULE_ID, countFingerprint)] : [];
   evaluatedAlertKeys.push(...dropKeys);
 
   const currentGroupTimestamps = new Set(currentGroups.map((group) => group.ts));
@@ -948,8 +1078,10 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
       nowMs, freshnessMs, structuralIntervalMs, activeFreshnessMs: freshnessMs,
     });
     churnReady = ready && gate === "ok";
-    candidates.push(...buildChurnCandidates(churnEntries));
-    for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, entityKey));
+    if (typeof observedAvailabilitySignature === "string" && SESSION_AVAILABILITY_SIGNATURE_PATTERN.test(observedAvailabilitySignature)) {
+      candidates.push(...buildChurnCandidates(churnEntries, { availabilitySignature: observedAvailabilitySignature }));
+      for (const entityKey of evaluatedEntityKeys) churnKeys.push(alertId(SESSION_CHURN_RULE_ID, sessionChurnFingerprintForAvailabilitySignature(entityKey, observedAvailabilitySignature)));
+    }
   }
   evaluatedAlertKeys.push(...churnKeys);
 
@@ -959,8 +1091,12 @@ export async function computeSessionBaselineCandidates(descartesPaths, options =
     [SESSION_COUNT_DROP_RULE_ID]: buildRuleEvaluation({
       historyTrust, coldStartPendingThisTick, horizonOk: dropHorizonOk,
       baselineSamples: { count: windowed.stats.count, required: minSampleCount },
-      readinessGate: censusReadiness.gate === "latest_census_stale" || (dropScorable && !dropFresh)
+      readinessGate: censusReadiness.gate === "latest_census_stale"
         ? "latest_census_stale"
+        : censusReadiness.gate === "no_complete_census"
+          ? "no_complete_census"
+          : (dropScorable && !dropFresh)
+            ? "latest_census_stale"
         : dropEvaluated && censusFresh ? "ok" : "baseline_warming_up",
       evaluatedAlertKeys: dropKeys,
     }),

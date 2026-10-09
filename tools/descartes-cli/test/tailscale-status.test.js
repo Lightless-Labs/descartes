@@ -24,6 +24,22 @@ function enoent() {
   return failure({ code: "ENOENT", error: "spawn ENOENT" });
 }
 
+function untrusted() {
+  return {
+    status: "untrusted_binary",
+    error: "untrusted",
+    command: { argv: ["tailscale"], read_only: true },
+    binary: {
+      binary: "tailscale",
+      status: "untrusted_binary",
+      resolved_path: "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+      trust_verdict: "untrusted_binary",
+      offending_component: "/Applications",
+      trust_reason: "group_writable",
+    },
+  };
+}
+
 function permissionDenied(stderr = "Permission denied\n") {
   return failure({ code: 1, stderr });
 }
@@ -145,12 +161,22 @@ test("BEHAVIORAL: the collector invokes only tailscale status --json", async () 
   assert.deepEqual(calls.map(({ command, args }) => [command, ...args]), [["tailscale", "status", "--json"]]);
 });
 
-test("ENOENT degrades to absent and never fabricates a zero", async () => {
+test("ENOENT is not-found-on-known-paths and never fabricates a zero", async () => {
   const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript()) });
   assert.equal(envelope.status, "unable");
   assert.equal(envelope.confidence, 0);
-  assert.equal(envelope.result.status, "absent");
+  assert.equal(envelope.result.status, "not_found_on_known_paths");
   assert.deepEqual(envelope.result.peers, []);
+});
+
+test("untrusted binary remains explicit with offending component, reason, and operator override hint", async () => {
+  const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(untrusted())) });
+  assert.equal(envelope.result.status, "untrusted_binary");
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.review_hint, "untrusted_binary");
+  assert.equal(envelope.result.binary_provenance.offending_component, "/Applications");
+  assert.equal(envelope.result.binary_provenance.trust_reason, "group_writable");
+  assert.match(envelope.result.operator_override_hint, /trusted_binary_paths/);
 });
 
 for (const backendState of ["NeedsLogin", "NoState", "Stopped", "NeedsMachineAuth", "Starting"]) {

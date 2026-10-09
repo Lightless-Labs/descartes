@@ -8,6 +8,7 @@ import {
   DEFAULT_LAST_HISTORY_LIMIT,
   DEFAULT_PEER_ENTITY_LIMIT,
   parseLastOutput,
+  parseScutilNcListDetailed,
   parseScutilNcList,
   parseWgEndpoints,
   parseWgHandshakes,
@@ -29,6 +30,21 @@ function failure({ code, stdout = "", stderr = "", error = "boom" } = {}) {
 
 function enoent() {
   return failure({ code: "ENOENT", error: "spawn ENOENT" });
+}
+
+function untrusted(binary) {
+  return {
+    status: "untrusted_binary",
+    error: "untrusted",
+    command: { argv: [binary], read_only: true },
+    binary: {
+      binary,
+      status: "untrusted_binary",
+      resolved_path: `/tmp/unsafe/${binary}`,
+      trust_verdict: "untrusted_binary",
+      offending_component: "/tmp/unsafe",
+    },
+  };
 }
 
 function permissionDenied(stderr = "Permission denied\n") {
@@ -156,16 +172,59 @@ test("parseWgHandshakes maps pubkey -> epoch seconds, 0 means never handshaked",
 // scutil --nc list
 // ---------------------------------------------------------------------------------------------
 
-test("parseScutilNcList parses connected/disconnected VPN service lines", () => {
+test("parseScutilNcList parses real macOS output with the type token between UUID and name", () => {
   const stdout = [
-    '* (Connected)    1E4E6C58-F859-4E51-92A6-BF4B14A23689 "Corp VPN"     [PPP:L2TP]',
-    '  (Disconnected) 2A7BDCE1-1234-4E51-92A6-BF4B14A23690 "Home VPN"     [IPSec]',
+    "Available network connection services in the current set (*=enabled):",
+    '* (Connected)    1E4E6C58-F859-4E51-92A6-BF4B14A23689 VPN (com.example.vpn) "Corp VPN"     [PPP:L2TP]',
+    '  (Disconnected) 2A7BDCE1-1234-4E51-92A6-BF4B14A23690 IPSec "Home VPN"     [IPSec]',
   ].join("\n");
   const services = parseScutilNcList(stdout);
   assert.deepEqual(services, [
-    { status: "Connected", service_uuid: "1E4E6C58-F859-4E51-92A6-BF4B14A23689", service_name: "Corp VPN" },
-    { status: "Disconnected", service_uuid: "2A7BDCE1-1234-4E51-92A6-BF4B14A23690", service_name: "Home VPN" },
+    { status: "Connected", service_uuid: "1E4E6C58-F859-4E51-92A6-BF4B14A23689", service_name: "Corp VPN", service_type: "PPP:L2TP", is_vpn: true, is_tailscale: false },
+    { status: "Disconnected", service_uuid: "2A7BDCE1-1234-4E51-92A6-BF4B14A23690", service_name: "Home VPN", service_type: "IPSec", is_vpn: true, is_tailscale: false },
   ]);
+});
+
+test("parseScutilNcList classifies VPN types, excludes modem types from VPN counting, and marks Tailscale", () => {
+  const detailed = parseScutilNcListDetailed([
+    "Available network connection services in the current set (*=enabled):",
+    '* (Connected) B91A0000-0000-0000-0000-00000000A702 VPN (io.tailscale.ipn.macsys) "Tailscale" [VPN:io.tailscale.ipn.macsys]',
+    '* (Disconnected) EA7E0000-0000-0000-0000-000000000000 PPP --> com.example.spice.0 "Spice modem" [PPP:Modem]',
+    '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
+    '* (Connected) 4A2B0000-0000-0000-0000-000000000004 VPN (io.tailscale.ipn.attacker) "Other VPN" [VPN:io.tailscale.ipn.attacker]',
+  ].join("\n"));
+
+  assert.equal(detailed.unparsed_count, 0);
+  assert.deepEqual(detailed.services.map((service) => [service.service_name, service.is_vpn, service.is_tailscale]), [
+    ["Tailscale", true, true],
+    ["Spice modem", false, false],
+    ["Other VPN", true, false],
+    ["Other VPN", true, false],
+  ]);
+});
+
+test("parseScutilNcList treats a display name of Tailscale as an ordinary VPN unless its bracketed type is recognized", () => {
+  const detailed = parseScutilNcListDetailed(
+    '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.acme) "Tailscale" [VPN:com.acme]',
+  );
+  assert.equal(detailed.unparsed_count, 0);
+  assert.deepEqual(detailed.services, [{
+    status: "Connected",
+    service_uuid: "3A2B0000-0000-0000-0000-000000000003",
+    service_name: "Tailscale",
+    service_type: "VPN:com.acme",
+    is_vpn: true,
+    is_tailscale: false,
+  }]);
+});
+
+test("parseScutilNcListDetailed counts successful-but-unparseable lines so an empty parse cannot be ok", () => {
+  const detailed = parseScutilNcListDetailed([
+    '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
+    "not a scutil service line",
+  ].join("\n"));
+  assert.equal(detailed.services.length, 1);
+  assert.equal(detailed.unparsed_count, 1);
 });
 
 test("parseScutilNcList on empty stdout yields zero services (real zero)", () => {
@@ -323,7 +382,7 @@ test("who resolves with zero remote logins (ok+empty) -> envelope ok, distinguis
   assert.equal(envelope.result.total_count, 0);
 });
 
-test("SSH-only: who reports a remote login, WG/scutil absent -> exactly one ssh peer, WG recorded absent", async () => {
+test("SSH-only: who reports a remote login, WG/scutil not found -> exactly one ssh peer, WG recorded incomplete", async () => {
   const runFixedExecFile = scriptedExec(baseScript({
     [JSON.stringify(["who"])]: ok("alice   pts/0   2026-07-13 08:00 (203.0.113.5)\n"),
   }));
@@ -331,10 +390,30 @@ test("SSH-only: who reports a remote login, WG/scutil absent -> exactly one ssh 
   assert.equal(envelope.status, "ok");
   assert.equal(envelope.result.total_count, 1);
   assert.equal(envelope.result.peers[0].source_type, "ssh");
-  assert.equal(envelope.result.sources.wireguard.status, "absent");
+  assert.equal(envelope.result.sources.wireguard.status, "not_found_on_known_paths");
 });
 
-test("WireGuard present with peers, SSH absent -> exactly the WG peers, no fabricated SSH data", async () => {
+test("an untrusted vpn_services binary is incomplete and its resolved-path trust provenance is retained", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "darwin",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["scutil", "--nc", "list"])]: untrusted("scutil"),
+    })),
+  });
+  assert.equal(envelope.result.sources.vpn_services.status, "untrusted_binary");
+  assert.deepEqual(envelope.result.sources.vpn_services.binary_provenance, {
+    requested_binary: "scutil",
+    resolved_path: "/tmp/unsafe/scutil",
+    trust_verdict: "untrusted_binary",
+    offending_component: "/tmp/unsafe",
+    trust_reason: undefined,
+    same_uid_writable_components: [],
+  });
+  assert.equal(envelope.result.any_source_available, false);
+  assert.equal(envelope.result.total_count, 0);
+});
+
+test("WireGuard present with peers, SSH not found -> exactly the WG peers, no fabricated SSH data", async () => {
   const runFixedExecFile = scriptedExec(baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\nkeyB\n"),
@@ -345,7 +424,7 @@ test("WireGuard present with peers, SSH absent -> exactly the WG peers, no fabri
   assert.equal(envelope.status, "ok");
   assert.equal(envelope.result.total_count, 2);
   assert.deepEqual(envelope.result.peers.map((peer) => peer.source_type), ["wireguard", "wireguard"]);
-  assert.equal(envelope.result.sources.ssh_who.status, "absent");
+  assert.equal(envelope.result.sources.ssh_who.status, "not_found_on_known_paths");
 });
 
 test("WireGuard present, ZERO configured interfaces -> ok/empty, a real zero, never unable", async () => {
@@ -388,20 +467,34 @@ test("permission-denied on who/last -> missing_permission, never fabricated as z
   assert.equal(envelope.result.sources.ssh_last.status, "missing_permission");
 });
 
-test("macOS VPN service connected -> vpn_service peer with presence_state observed_active; disconnected -> observed_historical", async () => {
+test("macOS VPN service parsing keeps VPNs, drops the modem, and does not double-count Tailscale", async () => {
   const runFixedExecFile = scriptedExec(baseScript({
     [JSON.stringify(["scutil", "--nc", "list"])]: ok([
-      '* (Connected)    1E4E6C58-F859-4E51-92A6-BF4B14A23689 "Corp VPN"     [PPP:L2TP]',
-      '  (Disconnected) 2A7BDCE1-1234-4E51-92A6-BF4B14A23690 "Home VPN"     [IPSec]',
+      "Available network connection services in the current set (*=enabled):",
+      '* (Connected) B91A0000-0000-0000-0000-00000000A702 VPN (io.tailscale.ipn.macsys) "Tailscale" [VPN:io.tailscale.ipn.macsys]',
+      '* (Disconnected) EA7E0000-0000-0000-0000-000000000000 PPP --> com.example.spice.0 "Spice modem" [PPP:Modem]',
+      '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
     ].join("\n")),
   }));
   const envelope = await collectVpnPeerStatusEvidence({ platform: "darwin", runFixedExecFile });
   const services = envelope.result.peers.filter((peer) => peer.source_type === "vpn_service");
-  assert.equal(services.length, 2);
-  const corp = services.find((s) => s.service_name === "Corp VPN");
-  const home = services.find((s) => s.service_name === "Home VPN");
-  assert.equal(corp.presence_state, "observed_active");
-  assert.equal(home.presence_state, "observed_historical");
+  assert.equal(services.length, 1);
+  assert.equal(services[0].service_name, "Other VPN");
+  assert.equal(services[0].presence_state, "observed_active");
+});
+
+test("successful scutil output with an unparseable line degrades vpn_services to partial", async () => {
+  const runFixedExecFile = scriptedExec(baseScript({
+    [JSON.stringify(["scutil", "--nc", "list"])]: ok([
+      '* (Connected) 3A2B0000-0000-0000-0000-000000000003 VPN (com.example.other) "Other VPN" [VPN:com.example.other]',
+      "not a scutil service line",
+    ].join("\n")),
+  }));
+  const envelope = await collectVpnPeerStatusEvidence({ platform: "darwin", runFixedExecFile });
+  assert.equal(envelope.result.sources.vpn_services.status, "partial");
+  assert.equal(envelope.result.sources.vpn_services.unparsed_count, 1);
+  assert.equal(envelope.result.peers.filter((peer) => peer.source_type === "vpn_service").length, 1);
+  assert.equal(envelope.status, "warning");
 });
 
 test("scutil is never attempted on Linux (not_applicable, no execFile call at all)", async () => {

@@ -3,11 +3,11 @@ import { collectProcessEvidence } from "./processes.js";
 import { collectSystemEvidence } from "./system.js";
 import { deriveFindings } from "./findings.js";
 
-export async function collectAllEvidence() {
+export async function collectAllEvidence(options = {}) {
   const evidence = await Promise.all([
-    collectSystemEvidence(),
-    collectProcessEvidence(),
-    collectDiskEvidence(),
+    collectSystemEvidence(options),
+    collectProcessEvidence(options),
+    collectDiskEvidence(options),
   ]);
   return {
     evidence,

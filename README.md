@@ -79,6 +79,9 @@ guessing, so it never fabricates a "first time seen" claim. Positive-evidence de
 (credential access, canaries) are not gated this way and fire on any matching metadata change,
 benign or not. See [current limits](#current-limits).
 
+Collector execution refuses a path component when an untrusted principal could replace it, including through
+an unverified local group membership or ACL.
+
 The durable core will move to Rust over time. The current CLI uses Node.js, because this
 lets the tool ship quickly. The CLI includes the agent harness and the subscription login.
 
@@ -203,6 +206,52 @@ The collectors cover many areas:
 - certificates;
 - tmux and screen sessions;
 - VPN and peer status: WireGuard, macOS VPN services, and Tailscale.
+
+Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
+fixed, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
+the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
+and checks the file plus every ancestor directory to `/`. A normal component is trusted only when
+it is owned by `root` or the daemon UID, has no ACL, and has no group- or other-write bit. Linux
+rejects every group-writable or other-writable component as `untrusted_binary` with reason
+`group_writable`; it does not consult account databases to establish group trust. macOS may accept
+a group-writable component only after complete local `dscl` resolution proves that every writer is
+root, the daemon UID, or a local UID below 501 whose `AuthenticationAuthority` is absent or only
+`DisabledUser`. Every consumed macOS `dscl` attribute must be explicitly evidenced: `NestedGroups`
+may be absent only for an explicit `No such key: NestedGroups`, while `AppleMetaNodeLocation` must
+be present and equal `/Local/Default`; other missing or partial search-policy, group-membership,
+GroupMembers, primary-GID, `UniqueID`, or `AuthenticationAuthority` evidence fails closed.
+Same-UID owner writability is inside Descartes' current trust boundary and is recorded in provenance.
+Shell wrappers are rejected unless
+explicitly operator-trusted, so a trusted wrapper can never authorize an untrusted downstream
+binary. The resolver records a SHA-256 content hash for each resolved binary as informational
+provenance only; it is not persisted and never gates trust. An offending component,
+ACL uncertainty, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
+recheck produces `untrusted_binary`; the collector does not execute it and the census remains
+incomplete. The recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU
+window.
+
+Accepted residual: a former member of any accepted component group can retain that group's GID in
+processes started before removal and could modify an accepted binary in place; multi-admin or
+directory-bound Macs fail closed.
+
+An operator may explicitly accept a non-standard absolute executable by listing it in
+`$XDG_CONFIG_HOME/descartes/watch.json`:
+
+```json
+{
+  "trusted_binary_paths": ["/opt/operator-tools/bin/tmux"]
+}
+```
+
+Each configured entry is still realpath-resolved and checked as a regular executable before use,
+and evidence reports it as `operator_trusted`; this explicit override accepts the operator's
+responsibility for ownership, write bits, and ACLs. This is important for single-user Homebrew
+installs with unusual ownership or group arrangements; the exact executable may be added to
+`trusted_binary_paths` when the operator intentionally accepts that responsibility.
+A miss on known paths is `not_found_on_known_paths`: it contributes no zero for that source and
+removes it from the current session universe. If another multiplexer remains usable, the reduced
+universe can still be a complete census; baseline status continues to report the previously seen
+source as absent for as long as it remains unobserved.
 
 For the full list, see `docs/reference/collectors.md`.
 
@@ -553,6 +602,7 @@ For the complete safety-invariant list, see `AGENTS.md`.
 | hostname | not persisted to metric history; appears in the transient triage evidence envelope and in an `incident freeze` bundle if you take one (freeze bundles stay local — never sent to an LLM) | **raw**, in the compact evidence summary sent to the selected model provider |
 | disk mount point | raw, in local metric history (`sensitivity: path`) | **raw**, but only for a filesystem at ≥90% used, up to 8, as part of `pressured_filesystems` |
 | disk filesystem device path | raw, in local metric history (`sensitivity: path`) | not sent |
+| collector binary availability and resolved path | status is retained in evidence/census markers; paths are local execution provenance | not sent |
 
 `descartes incident freeze` and the local `history`/`alerts` commands only ever touch the
 local, Descartes-owned store — nothing there leaves the host. A `triage` request is

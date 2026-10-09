@@ -691,6 +691,60 @@ test("computeWindowedPeerStats regime-keyed fold: a mixed-regime fixture (N tick
   assert.equal(candidate, undefined, "the regime flip itself must never fire a false spike");
 });
 
+test("30 partial vpn_services ticks never establish peer count rules and freeze an existing alert", async () => {
+  const paths = await tempPaths();
+  const partialSignature = "v1:ok-ok-ok-partial-ok";
+  const partialTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    partialTicks.push(...activeTickWithMarker(tickTs(i), 0, partialSignature));
+  }
+
+  const result = await seedAndCompute(paths, partialTicks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT - 1) });
+  const state = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(state.confidence_state, "provisional");
+  assert.equal(state.stats.count, 0, "partial vpn_services ticks must not fold into the spike baseline");
+  assert.equal(state.drop.confidence_state, "provisional");
+  assert.equal(state.drop.stats.count, 0, "partial vpn_services ticks must not fold into the drop baseline");
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, [], "an incomplete tick cannot authorize evaluation or recovery");
+
+  const existing = {
+    id: alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT),
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    fingerprint: PEER_COUNT_VPN_FINGERPRINT,
+    severity: "warning",
+    title: "Peer count deviation",
+    summary: "existing",
+    diagnostics: {},
+    evidence_refs: ["peer-baseline"],
+    status: "active",
+    first_seen: tickTs(0),
+    last_seen: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT - 1),
+  };
+  const reconciled = applyAlertCandidates([existing], result.candidates, {
+    now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT - 1),
+    coveredAlertIds: new Set(result.evaluatedAlertKeys),
+  });
+  assert.equal(reconciled.alerts.find((alert) => alert.id === existing.id)?.status, "active", "an incomplete tick must freeze the existing alert identity");
+});
+
+test("30 missing_permission vpn_services ticks never establish or cover peer count rules", async () => {
+  const paths = await tempPaths();
+  const signature = "v1:ok-ok-ok-missing_permission-ok";
+  const ticks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    ticks.push(...activeTickWithMarker(tickTs(i), i === DEFAULT_PEER_MIN_SAMPLE_COUNT - 1 ? 1 : 0, signature));
+  }
+
+  const result = await seedAndCompute(paths, ticks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT - 1) });
+  const state = (await loadPeerBaselineStore(paths)).state;
+  assert.equal(state.confidence_state, "provisional");
+  assert.equal(state.stats.count, 0);
+  assert.equal(state.drop.stats.count, 0);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+});
+
 test("computeWindowedPeerStats regime-keyed fold: confidence_state resets to 'provisional' immediately on a regime flip, even though the OLD regime was already 'established'", () => {
   const degradedSignature = "v1:ok-ok-missing_permission-ok-ok";
   const preFlipTicks = [];
@@ -1049,6 +1103,7 @@ test("candidate shape matches the existing extraCandidates sources (buildCountDr
   assert.ok(spike);
   assert.equal(typeof spike.id, "string");
   assert.equal(spike.fingerprint, PEER_COUNT_MARKERLESS_FINGERPRINT);
+  assert.equal(spike.incident_key, "default");
   assert.equal(typeof spike.title, "string");
   assert.equal(typeof spike.summary, "string");
   assert.equal(typeof spike.diagnostics, "object");

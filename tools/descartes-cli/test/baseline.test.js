@@ -85,7 +85,7 @@ function a1SessionTick(hour, count) {
       attributes: { created_at_fingerprint: i === 0 ? `fingerprint-${hour}` : "stable" },
     });
   }
-  points.push({ ts, fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } });
+  points.push({ ts, fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete", availability_signature: "v1:tmux" } });
   return points;
 }
 
@@ -351,6 +351,32 @@ test("baseline status uses the persisted daemon structural interval for freshnes
   assert.equal(result.domains.find((domain) => domain.domain === "session").phase, "watching");
 });
 
+test("baseline status keeps reporting a multiplexer disappearance after the reduced universe warms", async () => {
+  const paths = await tempPaths();
+  await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
+  const points = [];
+  for (let hour = 0; hour < 30; hour += 1) {
+    points.push({
+      ts: a1Ts(hour),
+      fact_name: "session.presence",
+      entity_key: "session.census-marker.v1",
+      attributes: { census_state: "complete", availability_signature: "v1:tmux+screen", binary_availability: "tmux:ok|screen:ok" },
+    });
+  }
+  points.push({
+    ts: a1Ts(30),
+    fact_name: "session.presence",
+    entity_key: "session.census-marker.v1",
+    attributes: { census_state: "complete", availability_signature: "v1:screen", binary_availability: "tmux:not_found_on_known_paths|screen:ok" },
+  });
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
+  const status = await buildBaselineStatus(paths, { now: a1Ts(30.5), readFactPoints });
+  const session = status.domains.find((domain) => domain.domain === "session");
+  const reason = `source_not_observed: tmux since ${a1Ts(30)}`;
+  assert.ok(session.reasons.includes(reason));
+  assert.ok(session.rules.every((rule) => rule.reasons.includes(reason)));
+});
+
 test("baseline status keeps rule coverage honest on overflow ticks", async () => {
   const paths = await tempPaths();
   await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
@@ -380,14 +406,19 @@ test("status uses the producer census gate for an overflow tick with a valid ses
   const points = [];
   for (let hour = 0; hour < 30; hour += 1) points.push(...a1SessionTick(hour, 20));
 
-  // The prior churn observation is markerless, which the producer deliberately accepts as pair
-  // evidence, while baseline status must not count it as a complete census.
+  // The prior churn observation is in the same explicit universe as the current overflow tick.
   const priorChurnTs = a1Ts(30);
   points.push({
     ts: priorChurnTs,
     fact_name: "session.presence",
     entity_key: churnEntityKey,
     attributes: { created_at_fingerprint: "1111111111111111" },
+  });
+  points.push({
+    ts: priorChurnTs,
+    fact_name: "session.presence",
+    entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: "complete", availability_signature: "v1:tmux" },
   });
 
   const freshOverflowTs = a1Ts(34);
@@ -408,7 +439,7 @@ test("status uses the producer census gate for an overflow tick with a valid ses
       ts: freshOverflowTs,
       fact_name: "session.presence",
       entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
-      attributes: { census_state: "complete" },
+      attributes: { census_state: "complete", availability_signature: "v1:tmux" },
     },
   );
 
@@ -421,7 +452,7 @@ test("status uses the producer census gate for an overflow tick with a valid ses
   });
   const churnEvaluation = producer.ruleEvaluations[SESSION_CHURN_RULE_ID];
   assert.equal(churnEvaluation.gate, "ok");
-  assert.ok(churnEvaluation.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, churnEntityKey)));
+  assert.ok(churnEvaluation.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${churnEntityKey}`)));
 
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const session = status.domains.find((domain) => domain.domain === "session");
@@ -437,21 +468,21 @@ test("baseline status uses the detector's markerless session-churn observation f
   const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
   const points = [
     { ts: a1Ts(0), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-old" } },
-    { ts: a1Ts(0), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
+    { ts: a1Ts(0), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete", availability_signature: "v1:tmux" } },
     { ts: a1Ts(1), fact_name: "session.presence", entity_key: "session.other", attributes: { created_at_fingerprint: "stable" } },
-    { ts: a1Ts(1), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
+    { ts: a1Ts(1), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete", availability_signature: "v1:tmux" } },
     // This prior fingerprint is deliberately markerless. The real detector retains it for churn;
     // status must use the same observation filter rather than silently dropping it.
     { ts: a1Ts(2), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-old" } },
     { ts: a1Ts(3), fact_name: "session.presence", entity_key: entityKey, attributes: { created_at_fingerprint: "fp-new" } },
-    { ts: a1Ts(3), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete" } },
+    { ts: a1Ts(3), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "complete", availability_signature: "v1:tmux" } },
   ];
   const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const now = a1Ts(3);
   const status = await buildBaselineStatus(paths, { now, readFactPoints });
   const detector = await computeSessionBaselineCandidates(paths, { now, readFactPoints, writeSessionBaselineStore: async () => {} });
   const session = status.domains.find((domain) => domain.domain === "session");
-  const churnKey = alertId(SESSION_CHURN_RULE_ID, entityKey);
+  const churnKey = alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${entityKey}`);
   assert.equal(session.evaluated_alert_keys.includes(churnKey), true, "status must report the same churn identity as the detector");
   assert.equal(session.evaluated_alert_keys.includes(churnKey), detector.evaluatedAlertKeys.includes(churnKey));
   // S6 vocabulary: per-rule phases; the domain reads partial coverage (count_drop is still warming up).
@@ -484,8 +515,8 @@ for (const scenario of A1_SCENARIOS) {
       assert.deepEqual(statusKeys, expectedKeys, `${domain}: status per-rule coverage must mirror detector evaluatedAlertKeys`);
       const ruleKeys = domain === "session"
         ? {
-            [SESSION_COUNT_DROP_RULE_ID]: alertId(SESSION_COUNT_DROP_RULE_ID, "global"),
-            [SESSION_CHURN_RULE_ID]: alertId(SESSION_CHURN_RULE_ID, "session.tmux.0000000000000000"),
+            [SESSION_COUNT_DROP_RULE_ID]: alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux"),
+            [SESSION_CHURN_RULE_ID]: alertId(SESSION_CHURN_RULE_ID, "v2:tmux:session.tmux.0000000000000000"),
           }
         : {
             [PEER_COUNT_SPIKE_RULE_ID]: alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT),
@@ -798,7 +829,7 @@ test("A1: corrupt facts, a clock rollback, an incomplete latest census and an em
   const partialLatest = await statusOf(A1_ESTABLISHED_STORE, {
     extraPoints: [{ ts: a1Ts(30.25), fact_name: "session.presence", entity_key: "session.census-marker.v1", attributes: { census_state: "partial" } }],
   });
-  assert.equal(partialLatest.phase, "watching");
+  assert.equal(partialLatest.phase, "cannot establish — no complete census yet");
 
   const empty = await statusOf(A1_ESTABLISHED_STORE, { readPoints: [] });
   // S6 vocabulary for "stale — no complete census in the fact-history window".

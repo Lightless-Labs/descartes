@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { redactAndBoundProcessArgs } from "./processes.js";
 import { parseVmProcesses } from "./vms.js";
@@ -31,28 +32,22 @@ function truncate(value, max = 2048) {
 }
 
 async function runFixedCommand(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 4500,
-      maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    });
-    return {
-      status: "ok",
-      stdout,
-      stderr: truncate(stderr),
-      command: { argv, read_only: true },
-    };
-  } catch (error) {
-    return {
-      status: "unable",
-      error: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      stdout: truncate(error?.stdout ?? "", 4096),
-      stderr: truncate(error?.stderr ?? "", 2048),
-      command: { argv, read_only: true },
-    };
-  }
+  const result = await runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 4500,
+    maxBuffer: options.maxBuffer ?? 1024 * 1024,
+    execFileAsync,
+  });
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? "", 4096),
+    stderr: truncate(result.stderr ?? "", 2048),
+  };
+}
+
+function commandOptions(request, overrides = {}) {
+  return { ...request.resolver_options, ...overrides };
 }
 
 function parseJsonLines(stdout) {
@@ -701,7 +696,7 @@ export async function correlateContainerHostResources(hosts, request, { hasApple
     };
   }
   const args = psArgsForPlatform();
-  const probe = await runFixedCommand("ps", args, { timeout: 3000, maxBuffer: 1024 * 1024 });
+  const probe = await runFixedCommand("ps", args, commandOptions(request, { timeout: 3000, maxBuffer: 1024 * 1024 }));
   const processHints = probe.status === "ok" ? parseVmProcesses(probe.stdout, { limit: request.host_limit * 4 }) : [];
   const correlation = correlateContainerHostProcessHints(hosts, processHints);
   return {
@@ -731,10 +726,10 @@ async function collectAppleContainer(request) {
   if (process.platform !== "darwin") return collectAppleContainerUnavailable();
 
   const [statusProbe, versionProbe, listProbe, imageListProbe] = await Promise.all([
-    runFixedCommand("container", ["system", "status", "--format", "json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
-    runFixedCommand("container", ["system", "version", "--format", "json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
-    runFixedCommand("container", ["list", "--all", "--format", "json"], { timeout: 5000, maxBuffer: 1024 * 1024 }),
-    runFixedCommand("container", ["image", "list", "--format", "json"], { timeout: 5000, maxBuffer: 1024 * 1024 }),
+    runFixedCommand("container", ["system", "status", "--format", "json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 })),
+    runFixedCommand("container", ["system", "version", "--format", "json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 })),
+    runFixedCommand("container", ["list", "--all", "--format", "json"], commandOptions(request, { timeout: 5000, maxBuffer: 1024 * 1024 })),
+    runFixedCommand("container", ["image", "list", "--format", "json"], commandOptions(request, { timeout: 5000, maxBuffer: 1024 * 1024 })),
   ]);
   const status = statusProbe.status === "ok" ? parseAppleContainerSystemStatusJson(statusProbe.stdout) : undefined;
   const containers = listProbe.status === "ok" ? parseAppleContainerListJson(listProbe.stdout, { limit: request.container_limit, includeStopped: request.include_stopped }) : [];
@@ -742,7 +737,7 @@ async function collectAppleContainer(request) {
   let statsProbe;
   let stats = new Map();
   if (request.collect_stats && containers.some((container) => container.state === "running")) {
-    statsProbe = await runFixedCommand("container", ["stats", "--no-stream", "--format", "json"], { timeout: 6500, maxBuffer: 1024 * 1024 });
+    statsProbe = await runFixedCommand("container", ["stats", "--no-stream", "--format", "json"], commandOptions(request, { timeout: 6500, maxBuffer: 1024 * 1024 }));
     if (statsProbe.status === "ok") stats = parseAppleContainerStatsJson(statsProbe.stdout);
   }
   return {
@@ -763,14 +758,14 @@ async function collectAppleContainer(request) {
 async function collectDocker(request) {
   const psArgs = ["ps", request.include_stopped ? "--all" : undefined, "--no-trunc", "--format", "{{json .}}"].filter(Boolean);
   const [versionProbe, psProbe] = await Promise.all([
-    runFixedCommand("docker", ["version", "--format", "{{json .}}"], { timeout: 3500 }),
-    runFixedCommand("docker", psArgs, { timeout: 5000, maxBuffer: 1024 * 1024 }),
+    runFixedCommand("docker", ["version", "--format", "{{json .}}"], commandOptions(request, { timeout: 3500 })),
+    runFixedCommand("docker", psArgs, commandOptions(request, { timeout: 5000, maxBuffer: 1024 * 1024 })),
   ]);
   const containers = psProbe.status === "ok" ? parseDockerPsJsonLines(psProbe.stdout, { limit: request.container_limit, includeStopped: request.include_stopped }) : [];
   let statsProbe;
   let stats = new Map();
   if (request.collect_stats && containers.some((container) => container.state === "running")) {
-    statsProbe = await runFixedCommand("docker", ["stats", "--no-stream", "--format", "{{json .}}"], { timeout: 6500, maxBuffer: 1024 * 1024 });
+    statsProbe = await runFixedCommand("docker", ["stats", "--no-stream", "--format", "{{json .}}"], commandOptions(request, { timeout: 6500, maxBuffer: 1024 * 1024 }));
     if (statsProbe.status === "ok") stats = parseDockerStatsJsonLines(statsProbe.stdout);
   }
   return {
@@ -787,14 +782,14 @@ async function collectDocker(request) {
 async function collectPodman(request) {
   const psArgs = ["ps", request.include_stopped ? "--all" : undefined, "--format", "json"].filter(Boolean);
   const [versionProbe, psProbe] = await Promise.all([
-    runFixedCommand("podman", ["version", "--format", "json"], { timeout: 3500 }),
-    runFixedCommand("podman", psArgs, { timeout: 5000, maxBuffer: 1024 * 1024 }),
+    runFixedCommand("podman", ["version", "--format", "json"], commandOptions(request, { timeout: 3500 })),
+    runFixedCommand("podman", psArgs, commandOptions(request, { timeout: 5000, maxBuffer: 1024 * 1024 })),
   ]);
   const containers = psProbe.status === "ok" ? parsePodmanPsJson(psProbe.stdout, { limit: request.container_limit, includeStopped: request.include_stopped }) : [];
   let statsProbe;
   let stats = new Map();
   if (request.collect_stats && containers.some((container) => container.state === "running")) {
-    statsProbe = await runFixedCommand("podman", ["stats", "--no-stream", "--format", "json"], { timeout: 6500, maxBuffer: 1024 * 1024 });
+    statsProbe = await runFixedCommand("podman", ["stats", "--no-stream", "--format", "json"], commandOptions(request, { timeout: 6500, maxBuffer: 1024 * 1024 }));
     if (statsProbe.status === "ok") stats = parsePodmanStatsJson(statsProbe.stdout);
   }
   return {
@@ -810,8 +805,8 @@ async function collectPodman(request) {
 
 async function collectColima(request) {
   const [statusProbe, listProbe] = await Promise.all([
-    runFixedCommand("colima", ["status", "--json"], { timeout: 3500 }),
-    runFixedCommand("colima", ["list", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("colima", ["status", "--json"], commandOptions(request, { timeout: 3500 })),
+    runFixedCommand("colima", ["list", "--json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 })),
   ]);
   const statusHost = statusProbe.status === "ok" ? parseColimaStatusJson(statusProbe.stdout) : undefined;
   const listHosts = listProbe.status === "ok" ? parseColimaListJson(listProbe.stdout, { limit: request.host_limit }) : [];
@@ -827,7 +822,7 @@ async function collectColima(request) {
 }
 
 async function collectLima(request) {
-  const listProbe = await runFixedCommand("limactl", ["list", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("limactl", ["list", "--json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 }));
   const hosts = listProbe.status === "ok" ? parseLimaListJson(listProbe.stdout, { limit: request.host_limit }) : [];
   return {
     runtime: runtimeFromProbe("lima", listProbe),
@@ -837,7 +832,7 @@ async function collectLima(request) {
 }
 
 async function collectPodmanMachineHost(request) {
-  const listProbe = await runFixedCommand("podman", ["machine", "list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("podman", ["machine", "list", "--format", "json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const hosts = listProbe.status === "ok" ? parsePodmanMachineListJson(listProbe.stdout, { limit: request.host_limit }) : [];
   return {
     hosts,
@@ -877,6 +872,7 @@ function reviewHint(result) {
 
 export async function collectContainerEvidence(options = {}) {
   const request = normalizeContainerRequest(options);
+  Object.defineProperty(request, "resolver_options", { value: options });
   return timedEnvelope(async () => {
     const results = await Promise.all([
       collectDocker(request),

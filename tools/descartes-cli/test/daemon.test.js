@@ -166,6 +166,28 @@ test("foreground daemon iteration writes metric history and daemon status", asyn
   assert(summary.metrics.some((metric) => metric.metric_name === "system.memory.used_fraction"));
 });
 
+test("daemon iteration removes the legacy binary content-pin file", async () => {
+  const paths = await tempPaths();
+  const legacyFile = path.join(paths.stateDir, "daemon", "binary-content-pins.json");
+  const legacyTmpFile = path.join(paths.stateDir, "daemon", "binary-content-pins.json.4242.tmp");
+  await fs.mkdir(path.dirname(legacyFile), { recursive: true });
+  await fs.writeFile(legacyFile, "legacy pin state");
+  await fs.writeFile(legacyTmpFile, "orphaned legacy pin state");
+
+  await runDaemonIteration(paths, {
+    collectors: {
+      system: async () => envelope("system-overview", "collect_system", { load_average: [0, 0, 0], uptime_seconds: 1, memory: { used_fraction: 0, free_bytes: 1 }, swap: { used_bytes: 0 } }),
+      processes: async () => envelope("top-processes", "collect_processes", { top_cpu: [], top_memory: [] }),
+      disks: async () => envelope("disk-usage", "collect_disks", { filesystems: [], inodes: [] }),
+    },
+    ts: "2026-05-24T00:00:00.000Z",
+    now: "2026-05-24T00:00:00.000Z",
+  });
+
+  await assert.rejects(() => fs.access(legacyFile), { code: "ENOENT" });
+  await assert.rejects(() => fs.access(legacyTmpFile), { code: "ENOENT" });
+});
+
 // Component D (trusted-state step-1, §7): the honest integrity_level label. Additive-only, a
 // LABEL not a trust decision -- covered here as (a) the in-memory statusRecord returned by
 // runDaemonIteration and (b) the same field surviving the real writeDaemonStatus tmp+rename
@@ -620,6 +642,40 @@ test("collectStructuralEvidence calls only enabled structural collectors in a st
   );
   assert.deepEqual(calls, ["network"]);
   assert.deepEqual(onlyNetwork.map((e) => e.id), ["network-basics"]);
+});
+
+test("collectStructuralEvidence threads operator trust options through every resolver-backed collector", async () => {
+  const trustedBinaryPaths = ["/opt/homebrew/bin/tmux"];
+  const seen = [];
+  const capture = (name, id, tool) => async (options) => {
+    seen.push({ name, options });
+    return envelope(id, tool, {});
+  };
+  const collectors = {
+    services: capture("services", "services", "collect_services"),
+    network: capture("network", "network-basics", "collect_network"),
+    "scheduled-jobs": capture("scheduled-jobs", "scheduled-jobs", "collect_scheduled_jobs"),
+    provenance: capture("provenance", "provenance-warnings", "collect_provenance_warnings"),
+    sessions: capture("sessions", "sessions", "collect_sessions"),
+    "vpn-peer-status": capture("vpn-peer-status", "vpn-peer-status", "collect_vpn_peer_status"),
+    "tailscale-status": capture("tailscale-status", "tailscale-status", "collect_tailscale_status"),
+    "process-lineage": capture("process-lineage", "process-lineage-edges", "collect_process_lineage"),
+  };
+  await collectStructuralEvidence({ collectors: {
+    services: { enabled: true },
+    network: { enabled: true },
+    "scheduled-jobs": { enabled: true },
+    provenance: { enabled: true },
+    sessions: { enabled: true },
+    "vpn-peer-status": { enabled: true },
+    "tailscale-status": { enabled: true },
+    "process-lineage": { enabled: true },
+  } }, collectors, { trustedBinaryPaths });
+
+  assert.equal(seen.length, 8);
+  for (const { options } of seen) {
+    assert.deepEqual(options.trustedBinaryPaths, trustedBinaryPaths);
+  }
 });
 
 test("collectStructuralEvidence runs the process-lineage collector only when enabled", async () => {
@@ -2412,12 +2468,15 @@ function sessionFactPoint(ts, entityKey, fingerprint = "abababababababab") {
   };
 }
 
-function censusMarkerFactPoint(ts, state = "complete") {
+// Session baseline identities are versioned by the census universe. These daemon fixtures model
+// the tmux collector, so they must carry the explicit v1 universe marker; a marker without one is
+// the legacy `global` regime and is intentionally never evaluated for recovery.
+function censusMarkerFactPoint(ts, state = "complete", availabilitySignature = "v1:tmux") {
   return {
     ts,
     fact_name: "session.presence",
     entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
-    attributes: { census_state: state },
+    attributes: { census_state: state, availability_signature: availabilitySignature },
     source_envelope_id: "sessions",
     source_tool: "collect_sessions",
     sensitivity: "operational",

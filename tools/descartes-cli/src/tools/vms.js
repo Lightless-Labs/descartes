@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { redactAndBoundProcessArgs } from "./processes.js";
 
@@ -26,28 +27,22 @@ function truncate(value, max = 2048) {
 }
 
 async function runFixedCommand(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 4500,
-      maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    });
-    return {
-      status: "ok",
-      stdout,
-      stderr: truncate(stderr),
-      command: { argv, read_only: true },
-    };
-  } catch (error) {
-    return {
-      status: "unable",
-      error: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      stdout: truncate(error?.stdout ?? "", 4096),
-      stderr: truncate(error?.stderr ?? "", 2048),
-      command: { argv, read_only: true },
-    };
-  }
+  const result = await runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 4500,
+    maxBuffer: options.maxBuffer ?? 1024 * 1024,
+    execFileAsync,
+  });
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? "", 4096),
+    stderr: truncate(result.stderr ?? "", 2048),
+  };
+}
+
+function commandOptions(request, overrides = {}) {
+  return { ...request.resolver_options, ...overrides };
 }
 
 function parseJsonMaybeArray(stdout) {
@@ -538,7 +533,7 @@ function runtimeFromPathProbe(runtime, probe) {
 
 async function processVms(request) {
   const args = psArgsForPlatform();
-  const probe = await runFixedCommand("ps", args, { timeout: 3000, maxBuffer: 1024 * 1024 });
+  const probe = await runFixedCommand("ps", args, commandOptions(request, { timeout: 3000, maxBuffer: 1024 * 1024 }));
   const vms = probe.status === "ok" ? parseVmProcesses(probe.stdout, { limit: request.vm_limit }) : [];
   const runtimes = [...new Set(vms.map((vm) => vm.runtime))].map((runtime) => ({
     runtime,
@@ -556,8 +551,8 @@ async function processVms(request) {
 
 async function collectTart(request) {
   const [versionProbe, listProbe] = await Promise.all([
-    runFixedCommand("tart", ["--version"], { timeout: 2500 }),
-    runFixedCommand("tart", ["list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("tart", ["--version"], commandOptions(request, { timeout: 2500 })),
+    runFixedCommand("tart", ["list", "--format", "json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 })),
   ]);
   const vms = listProbe.status === "ok" ? parseTartListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
@@ -572,8 +567,8 @@ async function collectTart(request) {
 
 async function collectColima(request) {
   const [statusProbe, listProbe] = await Promise.all([
-    runFixedCommand("colima", ["status", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
-    runFixedCommand("colima", ["list", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("colima", ["status", "--json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 })),
+    runFixedCommand("colima", ["list", "--json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 })),
   ]);
   const statusVm = statusProbe.status === "ok" ? parseColimaStatusJson(statusProbe.stdout) : undefined;
   const listVms = listProbe.status === "ok" ? parseColimaListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
@@ -589,7 +584,7 @@ async function collectColima(request) {
 }
 
 async function collectLima(request) {
-  const listProbe = await runFixedCommand("limactl", ["list", "--json"], { timeout: 3500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("limactl", ["list", "--json"], commandOptions(request, { timeout: 3500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseLimaListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("lima", listProbe),
@@ -599,7 +594,7 @@ async function collectLima(request) {
 }
 
 async function collectMultipass(request) {
-  const listProbe = await runFixedCommand("multipass", ["list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("multipass", ["list", "--format", "json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseMultipassListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("multipass", listProbe),
@@ -610,8 +605,8 @@ async function collectMultipass(request) {
 
 async function collectVirtualBox(request) {
   const [vmsProbe, runningProbe] = await Promise.all([
-    runFixedCommand("VBoxManage", ["list", "vms"], { timeout: 4500, maxBuffer: 512 * 1024 }),
-    runFixedCommand("VBoxManage", ["list", "runningvms"], { timeout: 4500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("VBoxManage", ["list", "vms"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 })),
+    runFixedCommand("VBoxManage", ["list", "runningvms"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 })),
   ]);
   const vms = vmsProbe.status === "ok" ? parseVirtualBoxVms(vmsProbe.stdout, runningProbe.stdout, { limit: request.vm_limit }) : [];
   return {
@@ -625,7 +620,7 @@ async function collectVirtualBox(request) {
 }
 
 async function collectLibvirt(request) {
-  const listProbe = await runFixedCommand("virsh", ["list", "--all"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("virsh", ["list", "--all"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseVirshList(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("libvirt", listProbe),
@@ -636,8 +631,8 @@ async function collectLibvirt(request) {
 
 async function collectParallels(request) {
   const [versionProbe, listProbe] = await Promise.all([
-    runFixedCommand("prlctl", ["--version"], { timeout: 2500 }),
-    runFixedCommand("prlctl", ["list", "--all", "--json"], { timeout: 4500, maxBuffer: 512 * 1024 }),
+    runFixedCommand("prlctl", ["--version"], commandOptions(request, { timeout: 2500 })),
+    runFixedCommand("prlctl", ["list", "--all", "--json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 })),
   ]);
   const vms = listProbe.status === "ok" ? parseParallelsListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
@@ -651,7 +646,7 @@ async function collectParallels(request) {
 }
 
 async function collectVmware(request) {
-  const listProbe = await runFixedCommand("vmrun", ["list"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("vmrun", ["list"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseVmrunList(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("vmware", listProbe),
@@ -674,7 +669,7 @@ async function collectUtm() {
 }
 
 async function collectPodmanMachine(request) {
-  const listProbe = await runFixedCommand("podman", ["machine", "list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("podman", ["machine", "list", "--format", "json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parsePodmanMachineListJson(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("podman_machine", listProbe),
@@ -684,7 +679,7 @@ async function collectPodmanMachine(request) {
 }
 
 async function collectIncus(request) {
-  const listProbe = await runFixedCommand("incus", ["list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("incus", ["list", "--format", "json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseIncusOrLxcListJson(listProbe.stdout, { runtime: "incus", limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("incus", listProbe),
@@ -694,7 +689,7 @@ async function collectIncus(request) {
 }
 
 async function collectLxd(request) {
-  const listProbe = await runFixedCommand("lxc", ["list", "--format", "json"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("lxc", ["list", "--format", "json"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseIncusOrLxcListJson(listProbe.stdout, { runtime: "lxd", limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("lxd", listProbe),
@@ -704,7 +699,7 @@ async function collectLxd(request) {
 }
 
 async function collectProxmox(request) {
-  const listProbe = await runFixedCommand("qm", ["list"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("qm", ["list"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseQmList(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("proxmox", listProbe),
@@ -714,7 +709,7 @@ async function collectProxmox(request) {
 }
 
 async function collectXen(request) {
-  const listProbe = await runFixedCommand("xl", ["list"], { timeout: 4500, maxBuffer: 512 * 1024 });
+  const listProbe = await runFixedCommand("xl", ["list"], commandOptions(request, { timeout: 4500, maxBuffer: 512 * 1024 }));
   const vms = listProbe.status === "ok" ? parseXlList(listProbe.stdout, { limit: request.vm_limit }) : [];
   return {
     runtime: runtimeFromProbe("xen", listProbe),
@@ -839,6 +834,7 @@ function reviewHint(result) {
 
 export async function collectVmEvidence(options = {}) {
   const request = normalizeVmRequest(options);
+  Object.defineProperty(request, "resolver_options", { value: options });
   return timedEnvelope(async () => {
     const results = await Promise.all([
       collectTart(request),

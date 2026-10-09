@@ -25,6 +25,7 @@ import {
   computeSessionBaselineCandidates,
   computeWindowedSessionStats,
   groupSessionFactsByTick,
+  sessionSourceDisappearanceReasons,
   loadSessionBaselineStore,
   SESSION_CHURN_RULE_ID,
   SESSION_COUNT_DROP_RULE_ID,
@@ -499,7 +500,7 @@ function horizonShortSinceOf(daemonRecord, ruleId, nowMs) {
 
 // The status reasons for one rule (fact-store capacity plan §4.4/§7 S6). Annotations only: the phase
 // comes from the detector's own gate; a reason never makes a rule "watching" or stops it.
-function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, legacyPending }) {
+function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, legacyPending, domainReasons = [] }) {
   const reasons = [];
   if (absent) reasons.push("not_observed_no_store");
   if (absent && legacyPending) reasons.push("legacy_store_pending_migration");
@@ -512,6 +513,7 @@ function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, l
   if (familyBlock.budget_rejected?.reason === "budget_below_horizon_floor") reasons.push("budget_below_horizon_floor");
   if (familyBlock.horizon_invariant_unmet) reasons.push("horizon_invariant_unmet");
   if (familyBlock.retention_failing) reasons.push("retention_failing");
+  reasons.push(...domainReasons);
   return reasons;
 }
 
@@ -542,6 +544,7 @@ function buildDomainReports(inputs) {
     const familyBlock = familyStatusBlock({ family: definition.family, familyRead, nowMs: inputs.nowMs, budgets, structuralIntervalMs: inputs.structuralIntervalMs, daemonRecord: inputs.daemonRecord });
     families[definition.family] = familyBlock;
     const absent = storeAbsent(familyRead);
+    const domainReasons = definition.domain === "session" ? sessionSourceDisappearanceReasons(groups) : [];
     const rules = [];
     for (const run of runs) {
       const entry = run.entry ? { ...run.entry, domain: definition.domain } : undefined;
@@ -571,7 +574,7 @@ function buildDomainReports(inputs) {
           horizon_ms: RULE_HORIZONS.get(ruleId)?.horizonMs,
           ...(horizonShortSince ? { horizon_short_since_ts: horizonShortSince } : {}),
           reasons: [
-            ...ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, legacyPending: inputs.legacy?.status === "pending_migration" }),
+            ...ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, legacyPending: inputs.legacy?.status === "pending_migration", domainReasons }),
             ...(rearming && ruleEvaluation?.gate === "cold_start_pending" ? ["lockout_rearming"] : []),
           ],
         });
@@ -593,6 +596,7 @@ function buildDomainReports(inputs) {
       complete_ticks: Math.min(...runs.map((run) => (lockoutRearmsThisTick(run, inputs.nowMs) ? 0 : progressForState(run.entry ? { ...run.entry, domain: definition.domain } : undefined, groups, inputs.nowMs)))),
       required_ticks: STATUS_TICK_COUNT,
       established_count: establishedForDomain(definition.domain, points, groups).length,
+      ...(domainReasons.length > 0 ? { reasons: domainReasons } : {}),
       ...(hasIncompleteLatest(definition.domain, groups) ? { latest_census_incomplete: true } : {}),
       // Domain-level roll-ups (watch-fabrication A1/A3 schema), derived ONLY from the per-rule
       // records above -- never a second readiness computation: watching_rules is exactly the rules

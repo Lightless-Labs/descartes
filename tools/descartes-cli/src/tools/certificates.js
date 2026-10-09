@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -239,28 +240,23 @@ async function collectPathSource(source, request) {
   }
 }
 
-async function runFixedCommand(command, args) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: 5000,
-      maxBuffer: MAX_COMMAND_BUFFER,
-    });
-    return { status: "ok", stdout, stderr: truncate(stderr), command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "unable",
-      error: error instanceof Error ? error.message : String(error),
-      code: error?.code,
-      stdout: truncate(error?.stdout ?? "", 4096),
-      stderr: truncate(error?.stderr ?? "", 2048),
-      command: { argv, read_only: true },
-    };
-  }
+async function runFixedCommand(command, args, options = {}) {
+  const result = await runResolvedExecFile(command, args, {
+    ...options,
+    timeout: 5000,
+    maxBuffer: MAX_COMMAND_BUFFER,
+    execFileAsync,
+  });
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? "", 4096),
+    stderr: truncate(result.stderr ?? "", 2048),
+  };
 }
 
-async function collectCommandSource(source, request) {
-  const command = await runFixedCommand(source.command, source.args);
+async function collectCommandSource(source, request, options = {}) {
+  const command = await runFixedCommand(source.command, source.args, options);
   const parsed = command.status === "ok"
     ? parseCertificateBundle(command.stdout, {
       source: source.id,
@@ -352,7 +348,7 @@ export async function collectCertificateEvidence(options = {}) {
     const sourceResults = [];
     for (const source of sourceDefinitions) {
       sourceResults.push(source.type === "command"
-        ? await collectCommandSource(source, request)
+        ? await collectCommandSource(source, request, options)
         : await collectPathSource(source, request));
     }
 

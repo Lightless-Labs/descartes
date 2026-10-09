@@ -2,6 +2,45 @@
 
 **Last updated:** 2026-10-09
 
+## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
+
+Removed the content-hash pin map, daemon persistence, `contentHashCache` plumbing, and the
+content-change trust gate in atomic commits `e7914db` (red tests), `f194b7c`
+(implementation), and `11f1fd2` (macOS dscl stdout/stderr compatibility). Existing legacy pin
+files are deleted when the daemon loads. SHA-256 remains only as non-gating binary provenance.
+The immediate pre-exec `(dev, ino)` identity check remains. macOS group resolution now requires
+explicit evidence for every consumed dscl attribute: `NestedGroups` can be empty only after an
+explicit `No such key: NestedGroups`, `AppleMetaNodeLocation` must be present and `/Local/Default`,
+and missing `GroupMembership`, `UniqueID`, or other required evidence fails closed. The accepted
+residual remains that a former member of an accepted component group can retain its GID in a
+pre-existing process and modify an accepted binary in place.
+
+Focused resolver tests pass **36/36**; daemon tests pass **201/201**. Final fresh-XDG host-access
+`npm test` passes **2413/2413, 0 failures, 34 skips, 2447 total**, including live provenance.
+The sandbox-only run had **2391 passing, 22 environment failures, 34 skips, 2447 total**: 17
+notifier-reuse and 3 tap-bump loopback `listen EPERM` failures, plus 2 live provenance checks
+blocked by sandbox process inspection. Live host resolution remains `resolved/trusted` for tmux
+(`/opt/homebrew/Cellar/tmux/3.6a/bin/tmux`) and tailscale
+(`/Applications/Tailscale.app/Contents/MacOS/Tailscale`). No push or merge.
+
+## Collector-source + notify-once merge — 2026-10-09 — local, not pushed
+
+Merged `main` with `--no-ff` into `fix/collector-sources-2026-10`. Conflict resolution retains
+both histories in this handoff. Collector-source behavior remains the branch version: strict
+binary trust, incomplete-census freezes, per-source session census universes, versioned session
+identities, and legacy churn freeze. Main's per-incident `incident_key` producers and delivery
+changes are retained; session churn re-applies its transition key (`churn:<entity>:<prior>:<current>`)
+on top of the branch's versioned session alert identity, and session count-drop retains its
+versioned identity. Session and peer count deviations explicitly use the stable `default` incident
+within their respective versioned alert identities; the other main producers retain their incident
+keys unchanged.
+
+Validation after conflict resolution: fresh-XDG host-access `npm test` passes **2410/2410, 0
+failures, 34 skips, 2444 total**. The focused live provenance files pass **74/74, 0 failures**,
+including both live macOS provenance checks. No test failures required classification or repair;
+the suite's intentional fault-injection `ENOSPC`/degraded-path diagnostics were expected and
+their tests passed. No push.
+
 ## Notify-once deferred LLM-route failure fix — 2026-10-09 — local, not pushed
 
 The three early-return paths for degraded, unreadable, or unavailable LLM-route dependencies now
@@ -77,6 +116,149 @@ notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump loopback `liste
 failures remain.
 No push or merge is authorized.
 
+## Collector source trust rework — 2026-10-09
+
+Implemented the daybreak gate-5 decision locally in `c4eea62` (red TDD contract) and
+`87a9850` (implementation), with no push or merge. Linux now rejects every group-writable or
+other-writable collector component as `untrusted_binary` / `group_writable` and no longer reads
+NSS, `/etc/group`, `/etc/passwd`, or userdb membership for trust. macOS retains complete local
+`dscl` group trust, fails closed on failed or partial lookups, and accepts low-UID system accounts
+only when `AuthenticationAuthority` is absent or only `DisabledUser`. The accepted supplementary-
+GID residual is documented in the README, collector reference, and resolver comment. Trusted
+resolved binaries carried SHA-256 content hashes in that superseded slice; the current branch
+retains the hash only as non-gating provenance and evaluates content changes without a pin.
+
+Focused resolver tests pass 34/34; resolver-adjacent session/Tailscale/VPN integration tests pass
+117/117. Full fresh-XDG host-access `npm test` passes **2369/2369, 0 failures, 34 skips, 2403
+total**. The 34 skips are the existing platform/tool-gated `verify-install.sh` tests on macOS;
+live provenance passes. Host verification reports both `tmux` and `tailscale` as
+`resolved/trusted`: `/opt/homebrew/Cellar/tmux/3.6a/bin/tmux` and
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`, with `_mbsetupuser` recorded as the
+accepted disabled system account. No push or merge.
+
+## Daybreak rework — 2026-10-09
+
+Fixed the current daybreak-blue findings on `fix/collector-sources-2026-10` in five local atomic
+commits, with no push or merge: `77b3834` (Linux ACL absence requires ENODATA or an explicit
+"No such attribute" result, including directory default ACL probes), `139d083` (Linux trust checks
+`passwd`, `group`, and inherited/explicit `initgroups`, allowing only `files`/`systemd` with default
+actions and the safe missing-nsswitch fallback), `4aac4fd` (macOS low-UID authentication-authority
+allowlist, local-only search policy, and GroupMembers GUID resolution), `e467ed9` (exact emitted v1
+session signatures and legacy churn freeze), and `a0e0a4f` (real multiline `dscl -search` GUID output).
+
+Focused resolver tests pass 39/39 and session-baseline tests pass 80/80. Full fresh-XDG host-access
+`npm test` passes **2374/2374, 0 failures, 34 skipped, 2408 total**; the skips are the existing
+platform-gated `verify-install.sh` tests. Live host verification after the GUID parser fix reports
+both `tmux` and `tailscale` as `resolved/trusted`; both use the local-only `CSPSearchPath:
+/Local/Default`, and both resolve the admin GUID set including accepted `_mbsetupuser` UID 248.
+
+## Group-aware collector binary trust — 2026-10-09
+
+Updated the binary resolver after `4c9cb40` so macOS group-writable path components accept the
+effective local writer set when each principal is root, the daemon UID, or a local UID-below-501
+account whose `AuthenticationAuthority` contains neither `ShadowHash` nor `Kerberos`. Failed user
+lookups remain unverifiable and untrusted; accepted system accounts are carried in binary
+provenance. Linux remains strict and unchanged: it parses `/etc/group`, `/etc/passwd`, and a
+`files`-only `nsswitch.conf` group source. ACL presence or detection failure remains untrusted,
+wrappers remain rejected unless explicitly operator-trusted, and `trusted_binary_paths` remains the
+unusual-setup override. Group membership is cached in one object shared by resolver-backed
+collectors during each daemon tick.
+
+Host verification: `/usr/bin/dscl . -read /Groups/admin GroupMembership` returned
+`root _mbsetupuser thomas`; `_mbsetupuser` returned `UniqueID: 248` and `No such key:
+AuthenticationAuthority`, while the daemon user is UID 502. The local admin writer UIDs are
+`[0, 248, 502]`. On this host, `resolveCollectorBinary('tmux')` is `trusted` at
+`/opt/homebrew/Cellar/tmux/3.6a/bin/tmux`, and `resolveCollectorBinary('tailscale')` is `trusted` at
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`; both record `{name: "_mbsetupuser", uid:
+248}` as an accepted system account.
+
+Focused resolver tests pass 26/26. Fresh-XDG host-access `npm test` passes **2360/2360, 0 failures,
+34 skipped, 2394 total**. No push or merge.
+
+## macOS ACL parser regression — 2026-10-09
+
+Fixed the live macOS provenance regression locally on `fix/collector-sources-2026-10`. The
+`ls -led` ACL parser now accepts setuid/setgid/sticky mode characters, treats `@` as an xattr
+marker without implying an ACL, and treats only a `+` mode suffix followed by valid numbered ACE
+lines as ACL-present; malformed ACL output remains `acl_unknown` and therefore untrusted. Added
+real-shape fixtures for plain files, setuid files, xattr-marked directories, and ACL files with
+ACE lines. The two live macOS provenance tests pass 2/2 outside the restricted sandbox. Fresh-XDG
+full `npm test` passes **2353/2353, 0 failures, 34 skipped, 2387 total**. No push or merge.
+
+## Daybreak re-gate — 2026-10-09
+
+The current `fix/collector-sources-2026-10` re-gate is implemented locally in atomic commits
+`4c9cb40` (fail-closed binary ownership/ACL trust, operator-path docs, and cache removal),
+`8ed5a83` (malformed tmux/screen output makes the source partial), `6ba7d80` (v2 session-universe
+count/churn identities, persistent multiplexer-disappearance status, and tmux+screen → screen
+re-warm regression), `f1830c6` (nonzero screen output with malformed rows remains partial), and
+`f668599` (version daemon fixtures with explicit census universes). No push or merge.
+
+Binary trust no longer performs group-membership resolution. Every realpath'd file/ancestor must be
+root/daemon-owned, not group/other-writable, and ACL-free; ACL probe uncertainty is untrusted with
+an operator `trusted_binary_paths` remediation hint. Session count/churn coverage is universe-scoped
+(`v2:tmux`, `v2:screen`, `v2:tmux+screen`), while legacy identities freeze. Baseline status carries
+`binary_availability` and reports `source_not_observed: <multiplexer> since <ts>` while a previously
+observed source remains a known-path miss. Focused resolver, session collector, session baseline,
+baseline, daemon, and upgrade suites are green. The fresh-XDG full suite reports 2,383 total / 2,327
+pass / 22 fail / 34 skip; all 22 failures are sandbox/live-host environment failures: 20 loopback
+`listen EPERM` failures and 2 live macOS provenance checks returning `unknown` because process
+inspection is restricted. No changed-behavior failures remain.
+
+## Per-source session census — 2026-10-09
+
+After merge commit `107f758` and test commit `6ec21fc`, the session census now derives a canonical
+availability universe from usable (`ok`) multiplexer sources. `not_found_on_known_paths` sources are
+outside the universe; present-but-unusable sources keep the census incomplete. Session fact markers
+carry the universe signature, and session baseline folds/churn readiness are isolated to the current
+signature. A signature change or a not-found transition re-warms the session baseline; incomplete
+latest censuses emit no evaluated keys, so existing alerts freeze rather than recover from fabricated
+zeros. Overflow ticks remain fresh for churn while excluded from the statistical count fold.
+
+The implementation is committed locally. Focused session, translator, baseline, status-consistency,
+rule-evaluation, daemon, and upgrade checks pass; the required fresh-XDG full suite has the totals
+reported above. No push.
+
+## Main merge — 2026-10-09
+
+Merged local `main` at `b60efc8` into `fix/collector-sources-2026-10`. The conflict resolution
+retains strict collector binary trust and operator-trusted path threading, incomplete session/VPN
+census handling, Tailscale provenance, per-family fact-store migration/budgets, peer availability
+regime vetoes, and the capacity branch's freshness/rule-evaluation surfaces. The fresh-XDG full
+suite reached 2,330 passing, 9 failing, and 34 skipped; the failures are centered on the known
+session census requiring both tmux and screen and its dependent re-warm/status paths, which is the
+next fix in this worktree.
+
+## Daybreak rework closure — 2026-10-06
+
+On branch `fix/collector-sources-2026-10`, the daybreak-blue findings and live-host regressions are
+fixed locally and have not been pushed or merged. Atomic commits for this task are `3eefccf`
+(provenance process-table output bound), `44540d9` (effective writer-set binary trust and wrapper
+rejection), `bdbc560` (incomplete session/VPN census handling and finite Tailscale IDs), and
+`5897fb2` (operator-trusted path threading through daemon, Pi, and all resolver-backed collectors).
+The earlier writer-set policy was superseded by strict root/daemon ownership, mode-bit, and ACL
+checks on every ancestor; group membership is not resolved. Operator-trusted absolute paths remain
+an explicit override. Script wrappers are rejected unless the exact path is operator-trusted, so a
+trusted wrapper cannot substitute for a rejected downstream binary. Tailscale untrusted evidence
+retains the offending component, reason, and override hint.
+
+Validation: the required fresh-XDG full `npm test` run with host access passed **2113/2113, 0
+failures, 34 skips, 2147 total**. The two live macOS provenance regressions pass outside the
+sandbox (45/45 provenance/Pi targeted tests). The focused collector suites and operator-trusted
+end-to-end tests also pass. No push or merge was performed.
+
+## Collector-source hardening — 2026-10-06
+
+On branch `fix/collector-sources-2026-10`, H6 is committed locally as `be09348` and H5 is
+committed locally in this worktree; neither has been pushed or merged. H6 adds shared pinned absolute
+binary resolution across collector subprocesses, records resolved paths/availability, and keeps
+`not_found_on_known_paths` out of complete session census markers. H5 parses real macOS
+`scutil --nc list` shapes, classifies bracketed VPN types, excludes Tailscale's own entry from
+VPN peer duplication, and marks successful-but-unparseable output partial. Focused changed-suite
+validation is green at 159 tests. Fresh-XDG full `npm test` reports **2154 total / 2098 pass /
+22 fail / 34 skip**; all 22 failures are sandbox/live-host environment failures (20 localhost
+listen `EPERM`, 2 live macOS process/provenance checks returning `unknown` because `ps` is blocked),
+with no changed-behavior failures identified.
 ## Review-fix update — 2026-10-05
 
 On branch `fix/watch-fabrication-2026-10`, the watch-fabrication review fixes are committed
@@ -188,7 +370,7 @@ Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing h
 
 ## Current Status
 
-> **RESUME HERE (2026-10-09 late) — main has capacity + notify-once; plan at v5; collector-sources in gate; root-helper CI red.**
+> **SUPERSEDED:** This pin-era section is stale; use the current **Collector-source pin removal and B3 closure — 2026-10-09** section at the top of this document.
 > - **Pushed to origin/main (b60efc8):** provenance + watch-fab + **fact-store capacity** (G3 READY; merge 1169d40 + status fix b60efc8, daybreak READY).
 > - **Local main, NOT pushed:** **notify-once (R3) merged (fe4302b)** — per-incident records under each alert id, independent delivery/confirmation, storm mode (one notification, ack resets), global severity order with per-route per-tick circuit breaker (no per-tick cap), retries over all persisted incidents incl. post-ack, legacy ⇒ notify once, dated byte-capped audit segments; daybreak READY after 10 rounds (final backoff fix 2fc3149 not separately gated yet). Pre-existing alert-store concurrent-writer race tracked in `todos/2026-10-09-alert-store-concurrent-writers.md`. Push needs operator OK.
 > - **`fix/collector-sources-2026-10`** (worktree `collector-sources`): H5/H6 + binary trust (macOS: local-group trust incl. non-authenticating system accounts e.g. `_mbsetupuser`, ACL fail-closed, GUID members, local-only search policy, content-hash pin; LINUX: strict — no group-writable trust) + per-source session census universes (versioned identities, legacy frozen). **Accepted residual (documented):** on macOS a process that held the admin GID before removal keeps write access until it exits. In daybreak gate 6. Must merge new main (R3) before final gate.

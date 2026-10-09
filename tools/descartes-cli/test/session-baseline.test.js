@@ -19,6 +19,7 @@ import {
   DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS,
   SESSION_CHURN_RULE_ID,
   SESSION_COUNT_DROP_RULE_ID,
+  SESSION_AVAILABILITY_SIGNATURE_INVALID,
   buildChurnCandidates,
   buildCountDropCandidate,
   computeSessionBaselineCandidates,
@@ -64,12 +65,15 @@ function sessionPoint(ts, entityKey, fingerprint = "abababababababab") {
   };
 }
 
-function censusMarkerPoint(ts, state = "complete") {
+function censusMarkerPoint(ts, state = "complete", availabilitySignature) {
   return {
     ts,
     fact_name: "session.presence",
     entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
-    attributes: { census_state: state },
+    attributes: {
+      census_state: state,
+      availability_signature: availabilitySignature ?? "v1:tmux",
+    },
     source_envelope_id: "sessions",
     source_tool: "collect_sessions",
     sensitivity: "operational",
@@ -221,6 +225,80 @@ test("groupSessionFactsByTick: orders tick-groups ascending by ts regardless of 
   const points = flatten([completeTick(tickTs(2), 1), completeTick(tickTs(0), 1), completeTick(tickTs(1), 1)]);
   const groups = groupSessionFactsByTick(points);
   assert.deepEqual(groups.map((g) => g.ts), [tickTs(0), tickTs(1), tickTs(2)]);
+});
+
+test("groupSessionFactsByTick carries the session availability signature into the regime", () => {
+  const groups = groupSessionFactsByTick([
+    ...completeTick(tickTs(0), 1).slice(0, 1),
+    censusMarkerPoint(tickTs(0), "complete", "v1:tmux"),
+  ]);
+  assert.equal(groups[0].availabilitySignature, "v1:tmux");
+});
+
+test("groupSessionFactsByTick accepts exactly the three emitted v1 multiplexer signatures", () => {
+  for (const signature of ["v1:tmux", "v1:screen", "v1:tmux+screen"]) {
+    const groups = groupSessionFactsByTick([censusMarkerPoint(tickTs(0), "complete", signature)]);
+    assert.equal(groups[0].availabilitySignature, signature);
+  }
+  for (const signature of ["v2:tmux", "v2:screen", "v2:tmux+screen", "v1:screen+screen"]) {
+    const groups = groupSessionFactsByTick([censusMarkerPoint(tickTs(0), "complete", signature)]);
+    assert.equal(groups[0].availabilitySignature, SESSION_AVAILABILITY_SIGNATURE_INVALID, signature);
+  }
+});
+
+test("session baseline re-warms when tmux becomes not-found and does not evaluate the old alert", async () => {
+  const paths = await tempPaths();
+  const baseline = [];
+  for (let i = 0; i < 30; i += 1) {
+    baseline.push(...completeTick(tickTs(i), 20).slice(0, 20));
+    baseline.push(censusMarkerPoint(tickTs(i), "complete", "v1:tmux+screen"));
+  }
+  const first = await seedAndCompute(paths, baseline);
+  assert.ok(first.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux+screen")));
+
+  const regimeMarker = censusMarkerPoint(tickTs(30), "partial");
+  regimeMarker.attributes.binary_availability = "tmux:not_found_on_known_paths|screen:not_found_on_known_paths";
+  const regimeChange = [regimeMarker];
+  await appendFactPointsByFamily(paths, regimeChange, { now: tickTs(30) });
+  const changed = await computeSessionBaselineCandidates(paths, { now: tickTs(30) });
+  assert.deepEqual(changed.candidates, []);
+  assert.deepEqual(changed.evaluatedAlertKeys, []);
+  assert.equal(changed.ruleEvaluations[SESSION_COUNT_DROP_RULE_ID].gate, "cold_start_pending");
+});
+
+test("session count alert identity stays frozen when tmux+screen narrows to screen after re-warm", async () => {
+  const paths = await tempPaths();
+  const oldUniverse = [];
+  for (let hour = 0; hour < 30; hour += 1) {
+    oldUniverse.push(...completeTick(tickTs(hour), 20).slice(0, 20));
+    oldUniverse.push(censusMarkerPoint(tickTs(hour), "complete", "v1:tmux+screen"));
+  }
+  oldUniverse.push(censusMarkerPoint(tickTs(30), "complete", "v1:tmux+screen"));
+  const raised = await seedAndCompute(paths, oldUniverse, { now: tickTs(30) });
+  const oldKey = alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux+screen");
+  assert.ok(raised.candidates.some((candidate) => candidate.id === oldKey));
+
+  let latest;
+  for (let hour = 31; hour <= 61; hour += 1) {
+    const points = [...completeTick(tickTs(hour), 20).slice(0, 20), censusMarkerPoint(tickTs(hour), "complete", "v1:screen")];
+    await appendFactPointsByFamily(paths, points, { now: tickTs(hour) });
+    latest = await computeSessionBaselineCandidates(paths, { now: tickTs(hour) });
+  }
+
+  const newKey = alertId(SESSION_COUNT_DROP_RULE_ID, "v2:screen");
+  assert.ok(latest.evaluatedAlertKeys.includes(newKey), "the new universe eventually evaluates its own identity");
+  assert.equal(latest.evaluatedAlertKeys.includes(oldKey), false, "the old universe identity must remain frozen forever");
+});
+
+test("an untrusted-present multiplexer census is incomplete and cannot fold a zero", async () => {
+  const paths = await tempPaths();
+  const baseline = [];
+  for (let i = 0; i < 3; i += 1) baseline.push(...completeTick(tickTs(i), 2).slice(0, 2), censusMarkerPoint(tickTs(i), "complete", "v1:tmux"));
+  await seedAndCompute(paths, baseline, { minSampleCount: 1 });
+  await appendFactPointsByFamily(paths, [censusMarkerPoint(tickTs(3), "partial", "v1:tmux")], { now: tickTs(3) });
+  const result = await computeSessionBaselineCandidates(paths, { now: tickTs(3), minSampleCount: 1 });
+  assert.deepEqual(result.evaluatedAlertKeys, []);
+  assert.equal(result.ruleEvaluations[SESSION_CHURN_RULE_ID].gate, "no_complete_census");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -636,7 +714,7 @@ test("session.churn non-fire (A3): an older observation K+1 complete ticks back 
     const paths = await tempPaths();
     const result = await seedAndCompute(paths, points, { now: latestTs });
     assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0);
-    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)), false);
+    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${entityKey}`)), false);
   }
 });
 
@@ -669,6 +747,32 @@ test("session.churn non-fire: pre-existing-history-at-first-run (upgrade-day sto
   const firstPostDeployTick = [censusMarkerPoint(tickTs(48), "complete")]; // e1 absent this tick, but the marker exists now
   const churn = detectSessionChurn([...legacyPoints, ...firstPostDeployTick]);
   assert.deepEqual(churn, [], "no upgrade-day storm: legacy markerless history must never fire on first run");
+});
+
+test("session.churn legacy identity is frozen: 31 complete signatureless ticks never emit churn or legacy coverage", async () => {
+  const paths = await tempPaths();
+  const entityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [];
+  for (let hour = 0; hour < 30; hour += 1) {
+    points.push(sessionPoint(tickTs(hour), entityKey, "fp-stable"));
+    points.push({
+      ts: tickTs(hour),
+      fact_name: "session.presence",
+      entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+      attributes: { census_state: "complete" },
+    });
+  }
+  points.push(sessionPoint(tickTs(30), entityKey, "fp-changed"));
+  points.push({
+    ts: tickTs(30),
+    fact_name: "session.presence",
+    entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+    attributes: { census_state: "complete" },
+  });
+
+  const result = await seedAndCompute(paths, points, { now: tickTs(30) });
+  assert.deepEqual(result.candidates.filter((candidate) => candidate.rule_id === SESSION_CHURN_RULE_ID), []);
+  assert.equal(result.evaluatedAlertKeys.some((key) => key.includes("session.churn") && key.endsWith(entityKey)), false);
 });
 
 test("session.churn: a partial tick-group's own point is excluded from the pool (must-fix 2), but flanking complete observations still churn-compare correctly", () => {
@@ -1206,7 +1310,8 @@ test("candidate shape matches the existing extraCandidates sources (buildPublicB
     last_observation: { ts: tickTs(0), count: 0, z_score: -10, mean_before: 20, stddev_before: 0.5 },
   });
   const [churnCandidate] = buildChurnCandidates([{ entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" }]);
-  assert.deepEqual(Object.keys(dropCandidate).sort(), ["diagnostics", "evidence_refs", "fingerprint", "id", "rule_id", "severity", "summary", "title"]);
+  assert.deepEqual(Object.keys(dropCandidate).sort(), ["diagnostics", "evidence_refs", "fingerprint", "id", "incident_key", "rule_id", "severity", "summary", "title"]);
+  assert.equal(dropCandidate.incident_key, "default");
   assert.deepEqual(Object.keys(churnCandidate).sort(), ["diagnostics", "evidence_refs", "fingerprint", "id", "incident_key", "rule_id", "severity", "summary", "title"]);
   assert.match(churnCandidate.incident_key, /^churn:/);
 });
@@ -1340,8 +1445,8 @@ test("A2 control: a FRESH latest complete tick fires both session.count_drop and
   const result = await seedAndCompute(await tempPaths(), ticks, { now: new Date(Date.parse(tickTs(30)) + HOUR_MS).toISOString() });
   assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 1);
   assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 1);
-  assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")), true);
-  assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)), true);
+  assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux")), true);
+  assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${entityKey}`)), true);
 });
 
 test("A2: a STALE latest complete tick (older than the freshness window) emits no session.count_drop / session.churn and reports neither identity (freeze)", async () => {
@@ -1350,8 +1455,8 @@ test("A2: a STALE latest complete tick (older than the freshness window) emits n
   for (const extra of [{}, { activeFreshnessMs: 3 * HOUR_MS }]) {
     const result = await seedAndCompute(await tempPaths(), ticks, { now: staleNow, ...extra });
     assert.deepEqual(result.candidates, [], "a 4h-old tick must not be re-scored as current");
-    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")), false);
-    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)), false);
+    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux")), false);
+    assert.equal(result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${entityKey}`)), false);
   }
   // A wider explicit window (as the daemon threads for a slower structural cadence) keeps it fresh.
   const wide = await seedAndCompute(await tempPaths(), ticks, { now: staleNow, activeFreshnessMs: 6 * HOUR_MS });
@@ -1373,7 +1478,7 @@ test("recovery coverage (i) — GENUINE clear reports the identity so a persiste
   const churnResult = await seedAndCompute(churnPaths, churnPoints);
   assert.equal(churnResult.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a now-stable fingerprint must not fire churn");
   assert.equal(
-    churnResult.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)),
+    churnResult.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${entityKey}`)),
     true,
     "a freshly-evaluated, no-longer-anomalous entity must be reported so its persisted alert can recover",
   );
@@ -1387,7 +1492,7 @@ test("recovery coverage (i) — GENUINE clear reports the identity so a persiste
   const dropResult = await seedAndCompute(dropPaths, flatten(dropTicks));
   assert.equal(dropResult.candidates.filter((c) => c.rule_id === SESSION_COUNT_DROP_RULE_ID).length, 0, "an on-mean tick must not fire count_drop");
   assert.equal(
-    dropResult.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")),
+    dropResult.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux")),
     true,
     "an established (non-warm-up) count_drop verdict must report the global identity so a persisted alert can recover",
   );
@@ -1405,7 +1510,7 @@ test("recovery coverage (ii) — UNEVALUATED identities are NOT reported (so a p
   const result = await seedAndCompute(paths, points);
   assert.equal(result.candidates.filter((c) => c.rule_id === SESSION_CHURN_RULE_ID).length, 0, "a stale pair must not fire (must-fix 4 recency bound)");
   assert.equal(
-    result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, entityKey)),
+    result.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, `v2:tmux:${entityKey}`)),
     false,
     "a stale entity (newest observation not in the latest complete tick) was not genuinely evaluated -- reporting it would falsely recover a persisted alert",
   );
@@ -1413,7 +1518,7 @@ test("recovery coverage (ii) — UNEVALUATED identities are NOT reported (so a p
   // so no established count_drop verdict was reached: its "global" identity must NOT be reported
   // either (a warm-up detector freezes, never recovers).
   assert.equal(
-    result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global")),
+    result.evaluatedAlertKeys.includes(alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux")),
     false,
     "a provisional (warm-up) count_drop must not report the global identity",
   );
@@ -1442,7 +1547,7 @@ test("S3 horizon: count_drop (30 h) and churn (6 h) are gated per rule -- short 
   for (let i = 0; i < 31; i += 1) ticks.push([...completeTick(tickTs(i), 19), sessionPoint(tickTs(i), "session.tmux.aaaaaaaaaaaaaaaa", "2222222222222222")]);
   const now = tickTs(30);
   const baseline = await seedAndCompute(paths, flatten(ticks), { now });
-  const dropKey = alertId(SESSION_COUNT_DROP_RULE_ID, "global");
+  const dropKey = alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux");
   assert.ok(baseline.evaluatedAlertKeys.includes(dropKey), "control: count_drop evaluated with full coverage");
   const baselineChurnCount = baseline.evaluatedAlertKeys.filter((key) => key !== dropKey).length;
   assert.ok(baselineChurnCount > 0, "control: churn identities evaluated with full coverage");

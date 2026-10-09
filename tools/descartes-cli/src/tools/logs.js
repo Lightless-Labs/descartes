@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -37,38 +38,22 @@ function truncate(value, max = 2048) {
 }
 
 async function runFixedCommand(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 5000,
-      maxBuffer: options.maxBuffer ?? 1024 * 1024,
-    });
-    return {
-      status: "ok",
-      stdout,
-      stderr: truncate(stderr),
-      command: { argv, read_only: true },
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (options.allowPartial && message.includes("stdout maxBuffer") && error?.stdout) {
-      return {
-        status: "ok",
-        partial_output: true,
-        error: message,
-        stdout: error.stdout,
-        stderr: truncate(error?.stderr ?? "", 2048),
-        command: { argv, read_only: true },
-      };
-    }
-    return {
-      status: "unable",
-      error: message,
-      stdout: truncate(error?.stdout ?? "", 4096),
-      stderr: truncate(error?.stderr ?? "", 2048),
-      command: { argv, read_only: true },
-    };
+  const result = await runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 5000,
+    maxBuffer: options.maxBuffer ?? 1024 * 1024,
+    execFileAsync,
+  });
+  const message = result.error ?? "";
+  if (options.allowPartial && message.includes("stdout maxBuffer") && result.stdout) {
+    return { ...result, status: "ok", partial_output: true, stderr: truncate(result.stderr ?? "", 2048) };
   }
+  return {
+    ...result,
+    status: result.status === "ok" ? "ok" : (result.availability ?? "unable"),
+    stdout: truncate(result.stdout ?? "", 4096),
+    stderr: truncate(result.stderr ?? "", 2048),
+  };
 }
 
 function looksSecretToken(value) {
@@ -309,21 +294,21 @@ function probeResult({ name, source, command, entries, parsedTotal, parser, cate
   };
 }
 
-async function journalProbe({ name, args, source = "journal", limit, messageChars, category, categoryFilter }) {
-  const command = await runFixedCommand("journalctl", args, { timeout: 5000, maxBuffer: 1024 * 1024 });
+async function journalProbe({ name, args, source = "journal", limit, messageChars, category, categoryFilter, resolverOptions }) {
+  const command = await runFixedCommand("journalctl", args, { ...resolverOptions, timeout: 5000, maxBuffer: 1024 * 1024 });
   if (command.status !== "ok") return probeResult({ name, source, command, entries: [], parsedTotal: 0, parser: "journal_json", category });
   const all = parseJournalctlJsonLines(command.stdout, { limit: MAX_EVENT_LIMIT * 4, messageChars, categoryFilter });
   return probeResult({ name, source, command, entries: all.slice(0, limit), parsedTotal: all.length, parser: "journal_json", category });
 }
 
-async function tailProbe({ name, path, source, limit, messageChars, category, categoryFilter }) {
-  const command = await runFixedCommand("tail", ["-n", String(limit), path], { timeout: 2500, maxBuffer: 256 * 1024 });
+async function tailProbe({ name, path, source, limit, messageChars, category, categoryFilter, resolverOptions }) {
+  const command = await runFixedCommand("tail", ["-n", String(limit), path], { ...resolverOptions, timeout: 2500, maxBuffer: 256 * 1024 });
   if (command.status !== "ok") return probeResult({ name, source, command, entries: [], parsedTotal: 0, parser: "syslog_lines", category });
   const all = parseSyslogLines(command.stdout, { source, rawFile: path, limit: MAX_EVENT_LIMIT * 4, messageChars, categoryFilter });
   return probeResult({ name, source, command, entries: all.slice(0, limit), parsedTotal: all.length, parser: "syslog_lines", category });
 }
 
-async function macLogProbe({ name, predicate, limit, messageChars, category, categoryFilter, windowMinutes }) {
+async function macLogProbe({ name, predicate, limit, messageChars, category, categoryFilter, windowMinutes, resolverOptions }) {
   const command = await runFixedCommand("log", [
     "show",
     "--last",
@@ -332,7 +317,7 @@ async function macLogProbe({ name, predicate, limit, messageChars, category, cat
     "ndjson",
     "--predicate",
     predicate,
-  ], { timeout: 6500, maxBuffer: 1024 * 1024, allowPartial: true });
+  ], { ...resolverOptions, timeout: 6500, maxBuffer: 1024 * 1024, allowPartial: true });
   if (command.status !== "ok") return probeResult({ name, source: "unified_log", command, entries: [], parsedTotal: 0, parser: "mac_unified_log_json", category });
   const all = parseMacUnifiedLogJson(command.stdout, { limit: MAX_EVENT_LIMIT * 4, messageChars, categoryFilter });
   return probeResult({ name, source: "unified_log", command, entries: all.slice(0, limit), parsedTotal: all.length, parser: "mac_unified_log_json", category });
@@ -352,6 +337,7 @@ async function collectLinuxLogProbes(request) {
       limit,
       messageChars: request.message_chars,
       category: "general",
+      resolverOptions: request.resolver_options,
     }),
   ];
 
@@ -363,6 +349,7 @@ async function collectLinuxLogProbes(request) {
         limit,
         messageChars: request.message_chars,
         category: "fail2ban",
+        resolverOptions: request.resolver_options,
         categoryFilter: (category) => category === "fail2ban" || category === "auth" || category === "general",
       }),
       journalProbe({
@@ -371,6 +358,7 @@ async function collectLinuxLogProbes(request) {
         limit,
         messageChars: request.message_chars,
         category: "firewall",
+        resolverOptions: request.resolver_options,
         categoryFilter: (category) => category === "firewall" || category === "general",
       }),
       journalProbe({
@@ -379,6 +367,7 @@ async function collectLinuxLogProbes(request) {
         limit,
         messageChars: request.message_chars,
         category: "firewall",
+        resolverOptions: request.resolver_options,
         categoryFilter: (category) => category === "firewall",
       }),
       tailProbe({
@@ -388,6 +377,7 @@ async function collectLinuxLogProbes(request) {
         limit,
         messageChars: request.message_chars,
         category: "fail2ban",
+        resolverOptions: request.resolver_options,
         categoryFilter: (category) => category === "fail2ban" || category === "auth" || category === "general",
       }),
       tailProbe({
@@ -397,6 +387,7 @@ async function collectLinuxLogProbes(request) {
         limit,
         messageChars: request.message_chars,
         category: "firewall",
+        resolverOptions: request.resolver_options,
         categoryFilter: (category) => category === "firewall",
       })
     );
@@ -415,6 +406,7 @@ async function collectMacLogProbes(request) {
       messageChars: request.message_chars,
       category: "general",
       windowMinutes: request.window_minutes,
+      resolverOptions: request.resolver_options,
     }),
   ];
 
@@ -427,6 +419,7 @@ async function collectMacLogProbes(request) {
       category: "firewall_or_fail2ban",
       categoryFilter: securityCategory,
       windowMinutes: request.window_minutes,
+      resolverOptions: request.resolver_options,
     }));
   }
 
@@ -448,6 +441,7 @@ function reviewHint(result) {
 
 export async function collectRecentLogsEvidence(options = {}) {
   const request = normalizeLogRequest(options);
+  Object.defineProperty(request, "resolver_options", { value: options });
   return timedEnvelope(async () => {
     let probes;
     if (process.platform === "linux") probes = await collectLinuxLogProbes(request);

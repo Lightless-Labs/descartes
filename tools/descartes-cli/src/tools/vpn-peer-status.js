@@ -14,8 +14,8 @@
 //   - Established-inbound cross-reference: `ss`/`netstat` (lowest-confidence, first-to-cut;
 //     kept as raw operator-triage context only -- never translated into a persisted peer fact).
 //
-// Degrade-not-fabricate (hard requirement, per source): a binary that is genuinely ABSENT
-// (ENOENT) degrades to "absent"; a binary that runs but is denied by the OS (EACCES/EPERM, or
+// Degrade-not-fabricate (hard requirement, per source): a binary missing from the pinned known
+// paths (including ENOENT) degrades to "not_found_on_known_paths"; a binary that runs but is denied by the OS (EACCES/EPERM, or
 // wg's own "Permission denied"/"Operation not permitted" stderr text) degrades to
 // "missing_permission" and is NEVER escalated (no sudo/pkexec/setcap/doas -- see the escalation
 // lint, test/escalation-lint.test.js, which scans this file too); a binary that runs and
@@ -33,6 +33,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -55,23 +56,17 @@ export const DEFAULT_LAST_HISTORY_LIMIT = 50;
 const MAX_WG_INTERFACES = 16;
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 256 * 1024,
-    });
-    return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "error",
-      code: error?.code,
-      stdout: error?.stdout ?? "",
-      stderr: error?.stderr ?? "",
-      error: error instanceof Error ? error.message : String(error),
-      command: { argv, read_only: true },
-    };
-  }
+  return runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 256 * 1024,
+    execFileAsync,
+  });
+}
+
+function probeOptions(options, overrides = {}) {
+  const { runFixedExecFile: _injectedRunner, ...resolverOptions } = options;
+  return { ...resolverOptions, ...overrides };
 }
 
 function isPermissionDenied(probe) {
@@ -106,14 +101,15 @@ export function parseWhoOutput(stdout) {
 
 async function collectSshWho(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("who", [], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("who", [], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (probe.status === "ok") {
     const { entries } = parseWhoOutput(probe.stdout);
-    return { status: "ok", entries, command: probe.command };
+    return { status: "ok", entries, command: probe.command, binary: probe.binary };
   }
-  if (probe.code === "ENOENT") return { status: "absent", entries: [], command: probe.command };
-  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], error: probe.error, command: probe.command };
-  return { status: "unable", entries: [], error: probe.error, command: probe.command };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], command: probe.command, binary: probe.binary };
+  if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
+  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
+  return { status: "unable", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -161,14 +157,15 @@ export function parseLastOutput(stdout) {
 async function collectSshLast(options) {
   const n = Math.max(1, Number(options.lastHistoryLimit) || DEFAULT_LAST_HISTORY_LIMIT);
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("last", ["-n", String(n)], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("last", ["-n", String(n)], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (probe.status === "ok") {
     const { entries, malformed_count } = parseLastOutput(probe.stdout);
-    return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command };
+    return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
   }
-  if (probe.code === "ENOENT") return { status: "absent", entries: [], requested_n: n, command: probe.command };
-  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], requested_n: n, error: probe.error, command: probe.command };
-  return { status: "unable", entries: [], requested_n: n, error: probe.error, command: probe.command };
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command, binary: probe.binary };
+  if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
+  if (isPermissionDenied(probe)) return { status: "missing_permission", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
+  return { status: "unable", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -195,16 +192,16 @@ async function collectSshLast(options) {
 // ---------------------------------------------------------------------------------------------
 
 async function wgShowInterfaces(runExec, options) {
-  return runExec("wg", ["show", "interfaces"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", "interfaces"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowPeers(runExec, iface, options) {
-  return runExec("wg", ["show", iface, "peers"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", iface, "peers"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowEndpoints(runExec, iface, options) {
-  return runExec("wg", ["show", iface, "endpoints"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", iface, "endpoints"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowLatestHandshakes(runExec, iface, options) {
-  return runExec("wg", ["show", iface, "latest-handshakes"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  return runExec("wg", ["show", iface, "latest-handshakes"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 
 export function parseWgInterfaceList(stdout) {
@@ -244,8 +241,11 @@ async function collectWireguardPeers(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const listProbe = await wgShowInterfaces(runExec, options);
 
-  if (listProbe.code === "ENOENT") {
-    return { status: "absent", interfaces: [], peers: [], elevation_candidate: false };
+  if (isBinaryNotFound(listProbe)) {
+    return { status: "not_found_on_known_paths", interfaces: [], peers: [], elevation_candidate: false, binary: listProbe.binary };
+  }
+  if (isBinaryUntrusted(listProbe)) {
+    return { status: "untrusted_binary", interfaces: [], peers: [], elevation_candidate: false, error: listProbe.error, binary: listProbe.binary };
   }
   if (listProbe.status !== "ok") {
     const elevationCandidate = isPermissionDenied(listProbe);
@@ -255,6 +255,7 @@ async function collectWireguardPeers(options) {
       peers: [],
       elevation_candidate: elevationCandidate,
       error: listProbe.error,
+      binary: listProbe.binary,
     };
   }
 
@@ -313,6 +314,7 @@ async function collectWireguardPeers(options) {
     // (cap+1)th interface vanishing from the census with no trace.
     interfaces_truncated: allInterfaceNames.length > MAX_WG_INTERFACES,
     total_interface_count: allInterfaceNames.length,
+    binary: listProbe.binary,
   };
 }
 
@@ -321,22 +323,42 @@ async function collectWireguardPeers(options) {
 // every other platform without attempting the command at all -- scutil does not exist there).
 // ---------------------------------------------------------------------------------------------
 
-// "* (Connected)    1E4E6C58-F859-4E51-92A6-BF4B14A23689 "Corp VPN"      [PPP:L2TP]" -- an
-// optional leading "*" marks the default service; status in parens; a UUID; the operator-chosen
-// service name in quotes.
-const SCUTIL_NC_LINE_RE = /^\*?\s*\((\w[\w ]*)\)\s+([0-9A-Fa-f-]{36})\s+"([^"]*)"/;
+// Real output has a service-type token between the UUID and the quoted name, followed by a
+// bracketed type classifier. Keep the whole pre-name token loose because macOS emits forms such
+// as `VPN (...)`, `IPSec`, and `PPP --> com.example...`.
+const SCUTIL_NC_LINE_RE = /^\*?\s*\(([^)]+)\)\s+([0-9A-Fa-f-]{36})\s+.+?\s+"([^"]*)"\s+\[([^\]]+)\]\s*$/;
+const SCUTIL_NC_HEADER_RE = /^Available network connection services in the current set \(\*=enabled\):$/;
+const VPN_SERVICE_TYPE_RE = /^(?:VPN:.*|IPSec|PPP:L2TP)$/i;
+const TAILSCALE_SERVICE_TYPE_IDS = new Set(["io.tailscale.ipn.macos", "io.tailscale.ipn.macsys"]);
 
-export function parseScutilNcList(stdout) {
+export function parseScutilNcListDetailed(stdout) {
   const services = [];
+  let unparsed_count = 0;
   for (const rawLine of String(stdout ?? "").split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
+    if (SCUTIL_NC_HEADER_RE.test(line)) continue;
     const match = line.match(SCUTIL_NC_LINE_RE);
-    if (!match) continue;
-    const [, status, uuid, name] = match;
-    services.push({ status: status.trim(), service_uuid: uuid, service_name: name });
+    if (!match) {
+      unparsed_count += 1;
+      continue;
+    }
+    const [, status, uuid, name, service_type] = match;
+    const is_tailscale = TAILSCALE_SERVICE_TYPE_IDS.has(String(service_type).toLowerCase().replace(/^vpn:/, ""));
+    services.push({
+      status: status.trim(),
+      service_uuid: uuid,
+      service_name: name,
+      service_type,
+      is_vpn: VPN_SERVICE_TYPE_RE.test(service_type),
+      is_tailscale,
+    });
   }
-  return services;
+  return { services, unparsed_count };
+}
+
+export function parseScutilNcList(stdout) {
+  return parseScutilNcListDetailed(stdout).services;
 }
 
 async function collectVpnServices(options) {
@@ -344,13 +366,21 @@ async function collectVpnServices(options) {
   if (platform !== "darwin") return { status: "not_applicable", services: [] };
 
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("scutil", ["--nc", "list"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-  if (probe.code === "ENOENT") return { status: "absent", services: [] };
+  const probe = await runExec("scutil", ["--nc", "list"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [], binary: probe.binary };
   if (probe.status !== "ok") {
-    if (isPermissionDenied(probe)) return { status: "missing_permission", services: [], error: probe.error };
-    return { status: "unable", services: [], error: probe.error };
+    if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", services: [], error: probe.error, binary: probe.binary };
+    if (isPermissionDenied(probe)) return { status: "missing_permission", services: [], error: probe.error, binary: probe.binary };
+    return { status: "unable", services: [], error: probe.error, binary: probe.binary };
   }
-  return { status: "ok", services: parseScutilNcList(probe.stdout) };
+  const parsed = parseScutilNcListDetailed(probe.stdout);
+  return {
+    status: parsed.unparsed_count > 0 ? "partial" : "ok",
+    services: parsed.services.filter((service) => service.is_vpn && !service.is_tailscale),
+    unparsed_count: parsed.unparsed_count,
+    tailscale_entry_observed: parsed.services.some((service) => service.is_tailscale),
+    binary: probe.binary,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -365,18 +395,20 @@ async function collectEstablishedInbound(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
 
   if (platform === "linux") {
-    const probe = await runExec("ss", ["-H", "-tn", "state", "established"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-    if (probe.code === "ENOENT") return { status: "absent", count: 0 };
-    if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error };
+    const probe = await runExec("ss", ["-H", "-tn", "state", "established"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
+    if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
+    if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
+    if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
     const lines = String(probe.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
-    return { status: "ok", count: lines.length };
+    return { status: "ok", count: lines.length, binary: probe.binary };
   }
 
-  const probe = await runExec("netstat", ["-an", "-p", "tcp"], { timeout: options.timeout, maxBuffer: options.maxBuffer });
-  if (probe.code === "ENOENT") return { status: "absent", count: 0 };
-  if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error };
+  const probe = await runExec("netstat", ["-an", "-p", "tcp"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
+  if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
+  if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
+  if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
   const count = String(probe.stdout ?? "").split("\n").filter((line) => /established/i.test(line)).length;
-  return { status: "ok", count };
+  return { status: "ok", count, binary: probe.binary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -436,8 +468,8 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
     return {
       platform,
       sources: {
-        ssh_who: { status: who.status, error: who.error },
-        ssh_last: { status: last.status, error: last.error, requested_n: last.requested_n },
+        ssh_who: { status: who.status, error: who.error, binary_provenance: binaryProvenance(who.binary) },
+        ssh_last: { status: last.status, error: last.error, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
         wireguard: {
           status: wireguard.status,
           error: wireguard.error,
@@ -445,9 +477,16 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
           interfaces: wireguard.interfaces ?? [],
           interfaces_truncated: wireguard.interfaces_truncated ?? false,
           total_interface_count: wireguard.total_interface_count ?? (wireguard.interfaces?.length ?? 0),
+          binary_provenance: binaryProvenance(wireguard.binary),
         },
-        vpn_services: { status: vpnServices.status, error: vpnServices.error },
-        established_inbound: { status: establishedInbound.status, error: establishedInbound.error },
+        vpn_services: {
+          status: vpnServices.status,
+          error: vpnServices.error,
+          unparsed_count: vpnServices.unparsed_count ?? 0,
+          tailscale_entry_observed: vpnServices.tailscale_entry_observed ?? false,
+          binary_provenance: binaryProvenance(vpnServices.binary),
+        },
+        established_inbound: { status: establishedInbound.status, error: establishedInbound.error, binary_provenance: binaryProvenance(establishedInbound.binary) },
       },
       any_source_available: anySourceAvailable,
       total_count: allPeers.length,
@@ -457,11 +496,17 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
     };
   }, (result) => evidenceEnvelope({
     id: "vpn-peer-status",
-    status: result.any_source_available ? "ok" : "unable",
+    status: result.any_source_available
+      ? (Object.values(result.sources).some((source) => source.status === "ok") ? "ok" : "warning")
+      : "unable",
     source: "vpn_peer_status",
     result,
-    confidence: result.any_source_available ? 1 : 0,
-    reviewHint: result.any_source_available ? "none" : "missing_permission",
+    confidence: result.any_source_available
+      ? (Object.values(result.sources).some((source) => source.status === "ok") ? 1 : 0.4)
+      : 0,
+    reviewHint: result.any_source_available
+      ? (Object.values(result.sources).some((source) => source.status === "ok") ? "none" : "ambiguous")
+      : "missing_permission",
     tool: "collect_vpn_peer_status",
     target: `cap=${result.cap}`,
   }));

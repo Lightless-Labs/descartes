@@ -26,6 +26,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -40,25 +41,37 @@ export const MAX_SESSION_ENTITY_LIMIT = 200;
 // and reliable, unlike screen's optional (and locale-formatted) creation-date column, which is
 // deliberately NOT parsed below (see collectScreenSessions/parseScreenLs doc).
 const TMUX_FORMAT = "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}";
+const SESSION_MULTIPLEXER_ORDER = ["tmux", "screen"];
+const NOT_FOUND_STATUS = "not_found_on_known_paths";
+
+function sessionAvailabilitySignature(multiplexers) {
+  const universe = SESSION_MULTIPLEXER_ORDER.filter((name) => multiplexers.some(
+    (mux) => mux.multiplexer === name && mux.status === "ok",
+  ));
+  return universe.length > 0 ? `v1:${universe.join("+")}` : undefined;
+}
+
+function sessionCensusComplete(multiplexers) {
+  const usable = multiplexers.filter((mux) => mux.status === "ok");
+  const incomplete = multiplexers.some((mux) => mux.status !== "ok" && mux.status !== NOT_FOUND_STATUS);
+  // A known-path miss is outside this tick's observable universe. It is neither an incomplete
+  // source nor evidence of a zero; at least one usable source is still required to make a real
+  // census. Any present-but-unusable source remains an incomplete census.
+  return usable.length > 0 && !incomplete;
+}
 
 async function runFixedExecFile(command, args, options = {}) {
-  const argv = [command, ...args];
-  try {
-    const { stdout, stderr } = await execFileAsync(command, args, {
-      timeout: options.timeout ?? 3000,
-      maxBuffer: options.maxBuffer ?? 256 * 1024,
-    });
-    return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
-  } catch (error) {
-    return {
-      status: "error",
-      code: error?.code,
-      stdout: error?.stdout ?? "",
-      stderr: error?.stderr ?? "",
-      error: error instanceof Error ? error.message : String(error),
-      command: { argv, read_only: true },
-    };
-  }
+  return runResolvedExecFile(command, args, {
+    ...options,
+    timeout: options.timeout ?? 3000,
+    maxBuffer: options.maxBuffer ?? 256 * 1024,
+    execFileAsync,
+  });
+}
+
+function probeOptions(options, overrides = {}) {
+  const { runFixedExecFile: _injectedRunner, ...resolverOptions } = options;
+  return { ...resolverOptions, ...overrides };
 }
 
 /**
@@ -144,7 +157,7 @@ export function parseScreenLs(stdout) {
 }
 
 /**
- * tmux exits non-zero both when the binary is genuinely absent (ENOENT) AND when it's present
+ * tmux exits non-zero both when the binary is missing from known paths (ENOENT) AND when it's present
  * but no server is running (the honest "zero tmux sessions" case) — these must not be conflated.
  * Any OTHER failure (permission denied, timeout, unexpected error) degrades this multiplexer to
  * "unable" rather than being guessed as either extreme.
@@ -152,22 +165,32 @@ export function parseScreenLs(stdout) {
 async function collectTmuxSessions(options = {}) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const args = ["list-sessions", "-F", TMUX_FORMAT];
-  const probe = await runExec("tmux", args, { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("tmux", args, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
   if (probe.status === "ok") {
     const parsed = parseTmuxSessions(probe.stdout);
-    return { multiplexer: "tmux", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command };
+    return {
+      multiplexer: "tmux",
+      status: parsed.malformed_count > 0 ? "partial" : "ok",
+      sessions: parsed.sessions,
+      malformed_count: parsed.malformed_count,
+      command: probe.command,
+      binary: probe.binary,
+    };
   }
-  if (probe.code === "ENOENT") {
-    return { multiplexer: "tmux", status: "absent", sessions: [], command: probe.command };
+  if (isBinaryNotFound(probe)) {
+    return { multiplexer: "tmux", status: "not_found_on_known_paths", sessions: [], command: probe.command, binary: probe.binary };
+  }
+  if (isBinaryUntrusted(probe)) {
+    return { multiplexer: "tmux", status: "untrusted_binary", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
   }
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   if (/no server running|no such file or directory|error connecting to/i.test(text)) {
     // tmux binary present, ran, and told us (via its own no-server error) that zero sessions
     // exist — a real, distinguishable fact, not a fabricated one.
-    return { multiplexer: "tmux", status: "ok", sessions: [], malformed_count: 0, command: probe.command };
+    return { multiplexer: "tmux", status: "ok", sessions: [], malformed_count: 0, command: probe.command, binary: probe.binary };
   }
-  return { multiplexer: "tmux", status: "unable", sessions: [], error: probe.error, command: probe.command };
+  return { multiplexer: "tmux", status: "unable", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 /**
@@ -179,26 +202,46 @@ async function collectTmuxSessions(options = {}) {
 async function collectScreenSessions(options = {}) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
   const args = ["-ls"];
-  const probe = await runExec("screen", args, { timeout: options.timeout, maxBuffer: options.maxBuffer });
+  const probe = await runExec("screen", args, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
-  if (probe.code === "ENOENT") {
-    return { multiplexer: "screen", status: "absent", sessions: [], command: probe.command };
+  if (isBinaryNotFound(probe)) {
+    return { multiplexer: "screen", status: "not_found_on_known_paths", sessions: [], command: probe.command, binary: probe.binary };
+  }
+
+  if (isBinaryUntrusted(probe)) {
+    return { multiplexer: "screen", status: "untrusted_binary", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
   }
 
   const text = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
   const parsed = parseScreenLs(text);
-  if (probe.status === "ok" || parsed.no_sockets || parsed.sessions.length > 0) {
-    return { multiplexer: "screen", status: "ok", sessions: parsed.sessions, malformed_count: parsed.malformed_count, command: probe.command };
+  if (parsed.malformed_count > 0) {
+    return {
+      multiplexer: "screen",
+      status: "partial",
+      sessions: parsed.sessions,
+      malformed_count: parsed.malformed_count,
+      command: probe.command,
+      binary: probe.binary,
+    };
   }
-  return { multiplexer: "screen", status: "unable", sessions: [], error: probe.error, command: probe.command };
+  if (probe.status === "ok" || parsed.no_sockets || parsed.sessions.length > 0) {
+    return {
+      multiplexer: "screen",
+      status: parsed.malformed_count > 0 ? "partial" : "ok",
+      sessions: parsed.sessions,
+      malformed_count: parsed.malformed_count,
+      command: probe.command,
+      binary: probe.binary,
+    };
+  }
+  return { multiplexer: "screen", status: "unable", sessions: [], error: probe.error, command: probe.command, binary: probe.binary };
 }
 
 /**
  * Session-census L0 collector (Slice 1). Combines tmux + screen results, bounds the combined
- * entity count at DEFAULT_SESSION_ENTITY_LIMIT (must-fix 5), and computes the overall
- * degrade-not-fabricate envelope status: "unable"/confidence 0 only when NEITHER multiplexer
- * binary is present/usable this tick — any single successful (even zero-session) read from
- * either multiplexer counts as a real "ok" observation.
+ * entity count at DEFAULT_SESSION_ENTITY_LIMIT (must-fix 5). The census universe is the set of
+ * present, usable multiplexers. A known-path miss is outside that universe; a present-but-
+ * unusable source keeps the census partial so its missing sessions can never become a zero.
  */
 export async function collectSessionEvidence(options = {}) {
   const cap = Math.min(MAX_SESSION_ENTITY_LIMIT, Math.max(1, Number(options.sessionLimit) || DEFAULT_SESSION_ENTITY_LIMIT));
@@ -216,7 +259,9 @@ export async function collectSessionEvidence(options = {}) {
       }
     }
 
-    const anyBinaryAvailable = multiplexers.some((mux) => mux.status === "ok");
+    const anyBinaryAvailable = multiplexers.some((mux) => mux.status === "ok" || mux.status === "partial");
+    const censusComplete = sessionCensusComplete(multiplexers);
+    const availabilitySignature = sessionAvailabilitySignature(multiplexers);
     const truncated = allSessions.length > cap;
 
     return {
@@ -224,9 +269,13 @@ export async function collectSessionEvidence(options = {}) {
       multiplexers: multiplexers.map((mux) => ({
         multiplexer: mux.multiplexer,
         status: mux.status,
+        malformed_count: mux.malformed_count ?? 0,
         ...(mux.error ? { error: mux.error } : {}),
+        binary_provenance: binaryProvenance(mux.binary),
       })),
       any_binary_available: anyBinaryAvailable,
+      census_state: censusComplete ? "complete" : "partial",
+      ...(availabilitySignature ? { availability_signature: availabilitySignature } : {}),
       total_count: allSessions.length,
       sessions: allSessions.slice(0, cap),
       truncated,
@@ -234,11 +283,14 @@ export async function collectSessionEvidence(options = {}) {
     };
   }, (result) => evidenceEnvelope({
     id: "sessions",
-    status: result.any_binary_available ? "ok" : "unable",
+    status: result.census_state === "complete" ? "ok" : result.any_binary_available ? "warning" : "unable",
     source: "session_multiplexer",
     result,
-    confidence: result.any_binary_available ? 1 : 0,
-    reviewHint: result.any_binary_available ? "none" : "missing_permission",
+    confidence: result.census_state === "complete" ? 1 : result.any_binary_available ? 0.5 : 0,
+    reviewHint: result.census_state === "complete"
+      ? "none"
+      : result.multiplexers.some((mux) => (mux.malformed_count ?? 0) > 0) ? "malformed_output"
+        : result.multiplexers.find((mux) => mux.status !== "ok")?.status === "untrusted_binary" ? "untrusted_binary" : "missing_permission",
     tool: "collect_sessions",
     target: `cap=${result.cap}`,
   }));
