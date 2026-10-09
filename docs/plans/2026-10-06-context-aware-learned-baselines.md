@@ -1409,6 +1409,24 @@ These are not closed by more machinery, by design. Each is stated, bounded and v
    - on-host evaluation inputs can be forged (§6.3.2).
 7. **Patient poisoning** of a learned lineage at the drift-budget rate (§6.3.2). It is notified and reversible, but cannot be prevented without off-host attestation.
 
+**Addendum (2026-10-09, after the v5 reviews).** Opus v5 (0 BLOCKER, 3 HIGH; `docs/reviews/2026-10-09-context-plan-v5-review-opus.md`) and Astra v5 (0 BLOCKER, 4 HIGH; `docs/reviews/2026-10-09-context-plan-v5-review-astra.md`). As agreed after v4, the plan is **not revised again for these**. None affects C0 or C2 (context data collection), which start now. Each item names the step that must close it before that step lands; that step's daybreak gate checks it.
+
+| # | Item (sources) | Must be closed before |
+|---|---|---|
+| 8 | **Pending-directory loss mutes then re-baselines an established incumbent** when no episode is open; ticks never adjudicated fold (Opus H1, Astra 1). Direction: losing the pending store must never re-base an incumbent from post-break ticks; keep a durable per-incumbent serving snapshot outside the pending directory, or freeze until N trusted ticks are journaled. | C1.4 / C1a |
+| 9 | **Quarantine does not revoke versions that learned from the quarantined data** (Opus H2, Astra 2). Direction: training-membership provenance is live; a later quarantine of any member marks every version that trained on it as tainted, and those versions are demoted (automatic, notified, reversible) and re-fit without it. | C7a |
+| 10 | **Peer regimes share one recovery unit** — fabricated recovery or indefinite muting across regimes (Opus H3, Astra 3). Direction: per-regime incident keys (or alert identities) for peer LEVEL/EVENT incidents, consistent with notify-once per-incident records; recovery only within the raising regime. | C1a (peers) |
+| 11 | **Reciprocal corroboration vetoes make correlated legitimate changes label-only** (Astra 4, NEW) — the UAC ditch again. Direction: a veto must be satisfiable by evidence other than a label (independent context facts such as a software-change event, bounded quiet within the drift budget); no path where only a label can admit. | C7a |
+| 12 | Drift-budget continuity/bootstrap (anchor for the first promotion, total vs rate, doctrine :110-116 alignment) (Opus M1, Astra 6). | DA + C7a |
+| 13 | Running extreme is a raw count, wrong for context-conditioned learned LEVEL streams (Opus M3, Astra 5). Direction: extreme in surprise units for learned streams; raw counts stay for incumbents only. | C5 |
+| 14 | `earned_promotion` admission scope (which lineage's items) and the incumbent explanation boundary (Opus M5, Astra 7). | C7a |
+| 15 | Label budget counts labels not coverage; bulk forged label bypasses vetoes (Opus M6, Astra 8). | C1.3 |
+| 16 | Watermark needs a durable observation→pass mapping (Astra 9). | C1.4 |
+| 17 | Retained evidence vs the runtime promotion protocol (Astra 10); interim-noise "bound" is a measurement (Opus M2, Astra 12). | C3b / C1a replay gate |
+| 18 | Pending novelty can grow alert storage without bound (Opus M7, Astra 11). Direction: bounded pending set with storm semantics (one notification), never silent eviction. | C1a |
+| 19 | CC3-E "every open incident" vacuous after delivered EVENT incidents close (Opus M4, Astra 14). | C1.1 |
+| 20 | Exposure assumes wall-clock elapsed time is valid (Astra 13, NEW). Direction: exposure from the monotonic/boottime clock readings already kept (I68), wall time only as a cross-check. | C2 (data) / C4 |
+
 ## 17. Key code refs
 
 Refs on `main` are verified at 66d3a2b (v5). Its code differs from 1169d40 only in `baseline.js` (b60efc8), so every `main` line below is unchanged since the capacity merge. Branch refs name their tip, and move when the branch is rebased.
