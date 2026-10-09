@@ -5,7 +5,8 @@
 ## Collector-source daybreak blockers — 2026-10-09 — local, not pushed
 
 Closed the two daybreak blockers in atomic commits `d351e22` (TDD regressions and persistence
-coverage), `6ae16ca` (implementation), and `d9d38c2` (README/reference residual corrections).
+coverage), `6ae16ca` (implementation), `d9d38c2` (README/reference residual corrections),
+`f30d304` (present-inode pruning regression), and `cb6f600` (present-inode pin retention).
 macOS dscl trust now requires explicit evidence for every relevant attribute; silent omissions,
 including `UniqueID: 400` without an `AuthenticationAuthority` line, fail closed. An explicitly
 reported `No such key: AuthenticationAuthority` is the only accepted absent-authority evidence.
