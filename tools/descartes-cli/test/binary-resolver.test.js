@@ -24,6 +24,7 @@ function trustedStats(filePath, { file = regularExecutable(), ancestors = {} } =
 }
 
 const readableBinary = async () => Buffer.from("not a script");
+const aclAbsent = async () => "absent";
 
 test("resolveCollectorBinary uses only pinned absolute candidates and accepts a regular executable", async () => {
   const seen = [];
@@ -43,6 +44,7 @@ test("resolveCollectorBinary uses only pinned absolute candidates and accepts a 
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 501,
   });
 
@@ -82,7 +84,44 @@ test("resolveCollectorBinary rejects a candidate in a world-writable directory a
   assert.equal(resolution.offending_component, "/opt/homebrew/bin");
 });
 
-test("resolveCollectorBinary trusts a non-writable executable owned by another user", async () => {
+test("resolveCollectorBinary rejects an ACL-granted writer even when mode bits look safe", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/usr/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/usr/bin/tmux", {
+      file: regularExecutable(0o100555),
+      ancestors: { "/usr/bin": directory(), "/usr": directory(), "/": directory() },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: async (component) => component === "/usr/bin/tmux" ? "present" : "absent",
+    expectedUid: 0,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.offending_component, "/usr/bin/tmux");
+  assert.equal(resolution.trust_reason, "acl_present");
+  assert.match(resolution.operator_override_hint, /trusted_binary_paths/);
+});
+
+test("resolveCollectorBinary fails closed when ACL state cannot be determined", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "linux",
+    realpathFn: async (candidate) => candidate === "/usr/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/usr/bin/tmux", {
+      file: regularExecutable(),
+      ancestors: { "/usr/bin": directory(), "/usr": directory(), "/": directory() },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: async () => "unknown",
+    expectedUid: 0,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.offending_component, "/usr/bin/tmux");
+  assert.equal(resolution.trust_reason, "acl_unknown");
+});
+
+test("resolveCollectorBinary rejects a non-writable executable owned by another user", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "linux",
     realpathFn: async (candidate) => candidate,
@@ -97,9 +136,9 @@ test("resolveCollectorBinary trusts a non-writable executable owned by another u
     expectedUid: 1000,
   });
 
-  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
-  assert.equal(resolution.path, "/usr/bin/tmux");
-  assert.equal(resolution.trust_verdict, "trusted");
+  assert.equal(resolution.status, "untrusted_binary", JSON.stringify(resolution));
+  assert.equal(resolution.offending_component, "/usr/bin/tmux");
+  assert.equal(resolution.trust_reason, "foreign_owner");
 });
 
 test("resolveCollectorBinary rejects an owner-writable executable owned by another user", async () => {
@@ -119,10 +158,10 @@ test("resolveCollectorBinary rejects an owner-writable executable owned by anoth
 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.offending_component, "/usr/bin/tmux");
-  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
+  assert.equal(resolution.trust_reason, "foreign_owner");
 });
 
-test("resolveCollectorBinary trusts a group-writable ancestor when its effective writers are root and the daemon uid", async () => {
+test("resolveCollectorBinary rejects a group-writable ancestor without resolving group membership", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
     realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
@@ -134,12 +173,13 @@ test("resolveCollectorBinary trusts a group-writable ancestor when its effective
       },
     }),
     readFileFn: readableBinary,
-    groupWriterUidsFn: async (gid) => ({ uids: gid === 80 ? [0, 501] : [] }),
+    aclCheckFn: aclAbsent,
     expectedUid: 501,
   });
 
-  assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
-  assert.equal(resolution.path, "/opt/homebrew/bin/tmux");
+  assert.equal(resolution.status, "untrusted_binary", JSON.stringify(resolution));
+  assert.equal(resolution.offending_component, "/opt/homebrew/bin");
+  assert.equal(resolution.trust_reason, "group_writable");
 });
 
 test("resolveCollectorBinary rejects a group-writable ancestor with a second admin and exposes the operator override", async () => {
@@ -153,14 +193,13 @@ test("resolveCollectorBinary rejects a group-writable ancestor with a second adm
       },
     }),
     readFileFn: readableBinary,
-    groupWriterUidsFn: async () => ({ uids: [0, 501, 502] }),
+    aclCheckFn: aclAbsent,
     expectedUid: 501,
   });
 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.offending_component, "/opt/homebrew/bin");
-  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
-  assert.deepEqual(resolution.writer_uids, [0, 501, 502]);
+  assert.equal(resolution.trust_reason, "group_writable");
   assert.match(resolution.operator_override_hint, /trusted_binary_paths/);
 });
 
@@ -186,13 +225,13 @@ test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitu
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
     readFileFn: async (target) => target === wrapper ? "#!/bin/sh\n/Applications/Tailscale.app/Contents/MacOS/Tailscale\n" : "mach-o",
-    groupWriterUidsFn: async () => ({ uids: [0, 501, 502] }),
+    aclCheckFn: aclAbsent,
     expectedUid: 501,
   });
 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.offending_component, "/Applications");
-  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
+  assert.equal(resolution.trust_reason, "group_writable");
 });
 
 test("resolveCollectorBinary resolves symlinks before checking a world-writable target ancestor", async () => {
@@ -200,11 +239,13 @@ test("resolveCollectorBinary resolves symlinks before checking a world-writable 
     platform: "linux",
     realpathFn: async (candidate) => candidate === "/usr/bin/tmux" ? "/unsafe/tmux" : candidate,
     statFn: trustedStats("/unsafe/tmux", {
+      file: { ...regularExecutable(), uid: 1000 },
       ancestors: {
         "/unsafe": directory(0o40777, 1000),
       },
     }),
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 1000,
   });
 
@@ -218,13 +259,14 @@ test("resolveCollectorBinary treats an ancestor stat failure as untrusted_binary
     platform: "linux",
     realpathFn: async (candidate) => candidate,
     statFn: async (target) => {
-      if (target === "/usr/bin/tmux") return regularExecutable();
+      if (target === "/usr/bin/tmux") return { ...regularExecutable(), uid: 1000 };
       if (target === "/usr/bin") throw Object.assign(new Error("EIO"), { code: "EIO" });
       if (target === "/usr") return directory(0o40755, 0);
       if (target === "/") return directory(0o40755, 0);
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 1000,
   });
 
@@ -266,6 +308,7 @@ test("runResolvedExecFile invokes the resolved absolute path, never ambient PATH
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 0,
     execFileAsync: async (...args) => {
       calls.push(args);
@@ -286,13 +329,14 @@ test("runResolvedExecFile rechecks the resolved file identity immediately before
     platform: "linux",
     realpathFn: async (candidate) => candidate,
     statFn: async (candidate) => {
-      if (candidate === "/usr/bin/tmux") return { ...regularExecutable(), ino: statCount++ === 0 ? 2 : 99 };
+      if (candidate === "/usr/bin/tmux") return { ...regularExecutable(), uid: 1000, ino: statCount++ === 0 ? 2 : 99 };
       if (candidate === "/usr/bin") return directory(0o40755, 0);
       if (candidate === "/usr") return directory(0o40755, 0);
       if (candidate === "/") return directory(0o40755, 0);
       throw Object.assign(new Error("missing"), { code: "ENOENT" });
     },
     readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
     expectedUid: 1000,
     execFileAsync: async (...args) => {
       calls.push(args);

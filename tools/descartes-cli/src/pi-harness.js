@@ -46,11 +46,10 @@ export function createEvidenceTools(paths) {
   // collector" contract for derive_findings, which this registry now actually enforces).
   const evidenceRegistry = new Map();
   let collectorConfigPromise;
-  const writerMembershipCache = {};
   async function collectorOptions() {
     collectorConfigPromise ??= loadWatchConfig(paths).catch(() => ({}));
     const config = await collectorConfigPromise;
-    return { trustedBinaryPaths: config.trusted_binary_paths ?? [], writerMembershipCache };
+    return { trustedBinaryPaths: config.trusted_binary_paths ?? [] };
   }
   function registerEvidence(bundle) {
     if (bundle?.id) evidenceRegistry.set(bundle.id, bundle);

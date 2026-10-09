@@ -5,9 +5,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsyncDefault = promisify(execFile);
-const MACOS_GROUP_LOOKUP = "/usr/bin/dscl";
-const MACOS_UID_LOOKUP = "/usr/bin/id";
-const LINUX_GROUP_LOOKUP = "/usr/bin/getent";
+const MACOS_LS = "/bin/ls";
+const LINUX_XATTR_COMMANDS = ["/usr/bin/getfattr", "/bin/getfattr"];
 
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
 export const UNTRUSTED_BINARY = "untrusted_binary";
@@ -93,7 +92,7 @@ function missing(error) {
   return error?.code === "ENOENT" || error?.code === "ENOTDIR";
 }
 
-function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [], writerUids = [] }) {
+function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [] }) {
   return {
     status: UNTRUSTED_BINARY,
     path: undefined,
@@ -102,7 +101,6 @@ function trustFailure({ resolvedPath, component, reason, sameUidWritableComponen
     offending_component: component,
     trust_reason: reason,
     same_uid_writable_components: sameUidWritableComponents,
-    writer_uids: writerUids,
     operator_override_hint: "Review this absolute path and add it to trusted_binary_paths in watch.json only if the operator accepts the risk.",
   };
 }
@@ -110,45 +108,6 @@ function trustFailure({ resolvedPath, component, reason, sameUidWritableComponen
 function asUid(value) {
   const uid = Number(String(value).trim());
   return Number.isInteger(uid) && uid >= 0 ? uid : undefined;
-}
-
-function parseDsclGroupMembership(stdout) {
-  const line = String(stdout ?? "").split("\n").find((candidate) => /^GroupMembership:\s*/.test(candidate.trim()));
-  if (!line) return undefined;
-  return line.replace(/^\s*GroupMembership:\s*/, "").trim().split(/\s+/).filter(Boolean);
-}
-
-function parseDsclPrimaryGroupList(stdout, gid) {
-  return String(stdout ?? "").split("\n").flatMap((line) => {
-    const fields = line.trim().split(/\s+/);
-    return fields.length >= 2 && fields.at(-1) === String(gid) ? [fields[0]] : [];
-  });
-}
-
-function parseDsclGroupList(stdout, gid) {
-  const fields = String(stdout ?? "").split("\n").map((line) => line.trim().split(/\s+/));
-  return fields.find((parts) => parts.length >= 2 && parts.at(-1) === String(gid))?.[0];
-}
-
-function parseGetentGroup(stdout, gid) {
-  const line = String(stdout ?? "").split("\n").map((candidate) => candidate.trim())
-    .find((candidate) => candidate && candidate.split(":").length >= 4 && candidate.split(":")[2] === String(gid));
-  if (!line) return undefined;
-  const fields = line.split(":");
-  return { name: fields[0], members: fields[3] ? fields[3].split(",").filter(Boolean) : [] };
-}
-
-function parseGetentPasswd(stdout, names, gid) {
-  const wanted = new Set(names);
-  const uids = new Set();
-  for (const line of String(stdout ?? "").split("\n")) {
-    const fields = line.trim().split(":");
-    if (fields.length < 4) continue;
-    const uid = asUid(fields[2]);
-    const primaryGid = fields[3];
-    if (uid !== undefined && (wanted.has(fields[0]) || primaryGid === String(gid))) uids.add(uid);
-  }
-  return uids;
 }
 
 async function execLookup(execFileAsync, command, args) {
@@ -160,44 +119,36 @@ async function execLookup(execFileAsync, command, args) {
   }
 }
 
-async function loadGroupWriterUids(gid, { platform, cache = {}, execFileAsync = execFileAsyncDefault } = {}) {
-  const numericGid = asUid(gid);
-  if (numericGid === undefined) return { error: "group_id_unavailable" };
-  cache.groupWriterUids ??= new Map();
-  if (cache.groupWriterUids.has(numericGid)) return cache.groupWriterUids.get(numericGid);
+function normalizeAclStatus(result) {
+  const status = typeof result === "string" ? result : result?.status;
+  return status === "present" || status === "absent" ? status : "unknown";
+}
 
-  let result;
+function macOsAclStatus(stdout) {
+  const line = String(stdout ?? "").split("\n").find((candidate) => candidate.trim());
+  if (!line) return "unknown";
+  const mode = line.trim().split(/\s+/)[0];
+  if (!/^[bcdlps-][rwx-]{9}[+@]?$/.test(mode)) return "unknown";
+  return mode.endsWith("+") ? "present" : "absent";
+}
+
+async function detectAclStatus(component, { platform, execFileAsync = execFileAsyncDefault } = {}) {
   if (platform === "darwin") {
-    const groupList = await execLookup(execFileAsync, MACOS_GROUP_LOOKUP, [".", "-list", "/Groups", "PrimaryGroupID"]);
-    const groupName = groupList.error ? undefined : parseDsclGroupList(groupList.stdout, numericGid);
-    if (!groupName) result = { error: "group_membership_unresolvable" };
-    else {
-      const [membership, primaryUsers] = await Promise.all([
-        execLookup(execFileAsync, MACOS_GROUP_LOOKUP, [".", "-read", `/Groups/${groupName}`, "GroupMembership"]),
-        execLookup(execFileAsync, MACOS_GROUP_LOOKUP, [".", "-list", "/Users", "PrimaryGroupID"]),
-      ]);
-      const supplementaryNames = membership.error ? undefined : parseDsclGroupMembership(membership.stdout);
-      const primaryNames = primaryUsers.error ? undefined : parseDsclPrimaryGroupList(primaryUsers.stdout, numericGid);
-      if (!supplementaryNames || !primaryNames) result = { error: "group_membership_unresolvable" };
-      else {
-        const names = [...new Set([...supplementaryNames, ...primaryNames])];
-        const uidResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_UID_LOOKUP, ["-u", name])));
-        const uids = uidResults.map((entry) => entry.error ? undefined : asUid(entry.stdout)).filter((uid) => uid !== undefined);
-        result = uids.length === uidResults.length ? { uids } : { error: "group_membership_unresolvable" };
-      }
-    }
-  } else if (platform === "linux") {
-    const group = await execLookup(execFileAsync, LINUX_GROUP_LOOKUP, ["group", String(numericGid)]);
-    const parsedGroup = group.error ? undefined : parseGetentGroup(group.stdout, numericGid);
-    const passwd = await execLookup(execFileAsync, LINUX_GROUP_LOOKUP, ["passwd"]);
-    if (!parsedGroup || passwd.error) result = { error: "group_membership_unresolvable" };
-    else result = { uids: [...parseGetentPasswd(passwd.stdout, parsedGroup.members, numericGid)] };
-  } else {
-    result = { error: "group_membership_unresolvable" };
+    const result = await execLookup(execFileAsync, MACOS_LS, ["-led", component]);
+    return result.error ? "unknown" : macOsAclStatus(result.stdout);
   }
-
-  cache.groupWriterUids.set(numericGid, result);
-  return result;
+  if (platform === "linux") {
+    for (const command of LINUX_XATTR_COMMANDS) {
+      const result = await execLookup(execFileAsync, command, ["--only-values", "--name=system.posix_acl_access", "--absolute-names", component]);
+      if (!result.error) return "present";
+      if (result.error.code === "ENOENT") continue;
+      // getfattr uses exit status 1 for a missing xattr. Other failures mean that the
+      // filesystem's ACL state was not established and must not be trusted.
+      if (result.error.code === 1 || /no such attribute/i.test(String(result.error.stderr ?? ""))) return "absent";
+      return "unknown";
+    }
+  }
+  return "unknown";
 }
 
 async function inspectTrustedPath(resolvedPath, {
@@ -206,8 +157,8 @@ async function inspectTrustedPath(resolvedPath, {
   expectedUid,
   platform = process.platform,
   operatorTrusted = false,
-  groupWriterUidsFn = loadGroupWriterUids,
-  groupWriterCache = {},
+  aclCheckFn = detectAclStatus,
+  execFileAsync = execFileAsyncDefault,
 } = {}) {
   const fileResult = await safeStat(statFn, resolvedPath);
   if (!fileResult.stat) return trustFailure({ resolvedPath, component: resolvedPath, reason: "stat_failed" });
@@ -236,37 +187,22 @@ async function inspectTrustedPath(resolvedPath, {
     if (component !== resolvedPath && !result.stat.isDirectory?.()) {
       return trustFailure({ resolvedPath, component, reason: "not_directory", sameUidWritableComponents });
     }
+    const ownerUid = asUid(result.stat.uid);
+    if (ownerUid !== 0 && ownerUid !== expectedUid) {
+      return trustFailure({ resolvedPath, component, reason: "foreign_owner", sameUidWritableComponents });
+    }
     const mode = Number(result.stat.mode);
-    const ownerWritable = (mode & 0o200) !== 0;
-    const groupWritable = (mode & 0o020) !== 0;
-    const otherWritable = (mode & 0o002) !== 0;
-    const writerUids = [];
-    if (ownerWritable) {
-      const ownerUid = asUid(result.stat.uid);
-      if (ownerUid === undefined) return trustFailure({ resolvedPath, component, reason: "owner_unresolvable", sameUidWritableComponents });
-      writerUids.push(ownerUid);
+    if ((mode & 0o020) !== 0) {
+      return trustFailure({ resolvedPath, component, reason: "group_writable", sameUidWritableComponents });
     }
-    if (groupWritable) {
-      const groupResult = await groupWriterUidsFn(result.stat.gid, {
-        platform,
-        cache: groupWriterCache,
-      });
-      if (!groupResult || groupResult.error || !Array.isArray(groupResult.uids)) {
-        return trustFailure({ resolvedPath, component, reason: groupResult?.error ?? "group_membership_unresolvable", sameUidWritableComponents, writerUids });
-      }
-      writerUids.push(...groupResult.uids);
+    if ((mode & 0o002) !== 0) {
+      return trustFailure({ resolvedPath, component, reason: "other_writable", sameUidWritableComponents });
     }
-    const uniqueWriterUids = [...new Set(writerUids)];
-    if (otherWritable || uniqueWriterUids.some((uid) => uid !== 0 && uid !== expectedUid)) {
-      return trustFailure({
-        resolvedPath,
-        component,
-        reason: otherWritable ? "everyone_writable" : "writer_set_not_subset_allowed",
-        sameUidWritableComponents,
-        writerUids: uniqueWriterUids,
-      });
+    const aclStatus = normalizeAclStatus(await aclCheckFn(component, { platform, stat: result.stat, execFileAsync }));
+    if (aclStatus !== "absent") {
+      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents });
     }
-    if (ownerWritable && Number(result.stat.uid) === expectedUid) {
+    if ((mode & 0o200) !== 0 && ownerUid === expectedUid) {
       sameUidWritableComponents.push(component);
     }
   }
@@ -293,10 +229,10 @@ async function inspectTrustedPath(resolvedPath, {
 
 /**
  * Resolve a collector command without consulting PATH. Candidates are realpath-resolved and a
- * normal candidate is accepted only when the executable and every directory up to / has an
- * effective writer set contained in {root, daemon UID}. Owner/group write bits are expanded to
- * actual UIDs; world-write, unresolved membership, and shell wrappers fail closed. Same-UID owner
- * writability is intentionally accepted and recorded in same_uid_writable_components.
+ * normal candidate is accepted only when the executable and every directory up to / is owned by
+ * root or the daemon UID, has no group/other write bit, and has no extended ACL. ACL uncertainty,
+ * foreign ownership, and write bits fail closed. Same-UID owner writability is intentionally
+ * accepted and recorded in same_uid_writable_components.
  */
 export async function resolveCollectorBinary(binary, {
   platform = process.platform,
@@ -307,9 +243,8 @@ export async function resolveCollectorBinary(binary, {
   homeDir,
   username,
   readFileFn = defaultReadFile,
-  groupWriterUidsFn = loadGroupWriterUids,
-  groupWriterCache = {},
   execFileAsync = execFileAsyncDefault,
+  aclCheckFn = detectAclStatus,
 } = {}) {
   const name = String(binary ?? "");
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
@@ -335,9 +270,8 @@ export async function resolveCollectorBinary(binary, {
       expectedUid,
       platform,
       operatorTrusted,
-      groupWriterUidsFn,
-      groupWriterCache,
       execFileAsync,
+      aclCheckFn,
     });
     if (inspected.status === "resolved") {
       return { ...inspected, binary: name, candidates };
@@ -374,6 +308,7 @@ export function binaryProvenance(probe) {
     trust_verdict: binary?.trust_verdict,
     offending_component: binary?.offending_component,
     trust_reason: binary?.trust_reason,
+    operator_override_hint: binary?.operator_override_hint,
     same_uid_writable_components: binary?.same_uid_writable_components ?? [],
   };
 }

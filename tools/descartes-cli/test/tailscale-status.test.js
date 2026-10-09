@@ -35,7 +35,7 @@ function untrusted() {
       resolved_path: "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
       trust_verdict: "untrusted_binary",
       offending_component: "/Applications",
-      trust_reason: "writer_set_not_subset_allowed",
+      trust_reason: "group_writable",
     },
   };
 }
@@ -175,7 +175,7 @@ test("untrusted binary remains explicit with offending component, reason, and op
   assert.equal(envelope.status, "warning");
   assert.equal(envelope.review_hint, "untrusted_binary");
   assert.equal(envelope.result.binary_provenance.offending_component, "/Applications");
-  assert.equal(envelope.result.binary_provenance.trust_reason, "writer_set_not_subset_allowed");
+  assert.equal(envelope.result.binary_provenance.trust_reason, "group_writable");
   assert.match(envelope.result.operator_override_hint, /trusted_binary_paths/);
 });
 

@@ -430,7 +430,6 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   const collectorOptions = {
     ...options,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
-    writerMembershipCache: options.writerMembershipCache ?? {},
   };
   if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
   if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
@@ -971,12 +970,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  // Collector subprocesses receive only explicitly configured trusted paths plus a per-tick
-  // writer-membership cache. Keep this option threading when running the capacity migration;
-  // migration is orthogonal to binary trust and must not silently drop the collector policy.
+  // Collector subprocesses receive only explicitly configured trusted paths. Binary trust is
+  // intentionally local to each realpath/stat/ACL inspection; no group-membership cache exists.
   const collectorOptions = {
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
-    writerMembershipCache: {},
   };
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and

@@ -624,7 +624,6 @@ test("collectStructuralEvidence calls only enabled structural collectors in a st
 
 test("collectStructuralEvidence threads operator trust options through every resolver-backed collector", async () => {
   const trustedBinaryPaths = ["/opt/homebrew/bin/tmux"];
-  const writerMembershipCache = {};
   const seen = [];
   const capture = (name, id, tool) => async (options) => {
     seen.push({ name, options });
@@ -649,12 +648,11 @@ test("collectStructuralEvidence threads operator trust options through every res
     "vpn-peer-status": { enabled: true },
     "tailscale-status": { enabled: true },
     "process-lineage": { enabled: true },
-  } }, collectors, { trustedBinaryPaths, writerMembershipCache });
+  } }, collectors, { trustedBinaryPaths });
 
   assert.equal(seen.length, 8);
   for (const { options } of seen) {
     assert.deepEqual(options.trustedBinaryPaths, trustedBinaryPaths);
-    assert.equal(options.writerMembershipCache, writerMembershipCache);
   }
 });
 
