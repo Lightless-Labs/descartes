@@ -18,9 +18,11 @@ CLI path. The resolver follows
 symlinks, requires a regular executable, and checks the file plus every ancestor directory to `/`:
 only root or the daemon UID may own each component; other-write is rejected; ACL presence or ACL
 detection failure is rejected; and group-write is accepted only when the owning group's effective
-members, resolved from local sources, are a subset of `{root, daemon UID}`. macOS uses local `dscl`
-records and rejects nested or non-local groups; Linux parses `/etc/group` and `/etc/passwd` directly
-and rejects a `group:` nsswitch line that can consult directory services. Same-UID owner writability
+members, resolved from local sources, are a subset of `{root, daemon UID}`; on macOS, local users
+below UID 501 with no `AuthenticationAuthority` containing `ShadowHash` or `Kerberos` are accepted
+as non-authenticating system accounts and recorded in provenance. macOS uses local `dscl` records
+and rejects nested or non-local groups; Linux parses `/etc/group` and `/etc/passwd` directly and
+rejects a `group:` nsswitch line that can consult directory services. Same-UID owner writability
 is accepted within the current trust boundary but recorded as provenance. A failed check is
 `untrusted_binary`, is never executed, and leaves the source census incomplete. The immediate
 pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU

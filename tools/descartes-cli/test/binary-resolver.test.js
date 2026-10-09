@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   candidatePaths,
+  binaryProvenance,
   parseMacOsAclStatus,
   resolveCollectorBinary,
   runResolvedExecFile,
@@ -189,7 +190,7 @@ test("resolveCollectorBinary rejects an owner-writable executable owned by anoth
   assert.equal(resolution.trust_reason, "foreign_owner");
 });
 
-test("resolveCollectorBinary trusts a macOS group-writable Homebrew ancestor when the local group is root plus the daemon", async () => {
+test("resolveCollectorBinary trusts a macOS admin group containing root, a non-authenticating system account, and the daemon", async () => {
   const resolution = await resolveCollectorBinary("tmux", {
     platform: "darwin",
     realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
@@ -205,11 +206,12 @@ test("resolveCollectorBinary trusts a macOS group-writable Homebrew ancestor whe
     execFileAsync: async (command, args) => {
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nPrimaryGroupID: 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
-      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root UniqueID") return { stdout: "UniqueID: 0\n" };
-      if (args.join(" ") === ". -read /Users/thomas UniqueID") return { stdout: "UniqueID: 502\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root _mbsetupuser thomas\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root _mbsetupuser thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n_mbsetupuser 248\nthomas 20\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/_mbsetupuser AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 248\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 502,
@@ -217,6 +219,66 @@ test("resolveCollectorBinary trusts a macOS group-writable Homebrew ancestor whe
 
   assert.equal(resolution.status, "resolved", JSON.stringify(resolution));
   assert.equal(resolution.path, "/opt/homebrew/bin/tmux");
+  assert.deepEqual(resolution.accepted_system_accounts, [{ name: "_mbsetupuser", uid: 248 }]);
+  assert.deepEqual(binaryProvenance(resolution).accepted_system_accounts, [{ name: "_mbsetupuser", uid: 248 }]);
+});
+
+test("resolveCollectorBinary rejects a macOS uid-below-501 account with ShadowHash authentication", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser thomas\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root olduser thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/olduser AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 400\nAuthenticationAuthority: ;ShadowHash;\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.offending_component, "/opt/homebrew/bin");
+  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
+  assert.deepEqual(resolution.writer_uids, [0, 400, 502]);
+});
+
+test("resolveCollectorBinary rejects a macOS uid-at-or-above-501 extra user even without authentication authority", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
+      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\nNo such key: AuthenticationAuthority\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.offending_component, "/opt/homebrew/bin");
+  assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
+  assert.deepEqual(resolution.writer_uids, [0, 502, 503]);
 });
 
 test("resolveCollectorBinary rejects a macOS group-writable ancestor when the local group has another user", async () => {
@@ -237,9 +299,9 @@ test("resolveCollectorBinary rejects a macOS group-writable ancestor when the lo
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nPrimaryGroupID: 80\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root UniqueID") return { stdout: "UniqueID: 0\n" };
-      if (args.join(" ") === ". -read /Users/thomas UniqueID") return { stdout: "UniqueID: 502\n" };
-      if (args.join(" ") === ". -read /Users/other UniqueID") return { stdout: "UniqueID: 503\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\n" };
+      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 502,
@@ -395,9 +457,9 @@ test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitu
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root UniqueID") return { stdout: "UniqueID: 0\n" };
-      if (args.join(" ") === ". -read /Users/thomas UniqueID") return { stdout: "UniqueID: 501\n" };
-      if (args.join(" ") === ". -read /Users/other UniqueID") return { stdout: "UniqueID: 503\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 501\n" };
+      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 501,

@@ -4,24 +4,26 @@
 
 ## Group-aware collector binary trust — 2026-10-09
 
-Updated the binary resolver after `4c9cb40` to accept group-writable path components only when the
-effective owning-group UID set is a subset of `{root, daemon UID}`. macOS resolves group membership
-from local `dscl .` group/user records and rejects nested or non-local groups; Linux parses
-`/etc/group` and `/etc/passwd` directly and rejects any non-`files` group source in `nsswitch.conf`.
-ACL presence or detection failure remains untrusted, wrappers remain rejected unless explicitly
-operator-trusted, and `trusted_binary_paths` remains the unusual-setup override. Group membership
-is cached in one object shared by all resolver-backed collectors during each daemon tick.
+Updated the binary resolver after `4c9cb40` so macOS group-writable path components accept the
+effective local writer set when each principal is root, the daemon UID, or a local UID-below-501
+account whose `AuthenticationAuthority` contains neither `ShadowHash` nor `Kerberos`. Failed user
+lookups remain unverifiable and untrusted; accepted system accounts are carried in binary
+provenance. Linux remains strict and unchanged: it parses `/etc/group`, `/etc/passwd`, and a
+`files`-only `nsswitch.conf` group source. ACL presence or detection failure remains untrusted,
+wrappers remain rejected unless explicitly operator-trusted, and `trusted_binary_paths` remains the
+unusual-setup override. Group membership is cached in one object shared by resolver-backed
+collectors during each daemon tick.
 
 Host verification: `/usr/bin/dscl . -read /Groups/admin GroupMembership` returned
-`root _mbsetupuser thomas`; `/usr/bin/dscl . -list /Users PrimaryGroupID` returned no users with
-primary group 80. The local admin group therefore has writer UIDs `[0, 248, 502]`, so this host's
-`tmux` (`/opt/homebrew/Cellar/tmux/3.6a/bin/tmux`, offending `/opt/homebrew/Cellar`) and
-`tailscale` (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`, offending `/Applications`)
-both correctly resolve `untrusted_binary` with `writer_set_not_subset_allowed`; the conditional
-single-user `{root, current user}` case is covered by deterministic tests and resolves trusted.
+`root _mbsetupuser thomas`; `_mbsetupuser` returned `UniqueID: 248` and `No such key:
+AuthenticationAuthority`, while the daemon user is UID 502. The local admin writer UIDs are
+`[0, 248, 502]`. On this host, `resolveCollectorBinary('tmux')` is `trusted` at
+`/opt/homebrew/Cellar/tmux/3.6a/bin/tmux`, and `resolveCollectorBinary('tailscale')` is `trusted` at
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`; both record `{name: "_mbsetupuser", uid:
+248}` as an accepted system account.
 
-Focused resolver tests pass 24/24. Fresh-XDG host-access `npm test` passes **2358/2358, 0 failures,
-34 skipped, 2392 total**. No push or merge.
+Focused resolver tests pass 26/26. Fresh-XDG host-access `npm test` passes **2360/2360, 0 failures,
+34 skipped, 2394 total**. No push or merge.
 
 ## macOS ACL parser regression — 2026-10-09
 

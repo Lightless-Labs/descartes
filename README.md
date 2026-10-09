@@ -214,9 +214,9 @@ and checks the file plus every ancestor directory to `/`. A component is trusted
 not `root` or the daemon UID, it is other-writable, its ACL is present or cannot be proved absent,
 or a group-writable component's effective membership cannot be verified from local sources or
 includes another UID, because an unverified or foreign writer could replace the collector. macOS
-membership uses local `dscl` records and Linux membership uses `/etc/group`, `/etc/passwd`, and a
-local-only `nsswitch.conf` check, so a single-user Homebrew tree and `/Applications/Tailscale.app`
-work without configuration when their admin group contains only root and the daemon user. Same-UID
+membership uses local `dscl` records and permits root, the daemon UID, and local users below UID 501
+whose `AuthenticationAuthority` has neither `ShadowHash` nor `Kerberos`; Linux membership uses
+`/etc/group`, `/etc/passwd`, and a local-only `nsswitch.conf` check. Same-UID
 owner writability is inside Descartes' current trust boundary and is recorded in provenance. Shell
 wrappers are rejected unless explicitly operator-trusted, so a trusted wrapper can never authorize an
 untrusted downstream binary. An offending component, ACL uncertainty, stat failure, or binary

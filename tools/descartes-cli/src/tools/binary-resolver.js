@@ -96,7 +96,7 @@ function missing(error) {
   return error?.code === "ENOENT" || error?.code === "ENOTDIR";
 }
 
-function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [], writerUids = [] }) {
+function trustFailure({ resolvedPath, component, reason, sameUidWritableComponents = [], writerUids = [], acceptedSystemAccounts = [] }) {
   return {
     status: UNTRUSTED_BINARY,
     path: undefined,
@@ -106,6 +106,7 @@ function trustFailure({ resolvedPath, component, reason, sameUidWritableComponen
     trust_reason: reason,
     same_uid_writable_components: sameUidWritableComponents,
     writer_uids: writerUids,
+    accepted_system_accounts: acceptedSystemAccounts,
     operator_override_hint: "Review this absolute path and add it to trusted_binary_paths in watch.json only if the operator accepts the risk.",
   };
 }
@@ -120,6 +121,13 @@ function parseDsclAttribute(stdout, attribute) {
   const line = String(stdout ?? "").split(/\r?\n/).find((candidate) => candidate.trim().startsWith(prefix));
   if (!line) return undefined;
   return line.trim().slice(prefix.length).trim();
+}
+
+function parseDsclAttributes(stdout, attribute) {
+  const prefix = `${attribute}:`;
+  return String(stdout ?? "").split(/\r?\n/)
+    .filter((candidate) => candidate.trim().startsWith(prefix))
+    .map((candidate) => candidate.trim().slice(prefix.length).trim());
 }
 
 export function parseDsclGroupMembership(stdout) {
@@ -209,7 +217,7 @@ function hasNonLocalLinuxGroupSource(sources) {
 
 async function execLookup(execFileAsync, command, args) {
   try {
-    const result = await execFileAsync(command, args, { timeout: 2000, maxBuffer: 256 * 1024 });
+    const result = await execFileAsync(command, args, { timeout: 5000, maxBuffer: 256 * 1024 });
     return { stdout: result.stdout ?? "" };
   } catch (error) {
     return { error };
@@ -252,9 +260,29 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   const names = [...new Set([...supplementaryNames, ...primaryNames])];
   if (names.some((name) => !validLocalRecordName(name))) return unresolvedGroupMembership();
 
-  const uidResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "UniqueID"])));
-  const uids = uidResults.map((result) => result.error ? undefined : parseDsclUniqueId(result.stdout));
-  return uids.every((uid) => uid !== undefined) ? { uids } : unresolvedGroupMembership();
+  const userResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "AuthenticationAuthority", "UniqueID"])));
+  const principals = userResults.map((result, index) => {
+    if (result.error) return undefined;
+    const uid = parseDsclUniqueId(result.stdout);
+    if (uid === undefined) return undefined;
+    const authenticationAuthorities = parseDsclAttributes(result.stdout, "AuthenticationAuthority");
+    return {
+      name: names[index],
+      uid,
+      authentication_authorities: authenticationAuthorities,
+      authenticating: authenticationAuthorities.some((value) => /ShadowHash|Kerberos/i.test(value)),
+    };
+  });
+  if (principals.some((principal) => principal === undefined)) return unresolvedGroupMembership();
+
+  const acceptedSystemAccounts = principals
+    .filter((principal) => principal.uid > 0 && principal.uid < 501 && !principal.authenticating)
+    .map(({ name, uid }) => ({ name, uid }));
+  return {
+    uids: principals.map((principal) => principal.uid),
+    principals,
+    acceptedSystemAccounts,
+  };
 }
 
 async function loadLinuxGroupWriterUids(gid, { readLocalFileFn }) {
@@ -376,15 +404,16 @@ async function inspectTrustedPath(resolvedPath, {
 
   const components = [resolvedPath, ...ancestorPaths(resolvedPath)];
   const sameUidWritableComponents = [];
+  const acceptedSystemAccounts = [];
   for (const component of components) {
     const result = component === resolvedPath ? fileResult : await safeStat(statFn, component);
-    if (!result.stat) return trustFailure({ resolvedPath, component, reason: "stat_failed", sameUidWritableComponents });
+    if (!result.stat) return trustFailure({ resolvedPath, component, reason: "stat_failed", sameUidWritableComponents, acceptedSystemAccounts });
     if (component !== resolvedPath && !result.stat.isDirectory?.()) {
-      return trustFailure({ resolvedPath, component, reason: "not_directory", sameUidWritableComponents });
+      return trustFailure({ resolvedPath, component, reason: "not_directory", sameUidWritableComponents, acceptedSystemAccounts });
     }
     const ownerUid = asUid(result.stat.uid);
     if (ownerUid !== 0 && ownerUid !== expectedUid) {
-      return trustFailure({ resolvedPath, component, reason: "foreign_owner", sameUidWritableComponents });
+      return trustFailure({ resolvedPath, component, reason: "foreign_owner", sameUidWritableComponents, acceptedSystemAccounts });
     }
     const mode = Number(result.stat.mode);
     let writerUids = [];
@@ -396,20 +425,28 @@ async function inspectTrustedPath(resolvedPath, {
         readLocalFileFn,
       });
       if (!groupResult || groupResult.error || !Array.isArray(groupResult.uids)) {
-        return trustFailure({ resolvedPath, component, reason: groupResult?.error ?? "group_membership_unverifiable", sameUidWritableComponents, writerUids });
+        return trustFailure({ resolvedPath, component, reason: groupResult?.error ?? "group_membership_unverifiable", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
       }
       writerUids = [...new Set(groupResult.uids)];
-      const allowed = writerUids.every((uid) => uid === 0 || (expectedUid !== undefined && uid === expectedUid));
+      for (const account of groupResult.acceptedSystemAccounts ?? []) {
+        if (!acceptedSystemAccounts.some((existing) => existing.name === account.name && existing.uid === account.uid)) {
+          acceptedSystemAccounts.push(account);
+        }
+      }
+      const principals = groupResult.principals ?? writerUids.map((uid) => ({ uid }));
+      const allowed = principals.every((principal) => principal.uid === 0
+        || (expectedUid !== undefined && principal.uid === expectedUid)
+        || (platform === "darwin" && principal.uid > 0 && principal.uid < 501 && !principal.authenticating));
       if (!allowed) {
-        return trustFailure({ resolvedPath, component, reason: "writer_set_not_subset_allowed", sameUidWritableComponents, writerUids });
+        return trustFailure({ resolvedPath, component, reason: "writer_set_not_subset_allowed", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
       }
     }
     if ((mode & 0o002) !== 0) {
-      return trustFailure({ resolvedPath, component, reason: "other_writable", sameUidWritableComponents, writerUids });
+      return trustFailure({ resolvedPath, component, reason: "other_writable", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
     const aclStatus = normalizeAclStatus(await aclCheckFn(component, { platform, stat: result.stat, execFileAsync }));
     if (aclStatus !== "absent") {
-      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids });
+      return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
     if ((mode & 0o200) !== 0 && ownerUid === expectedUid) {
       sameUidWritableComponents.push(component);
@@ -420,10 +457,10 @@ async function inspectTrustedPath(resolvedPath, {
   try {
     contents = await readFileFn(resolvedPath, { encoding: "utf8" });
   } catch {
-    return trustFailure({ resolvedPath, component: resolvedPath, reason: "script_probe_failed", sameUidWritableComponents });
+    return trustFailure({ resolvedPath, component: resolvedPath, reason: "script_probe_failed", sameUidWritableComponents, acceptedSystemAccounts });
   }
   if (String(contents).startsWith("#!")) {
-    return trustFailure({ resolvedPath, component: resolvedPath, reason: "shell_wrapper_not_allowed", sameUidWritableComponents });
+    return trustFailure({ resolvedPath, component: resolvedPath, reason: "shell_wrapper_not_allowed", sameUidWritableComponents, acceptedSystemAccounts });
   }
 
   return {
@@ -432,6 +469,7 @@ async function inspectTrustedPath(resolvedPath, {
     resolved_path: resolvedPath,
     trust_verdict: "trusted",
     same_uid_writable_components: sameUidWritableComponents,
+    accepted_system_accounts: acceptedSystemAccounts,
     file_stat: fileResult.stat,
   };
 }
@@ -440,10 +478,12 @@ async function inspectTrustedPath(resolvedPath, {
  * Resolve a collector command without consulting PATH. Candidates are realpath-resolved and a
  * normal candidate is accepted only when the executable and every directory up to / is owned by
  * root or the daemon UID, has no other-write bit, has no extended ACL, and any group-writable
- * component's locally resolved effective member set is contained in {root, daemon UID}. Group
- * membership is read from local platform sources only and is cached for the caller's tick. ACL
- * uncertainty, foreign ownership, unresolved membership, and write bits fail closed. Same-UID
- * owner writability is intentionally accepted and recorded in same_uid_writable_components.
+ * component's locally resolved effective member set is contained in {root, daemon UID}. On macOS,
+ * local UID-below-501 accounts without ShadowHash/Kerberos AuthenticationAuthority are also
+ * accepted as non-authenticating system accounts and recorded in provenance. Group membership is
+ * read from local platform sources only and is cached for the caller's tick. ACL uncertainty,
+ * foreign ownership, unresolved membership, and write bits fail closed. Same-UID owner writability
+ * is intentionally accepted and recorded in same_uid_writable_components.
  */
 export async function resolveCollectorBinary(binary, {
   platform = process.platform,
@@ -527,6 +567,9 @@ export function binaryProvenance(probe) {
     trust_reason: binary?.trust_reason,
     ...(binary?.operator_override_hint ? { operator_override_hint: binary.operator_override_hint } : {}),
     same_uid_writable_components: binary?.same_uid_writable_components ?? [],
+    ...((binary?.accepted_system_accounts?.length ?? 0) > 0
+      ? { accepted_system_accounts: binary.accepted_system_accounts }
+      : {}),
   };
 }
 
