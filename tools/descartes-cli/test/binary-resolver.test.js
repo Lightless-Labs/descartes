@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   candidatePaths,
   binaryProvenance,
   detectAclStatus,
+  loadContentHashCache,
+  persistContentHashCache,
   parseMacOsAclStatus,
   resolveCollectorBinary,
+  resolveBinaryContentPinStorePaths,
   runResolvedExecFile,
 } from "../src/tools/binary-resolver.js";
 
@@ -255,10 +261,10 @@ test("resolveCollectorBinary trusts a macOS admin group containing root, a non-a
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root _mbsetupuser thomas\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root _mbsetupuser thomas\nNo such key: GroupMembers\nPrimaryGroupID: 80\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root _mbsetupuser thomas\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n_mbsetupuser 248\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
       if (args.join(" ") === ". -read /Users/_mbsetupuser AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 248\nNo such key: AuthenticationAuthority\n" };
       if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
@@ -285,7 +291,7 @@ test("resolveCollectorBinary rejects a partial macOS GroupMembership lookup even
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas attacker\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas attacker\nNo such key: GroupMembers\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") throw new Error("partial dscl attribute read");
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
@@ -309,10 +315,10 @@ test("resolveCollectorBinary rejects a macOS uid-below-501 account with ShadowHa
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser thomas\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser thomas\nNo such key: GroupMembers\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root olduser thomas\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
       if (args.join(" ") === ". -read /Users/olduser AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 400\nAuthenticationAuthority: ;ShadowHash;\n" };
       if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
@@ -324,6 +330,34 @@ test("resolveCollectorBinary rejects a macOS uid-below-501 account with ShadowHa
   assert.equal(resolution.offending_component, "/opt/homebrew/bin");
   assert.equal(resolution.trust_reason, "writer_set_not_subset_allowed");
   assert.deepEqual(resolution.writer_uids, [0, 400, 502]);
+});
+
+test("resolveCollectorBinary fails closed when UniqueID is returned without explicit AuthenticationAuthority evidence", async () => {
+  const resolution = await resolveCollectorBinary("tmux", {
+    platform: "darwin",
+    realpathFn: async (candidate) => candidate === "/opt/homebrew/bin/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: trustedStats("/opt/homebrew/bin/tmux", {
+      ancestors: { "/opt": directory(), "/opt/homebrew": directory(), "/opt/homebrew/bin": groupWritableDirectory(80) },
+    }),
+    readFileFn: readableBinary,
+    aclCheckFn: aclAbsent,
+    execFileAsync: async (command, args) => {
+      assert.equal(command, "/usr/bin/dscl");
+      if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
+      if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser thomas\nGroupMembers: \n" };
+      if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root olduser thomas\n" };
+      if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/olduser AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 400\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
+      throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
+    },
+    expectedUid: 502,
+  });
+
+  assert.equal(resolution.status, "untrusted_binary");
+  assert.equal(resolution.trust_reason, "group_membership_unverifiable");
 });
 
 test("resolveCollectorBinary rejects every low-UID macOS account authority except absent or DisabledUser", async () => {
@@ -340,10 +374,10 @@ test("resolveCollectorBinary rejects every low-UID macOS account authority excep
         assert.equal(command, "/usr/bin/dscl");
         if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
         if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-        if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser\n" };
+        if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root olduser\nNo such key: GroupMembers\n" };
         if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root olduser\n" };
         if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
-        if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
         if (args.join(" ") === ". -read /Users/olduser AuthenticationAuthority UniqueID") return { stdout: `UniqueID: 400\nAuthenticationAuthority: ${authority}\n` };
         throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
       },
@@ -368,10 +402,10 @@ test("resolveCollectorBinary accepts a low-UID macOS account disabled by Authent
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default /BSD/local\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root disabled\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root disabled\nNo such key: GroupMembers\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root disabled\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
       if (args.join(" ") === ". -read /Users/disabled AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 400\nAuthenticationAuthority: ;DisabledUser;\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
@@ -399,7 +433,7 @@ test("resolveCollectorBinary includes macOS GroupMembers GUIDs and rejects an ex
       if (args.join(" ") === ". -search /Users GeneratedUID GUID-ATTACKER") return { stdout: "attacker\t\tGeneratedUID = (\n    \"GUID-ATTACKER\"\n)\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
       if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
       if (args.join(" ") === ". -read /Users/attacker AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\nAuthenticationAuthority: ;ShadowHash;\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
@@ -446,10 +480,10 @@ test("resolveCollectorBinary rejects a macOS uid-at-or-above-501 extra user even
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nNo such key: GroupMembers\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
       if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nAuthenticationAuthority: ;ShadowHash;\n" };
       if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\nNo such key: AuthenticationAuthority\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
@@ -479,12 +513,12 @@ test("resolveCollectorBinary rejects a macOS group-writable ancestor when the lo
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nPrimaryGroupID: 80\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nNo such key: GroupMembers\nPrimaryGroupID: 80\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
-      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\n" };
-      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 502\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\nNo such key: AuthenticationAuthority\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 502,
@@ -510,7 +544,7 @@ test("resolveCollectorBinary rejects a macOS nested group as unverifiable", asyn
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nNestedGroups: nested-uuid\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nNo such key: GroupMembers\nNestedGroups: nested-uuid\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 502,
@@ -533,7 +567,7 @@ test("resolveCollectorBinary rejects a macOS non-local group node as unverifiabl
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /LDAPv3/example\nGroupMembership: root thomas\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /LDAPv3/example\nGroupMembership: root thomas\nNo such key: GroupMembers\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 502,
@@ -587,12 +621,12 @@ test("resolveCollectorBinary never accepts a trusted shell wrapper as a substitu
       assert.equal(command, "/usr/bin/dscl");
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
-      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\n" };
+      if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas other\nNo such key: GroupMembers\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas other\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
-      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
-      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 501\n" };
-      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\n" };
+      if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/thomas AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 501\nNo such key: AuthenticationAuthority\n" };
+      if (args.join(" ") === ". -read /Users/other AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 503\nNo such key: AuthenticationAuthority\n" };
       throw new Error(`unexpected dscl argv: ${args.join(" ")}`);
     },
     expectedUid: 501,
@@ -781,4 +815,85 @@ test("resolveCollectorBinary evaluates a brew-upgrade path with a new inode inde
   assert.match(first.content_hash, /^[0-9a-f]{64}$/);
   assert.notEqual(first.resolved_path, second.resolved_path);
   assert.notEqual(first.file_stat.ino, second.file_stat.ino);
+});
+
+test("resolveCollectorBinary refuses changed content when the same inode moves to another pinned path", async () => {
+  let activePath = "/pinned/one/tmux";
+  const contentHashCache = new Map();
+  const statFn = async (target) => {
+    if (target === "/pinned/one/tmux" || target === "/pinned/two/tmux") {
+      if (target !== activePath) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      return { ...regularExecutable(), uid: 0, dev: 7, ino: 11, size: 4, mtimeMs: 10 };
+    }
+    if (target === "/pinned/one" || target === "/pinned/two" || target === "/pinned") return directory();
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  };
+  const realpathFn = async (target) => {
+    if (target === activePath) return activePath;
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  };
+  const first = await resolveCollectorBinary("tmux", {
+    platform: "linux",
+    trustedBinaryPaths: ["/pinned/one/tmux", "/pinned/two/tmux"],
+    realpathFn,
+    statFn,
+    readFileFn: async () => Buffer.from(activePath === "/pinned/one/tmux" ? "good" : "evil"),
+    aclCheckFn: aclAbsent,
+    expectedUid: 0,
+    contentHashCache,
+  });
+  activePath = "/pinned/two/tmux";
+  const second = await resolveCollectorBinary("tmux", {
+    platform: "linux",
+    trustedBinaryPaths: ["/pinned/one/tmux", "/pinned/two/tmux"],
+    realpathFn,
+    statFn,
+    readFileFn: async () => Buffer.from("evil"),
+    aclCheckFn: aclAbsent,
+    expectedUid: 0,
+    contentHashCache,
+  });
+
+  assert.equal(first.status, "resolved", JSON.stringify(first));
+  assert.equal(second.status, "untrusted_binary");
+  assert.equal(second.trust_reason, "content_changed_in_place");
+  assert.equal(second.resolved_path, "/pinned/two/tmux");
+});
+
+test("content pins persist across daemon restarts and discard inodes no longer present", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-content-pins-"));
+  const paths = { stateDir: root };
+  const cache = new Map([
+    ["7:11", { size: 4, mtime: 10, sha256: "a".repeat(64) }],
+    ["7:12", { size: 4, mtime: 10, sha256: "b".repeat(64) }],
+  ]);
+  await persistContentHashCache(paths, cache);
+  const store = JSON.parse(await fs.readFile(resolveBinaryContentPinStorePaths(paths).file, "utf8"));
+  assert.deepEqual(store.pins["7:11"], { size: 4, mtime: 10, sha256: "a".repeat(64) });
+
+  const loaded = await loadContentHashCache(paths, {
+    platform: "linux",
+    trustedBinaryPaths: ["/pinned/tmux"],
+    binaries: ["tmux"],
+    realpathFn: async (candidate) => candidate === "/pinned/tmux" ? candidate : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+    statFn: async (target) => target === "/pinned/tmux"
+      ? { ...regularExecutable(), dev: 7, ino: 11 }
+      : (() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); })(),
+  });
+
+  assert.deepEqual(loaded.get("7:11"), { size: 4, mtime: 10, sha256: "a".repeat(64) });
+  assert.equal(loaded.has("7:12"), false);
+});
+
+test("content pin persistence is bounded", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-content-pins-"));
+  const cache = new Map(Array.from({ length: 300 }, (_, index) => [
+    `1:${index}`,
+    { size: 4, mtime: index, sha256: String(index).padStart(64, "0") },
+  ]));
+  await persistContentHashCache({ stateDir: root }, cache);
+  const store = JSON.parse(await fs.readFile(resolveBinaryContentPinStorePaths({ stateDir: root }).file, "utf8"));
+  assert.equal(Object.keys(store.pins).length, 256);
+  assert.equal(store.pins["1:0"], undefined);
+  assert.ok(store.pins["1:299"]);
 });
