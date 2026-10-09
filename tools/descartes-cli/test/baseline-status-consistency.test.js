@@ -15,9 +15,10 @@
 //     since its detector's anchor (factHistoryTrustworthy), a clear lockout, and passes the daemon's
 //     own per-rule eligibility predicate (ruleEligible) on a fresh read; and each not-watching gate
 //     (history_untrusted, cold_start_pending, history_horizon_short) is independently true;
-//   - freshness from the test's own record of the newest complete census it wrote: a watching rule
-//     has a fresh one, the census-stale gate fires only on a stale one, and EVERY rule carries the
-//     latest_census_stale reason exactly when it is stale;
+//   - freshness from the test's own record of the newest complete census it wrote: a watching census
+//     rule has a fresh one, and the census-stale gate fires only on a stale one;
+//   - every status gate reason is a reason implied by that rule's producer evaluation (the producer
+//     is the single readiness implementation, including overflow-vs-complete census semantics);
 //   - the per-rule keys partition each producer's top-level evaluatedAlertKeys (the daemon's coverage).
 //
 // Scenarios (seeded real-volume generator, small scale): a never-created store (fresh install, and a
@@ -182,6 +183,26 @@ function record(ruleId, gate) {
   coverage.gates.get(ruleId).add(gate);
 }
 
+function producerImpliedReasons(evaluation) {
+  const reasons = new Set();
+  if (evaluation?.gate === "latest_census_stale") reasons.add("latest_census_stale");
+  if (evaluation?.gate === "history_horizon_short") reasons.add("history_horizon_short");
+  if (typeof evaluation?.horizon_reason === "string") reasons.add(`seen_set_${evaluation.horizon_reason}`);
+  return reasons;
+}
+
+function assertStatusReasonsImpliedByProducer(statusRule, evaluation, label) {
+  const implied = producerImpliedReasons(evaluation);
+  const producerReasons = statusRule.reasons.filter((reason) => (
+    reason === "latest_census_stale"
+    || reason === "history_horizon_short"
+    || reason.startsWith("seen_set_")
+  ));
+  for (const reason of producerReasons) {
+    assert.ok(implied.has(reason), `${label}: status reason ${reason} is not implied by producer evaluation ${JSON.stringify(evaluation)}`);
+  }
+}
+
 // The property: status first (read-only), then the daemon's fast tick at the same instant.
 async function checkpoint(paths, rig, nowIso, label) {
   const status = await buildBaselineStatus(paths, { now: nowIso });
@@ -195,6 +216,7 @@ async function checkpoint(paths, rig, nowIso, label) {
     const detector = observed.get(producer)?.ruleEvaluations?.[ruleId];
     assert.ok(detector, `${label}: the daemon's ${producer} producer reported ${ruleId}`);
     const where = `${label} @ ${nowIso}: ${ruleId} (status: ${statusRule.phase}; detector gate: ${detector.gate})`;
+    assertStatusReasonsImpliedByProducer(statusRule, detector, where);
     assert.equal(statusRule.watching, detector.evaluable, `${where}: watching <=> the detector evaluates`);
     assert.equal(statusRule.phase === "watching", detector.evaluable, `${where}: the phase says watching exactly when it evaluates`);
     assert.deepEqual([...statusRule.evaluated_alert_keys].sort(), [...detector.evaluatedAlertKeys].sort(), `${where}: status's evaluated keys == the detector's`);
@@ -211,13 +233,10 @@ async function checkpoint(paths, rig, nowIso, label) {
     // complete census THIS TEST wrote for the family, against the daemon's 3 x structural interval.
     const lastComplete = rig.lastCompleteMs[family];
     const independentlyStale = lastComplete === undefined || !(nowMs - lastComplete <= rig.activeFreshnessMs);
-    // Every rule, census or not, carries latest_census_stale exactly when the census is stale (H1:
-    // the session/peer detectors have no freshness gate, so status must disclose it).
-    assert.equal(statusRule.reasons.includes("latest_census_stale"), independentlyStale, `${where}: latest_census_stale reason <=> the latest complete census is older than ${rig.activeFreshnessMs} ms (reasons ${statusRule.reasons})`);
-    if (independentlyStale) coverage.staleReason.add(ruleId);
     if (CENSUS_RULES.has(ruleId)) {
       if (statusRule.watching) assert.equal(independentlyStale, false, `${where}: a watching census rule has a fresh latest complete census`);
       if (detector.gate === "latest_census_stale") assert.equal(independentlyStale, true, `${where}: the census-stale gate fires only on a stale census`);
+      if (detector.gate === "latest_census_stale") coverage.staleReason.add(ruleId);
     }
     // The shared-predicate oracle (I11), both directions, on a fresh read of the same store and the
     // persisted detector state: "watching" => trusted since the anchor, lockout clear and the
@@ -467,8 +486,8 @@ test("T11: per rule, baseline status reads watching exactly when the daemon's de
   }
   // Not reached at this level: peer.count_drop's drop_history_not_ready (needs lockout-complete but
   // marker-incomplete peer ticks after a re-armed anchor over an established drop baseline).
-  // The stale-census reason was seen on every rule, and an incomplete latest census was exercised.
-  for (const ruleId of RULES.keys()) assert.ok(coverage.staleReason.has(ruleId), `${ruleId} carried the latest_census_stale reason on a stale census`);
+  // The stale-census reason was seen on every census-gated rule, and an incomplete latest census was exercised.
+  for (const ruleId of CENSUS_RULES) assert.ok(coverage.staleReason.has(ruleId), `${ruleId} carried the latest_census_stale reason on a stale census`);
   assert.ok(coverage.incompleteLatest > 0, "an incomplete latest census was exercised");
   // Zero entities still evaluate and still read watching (I11): this generator's session census is
   // always empty.

@@ -158,18 +158,6 @@ function hasIncompleteLatest(domain, groups) {
   return groups.length > 0 && !isComplete(domain, groups[groups.length - 1]);
 }
 
-// H1 (S6 review; I11 "a fresh complete latest group"): no complete census within the daemon's
-// freshness window (ACTIVE_FRESHNESS_MULTIPLE x the structural interval -- the same activeFreshnessMs
-// every census-dependent detector gates on), including a window with no complete census left at all.
-// A stale census stops every census-dependent rule and freezes its recovery coverage.
-function latestCompleteCensusStale(domain, groups, nowMs, activeFreshnessMs) {
-  if (groups.length === 0) return false;
-  const complete = completeGroups(domain, groups);
-  if (complete.length === 0) return true;
-  const latestMs = new Date(complete[complete.length - 1].ts).getTime();
-  return !(nowMs - latestMs <= activeFreshnessMs);
-}
-
 function stateReason(entry, groups) {
   const storeLossThisTick = Boolean(entry.missing || entry.corrupt);
   // A1 (watch-fabrication branch): a genuinely-read pending store carries its OWN recorded reason --
@@ -511,11 +499,11 @@ function horizonShortSinceOf(daemonRecord, ruleId, nowMs) {
 
 // The status reasons for one rule (fact-store capacity plan §4.4/§7 S6). Annotations only: the phase
 // comes from the detector's own gate; a reason never makes a rule "watching" or stops it.
-function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale, legacyPending }) {
+function ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, legacyPending }) {
   const reasons = [];
   if (absent) reasons.push("not_observed_no_store");
   if (absent && legacyPending) reasons.push("legacy_store_pending_migration");
-  if (!absent && (censusStale || ruleEvaluation?.gate === "latest_census_stale")) reasons.push("latest_census_stale");
+  if (!absent && ruleEvaluation?.gate === "latest_census_stale") reasons.push("latest_census_stale");
   if (ruleEvaluation?.gate === "history_horizon_short") {
     reasons.push("history_horizon_short");
   }
@@ -554,7 +542,6 @@ function buildDomainReports(inputs) {
     const familyBlock = familyStatusBlock({ family: definition.family, familyRead, nowMs: inputs.nowMs, budgets, structuralIntervalMs: inputs.structuralIntervalMs, daemonRecord: inputs.daemonRecord });
     families[definition.family] = familyBlock;
     const absent = storeAbsent(familyRead);
-    const censusStale = !absent && latestCompleteCensusStale(definition.domain, groups, inputs.nowMs, inputs.activeFreshnessMs);
     const rules = [];
     for (const run of runs) {
       const entry = run.entry ? { ...run.entry, domain: definition.domain } : undefined;
@@ -584,7 +571,7 @@ function buildDomainReports(inputs) {
           horizon_ms: RULE_HORIZONS.get(ruleId)?.horizonMs,
           ...(horizonShortSince ? { horizon_short_since_ts: horizonShortSince } : {}),
           reasons: [
-            ...ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, censusStale, legacyPending: inputs.legacy?.status === "pending_migration" }),
+            ...ruleReasons({ ruleEvaluation, absent, familyBlock, horizonShortSince, legacyPending: inputs.legacy?.status === "pending_migration" }),
             ...(rearming && ruleEvaluation?.gate === "cold_start_pending" ? ["lockout_rearming"] : []),
           ],
         });

@@ -36,6 +36,8 @@ import {
   PROCESS_LINEAGE_EDGE_CENSUS_FACT_NAME,
   PROCESS_LINEAGE_EDGE_CENSUS_MARKER_ENTITY_KEY,
   PROCESS_LINEAGE_EDGE_FACT_NAME,
+  SESSION_CENSUS_MARKER_ENTITY_KEY,
+  SESSION_OVERFLOW_ENTITY_KEY,
   SCHEDULED_JOB_CENSUS_FACT_NAME,
   SCHEDULED_JOB_CENSUS_MARKER_ENTITY_KEY,
   SCHEDULED_JOB_PRESENCE_FACT_NAME,
@@ -368,6 +370,65 @@ test("baseline status keeps rule coverage honest on overflow ticks", async () =>
   const peer = result.domains.find((domain) => domain.domain === "peer");
   assert.ok(session.watching_rules.includes(SESSION_CHURN_RULE_ID), "session churn still evaluates on a complete overflow tick");
   assert.ok(peer.watching_rules.includes(PEER_COUNT_SPIKE_RULE_ID), "peer spike still scores a capped overflow tick");
+});
+
+test("status uses the producer census gate for an overflow tick with a valid session churn pair", async () => {
+  const paths = await tempPaths();
+  await writeSessionBaselineStore(paths, A1_ESTABLISHED_STORE);
+
+  const churnEntityKey = "session.tmux.aaaaaaaaaaaaaaaa";
+  const points = [];
+  for (let hour = 0; hour < 30; hour += 1) points.push(...a1SessionTick(hour, 20));
+
+  // The prior churn observation is markerless, which the producer deliberately accepts as pair
+  // evidence, while baseline status must not count it as a complete census.
+  const priorChurnTs = a1Ts(30);
+  points.push({
+    ts: priorChurnTs,
+    fact_name: "session.presence",
+    entity_key: churnEntityKey,
+    attributes: { created_at_fingerprint: "1111111111111111" },
+  });
+
+  const freshOverflowTs = a1Ts(34);
+  points.push(
+    {
+      ts: freshOverflowTs,
+      fact_name: "session.presence",
+      entity_key: churnEntityKey,
+      attributes: { created_at_fingerprint: "2222222222222222" },
+    },
+    {
+      ts: freshOverflowTs,
+      fact_name: "session.presence",
+      entity_key: SESSION_OVERFLOW_ENTITY_KEY,
+      attributes: { overflow: "true" },
+    },
+    {
+      ts: freshOverflowTs,
+      fact_name: "session.presence",
+      entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
+      attributes: { census_state: "complete" },
+    },
+  );
+
+  const readFactPoints = stubFamilyRead(points, { status: "intact" });
+  const now = new Date(Date.parse(freshOverflowTs) + 30 * 60 * 1000).toISOString();
+  const producer = await computeSessionBaselineCandidates(paths, {
+    now,
+    readFactPoints,
+    writeSessionBaselineStore: async () => {},
+  });
+  const churnEvaluation = producer.ruleEvaluations[SESSION_CHURN_RULE_ID];
+  assert.equal(churnEvaluation.gate, "ok");
+  assert.ok(churnEvaluation.evaluatedAlertKeys.includes(alertId(SESSION_CHURN_RULE_ID, churnEntityKey)));
+
+  const status = await buildBaselineStatus(paths, { now, readFactPoints });
+  const session = status.domains.find((domain) => domain.domain === "session");
+  const churnRule = ruleOf(session, SESSION_CHURN_RULE_ID);
+  assert.equal(churnRule.gate, churnEvaluation.gate);
+  assert.equal(churnRule.watching, true);
+  assert.equal(churnRule.reasons.includes("latest_census_stale"), false);
 });
 
 test("baseline status uses the detector's markerless session-churn observation filter", async () => {
