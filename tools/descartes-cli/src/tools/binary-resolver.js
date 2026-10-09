@@ -423,7 +423,10 @@ async function presentContentPinIdentities({
       const real = await safeRealpath(realpathFn, candidate);
       if (!real.path) continue;
       const result = await safeStat(statFn, real.path);
-      if (result.stat && isRegularExecutable(result.stat)) {
+      // Retain a pin for any inode that is still present at a known candidate, even if a
+      // transient mode change makes it non-executable. Dropping it in that state would allow
+      // the same inode to be re-pinned after executability is restored.
+      if (result.stat) {
         const identity = contentIdentity(result.stat);
         if (identity) present.add(identity);
       }
