@@ -215,10 +215,20 @@ function parseDsclGroupMembers(stdout) {
 }
 
 function parseDsclSearchUser(stdout, guid) {
-  const matches = String(stdout ?? "").split(/\r?\n/).flatMap((line) => {
-    const match = /^(\S+)\s+GeneratedUID:\s*(\S+)\s*$/.exec(line.trim());
-    return match && match[2] === guid ? [match[1]] : [];
-  });
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  const matches = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    const compact = /^(\S+)\s+GeneratedUID:\s*(\S+)\s*$/.exec(line);
+    if (compact && compact[2] === guid) {
+      matches.push(compact[1]);
+      continue;
+    }
+    const multiline = /^(\S+)\s+GeneratedUID\s*=\s*\(\s*$/.exec(line);
+    if (!multiline) continue;
+    const quotedGuid = lines.slice(index + 1).map((candidate) => candidate.trim()).find((candidate) => /^"[^"]+"$/.test(candidate));
+    if (quotedGuid === `"${guid}"`) matches.push(multiline[1]);
+  }
   return matches.length === 1 && validLocalRecordName(matches[0]) ? matches[0] : undefined;
 }
 

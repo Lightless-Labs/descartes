@@ -372,7 +372,7 @@ test("resolveCollectorBinary includes macOS GroupMembers GUIDs and rejects an ex
       if (args.join(" ") === "/Search -read / CSPSearchPath") return { stdout: "CSPSearchPath: /Local/Default\n" };
       if (args.join(" ") === ". -list /Groups PrimaryGroupID") return { stdout: "admin 80\n" };
       if (args.join(" ") === ". -read /Groups/admin") return { stdout: "AppleMetaNodeLocation: /Local/Default\nGroupMembership: root thomas\nGroupMembers: GUID-ATTACKER\n" };
-      if (args.join(" ") === ". -search /Users GeneratedUID GUID-ATTACKER") return { stdout: "attacker GeneratedUID: GUID-ATTACKER\n" };
+      if (args.join(" ") === ". -search /Users GeneratedUID GUID-ATTACKER") return { stdout: "attacker\t\tGeneratedUID = (\n    \"GUID-ATTACKER\"\n)\n" };
       if (args.join(" ") === ". -read /Groups/admin GroupMembership") return { stdout: "GroupMembership: root thomas\n" };
       if (args.join(" ") === ". -list /Users PrimaryGroupID") return { stdout: "root 0\nthomas 20\n" };
       if (args.join(" ") === ". -read /Users/root AuthenticationAuthority UniqueID") return { stdout: "UniqueID: 0\n" };
