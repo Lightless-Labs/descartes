@@ -778,6 +778,7 @@ test("resolveCollectorBinary evaluates a brew-upgrade path with a new inode inde
 
   assert.equal(first.status, "resolved", JSON.stringify(first));
   assert.equal(second.status, "resolved", JSON.stringify(second));
+  assert.match(first.content_hash, /^[0-9a-f]{64}$/);
   assert.notEqual(first.resolved_path, second.resolved_path);
   assert.notEqual(first.file_stat.ino, second.file_stat.ino);
 });

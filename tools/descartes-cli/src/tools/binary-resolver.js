@@ -617,6 +617,7 @@ export function binaryProvenance(probe) {
     offending_component: binary?.offending_component,
     trust_reason: binary?.trust_reason,
     ...(binary?.operator_override_hint ? { operator_override_hint: binary.operator_override_hint } : {}),
+    ...(typeof binary?.content_hash === "string" ? { content_hash: binary.content_hash } : {}),
     same_uid_writable_components: binary?.same_uid_writable_components ?? [],
     ...((binary?.accepted_system_accounts?.length ?? 0) > 0
       ? { accepted_system_accounts: binary.accepted_system_accounts }
