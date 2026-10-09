@@ -124,6 +124,7 @@ test("confirmed incidents are retained and a 257th identity enters a one-notific
   assert.equal(Object.keys(overflow.alerts[0].incidents).length, 256);
   assert.equal(overflow.alerts[0].incidents["identity-0"].confirmed_at !== null, true);
   assert.deepEqual(overflow.notification_due_incidents.map((entry) => entry.incident_key), ["__incident_storm__"]);
+  assert.deepEqual(overflow.adjudication_due_incidents, [], "incident storm suppresses every per-incident adjudication");
   await writeAlertRecords(paths, overflow.alerts);
   const delivered = [];
   await emitSessionAlertSignals(paths, overflow, {

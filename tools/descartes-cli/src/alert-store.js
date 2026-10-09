@@ -665,7 +665,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       }
       const sameNegativeAdjudication = next.incidents[key].adjudication?.notify === false
         && next.incidents[key].adjudication?.severity === next.incidents[key].severity_max;
-      if (!legacySuppressed && !sameNegativeAdjudication && (newIncident || severityEscalated || dueForAlert.some((entry) => entry.incident_key === key))) {
+      if (next.incident_state !== "incident_storm" && !legacySuppressed && !sameNegativeAdjudication && (newIncident || severityEscalated || dueForAlert.some((entry) => entry.incident_key === key))) {
         adjudicationForAlert.push({ alert_id: id, incident_key: key });
       }
     }
@@ -689,6 +689,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       next.incident_key_overflow = true;
       next.incident_storm_count = Math.max(next.incident_storm_count ?? 0, Object.keys(next.incidents).length + overflowCount);
       dueForAlert.length = 0;
+      adjudicationForAlert.length = 0;
       if (!next.incident_storm_notified_at && !["acknowledged", "suppressed"].includes(next.status) && !next.legacy_without_episode
         && deliveryBackoffEligible(next, new Date(now).getTime())) {
         dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
