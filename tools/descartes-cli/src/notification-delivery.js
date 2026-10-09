@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -11,9 +10,11 @@ const execFileAsync = promisify(execFile);
 export const NOTIFICATION_CHANNELS = new Set(["cli", "macos-desktop", "macos-native", "linux-desktop", "syslog"]);
 
 export function resolveNotificationDeliveryPaths(descartesPaths) {
+  const alertsDir = path.join(descartesPaths.stateDir, "alerts");
   return {
     configFile: path.join(descartesPaths.configDir, "notifications.json"),
-    auditFile: path.join(descartesPaths.stateDir, "alerts", "notification-delivery.jsonl"),
+    auditDir: alertsDir,
+    auditFile: path.join(alertsDir, "notification-delivery.jsonl"),
   };
 }
 
@@ -241,116 +242,128 @@ function commandForPayload(channel, payload, options = {}) {
 }
 
 export const MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS = 1000;
-const deliveryAuditCache = new Map();
+// The old row-count rotation constant remains exported for source compatibility only. Delivery
+// audit retention is now segment-based, never row-count-based.
+export const DEFAULT_NOTIFICATION_DELIVERY_AUDIT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 function parseAuditRecords(contents) {
-  return contents.split("\n").filter(Boolean).map((line) => {
+  return contents.split("\n").filter((line) => line.trim()).map((line) => {
     try { return JSON.parse(line); } catch { return undefined; }
   }).filter(Boolean);
 }
 
-function sameFailureRecord(previous, record) {
-  const failure = ["error", "unavailable", "disabled"].includes(record.status);
-  return failure && previous && previous.status === record.status
-    && previous.channel === record.channel
-    && previous.reason === record.reason
-    && JSON.stringify(previous.payload ?? {}) === JSON.stringify(record.payload ?? {});
+function utcDay(ts) {
+  return normalizeIso(ts, "audit timestamp").slice(0, 10);
 }
 
-function compactAuditRecords(records, ts) {
-  if (records.length <= MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS && records[0]?.status !== "summary") return records;
-  const hasSummary = records[0]?.status === "summary";
-  const previousSummary = hasSummary ? records[0] : undefined;
-  const rawRecords = hasSummary ? records.slice(1) : records;
-  const dropCount = Math.max(0, rawRecords.length - (MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS - 1));
-  const dropped = rawRecords.slice(0, dropCount);
-  return [{
-    ts,
-    status: "summary",
-    reason: "audit_rotation",
-    dropped_count: (previousSummary?.dropped_count ?? 0) + dropped.length,
-    first_dropped_ts: dropped[0]?.ts,
-    last_dropped_ts: dropped.at(-1)?.last_ts ?? dropped.at(-1)?.ts,
-  }, ...rawRecords.slice(dropCount)];
+function previousUtcDay(day) {
+  return new Date(Date.parse(`${day}T00:00:00.000Z`) - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
-async function appendDeliveryAudit(descartesPaths, record, options = {}) {
-  const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  await ensureParent(auditFile);
-  // The daemon and `alerts notifications test` are legitimate independent writers. Refresh the
-  // snapshot for every append so a process-local cache can never rotate a stale view over rows
-  // appended by the other process.
-  let records = [];
-  try {
-    records = parseAuditRecords(await fs.readFile(auditFile, "utf8"));
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  deliveryAuditCache.set(auditFile, records);
-  const previous = records.at(-1);
-  const sameFailure = sameFailureRecord(previous, record);
-  const next = sameFailure
-    ? { ...previous, last_ts: record.ts, repeat_count: (previous.repeat_count ?? 1) + 1 }
-    : record;
-  const prospective = sameFailure ? [...records.slice(0, -1), next] : [...records, next];
-  const needsRotation = sameFailure || prospective.length > MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS || prospective[0]?.status === "summary";
-  if (!needsRotation) {
-    deliveryAuditCache.set(auditFile, prospective);
-    if (!sameFailure) await fs.appendFile(auditFile, `${JSON.stringify(next)}\n`, { mode: 0o600 });
-    return next;
-  }
-
-  // Rotation boundary: let appenders that already opened the current path finish on this inode,
-  // while appenders that open the path afterward get a fresh file. Never rewrite the current path
-  // from the stale pre-rename snapshot.
-  if (!sameFailure) await options.beforeAuditRotation?.({ auditFile });
-  const archiveFile = `${auditFile}.${process.pid}.${crypto.randomUUID()}.archive`;
-  try {
-    await fs.rename(auditFile, archiveFile);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  let archivedRecords = [];
-  try {
-    archivedRecords = parseAuditRecords(await fs.readFile(archiveFile, "utf8"));
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  const archivedPrevious = archivedRecords.at(-1);
-  const archivedSameFailure = sameFailureRecord(archivedPrevious, record);
-  const archivedNext = archivedSameFailure
-    ? { ...archivedPrevious, last_ts: record.ts, repeat_count: (archivedPrevious.repeat_count ?? 1) + 1 }
-    : record;
-  const compacted = compactAuditRecords(
-    archivedSameFailure ? [...archivedRecords.slice(0, -1), archivedNext] : [...archivedRecords, archivedNext],
-    record.ts,
-  );
-  // Append the compacted result instead of replacing the path: a new writer may have created a
-  // fresh current file while the old inode was being compacted, and its rows must survive too.
-  await fs.appendFile(auditFile, `${compacted.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
-  try { await fs.unlink(archiveFile); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-  deliveryAuditCache.set(auditFile, compacted);
-  return archivedNext;
+function datedSegmentFile(auditDir, day) {
+  return path.join(auditDir, `notification-delivery-${day}.jsonl`);
 }
 
-export async function readNotificationDeliveryAudit(descartesPaths) {
-  const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  let contents;
+function isDatedSegment(name) {
+  return /^notification-delivery-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name);
+}
+
+function isOrphanArchive(name) {
+  return /^notification-delivery\.jsonl\..+\.archive$/.test(name);
+}
+
+async function readAuditFile(file) {
   try {
-    contents = await fs.readFile(auditFile, "utf8");
+    return parseAuditRecords(await fs.readFile(file, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const records = [];
-  for (const line of contents.split("\n")) {
-    if (!line.trim()) continue;
+}
+
+async function auditFilesInReadOrder(descartesPaths) {
+  const { auditDir, auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  let entries;
+  try {
+    entries = await fs.readdir(auditDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const names = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+  const files = names.has(path.basename(auditFile)) ? [auditFile] : [];
+  const archives = entries.filter((entry) => entry.isFile() && isOrphanArchive(entry.name)).map((entry) => entry.name).sort();
+  files.push(...archives.map((name) => path.join(auditDir, name)));
+  files.push(...entries.filter((entry) => entry.isFile() && isDatedSegment(entry.name)).map((entry) => entry.name).sort().map((name) => path.join(auditDir, name)));
+  return files;
+}
+
+async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {}) {
+  const { auditDir, auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const retentionMs = Number.isFinite(options.retentionMs) && options.retentionMs >= 0
+    ? options.retentionMs
+    : DEFAULT_NOTIFICATION_DELIVERY_AUDIT_RETENTION_MS;
+  const nowDay = utcDay(now);
+  const protectedDays = new Set([nowDay, previousUtcDay(nowDay)]);
+  const cutoffMs = new Date(now).getTime() - retentionMs;
+  let entries;
+  try {
+    entries = await fs.readdir(auditDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || path.join(auditDir, entry.name) === auditFile) continue;
+    const segmentMatch = /^notification-delivery-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(entry.name);
+    const archive = isOrphanArchive(entry.name);
+    if (!segmentMatch && !archive) continue;
+    const file = path.join(auditDir, entry.name);
+    let records = [];
     try {
-      records.push(JSON.parse(line));
-    } catch {
-      // Ignore corrupt local audit lines rather than breaking alert delivery.
+      records = await readAuditFile(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    const timestamps = records.map((record) => Date.parse(record.ts)).filter(Number.isFinite);
+    let fileNewestMs;
+    if (timestamps.length > 0) {
+      fileNewestMs = Math.max(...timestamps);
+    } else {
+      try {
+        fileNewestMs = (await fs.stat(file)).mtimeMs;
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        throw error;
+      }
+    }
+    const datedDay = segmentMatch?.[1];
+    const protectedByDay = datedDay ? protectedDays.has(datedDay) : timestamps.some((ts) => protectedDays.has(new Date(ts).toISOString().slice(0, 10)));
+    // Delete only a whole file whose newest evidence is outside retention. Current and previous
+    // UTC-day segments are always protected, even with a zero-day test/operator retention value.
+    if (!protectedByDay && fileNewestMs < cutoffMs) {
+      try { await fs.unlink(file); } catch (error) { if (error?.code !== "ENOENT") throw error; }
     }
   }
+}
+
+async function appendDeliveryAudit(descartesPaths, record, options = {}) {
+  const { auditDir } = resolveNotificationDeliveryPaths(descartesPaths);
+  const segmentFile = datedSegmentFile(auditDir, utcDay(record.ts));
+  await ensureParent(segmentFile);
+  // fs.appendFile opens and closes this dated segment for every row. There is no shared descriptor,
+  // inode rename, read/modify/write, compaction, or replacement window for a concurrent writer.
+  await fs.appendFile(segmentFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  await options.beforeAuditRetention?.({ segmentFile, auditDir, now: record.ts });
+  await pruneNotificationDeliveryAudit(descartesPaths, record.ts, options);
+  return record;
+}
+
+export async function readNotificationDeliveryAudit(descartesPaths) {
+  const files = await auditFilesInReadOrder(descartesPaths);
+  const records = [];
+  for (const file of files) records.push(...await readAuditFile(file));
   return records;
 }
 
