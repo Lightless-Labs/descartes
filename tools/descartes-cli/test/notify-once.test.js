@@ -151,7 +151,7 @@ test("a lost confirmation write causes redelivery, never silence", async () => {
   assert.deepEqual(replay.notification_due_incidents.map((entry) => entry.incident_key), ["identity-a"]);
 });
 
-test("a legacy active record without episode metadata is not notified", () => {
+test("legacy_without_episode suppresses only the upgrade episode and clears before a fresh incident", () => {
   const legacy = {
     id: "alert_legacy_no_episode",
     rule_id: "system.memory.sustained_high",
@@ -161,8 +161,17 @@ test("a legacy active record without episode metadata is not notified", () => {
     first_seen: "2026-10-01T00:00:00.000Z",
     last_seen: "2026-10-01T00:00:00.000Z",
   };
-  const result = applyAlertCandidates([legacy], [{ ...legacy, incident_key: "default" }], { now: "2026-10-06T00:00:00.000Z" });
-  assert.deepEqual(result.notification_due_incidents, []);
+  const upgraded = applyAlertCandidates([legacy], [{ ...legacy, incident_key: "default" }], { now: "2026-10-06T00:00:00.000Z" });
+  assert.deepEqual(upgraded.notification_due_incidents, []);
+  assert.equal(upgraded.alerts[0].legacy_without_episode, true);
+
+  const recovered = applyAlertCandidates(upgraded.alerts, [], { now: "2026-10-06T00:01:00.000Z" });
+  assert.equal(recovered.alerts[0].status, "recovered");
+  assert.equal(recovered.alerts[0].legacy_without_episode, false);
+
+  const fresh = applyAlertCandidates(recovered.alerts, [{ ...legacy, incident_key: "default" }], { now: "2026-10-06T00:02:00.000Z" });
+  assert.deepEqual(fresh.notification_due_incidents, [{ alert_id: "alert_legacy_no_episode", incident_key: "default" }]);
+  assert.equal(fresh.alerts[0].legacy_without_episode, false);
 });
 
 test("a stale second evaluation cannot deliver an already-confirmed notification", async () => {

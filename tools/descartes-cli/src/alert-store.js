@@ -713,6 +713,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         ...alert,
         status: "recovered",
         last_seen: now,
+        legacy_without_episode: false,
         incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, { ...incident, status: "recovered" }])),
       }));
     }
