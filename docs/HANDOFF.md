@@ -2,6 +2,22 @@
 
 **Last updated:** 2026-10-09
 
+## Daybreak rework — 2026-10-09
+
+Fixed the current daybreak-blue findings on `fix/collector-sources-2026-10` in five local atomic
+commits, with no push or merge: `77b3834` (Linux ACL absence requires ENODATA or an explicit
+"No such attribute" result, including directory default ACL probes), `139d083` (Linux trust checks
+`passwd`, `group`, and inherited/explicit `initgroups`, allowing only `files`/`systemd` with default
+actions and the safe missing-nsswitch fallback), `4aac4fd` (macOS low-UID authentication-authority
+allowlist, local-only search policy, and GroupMembers GUID resolution), `e467ed9` (exact emitted v1
+session signatures and legacy churn freeze), and `a0e0a4f` (real multiline `dscl -search` GUID output).
+
+Focused resolver tests pass 39/39 and session-baseline tests pass 80/80. Full fresh-XDG host-access
+`npm test` passes **2374/2374, 0 failures, 34 skipped, 2408 total**; the skips are the existing
+platform-gated `verify-install.sh` tests. Live host verification after the GUID parser fix reports
+both `tmux` and `tailscale` as `resolved/trusted`; both use the local-only `CSPSearchPath:
+/Local/Default`, and both resolve the admin GUID set including accepted `_mbsetupuser` UID 248.
+
 ## Group-aware collector binary trust — 2026-10-09
 
 Updated the binary resolver after `4c9cb40` so macOS group-writable path components accept the
