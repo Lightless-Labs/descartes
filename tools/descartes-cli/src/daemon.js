@@ -73,6 +73,7 @@ import { collectSystemEvidence } from "./tools/system.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
+import { KNOWN_COLLECTOR_BINARIES, loadContentHashCache, persistContentHashCache } from "./tools/binary-resolver.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -975,9 +976,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   };
 
   // Collector subprocesses receive only explicitly configured trusted paths. Binary content
-  // hashes are retained by the resolver so an in-place rewrite of a trusted inode is refused.
+  // hashes are retained by the resolver so an in-place rewrite of a trusted inode is refused,
+  // including after a daemon restart or a move to another pinned path.
+  const contentHashCache = options.contentHashCache ?? await loadContentHashCache(descartesPaths, {
+    trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+    binaries: KNOWN_COLLECTOR_BINARIES,
+  });
   const collectorOptions = {
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
+    contentHashCache,
   };
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and
@@ -1932,6 +1939,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     : delivered?.metricAlertFallback
       ?? (alertIntelligenceConfig?.enabled && options.deliverMetricAlertFallback !== false ? { fired: [], skipped: "intelligence_enabled" } : undefined);
   const alertIntelligence = delivered?.alertIntelligence;
+  try {
+    await (options.persistContentHashCache ?? persistContentHashCache)(descartesPaths, contentHashCache);
+  } catch (error) {
+    console.warn(`[daemon] binary content-pin persistence failed (${error instanceof Error ? error.message : String(error)}); current-tick pins remain in memory only`);
+  }
   return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 

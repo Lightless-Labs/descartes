@@ -1,4 +1,11 @@
-import { readFile as defaultReadFile, realpath as defaultRealpath, stat as defaultStat } from "node:fs/promises";
+import {
+  mkdir as defaultMkdir,
+  readFile as defaultReadFile,
+  realpath as defaultRealpath,
+  rename as defaultRename,
+  stat as defaultStat,
+  writeFile as defaultWriteFile,
+} from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +21,17 @@ const LINUX_ACL_ATTRIBUTES = ["system.posix_acl_access", "system.posix_acl_defau
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
 export const UNTRUSTED_BINARY = "untrusted_binary";
 
-const DEFAULT_CONTENT_HASH_CACHE = new Map();
+export const MAX_CONTENT_PIN_ENTRIES = 256;
+export const CONTENT_PIN_SCHEMA_VERSION = 1;
+export const CONTENT_PIN_STORE_NAME = "binary-content-pins.json";
+
+export const KNOWN_COLLECTOR_BINARIES = Object.freeze([
+  "VBoxManage", "codesign", "colima", "container", "crontab", "df", "docker", "id", "incus",
+  "ip", "journalctl", "launchctl", "limactl", "log", "lsof", "lxc", "multipass", "netstat",
+  "ntpq", "plutil", "podman", "prlctl", "ps", "qm", "route", "scutil", "screen",
+  "sntp", "spctl", "ss", "sestatus", "sysctl", "systemctl", "systemsetup", "tail", "tart",
+  "tailscale", "timedatectl", "tmux", "virsh", "vmrun", "wg", "who", "xl",
+]);
 
 const COMMON_BINARY_DIRECTORIES = Object.freeze([
   "/usr/bin",
@@ -124,6 +141,18 @@ function parseDsclAttribute(stdout, attribute) {
   return line.trim().slice(prefix.length).trim();
 }
 
+function dsclAttributeEvidence(stdout, attribute) {
+  const lines = String(stdout ?? "").split(/\r?\n/).map((line) => line.trim());
+  const prefix = `${attribute}:`;
+  const valueLine = lines.find((line) => line.startsWith(prefix));
+  const explicitAbsent = lines.some((line) => line === `No such key: ${attribute}`);
+  return {
+    present: valueLine !== undefined,
+    explicitAbsent,
+    value: valueLine === undefined ? undefined : valueLine.slice(prefix.length).trim(),
+  };
+}
+
 function parseDsclAttributes(stdout, attribute) {
   const prefix = `${attribute}:`;
   return String(stdout ?? "").split(/\r?\n/)
@@ -132,12 +161,15 @@ function parseDsclAttributes(stdout, attribute) {
 }
 
 export function parseDsclGroupMembership(stdout) {
-  const value = parseDsclAttribute(stdout, "GroupMembership");
-  return value === undefined ? undefined : value.split(/\s+/).filter(Boolean);
+  const evidence = dsclAttributeEvidence(stdout, "GroupMembership");
+  if (evidence.present) return evidence.value.split(/\s+/).filter(Boolean);
+  return evidence.explicitAbsent ? [] : undefined;
 }
 
 export function parseDsclPrimaryGroupList(stdout, gid) {
   const lines = String(stdout ?? "").split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length === 0) return undefined;
+  if (lines.every((line) => line.trim() === "No such key: PrimaryGroupID")) return undefined;
   if (lines.some((line) => {
     const fields = line.trim().split(/\s+/);
     return fields.length < 2 || !/^-?\d+$/.test(fields.at(-1));
@@ -162,7 +194,7 @@ export function parseDsclGroupList(stdout, gid) {
 }
 
 function parseDsclUniqueId(stdout) {
-  return asUid(parseDsclAttribute(stdout, "UniqueID") ?? String(stdout ?? "").trim());
+  return asUid(dsclAttributeEvidence(stdout, "UniqueID").value);
 }
 
 function parseMacOsNode(stdout) {
@@ -206,8 +238,9 @@ function validLocalRecordName(name) {
 }
 
 function parseDsclGroupMembers(stdout) {
-  const value = parseDsclAttribute(stdout, "GroupMembers");
-  return value === undefined ? [] : value.split(/\s+/).filter(Boolean);
+  const evidence = dsclAttributeEvidence(stdout, "GroupMembers");
+  if (evidence.present) return evidence.value.split(/\s+/).filter(Boolean);
+  return evidence.explicitAbsent ? [] : undefined;
 }
 
 function parseDsclSearchUser(stdout, guid) {
@@ -264,8 +297,9 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   }
   const fullMembership = parseDsclGroupMembership(fullRecord.stdout);
   if (!fullMembership) return unresolvedGroupMembership();
-  // ACCEPTED RESIDUAL: a process that held the admin group's GID before being removed from the group retains write access until it exits; on a single-user Mac this requires a previously-admin principal; multi-admin or directory-bound Macs fail closed.
+  // ACCEPTED RESIDUAL: a former member of any accepted component group can retain that group's GID in processes started before removal; multi-admin or directory-bound Macs fail closed.
   const groupGuids = parseDsclGroupMembers(fullRecord.stdout);
+  if (!groupGuids) return unresolvedGroupMembership();
   const guidNames = await Promise.all(groupGuids.map(async (guid) => {
     const result = await execLookup(execFileAsync, MACOS_DSCL, [".", "-search", "/Users", "GeneratedUID", guid]);
     return result.error ? undefined : parseDsclSearchUser(result.stdout, guid);
@@ -290,7 +324,13 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
     if (result.error) return undefined;
     const uid = parseDsclUniqueId(result.stdout);
     if (uid === undefined) return undefined;
-    const authenticationAuthorities = parseDsclAttributes(result.stdout, "AuthenticationAuthority");
+    const authenticationAuthority = dsclAttributeEvidence(result.stdout, "AuthenticationAuthority");
+    // A missing AuthenticationAuthority line is not evidence that the account is disabled.
+    // Only dscl's explicit "No such key" response proves that the attribute is absent.
+    if (!authenticationAuthority.present && !authenticationAuthority.explicitAbsent) return undefined;
+    const authenticationAuthorities = authenticationAuthority.present
+      ? parseDsclAttributes(result.stdout, "AuthenticationAuthority")
+      : [];
     return {
       name: names[index],
       uid,
@@ -332,9 +372,9 @@ function normalizeAclStatus(result) {
   return status === "present" || status === "absent" ? status : "unknown";
 }
 
-function contentIdentity(stat, resolvedPath) {
+function contentIdentity(stat) {
   if (stat?.dev === undefined || stat?.ino === undefined) return undefined;
-  return `${String(stat.dev)}:${String(stat.ino)}:${resolvedPath}`;
+  return `${String(stat.dev)}:${String(stat.ino)}`;
 }
 
 function cachedContentHash(cache, identity) {
@@ -348,7 +388,103 @@ function saveContentHash(cache, identity, value) {
   else if (cache && typeof cache === "object") cache[identity] = value;
 }
 
+export function resolveBinaryContentPinStorePaths(descartesPaths) {
+  const dir = path.join(descartesPaths.stateDir, "daemon");
+  return { dir, file: path.join(dir, CONTENT_PIN_STORE_NAME) };
+}
+
+function normalizeContentPin(value) {
+  if (!value || typeof value !== "object" || !/^[0-9a-f]{64}$/.test(String(value.sha256 ?? value.hash ?? ""))) return undefined;
+  return {
+    size: value.size ?? null,
+    mtime: value.mtime ?? null,
+    sha256: String(value.sha256 ?? value.hash),
+  };
+}
+
+function contentPinEntries(cache) {
+  if (cache instanceof Map) return [...cache.entries()];
+  if (!cache || typeof cache !== "object") return [];
+  return Object.entries(cache);
+}
+
+async function presentContentPinIdentities({
+  platform,
+  trustedBinaryPaths,
+  homeDir,
+  username,
+  binaries,
+  realpathFn,
+  statFn,
+}) {
+  const present = new Set();
+  for (const binary of binaries ?? []) {
+    for (const candidate of candidatePaths(binary, platform, { trustedBinaryPaths, homeDir, username })) {
+      const real = await safeRealpath(realpathFn, candidate);
+      if (!real.path) continue;
+      const result = await safeStat(statFn, real.path);
+      if (result.stat && isRegularExecutable(result.stat)) {
+        const identity = contentIdentity(result.stat);
+        if (identity) present.add(identity);
+      }
+    }
+  }
+  return present;
+}
+
+export async function loadContentHashCache(descartesPaths, {
+  platform = process.platform,
+  trustedBinaryPaths = [],
+  homeDir,
+  username,
+  binaries = KNOWN_COLLECTOR_BINARIES,
+  maxEntries = MAX_CONTENT_PIN_ENTRIES,
+  realpathFn = defaultRealpath,
+  statFn = defaultStat,
+} = {}) {
+  const cache = new Map();
+  const { file } = resolveBinaryContentPinStorePaths(descartesPaths);
+  try {
+    const parsed = JSON.parse(await defaultReadFile(file, "utf8"));
+    if (parsed?.version !== CONTENT_PIN_SCHEMA_VERSION || !parsed?.pins || typeof parsed.pins !== "object") return cache;
+    for (const [identity, value] of Object.entries(parsed.pins).slice(-maxEntries)) {
+      const pin = normalizeContentPin(value);
+      if (pin && /^.+:.+$/.test(identity)) cache.set(identity, pin);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") return cache;
+  }
+
+  const present = await presentContentPinIdentities({
+    platform,
+    trustedBinaryPaths,
+    homeDir,
+    username,
+    binaries,
+    realpathFn,
+    statFn,
+  });
+  for (const identity of cache.keys()) {
+    if (!present.has(identity)) cache.delete(identity);
+  }
+  return cache;
+}
+
+export async function persistContentHashCache(descartesPaths, cache, { maxEntries = MAX_CONTENT_PIN_ENTRIES } = {}) {
+  const { dir, file } = resolveBinaryContentPinStorePaths(descartesPaths);
+  const entries = contentPinEntries(cache)
+    .map(([identity, value]) => [identity, normalizeContentPin(value)])
+    .filter(([, value]) => value !== undefined)
+    .slice(-maxEntries);
+  await defaultMkdir(dir, { recursive: true, mode: 0o700 });
+  const tempFile = `${file}.${process.pid}.tmp`;
+  await defaultWriteFile(tempFile, JSON.stringify({ version: CONTENT_PIN_SCHEMA_VERSION, pins: Object.fromEntries(entries) }, null, 2), { mode: 0o600 });
+  await defaultRename(tempFile, file);
+}
+
 async function readAndRecordContent(readFileFn, resolvedPath, stat, contentHashCache) {
+  const identity = contentIdentity(stat);
+  if (!identity) return { error: "content_identity_unavailable" };
   let contents;
   try {
     contents = await readFileFn(resolvedPath);
@@ -357,13 +493,12 @@ async function readAndRecordContent(readFileFn, resolvedPath, stat, contentHashC
   }
   const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(String(contents));
   const hash = createHash("sha256").update(bytes).digest("hex");
-  const identity = contentIdentity(stat, resolvedPath);
   const previous = cachedContentHash(contentHashCache, identity);
-  if (previous && previous.hash !== hash) return { error: "content_changed_in_place" };
+  if (previous && (previous.sha256 ?? previous.hash) !== hash) return { error: "content_changed_in_place" };
   saveContentHash(contentHashCache, identity, {
-    hash,
     size: stat?.size,
     mtime: stat?.mtimeMs ?? stat?.mtimeNs,
+    sha256: hash,
   });
   return { contents, hash };
 }
@@ -427,7 +562,7 @@ async function inspectTrustedPath(resolvedPath, {
   operatorTrusted = false,
   groupWriterUidsFn = loadGroupWriterUids,
   groupWriterCache = {},
-  contentHashCache = DEFAULT_CONTENT_HASH_CACHE,
+  contentHashCache,
   aclCheckFn = detectAclStatus,
   execFileAsync = execFileAsyncDefault,
 } = {}) {
@@ -532,7 +667,8 @@ async function inspectTrustedPath(resolvedPath, {
  * root or the daemon UID, has no group/other-write bit, and has no extended ACL. Linux rejects
  * group-writable components without consulting account databases. macOS may trust a local group
  * after complete local dscl resolution; low-UID system accounts are accepted only when
- * AuthenticationAuthority is absent or contains only DisabledUser, and are recorded in provenance.
+ * AuthenticationAuthority is explicitly reported absent by dscl or contains only DisabledUser,
+ * and are recorded in provenance.
  * ACL uncertainty, foreign ownership, unresolved membership, and write bits fail closed.
  * Same-UID owner writability is intentionally accepted and recorded in same_uid_writable_components.
  */
@@ -547,7 +683,7 @@ export async function resolveCollectorBinary(binary, {
   readFileFn = defaultReadFile,
   groupWriterUidsFn = loadGroupWriterUids,
   groupWriterCache = {},
-  contentHashCache = DEFAULT_CONTENT_HASH_CACHE,
+  contentHashCache,
   execFileAsync = execFileAsyncDefault,
   aclCheckFn = detectAclStatus,
 } = {}) {
@@ -558,7 +694,9 @@ export async function resolveCollectorBinary(binary, {
 
   const configuredPaths = new Set(trustedBinaryPaths.filter((candidate) => typeof candidate === "string" && path.isAbsolute(candidate)));
   const candidates = candidatePaths(name, platform, { trustedBinaryPaths, homeDir, username });
+  const effectiveContentHashCache = contentHashCache ?? new Map();
   let firstUntrusted;
+  let firstResolvedUntrusted;
 
   for (const candidate of candidates) {
     const operatorTrusted = configuredPaths.has(candidate);
@@ -577,16 +715,17 @@ export async function resolveCollectorBinary(binary, {
       operatorTrusted,
       groupWriterUidsFn,
       groupWriterCache,
-      contentHashCache,
+      contentHashCache: effectiveContentHashCache,
       execFileAsync,
       aclCheckFn,
     });
     if (inspected.status === "resolved") {
       return { ...inspected, binary: name, candidates };
     }
-    firstUntrusted ??= { ...inspected, binary: name, candidates };
+    firstResolvedUntrusted ??= { ...inspected, binary: name, candidates };
   }
 
+  if (firstResolvedUntrusted) return firstResolvedUntrusted;
   if (firstUntrusted) return { ...firstUntrusted, binary: name, candidates };
   return { status: NOT_FOUND_ON_KNOWN_PATHS, binary: name, path: undefined, resolved_path: undefined, trust_verdict: NOT_FOUND_ON_KNOWN_PATHS, candidates };
 }
@@ -644,7 +783,7 @@ async function reverifyResolvedBinary(resolution, options) {
     options.readFileFn ?? defaultReadFile,
     real.path,
     current.stat,
-    options.contentHashCache ?? DEFAULT_CONTENT_HASH_CACHE,
+    options.contentHashCache ?? new Map(),
   );
   if (content.error || (resolution.content_hash && content.hash !== resolution.content_hash)) {
     return {
