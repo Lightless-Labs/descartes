@@ -2,22 +2,27 @@
 
 **Last updated:** 2026-10-09
 
-## R3 notify-once review fixes — 2026-10-09 — local, not pushed
+## R3 notify-once daybreak rework — 2026-10-09 — local, not pushed
 
-On branch `feat/notify-once-2026-10`, alert delivery now persists first-class incident records under
-each alert id. `incidents[incident_key]` stores first/last seen, maximum and notified severity,
-confirmation, delivery-failure/backoff state, and status. Candidate application groups and sorts
-incident keys deterministically; delivery iterates due incidents and confirms each one independently.
-Alert-level active/recovered/acknowledged status and detector recovery coverage remain unchanged.
+On branch `feat/notify-once-2026-10`, the daybreak-blue findings are closed in four local commits:
+`93cd13e`, `5fc6cfe`, `8d1910b`, and `afdfeeb`. Alert delivery now persists first-class incident
+records under each alert id. `incidents[incident_key]` stores first/last seen, maximum and notified
+severity, confirmation, delivery-failure/backoff state, and status. Candidate application groups and
+sorts incident keys deterministically; delivery iterates due incidents and confirms each one
+independently. Alert-level active/recovered/acknowledged status and detector recovery coverage remain
+unchanged.
 
 Confirmed incident keys are retained while an alert is active. At 256 live keys, the alert enters
 explicit `incident_storm` state (operator policy (O)): it emits one count-bearing storm notification,
 suppresses per-key notifications and adjudications until recovery or acknowledgement, and retries
 the storm after a failed delivery without another overflow. Due-ness is computed over all persisted
-active incidents, including failed incidents whose keys are absent from the current tick. Legacy
-records without episode metadata are suppressed only for the upgrade episode; recovery clears that
-compatibility marker so a fresh incident notifies. A lost confirmation write can duplicate a later
-delivery but cannot create silence; these paths are covered by regression tests.
+active incidents, including failed incidents whose keys are absent from the current tick or excluded
+by detector coverage. Delivery work is capped at 8 attempts per daemon tick (operator policy (O)),
+prioritizing severity descending then oldest unconfirmed work; deferred entries remain due and are
+eventually attempted. Legacy records without episode metadata are suppressed only for the upgrade
+episode; recovery clears that compatibility marker so a fresh incident notifies. A lost confirmation
+write can duplicate a later delivery but cannot create silence; these paths are covered by regression
+tests.
 
 The daemon singleton and CLI command queue introduced by the earlier slice were removed. `alerts ack`
 uses the existing direct persistence path. Concurrent daemons are an unsupported configuration; the
@@ -25,15 +30,17 @@ pre-existing alert-store read-modify-write lost-update race is deliberately not 
 tracked in [`todos/2026-10-09-alert-store-concurrent-writers.md`](../todos/2026-10-09-alert-store-concurrent-writers.md).
 The correlation detector now anchors each join on the correlated incident's own first-seen tick and
 incident key, so churn A→B then B→C cannot collapse. Containment recommendations consume each
-incident-level due entry rather than the alert's preferred projection. Notification audit rotation
-renames the current inode to an archive before compaction, preserving a row appended in the
-read-to-rename interval and never replacing a fresh current file created by another writer.
+incident-level due entry rather than the alert's preferred projection; the final containment pass
+filters stale due entries after same-tick recovery. Notification delivery audit uses dated UTC
+append-only JSONL segments, reads the legacy file and orphan archives before dated segments, and
+retains/deletes only whole old segments without rewriting or renaming an append target.
 
-The targeted notify-once, containment, and notification-delivery suites pass 59/59. Fresh-XDG
-`npm test` completed with 2,318 passing, 22 environment failures, 34 skipped, and 2,374 total.
-The 22 failures are 17 sandbox notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump
-loopback `listen EPERM` tests, and 2 live-host macOS provenance checks returning `unknown` instead
-of `ok`; no changed-behavior failures occurred.
+Focused suites pass: alert-store 25/25, alert-intelligence 144/144, notification-delivery 18/18,
+and containment/fact-store regressions 2/2. Fresh-XDG `npm test` completed with 2,376 total,
+2,320 passing, 22 environment failures, 34 skipped, and 0 todo. The 22 failures are 17 sandbox
+notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump loopback `listen EPERM` tests, and
+2 live-host macOS provenance checks returning `unknown` instead of `ok`; no product-behavior
+failures remain.
 No push or merge is authorized.
 
 ## Review-fix update — 2026-10-05

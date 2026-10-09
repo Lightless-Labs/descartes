@@ -1,6 +1,6 @@
 # Notify-once incident records
 
-**Status:** complete locally, 2026-10-09 — final architecture update after daybreak-blue review
+**Status:** complete locally, 2026-10-09 — daybreak-blue rework closed
 
 ## Objective
 
@@ -16,21 +16,25 @@ explicit storm state that has one notification target and suppresses per-inciden
   retried when its persisted backoff expires even if that key is absent from the current tick.
 - Legacy records without episode metadata are suppressed only during their upgrade episode; recovery
   clears that compatibility marker so a later fresh incident can notify.
+- Every tick scans every persisted active alert for expired failed-incident and failed-storm retries,
+  including alerts with no current candidates or excluded recovery coverage. Delivery attempts share
+  an operator policy cap of 8 per tick, ordered by severity descending and oldest unconfirmed work;
+  deferred due entries remain persisted for later ticks.
 - At the live-incident bound, `incident_storm` is one persisted notification target. It retries after
   failure without requiring another overflow and does not send per-incident LLM adjudications.
 - Delivery is at-least-once across a crash after external delivery and before confirmation.
-- Notification audit rotation atomically renames the current file to an archive before offline
-  compaction, preserving appenders holding the old inode and appending the compacted result to the
-  fresh path.
+- Notification delivery audit is dated UTC append-only JSONL segments. Writers open the segment for
+  each append; readers consume the legacy file first, then orphan archives, then dated segments in
+  order. Retention removes only whole old segments, never the current or previous UTC day, with no
+  rewrite, rename, or compaction of an append target.
 - A future writer-boundary design is still TODO: concurrent alert-store read-modify-write writers
   are unsupported and remain tracked separately in `todos/2026-10-09-alert-store-concurrent-writers.md`.
 
 ## Verification
 
-- Focused notify-once/containment/notification-delivery suites: 59 passing.
-- Fresh-XDG `npm test`: 2,318 passing, 22 environment failures, 34 skipped, 2,374 total. The
-  failures are 17 sandbox notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump loopback
-  `listen EPERM` tests, and 2 live-host macOS provenance checks returning `unknown` instead of `ok`.
-- Fresh-XDG `npm test`: 2,115 passing, 22 environment failures, 34 skipped, 2,171 total.
-  The failures are the existing sandbox loopback `listen EPERM` tests (20) and two live-host
-  macOS provenance checks returning `unknown` instead of `ok`.
+- Focused notify-once suites: alert-store 25/25, alert-intelligence 144/144,
+  notification-delivery 18/18, and the containment/fact-store regressions 2/2.
+- Fresh-XDG `npm test`: 2,376 total, 2,320 passing, 22 environment failures, 34 skipped, 0 todo.
+  The failures are 17 sandbox notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump
+  loopback `listen EPERM` tests, and 2 live-host macOS provenance checks returning `unknown` instead
+  of `ok`; no product-behavior failures remain.
