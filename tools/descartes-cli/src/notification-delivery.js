@@ -246,18 +246,18 @@ const deliveryAuditCache = new Map();
 async function appendDeliveryAudit(descartesPaths, record) {
   const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
   await ensureParent(auditFile);
-  let records = deliveryAuditCache.get(auditFile);
-  if (!records) {
-    records = [];
-    try {
-      records = (await fs.readFile(auditFile, "utf8")).split("\n").filter(Boolean).map((line) => {
-        try { return JSON.parse(line); } catch { return undefined; }
-      }).filter(Boolean);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-    deliveryAuditCache.set(auditFile, records);
+  // The daemon and `alerts notifications test` are legitimate independent writers. Refresh the
+  // snapshot for every append so a process-local cache can never rotate a stale view over rows
+  // appended by the other process.
+  let records = [];
+  try {
+    records = (await fs.readFile(auditFile, "utf8")).split("\n").filter(Boolean).map((line) => {
+      try { return JSON.parse(line); } catch { return undefined; }
+    }).filter(Boolean);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
   }
+  deliveryAuditCache.set(auditFile, records);
   const previous = records.at(-1);
   const failure = ["error", "unavailable", "disabled"].includes(record.status);
   const sameFailure = failure && previous && previous.status === record.status

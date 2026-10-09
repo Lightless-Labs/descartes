@@ -307,3 +307,30 @@ test("delivery audit rotates every row type and retains a summary", async () => 
   assert.equal(audit[0].dropped_count, 2);
   assert.equal(audit.at(-1).payload.title, "Alert newest");
 });
+
+test("audit rotation rereads rows appended by another process", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveNotificationDeliveryPaths(paths);
+  // Prime the old process-local cache, then append as the simulated second writer.
+  await deliverNotificationDecision(paths, { notify: false, title: "daemon row", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-09T00:00:00.000Z",
+  });
+  const filler = Array.from({ length: MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS - 2 }, (_, index) => JSON.stringify({
+    ts: new Date(Date.UTC(2026, 9, 9, 0, 1, index)).toISOString(),
+    status: "skipped",
+    reason: "filler",
+    channel: "cli",
+    payload: { title: `filler ${index}`, body: "Body" },
+  })).join("\n");
+  await fs.appendFile(auditFile, `${filler}\n`);
+  const external = { ts: "2026-10-09T00:01:59.000Z", status: "delivered", channel: "cli", payload: { title: "external row", body: "Body" } };
+  await fs.appendFile(auditFile, `${JSON.stringify(external)}\n`);
+
+  await deliverNotificationDecision(paths, { notify: false, title: "rotating row", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-09T00:02:00.000Z",
+  });
+  const audit = await readNotificationDeliveryAudit(paths);
+  assert.ok(audit.some((entry) => entry.payload?.title === "external row"));
+});
