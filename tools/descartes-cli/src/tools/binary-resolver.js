@@ -18,14 +18,6 @@ const LINUX_ACL_ATTRIBUTES = ["system.posix_acl_access", "system.posix_acl_defau
 export const NOT_FOUND_ON_KNOWN_PATHS = "not_found_on_known_paths";
 export const UNTRUSTED_BINARY = "untrusted_binary";
 
-export const KNOWN_COLLECTOR_BINARIES = Object.freeze([
-  "VBoxManage", "codesign", "colima", "container", "crontab", "df", "docker", "id", "incus",
-  "ip", "journalctl", "launchctl", "limactl", "log", "lsof", "lxc", "multipass", "netstat",
-  "ntpq", "plutil", "podman", "prlctl", "ps", "qm", "route", "scutil", "screen",
-  "sntp", "spctl", "ss", "sestatus", "sysctl", "systemctl", "systemsetup", "tail", "tart",
-  "tailscale", "timedatectl", "tmux", "virsh", "vmrun", "wg", "who", "xl",
-]);
-
 const COMMON_BINARY_DIRECTORIES = Object.freeze([
   "/usr/bin",
   "/bin",

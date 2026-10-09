@@ -937,6 +937,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       console.warn(`[daemon] legacy binary content-pin cleanup failed (${error instanceof Error ? error.message : String(error)})`);
     }
   }
+  try {
+    const daemonStateDir = path.join(descartesPaths.stateDir, "daemon");
+    const entries = await fs.readdir(daemonStateDir);
+    await Promise.all(entries
+      .filter((entry) => entry.startsWith(`${LEGACY_CONTENT_PIN_FILE}.`) && entry.endsWith(".tmp"))
+      .map((entry) => fs.unlink(path.join(daemonStateDir, entry))));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[daemon] orphaned binary content-pin tmp cleanup failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
   // Slice B (Codex-hardening): one freshness horizon, derived from the RESOLVED profile's structural
   // interval (not options.profile, which may be undefined when defaulted), threaded into BOTH the
   // live-active and shadow-soak constraint evals so they apply the identical staleness bound.

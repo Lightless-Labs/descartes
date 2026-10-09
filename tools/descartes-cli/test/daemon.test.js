@@ -169,8 +169,10 @@ test("foreground daemon iteration writes metric history and daemon status", asyn
 test("daemon iteration removes the legacy binary content-pin file", async () => {
   const paths = await tempPaths();
   const legacyFile = path.join(paths.stateDir, "daemon", "binary-content-pins.json");
+  const legacyTmpFile = path.join(paths.stateDir, "daemon", "binary-content-pins.json.4242.tmp");
   await fs.mkdir(path.dirname(legacyFile), { recursive: true });
   await fs.writeFile(legacyFile, "legacy pin state");
+  await fs.writeFile(legacyTmpFile, "orphaned legacy pin state");
 
   await runDaemonIteration(paths, {
     collectors: {
@@ -183,6 +185,7 @@ test("daemon iteration removes the legacy binary content-pin file", async () => 
   });
 
   await assert.rejects(() => fs.access(legacyFile), { code: "ENOENT" });
+  await assert.rejects(() => fs.access(legacyTmpFile), { code: "ENOENT" });
 });
 
 // Component D (trusted-state step-1, §7): the honest integrity_level label. Additive-only, a

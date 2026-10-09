@@ -370,7 +370,7 @@ Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing h
 
 ## Current Status
 
-> **RESUME HERE (2026-10-09 late) — main has capacity + notify-once; plan at v5; collector-sources in gate; root-helper CI red.**
+> **SUPERSEDED:** This pin-era section is stale; use the current **Collector-source pin removal and B3 closure — 2026-10-09** section at the top of this document.
 > - **Pushed to origin/main (b60efc8):** provenance + watch-fab + **fact-store capacity** (G3 READY; merge 1169d40 + status fix b60efc8, daybreak READY).
 > - **Local main, NOT pushed:** **notify-once (R3) merged (fe4302b)** — per-incident records under each alert id, independent delivery/confirmation, storm mode (one notification, ack resets), global severity order with per-route per-tick circuit breaker (no per-tick cap), retries over all persisted incidents incl. post-ack, legacy ⇒ notify once, dated byte-capped audit segments; daybreak READY after 10 rounds (final backoff fix 2fc3149 not separately gated yet). Pre-existing alert-store concurrent-writer race tracked in `todos/2026-10-09-alert-store-concurrent-writers.md`. Push needs operator OK.
 > - **`fix/collector-sources-2026-10`** (worktree `collector-sources`): H5/H6 + binary trust (macOS: local-group trust incl. non-authenticating system accounts e.g. `_mbsetupuser`, ACL fail-closed, GUID members, local-only search policy, content-hash pin; LINUX: strict — no group-writable trust) + per-source session census universes (versioned identities, legacy frozen). **Accepted residual (documented):** on macOS a process that held the admin GID before removal keeps write access until it exits. In daybreak gate 6. Must merge new main (R3) before final gate.
