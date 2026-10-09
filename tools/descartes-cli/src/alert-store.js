@@ -387,6 +387,7 @@ export function normalizeAlertRecord(record) {
     incident_state: incidentState,
     incident_storm_count: Number.isInteger(record.incident_storm_count) && record.incident_storm_count > 0 ? record.incident_storm_count : 0,
     incident_storm_notified_at: record.incident_storm_notified_at ? normalizeIso(record.incident_storm_notified_at, "incident_storm_notified_at") : null,
+    incident_storm_failure_count: Number.isInteger(record.incident_storm_failure_count) && record.incident_storm_failure_count > 0 ? record.incident_storm_failure_count : 0,
     legacy_without_episode: legacyWithoutEpisode,
     status,
     severity: record.severity === undefined || record.severity === null ? "warning" : String(record.severity),
@@ -532,6 +533,7 @@ function syncAlertProjection(alert) {
   const notified = [...new Set(confirmed.map((incident) => incident.notified_severity).filter(Boolean))]
     .sort((left, right) => alertSeverityRank(right) - alertSeverityRank(left));
   const payload = current?.payload ?? {};
+  const stormRetry = alert.incident_state === "incident_storm";
   return normalizeAlertRecord({
     ...alert,
     incident_key: preferredKey === "default" ? null : preferredKey,
@@ -548,13 +550,14 @@ function syncAlertProjection(alert) {
     last_notified: confirmed.map((incident) => incident.confirmed_at).sort().at(-1) ?? null,
     notified_severity_max: notified[0] ?? null,
     episode_notified_at: confirmed.map((incident) => incident.confirmed_at).sort().at(-1) ?? null,
-    delivery_failure_count: current?.delivery_failure_count ?? 0,
-    last_delivery_failure_at: current?.last_delivery_failure_at ?? null,
-    delivery_failure_reason: current?.delivery_failure_reason ?? null,
-    delivery_failing_since: current?.delivery_failing_since ?? null,
-    next_attempt_at: current?.next_attempt_at ?? null,
-    last_attempt_at: current?.last_attempt_at ?? null,
-    backoff_delay_ms: current?.backoff_delay_ms ?? null,
+    delivery_failure_count: stormRetry ? alert.delivery_failure_count ?? 0 : current?.delivery_failure_count ?? 0,
+    last_delivery_failure_at: stormRetry ? alert.last_delivery_failure_at ?? null : current?.last_delivery_failure_at ?? null,
+    delivery_failure_reason: stormRetry ? alert.delivery_failure_reason ?? null : current?.delivery_failure_reason ?? null,
+    delivery_failing_since: stormRetry ? alert.delivery_failing_since ?? null : current?.delivery_failing_since ?? null,
+    next_attempt_at: stormRetry ? alert.next_attempt_at ?? null : current?.next_attempt_at ?? null,
+    last_attempt_at: stormRetry ? alert.last_attempt_at ?? null : current?.last_attempt_at ?? null,
+    backoff_delay_ms: stormRetry ? alert.backoff_delay_ms ?? null : current?.backoff_delay_ms ?? null,
+    incident_storm_failure_count: alert.incident_storm_failure_count ?? 0,
     adjudicated_at: current?.adjudicated_at ?? null,
     adjudicated_episode_key: current?.adjudicated_at ? preferredKey : null,
     adjudication: current?.adjudication ?? null,
@@ -619,6 +622,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
     };
     let overflowCount = 0;
     const dueForAlert = [];
+    const adjudicationForAlert = [];
     for (const key of [...incidentCandidates.keys()].sort()) {
       const candidate = incidentCandidates.get(key);
       const previousIncident = next.incidents[key];
@@ -662,7 +666,22 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       const sameNegativeAdjudication = next.incidents[key].adjudication?.notify === false
         && next.incidents[key].adjudication?.severity === next.incidents[key].severity_max;
       if (!legacySuppressed && !sameNegativeAdjudication && (newIncident || severityEscalated || dueForAlert.some((entry) => entry.incident_key === key))) {
-        adjudicationDueIncidents.push({ alert_id: id, incident_key: key });
+        adjudicationForAlert.push({ alert_id: id, incident_key: key });
+      }
+    }
+
+    // Due-ness belongs to every persisted active incident, not only to identities observed in this
+    // tick. A failed incident may be absent from the current candidate set while its sibling keeps
+    // the alert active; once its backoff expires it still needs another delivery attempt.
+    if (next.incident_state !== "incident_storm" && !next.legacy_without_episode) {
+      for (const [key, incident] of Object.entries(next.incidents).sort(([left], [right]) => left.localeCompare(right))) {
+        if (!notificationDueForIncident(next, incident, { nowMs: new Date(now).getTime() })) continue;
+        if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
+        const sameNegativeAdjudication = incident.adjudication?.notify === false
+          && incident.adjudication?.severity === incident.severity_max;
+        if (!sameNegativeAdjudication && !adjudicationForAlert.some((entry) => entry.incident_key === key)) {
+          adjudicationForAlert.push({ alert_id: id, incident_key: key });
+        }
       }
     }
     if (overflowCount > 0) {
@@ -674,8 +693,15 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         && deliveryBackoffEligible(next, new Date(now).getTime())) {
         dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
       }
+    } else if (next.incident_state === "incident_storm" && !next.incident_storm_notified_at
+      && !["acknowledged", "suppressed"].includes(next.status) && !next.legacy_without_episode
+      && deliveryBackoffEligible(next, new Date(now).getTime())) {
+      // The storm is itself a persisted notification target. Retry a failed storm even when this
+      // tick contains no new overflow identity.
+      dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
     }
     notificationDueIncidents.push(...dueForAlert);
+    adjudicationDueIncidents.push(...adjudicationForAlert);
     byId.set(id, syncAlertProjection(next));
   }
 

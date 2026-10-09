@@ -81,6 +81,33 @@ test("delivery iterates every due incident under one alert id", async () => {
   assert.equal(persisted.incidents["identity-b"].confirmed_at !== null, true);
 });
 
+test("a persisted failed incident is retried when its key is absent from a later tick", async () => {
+  const paths = await tempPaths();
+  const first = applyAlertCandidates([], [candidate("identity-a"), candidate("identity-b")], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, first.alerts);
+  await recordAlertDeliveryFailure(paths, "alert_shared", { now: "2026-10-06T00:00:00.000Z", incidentKey: "identity-a" });
+  await confirmAlertDelivery(paths, "alert_shared", { now: "2026-10-06T00:00:01.000Z", incidentKey: "identity-b" });
+
+  const beforeBackoff = applyAlertCandidates(await readAlertRecords(paths), [candidate("identity-b")], { now: "2026-10-06T00:00:30.000Z" });
+  assert.deepEqual(beforeBackoff.notification_due_incidents, []);
+  const afterBackoff = applyAlertCandidates(beforeBackoff.alerts, [candidate("identity-b")], { now: "2026-10-06T00:01:01.000Z" });
+  assert.deepEqual(afterBackoff.notification_due_incidents, [{ alert_id: "alert_shared", incident_key: "identity-a" }]);
+});
+
+test("a failed storm notification is retried after backoff without another overflow", async () => {
+  const paths = await tempPaths();
+  const candidates = Array.from({ length: 257 }, (_, index) => candidate(`identity-${index}`));
+  const storm = applyAlertCandidates([], candidates, { now: "2026-10-06T00:00:00.000Z" });
+  assert.deepEqual(storm.notification_due_incidents.map((entry) => entry.incident_key), ["__incident_storm__"]);
+  await writeAlertRecords(paths, storm.alerts);
+  await recordAlertDeliveryFailure(paths, "alert_shared", { now: "2026-10-06T00:00:00.000Z", incidentKey: "__incident_storm__" });
+
+  const beforeBackoff = applyAlertCandidates(await readAlertRecords(paths), [candidate("identity-0")], { now: "2026-10-06T00:00:30.000Z" });
+  assert.deepEqual(beforeBackoff.notification_due_incidents, []);
+  const afterBackoff = applyAlertCandidates(beforeBackoff.alerts, [candidate("identity-0")], { now: "2026-10-06T00:01:01.000Z" });
+  assert.deepEqual(afterBackoff.notification_due_incidents, [{ alert_id: "alert_shared", incident_key: "__incident_storm__", storm: true, incident_count: 257 }]);
+});
+
 test("confirmed incidents are retained and a 257th identity enters a one-notification storm state", async () => {
   const paths = await tempPaths();
   let alerts = [];
