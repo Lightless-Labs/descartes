@@ -26,7 +26,10 @@ incident key, so churn A→B then B→C cannot collapse. Notification audit appe
 file and retains rows appended by another process.
 
 The combined focused run reached 369/372 before the final three regressions were fixed; the targeted
-regression suites then completed 67/67. Full fresh-XDG `npm test` is still required before handoff.
+regression suites then completed 67/67. Fresh-XDG `npm test` completed with 2,116 passing, 22
+environment failures, 34 skipped, and 2,172 total. The 22 failures are 17 sandbox loopback
+`listen EPERM` tests, 3 sandbox tap-bump loopback tests with the same `listen EPERM`, and 2 live-host
+macOS provenance checks returning `unknown` instead of `ok`; no changed-behavior failures occurred.
 No push or merge is authorized.
 
 ## Review-fix update — 2026-10-05
