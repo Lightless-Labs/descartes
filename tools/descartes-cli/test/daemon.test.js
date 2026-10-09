@@ -2446,12 +2446,15 @@ function sessionFactPoint(ts, entityKey, fingerprint = "abababababababab") {
   };
 }
 
-function censusMarkerFactPoint(ts, state = "complete") {
+// Session baseline identities are versioned by the census universe. These daemon fixtures model
+// the tmux collector, so they must carry the explicit v1 universe marker; a marker without one is
+// the legacy `global` regime and is intentionally never evaluated for recovery.
+function censusMarkerFactPoint(ts, state = "complete", availabilitySignature = "v1:tmux") {
   return {
     ts,
     fact_name: "session.presence",
     entity_key: SESSION_CENSUS_MARKER_ENTITY_KEY,
-    attributes: { census_state: state },
+    attributes: { census_state: state, availability_signature: availabilitySignature },
     source_envelope_id: "sessions",
     source_tool: "collect_sessions",
     sensitivity: "operational",

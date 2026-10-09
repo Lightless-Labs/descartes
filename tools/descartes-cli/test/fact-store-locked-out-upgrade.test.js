@@ -181,7 +181,7 @@ test("T10: an already-locked-out install upgrades: legacy quarantined outside le
         if ((coverage.get(label) ?? []).length > 0) noveltyProblems.push(`tick ${index}: ${label} evaluated while horizon-short`);
       }
     }
-    const countRules = (coverage.get("session") ?? []).includes(alertId(SESSION_COUNT_DROP_RULE_ID, "global"))
+    const countRules = (coverage.get("session") ?? []).includes(alertId(SESSION_COUNT_DROP_RULE_ID, "v2:tmux"))
       // Merge (R8 identities): marker-backed peer counts evaluate under v2:vpn, never legacy "global".
       && (coverage.get("peer") ?? []).includes(alertId(PEER_COUNT_DROP_RULE_ID, PEER_COUNT_VPN_FINGERPRINT))
       && (coverage.get("peer") ?? []).includes(alertId(PEER_COUNT_SPIKE_RULE_ID, PEER_COUNT_VPN_FINGERPRINT));
