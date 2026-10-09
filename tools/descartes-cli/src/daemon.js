@@ -390,7 +390,6 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
   const collectorOptions = {
     ...options,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
-    groupWriterCache: options.groupWriterCache ?? {},
   };
   const evidence = [];
   if (profile.collectors.system?.enabled) evidence.push(await activeCollectors.system(collectorOptions));
@@ -430,7 +429,6 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   const collectorOptions = {
     ...options,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
-    groupWriterCache: options.groupWriterCache ?? {},
   };
   const evidence = [];
   if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(collectorOptions));
@@ -976,12 +974,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     loadLearnedConfig: async () => configSnapshot.learned,
   };
 
-  // Collector subprocesses receive only explicitly configured trusted paths. Group membership
-  // is resolved from local sources and cached in one fresh object shared by every collector in
-  // this daemon tick; the object is discarded before the next iteration.
+  // Collector subprocesses receive only explicitly configured trusted paths. Binary content
+  // hashes are retained by the resolver so an in-place rewrite of a trusted inode is refused.
   const collectorOptions = {
     trustedBinaryPaths: configSnapshot.watch.trusted_binary_paths,
-    groupWriterCache: {},
   };
   // S5 (fact-store capacity plan §4.6 M2/M3, Q3/Q4): quarantine the legacy single store (and the
   // pre-S4 seen-sets) out of the facts tree, idempotently, before any per-family write this tick, and

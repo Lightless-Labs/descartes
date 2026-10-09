@@ -749,10 +749,10 @@ test("resolveCollectorBinary evaluates a brew-upgrade path with a new inode inde
   let version = "3.6a";
   const contentHashCache = new Map();
   const statFn = async (target) => {
-    if (target === "/opt/homebrew/bin/tmux") {
+    if (target === "/opt/homebrew/bin/tmux" || target.endsWith("/bin/tmux")) {
       return { ...regularExecutable(), uid: 0, dev: 1, ino: version === "3.6a" ? 2 : 99, size: 4, mtimeMs: 10 };
     }
-    if (target.startsWith("/opt/homebrew/Cellar/") || target === "/opt/homebrew/bin") return directory(0o40755, 0);
+    if (target === "/opt/homebrew/Cellar" || target.startsWith("/opt/homebrew/Cellar/") || target === "/opt/homebrew/bin") return directory(0o40755, 0);
     if (target === "/opt/homebrew" || target === "/opt") return directory(0o40755, 0);
     if (target === "/") return directory(0o40755, 0);
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
