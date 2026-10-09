@@ -235,6 +235,60 @@ test("delivery failures remain visible without consuming the episode", async () 
   assert.equal(stored.episode_notified_at, null);
 });
 
+test("persisted ordinary and storm retries are scanned when the current tick has no candidates and coverage excludes the alert", async () => {
+  const paths = await tempPaths();
+  const candidate = {
+    id: "alert_retry_without_candidates",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    severity: "warning",
+    title: "Memory high",
+    summary: "High",
+    incident_key: "ordinary-incident",
+  };
+  const ordinary = applyAlertCandidates([], [candidate], { now: "2026-10-09T00:00:00.000Z" });
+  await writeAlertRecords(paths, ordinary.alerts);
+  await recordAlertDeliveryFailure(paths, candidate.id, {
+    now: "2026-10-09T00:00:00.000Z",
+    reason: "unavailable",
+    incidentKey: "ordinary-incident",
+  });
+  const ordinaryStored = await readAlertRecords(paths);
+  const ordinaryRetry = applyAlertCandidates(ordinaryStored, [], {
+    now: "2026-10-09T00:01:00.000Z",
+    coveredAlertIds: new Set(),
+  });
+  assert.deepEqual(ordinaryRetry.notification_due_incidents, [{
+    alert_id: candidate.id,
+    incident_key: "ordinary-incident",
+  }]);
+
+  const stormCandidates = Array.from({ length: 257 }, (_, index) => ({
+    ...candidate,
+    id: candidate.id,
+    incident_key: `storm-${index}`,
+  }));
+  const storm = applyAlertCandidates([], stormCandidates, { now: "2026-10-09T00:00:00.000Z" });
+  assert.equal(storm.notification_due_incidents[0].incident_key, "__incident_storm__");
+  await writeAlertRecords(paths, storm.alerts);
+  await recordAlertDeliveryFailure(paths, candidate.id, {
+    now: "2026-10-09T00:00:00.000Z",
+    reason: "unavailable",
+    incidentKey: "__incident_storm__",
+  });
+  const stormStored = await readAlertRecords(paths);
+  const stormRetry = applyAlertCandidates(stormStored, [], {
+    now: "2026-10-09T00:01:00.000Z",
+    coveredAlertIds: new Set(),
+  });
+  assert.deepEqual(stormRetry.notification_due_incidents, [{
+    alert_id: candidate.id,
+    incident_key: "__incident_storm__",
+    storm: true,
+    incident_count: 257,
+  }]);
+});
+
 test("ordinary memory statistics do not create a second episode", () => {
   const candidate = {
     id: alertId("system.memory.sustained_high", "global"),

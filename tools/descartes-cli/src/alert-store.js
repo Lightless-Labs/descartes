@@ -670,20 +670,6 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       }
     }
 
-    // Due-ness belongs to every persisted active incident, not only to identities observed in this
-    // tick. A failed incident may be absent from the current candidate set while its sibling keeps
-    // the alert active; once its backoff expires it still needs another delivery attempt.
-    if (next.incident_state !== "incident_storm" && !next.legacy_without_episode) {
-      for (const [key, incident] of Object.entries(next.incidents).sort(([left], [right]) => left.localeCompare(right))) {
-        if (!notificationDueForIncident(next, incident, { nowMs: new Date(now).getTime() })) continue;
-        if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
-        const sameNegativeAdjudication = incident.adjudication?.notify === false
-          && incident.adjudication?.severity === incident.severity_max;
-        if (!sameNegativeAdjudication && !adjudicationForAlert.some((entry) => entry.incident_key === key)) {
-          adjudicationForAlert.push({ alert_id: id, incident_key: key });
-        }
-      }
-    }
     if (overflowCount > 0) {
       next.incident_state = "incident_storm";
       next.incident_key_overflow = true;
@@ -694,12 +680,6 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         && deliveryBackoffEligible(next, new Date(now).getTime())) {
         dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
       }
-    } else if (next.incident_state === "incident_storm" && !next.incident_storm_notified_at
-      && !["acknowledged", "suppressed"].includes(next.status) && !next.legacy_without_episode
-      && deliveryBackoffEligible(next, new Date(now).getTime())) {
-      // The storm is itself a persisted notification target. Retry a failed storm even when this
-      // tick contains no new overflow identity.
-      dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
     }
     notificationDueIncidents.push(...dueForAlert);
     adjudicationDueIncidents.push(...adjudicationForAlert);
@@ -716,6 +696,35 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         legacy_without_episode: false,
         incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, { ...incident, status: "recovered" }])),
       }));
+    }
+  }
+
+  // Retry scanning is deliberately independent of the current candidate groups. Detector
+  // unavailability, an empty candidate set, or a recovery-coverage veto must not make an active
+  // alert forget a failed incident whose persisted backoff has expired. Run this after recovery so
+  // an alert covered by a genuinely empty detector pass is not reported due and recovered in the
+  // same result.
+  for (const [id, alert] of byId) {
+    if (alert.incident_state === "incident_storm") {
+      if (!alert.incident_storm_notified_at && !["acknowledged", "suppressed", "recovered"].includes(alert.status)
+        && !alert.legacy_without_episode && deliveryBackoffEligible(alert, new Date(now).getTime())) {
+        if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === INCIDENT_STORM_KEY)) {
+          notificationDueIncidents.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: alert.incident_storm_count });
+        }
+      }
+      continue;
+    }
+    if (alert.legacy_without_episode) continue;
+    for (const [key, incident] of Object.entries(alert.incidents ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
+      if (!notificationDueForIncident(alert, incident, { nowMs: new Date(now).getTime() })) continue;
+      if (!notificationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === key)) {
+        notificationDueIncidents.push({ alert_id: id, incident_key: key });
+      }
+      const sameNegativeAdjudication = incident.adjudication?.notify === false
+        && incident.adjudication?.severity === incident.severity_max;
+      if (!sameNegativeAdjudication && !adjudicationDueIncidents.some((entry) => entry.alert_id === id && entry.incident_key === key)) {
+        adjudicationDueIncidents.push({ alert_id: id, incident_key: key });
+      }
     }
   }
 
