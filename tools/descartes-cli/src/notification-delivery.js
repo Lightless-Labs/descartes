@@ -303,10 +303,11 @@ async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {})
   }
   const candidates = [];
   for (const entry of entries) {
-    if (!entry.isFile() || path.join(auditDir, entry.name) === auditFile) continue;
+    if (!entry.isFile()) continue;
     const segmentMatch = /^notification-delivery-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(entry.name);
     const archive = isOrphanArchive(entry.name);
-    if (!segmentMatch && !archive) continue;
+    const legacy = entry.name === path.basename(auditFile);
+    if (!segmentMatch && !archive && !legacy) continue;
     const file = path.join(auditDir, entry.name);
     let initialStat;
     try {
@@ -317,7 +318,14 @@ async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {})
     }
     candidates.push({ file, name: entry.name, initialStat });
   }
-  candidates.sort((left, right) => left.name.localeCompare(right.name));
+  // The compatibility file predates dated segments and is therefore always the oldest retention
+  // candidate, even though its filename would sort after a dated segment lexicographically.
+  const legacyName = path.basename(auditFile);
+  candidates.sort((left, right) => {
+    const leftRank = left.name === legacyName ? 0 : isOrphanArchive(left.name) ? 1 : 2;
+    const rightRank = right.name === legacyName ? 0 : isOrphanArchive(right.name) ? 1 : 2;
+    return leftRank - rightRank || left.name.localeCompare(right.name);
+  });
   let totalBytes = candidates.reduce((sum, candidate) => sum + candidate.initialStat.size, 0);
 
   // Snapshot all candidates before a paused writer can race the unlink phase. appendDeliveryAudit

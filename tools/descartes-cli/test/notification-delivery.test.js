@@ -327,6 +327,24 @@ test("retention deletes oldest-by-name segments until the total byte cap is sati
   await fs.access(path.join(dir, "notification-delivery-2026-10-09.jsonl"));
 });
 
+test("retention counts and prunes the legacy audit file as the oldest segment", async () => {
+  const paths = await tempPaths();
+  const { auditDir, auditFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(auditDir, { recursive: true });
+  await fs.writeFile(auditFile, "x".repeat(4096));
+
+  await deliverNotificationDecision(paths, { notify: true, title: "current", body: "Body" }, {
+    config: { enabled: true, channel: "cli" },
+    now: "2026-10-09T00:03:00.000Z",
+    maxBytes: 1,
+  });
+
+  await assert.rejects(() => fs.access(auditFile));
+  await fs.access(path.join(auditDir, "notification-delivery-2026-10-09.jsonl"));
+  const audit = await readNotificationDeliveryAudit(paths);
+  assert.deepEqual(audit.map((entry) => entry.payload?.title), ["current"]);
+});
+
 test("concurrent append during retention is not lost and a post-append crash leaves the row readable", async () => {
   const paths = await tempPaths();
   let hookCalled = false;
