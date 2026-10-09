@@ -16,17 +16,22 @@ daemon user's `~/.nix-profile/bin`, and `/etc/profiles/per-user/<user>/bin`), Ni
 locations, Homebrew locations on macOS, and the macOS `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
 CLI path. The resolver follows
 symlinks, requires a regular executable, and checks the file plus every ancestor directory to `/`:
-only root or the daemon UID may own each component; other-write is rejected; ACL presence or ACL
-detection failure is rejected; and group-write is accepted only when the owning group's effective
-members, resolved from local sources, are a subset of `{root, daemon UID}`; on macOS, local users
-below UID 501 with no `AuthenticationAuthority` containing `ShadowHash` or `Kerberos` are accepted
-as non-authenticating system accounts and recorded in provenance. macOS uses local `dscl` records
-and rejects nested or non-local groups; Linux parses `/etc/group` and `/etc/passwd` directly and
-rejects a `group:` nsswitch line that can consult directory services. Same-UID owner writability
-is accepted within the current trust boundary but recorded as provenance. A failed check is
-`untrusted_binary`, is never executed, and leaves the source census incomplete. The immediate
-pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU
-window. Operators may list explicit absolute escape-hatch paths in
+only root or the daemon UID may own each component; ACL presence or ACL detection failure is
+rejected. On Linux, any group-write or other-write is rejected as `untrusted_binary` with reason
+`group_writable`; Linux no longer consults account databases for group trust. On macOS, group-write
+is accepted only when complete local `dscl` resolution proves every writer is root, the daemon UID,
+or a local UID below 501 whose `AuthenticationAuthority` is absent or only `DisabledUser`.
+Failures or partial results from search policy, GroupMembership, GroupMembers, primary-GID listings,
+or AuthenticationAuthority fail closed; nested or non-local groups are rejected. Same-UID owner
+writability is accepted within the current trust boundary but recorded as provenance. The resolver
+records a SHA-256 content hash for each trusted resolved binary by file identity and metadata and
+refuses `content_changed_in_place` when content changes while `(dev, ino)` stays the same. A new
+path/inode, such as a Homebrew upgrade into a new Cellar directory, is evaluated fresh. A failed
+check is `untrusted_binary`, is never executed, and leaves the source census incomplete. The
+immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual resolution-to-exec
+TOCTOU window. Accepted residual: a process that held the admin group's GID before being removed
+from the group retains write access until it exits; on a single-user Mac this requires a
+previously-admin principal; multi-admin or directory-bound Macs fail closed. Operators may list explicit absolute escape-hatch paths in
 `watch.json` under `trusted_binary_paths`; those entries still need realpath + regular-file
 validation and are reported as `operator_trusted`. Evidence records the requested binary, resolved
 absolute path, trust verdict, and any offending component. If no known candidate is usable, the

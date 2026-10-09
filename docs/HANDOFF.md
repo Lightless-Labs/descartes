@@ -2,6 +2,26 @@
 
 **Last updated:** 2026-10-09
 
+## Collector source trust rework — 2026-10-09
+
+Implemented the daybreak gate-5 decision locally in `c4eea62` (red TDD contract) and
+`87a9850` (implementation), with no push or merge. Linux now rejects every group-writable or
+other-writable collector component as `untrusted_binary` / `group_writable` and no longer reads
+NSS, `/etc/group`, `/etc/passwd`, or userdb membership for trust. macOS retains complete local
+`dscl` group trust, fails closed on failed or partial lookups, and accepts low-UID system accounts
+only when `AuthenticationAuthority` is absent or only `DisabledUser`. The accepted supplementary-
+GID residual is documented in the README, collector reference, and resolver comment. Trusted
+resolved binaries now carry SHA-256 content hashes; a same-`(dev, ino)` content change is refused
+as `content_changed_in_place`, while a new path/inode is evaluated fresh.
+
+Focused resolver tests pass 34/34; resolver-adjacent session/Tailscale/VPN integration tests pass
+117/117. Full fresh-XDG host-access `npm test` passes **2369/2369, 0 failures, 34 skips, 2403
+total**. The 34 skips are the existing platform/tool-gated `verify-install.sh` tests on macOS;
+live provenance passes. Host verification reports both `tmux` and `tailscale` as
+`resolved/trusted`: `/opt/homebrew/Cellar/tmux/3.6a/bin/tmux` and
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`, with `_mbsetupuser` recorded as the
+accepted disabled system account. No push or merge.
+
 ## Daybreak rework — 2026-10-09
 
 Fixed the current daybreak-blue findings on `fix/collector-sources-2026-10` in five local atomic

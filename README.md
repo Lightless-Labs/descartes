@@ -210,19 +210,26 @@ The collectors cover many areas:
 Collector subprocesses never use the ambient `PATH`: each bare binary name is resolved from a
 pinned, platform-specific set of absolute paths (including the macOS Tailscale app CLI path and
 the standard Nix profile locations). The resolver follows symlinks, requires a regular executable,
-and checks the file plus every ancestor directory to `/`. A component is trusted only when its
-not `root` or the daemon UID, it is other-writable, its ACL is present or cannot be proved absent,
-or a group-writable component's effective membership cannot be verified from local sources or
-includes another UID, because an unverified or foreign writer could replace the collector. macOS
-membership uses local `dscl` records and permits root, the daemon UID, and local users below UID 501
-whose `AuthenticationAuthority` has neither `ShadowHash` nor `Kerberos`; Linux membership uses
-`/etc/group`, `/etc/passwd`, and a local-only `nsswitch.conf` check. Same-UID
-owner writability is inside Descartes' current trust boundary and is recorded in provenance. Shell
-wrappers are rejected unless explicitly operator-trusted, so a trusted wrapper can never authorize an
-untrusted downstream binary. An offending component, ACL uncertainty, stat failure, or binary
-replacement detected by the immediate pre-exec `(dev, ino)` recheck produces `untrusted_binary`; the
-collector does not execute it and the census remains incomplete. The recheck narrows but cannot
-eliminate the residual resolution-to-exec TOCTOU window.
+and checks the file plus every ancestor directory to `/`. A normal component is trusted only when
+it is owned by `root` or the daemon UID, has no ACL, and has no group- or other-write bit. Linux
+rejects every group-writable or other-writable component as `untrusted_binary` with reason
+`group_writable`; it does not consult account databases to establish group trust. macOS may accept
+a group-writable component only after complete local `dscl` resolution proves that every writer is
+root, the daemon UID, or a local UID below 501 whose `AuthenticationAuthority` is absent or only
+`DisabledUser`. Any failed or partial macOS search-policy, group-membership, GroupMembers,
+primary-GID, or AuthenticationAuthority lookup fails closed. Same-UID owner writability is inside
+Descartes' current trust boundary and is recorded in provenance. Shell wrappers are rejected unless
+explicitly operator-trusted, so a trusted wrapper can never authorize an untrusted downstream
+binary. The resolver records a SHA-256 content hash for each trusted resolved binary keyed by its
+file identity and metadata; a content change on the same `(dev, ino)` is refused as
+`content_changed_in_place`, while a new path/inode is evaluated fresh. An offending component,
+ACL uncertainty, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
+recheck produces `untrusted_binary`; the collector does not execute it and the census remains
+incomplete. The recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU window.
+
+Accepted residual: a process that held the admin group's GID before being removed from the group
+retains write access until it exits; on a single-user Mac this requires a previously-admin
+principal; multi-admin or directory-bound Macs fail closed.
 
 An operator may explicitly accept a non-standard absolute executable by listing it in
 `$XDG_CONFIG_HOME/descartes/watch.json`:
