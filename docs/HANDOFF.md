@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-10-09
 
-## R3 notify-once incident records — 2026-10-09 — local, not pushed
+## R3 notify-once review fixes — 2026-10-09 — local, not pushed
 
 On branch `feat/notify-once-2026-10`, alert delivery now persists first-class incident records under
 each alert id. `incidents[incident_key]` stores first/last seen, maximum and notified severity,
@@ -11,25 +11,29 @@ incident keys deterministically; delivery iterates due incidents and confirms ea
 Alert-level active/recovered/acknowledged status and detector recovery coverage remain unchanged.
 
 Confirmed incident keys are retained while an alert is active. At 256 live keys, the alert enters
-explicit `incident_storm` state (operator policy (O)): it emits one count-bearing storm notification
-and suppresses per-key notifications until recovery or acknowledgement. The storm itself uses the
-same retry/backoff and at-least-once delivery rules. Legacy records without episode metadata remain
-silent. A lost confirmation write can duplicate a later delivery but cannot create silence; this is
-covered by a regression test.
+explicit `incident_storm` state (operator policy (O)): it emits one count-bearing storm notification,
+suppresses per-key notifications and adjudications until recovery or acknowledgement, and retries
+the storm after a failed delivery without another overflow. Due-ness is computed over all persisted
+active incidents, including failed incidents whose keys are absent from the current tick. Legacy
+records without episode metadata are suppressed only for the upgrade episode; recovery clears that
+compatibility marker so a fresh incident notifies. A lost confirmation write can duplicate a later
+delivery but cannot create silence; these paths are covered by regression tests.
 
 The daemon singleton and CLI command queue introduced by the earlier slice were removed. `alerts ack`
 uses the existing direct persistence path. Concurrent daemons are an unsupported configuration; the
 pre-existing alert-store read-modify-write lost-update race is deliberately not fixed here and is
 tracked in [`todos/2026-10-09-alert-store-concurrent-writers.md`](../todos/2026-10-09-alert-store-concurrent-writers.md).
 The correlation detector now anchors each join on the correlated incident's own first-seen tick and
-incident key, so churn A→B then B→C cannot collapse. Notification audit append/rotation rereads the
-file and retains rows appended by another process.
+incident key, so churn A→B then B→C cannot collapse. Containment recommendations consume each
+incident-level due entry rather than the alert's preferred projection. Notification audit rotation
+renames the current inode to an archive before compaction, preserving a row appended in the
+read-to-rename interval and never replacing a fresh current file created by another writer.
 
-The combined focused run reached 369/372 before the final three regressions were fixed; the targeted
-regression suites then completed 67/67. Fresh-XDG `npm test` completed with 2,116 passing, 22
-environment failures, 34 skipped, and 2,172 total. The 22 failures are 17 sandbox loopback
-`listen EPERM` tests, 3 sandbox tap-bump loopback tests with the same `listen EPERM`, and 2 live-host
-macOS provenance checks returning `unknown` instead of `ok`; no changed-behavior failures occurred.
+The targeted notify-once, containment, and notification-delivery suites pass 59/59. Fresh-XDG
+`npm test` completed with 2,318 passing, 22 environment failures, 34 skipped, and 2,374 total.
+The 22 failures are 17 sandbox notifier-reuse loopback `listen EPERM` tests, 3 sandbox tap-bump
+loopback `listen EPERM` tests, and 2 live-host macOS provenance checks returning `unknown` instead
+of `ok`; no changed-behavior failures occurred.
 No push or merge is authorized.
 
 ## Review-fix update — 2026-10-05
