@@ -567,7 +567,7 @@ function syncAlertProjection(alert) {
 function notificationDueForIncident(alert, incident, { newIncident = false, severityEscalated = false, nowMs } = {}) {
   if (!incident || ["suppressed", "recovered"].includes(alert.status) || ["suppressed", "recovered"].includes(incident.status)) return false;
   if (newIncident || severityEscalated) return true;
-  if (alert.status === "acknowledged") return false;
+  if (alert.status === "acknowledged" && incident.status === "acknowledged") return false;
   if (incident.confirmed_at && incidentSeverityRank(incident) <= alertSeverityRank(incident.notified_severity)) return false;
   return deliveryBackoffEligible({ last_attempt_at: incident.last_attempt_at, backoff_delay_ms: incident.backoff_delay_ms }, nowMs);
 }

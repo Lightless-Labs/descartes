@@ -549,6 +549,48 @@ test("acknowledgement persists and suppresses re-notification while condition re
   assert.deepEqual(applied.notification_due_ids, []);
 });
 
+test("acknowledged alerts retry a failed incident created after acknowledgement", async () => {
+  const paths = await tempPaths();
+  const [alert] = await writeAlertRecords(paths, [{
+    id: "alert_post_ack_retry",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    title: "Memory pressure",
+    summary: "Memory remains high",
+    severity: "critical",
+    first_seen: "2026-05-28T00:00:00.000Z",
+    last_seen: "2026-05-28T00:00:00.000Z",
+    episode_started_at: "2026-05-28T00:00:00.000Z",
+    incidents: {},
+  }]);
+  await acknowledgeAlert(paths, alert.id, { now: "2026-05-28T00:01:00.000Z" });
+
+  const postAck = applyAlertCandidates(await readAlertRecords(paths), [{
+    id: alert.id,
+    rule_id: alert.rule_id,
+    fingerprint: alert.fingerprint,
+    incident_key: "post-ack-canary",
+    title: "Memory pressure",
+    summary: "A new failure arrived after acknowledgement",
+    severity: "critical",
+  }], { now: "2026-05-28T00:02:00.000Z" });
+  assert.equal(postAck.alerts[0].status, "acknowledged");
+  assert.deepEqual(postAck.notification_due_incidents, [{ alert_id: alert.id, incident_key: "post-ack-canary" }]);
+  await writeAlertRecords(paths, postAck.alerts);
+
+  await recordAlertDeliveryFailure(paths, alert.id, {
+    now: "2026-05-28T00:02:00.000Z",
+    incidentKey: "post-ack-canary",
+    reason: "notifier_unavailable",
+  });
+  const retry = applyAlertCandidates(await readAlertRecords(paths), [], {
+    now: "2026-05-28T00:03:00.001Z",
+    coveredAlertIds: new Set(),
+  });
+  assert.equal(retry.alerts[0].status, "acknowledged");
+  assert.deepEqual(retry.notification_due_incidents, [{ alert_id: alert.id, incident_key: "post-ack-canary" }]);
+});
+
 test("evaluate and persist alerts uses local history and daemon status without an LLM", async () => {
   const paths = await tempPaths();
   await appendMetricPoints(paths, [
