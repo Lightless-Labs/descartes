@@ -108,6 +108,73 @@ function compareDueAlerts(left, right) {
   return leftKey.localeCompare(rightKey);
 }
 
+function deliveryWorkKey(route, alert, entry) {
+  return `${route}\0${alert.id}\0${entry.incidentKey ?? alertEpisodeKey(alert)}`;
+}
+
+function deliveryPlanAllows(plan, route, alert, entry) {
+  return !plan || plan.allowed.has(deliveryWorkKey(route, alert, entry));
+}
+
+function deliveryUrgency(alert, entry) {
+  if (entry.storm === true) return 0;
+  const incident = alert.incidents?.[entry.incidentKey];
+  if (!incident) return 0;
+  const current = alertSeverityRank(incident.severity_max ?? alert.severity);
+  const notified = alertSeverityRank(incident.notified_severity);
+  if (!incident.last_attempt_at || current > notified) return 0;
+  return 1;
+}
+
+// The daemon has three delivery routes, but one per-tick adapter budget. Build the complete
+// route-qualified due set before any route spends a slot. The first assignment is explicit rather
+// than incidental: it reserves a slot for the highest-severity due work, so a lower-severity retry
+// flood cannot hide a critical item behind the session -> metric -> LLM call order.
+export function buildGlobalDeliveryPlan(evaluation, config = {}) {
+  const alerts = Array.isArray(evaluation?.alerts) ? evaluation.alerts : [];
+  const byId = new Map(alerts.map((alert) => [alert.id, alert]));
+  const due = [];
+  const add = (field, routeFor) => {
+    for (const entry of incidentEntries(evaluation, field)) {
+      const base = byId.get(entry.alertId);
+      if (!base) continue;
+      const alert = alertForIncident(base, entry);
+      const route = routeFor(alert, entry);
+      if (!route) continue;
+      due.push({ route, alert, entry, firstSeenMs: dueIncidentFirstSeenMs(alert, entry), urgency: deliveryUrgency(alert, entry) });
+    }
+  };
+
+  const metricFallbackEnabled = !config.enabled && !config.unavailable && !config.corrupt
+    && normalizeEnabledNamespaces(config.enabled_namespaces).includes("metric");
+  add("notification_due_incidents", (alert, entry) => {
+    if (entry.storm === true || ALL_DETERMINISTIC_LOCAL_DELIVERY_RULE_IDS.includes(alert.rule_id)) return "session";
+    const { namespace, hardExcluded } = classifyAlertNamespace(alert.rule_id);
+    return !entry.storm && !hardExcluded && namespace === "metric" && metricFallbackEnabled ? "metric" : undefined;
+  });
+  add("adjudication_due_incidents", (alert) => {
+    return config.enabled && classifyAlertEligibility(alert, config).eligible ? "llm" : undefined;
+  });
+
+  const ordered = due.sort((left, right) => {
+    const severity = alertSeverityRank(right.alert.severity) - alertSeverityRank(left.alert.severity);
+    if (severity !== 0) return severity;
+    if (left.urgency !== right.urgency) return left.urgency - right.urgency;
+    if (left.firstSeenMs !== right.firstSeenMs) return left.firstSeenMs - right.firstSeenMs;
+    return deliveryWorkKey(left.route, left.alert, left.entry).localeCompare(deliveryWorkKey(right.route, right.alert, right.entry));
+  });
+  const highest = ordered[0];
+  const assignments = highest
+    ? [highest, ...ordered.filter((item) => item !== highest)].slice(0, MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK)
+    : [];
+  return {
+    assignments,
+    allowed: new Set(assignments.map((item) => deliveryWorkKey(item.route, item.alert, item.entry))),
+    due_count: ordered.length,
+    deferred: Math.max(0, ordered.length - assignments.length),
+  };
+}
+
 function deliveryWasSuccessful(delivery) {
   return delivery?.status === "delivered" || delivery?.status === "cli_only" || delivery?.status === "recorded" || delivery?.delivered === true;
 }
@@ -729,6 +796,10 @@ export async function emitSessionAlertSignals(descartesPaths, evaluation, option
   const failed = [];
   let deferred = 0;
   for (const { entry, alert } of dueSessionAlerts) {
+    if (!deliveryPlanAllows(options.deliveryPlan, "session", alert, entry)) {
+      deferred += 1;
+      continue;
+    }
     const decision = buildSessionAlertNotificationDecision(alert);
     const episodeKey = incidentKeyForAlert(alert);
     try {
@@ -1059,6 +1130,10 @@ export async function emitMetricAlertFallbackSignals(descartesPaths, evaluation,
   const failed = [];
   let deferred = 0;
   for (const { entry, alert } of dueMetricAlerts) {
+    if (!deliveryPlanAllows(options.deliveryPlan, "metric", alert, entry)) {
+      deferred += 1;
+      continue;
+    }
     const decision = {
       notify: true,
       severity: alert.severity === "critical" ? "critical" : "warning",
@@ -1488,7 +1563,11 @@ export async function adjudicateAlertNotifications(descartesPaths, evaluation, o
   const orderedAlerts = [
     ...eligibleAlerts.filter((alert) => alert.severity === "critical"),
     ...eligibleAlerts.filter((alert) => alert.severity !== "critical"),
-  ];
+  ].filter((alert) => {
+    const entry = dueEntries.find((candidate) => candidate.alertId === alert.id
+      && (candidate.incidentKey ?? alertEpisodeKey(alert)) === incidentKeyForAlert(alert));
+    return entry ? deliveryPlanAllows(options.deliveryPlan, "llm", alertForIncident(alert, entry), entry) : !options.deliveryPlan;
+  });
 
   // The budget window uses raw `now` (see the REVERTED note above boundBudgetNow's former home for
   // why the monotonic anchor was removed). The backward-clock-step case is handled fail-closed by

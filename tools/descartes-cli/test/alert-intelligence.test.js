@@ -11,6 +11,7 @@ import {
   KNOWN_ALERT_NAMESPACES,
   adjudicateAlertNotifications,
   alertIntelligencePrompt,
+  buildGlobalDeliveryPlan,
   classifyAlertNamespace,
   emitMetricAlertFallbackSignals,
   emitSessionAlertSignals,
@@ -134,6 +135,84 @@ test("delivery attempts are capped per tick, prioritize a new critical incident,
     nowMs += 60_000;
   }
   assert.equal(firstAttempt.size, eventualCandidates.length, "every failed incident eventually receives an attempt");
+});
+
+test("global delivery queue reserves the highest-severity metric item ahead of eight session retries", async () => {
+  const paths = await tempPaths();
+  const warningCandidates = Array.from({ length: 8 }, (_, index) => ({
+    id: `session_retry_${index}`,
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: `session-${index}`,
+    incident_key: `session-${index}`,
+    severity: "warning",
+    title: "Session retry",
+    summary: "Session retry",
+    diagnostics: { observed_count: 1, mean_before: 4, z_score: -3, confidence_state: "high" },
+  }));
+  const criticalCandidate = {
+    id: "memory_critical",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    incident_key: "memory-critical",
+    severity: "critical",
+    title: "Memory critical",
+    summary: "Memory critical",
+  };
+  const applied = applyAlertCandidates([], [...warningCandidates, criticalCandidate], { now: "2026-10-09T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const evaluation = {
+    alerts: applied.alerts,
+    notification_due_incidents: applied.notification_due_incidents,
+    adjudication_due_incidents: applied.adjudication_due_incidents,
+  };
+  const plan = buildGlobalDeliveryPlan(evaluation, { enabled: false });
+  assert.equal(plan.assignments[0].alert.id, criticalCandidate.id);
+  assert.equal(plan.assignments[0].route, "metric");
+
+  const calls = [];
+  const delivery = async (_paths, _decision, options) => {
+    calls.push(options.alertId);
+    return { status: "error" };
+  };
+  const budget = { remaining: 8, attempted: 0 };
+  await emitMetricAlertFallbackSignals(paths, evaluation, { now: "2026-10-09T00:00:00.000Z", config: { enabled: false }, deliverNotification: delivery, deliveryBudget: budget, deliveryPlan: plan });
+  await emitSessionAlertSignals(paths, evaluation, { now: "2026-10-09T00:00:00.000Z", deliverNotification: delivery, deliveryBudget: budget, deliveryPlan: plan });
+  assert.equal(calls[0], criticalCandidate.id, "the critical metric delivery must be attempted in this tick");
+  assert.equal(calls.length, 8);
+});
+
+test("global delivery queue makes bounded progress for every due item across 10,000 ticks", () => {
+  const alerts = Array.from({ length: 257 }, (_, index) => ({
+    id: `alert_${index}`,
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    severity: index === 256 ? "critical" : "warning",
+    first_seen: new Date(Date.parse("2026-10-09T00:00:00.000Z") + index).toISOString(),
+    incidents: {
+      [`incident-${index}`]: {
+        first_seen: new Date(Date.parse("2026-10-09T00:00:00.000Z") + index).toISOString(),
+        severity_max: index === 256 ? "critical" : "warning",
+        notified_severity: null,
+        confirmed_at: null,
+        last_attempt_at: null,
+        status: "active",
+        payload: { severity: index === 256 ? "critical" : "warning", title: "Alert", summary: "Alert", diagnostics: {} },
+      },
+    },
+  }));
+  let remaining = alerts.map((alert) => ({ alert_id: alert.id, incident_key: Object.keys(alert.incidents)[0] }));
+  const attempted = new Set();
+  let ticks = 0;
+  while (remaining.length > 0 && ticks < 10_000) {
+    const evaluation = { alerts, notification_due_incidents: remaining };
+    const plan = buildGlobalDeliveryPlan(evaluation, { enabled: false });
+    for (const item of plan.assignments) attempted.add(`${item.alert.id}\0${item.entry.incidentKey}`);
+    const selected = new Set(plan.assignments.map((item) => `${item.alert.id}\0${item.entry.incidentKey}`));
+    remaining = remaining.filter((item) => !selected.has(`${item.alert_id}\0${item.incident_key}`));
+    ticks += 1;
+  }
+  assert.equal(remaining.length, 0);
+  assert.equal(attempted.size, alerts.length);
+  assert.ok(ticks <= Math.ceil(alerts.length / 8));
 });
 
 // Frozen, byte-for-byte copy of the pre-S13 alertIntelligencePrompt implementation (including the

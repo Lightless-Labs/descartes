@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK, readAlertIntelligenceConfig } from "./alert-intelligence.js";
+import { adjudicateAlertNotifications, buildGlobalDeliveryPlan, emitMetricAlertFallbackSignals, emitSessionAlertSignals, MAX_NOTIFICATION_DELIVERY_ATTEMPTS_PER_TICK, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -1897,6 +1897,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
     }
   }
+  // Finding F6: read alert-intelligence config ONCE and share it with every delivery route. The
+  // global plan below must see the same config as metric fallback and LLM adjudication.
+  const alertIntelligenceConfig = alerts ? (options.alertIntelligenceConfig ?? await readAlertIntelligenceConfig(descartesPaths)) : undefined;
+  const deliveryPlan = alerts ? buildGlobalDeliveryPlan(alerts, alertIntelligenceConfig) : undefined;
   // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
   // (Decision 2) and therefore structurally can NEVER reach adjudicateAlertNotifications' LLM path
   // below — left unmitigated, this milestone's first alerting slice would never actively notify the
@@ -1913,22 +1917,6 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // false / no alerts), not `[]` -- emitSessionAlertSignals returns a delivery-result object, not a
   // candidate array.
   const emitSessionAlerts = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
-  const sessionAlertDelivery = alerts && !alertPersistenceError && options.deliverSessionAlerts !== false
-    ? await safeCandidates(
-        "session-alert-delivery",
-        () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, deliveryBudget }),
-        undefined,
-      )
-    : undefined;
-  // Finding F6: read alert-intelligence config ONCE and share it with both the new deterministic
-  // metric-alert fallback below AND the existing adjudicateAlertNotifications call, so the two
-  // branches' enablement checks are atomic within one tick (an operator flipping
-  // `alerts intelligence enable` mid-tick can otherwise, in principle, land between two independent
-  // file reads and cause one alert to be delivered twice in the same tick, worded differently).
-  // Gated on `alerts` (mainAlerts) being truthy, same as every consumer below -- when
-  // options.evaluateAlerts is false there is nothing to adjudicate/deliver this tick, so this must
-  // not add a config read that wasn't there before.
-  const alertIntelligenceConfig = alerts ? (options.alertIntelligenceConfig ?? await readAlertIntelligenceConfig(descartesPaths)) : undefined;
   // Finding F6, additive: core resource ("metric" namespace: daemon./system./disk.) alerts have no
   // non-LLM delivery path today — emitSessionAlertSignals' allowlist deliberately excludes them
   // (see that function's own header comment), and adjudicateAlertNotifications (the LLM path)
@@ -1938,17 +1926,39 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // — see emitMetricAlertFallbackSignals' own header comment for the full invariant-preservation
   // rationale. Same DI-seam + safeCandidates discipline as sessionAlertDelivery immediately above.
   const emitMetricFallback = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
-  const metricAlertFallback = alerts && !alertPersistenceError && options.deliverMetricAlertFallback !== false
-    ? await safeCandidates(
-        "metric-alert-fallback",
-        () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig, deliveryBudget }),
-        undefined,
-      )
-    : undefined;
   const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
-  const alertIntelligence = alerts && !alertPersistenceError && options.adjudicateAlerts !== false
-    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig, deliveryBudget })
-    : undefined;
+  let sessionAlertDelivery;
+  let metricAlertFallback;
+  let alertIntelligence;
+  const routeOrder = [...new Set([
+    ...(deliveryPlan?.assignments ?? []).map((item) => item.route),
+    "session",
+    "metric",
+    "llm",
+  ])];
+  for (const route of routeOrder) {
+    if (route === "session") {
+      sessionAlertDelivery = alerts && !alertPersistenceError && options.deliverSessionAlerts !== false
+        ? await safeCandidates(
+            "session-alert-delivery",
+            () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, deliveryBudget, deliveryPlan }),
+            undefined,
+          )
+        : undefined;
+    } else if (route === "metric") {
+      metricAlertFallback = alerts && !alertPersistenceError && options.deliverMetricAlertFallback !== false
+        ? await safeCandidates(
+            "metric-alert-fallback",
+            () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig, deliveryBudget, deliveryPlan }),
+            undefined,
+          )
+        : undefined;
+    } else if (route === "llm") {
+      alertIntelligence = alerts && !alertPersistenceError && options.adjudicateAlerts !== false
+        ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig, deliveryBudget, deliveryPlan })
+        : undefined;
+    }
+  }
   return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 
