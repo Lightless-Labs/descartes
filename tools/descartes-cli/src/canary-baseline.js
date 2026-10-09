@@ -425,6 +425,13 @@ function hashCanaryId(canaryId) {
   return createHash("sha256").update(`canary.tripped:${canaryId}`).digest("hex").slice(0, 16);
 }
 
+function hashCanaryTripIncident(entry) {
+  return createHash("sha256")
+    .update(`canary.tripped.incident:${entry.canary_id}\0${entry.trip_reason}\0${entry.tripped_at_ts}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
 function hashCanaryTamperKey(key) {
   return createHash("sha256").update(`canary.tampered:${key}`).digest("hex").slice(0, 16);
 }
@@ -444,6 +451,10 @@ export function buildCanaryTrippedCandidates(entries = []) {
       id: alertId(CANARY_TRIPPED_RULE_ID, canaryIdHash),
       rule_id: CANARY_TRIPPED_RULE_ID,
       fingerprint: canaryIdHash,
+      // Episode identity is the observed change event, not the canary's stable alert identity.
+      // Consecutive trips for one canary therefore notify independently while diagnostic counters
+      // and timestamps remain non-semantic to alert-store episode logic.
+      incident_key: hashCanaryTripIncident(entry),
       severity: "critical",
       title: "Canary tripped",
       summary: "A decoy credential/persistence artifact was accessed or modified.",

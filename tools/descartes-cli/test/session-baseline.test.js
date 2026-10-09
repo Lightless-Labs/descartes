@@ -1206,9 +1206,9 @@ test("candidate shape matches the existing extraCandidates sources (buildPublicB
     last_observation: { ts: tickTs(0), count: 0, z_score: -10, mean_before: 20, stddev_before: 0.5 },
   });
   const [churnCandidate] = buildChurnCandidates([{ entity_key: "session.tmux.aaaaaaaaaaaaaaaa", prior_fingerprint: "1111111111111111", current_fingerprint: "2222222222222222" }]);
-  for (const candidate of [dropCandidate, churnCandidate]) {
-    assert.deepEqual(Object.keys(candidate).sort(), ["diagnostics", "evidence_refs", "fingerprint", "id", "rule_id", "severity", "summary", "title"]);
-  }
+  assert.deepEqual(Object.keys(dropCandidate).sort(), ["diagnostics", "evidence_refs", "fingerprint", "id", "rule_id", "severity", "summary", "title"]);
+  assert.deepEqual(Object.keys(churnCandidate).sort(), ["diagnostics", "evidence_refs", "fingerprint", "id", "incident_key", "rule_id", "severity", "summary", "title"]);
+  assert.match(churnCandidate.incident_key, /^churn:/);
 });
 
 test("sanitized-diagnostics assertion: every diagnostics field for both candidate types survives sanitizeDiagnostics() unchanged (numeric/closed-enum/hash only)", () => {

@@ -10,9 +10,11 @@ const execFileAsync = promisify(execFile);
 export const NOTIFICATION_CHANNELS = new Set(["cli", "macos-desktop", "macos-native", "linux-desktop", "syslog"]);
 
 export function resolveNotificationDeliveryPaths(descartesPaths) {
+  const alertsDir = path.join(descartesPaths.stateDir, "alerts");
   return {
     configFile: path.join(descartesPaths.configDir, "notifications.json"),
-    auditFile: path.join(descartesPaths.stateDir, "alerts", "notification-delivery.jsonl"),
+    auditDir: alertsDir,
+    auditFile: path.join(alertsDir, "notification-delivery.jsonl"),
   };
 }
 
@@ -74,6 +76,7 @@ export function normalizeNotificationPayload(decision = {}, options = {}) {
   return {
     alert_id: options.alertId ? String(options.alertId) : undefined,
     rule_id: options.ruleId ? String(options.ruleId) : undefined,
+    episode_key: options.episodeKey ? String(options.episodeKey) : undefined,
     severity,
     title: clampString(decision.title, 80) || "Descartes alert",
     body: clampString(decision.body, 240) || "Descartes noticed a local system alert.",
@@ -238,56 +241,172 @@ function commandForPayload(channel, payload, options = {}) {
   return { unavailable: `Unsupported notification channel: ${channel}` };
 }
 
-async function appendDeliveryAudit(descartesPaths, record) {
-  const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  await ensureParent(auditFile);
-  await fs.appendFile(auditFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  return record;
+export const MAX_NOTIFICATION_DELIVERY_AUDIT_RECORDS = 1000;
+// Operator policy (O): retain complete dated audit segments up to this total byte cap.
+export const MAX_NOTIFICATION_DELIVERY_AUDIT_BYTES = 50 * 1024 * 1024;
+
+function parseAuditRecords(contents) {
+  return contents.split("\n").filter((line) => line.trim()).map((line) => {
+    try { return JSON.parse(line); } catch { return undefined; }
+  }).filter(Boolean);
 }
 
-export async function readNotificationDeliveryAudit(descartesPaths) {
-  const { auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  let contents;
+function datedSegmentFile(auditDir, day) {
+  return path.join(auditDir, `notification-delivery-${day}.jsonl`);
+}
+
+function isDatedSegment(name) {
+  return /^notification-delivery-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name);
+}
+
+function isOrphanArchive(name) {
+  return /^notification-delivery\.jsonl\..+\.archive$/.test(name);
+}
+
+async function readAuditFile(file) {
   try {
-    contents = await fs.readFile(auditFile, "utf8");
+    return parseAuditRecords(await fs.readFile(file, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const records = [];
-  for (const line of contents.split("\n")) {
-    if (!line.trim()) continue;
+}
+
+async function auditFilesInReadOrder(descartesPaths) {
+  const { auditDir, auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  let entries;
+  try {
+    entries = await fs.readdir(auditDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const names = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+  const files = names.has(path.basename(auditFile)) ? [auditFile] : [];
+  const archives = entries.filter((entry) => entry.isFile() && isOrphanArchive(entry.name)).map((entry) => entry.name).sort();
+  files.push(...archives.map((name) => path.join(auditDir, name)));
+  files.push(...entries.filter((entry) => entry.isFile() && isDatedSegment(entry.name)).map((entry) => entry.name).sort().map((name) => path.join(auditDir, name)));
+  return files;
+}
+
+async function pruneNotificationDeliveryAudit(descartesPaths, now, options = {}) {
+  const { auditDir, auditFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes >= 0
+    ? options.maxBytes
+    : MAX_NOTIFICATION_DELIVERY_AUDIT_BYTES;
+  let entries;
+  try {
+    entries = await fs.readdir(auditDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const segmentMatch = /^notification-delivery-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(entry.name);
+    const archive = isOrphanArchive(entry.name);
+    const legacy = entry.name === path.basename(auditFile);
+    if (!segmentMatch && !archive && !legacy) continue;
+    const file = path.join(auditDir, entry.name);
+    let initialStat;
     try {
-      records.push(JSON.parse(line));
-    } catch {
-      // Ignore corrupt local audit lines rather than breaking alert delivery.
+      initialStat = await fs.stat(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    candidates.push({ file, name: entry.name, initialStat });
+  }
+  // The compatibility file predates dated segments and is therefore always the oldest retention
+  // candidate, even though its filename would sort after a dated segment lexicographically.
+  const legacyName = path.basename(auditFile);
+  candidates.sort((left, right) => {
+    const leftRank = left.name === legacyName ? 0 : isOrphanArchive(left.name) ? 1 : 2;
+    const rightRank = right.name === legacyName ? 0 : isOrphanArchive(right.name) ? 1 : 2;
+    return leftRank - rightRank || left.name.localeCompare(right.name);
+  });
+  let totalBytes = candidates.reduce((sum, candidate) => sum + candidate.initialStat.size, 0);
+
+  // Snapshot all candidates before a paused writer can race the unlink phase. appendDeliveryAudit
+  // passes this hook only for tests and diagnostics; production callers leave it undefined.
+  await options.beforeAuditRetention?.({ auditDir, segmentFile: options.segmentFile, now });
+
+  for (const { file, initialStat } of candidates) {
+    if (totalBytes <= maxBytes) break;
+    // Never remove the dated segment this process appended during this tick, even if a wall-clock
+    // rollback made its name sort before older segments.
+    if (file === options.segmentFile) continue;
+    let latestStat;
+    try {
+      latestStat = await fs.stat(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        totalBytes -= initialStat.size;
+        continue;
+      }
+      throw error;
+    }
+    if (latestStat.mtimeMs !== initialStat.mtimeMs || latestStat.size !== initialStat.size) continue;
+    try {
+      await fs.unlink(file);
+      totalBytes -= latestStat.size;
+    } catch (error) {
+      if (error?.code === "ENOENT") totalBytes -= latestStat.size;
+      else throw error;
     }
   }
-  return records;
+}
+
+async function appendDeliveryAudit(descartesPaths, record, options = {}) {
+  const { auditDir } = resolveNotificationDeliveryPaths(descartesPaths);
+  const segmentFile = datedSegmentFile(auditDir, normalizeIso(record.ts, "audit timestamp").slice(0, 10));
+  await ensureParent(segmentFile);
+  // fs.appendFile opens and closes this dated segment for every row. There is no shared descriptor,
+  // inode rename, read/modify/write, compaction, or replacement window for a concurrent writer.
+  await fs.appendFile(segmentFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  await pruneNotificationDeliveryAudit(descartesPaths, record.ts, { ...options, segmentFile });
+  return record;
+}
+
+export async function readNotificationDeliveryAudit(descartesPaths) {
+  const files = await auditFilesInReadOrder(descartesPaths);
+  const records = [];
+  for (const file of files) records.push(...await readAuditFile(file));
+  return records.map((record, index) => ({ record, index, ts: Date.parse(record?.ts) }))
+    .sort((left, right) => {
+      const leftValid = Number.isFinite(left.ts);
+      const rightValid = Number.isFinite(right.ts);
+      if (leftValid && rightValid && left.ts !== right.ts) return left.ts - right.ts;
+      if (leftValid !== rightValid) return leftValid ? -1 : 1;
+      return left.index - right.index;
+    })
+    .map(({ record }) => record);
 }
 
 export async function deliverNotificationDecision(descartesPaths, decision, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
   const config = options.config ?? await readNotificationDeliveryConfig(descartesPaths);
   const payload = normalizeNotificationPayload(decision, options);
+  const append = (record) => appendDeliveryAudit(descartesPaths, record, options);
   if (decision?.notify !== true) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "skipped", reason: "notify_false", channel: config.channel, payload });
+    return append({ ts: now, status: "skipped", reason: "notify_false", channel: config.channel, payload });
   }
   if (!config.enabled) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "disabled", channel: config.channel, payload });
+    return append({ ts: now, status: "disabled", channel: config.channel, payload });
   }
   const commandSpec = commandForPayload(config.channel, payload, { ...options, config });
   if (!commandSpec) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "cli_only", channel: config.channel, payload });
+    return append({ ts: now, status: "cli_only", channel: config.channel, payload });
   }
   if (commandSpec.unavailable) {
-    return appendDeliveryAudit(descartesPaths, { ts: now, status: "unavailable", channel: config.channel, reason: commandSpec.unavailable, payload });
+    return append({ ts: now, status: "unavailable", channel: config.channel, reason: commandSpec.unavailable, payload });
   }
 
   const runner = options.runner ?? execFileAsync;
   try {
     await runner(commandSpec.command, commandSpec.args, { timeout: options.timeoutMs ?? 5000, maxBuffer: 1024 * 64 });
-    return appendDeliveryAudit(descartesPaths, {
+    return append({
       ts: now,
       status: "delivered",
       channel: config.channel,
@@ -302,7 +421,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
     // follow-up). Only a spawn failure (`open` itself unrunnable — a string `error.code` like ENOENT)
     // or a timeout/kill is a real error.
     if (commandSpec.best_effort_status && typeof error?.code === "number") {
-      return appendDeliveryAudit(descartesPaths, {
+      return append({
         ts: now,
         status: "delivered",
         delivery_confidence: "best_effort",
@@ -311,7 +430,7 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
         payload,
       });
     }
-    return appendDeliveryAudit(descartesPaths, {
+    return append({
       ts: now,
       status: "error",
       channel: config.channel,

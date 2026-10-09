@@ -11,6 +11,7 @@ import {
   KNOWN_ALERT_NAMESPACES,
   adjudicateAlertNotifications,
   alertIntelligencePrompt,
+  deliverDueAlertNotifications,
   classifyAlertNamespace,
   emitMetricAlertFallbackSignals,
   emitSessionAlertSignals,
@@ -25,6 +26,7 @@ import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "../src/canary-b
 import { containmentRecommendationRuleIds } from "../src/containment-recommend.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
 import { readNotificationDeliveryAudit } from "../src/notification-delivery.js";
+import { applyAlertCandidates, readAlertRecords, writeAlertRecords } from "../src/alert-store.js";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "../src/peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "../src/service-baseline.js";
@@ -67,6 +69,190 @@ function alert(overrides = {}) {
     ...overrides,
   };
 }
+
+test("a failing deterministic route attempts one item per tick and backs off every skipped incident", async () => {
+  const paths = await tempPaths();
+  const candidates = Array.from({ length: 255 }, (_, index) => ({
+    id: `alert_retry_${String(index).padStart(3, "0")}`,
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: `incident-${index}`,
+    incident_key: `incident-${index}`,
+    severity: "warning",
+    title: "Session count deviation",
+    summary: "Session count dropped.",
+    diagnostics: { observed_count: 1, mean_before: 4, z_score: -3, confidence_state: "high" },
+  }));
+  candidates.push({
+    id: "alert_retry_critical",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: "critical",
+    incident_key: "critical",
+    severity: "critical",
+    title: "Critical session count deviation",
+    summary: "Session count collapsed.",
+    diagnostics: { observed_count: 0, mean_before: 4, z_score: -8, confidence_state: "high" },
+  });
+  const applied = applyAlertCandidates([], candidates, { now: "2026-10-09T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const firstTickCalls = [];
+  const firstTick = await emitSessionAlertSignals(paths, {
+    alerts: applied.alerts,
+    notification_due_incidents: applied.notification_due_incidents,
+  }, {
+    now: "2026-10-09T00:00:00.000Z",
+    deliverNotification: async (_paths, _decision, options) => {
+      firstTickCalls.push(options.alertId);
+      return { status: "error" };
+    },
+  });
+  assert.equal(firstTick.failed.length, 256, "every due incident is either attempted or recorded as a skipped route failure");
+  assert.equal(firstTickCalls.length, 1, "a failing route gets one notifier timeout per tick");
+  assert.equal(firstTickCalls[0], "alert_retry_critical", "critical delivery is prioritized over older warnings");
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.every((record) => Object.values(record.incidents).every((incident) => incident.delivery_failure_count === 1)), true);
+
+  const secondTickCalls = [];
+  const secondTick = await emitSessionAlertSignals(paths, {
+    alerts: persisted,
+    notification_due_incidents: applied.notification_due_incidents,
+  }, {
+    now: "2026-10-09T00:01:00.001Z",
+    deliverNotification: async (_paths, _decision, options) => {
+      secondTickCalls.push(options.alertId);
+      return { status: "error" };
+    },
+  });
+  assert.equal(secondTick.failed.length, 256);
+  assert.equal(secondTickCalls.length, 1, "the same route gets at most one timeout on the next tick too");
+});
+
+test("global delivery order puts a new deterministic critical ahead of older failed LLM criticals", async () => {
+  const paths = await tempPaths();
+  const llmAlerts = Array.from({ length: 8 }, (_, index) => ({
+    id: `llm_retry_${index}`,
+    rule_id: "system.memory.sustained_high",
+    severity: "critical",
+    first_seen: `2026-10-08T00:0${index}:00.000Z`,
+    incidents: { [`llm-${index}`]: {
+      first_seen: `2026-10-08T00:0${index}:00.000Z`, severity_max: "critical", notified_severity: "critical",
+      confirmed_at: null, last_attempt_at: "2026-10-08T12:00:00.000Z", backoff_delay_ms: 0, status: "active",
+      payload: { severity: "critical", title: "Old model retry", summary: "Old model retry", diagnostics: {} },
+    } },
+  }));
+  const calls = [];
+  for (let tick = 0; tick < 3; tick += 1) {
+    const deterministic = {
+      id: `session_critical_${tick}`, rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical", first_seen: `2026-10-09T00:0${tick}:00.000Z`,
+      incidents: { session: {
+        first_seen: `2026-10-09T00:0${tick}:00.000Z`, severity_max: "critical", notified_severity: null,
+        confirmed_at: null, last_attempt_at: null, status: "active",
+        payload: { severity: "critical", title: "New deterministic critical", summary: "New deterministic critical", diagnostics: {} },
+      } },
+    };
+    const evaluation = {
+      alerts: [...llmAlerts, deterministic],
+      notification_due_incidents: [{ alert_id: deterministic.id, incident_key: "session" }],
+      adjudication_due_incidents: llmAlerts.map((alert, index) => ({ alert_id: alert.id, incident_key: `llm-${index}` })),
+    };
+    const delivered = await deliverDueAlertNotifications(paths, evaluation, {
+      now: `2026-10-09T00:0${tick}:00.000Z`,
+      config: { enabled: true, enabled_namespaces: ["metric"], max_calls_per_hour: 20, critical_reservation: 0 },
+      createSession: async () => { throw new Error("LLM unavailable"); },
+      deliverNotification: async (_paths, _decision, options) => {
+        calls.push(options.alertId);
+        return { status: "delivered" };
+      },
+    });
+    assert.equal(delivered.alertIntelligence.route_failed, true);
+    assert.equal(calls.at(-1), deterministic.id, `tick ${tick}: deterministic delivery must survive the failed LLM route`);
+  }
+  assert.deepEqual(calls, ["session_critical_0", "session_critical_1", "session_critical_2"], "the deterministic route must deliver on every tick");
+  assert.equal(calls.filter((id) => llmAlerts.some((alert) => alert.id === id)).length, 0, "LLM unavailability must not consume a second timeout");
+});
+
+test("failing routes remain bounded across 10,000 modeled ticks", async () => {
+  const paths = await tempPaths();
+  const alerts = [{
+    id: "alert_0", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "critical",
+    first_seen: "2026-10-09T00:00:00.000Z",
+    incidents: { "incident-0": {
+      first_seen: "2026-10-09T00:00:00.000Z", severity_max: "critical", notified_severity: null,
+      confirmed_at: null, status: "active", payload: { severity: "critical", title: "Alert", summary: "Alert", diagnostics: {} },
+    } },
+  }];
+  await writeAlertRecords(paths, alerts);
+  const evaluation = { alerts, notification_due_incidents: [{ alert_id: "alert_0", incident_key: "incident-0" }] };
+  let calls = 0;
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    for (let tick = 0; tick < 10_000; tick += 1) {
+      await deliverDueAlertNotifications(paths, evaluation, {
+        now: new Date(Date.parse("2026-10-09T00:00:00.000Z") + tick * 60_000).toISOString(),
+        config: { enabled: false },
+        deliverNotification: async () => { calls += 1; throw new Error("deterministic route unavailable"); },
+      });
+    }
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert(calls > 0);
+  assert(calls < 1_000, `persisted backoff must bound retries across 10,000 ticks; got ${calls}`);
+});
+
+test("a persisted failing session route batches 256 skips and still delivers a metric critical promptly", async () => {
+  const paths = await tempPaths();
+  const sessionAlerts = Array.from({ length: 256 }, (_, index) => ({
+    id: `session_retry_${String(index).padStart(3, "0")}`,
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: `session-${index}`,
+    incident_key: `session-${index}`,
+    severity: "critical",
+    title: "Session count deviation",
+    summary: "Session count dropped.",
+    diagnostics: { observed_count: 0, mean_before: 4, z_score: -8, confidence_state: "high" },
+  }));
+  const metricAlert = {
+    id: "metric_retry_critical",
+    rule_id: "system.memory.sustained_high",
+    fingerprint: "global",
+    incident_key: "metric",
+    severity: "critical",
+    title: "Critical memory pressure",
+    summary: "Memory stayed high.",
+    diagnostics: {},
+  };
+  const applied = applyAlertCandidates([], [...sessionAlerts, metricAlert], { now: "2026-10-09T00:00:00.000Z" });
+  await writeAlertRecords(paths, applied.alerts);
+  const evaluation = {
+    alerts: applied.alerts,
+    notification_due_incidents: applied.notification_due_incidents,
+  };
+  const calls = [];
+  const storeWrites = [];
+  const started = performance.now();
+  const result = await deliverDueAlertNotifications(paths, evaluation, {
+    now: "2026-10-09T00:00:00.000Z",
+    config: { enabled: false, enabled_namespaces: ["metric"] },
+    onAlertStoreWrite: (outcomes) => storeWrites.push(outcomes),
+    deliverNotification: async (_paths, _decision, options) => {
+      calls.push(options.alertId);
+      if (options.alertId.startsWith("session_retry_")) return { status: "error" };
+      return { status: "delivered" };
+    },
+  });
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(result.metricAlertFallback.fired.includes("metric_retry_critical"), true);
+  assert.equal(calls.includes("metric_retry_critical"), true);
+  assert(elapsedMs < 1_000, `the healthy metric route took ${elapsedMs.toFixed(1)}ms`);
+  assert.equal(storeWrites.length, 1, "one alert-store transaction must persist the whole delivery phase");
+  assert.equal(storeWrites[0].length, 257, "the transaction includes the failed route item and every breaker skip");
+  const persisted = await readAlertRecords(paths);
+  assert.equal(persisted.length, 257);
+  assert.equal(persisted.find((alert) => alert.id === "metric_retry_critical").incidents.metric.confirmed_at, "2026-10-09T00:00:00.000Z");
+  assert.equal(persisted.filter((alert) => alert.rule_id === SESSION_COUNT_DROP_RULE_ID).every((alert) => alert.incidents[Object.keys(alert.incidents)[0]].delivery_failure_count === 1), true);
+});
 
 // Frozen, byte-for-byte copy of the pre-S13 alertIntelligencePrompt implementation (including the
 // exact context key order and helper field selection), used ONLY as a golden reference for the
@@ -393,6 +579,51 @@ test("enabled alert intelligence wakes fake LLM and records audited decision", a
   assert.equal(audit[0].status, "ok");
   assert.equal(audit[0].decision.notify, true);
   assert.equal(audit[0].decision.title, "Memory pressure is high");
+});
+
+test("notify:false is adjudication state, not delivery state, and reopens only for a new producer episode", async () => {
+  const paths = await tempPaths();
+  const prompts = [];
+  const candidate = alert({ diagnostics: { identity_hash: "identity-a", observed_at: "2026-10-06T00:00:00.000Z" } });
+  const first = applyAlertCandidates([], [candidate], { now: "2026-10-06T00:00:00.000Z" });
+  await writeAlertRecords(paths, first.alerts);
+  const config = normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 5, critical_reservation: 0 });
+  const decision = { notify: false, severity: "warning", title: "No notification", body: "Not actionable", reason: "stable" };
+  const firstRun = await adjudicateAlertNotifications(paths, {
+    alerts: first.alerts,
+    adjudication_due_ids: first.adjudication_due_ids,
+    notification_due_ids: first.notification_due_ids,
+  }, {
+    now: "2026-10-06T00:01:00.000Z",
+    config,
+    createSession: fakeCreateSession(prompts, decision),
+  });
+  assert.equal(firstRun.decisions[0].decision.notify, false);
+  assert.equal((await readAlertRecords(paths))[0].episode_notified_at, null);
+  assert.equal((await readAlertRecords(paths))[0].adjudication.notify, false);
+
+  const unchanged = applyAlertCandidates(await readAlertRecords(paths), [candidate], { now: "2026-10-06T00:02:00.000Z" });
+  assert.deepEqual(unchanged.notification_due_ids, [candidate.id], "notify:false never proves delivery");
+  assert.deepEqual(unchanged.adjudication_due_ids, [], "unchanged evidence is not re-adjudicated");
+  const quietRun = await adjudicateAlertNotifications(paths, unchanged, {
+    now: "2026-10-06T00:02:00.000Z",
+    config,
+    createSession: async () => { throw new Error("unchanged notify:false must not wake the model"); },
+  });
+  assert.equal(quietRun.status, "no_due_alerts");
+
+  const diagnosticOnly = applyAlertCandidates(await readAlertRecords(paths), [{
+    ...candidate,
+    diagnostics: { identity_hash: "identity-b", observed_at: "2026-10-06T00:03:00.000Z" },
+  }], { now: "2026-10-06T00:03:00.000Z" });
+  assert.deepEqual(diagnosticOnly.adjudication_due_ids, []);
+
+  const changed = applyAlertCandidates(await readAlertRecords(paths), [{
+    ...candidate,
+    incident_key: "identity-b",
+    diagnostics: { identity_hash: "identity-b", observed_at: "2026-10-06T00:03:00.000Z" },
+  }], { now: "2026-10-06T00:03:00.000Z" });
+  assert.deepEqual(changed.adjudication_due_ids, [candidate.id]);
 });
 
 test("alert intelligence respects max calls per hour", async () => {
@@ -1142,6 +1373,43 @@ test("S13 I/O hardening: a non-ENOENT budget-seed audit read failure (audit path
   assert.deepEqual(result.decisions, []);
 });
 
+test("an unreadable LLM audit records a delivery failure and applies backoff across daemon ticks", async () => {
+  const paths = await tempPaths();
+  const { auditFile } = resolveAlertIntelligencePaths(paths);
+  await fs.mkdir(auditFile, { recursive: true });
+  const config = normalizeAlertIntelligenceConfig({ enabled: true, max_calls_per_hour: 3, critical_reservation: 0 });
+  const candidate = alert({ id: "alert_audit_retry", rule_id: "system.memory.sustained_high" });
+  const ticks = [
+    "2026-10-09T00:00:00.000Z",
+    "2026-10-09T00:00:30.000Z",
+    "2026-10-09T00:01:01.000Z",
+  ];
+
+  let evaluation = applyAlertCandidates([], [candidate], { now: ticks[0] });
+  await writeAlertRecords(paths, evaluation.alerts);
+
+  const first = await deliverDueAlertNotifications(paths, evaluation, { now: ticks[0], config });
+  let persisted = (await readAlertRecords(paths))[0];
+  assert.equal(first.alertIntelligence.status, "audit_unavailable");
+  assert.equal(first.items.length, 1);
+  assert.equal(persisted.incidents.default.delivery_failure_count, 1);
+  assert.equal(persisted.incidents.default.last_attempt_at, ticks[0]);
+  assert.equal(persisted.incidents.default.next_attempt_at, "2026-10-09T00:01:00.000Z");
+
+  evaluation = applyAlertCandidates(await readAlertRecords(paths), [candidate], { now: ticks[1] });
+  const second = await deliverDueAlertNotifications(paths, evaluation, { now: ticks[1], config });
+  persisted = (await readAlertRecords(paths))[0];
+  assert.equal(second.items.length, 0, "the failed LLM route must honor persisted backoff on the next tick");
+  assert.equal(persisted.incidents.default.delivery_failure_count, 1);
+
+  evaluation = applyAlertCandidates(await readAlertRecords(paths), [candidate], { now: ticks[2] });
+  const third = await deliverDueAlertNotifications(paths, evaluation, { now: ticks[2], config });
+  persisted = (await readAlertRecords(paths))[0];
+  assert.equal(third.alertIntelligence.status, "audit_unavailable");
+  assert.equal(third.items.length, 1, "the failure becomes due again only after backoff expires");
+  assert.equal(persisted.incidents.default.delivery_failure_count, 2);
+});
+
 test("S13 I/O hardening: an appendAuditRecord failure does not crash adjudicate, BREAKS after the first failure (does not continue to a second due alert), and surfaces audit_write_degraded (never 'ok')", async () => {
   const paths = await tempPaths();
   await writeAlertIntelligenceConfig(paths, { enabled: true, max_calls_per_hour: 5, critical_reservation: 0 }, { now: "2026-07-14T00:00:00.000Z" });
@@ -1430,7 +1698,7 @@ test("emitSessionAlertSignals fires ONLY for session.* rule_ids — a due non-se
   assert.equal(deliveries[0].ruleId, SESSION_COUNT_DROP_RULE_ID);
 });
 
-test("emitSessionAlertSignals respects cooldown: an alert absent from notification_due_ids (a second tick within the cooldown window, per applyAlertCandidates) does not re-deliver", async () => {
+test("emitSessionAlertSignals only delivers alerts present in the episode-qualified due set", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const sessionAlert = alert({ id: "alert_session_count_drop", rule_id: SESSION_COUNT_DROP_RULE_ID, severity: "warning", diagnostics: { observed_count: 5, mean_before: 20, stddev_before: 0.5, z_score: -4, confidence_state: "established" } });
@@ -1439,11 +1707,47 @@ test("emitSessionAlertSignals respects cooldown: an alert absent from notificati
   const first = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [sessionAlert.id] }, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
   assert.deepEqual(first.fired, [sessionAlert.id]);
 
-  // A second tick within cooldown: applyAlertCandidates would NOT include this id in
-  // notification_due_ids again (see alert-store.js's notificationDue) — simulated here directly.
+  // A persistent second tick: applyAlertCandidates would NOT include this id in
+  // notification_due_ids again — simulated here directly.
   const second = await emitSessionAlertSignals(paths, { alerts: [sessionAlert], notification_due_ids: [] }, { now: "2026-07-14T00:05:00.000Z", deliverNotification });
   assert.deepEqual(second.fired, []);
   assert.equal(deliveries.length, 1, "must not re-deliver within the cooldown window");
+});
+
+test("deterministic local delivery follows episode notification state across persistence and escalation", async () => {
+  const paths = await tempPaths();
+  const deliveries = [];
+  const deliverNotification = async (descartesPaths, decision, opts) => {
+    deliveries.push({ decision, opts });
+    return { status: "recorded" };
+  };
+  const candidate = {
+    id: "alert_session_episode",
+    rule_id: SESSION_COUNT_DROP_RULE_ID,
+    fingerprint: "global",
+    severity: "warning",
+    title: "Session count deviation",
+    summary: "Session count is below baseline.",
+    diagnostics: { observed_count: 5, mean_before: 20, z_score: -4, confidence_state: "established" },
+  };
+
+  let state = [];
+  const first = applyAlertCandidates(state, [candidate], { now: "2026-07-14T00:01:00.000Z" });
+  await writeAlertRecords(paths, first.alerts);
+  await emitSessionAlertSignals(paths, first, { now: "2026-07-14T00:01:00.000Z", deliverNotification });
+  state = await readAlertRecords(paths);
+
+  const persistent = applyAlertCandidates(state, [{ ...candidate, summary: "Still below baseline." }], { now: "2026-07-15T00:01:00.000Z" });
+  state = persistent.alerts;
+  await emitSessionAlertSignals(paths, persistent, { now: "2026-07-15T00:01:00.000Z", deliverNotification });
+
+  const escalated = applyAlertCandidates(state, [{ ...candidate, severity: "critical", summary: "Session count collapsed." }], { now: "2026-07-15T00:02:00.000Z" });
+  await writeAlertRecords(paths, escalated.alerts);
+  await emitSessionAlertSignals(paths, escalated, { now: "2026-07-15T00:02:00.000Z", deliverNotification });
+
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[0].decision.severity, "warning");
+  assert.equal(deliveries[1].decision.severity, "critical");
 });
 
 test("emitSessionAlertSignals: last_notified/cooldown_until being present on the alert record is NOT itself treated as delivery evidence — only an actual deliverNotification call counts", async () => {
@@ -1478,7 +1782,7 @@ test("emitSessionAlertSignals: zero due ids -> [] with no deliverNotification ca
   assert.equal(deliverCalled, false);
 });
 
-test("emitSessionAlertSignals: a throwing deliverNotification (I/O failure) DEGRADES that single delivery — never aborts the tick — and later due alerts still get delivered", async () => {
+test("emitSessionAlertSignals: a throwing deliverNotification opens the route circuit for the rest of the tick", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const tamperedAlert = alert({
@@ -1504,10 +1808,9 @@ test("emitSessionAlertSignals: a throwing deliverNotification (I/O failure) DEGR
     { alerts: [tamperedAlert, okAlert], notification_due_ids: [tamperedAlert.id, okAlert.id] },
     { now: "2026-07-14T00:01:00.000Z", deliverNotification },
   );
-  assert.deepEqual(result.fired, [okAlert.id], "the failing canary.tampered delivery is skipped, not fired");
-  assert.deepEqual(result.failed, [tamperedAlert.id]);
-  assert.equal(deliveries.length, 1, "the later due alert must still be delivered despite the earlier throw");
-  assert.equal(deliveries[0].ruleId, SESSION_COUNT_DROP_RULE_ID);
+  assert.deepEqual(result.fired, [], "the route circuit prevents later deliveries after the first failure");
+  assert.deepEqual(result.failed, [tamperedAlert.id, okAlert.id]);
+  assert.equal(deliveries.length, 0, "the later due alert must not consume another notifier timeout");
 });
 
 // --- daybreak-blue #6 (MEDIUM): a RESOLVED (non-throwing) failed delivery must not be reported as
@@ -1545,7 +1848,7 @@ test("a resolved delivery with status 'unavailable' is reported as failed, not f
   assert.deepEqual(result.failed, [current.id]);
 });
 
-test("resolved delivery statuses undefined/recorded/delivered/skipped/disabled/cli_only all remain fired (non-regression)", async () => {
+test("only successful delivery statuses fire; skipped/disabled remain due", async () => {
   const paths = await tempPaths();
   const statuses = [undefined, "recorded", "delivered", "skipped", "disabled", "cli_only"];
   for (const status of statuses) {
@@ -1559,8 +1862,9 @@ test("resolved delivery statuses undefined/recorded/delivered/skipped/disabled/c
       now: "2026-09-04T00:00:00.000Z",
       deliverNotification: async () => (status === undefined ? undefined : { status }),
     });
-    assert.deepEqual(result.fired, [current.id], `status ${status} must stay fired`);
-    assert.deepEqual(result.failed, [], `status ${status} must not be reported as failed`);
+    const expectedFailed = status === "skipped" || status === "disabled";
+    assert.deepEqual(result.fired, expectedFailed ? [] : [current.id], `status ${status} delivery classification`);
+    assert.deepEqual(result.failed, expectedFailed ? [current.id] : [], `status ${status} delivery classification`);
   }
 });
 
@@ -1730,7 +2034,7 @@ test("emitMetricAlertFallbackSignals fires ONLY for metric-namespace rule_ids �
   assert.equal(deliveries[0].ruleId, "system.memory.sustained_high");
 });
 
-test("emitMetricAlertFallbackSignals: a throwing deliverNotification (I/O failure) DEGRADES that single delivery — never aborts the tick — and later due metric alerts still get delivered", async () => {
+test("emitMetricAlertFallbackSignals: a throwing deliverNotification opens the route circuit for the rest of the tick", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const badAlert = alert({ id: "alert_disk", rule_id: "disk.space.high_used_fraction", severity: "critical" });
@@ -1745,10 +2049,9 @@ test("emitMetricAlertFallbackSignals: a throwing deliverNotification (I/O failur
     { alerts: [badAlert, okAlert], notification_due_ids: [badAlert.id, okAlert.id] },
     { now: "2026-07-14T00:01:00.000Z", config: { enabled: false }, deliverNotification },
   );
-  assert.deepEqual(result.fired, [okAlert.id]);
-  assert.deepEqual(result.failed, [badAlert.id]);
-  assert.equal(deliveries.length, 1, "the later due alert must still be delivered despite the earlier throw");
-  assert.equal(deliveries[0].ruleId, "system.memory.sustained_high");
+  assert.deepEqual(result.fired, []);
+  assert.deepEqual(result.failed, [badAlert.id, okAlert.id]);
+  assert.equal(deliveries.length, 0, "the later due alert must not consume another notifier timeout");
 });
 
 test("emitMetricAlertFallbackSignals: zero due ids -> [] with no deliverNotification call at all", async () => {
@@ -1985,7 +2288,7 @@ test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due 
   assert.equal(deliveries.length, 0);
 });
 
-test("emitSessionAlertSignals respects cooldown for peer.count_spike too: an alert absent from notification_due_ids does not re-deliver", async () => {
+test("emitSessionAlertSignals respects the episode-qualified due set for peer.count_spike", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const peerAlert = alert({ id: "alert_peer_count_spike", rule_id: PEER_COUNT_SPIKE_RULE_ID, severity: "warning", diagnostics: { observed_count: 8, mean_before: 2, stddev_before: 0.5, z_score: 12, confidence_state: "established" } });
@@ -2247,7 +2550,7 @@ test("emitSessionAlertSignals fires ONLY for the allowlisted rule_ids — a due 
   assert.equal(deliveries.length, 0);
 });
 
-test("emitSessionAlertSignals respects cooldown for service.disappeared too: an alert absent from notification_due_ids does not re-deliver", async () => {
+test("emitSessionAlertSignals respects the episode-qualified due set for service.disappeared", async () => {
   const paths = await tempPaths();
   const deliveries = [];
   const serviceAlert = alert({ id: "alert_service_disappeared", rule_id: SERVICE_DISAPPEARED_RULE_ID, severity: "warning", diagnostics: { entity_key_hash: "a1b2c3d4e5f6a7b8", last_seen_ts: "2026-07-14T00:00:00.000Z", complete_census_seen_count: 12 } });
@@ -2752,7 +3055,7 @@ test("F5: a normal call well within its deadline is byte-identical to pre-fix be
   assert.equal(audit[0].decision.title, "Memory pressure is high");
 });
 
-test("F5 budget invariant: a timed-out call still consumes exactly one admission slot, starving a subsequent alert in the same tick", async () => {
+test("F5: a timed-out LLM call opens the route circuit for the remaining due alerts", async () => {
   const paths = await tempPaths();
   const { session } = fakeHangingSession();
   const alerts = [
@@ -2770,7 +3073,8 @@ test("F5 budget invariant: a timed-out call still consumes exactly one admission
   });
 
   assert.equal(createSessionCalls, 1, "only the first (timed-out) alert should have been admitted -- the budget slot was already spent");
-  assert.equal(result.dropped_total, 1, "the second alert must have been dropped for budget reasons, not attempted");
+  assert.equal(result.dropped_total, 0, "the second alert was skipped by the route circuit, not the hourly budget");
+  assert.equal(result.route_failed, true);
   const audit = await readAlertIntelligenceAudit(paths);
   assert.equal(audit.length, 1);
   assert.equal(audit[0].alert_id, "alert_budget_1");
@@ -3138,4 +3442,3 @@ test("budget: a REAL elapsed hour frees the trailing-hour LLM-call budget (ordin
   assert.equal(second.status, "ok", "a genuinely-elapsed hour must still free the budget -- the fix must not regress ordinary aging-out");
   assert.equal(prompts.length, 2);
 });
-

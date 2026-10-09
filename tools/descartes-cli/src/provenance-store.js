@@ -557,6 +557,9 @@ function buildUnknownIdentityCandidate(identityHash, record) {
     id: alertId(UNKNOWN_IDENTITY_RULE_ID, fingerprint),
     rule_id: UNKNOWN_IDENTITY_RULE_ID,
     fingerprint,
+    // One alert id can represent repeated observations of the same provenance family. The
+    // producer's identity hash is the incident identity; stability counters are diagnostics only.
+    incident_key: identityHash,
     severity: "warning",
     title: "Unrecognized process identity confirmed stable",
     summary: "A process identity outside the accepted provenance baseline has been observed consistently and is no longer provisional.",
@@ -580,6 +583,9 @@ function buildNewPublicBindCandidate(identityHash, record, portKey) {
     id: alertId(NEW_PUBLIC_BIND_RULE_ID, fingerprint),
     rule_id: NEW_PUBLIC_BIND_RULE_ID,
     fingerprint,
+    // A port can move from process identity A to B under the same port fingerprint. The binder's
+    // identity hash is the producer-declared incident identity.
+    incident_key: identityHash,
     severity: "warning",
     title: "New public bind from an unbaselined identity",
     summary: "A listening socket bound to a public address is served by a process identity outside the accepted provenance baseline.",
@@ -601,6 +607,9 @@ function buildIdentityDriftCandidate(targetKey, staleEntry, currentEntry) {
     id: alertId(IDENTITY_DRIFT_RULE_ID, fingerprint),
     rule_id: IDENTITY_DRIFT_RULE_ID,
     fingerprint,
+    // Identity drift is keyed by the newly observed identity; target and old identity remain in
+    // diagnostics, never in generic alert-store episode semantics.
+    incident_key: currentEntry.identityHash,
     severity: "warning",
     title: "Process identity changed for a previously known target",
     summary: "A target previously matching a known-good identity now resolves to a different identity (e.g. executable replaced).",

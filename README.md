@@ -274,6 +274,62 @@ descartes alerts intelligence enable --max-per-hour 3
 descartes alerts notifications setup --channel desktop
 ```
 
+Ordinary alert delivery is episode-based: a newly active alert notifies once, a persistent alert
+stays quiet, and only an escalation above the highest severity already notified in that episode
+notifies again. De-escalation is silent. Recovery rearms the alert for one notification on its next
+activation, and an acknowledgement does not suppress a later incident or severity escalation.
+Each alert row persists an incident map, `incident_key -> { first_seen, last_seen, severity_max,
+notified_severity, confirmed_at, delivery_failure_count, next_attempt_at, status }`, so simultaneous
+incidents under one alert id are independently due, delivered, confirmed, and retried. Legacy rows
+without episode metadata are never notified until a new episode is observed.
+
+The live map retains confirmed keys and is bounded at 256 keys. (O) If a 257th live identity arrives,
+the alert enters explicit `incident_storm` state, emits one storm notification with the count, and
+stops per-key notifications until recovery or operator acknowledgement. Delivery state is committed
+only after the adapter returns a successful result (`delivered` or the explicit local `cli_only`
+result); failures remain due subject to rollback-safe exponential backoff. Crash after external
+delivery but before confirmation is explicitly at-least-once: a duplicate is acceptable, silence is
+not. Delivery audit records use append-only UTC date segments, such as
+`notification-delivery-2026-10-09.jsonl`. Retention is governed only by a 50 MiB total-byte cap:
+it removes whole segments oldest by filename while over the cap, never the segment written by the
+current process during that tick, and re-checks file metadata before unlinking. There is no
+wall-clock expiry. Residual: under cap pressure after a clock rollback, a rollback-dated segment
+may be considered oldest by filename. The audit reader merges legacy files, archives, and dated
+segments by record timestamp in stable chronological order.
+
+The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
+diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
+is:
+
+- `canary.tripped`: an opaque hash of canary id, trip reason, and observed trip timestamp, so
+  consecutive observed trips are separate incidents; `canary.tampered` remains `default` because
+  its fingerprint already represents the stable tamper condition.
+- `correlation.login_kill_proximity`: an opaque hash of anchor rule, anchor tick timestamp, and
+  peer identity; proximity, pool size, and prior-tick statistics are diagnostics only.
+- `provenance.port.new_public_bind`, `provenance.process.unknown_identity`, and
+  `provenance.process.identity_drift`: the producer's sanitized process identity hash, so a port
+  owner or process identity change is a new incident.
+- fixed daemon/system/disk rules and `constraint.violation.*`: `default`, because each alert id is
+  already the stable condition/fingerprint. Session and peer baseline deviations use `default` for
+  the same reason; their mean, max, count, z-score, and stability fields are never episode state.
+- session churn uses the observed transition (`prior_fingerprint` → `current_fingerprint`), and
+  credential access uses the observed metadata-change identity, so consecutive A→B→C changes notify
+  separately. Provenance bind/identity candidates carry their live identity hashes, including
+  multiple simultaneous identities under one port alert. Containment recommendations carry the
+  triggering incident key. Service/scheduled-job/lineage novelty and stable canary-tamper rules use
+  their stable producer identity.
+
+LLM adjudication is separate from delivery. A completed `notify:false` result records adjudication
+for the current incident but never marks the operator as notified. On upgrade, a record missing
+`episode_started_at` cannot prove current-activation delivery and is not notified. `alerts ack`
+uses the existing direct-write path. Multiple concurrent daemons are unsupported; the alert store's
+pre-existing read-modify-write lost-update boundary is documented in
+[`todos/2026-10-09-alert-store-concurrent-writers.md`](todos/2026-10-09-alert-store-concurrent-writers.md).
+The notification audit uses independent dated append targets so rows from the CLI and daemon are
+retained without row-count rotation or whole-file rewrite.
+Unknown/foreign severities are preserved and rank above `critical` for escalation comparison. The
+`adjudication.budget_exhausted` meta-signal is separate and keeps its own one-hour notification window.
+
 ## Self-learning and defensive detection (watch by default, author opt-in)
 
 Structural watching is on by default. It uses `watch.json` and can do these things:

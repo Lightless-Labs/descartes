@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import { adjudicateAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
+import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -1581,6 +1581,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let mainExtraCandidates;
   let mainAlerts;
   let coveredAlertIds;
+  let alertPersistenceError;
   // Detector-reported recovery coverage (§8.B): the per-tick, owner-scoped map of the alert
   // identities each producer LABEL reported it genuinely evaluated this tick (Map<label,
   // Set<alertId>>). Populated by safeCandidates at the twelve detector call sites below and consumed
@@ -1756,10 +1757,25 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         // call's ADDITIONAL always-excluded containment.recommend.* — withheld here because
         // containment is the only phase that legitimately evaluates it) and tier-ownership.
         coveredAlertIds,
+        lockTimeoutMs: options.lockTimeoutMs,
+        lockRetryMs: options.lockRetryMs,
       });
+    if (mainAlerts?.persistence_status === "lock_unavailable") {
+      alertPersistenceError = mainAlerts.persistence_error;
+      const failedStatus = {
+        ...status,
+        state: "error",
+        storage_write_error: combineErrors(status.storage_write_error, `alert-store: ${alertPersistenceError}`),
+      };
+      try {
+        status = await persistStatus(descartesPaths, failedStatus);
+      } catch {
+        status = failedStatus;
+      }
+    }
   }
   let alerts = mainAlerts;
-  if (mainAlerts) {
+  if (mainAlerts && !alertPersistenceError) {
     // Containment is a second phase: it consumes only the main evaluation's current active alerts
     // and notification-due IDs. Re-merge the first phase's candidates so shared recovery semantics
     // do not recover sibling alert families during the containment persistence pass.
@@ -1828,70 +1844,82 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       // itself threw, in which case failedLabels excludes its rule_ids just like any other
       // detector). §7.7 vetoes (history-untrusted, failed-detector, tier-ownership) apply identically.
       coveredAlertIds: containmentCoveredAlertIds,
+      lockTimeoutMs: options.lockTimeoutMs,
+      lockRetryMs: options.lockRetryMs,
     });
+    const finalAlertsById = new Map((containmentAlerts.alerts ?? []).map((alert) => [alert.id, alert]));
+    const dueEntryStillApplies = (entry) => {
+      const finalAlert = finalAlertsById.get(entry.alert_id);
+      if (!finalAlert || ["recovered", "suppressed"].includes(finalAlert.status)) return false;
+      if (entry.storm) return finalAlert.incident_state === "incident_storm";
+      const incident = finalAlert.incidents?.[entry.incident_key];
+      return Boolean(incident && !["recovered", "suppressed"].includes(incident.status));
+    };
     alerts = {
       ...containmentAlerts,
       // The second persistence pass must not hide ordinary alerts that were due in the first
-      // phase; containment adds to the same delivery set rather than replacing it.
+      // phase; containment adds to the same delivery set rather than replacing it. Filter against
+      // the second pass's final persisted state so an entry from the first pass cannot resurrect a
+      // recommendation that the containment pass recovered in the same tick.
       notification_due_ids: [...new Set([
         ...(mainAlerts.notification_due_ids ?? []),
         ...(containmentAlerts.notification_due_ids ?? []),
+      ].filter((id) => [...(mainAlerts.notification_due_incidents ?? []), ...(containmentAlerts.notification_due_incidents ?? [])]
+        .some((entry) => entry.alert_id === id && dueEntryStillApplies(entry))))],
+      notification_due_incidents: [...new Map([
+        ...(mainAlerts.notification_due_incidents ?? []),
+        ...(containmentAlerts.notification_due_incidents ?? []),
+      ].filter(dueEntryStillApplies).map((entry) => [`${entry.alert_id}\0${entry.incident_key}`, entry])).values()],
+      adjudication_due_incidents: [...new Map([
+        ...(mainAlerts.adjudication_due_incidents ?? []),
+        ...(containmentAlerts.adjudication_due_incidents ?? []),
+      ].map((entry) => [`${entry.alert_id}\0${entry.incident_key}`, entry])).values()],
+      adjudication_due_ids: [...new Set([
+        ...(mainAlerts.adjudication_due_ids ?? []),
+        ...(containmentAlerts.adjudication_due_ids ?? []),
       ])],
     };
+    if (alerts?.persistence_status === "lock_unavailable") {
+      alertPersistenceError = alerts.persistence_error;
+      const failedStatus = {
+        ...status,
+        state: "error",
+        storage_write_error: combineErrors(status.storage_write_error, `alert-store: ${alertPersistenceError}`),
+      };
+      try {
+        status = await persistStatus(descartesPaths, failedStatus);
+      } catch {
+        status = failedStatus;
+      }
+    }
   }
-  // Slice 4, Decision 2b (must-fix 3), additive: the session.* rule_ids above are unknown_namespace
-  // (Decision 2) and therefore structurally can NEVER reach adjudicateAlertNotifications' LLM path
-  // below — left unmitigated, this milestone's first alerting slice would never actively notify the
-  // operator. This deterministic, non-LLM delivery branch (mirrors emitBudgetExhaustedSignal's own
-  // "straight through deliverNotificationDecision, NEVER through the LLM" precedent) reuses the
-  // notification_due_ids/cooldown bookkeeping applyAlertCandidates already computed inside
-  // evaluateAndPersistAlerts above — no new cooldown machinery, no session/LLM construction.
-  // Slice 4b Decision 3b (Fable review MUST-FIX 4): emitSessionAlertSignals now also delivers a
-  // due peer.count_spike (also unknown_namespace, per Decision 3) through this identical branch —
-  // the widened allowlist is composed inside alert-intelligence.js itself, not here.
-  // Same DI-seam + safeCandidates discipline as above: a throw out of delivery must not crash the
-  // tick or clobber the alerts already persisted by evaluateAndPersistAlerts. Fallback is
-  // `undefined`, matching this branch's existing "no delivery this tick" shape (deliverSessionAlerts:
-  // false / no alerts), not `[]` -- emitSessionAlertSignals returns a delivery-result object, not a
-  // candidate array.
-  const emitSessionAlerts = options.emitSessionAlertSignals ?? emitSessionAlertSignals;
-  const sessionAlertDelivery = alerts && options.deliverSessionAlerts !== false
-    ? await safeCandidates(
-        "session-alert-delivery",
-        () => emitSessionAlerts(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification }),
-        undefined,
-      )
-    : undefined;
-  // Finding F6: read alert-intelligence config ONCE and share it with both the new deterministic
-  // metric-alert fallback below AND the existing adjudicateAlertNotifications call, so the two
-  // branches' enablement checks are atomic within one tick (an operator flipping
-  // `alerts intelligence enable` mid-tick can otherwise, in principle, land between two independent
-  // file reads and cause one alert to be delivered twice in the same tick, worded differently).
-  // Gated on `alerts` (mainAlerts) being truthy, same as every consumer below -- when
-  // options.evaluateAlerts is false there is nothing to adjudicate/deliver this tick, so this must
-  // not add a config read that wasn't there before.
+  // Finding F6: read alert-intelligence config ONCE and share it with every delivery route.
   const alertIntelligenceConfig = alerts ? (options.alertIntelligenceConfig ?? await readAlertIntelligenceConfig(descartesPaths)) : undefined;
-  // Finding F6, additive: core resource ("metric" namespace: daemon./system./disk.) alerts have no
-  // non-LLM delivery path today — emitSessionAlertSignals' allowlist deliberately excludes them
-  // (see that function's own header comment), and adjudicateAlertNotifications (the LLM path)
-  // returns zero decisions whenever alert-intelligence is at its default (disabled) state. This
-  // sibling branch delivers those alerts deterministically whenever the LLM route is off, and gets
-  // completely out of the way (zero deliveries) the moment an operator opts into alert-intelligence
-  // — see emitMetricAlertFallbackSignals' own header comment for the full invariant-preservation
-  // rationale. Same DI-seam + safeCandidates discipline as sessionAlertDelivery immediately above.
-  const emitMetricFallback = options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals;
-  const metricAlertFallback = alerts && options.deliverMetricAlertFallback !== false
+  const delivered = alerts && !alertPersistenceError
     ? await safeCandidates(
-        "metric-alert-fallback",
-        () => emitMetricFallback(descartesPaths, alerts, { now: ts, deliverNotification: options.deliverNotification, config: alertIntelligenceConfig }),
+        "alert-delivery",
+        () => deliverDueAlertNotifications(descartesPaths, alerts, {
+          now: ts,
+          config: alertIntelligenceConfig,
+          deliverNotification: options.deliverNotification,
+          emitSessionAlertSignals: options.emitSessionAlertSignals ?? emitSessionAlertSignals,
+          emitMetricAlertFallbackSignals: options.emitMetricAlertFallbackSignals ?? emitMetricAlertFallbackSignals,
+          adjudicateAlertNotifications: options.adjudicateAlertNotifications ?? adjudicateAlertNotifications,
+          createSession: options.createSession,
+          appendAuditRecord: options.appendAuditRecord,
+          deliverSessionAlerts: options.deliverSessionAlerts,
+          deliverMetricAlertFallback: options.deliverMetricAlertFallback,
+          adjudicateAlerts: options.adjudicateAlerts,
+        }),
         undefined,
       )
     : undefined;
-  const adjudicate = options.adjudicateAlertNotifications ?? adjudicateAlertNotifications;
-  const alertIntelligence = alerts && options.adjudicateAlerts !== false
-    ? await safeAdjudicateAlertNotifications(adjudicate, descartesPaths, alerts, { now: ts, config: alertIntelligenceConfig })
-    : undefined;
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, structuralEvidence, structuralFacts, shadowEvaluation };
+  const sessionAlertDelivery = delivered?.sessionAlertDelivery?.route_failed ? undefined : delivered?.sessionAlertDelivery;
+  const metricAlertFallback = delivered?.metricAlertFallback?.route_failed ? undefined
+    : delivered?.metricAlertFallback
+      ?? (alertIntelligenceConfig?.enabled && options.deliverMetricAlertFallback !== false ? { fired: [], skipped: "intelligence_enabled" } : undefined);
+  const alertIntelligence = delivered?.alertIntelligence;
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

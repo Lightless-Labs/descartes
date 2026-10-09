@@ -131,6 +131,7 @@ export function renderAlertList(alerts, options = {}) {
     if (alert.summary) lines.push(`  ${alert.summary}`);
     lines.push(`  first_seen=${alert.first_seen} last_seen=${alert.last_seen}`);
     if (alert.acknowledged_at) lines.push(`  acknowledged_at=${alert.acknowledged_at}`);
+    if (alert.delivery_failure_count > 0) lines.push(`  delivery= failing since ${alert.delivery_failing_since ?? alert.last_delivery_failure_at ?? "unknown"} (next attempt ${alert.next_attempt_at ?? "now"}; ${alert.delivery_failure_count} failure${alert.delivery_failure_count === 1 ? "" : "s"}${alert.delivery_failure_reason ? `: ${alert.delivery_failure_reason}` : ""})`);
   }
   return lines.join("\n");
 }
@@ -303,12 +304,12 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
 
   const printList = async () => {
     // Read-only view: list/watch must never mutate persisted alert state (no false recovery of
-    // canary/credential/session/... detector alerts, no phantom cooldown consumption with no
+    // canary/credential/session/... detector alerts, no phantom episode-state consumption with no
     // notification ever delivered). Uses evaluateAlerts (never writes) scoped to fixedAlertIds()
     // -- the identity-keyed set (§8.A) of the built-in threshold rules' alert IDs -- so this call
     // can only assert recovery for the built-in rules it actually evaluates; every detector alert's
     // identity is absent from that set and is therefore never touched here. Persisted mutation
-    // (recovery + cooldown/last_notified) remains exclusively the daemon's job via
+    // (recovery + episode/last_notified) remains exclusively the daemon's job via
     // evaluateAndPersistAlerts with the full extraCandidates set.
     const result = await evaluateAlerts(descartesPaths, { coveredAlertIds: fixedAlertIds() });
     if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, options), notification_due_ids: result.notification_due_ids }, null, 2));
