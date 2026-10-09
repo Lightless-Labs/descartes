@@ -289,7 +289,11 @@ stops per-key notifications until recovery or operator acknowledgement. Delivery
 only after the adapter returns a successful result (`delivered` or the explicit local `cli_only`
 result); failures remain due subject to rollback-safe exponential backoff. Crash after external
 delivery but before confirmation is explicitly at-least-once: a duplicate is acceptable, silence is
-not. Delivery audit rows are bounded for every result type by rotation with a retained summary.
+not. Delivery audit records use append-only UTC date segments, such as
+`notification-delivery-2026-10-09.jsonl`. Retention removes only whole old segments, protects the
+current and previous UTC days, re-checks file metadata before unlinking, and keeps recent writes
+safe across clock rollback and writer races. The audit reader merges legacy files, archives, and
+dated segments by record timestamp in stable chronological order.
 
 The producer declares incident identity. The episode is `(alert id, incident_key ?? "default")`;
 diagnostic statistics, timestamps, and stability counters never create episodes. The producer audit
@@ -319,7 +323,8 @@ for the current incident but never marks the operator as notified. On upgrade, a
 uses the existing direct-write path. Multiple concurrent daemons are unsupported; the alert store's
 pre-existing read-modify-write lost-update boundary is documented in
 [`todos/2026-10-09-alert-store-concurrent-writers.md`](todos/2026-10-09-alert-store-concurrent-writers.md).
-The notification audit rereads before append/rotation so rows from the CLI and daemon are retained.
+The notification audit uses independent dated append targets so rows from the CLI and daemon are
+retained without row-count rotation or whole-file rewrite.
 Unknown/foreign severities are preserved and rank above `critical` for escalation comparison. The
 `adjudication.budget_exhausted` meta-signal is separate and keeps its own one-hour notification window.
 
