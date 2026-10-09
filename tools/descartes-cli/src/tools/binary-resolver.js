@@ -8,6 +8,7 @@ const execFileAsyncDefault = promisify(execFile);
 const MACOS_LS = "/bin/ls";
 const MACOS_DSCL = "/usr/bin/dscl";
 const LINUX_XATTR_COMMANDS = ["/usr/bin/getfattr", "/bin/getfattr"];
+const LINUX_ACL_ATTRIBUTES = ["system.posix_acl_access", "system.posix_acl_default"];
 const LINUX_NSSWITCH = "/etc/nsswitch.conf";
 const LINUX_GROUP = "/etc/group";
 const LINUX_PASSWD = "/etc/passwd";
@@ -352,20 +353,30 @@ export function parseMacOsAclStatus(stdout) {
     : "unknown";
 }
 
-async function detectAclStatus(component, { platform, execFileAsync = execFileAsyncDefault } = {}) {
+export async function detectAclStatus(component, { platform, stat, execFileAsync = execFileAsyncDefault } = {}) {
   if (platform === "darwin") {
     const result = await execLookup(execFileAsync, MACOS_LS, ["-led", component]);
     return result.error ? "unknown" : parseMacOsAclStatus(result.stdout);
   }
   if (platform === "linux") {
+    const attributes = stat?.isDirectory?.()
+      ? LINUX_ACL_ATTRIBUTES
+      : [LINUX_ACL_ATTRIBUTES[0]];
     for (const command of LINUX_XATTR_COMMANDS) {
-      const result = await execLookup(execFileAsync, command, ["--only-values", "--name=system.posix_acl_access", "--absolute-names", component]);
-      if (!result.error) return "present";
-      if (result.error.code === "ENOENT") continue;
-      // getfattr uses exit status 1 for a missing xattr. Other failures mean that the
-      // filesystem's ACL state was not established and must not be trusted.
-      if (result.error.code === 1 || /no such attribute/i.test(String(result.error.stderr ?? ""))) return "absent";
-      return "unknown";
+      let commandUnavailable = true;
+      for (const attribute of attributes) {
+        const result = await execLookup(execFileAsync, command, ["--only-values", `--name=${attribute}`, "--absolute-names", component]);
+        if (!result.error) return "present";
+        if (result.error.code === "ENOENT") continue;
+        commandUnavailable = false;
+        // A missing attribute is the only trustworthy proof that no ACL is present. In
+        // particular, getfattr's exit status 1 is ambiguous unless its stderr identifies the
+        // requested attribute as absent; permission, unsupported-filesystem, and other errors
+        // must remain unknown and therefore untrusted.
+        if (result.error.code === "ENODATA" || /no such attribute/i.test(String(result.error.stderr ?? ""))) continue;
+        return "unknown";
+      }
+      if (!commandUnavailable) return "absent";
     }
   }
   return "unknown";

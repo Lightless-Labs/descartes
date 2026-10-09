@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   candidatePaths,
   binaryProvenance,
+  detectAclStatus,
   parseMacOsAclStatus,
   resolveCollectorBinary,
   runResolvedExecFile,
@@ -148,6 +149,53 @@ test("resolveCollectorBinary fails closed when ACL state cannot be determined", 
   assert.equal(resolution.status, "untrusted_binary");
   assert.equal(resolution.offending_component, "/usr/bin/tmux");
   assert.equal(resolution.trust_reason, "acl_unknown");
+});
+
+test("Linux ACL probe does not treat a bare getfattr exit 1 as proof that an ACL is absent", async () => {
+  const status = await detectAclStatus("/usr/bin/tmux", {
+    platform: "linux",
+    stat: regularExecutable(),
+    execFileAsync: async () => {
+      throw Object.assign(new Error("Permission denied"), { code: 1, stderr: "Permission denied" });
+    },
+  });
+
+  assert.equal(status, "unknown");
+});
+
+test("Linux ACL probe accepts only explicit absent-attribute evidence for access and directory-default ACLs", async () => {
+  const calls = [];
+  const status = await detectAclStatus("/usr/local/bin", {
+    platform: "linux",
+    stat: directory(),
+    execFileAsync: async (command, args) => {
+      calls.push(args);
+      throw Object.assign(new Error("No such attribute"), { code: 1, stderr: "getfattr: /usr/local/bin: No such attribute" });
+    },
+  });
+
+  assert.equal(status, "absent");
+  assert.deepEqual(calls.map((args) => args[1]), ["--name=system.posix_acl_access", "--name=system.posix_acl_default"]);
+});
+
+test("Linux ACL probe accepts ENODATA as absent but keeps other nonzero ACL errors unknown", async () => {
+  const absent = await detectAclStatus("/usr/bin/tmux", {
+    platform: "linux",
+    stat: regularExecutable(),
+    execFileAsync: async () => {
+      throw Object.assign(new Error("No data"), { code: "ENODATA", stderr: "" });
+    },
+  });
+  const unknown = await detectAclStatus("/usr/bin/tmux", {
+    platform: "linux",
+    stat: regularExecutable(),
+    execFileAsync: async () => {
+      throw Object.assign(new Error("unsupported"), { code: 95, stderr: "Operation not supported" });
+    },
+  });
+
+  assert.equal(absent, "absent");
+  assert.equal(unknown, "unknown");
 });
 
 test("resolveCollectorBinary rejects a non-writable executable owned by another user", async () => {
