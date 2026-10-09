@@ -24,14 +24,17 @@ or a local UID below 501 whose `AuthenticationAuthority` is absent or only `Disa
 Failures or partial results from search policy, GroupMembership, GroupMembers, primary-GID listings,
 or AuthenticationAuthority fail closed; nested or non-local groups are rejected. Same-UID owner
 writability is accepted within the current trust boundary but recorded as provenance. The resolver
-records a SHA-256 content hash for each trusted resolved binary by file identity and metadata and
-refuses `content_changed_in_place` when content changes while `(dev, ino)` stays the same. A new
-path/inode, such as a Homebrew upgrade into a new Cellar directory, is evaluated fresh. A failed
+records a SHA-256 content hash for each trusted resolved binary keyed only by `(dev, ino)`, with
+size and mtime metadata, and refuses `content_changed_in_place` when content changes while that
+identity stays the same, even if the inode is later seen under another pinned path. A genuinely
+new inode, such as a Homebrew upgrade into a new Cellar directory, is evaluated fresh. A failed
 check is `untrusted_binary`, is never executed, and leaves the source census incomplete. The
+bounded pin map is persisted in the daemon state directory and pruned to inodes still present on
+known pinned paths. The
 immediate pre-exec `(dev, ino)` recheck narrows but cannot eliminate the residual resolution-to-exec
-TOCTOU window. Accepted residual: a process that held the admin group's GID before being removed
-from the group retains write access until it exits; on a single-user Mac this requires a
-previously-admin principal; multi-admin or directory-bound Macs fail closed. Operators may list explicit absolute escape-hatch paths in
+TOCTOU window. Accepted residual: a former member of any accepted component group can retain that
+group's GID in processes started before removal; multi-admin or directory-bound Macs fail closed.
+Operators may list explicit absolute escape-hatch paths in
 `watch.json` under `trusted_binary_paths`; those entries still need realpath + regular-file
 validation and are reported as `operator_trusted`. Evidence records the requested binary, resolved
 absolute path, trust verdict, and any offending component. If no known candidate is usable, the

@@ -220,16 +220,18 @@ root, the daemon UID, or a local UID below 501 whose `AuthenticationAuthority` i
 primary-GID, or AuthenticationAuthority lookup fails closed. Same-UID owner writability is inside
 Descartes' current trust boundary and is recorded in provenance. Shell wrappers are rejected unless
 explicitly operator-trusted, so a trusted wrapper can never authorize an untrusted downstream
-binary. The resolver records a SHA-256 content hash for each trusted resolved binary keyed by its
-file identity and metadata; a content change on the same `(dev, ino)` is refused as
-`content_changed_in_place`, while a new path/inode is evaluated fresh. An offending component,
+binary. The resolver records a SHA-256 content hash for each trusted resolved binary keyed only by
+its `(dev, ino)` file identity, with size and mtime metadata; any later sighting of that inode
+under any pinned path must match the pin or is refused as `content_changed_in_place`. A genuinely
+new inode, such as a Homebrew upgrade, is evaluated fresh. An offending component,
 ACL uncertainty, stat failure, or binary replacement detected by the immediate pre-exec `(dev, ino)`
 recheck produces `untrusted_binary`; the collector does not execute it and the census remains
-incomplete. The recheck narrows but cannot eliminate the residual resolution-to-exec TOCTOU window.
+incomplete. The bounded pin map is persisted in the daemon state directory and pruned to inodes
+still present on known pinned paths. The recheck narrows but cannot eliminate the residual
+resolution-to-exec TOCTOU window.
 
-Accepted residual: a process that held the admin group's GID before being removed from the group
-retains write access until it exits; on a single-user Mac this requires a previously-admin
-principal; multi-admin or directory-bound Macs fail closed.
+Accepted residual: a former member of any accepted component group can retain that group's GID in
+processes started before removal; multi-admin or directory-bound Macs fail closed.
 
 An operator may explicitly accept a non-standard absolute executable by listing it in
 `$XDG_CONFIG_HOME/descartes/watch.json`:
