@@ -250,6 +250,7 @@ export function parseLoginctlShowSession(stdout) {
   }
   const sessions = [];
   let malformed_count = 0;
+  let duplicate_count = 0;
   let current = {};
   const flush = () => {
     if (Object.keys(current).length > 0) sessions.push(current);
@@ -266,12 +267,17 @@ export function parseLoginctlShowSession(stdout) {
     const key = line.slice(0, eq);
     if (!LOGINCTL_PROPERTIES.includes(key)) { malformed_count += 1; continue; }
     if (key === "Id" && current.Id !== undefined) flush();
+    if (Object.prototype.hasOwnProperty.call(current, key)) {
+      duplicate_count += 1;
+      malformed_count += 1;
+      continue;
+    }
     current[key] = line.slice(eq + 1);
   }
   flush();
   Object.defineProperty(sessions, "malformed_count", { value: malformed_count, enumerable: false });
   Object.defineProperty(sessions, "duplicate_count", {
-    value: finalizeCensus({ records: sessions, identity: (session) => session.Id, malformed: malformed_count }).duplicate_count,
+    value: duplicate_count + finalizeCensus({ records: sessions, identity: (session) => session.Id, malformed: malformed_count }).duplicate_count,
     enumerable: false,
   });
   return sessions;
