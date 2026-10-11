@@ -42,11 +42,30 @@ import {
   writeStatsState,
   writeSummaryChainState,
 } from "./context-summary.js";
-import { appendFactPoints, factStoreExists, readFactPoints } from "./fact-store.js";
+import { appendFactPoints, factStoreExists, normalizeFactPoint, readFactPoints } from "./fact-store.js";
 import { readFactIntegrityLedger } from "./fact-store-integrity.js";
 import { factFamilyForName } from "./fact-families.js";
 
 const VERDICTS = new Set(["verified", "unverified", "tripwire"]);
+// The only families a C2 point may join the tick's shared pass in: the context families. Never an
+// incumbent family, never a derived family (those are appended by finalizeContextC2 alone).
+export const CONTEXT_C2_PASS_FAMILIES = Object.freeze(new Set(["host_lifecycle", "network_context", "session_context", "collector_state"]));
+
+/**
+ * Isolation guard for the shared pass: the tick's fact batch is refused WHOLE (incumbents included)
+ * on an unregistered fact_name, and a family's append fails on a point its store rejects. So every C2
+ * point is checked here, before it joins the batch: a registered name, a context family, and a point
+ * the store accepts (closed schema included). Throws on the first offender (the caller then drops
+ * every C2 point and reports it); returns the points unchanged otherwise.
+ */
+export function admitContextC2Points(points) {
+  for (const point of points ?? []) {
+    const family = factFamilyForName(point?.fact_name);
+    if (!CONTEXT_C2_PASS_FAMILIES.has(family)) throw new Error("context C2 point outside the context families; no C2 point joins this tick");
+    normalizeFactPoint(point);
+  }
+  return points ?? [];
+}
 
 /**
  * Pass-1 half. Returns { points, context } where `points` are the C2 facts for the context families

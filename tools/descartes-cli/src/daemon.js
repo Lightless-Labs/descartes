@@ -48,7 +48,7 @@ import { collectNetConfigEvidence } from "./tools/net-config.js";
 import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
 import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
 import { collectSessionAttachmentEvidence } from "./tools/session-attachment.js";
-import { finalizeContextC2, prepareContextC2 } from "./context-c2-daemon.js";
+import { admitContextC2Points, finalizeContextC2, prepareContextC2 } from "./context-c2-daemon.js";
 import {
   bootIdDigest,
   boundaryCensusGaps,
@@ -1525,7 +1525,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
                 hmacKey,
                 daemonIntervalMs: profile.interval_ms,
               });
-              factPoints.push(...contextC2Prepared.points);
+              // Isolation guard: a C2 point the shared pass would reject (an unregistered name refuses
+              // the WHOLE batch, incumbents included) never joins it.
+              factPoints.push(...admitContextC2Points(contextC2Prepared.points));
             } catch (error) {
               contextC2Prepared = undefined;
               contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_prepare_failed" };

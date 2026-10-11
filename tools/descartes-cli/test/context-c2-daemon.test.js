@@ -156,6 +156,16 @@ test("C2 isolation: the incumbent families are byte-identical with the C2 phase 
   const off = await runAll({ contextC2: false });
   const failing = await runAll({ prepareContextC2: async () => { throw new Error("c2 boom"); } });
   const failingFinal = await runAll({ finalizeContextC2: async () => { throw new Error("c2 final boom"); } });
+  // A C2 point the shared pass would reject (an unregistered name refuses the whole batch; a point
+  // routed to an incumbent family) never joins it: the incumbents persist exactly as without C2.
+  const rogue = (point) => ({ prepareContextC2: async () => ({ points: [point], context: {} }), finalizeContextC2: async () => ({}) });
+  const unregistered = await runAll(rogue({ ts: new Date(T0).toISOString(), fact_name: "not.registered", entity_key: "x", attributes: {} }));
+  const intoIncumbent = await runAll(rogue({ ts: new Date(T0).toISOString(), fact_name: "session.presence", entity_key: "session.tmux.ffffffffffffffff", attributes: {} }));
+  const badSchema = await runAll(rogue({ ts: new Date(T0).toISOString(), fact_name: "host.daemon_gap", entity_key: "host.daemon_gap", attributes: { bogus: "1" } }));
+  for (const result of [unregistered, intoIncumbent, badSchema]) {
+    assert.deepEqual(result.files, off.files);
+    assert.match((result.statuses[0].status ?? result.statuses[0]).context_c2?.error ?? "", /context C2 point|closed schema/);
+  }
   assert.ok(on.files.session && on.files.peer, "the incumbent families were written");
   assert.deepEqual(on.files, off.files);
   assert.deepEqual(failing.files, off.files);
