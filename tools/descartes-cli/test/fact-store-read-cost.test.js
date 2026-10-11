@@ -114,6 +114,10 @@ test("T9: one fast tick's fact-store reads, costed at every family's default bud
     canary: 2, // daemon veto, detector
     network: 1, // active-constraint
     provenance: 1, // provenance-warning
+    // Context families (context plan C0) are DATA only: no fast-tick reader yet.
+    host_lifecycle: 0,
+    network_context: 0,
+    session_context: 0,
   });
   const seenSetReads = reads.reduce((sum, read) => sum + read.seenSetFamilies.length, 0);
   assert.equal(seenSetReads, 6, "the daemon veto and the three novelty detectors each read their family's seen-set");

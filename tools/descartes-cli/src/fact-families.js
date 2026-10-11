@@ -33,6 +33,12 @@ export const FACT_FAMILY_IDS = Object.freeze([
   "canary",
   "network",
   "provenance",
+  // Context families (docs/plans/2026-10-06-context-aware-learned-baselines.md §4, C0). DATA ONLY:
+  // no detector rule reads them yet, so they carry a declared memory horizon (DATA_FAMILY_HORIZONS
+  // below), not a RULE_HORIZONS entry.
+  "host_lifecycle",
+  "network_context",
+  "session_context",
 ]);
 
 const KNOWN_FAMILIES = new Set(FACT_FAMILY_IDS);
@@ -52,6 +58,19 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["canary.census", "canary"],
   ["network.listening_port.owner", "network"],
   ["provenance.warning", "provenance"],
+  // Context facts (C0.3-C0.12). Closed per-field schemas live in context-schemas.js; a test pins
+  // that every schema's family equals its registry family here.
+  ["host.boot", "host_lifecycle"],
+  ["host.boot_boundary", "host_lifecycle"],
+  ["host.clock_reading", "host_lifecycle"],
+  ["host.suspend", "host_lifecycle"],
+  ["host.boundary_census", "host_lifecycle"],
+  ["net.tailnet_state", "network_context"],
+  ["net.config_fingerprint", "network_context"],
+  ["session.login_record", "session_context"],
+  ["session.login_history_row", "session_context"],
+  ["session.login_census", "session_context"],
+  ["user.presence", "session_context"],
 ];
 
 function buildFactFamilyByName(pairs) {
@@ -246,6 +265,13 @@ const FAMILY_BUDGET_ENTRIES = [
   ["canary", 4 * MIB],
   ["network", 4 * MIB],
   ["provenance", 4 * MIB],
+  // Context families (C0): sized like the capacity plan, (horizon / interval) x worst-case tick x 1.25,
+  // against the 30-day declared data horizon (DATA_FAMILY_HORIZON_ENTRIES), with the 4x ceiling still
+  // admitting a 15-minute interval and not raising MIN_STRUCTURAL_INTERVAL_MS. Floors (1 h interval):
+  // host_lifecycle 3,570,300 B; network_context 1,467,000 B; session_context 10,415,700 B.
+  ["host_lifecycle", 4 * MIB],
+  ["network_context", 2 * MIB],
+  ["session_context", 11 * MIB],
 ];
 
 // The pinned worst-case tick shape per family (§15.3): the maximum normalized record size the REAL
@@ -270,6 +296,18 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   ["peer", { maxRecordBytes: 392, markerBytes: 933, entityCap: 400 }],
   // MAX_CANARIES (tools/canary.js).
   ["canary", { maxRecordBytes: 501, markerBytes: 247, entityCap: 200 }],
+  // Context families: the worst-case NORMALIZED record of each fact, computed from its closed schema
+  // (every field at its longest valid value; fact-families.test.js "C0 data-family T8" recomputes and
+  // pins these numbers). Each per-tick fact counts as a marker; host_lifecycle: boot 698 +
+  // boot_boundary 928 + clock_reading 1147 + suspend 581 + boundary_census 613; network_context:
+  // tailnet_state 601 + config_fingerprint 1029; session_context: login_census 777 + user.presence 508
+  // as markers, plus at most MAX_LOGIN_ARRIVALS_PER_TICK + MAX_LOGIN_HISTORY_ROWS_PER_TICK (8 + 8)
+  // records of at most 643 B.
+  // A boundary census (C0.12) borrows the next structural slot, so a horizon holds at most two extra
+  // ticks, inside the 1.25 headroom.
+  ["host_lifecycle", { maxRecordBytes: 0, markerBytes: 3967, entityCap: 0 }],
+  ["network_context", { maxRecordBytes: 0, markerBytes: 1630, entityCap: 0 }],
+  ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],
 ];
 
 export const BUDGET_INVARIANT_HEADROOM = 1.25;
@@ -303,12 +341,41 @@ function buildTickShapes() {
 
 export const FAMILY_TICK_SHAPES = buildTickShapes();
 
-// H_max(f): the longest eligibility horizon of any history-dependent rule reading family f (§4.5).
+// Context-plan C0/§4: families that no rule reads yet but whose history is kept as DATA for later
+// learners. Their declared horizon is the memory the budget must hold at worst-case volume (the 30-day
+// raw retention, fact-store.js DEFAULT_FACT_RETENTION_MS); it is a resource floor (class S), never an
+// eligibility gate, and never a RULE_HORIZONS entry (daemon.js pins RULE_HORIZONS to its
+// history-dependent rule set in both directions).
+const DATA_FAMILY_HORIZON_ENTRIES = [
+  ["host_lifecycle", 30 * DAY_MS],
+  ["network_context", 30 * DAY_MS],
+  ["session_context", 30 * DAY_MS],
+];
+
+function buildDataFamilyHorizons(entries) {
+  const map = new Map();
+  for (const [family, horizonMs] of entries) {
+    if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: data horizon for unknown family ${family}`);
+    if (map.has(family)) throw new Error(`fact-families: family ${family} has two data horizons`);
+    if (!Number.isFinite(horizonMs) || horizonMs <= 0) throw new Error(`fact-families: family ${family} has an invalid data horizon`);
+    for (const rule of RULE_HORIZONS.values()) {
+      if (rule.families.includes(family)) throw new Error(`fact-families: data family ${family} is read by rule-horizon rules; use RULE_HORIZONS`);
+    }
+    map.set(family, horizonMs);
+  }
+  return map;
+}
+
+export const DATA_FAMILY_HORIZONS = buildDataFamilyHorizons(DATA_FAMILY_HORIZON_ENTRIES);
+
+// H_max(f): the longest eligibility horizon of any history-dependent rule reading family f (§4.5),
+// or, for a data family, its declared data horizon.
 function buildFamilyHorizonMax() {
   const max = new Map();
   for (const rule of RULE_HORIZONS.values()) {
     for (const family of rule.families) max.set(family, Math.max(max.get(family) ?? 0, rule.horizonMs));
   }
+  for (const [family, horizonMs] of DATA_FAMILY_HORIZONS) max.set(family, Math.max(max.get(family) ?? 0, horizonMs));
   for (const family of max.keys()) {
     if (!FAMILY_TICK_SHAPES.has(family)) throw new Error(`fact-families: family ${family} carries a rule horizon but no pinned worst-case tick`);
   }

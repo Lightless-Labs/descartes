@@ -603,6 +603,25 @@ For the complete safety-invariant list, see `AGENTS.md`.
 | disk mount point | raw, in local metric history (`sensitivity: path`) | **raw**, but only for a filesystem at ≥90% used, up to 8, as part of `pressured_filesystems` |
 | disk filesystem device path | raw, in local metric history (`sensitivity: path`) | not sent |
 | collector binary availability and resolved path | status is retained in evidence/census markers; paths are local execution provenance | not sent |
+| boot id (`kern.bootsessionuuid` / `/proc/sys/kernel/random/boot_id`) | keyed HMAC (`host.boot`, `host.boot_boundary`); the local boot ledger keeps only SHA-256 digests | not sent |
+| boot time, OS build and kernel release | raw (`host.boot`) | not sent |
+| raw clock readings (wall, libuv hrtime, uptime, macOS sleep/wake sysctls, Linux `/proc/uptime` and suspend count) | raw numbers (`host.clock_reading`) | not sent |
+| tailnet name (`CurrentTailnet.Name`) | keyed HMAC (`net.tailnet_state`); backend state, `Self.Online`, exit-node use and a health-issue count bucket are kept as closed values | not sent |
+| network-configuration components: gateway MAC, IPv6 router-advertised /64 prefixes, DHCP domain, interface-scoped resolvers (never MagicDNS) | keyed HMAC per component plus a keyed aggregate (`net.config_fingerprint`); the default-route interface kind (wifi, ethernet, tunnel, ...) is a closed value | not sent |
+| login user name and remote host (who / loginctl / last) | keyed HMAC (`session.login_record`, `session.login_history_row`); origin, tty and service classes are closed values; the local dedupe state keeps only row digests keyed with the same per-install key (a row's user, tty, host and time are too guessable for a plain hash); without a usable key no login row is recorded | not sent |
+| console screen-lock and idle hints | closed values (`user.presence`) | not sent |
+
+**The context HMAC key.** Every "keyed HMAC" above uses one per-install key: 32 random bytes in
+`$XDG_STATE_HOME/descartes/keys/context-hmac.key`, created on first use as a `0600` file in a
+`0700` directory, kept outside fact history, and never federated, uploaded, logged or put in any
+bundle. A gateway MAC or a /64 prefix is a small search space, so an unkeyed hash of one would be
+reversible; without the key these values cannot be brute-forced back. A key that is unreadable,
+has a wider mode, has a foreign owner or has the wrong size is not used: the keyed fields are then
+recorded as `unknown`, never as an unkeyed hash. Deleting the key re-keys the install: new values
+no longer match older ones. Every context fact carries `hmac_key_id` (an HMAC of a fixed constant
+under the key, which reveals nothing about it), so a re-keyed install shows up as a key change
+rather than as every network, tailnet and user being new; the login dedupe state is discarded on a
+key change and its rows re-emit as `reseeded`.
 
 `descartes incident freeze` and the local `history`/`alerts` commands only ever touch the
 local, Descartes-owned store — nothing there leaves the host. A `triage` request is

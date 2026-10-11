@@ -18,7 +18,9 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus, isStrictRfc3339, validateCrossReferenceKeys } from "./census-validate.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -27,6 +29,7 @@ export const DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 export const MAX_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 
 async function runFixedExecFile(command, args, options = {}) {
+  throwIfCollectorAborted(options.signal);
   return runResolvedExecFile(command, args, {
     ...options,
     timeout: options.timeout ?? 3000,
@@ -48,7 +51,7 @@ function isPermissionDenied(probe) {
 
 function parseLastHandshake(value) {
   if (value === "0001-01-01T00:00:00Z") return 0;
-  if (typeof value !== "string") return undefined;
+  if (!isStrictRfc3339(value)) return undefined;
   const epochMilliseconds = Date.parse(value);
   return Number.isFinite(epochMilliseconds) ? Math.floor(epochMilliseconds / 1000) : undefined;
 }
@@ -57,32 +60,125 @@ function parsePeer(peer) {
   if (!peer || typeof peer !== "object" || Array.isArray(peer) || typeof peer.PublicKey !== "string" || peer.PublicKey.length === 0) {
     return undefined;
   }
+  for (const field of ["Online", "ExitNode", "ExitNodeOption"]) {
+    if (Object.prototype.hasOwnProperty.call(peer, field) && typeof peer[field] !== "boolean") return undefined;
+  }
+  if (Object.prototype.hasOwnProperty.call(peer, "LastHandshake") && parseLastHandshake(peer.LastHandshake) === undefined) return undefined;
   return {
     source_type: "tailscale",
     presence_state: peer.Online ? "observed_active" : "observed_historical",
     node_public_key: peer.PublicKey,
-    is_exit_node_active: Boolean(peer.ExitNode),
-    is_exit_node_option: Boolean(peer.ExitNodeOption),
+    is_exit_node_active: peer.ExitNode === true,
+    is_exit_node_option: peer.ExitNodeOption === true,
     latest_handshake_epoch_seconds: parseLastHandshake(peer.LastHandshake),
+  };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// Context plan C0.3: the daemon's own tailnet state, kept for EVERY parsed outcome (not only
+// Running). Each field is undefined when the JSON does not carry it: an absent Health list or Self
+// object is unknown, never a zero or a false. CurrentTailnet.Name is raw here, in memory only;
+// context-translators.js HMACs it before any fact point is built.
+function validateTailnetFields(parsed) {
+  if (Object.prototype.hasOwnProperty.call(parsed, "Self")) {
+    if (!isPlainObject(parsed.Self)) return false;
+    if (Object.prototype.hasOwnProperty.call(parsed.Self, "Online") && typeof parsed.Self.Online !== "boolean") return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "ExitNodeStatus")) {
+    if (!isPlainObject(parsed.ExitNodeStatus)) return false;
+    if (Object.prototype.hasOwnProperty.call(parsed.ExitNodeStatus, "ID") && typeof parsed.ExitNodeStatus.ID !== "string") return false;
+    if (Object.prototype.hasOwnProperty.call(parsed.ExitNodeStatus, "Online") && typeof parsed.ExitNodeStatus.Online !== "boolean") return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "Health")) {
+    if (!Array.isArray(parsed.Health) || parsed.Health.some((issue) => typeof issue !== "string")) return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "CurrentTailnet")) {
+    if (!isPlainObject(parsed.CurrentTailnet)) return false;
+    const tailnet = parsed.CurrentTailnet;
+    if (Object.prototype.hasOwnProperty.call(tailnet, "Name") && (typeof tailnet.Name !== "string" || tailnet.Name.length === 0)) return false;
+    if (Object.prototype.hasOwnProperty.call(tailnet, "MagicDNSSuffix") && typeof tailnet.MagicDNSSuffix !== "string") return false;
+    if (Object.prototype.hasOwnProperty.call(tailnet, "MagicDNSEnabled") && typeof tailnet.MagicDNSEnabled !== "boolean") return false;
+  }
+  return true;
+}
+
+function parseTailnetState(parsed, peerMapValid, peers, valid) {
+  const self = isPlainObject(parsed.Self) ? parsed.Self : undefined;
+  let exitNodeInUse;
+  if (valid && isPlainObject(parsed.ExitNodeStatus)) exitNodeInUse = true;
+  else if (valid && peerMapValid && peers.some((peer) => peer.is_exit_node_active)) exitNodeInUse = true;
+  else if (valid && peerMapValid && parsed.BackendState === "Running") exitNodeInUse = false;
+  const state = {
+    backend_state: parsed.BackendState,
+    self_online: typeof self?.Online === "boolean" ? self.Online : undefined,
+    exit_node_in_use: exitNodeInUse,
+    health_issue_count: Array.isArray(parsed.Health) ? parsed.Health.length : undefined,
+    current_tailnet_name: isPlainObject(parsed.CurrentTailnet) && typeof parsed.CurrentTailnet.Name === "string" && parsed.CurrentTailnet.Name.length > 0
+      ? parsed.CurrentTailnet.Name
+      : undefined,
+  };
+  if (!valid) state.valid = false;
+  return state;
+}
+
+/**
+ * C0 review H1: the envelope as it may leave this process for a model provider (the
+ * collect_tailscale_status triage tool). The raw `CurrentTailnet.Name` is only for the daemon's own
+ * translator, which HMACs it with the per-install key before any fact point; it is stripped here and
+ * replaced by a presence flag, so the tool result never carries it (README data table: "not sent").
+ * Pure; the input is not mutated.
+ */
+export function redactTailscaleEnvelopeForModel(envelope) {
+  const tailnet = envelope?.result?.tailnet;
+  if (!tailnet || typeof tailnet !== "object" || !Object.prototype.hasOwnProperty.call(tailnet, "current_tailnet_name")) return envelope;
+  const { current_tailnet_name: name, ...rest } = tailnet;
+  return {
+    ...envelope,
+    result: { ...envelope.result, tailnet: { ...rest, current_tailnet_name_present: typeof name === "string" && name.length > 0 } },
   };
 }
 
 /**
  * Pure parser for `tailscale status --json` output. Raw public keys remain in this in-memory
  * shape only; fact-translators.js hashes them before producing persisted fact points.
+ *
+ * C0.3: BackendState is required; the Peer map is NOT (a logged-out daemon omits it). When it is
+ * absent or malformed, `peer_map_valid` is false and `peers` is empty; the collector then never
+ * reports a Running daemon as an ok zero-peer census.
  */
 export function parseTailscaleStatusJson(stdout) {
-  const parsed = JSON.parse(String(stdout ?? ""));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || typeof parsed.BackendState !== "string") {
+  if (typeof stdout !== "string") throw new SyntaxError("tailscale status JSON must be a string");
+  const parsed = JSON.parse(stdout);
+  if (!isPlainObject(parsed) || typeof parsed.BackendState !== "string" || parsed.BackendState.length === 0) {
     throw new SyntaxError("tailscale status JSON has no valid BackendState");
   }
-  if (!parsed.Peer || typeof parsed.Peer !== "object" || Array.isArray(parsed.Peer)) {
-    throw new SyntaxError("tailscale status JSON has no valid Peer map");
-  }
+  const peerEntries = isPlainObject(parsed.Peer) ? Object.entries(parsed.Peer) : [];
+  // A Running status is a trustworthy peer census only when EVERY entry validates. Filtering a
+  // malformed entry would turn an unreadable population into a false zero and could also make the
+  // remaining entries falsely prove that no exit node is in use.
+  const parsedPeers = peerEntries.map(([, peer]) => parsePeer(peer));
+  const peerKeys = peerEntries.map(([key]) => key);
+  const publicKeys = parsedPeers.map((peer) => peer?.node_public_key).filter((key) => key !== undefined);
+  const keyReference = validateCrossReferenceKeys(peerKeys, publicKeys);
+  const peerMapValid = isPlainObject(parsed.Peer)
+    && parsedPeers.every((peer) => peer !== undefined)
+    && keyReference.ok;
+  const peerShapeValid = !Object.prototype.hasOwnProperty.call(parsed, "Peer") || peerMapValid;
+  const peers = peerMapValid ? parsedPeers : [];
+  const tailnetValid = validateTailnetFields(parsed);
 
   return {
     backend_state: parsed.BackendState,
-    peers: Object.values(parsed.Peer).map(parsePeer).filter(Boolean),
+    peer_map_valid: peerMapValid,
+    peer_shape_valid: peerShapeValid,
+    peer_key_reference_valid: keyReference.ok,
+    peer_key_reference_error: keyReference.ok ? undefined : keyReference.reason,
+    peers,
+    tailnet: parseTailnetState(parsed, peerMapValid, peers, tailnetValid),
+    tailnet_valid: tailnetValid,
   };
 }
 
@@ -110,10 +206,12 @@ function resultForFailure(status, probe, extra = {}) {
  * the single-source collector convention.
  */
 export async function collectTailscaleStatusEvidence(options = {}) {
-  const cap = Math.min(MAX_TAILSCALE_PEER_ENTITY_LIMIT, Math.max(1, Number(options.peerLimit) || DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT));
+  const requestedCap = typeof options.peerLimit === "number" && Number.isSafeInteger(options.peerLimit) ? options.peerLimit : DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT;
+  const cap = Math.min(MAX_TAILSCALE_PEER_ENTITY_LIMIT, Math.max(1, requestedCap));
 
   return timedEnvelope(async () => {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;
+    throwIfCollectorAborted(options.signal);
     const probe = await runExec("tailscale", ["status", "--json"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
     if (isBinaryNotFound(probe)) return resultForFailure("not_found_on_known_paths", probe, { cap });
@@ -136,9 +234,13 @@ export async function collectTailscaleStatusEvidence(options = {}) {
     // misreport a working daemon as a collection failure. Only an UNRECOGNIZED value falls through
     // to the `unable` fallback below (fail-safe: an unknown state is genuinely suspect).
     if (["NeedsLogin", "NoState", "Stopped", "NeedsMachineAuth", "Starting"].includes(parsed.backend_state)) {
+      if (!parsed.tailnet_valid || !parsed.peer_shape_valid) {
+        return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has malformed fields" });
+      }
       return {
         status: "logged_out",
         backend_state: parsed.backend_state,
+        tailnet: parsed.tailnet,
         peers: [],
         total_count: 0,
         truncated: false,
@@ -150,15 +252,29 @@ export async function collectTailscaleStatusEvidence(options = {}) {
     }
 
     if (parsed.backend_state !== "Running") {
-      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state });
+      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet });
+    }
+    if (!parsed.tailnet_valid) {
+      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has malformed tailnet fields" });
+    }
+    // C0.3: a Running daemon whose Peer map is missing or malformed is not a peer census (never an
+    // ok zero), but its tailnet state was observed and is kept.
+    if (!parsed.peer_map_valid) {
+      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has no valid Peer map" });
     }
 
+    const census = finalizeCensus({
+      records: parsed.peers,
+      identity: (peer) => peer.node_public_key,
+      cap,
+    });
     return {
-      status: "ok",
+      status: census.status,
       backend_state: parsed.backend_state,
-      total_count: parsed.peers.length,
-      peers: parsed.peers.slice(0, cap),
-      truncated: parsed.peers.length > cap,
+      tailnet: parsed.tailnet,
+      total_count: census.total_count,
+      peers: census.records,
+      truncated: census.truncated,
       cap,
       elevation_candidate: false,
       command: probe.command,

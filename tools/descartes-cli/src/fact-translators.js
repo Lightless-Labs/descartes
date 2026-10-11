@@ -854,7 +854,9 @@ function normalizedSourceStatus(status) {
 // not a contract) -- a stable, versioned signature format lets peer-baseline.js compare two
 // signatures with simple string equality.
 const PEER_AVAILABILITY_SOURCE_ORDER = ["ssh_who", "ssh_last", "wireguard", "vpn_services", "established_inbound"];
-const PEER_AVAILABILITY_SIGNATURE_VERSION = "v1";
+// C0 review M4: v2 from the C0.4 who/last parser fix, which changes what counts as a peer; a new
+// version is a new regime (peer-baseline.js accepts v1 and v2), so the baseline re-warms honestly.
+const PEER_AVAILABILITY_SIGNATURE_VERSION = "v2";
 
 // Degrade-not-fabricate: a missing/malformed `sources` object (e.g. a simplified test fixture)
 // degrades every source to "unknown" rather than throwing -- mirrors censusStateFor's own
@@ -1022,6 +1024,12 @@ export function factPointsFromVpnPeerEvidence(evidence, { ts } = {}) {
  * and its overflow marker safely composes with the sibling collector's overflow marker.
  */
 export function factPointsFromTailscaleStatusEvidence(evidence, { ts } = {}) {
+  // C0 review M8: a vpn-peer-status envelope the DAEMON synthesized (its census overran the C0.7
+  // sub-deadline or threw) writes no census marker, so tailscale peers alone would persist as a
+  // markerless peer tick the baseline treats as complete. Before C0.7 that tick was discarded whole;
+  // it still is, for the peer census. (No vpn-peer-status envelope at all -- the collector disabled --
+  // keeps the legacy markerless behaviour.)
+  if ((evidence ?? []).some((e) => e?.id === "vpn-peer-status" && e.source === "daemon")) return [];
   const envelope = (evidence ?? []).find((e) => e.id === "tailscale-status" && e.status !== "unable");
   if (!envelope) return [];
   const peers = envelope.result?.peers ?? [];

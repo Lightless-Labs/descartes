@@ -247,8 +247,10 @@ export async function collectSessionEvidence(options = {}) {
   const cap = Math.min(MAX_SESSION_ENTITY_LIMIT, Math.max(1, Number(options.sessionLimit) || DEFAULT_SESSION_ENTITY_LIMIT));
 
   return timedEnvelope(async () => {
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const platform = options.platform ?? process.platform;
     const tmux = await collectTmuxSessions(options);
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const screen = await collectScreenSessions(options);
     const multiplexers = [tmux, screen];
 

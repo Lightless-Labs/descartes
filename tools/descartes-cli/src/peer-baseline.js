@@ -41,23 +41,29 @@ const PEER_FACT_NAME = "peer.presence";
 // a future/incompatible marker producer) is NOT a legitimate regime key -- see
 // groupPeerFactsByTick's own use of this pattern below for why a type-only guard is insufficient.
 const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)";
-const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v1:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
+// C0 review M4: "v2" since the C0.4 who/last parser fix (local tmux/X/screen attachments and
+// weekday-as-host rows are no longer peers). v1 history stays a VALID regime key -- just a different
+// one -- so the count re-warms under v2 instead of scoring the parser change as a drop or a spike.
+const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v[12]:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
 
 export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
 // Slice 4c (observed-incident collectors plan) — the sign-flipped mirror of PEER_COUNT_SPIKE_RULE_ID.
 export const PEER_COUNT_DROP_RULE_ID = "peer.count_drop";
 
-// R8 identity migration: the count input is no longer one undifferentiated global peer universe.
-// Marker-backed ticks are signed by the VPN census and therefore count only VPN-source peers;
-// markerless ticks retain the legacy all-peer count. Version both identities so a persisted alert
-// created under the old global semantics can never be recovered by a differently-scoped detector.
-export const PEER_COUNT_VPN_FINGERPRINT = "v2:vpn";
-export const PEER_COUNT_MARKERLESS_FINGERPRINT = "v2:markerless";
+// R8/B1 identity migration: the count input is no longer one undifferentiated global peer
+// universe. Marker-backed ticks are signed by the VPN census and therefore count only VPN-source
+// peers; markerless ticks retain the legacy all-peer count. The availability-signature VERSION is
+// part of the identity namespace. A v1 marker is valid historical data for re-warming/folding,
+// but it is a legacy semantic regime and can never authorize recovery or raise under the current
+// detector identity. The `v2sig:` namespace deliberately cannot collide with the old `v2:`
+// fingerprints that were persisted before this fix.
+export const PEER_COUNT_VPN_FINGERPRINT = "v2sig:vpn";
+export const PEER_COUNT_MARKERLESS_FINGERPRINT = "v2sig:markerless";
 
 export function peerCountFingerprintForAvailabilitySignature(availabilitySignature) {
-  return availabilitySignature === undefined
-    ? PEER_COUNT_MARKERLESS_FINGERPRINT
-    : PEER_COUNT_VPN_FINGERPRINT;
+  if (availabilitySignature === undefined) return PEER_COUNT_MARKERLESS_FINGERPRINT;
+  if (typeof availabilitySignature !== "string" || !availabilitySignature.startsWith("v2:")) return undefined;
+  return PEER_COUNT_VPN_FINGERPRINT;
 }
 
 const COMPLETE_PEER_SOURCE_STATUSES = new Set(["ok", "absent", "not_applicable"]);
@@ -66,11 +72,9 @@ function availabilitySignatureHasIncompleteSource(signature) {
   if (signature === undefined) return false;
   const codes = typeof signature === "string" ? signature.split(":")[1]?.split("-") : undefined;
   if (!Array.isArray(codes) || codes.length !== 5) return true;
-  // The VPN-services census is the source whose incomplete service inventory changes the
-  // identity/count universe used by these rules. Other source slots retain their existing
-  // regime behavior (for example a WireGuard permission gap is already represented by its own
-  // source status and does not make a VPN-services census incomplete).
-  return !COMPLETE_PEER_SOURCE_STATUSES.has(codes[3]);
+  // Every source slot is evidence for the same tick. A partial/unknown slot means the population
+  // was filtered or incomplete somewhere, so neither folding nor evaluation may use this tick.
+  return codes.some((code) => !COMPLETE_PEER_SOURCE_STATUSES.has(code));
 }
 
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults
@@ -982,14 +986,14 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const spikeFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
   const dropFresh = isFreshTs(windowedDrop.last_observation?.ts, nowMs, freshnessMs);
   const currentFingerprint = peerCountFingerprintForAvailabilitySignature(currentGroups.at(-1)?.availabilitySignature);
-  const spikeCandidate = spikeFresh
+  const spikeCandidate = currentFingerprint !== undefined && spikeFresh
     ? buildCountSpikeCandidate(
       { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
       { deviationSigma, fingerprint: currentFingerprint },
     )
     : undefined;
   if (spikeCandidate && spikeHorizonOk && censusFresh) candidates.push(spikeCandidate);
-  const dropCandidate = dropFresh
+  const dropCandidate = currentFingerprint !== undefined && dropFresh
     ? buildCountDropCandidate(
       { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
       { deviationSigma, fingerprint: currentFingerprint },
@@ -1030,8 +1034,11 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     and the rule's eligibility horizon is met (S3) -- a stale tick is not evaluated.
   const spikeEvaluated = spikeFresh && windowed.confidence_state === "established";
   const dropEvaluated = dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady;
-  const spikeKeys = spikeEvaluated && spikeHorizonOk && censusFresh ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : [];
-  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : [];
+  const currentIdentityEvaluable = currentFingerprint !== undefined;
+  const spikeKeys = currentIdentityEvaluable && spikeEvaluated && spikeHorizonOk && censusFresh
+    ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : [];
+  const dropKeys = currentIdentityEvaluable && dropEvaluated && dropHorizonOk && censusFresh
+    ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : [];
   const evaluatedAlertKeys = [...spikeKeys, ...dropKeys];
   // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
   // Readiness order: stale census, warm-up, no scorable observation (e.g. a markerless Tailscale

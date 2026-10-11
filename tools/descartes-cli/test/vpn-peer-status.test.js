@@ -19,6 +19,13 @@ import {
 } from "../src/tools/vpn-peer-status.js";
 
 const SRC_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "tools", "vpn-peer-status.js");
+const WG_KEY_A = "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=";
+const WG_KEY_B = "xTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=";
+function wgKeyFor(index) {
+  const bytes = Buffer.alloc(32);
+  bytes.writeUInt32BE(index, 28);
+  return bytes.toString("base64");
+}
 
 function ok(stdout, stderr = "") {
   return { status: "ok", stdout, stderr, command: { argv: ["fixture"], read_only: true } };
@@ -91,6 +98,19 @@ test("parseWhoOutput on empty stdout yields zero entries", () => {
   assert.deepEqual(parseWhoOutput(""), { entries: [] });
 });
 
+test("B1 daybreak reproduction: who with one valid row plus MALFORMED is partial, never a complete census", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["who"])]: ok("alice pts/0 2026-10-11 12:00 (203.0.113.5)\nMALFORMED\n"),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_who.status, "partial");
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.result.sources.ssh_who.malformed_count, 1);
+  assert.equal(envelope.result.peers.length, 1);
+});
+
 // ---------------------------------------------------------------------------------------------
 // parseLastOutput — per-platform hostname fixtures (must-fix 7)
 // ---------------------------------------------------------------------------------------------
@@ -139,6 +159,57 @@ test("parseLastOutput on empty stdout yields zero entries, zero malformed", () =
   assert.deepEqual(parseLastOutput(""), { entries: [], malformed_count: 0 });
 });
 
+test("B1: a malformed last row makes ssh_last partial even when valid history remains", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["last", "-n", String(DEFAULT_LAST_HISTORY_LIMIT)])]: ok("alice pts/0 host.example Sun Oct 11 12:00 still logged in\nBROKEN\n"),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_last.status, "partial");
+  assert.equal(envelope.result.sources.ssh_last.malformed_count, 1);
+});
+
+test("HIGH 2 reproduction: exactly 50 last rows exhaust the shared cap, mark ssh_last partial/truncated, and emit overflow", async () => {
+  const rows = Array.from({ length: DEFAULT_LAST_HISTORY_LIMIT }, (_, index) =>
+    `user${index} pts/${index} host-${index}.example Sun Oct 11 12:00 still logged in`).join("\n");
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["last", "-n", String(DEFAULT_LAST_HISTORY_LIMIT)])]: ok(`${rows}\n`),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_last.status, "partial");
+  assert.equal(envelope.result.sources.ssh_last.truncated, true);
+  assert.equal(envelope.result.truncated, true);
+
+  const { factPointsFromVpnPeerEvidence } = await import("../src/fact-translators.js");
+  const points = factPointsFromVpnPeerEvidence([envelope], { ts: "2026-10-11T12:00:00.000Z" });
+  assert.ok(points.some((point) => point.attributes.overflow === "true"));
+});
+
+test("HIGH 2 regression: a reboot row still exhausts the raw last cap and engages the correlation overflow veto", async () => {
+  const remoteRows = Array.from({ length: DEFAULT_LAST_HISTORY_LIMIT - 1 }, (_, index) =>
+    `user${index} pts/${index} host-${index}.example Sun Oct 11 12:00 still logged in`).join("\n");
+  const rebootRow = "reboot   system boot  6.1.0  Sun Oct 11 00:00";
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["last", "-n", String(DEFAULT_LAST_HISTORY_LIMIT)])]: ok(`${remoteRows}\n${rebootRow}\n`),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_last.status, "partial");
+  assert.equal(envelope.result.sources.ssh_last.truncated, true);
+  assert.equal(envelope.result.truncated, true);
+
+  const { factPointsFromVpnPeerEvidence } = await import("../src/fact-translators.js");
+  const { findQualifyingPeerObservations } = await import("../src/incident-correlation.js");
+  const points = factPointsFromVpnPeerEvidence([envelope], { ts: "2026-10-11T12:00:00.000Z" });
+  const overflow = points.find((point) => point.attributes.overflow === "true");
+  assert.ok(overflow, "raw-cap exhaustion must emit the peer overflow marker");
+  assert.deepEqual(findQualifyingPeerObservations(points, { first_seen_ms: Date.parse("2026-10-11T12:00:00.000Z") }), []);
+});
+
 // ---------------------------------------------------------------------------------------------
 // WireGuard parsers
 // ---------------------------------------------------------------------------------------------
@@ -150,22 +221,65 @@ test("parseWgInterfaceList splits on whitespace, tolerates a single or multiple 
 });
 
 test("parseWgPeerList returns one pubkey per line, empty for a real zero-peers interface", () => {
-  const stdout = "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=\nxTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=\n";
+  const stdout = `${WG_KEY_A}\n${WG_KEY_B}\n`;
   assert.deepEqual(parseWgPeerList(stdout), [
-    "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=",
-    "xTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=",
+    WG_KEY_A,
+    WG_KEY_B,
   ]);
   assert.deepEqual(parseWgPeerList(""), []);
 });
 
 test("parseWgEndpoints maps pubkey -> endpoint, treating '(none)' as no endpoint", () => {
-  const stdout = "keyA\t203.0.113.10:51820\nkeyB\t(none)\n";
-  assert.deepEqual(parseWgEndpoints(stdout), { keyA: "203.0.113.10:51820", keyB: undefined });
+  const stdout = `${WG_KEY_A}\t203.0.113.10:51820\n${WG_KEY_B}\t(none)\n`;
+  assert.deepEqual(parseWgEndpoints(stdout), { [WG_KEY_A]: "203.0.113.10:51820", [WG_KEY_B]: undefined });
 });
 
 test("parseWgHandshakes maps pubkey -> epoch seconds, 0 means never handshaked", () => {
-  const stdout = "keyA\t1720000000\nkeyB\t0\n";
-  assert.deepEqual(parseWgHandshakes(stdout), { keyA: 1720000000, keyB: 0 });
+  const stdout = `${WG_KEY_A}\t1720000000\n${WG_KEY_B}\t0\n`;
+  assert.deepEqual(parseWgHandshakes(stdout), { [WG_KEY_A]: 1720000000, [WG_KEY_B]: 0 });
+});
+
+test("B1: WireGuard malformed rows are partial and never coerced into peers", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
+      [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${WG_KEY_A}\nMALFORMED ROW\n`),
+      [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${WG_KEY_A}\t203.0.113.10:51820\n`),
+      [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${WG_KEY_A}\t1720000000\n`),
+    })),
+  });
+  assert.equal(envelope.result.sources.wireguard.status, "partial");
+  assert.deepEqual(envelope.result.sources.wireguard.interfaces, [{ name: "wg0", status: "partial" }]);
+  assert.equal(envelope.result.peers.some((peer) => peer.source_type === "wireguard"), false);
+});
+
+test("B1 daybreak reproduction: malformed or mismatched WireGuard key populations are partial and emit no peers", async () => {
+  const cases = [
+    {
+      peers: "not-a-wireguard-public-key\n",
+      endpoints: `${WG_KEY_B}\t203.0.113.10:51820\n`,
+      handshakes: `${WG_KEY_B}\t1720000000\n`,
+    },
+    {
+      peers: `${WG_KEY_A}\n`,
+      endpoints: `${WG_KEY_B}\t203.0.113.10:51820\n`,
+      handshakes: `${WG_KEY_B}\t1720000000\n`,
+    },
+  ];
+  for (const fixture of cases) {
+    const envelope = await collectVpnPeerStatusEvidence({
+      platform: "linux",
+      runFixedExecFile: scriptedExec(baseScript({
+        [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
+        [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(fixture.peers),
+        [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(fixture.endpoints),
+        [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(fixture.handshakes),
+      })),
+    });
+    assert.equal(envelope.result.sources.wireguard.status, "partial");
+    assert.deepEqual(envelope.result.peers, []);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -283,9 +397,9 @@ test("BEHAVIORAL: across multiple interfaces (including an adversarial interface
   const adversarialIface = "wg0; wg show wg0 dump"; // a crafted/compromised interface name
   const script = {
     [JSON.stringify(["wg", "show", "interfaces"])]: ok(["wg0", adversarialIface].join(" ")),
-    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\n"),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok("keyA\t203.0.113.10:51820\n"),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok("keyA\t1720000000\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${WG_KEY_A}\n`),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${WG_KEY_A}\t203.0.113.10:51820\n`),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${WG_KEY_A}\t1720000000\n`),
     [JSON.stringify(["wg", "show", adversarialIface, "peers"])]: ok(""),
     [JSON.stringify(["wg", "show", adversarialIface, "endpoints"])]: ok(""),
     [JSON.stringify(["wg", "show", adversarialIface, "latest-handshakes"])]: ok(""),
@@ -416,9 +530,9 @@ test("an untrusted vpn_services binary is incomplete and its resolved-path trust
 test("WireGuard present with peers, SSH not found -> exactly the WG peers, no fabricated SSH data", async () => {
   const runFixedExecFile = scriptedExec(baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
-    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\nkeyB\n"),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok("keyA\t203.0.113.10:51820\nkeyB\t(none)\n"),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok("keyA\t1720000000\nkeyB\t0\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${WG_KEY_A}\n${WG_KEY_B}\n`),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${WG_KEY_A}\t203.0.113.10:51820\n${WG_KEY_B}\t(none)\n`),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${WG_KEY_A}\t1720000000\n${WG_KEY_B}\t0\n`),
   }));
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile });
   assert.equal(envelope.status, "ok");
@@ -455,6 +569,24 @@ test("permission-denied on a per-interface wg subcommand -> that interface is 'm
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile });
   assert.equal(envelope.result.sources.wireguard.status, "partial");
   assert.deepEqual(envelope.result.sources.wireguard.interfaces, [{ name: "wg0", status: "missing_permission", error: "boom" }]);
+});
+
+test("MEDIUM: aborting during wg0 prevents every later wg subprocess launch", async () => {
+  const controller = new AbortController();
+  const calls = [];
+  const script = baseScript({
+    [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0 wg1\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: () => {
+      controller.abort();
+      return ok(`${WG_KEY_A}\n`);
+    },
+  });
+  const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", signal: controller.signal, runFixedExecFile: scriptedExec(script, calls) });
+  assert.equal(envelope.status, "unable");
+  assert.deepEqual(calls.filter(([command]) => command === "wg"), [
+    ["wg", "show", "interfaces"],
+    ["wg", "show", "wg0", "peers"],
+  ]);
 });
 
 test("permission-denied on who/last -> missing_permission, never fabricated as zero", async () => {
@@ -545,12 +677,14 @@ test("a custom lastHistoryLimit is honored and still bounded (fixture-pinned per
 
 test("a peer flood above the cap is bounded at the cap, with truncated:true and the real total preserved", async () => {
   const cap = 5;
-  const pubkeys = Array.from({ length: cap * 4 }, (_, i) => `key-${i}`).join("\n");
+  const pubkeys = Array.from({ length: cap * 4 }, (_, i) => wgKeyFor(i)).join("\n");
+  const endpoints = Array.from({ length: cap * 4 }, (_, i) => `${wgKeyFor(i)}\t(none)`).join("\n");
+  const handshakes = Array.from({ length: cap * 4 }, (_, i) => `${wgKeyFor(i)}\t0`).join("\n");
   const script = baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(endpoints),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(handshakes),
   });
   const runFixedExecFile = scriptedExec(script);
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile, peerLimit: cap });
@@ -562,12 +696,14 @@ test("a peer flood above the cap is bounded at the cap, with truncated:true and 
 
 test("a peer count at or below the cap is never marked truncated", async () => {
   const cap = 5;
-  const pubkeys = Array.from({ length: cap }, (_, i) => `key-${i}`).join("\n");
+  const pubkeys = Array.from({ length: cap }, (_, i) => wgKeyFor(i)).join("\n");
+  const endpoints = Array.from({ length: cap }, (_, i) => `${wgKeyFor(i)}\t(none)`).join("\n");
+  const handshakes = Array.from({ length: cap }, (_, i) => `${wgKeyFor(i)}\t0`).join("\n");
   const script = baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(endpoints),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(handshakes),
   });
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: scriptedExec(script), peerLimit: cap });
   assert.equal(envelope.result.peers.length, cap);
@@ -576,15 +712,54 @@ test("a peer count at or below the cap is never marked truncated", async () => {
 
 // Fact-store capacity plan §2/S4: the peer cap is a hard UPPER clamp (T8 sizes the peer budget on it).
 test("an options.peerLimit above MAX_PEER_ENTITY_LIMIT is clamped down to it", async () => {
-  const pubkeys = Array.from({ length: MAX_PEER_ENTITY_LIMIT + 20 }, (_, i) => `key-${i}`).join("\n");
+  const count = MAX_PEER_ENTITY_LIMIT + 20;
+  const pubkeys = Array.from({ length: count }, (_, i) => wgKeyFor(i)).join("\n");
+  const endpoints = Array.from({ length: count }, (_, i) => `${wgKeyFor(i)}\t(none)`).join("\n");
+  const handshakes = Array.from({ length: count }, (_, i) => `${wgKeyFor(i)}\t0`).join("\n");
   const script = baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(endpoints),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(handshakes),
   });
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: scriptedExec(script), peerLimit: 100_000 });
   assert.equal(envelope.result.cap, MAX_PEER_ENTITY_LIMIT);
   assert.equal(envelope.result.peers.length, MAX_PEER_ENTITY_LIMIT);
   assert.equal(envelope.result.truncated, true);
+});
+
+// --- Context plan C0.4: explicit local patterns stop fabricating peers ---
+
+test("C0.4: who's (:0), (:1.0), (:pts/3:S.0) and (tmux(1234).%0) are local attachments, not remote hosts; (mosh [pid]) and real hosts stay remote", () => {
+  const stdout = [
+    "alice    tty7         2026-10-11 08:00 (:0)",
+    "alice    pts/1        2026-10-11 08:01 (:1.0)",
+    "alice    pts/3        2026-10-11 08:02 (:pts/3:S.0)",
+    "alice    pts/4        2026-10-11 08:03 (tmux(1234).%0)",
+    "bob      pts/5        2026-10-11 08:04 (mosh [4321])",
+    "carol    pts/6        2026-10-11 08:05 (203.0.113.7)",
+    "dave     pts/7        2026-10-11 08:06 (laptop.example:10.0)",
+  ].join("\n");
+  assert.deepEqual(parseWhoOutput(stdout).entries, [
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "bob", remote_host: "mosh [4321]" },
+    { remote_user: "carol", remote_host: "203.0.113.7" },
+    { remote_user: "dave", remote_host: "laptop.example:10.0" },
+  ]);
+});
+
+test("C0.4: a macOS `last` local row has no host column -- its date is no longer read as a remote host named \"Fri\" (real-output fixture)", () => {
+  const stdout = [
+    "thomas     ttys037  100.64.118.39          Sun Oct 11 12:53   still logged in",
+    "thomas     ttys001                         Fri Sep  4 16:18   still logged in",
+    "thomas     console                         Fri Sep  4 16:17   still logged in",
+    "alice      pts/2    :pts/3:S.0             Fri Sep  4 16:17 - 16:20  (00:03)",
+    "reboot time                                Fri Sep  4 16:10",
+    "",
+    "wtmp begins Fri Sep  4 16:10:30 2026",
+  ].join("\n");
+  assert.deepEqual(parseLastOutput(stdout).entries, [{ remote_user: "thomas", remote_host: "100.64.118.39" }]);
 });

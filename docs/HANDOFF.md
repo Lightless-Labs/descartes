@@ -2,6 +2,75 @@
 
 **Last updated:** 2026-10-11
 
+## Linux iproute2 route and inet6 grammar completion — 2026-10-11 — local, not pushed
+
+Added TDD coverage and a shared strict Linux iproute2 route grammar. The route parsers now accept
+the formatter-emitted standalone route flags (`dead`, `onlink`, `pervasive`, `offload`, `trap`,
+`notify`, `linkdown`, `unresolved`, `rt_offload`, `rt_trap`, and `rt_offload_failed`) plus the
+simple key/value attributes emitted by `print_route`, while rejecting unknown tokens, duplicates,
+missing values, and trailing junk. Linux inet6 lines now accept `metric N` before `scope`, the
+named and numeric address protocols, all existing IFA flags, residual `flags HEX`, and formatter
+scope names with bounded numeric values. Required real-shape fixtures are covered.
+
+Focused network, net-config, and census-validation verification passes **51/51**. Fresh-XDG full
+`npm test` completed with **2,623 total: 2,560 passed, 22 failed, 35 skipped, 6 todo**. The 22
+failures are environment-only: 17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1`
+(`listen EPERM`), and 2 live-process provenance checks return `unknown` under restricted process
+introspection. No changed-area product test failed. No push or merge.
+
+## Context facts C2 re-gate follow-up — 2026-10-11 — local, not pushed
+
+On `feat/context-facts-c2-2026-10`, closed the remaining HIGH/MEDIUM findings in six atomic
+commits: `63c48b1` (raw-cap last-history regression), `acc00bd` (raw source count drives
+truncation), `26bb036` (network parser prefix-junk regressions and generic grammar adversaries),
+`af93045` (full-line route/resolver/socket grammars), `8a9e2c1` (Linux inet6 flag/proto
+regressions), and `9aa5b1c` (documented iproute2 inet6 grammar). No push or merge.
+
+Focused verification passes **96/96**; `git diff --check` is clean. Fresh-XDG full `npm test`
+completed with **2,619 total: 2,556 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are
+environment-only: 17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1` (`listen EPERM`),
+and 2 live-process provenance checks return `unknown` under restricted process introspection. No
+changed-area product test failed.
+
+The `last` cap now counts non-header raw source rows before dropping reboot/shutdown/local rows,
+so 49 remote rows plus one reboot row at a 50-row cap is partial/truncated and emits the peer
+overflow marker; the correlation overflow veto is covered end-to-end. Linux route, resolv.conf,
+scutil DNS, Linux `ss`, and macOS `lsof` socket rows now consume anchored full-line grammars with
+validated values and reject suffix junk. Linux inet6 accepts the documented address flags and
+`kernel_lo`/`kernel_ra`/`kernel_ll` (plus numeric) address protocols while rejecting unknown
+tokens. No push or merge.
+
+## Context facts C2 daybreak re-gate — 2026-10-11 — local, not pushed
+
+On `feat/context-facts-c2-2026-10`, closed the remaining daybreak findings in eight atomic
+commits: `4e4c376` (red regressions and exhaustive parser/abort registries), `c62d1fe` (strict
+full-line network-config grammars), `54777ce` (shared `last` cap propagation and VPN overflow),
+`418872f` (duplicate loginctl properties), `51a6cc5` (network census validation without duplicate
+collapse), `74a4e61` (calendar-strict RFC3339), and `fa266af` (all-src subprocess abort audit and
+login opener guard), and `bdd5658` (calendar component round-trip). No push or merge.
+
+Focused verification passes **115/115**. Fresh-XDG full `npm test` completed with **2,615 total:
+2,552 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are environment-only: 17
+notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1` (`listen EPERM`), and 2 live-process
+provenance tests return `unknown` under restricted process introspection. No changed-area product
+test failed. `git diff --check` is clean.
+
+## Context facts C2 census validation rework — 2026-10-11 — local, not pushed
+
+On `feat/context-facts-c2-2026-10`, closed the reported census-validation findings in two
+atomic commits: `cc78fad` adds the red regressions and `f37db5a` introduces the shared
+`census-validate` finalizer, wires it through the incumbent peer/session/network/host parsers,
+rejects coercive metadata and non-RFC3339 timestamps, makes truncation and cross-reference
+mismatches partial, and checks every collector launch call site. No product alert family or
+mutating action was added. No push or merge.
+
+Focused verification passed: **168 passed, 0 failed, 1 skipped, 6 todo, 175 total**; `git
+diff --check` is clean. Fresh-XDG full `npm test` completed with **2,547 passed, 22 failed, 35
+skipped, 6 todo, 2,610 total**. All 22 failures are environmental: 17 notifier-reuse and 3
+tap-bump loopback test-server cases fail with `listen EPERM` because the sandbox forbids binding
+`127.0.0.1`, and 2 live-process provenance checks return `unknown` under sandbox process
+introspection. No changed-area product test failed.
+
 ## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
 Removed the content-hash pin map, daemon persistence, `contentHashCache` plumbing, and the

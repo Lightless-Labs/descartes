@@ -144,6 +144,29 @@ test("collector tools honor configured operator-trusted binaries loaded from wat
   assert.equal(toolResult.details.result.binary_provenance.trust_verdict, "operator_trusted");
 });
 
+test("C0 review H1: the collect_tailscale_status triage tool never hands the raw tailnet name to the model provider", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-pi-harness-tailnet-name-test-"));
+  const paths = resolveDescartesPaths({
+    HOME: root,
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    XDG_DATA_HOME: path.join(root, "data"),
+    XDG_STATE_HOME: path.join(root, "state"),
+    XDG_CACHE_HOME: path.join(root, "cache"),
+  });
+  const fakeTailscale = path.join(root, "tailscale");
+  await fs.writeFile(fakeTailscale, "#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ BackendState: 'Running', Peer: {}, Self: { Online: true }, CurrentTailnet: { Name: 'secret-tailnet.example.ts.net' } }));\n", { mode: 0o755 });
+  await fs.chmod(fakeTailscale, 0o755);
+  await writeWatchConfig(paths, { trusted_binary_paths: [fakeTailscale] });
+
+  const tailscaleTool = createEvidenceTools(paths).find((tool) => tool.name === "collect_tailscale_status");
+  const toolResult = await tailscaleTool.execute("test-call-id", {});
+
+  assert.equal(toolResult.details.status, "ok");
+  assert.equal(toolResult.details.result.tailnet.self_online, true, "the closed tailnet state is still reported");
+  assert.equal(toolResult.details.result.tailnet.current_tailnet_name, undefined);
+  assert.ok(!JSON.stringify(toolResult).includes("secret-tailnet"), "no raw tailnet name anywhere in the tool result");
+});
+
 // F7 fix B: derive_findings must only ever see evidence this session's own collector tool calls
 // actually produced (referenced by id), never a model-fabricated evidence envelope passed inline.
 test("derive_findings resolves ids from this session's own prior collect_system call and reports a never-collected id as unresolved", async () => {

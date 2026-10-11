@@ -16,6 +16,7 @@ import {
   DEFAULT_PEER_STDDEV_FLOOR,
   PEER_COUNT_MARKERLESS_FINGERPRINT,
   PEER_COUNT_VPN_FINGERPRINT,
+  peerCountFingerprintForAvailabilitySignature,
   PEER_COUNT_DROP_RULE_ID,
   PEER_COUNT_SPIKE_RULE_ID,
   PEER_SIGNATURE_INVALID,
@@ -25,6 +26,7 @@ import {
   computeWindowedPeerDropStats,
   computeWindowedPeerStats,
   groupPeerFactsByTick,
+  tickGroupDisposition,
   loadPeerBaselineStore,
   normalizePeerBaselineState,
   resolvePeerBaselineStorePaths,
@@ -81,7 +83,7 @@ function overflowMarkerPoint(ts) {
 
 // Slice 4c fixtures -------------------------------------------------------------------------
 
-const DEFAULT_SIGNATURE = "v1:ok-ok-ok-ok-ok";
+const DEFAULT_SIGNATURE = "v2:ok-ok-ok-ok-ok";
 
 function censusMarkerPoint(ts, signature = DEFAULT_SIGNATURE) {
   return {
@@ -220,6 +222,67 @@ test("PEER_COUNT_SPIKE_RULE_ID is 'peer.count_spike'", () => {
 
 test("PEER_COUNT_DROP_RULE_ID is 'peer.count_drop'", () => {
   assert.equal(PEER_COUNT_DROP_RULE_ID, "peer.count_drop");
+});
+
+test("B1: peer identities include the availability-signature version, and v1 signatures never authorize coverage", () => {
+  assert.equal(PEER_COUNT_VPN_FINGERPRINT, "v2sig:vpn");
+  assert.equal(PEER_COUNT_MARKERLESS_FINGERPRINT, "v2sig:markerless");
+  assert.equal(peerCountFingerprintForAvailabilitySignature("v2:ok-ok-ok-ok-ok"), "v2sig:vpn");
+  assert.equal(peerCountFingerprintForAvailabilitySignature("v1:ok-ok-ok-ok-ok"), undefined);
+  assert.equal(peerCountFingerprintForAvailabilitySignature(undefined), "v2sig:markerless");
+});
+
+test("B1 daybreak reproduction: a legacy v1-derived alert stays active while v2 re-warms, then v2 raises and recovers under its own identity", async () => {
+  const paths = await tempPaths();
+  const legacyFingerprint = "v2:vpn";
+  const legacyKey = alertId(PEER_COUNT_SPIKE_RULE_ID, legacyFingerprint);
+  const legacyAlert = {
+    id: legacyKey,
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    fingerprint: legacyFingerprint,
+    severity: "warning",
+    title: "Peer count deviation",
+    summary: "legacy v1-derived alert",
+    diagnostics: {},
+    evidence_refs: ["peer-baseline"],
+    status: "active",
+    first_seen: tickTs(0),
+    last_seen: tickTs(30),
+    last_notified: null,
+    cooldown_until: null,
+    acknowledged_at: null,
+  };
+  const oldTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    oldTicks.push(...activeTickWithMarker(tickTs(i), 2, "v1:ok-ok-ok-ok-ok"));
+  }
+  const oldDeviationTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  oldTicks.push(...activeTickWithMarker(oldDeviationTs, 40, "v1:ok-ok-ok-ok-ok"));
+  const old = await seedAndCompute(paths, oldTicks, { now: oldDeviationTs });
+  assert.equal(old.evaluatedAlertKeys.length, 0, "v1-signature history must not evaluate any peer identity");
+
+  const v2Ticks = [];
+  for (let i = 1; i <= DEFAULT_PEER_MIN_SAMPLE_COUNT + 1; i += 1) {
+    const ts = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + i);
+    v2Ticks.push(...activeTickWithMarker(ts, 2, "v2:ok-ok-ok-ok-ok"));
+  }
+  await appendFactPointsByFamily(paths, v2Ticks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT * 2 + 1) });
+  const warmed = await computePeerBaselineCandidates(paths, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT * 2 + 1) });
+  assert.equal(warmed.evaluatedAlertKeys.some((id) => id === legacyKey), false, "v2 coverage must never cover the legacy identity");
+
+  const v2DeviationTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT * 2 + 2);
+  await appendFactPointsByFamily(paths, activeTickWithMarker(v2DeviationTs, 40, "v2:ok-ok-ok-ok-ok"), { now: v2DeviationTs });
+  const v2Deviation = await computePeerBaselineCandidates(paths, { now: v2DeviationTs });
+  const v2Candidate = v2Deviation.candidates.find((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(v2Candidate?.fingerprint, PEER_COUNT_VPN_FINGERPRINT);
+  assert.notEqual(v2Candidate?.id, legacyKey);
+
+  const merged = applyAlertCandidates([legacyAlert], v2Deviation.candidates, {
+    now: v2DeviationTs,
+    coveredAlertIds: new Set(v2Deviation.evaluatedAlertKeys),
+  }).alerts;
+  assert.equal(merged.find((alert) => alert.id === legacyKey)?.status, "active", "legacy v1-derived alert must remain active");
+  assert.equal(merged.some((alert) => alert.id === v2Candidate?.id), true, "v2 deviation must open a separate incident");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -388,6 +451,14 @@ test("groupPeerFactsByTick: a marker-bearing tick-group surfaces availabilitySig
   assert.equal(groups[0].availabilitySignature, "v1:ok-ok-partial-ok-ok");
 });
 
+test("B1 daybreak reproduction: a who partial in the v2 marker makes the whole tick incomplete", () => {
+  const groups = groupPeerFactsByTick(activeTickWithMarker(tickTs(0), 1, "v2:partial-ok-ok-ok-ok"));
+  assert.equal(tickGroupDisposition(groups[0]), "unknown");
+  const windowed = computeWindowedPeerStats(groups, { minSampleCount: 1 });
+  assert.equal(windowed.confidence_state, "provisional");
+  assert.equal(windowed.last_observation, undefined);
+});
+
 test("groupPeerFactsByTick: a marker-less legacy tick-group still produces availabilitySignature: undefined (backward-compat pin)", () => {
   const groups = groupPeerFactsByTick(activeTick(tickTs(0), 3));
   assert.equal(groups.length, 1);
@@ -406,7 +477,7 @@ test("groupPeerFactsByTick (security-sweep F6, supersedes 'Decision 6 sentinel u
 });
 
 test("groupPeerFactsByTick (security-sweep F6): a GARBLED-BUT-STRING-TYPED availability_signature (e.g. empty string, or a shape that does not match buildPeerAvailabilitySignature's 'v1:<5 closed-enum codes>' format) coerces to the PEER_SIGNATURE_INVALID sentinel, DISTINCT from marker-less undefined -- a type-only guard is NOT enough (Stage 2 adversarial-review fix, 2026-07-23; hardened 2026-09-04 so an invalid marker can no longer silently pool with the trusted legacy-markerless regime)", () => {
-  for (const garbled of ["", "garbage", "v1:ok-ok-ok-ok", "v1:ok-ok-ok-ok-ok-ok", "v2:ok-ok-ok-ok-ok", "v1:ok-ok-injected-ok-ok", "not-even-versioned"]) {
+  for (const garbled of ["", "garbage", "v1:ok-ok-ok-ok", "v1:ok-ok-ok-ok-ok-ok", "v3:ok-ok-ok-ok-ok", "v2:ok-ok-injected-ok-ok", "v1:ok-ok-injected-ok-ok", "not-even-versioned"]) {
     const marker = { ...censusMarkerPoint(tickTs(0)), attributes: { availability_signature: garbled } };
     const groups = groupPeerFactsByTick([...activeTick(tickTs(0), 3), marker]);
     assert.equal(groups[0].availabilitySignature, PEER_SIGNATURE_INVALID, `expected garbled signature ${JSON.stringify(garbled)} to coerce to PEER_SIGNATURE_INVALID`);
@@ -746,7 +817,7 @@ test("30 missing_permission vpn_services ticks never establish or cover peer cou
 });
 
 test("computeWindowedPeerStats regime-keyed fold: confidence_state resets to 'provisional' immediately on a regime flip, even though the OLD regime was already 'established'", () => {
-  const degradedSignature = "v1:ok-ok-missing_permission-ok-ok";
+  const degradedSignature = "v2:ok-ok-ok-absent-ok";
   const preFlipTicks = [];
   for (let i = 0; i < 30; i += 1) preFlipTicks.push(...activeTickWithMarker(tickTs(i), 1, degradedSignature));
   const preFlipGroups = groupPeerFactsByTick(preFlipTicks);
@@ -790,6 +861,20 @@ test("computeWindowedPeerStats regime-keyed fold: TRANSITIONAL post-upgrade mixe
     const candidate = buildCountSpikeCandidate({ confidence_state: windowed.confidence_state, last_observation: windowed.last_observation });
     assert.equal(candidate, undefined, "no spike candidate is built off the reset");
   });
+});
+
+test("C0 review M4: the C0.4 who/last parser fix bumps the peer availability signature to v2, so v1 history is a different (valid) regime: the counts re-warm honestly instead of scoring a parser change as a drop", () => {
+  const ticks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT + 5; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 4, "v1:ok-ok-ok-ok-ok")); // tmux/X rows counted as peers
+  ticks.push(...activeTickWithMarker(tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 5), 1, "v2:ok-ok-ok-ok-ok")); // after the upgrade
+  const groups = groupPeerFactsByTick(ticks);
+  assert.equal(groups[0].availabilitySignature, "v1:ok-ok-ok-ok-ok", "v1 markers stay valid regime keys, never the invalid sentinel");
+  assert.equal(groups.at(-1).availabilitySignature, "v2:ok-ok-ok-ok-ok");
+  const drop = computeWindowedPeerDropStats(groups, { minSampleCount: DEFAULT_PEER_MIN_SAMPLE_COUNT });
+  assert.equal(drop.confidence_state, "provisional", "the v2 regime starts from zero");
+  assert.equal(buildCountDropCandidate({ confidence_state: drop.confidence_state, last_observation: drop.last_observation }), undefined);
+  // Not every string is a regime: an unknown version is still the invalid sentinel.
+  assert.equal(groupPeerFactsByTick(activeTickWithMarker(tickTs(0), 1, "v9:ok-ok-ok-ok-ok"))[0].availabilitySignature, PEER_SIGNATURE_INVALID);
 });
 
 // ---------------------------------------------------------------------------------------------

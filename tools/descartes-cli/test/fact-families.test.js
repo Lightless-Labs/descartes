@@ -273,8 +273,10 @@ test("T8: every family's default budget meets (H_max / interval) x worst-case ti
   assert.deepEqual(Object.fromEntries(FAMILY_DEFAULT_BUDGET_BYTES), {
     service: 18 * MIB, process_lineage: 10 * MIB, scheduled_job: 5 * MIB, session: 4 * MIB,
     peer: 16 * MIB, canary: 4 * MIB, network: 4 * MIB, provenance: 4 * MIB,
+    // Context families (C0; context plan §4): 17 MiB, sized by the data-family T8 test below.
+    host_lifecycle: 4 * MIB, network_context: 2 * MIB, session_context: 11 * MIB,
   });
-  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 65 * MIB);
+  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 82 * MIB);
 });
 
 test("T8 config floor: resolveFactStoreBudgets rejects a value below the horizon invariant (budget_below_horizon_floor) and falls back to the default; accepts one at or above it", () => {
@@ -417,4 +419,67 @@ test("T12 routing: every fact_name each translator can emit is registered (sourc
   ];
   assert.ok(points.length > 0);
   assert.doesNotThrow(() => groupFactPointsByFamily(points));
+});
+
+// --- Context plan C0 (docs/plans/2026-10-06-context-aware-learned-baselines.md §4): data families ---
+
+test("C0 data-family T8: each context family's budget holds its 30-day data horizon at the schema-derived worst-case tick x 1.25, without raising the minimum structural interval", async () => {
+  const { DATA_FAMILY_HORIZONS, MIN_STRUCTURAL_INTERVAL_MS } = await import("../src/fact-families.js");
+  const { CONTEXT_FACT_SCHEMAS } = await import("../src/context-schemas.js");
+  const { normalizeFactPoint } = await import("../src/fact-store.js");
+  const { MAX_LOGIN_ARRIVALS_PER_TICK, MAX_LOGIN_HISTORY_ROWS_PER_TICK, CONTEXT_ENVELOPE_SOURCES } = await import("../src/context-translators.js");
+  // Worst-case normalized record per context fact, from its closed schema: every field at its longest
+  // valid value, the longest envelope id/tool, a digest-suffixed entity key, confidence 0.
+  const longestSource = Object.values(CONTEXT_ENVELOPE_SOURCES).reduce((a, b) => (a.id.length + a.tool.length >= b.id.length + b.tool.length ? a : b));
+  const worst = {};
+  for (const [factName, schema] of CONTEXT_FACT_SCHEMAS) {
+    const attributes = {};
+    for (const [field, spec] of Object.entries(schema.fields)) {
+      const candidates = spec.kind === "enum" ? [...spec.values] : [...spec.sentinels];
+      if (spec.kind === "hmac") candidates.push("f".repeat(16));
+      if (spec.kind === "int") candidates.push(String(spec.max));
+      if (spec.kind === "pattern") candidates.push("9".repeat(spec.maxLength));
+      attributes[field] = candidates.sort((a, b) => b.length - a.length)[0];
+    }
+    // The per-field maxima are an UPPER BOUND, not necessarily one valid record (e.g. a pattern
+    // field at its max length), and the store now enforces the context schema (C0 review L8): the
+    // shape is normalized under a same-length placeholder name, then the real name is put back.
+    const record = normalizeFactPoint({
+      ts: "2026-10-11T00:00:00.000Z", fact_name: "x".repeat(factName.length), entity_key: `${factName}.${"f".repeat(16)}`, attributes,
+      source_envelope_id: longestSource.id, source_tool: longestSource.tool, sensitivity: "operational", confidence: 0,
+    });
+    record.fact_name = factName;
+    worst[factName] = Buffer.byteLength(`${JSON.stringify(record)}\n`);
+  }
+  assert.deepEqual(worst, {
+    "host.boot": 698, "host.boot_boundary": 928, "host.clock_reading": 1147, "host.suspend": 581, "host.boundary_census": 613,
+    "net.tailnet_state": 601, "net.config_fingerprint": 1029,
+    "session.login_record": 643, "session.login_history_row": 597, "session.login_census": 777, "user.presence": 508,
+  }, "a schema change must revisit the pinned context tick shapes");
+  const tick = {
+    host_lifecycle: worst["host.boot"] + worst["host.boot_boundary"] + worst["host.clock_reading"] + worst["host.suspend"] + worst["host.boundary_census"],
+    network_context: worst["net.tailnet_state"] + worst["net.config_fingerprint"],
+    session_context: worst["session.login_census"] + worst["user.presence"]
+      + (MAX_LOGIN_ARRIVALS_PER_TICK + MAX_LOGIN_HISTORY_ROWS_PER_TICK) * Math.max(worst["session.login_record"], worst["session.login_history_row"]),
+  };
+  for (const family of ["host_lifecycle", "network_context", "session_context"]) {
+    assert.equal(DATA_FAMILY_HORIZONS.get(family), 30 * DAY, `${family} declares the 30-day raw retention as its data horizon`);
+    assert.equal(FAMILY_HORIZON_MAX_MS.get(family), 30 * DAY);
+    assert.ok(FAMILY_TICK_SHAPES.get(family).worstTickBytes >= tick[family], `${family}: pinned ${FAMILY_TICK_SHAPES.get(family).worstTickBytes} < schema worst ${tick[family]}`);
+    const required = (30 * 24) * FAMILY_TICK_SHAPES.get(family).worstTickBytes * 1.25;
+    assert.ok(FAMILY_DEFAULT_BUDGET_BYTES.get(family) >= required, `${family}: ${FAMILY_DEFAULT_BUDGET_BYTES.get(family)} < ${required}`);
+    assert.equal(familyBudgetFloorBytes(family), Math.ceil(required));
+    assert.ok(familyBudgetCeilingBytes(family) >= familyBudgetFloorBytes(family, { structuralIntervalMs: 15 * 60 * 1000 }));
+  }
+  // The context families must not tighten the shortest supported structural interval (service sets it).
+  assert.equal(MIN_STRUCTURAL_INTERVAL_MS, 833_276);
+  assert.ok(!RULE_HORIZONS.has("host.boot") && [...RULE_HORIZONS.values()].every((rule) => rule.families.every((f) => !DATA_FAMILY_HORIZONS.has(f))));
+});
+
+test("C0.6: every context schema's family is the registry family of its fact_name, and every context fact is registered", async () => {
+  const { CONTEXT_FACT_SCHEMAS } = await import("../src/context-schemas.js");
+  for (const [factName, schema] of CONTEXT_FACT_SCHEMAS) assert.equal(FACT_FAMILY_BY_NAME.get(factName), schema.family, factName);
+  for (const [factName, family] of FACT_FAMILY_BY_NAME) {
+    if (["host_lifecycle", "network_context", "session_context"].includes(family)) assert.ok(CONTEXT_FACT_SCHEMAS.has(factName), `${factName} has no closed schema`);
+  }
 });

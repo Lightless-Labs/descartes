@@ -2,14 +2,16 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { execFile } from "node:child_process";
 import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import { throwIfCollectorAborted } from "./tools/collector-abort.js";
 
 function createPrompt() {
   return readline.createInterface({ input, output });
 }
 
-function maybeOpen(url) {
+function maybeOpen(url, signal) {
   const opener = process.platform === "darwin" ? "open" : process.platform === "linux" ? "xdg-open" : undefined;
   if (!opener) return;
+  throwIfCollectorAborted(signal);
   execFile(opener, [url], { stdio: "ignore" }, () => {});
 }
 
@@ -47,7 +49,7 @@ async function chooseProvider(authStorage, requestedProvider) {
   }
 }
 
-export async function runLogin(paths, args) {
+export async function runLogin(paths, args, { signal } = {}) {
   const options = parseLoginArgs(args);
   const authStorage = AuthStorage.create(paths.authFile);
   const provider = await chooseProvider(authStorage, options.provider);
@@ -71,7 +73,7 @@ export async function runLogin(paths, args) {
       console.log(info.url);
       if (info.instructions) console.log(`\n${info.instructions}`);
       if (options.openBrowser) {
-        maybeOpen(info.url);
+        maybeOpen(info.url, signal);
         console.log("Waiting for browser authentication...");
         console.log("If the browser callback cannot complete, rerun with `descartes login --no-open` and paste the redirect URL or code.");
       } else {

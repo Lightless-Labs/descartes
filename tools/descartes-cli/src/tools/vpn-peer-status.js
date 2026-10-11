@@ -35,6 +35,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus, validateCrossReferenceKeys } from "./census-validate.js";
+import { isLastDateStart, isLocalLoginHost } from "./login-origin.js";
+import { readSharedLastHistory } from "./last-history.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -56,6 +60,7 @@ export const DEFAULT_LAST_HISTORY_LIMIT = 50;
 const MAX_WG_INTERFACES = 16;
 
 async function runFixedExecFile(command, args, options = {}) {
+  throwIfCollectorAborted(options.signal);
   return runResolvedExecFile(command, args, {
     ...options,
     timeout: options.timeout ?? 3000,
@@ -84,27 +89,37 @@ function isPermissionDenied(probe) {
 // local console/tty login has no trailing parens at all -- `remote_host` stays undefined for it,
 // which the collector treats as "not a peer" (a real, distinguishable local session), never as
 // malformed input.
-const WHO_LINE_RE = /^(\S+)\s+\S+\s+.*?(?:\(([^)]+)\))?\s*$/;
+//
+// Context plan C0.4 (Opus M3, Astra 12): the parenthetical is not always a remote host. An X display
+// "(:0)", a GNU screen tag "(:pts/3:S.0)" and a tmux tag "(tmux(1234).%0)" are LOCAL attachments
+// and are no longer read as peers (login-origin.js holds the explicit patterns). The whole trailing
+// parenthetical is captured, so a nested tmux tag is classified rather than half-matched.
+const WHO_LINE_RE = /^(\S+)\s+(\S+)\s+[^(]*?(?:\((.+)\))?\s*$/;
 
 export function parseWhoOutput(stdout) {
+  if (typeof stdout !== "string") return { entries: [], malformed_count: 1 };
   const entries = [];
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  let malformed_count = 0;
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     const match = line.match(WHO_LINE_RE);
-    if (!match) continue; // unparseable line -- skipped, never fabricated into a partial entry
-    const [, user, remoteHost] = match;
-    entries.push({ remote_user: user, remote_host: remoteHost || undefined });
+    if (!match) { malformed_count += 1; continue; }
+    const [, user, tty, host] = match;
+    const remoteHost = host && !isLocalLoginHost(host, tty) ? host : undefined;
+    entries.push({ remote_user: user, remote_host: remoteHost });
   }
-  return { entries };
+  const duplicate_count = finalizeCensus({ records: entries, identity: (entry) => JSON.stringify(entry), malformed: malformed_count }).duplicate_count;
+  return malformed_count > 0 || duplicate_count > 0 ? { entries, malformed_count, duplicate_count } : { entries };
 }
 
 async function collectSshWho(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("who", [], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (probe.status === "ok") {
-    const { entries } = parseWhoOutput(probe.stdout);
-    return { status: "ok", entries, command: probe.command, binary: probe.binary };
+    const parsed = parseWhoOutput(probe.stdout);
+    return { status: parsed.malformed_count > 0 || parsed.duplicate_count > 0 ? "partial" : "ok", entries: parsed.entries, malformed_count: parsed.malformed_count ?? 0, duplicate_count: parsed.duplicate_count ?? 0, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], command: probe.command, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
@@ -136,9 +151,10 @@ const LAST_LOCAL_HOST_RE = /^(-|:0(\.0)?|console)$/i;
  * whatever `last` already printed (truncated or not) is what gets captured.
  */
 export function parseLastOutput(stdout) {
+  if (typeof stdout !== "string") return { entries: [], malformed_count: 1 };
   const entries = [];
   let malformedCount = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line || LAST_TRAILER_RE.test(line)) continue;
     const tokens = line.split(/\s+/);
@@ -146,21 +162,32 @@ export function parseLastOutput(stdout) {
       malformedCount += 1;
       continue;
     }
-    const [user, , host] = tokens;
+    const [user, tty, host] = tokens;
     if (LAST_PSEUDO_USER_RE.test(user)) continue; // reboot/shutdown -- not a peer, not malformed
-    if (LAST_LOCAL_HOST_RE.test(host)) continue; // local session -- not a peer, not malformed
+    // C0.4: a local row has NO host column, so the third token is the date ("Fri Sep  4 ..."); it
+    // used to be read as a remote host named "Fri". An explicit local attachment tag is local too.
+    if (isLastDateStart(host, tokens[3])) continue;
+    if (LAST_LOCAL_HOST_RE.test(host) || isLocalLoginHost(host, tty)) continue; // local session -- not a peer, not malformed
     entries.push({ remote_user: user, remote_host: host });
   }
-  return { entries, malformed_count: malformedCount };
+  const duplicate_count = finalizeCensus({ records: entries, identity: (entry) => JSON.stringify(entry), malformed: malformedCount }).duplicate_count;
+  return { entries, malformed_count: malformedCount, ...(duplicate_count > 0 ? { duplicate_count } : {}) };
 }
 
 async function collectSshLast(options) {
-  const n = Math.max(1, Number(options.lastHistoryLimit) || DEFAULT_LAST_HISTORY_LIMIT);
+  const requestedLimit = typeof options.lastHistoryLimit === "number" && Number.isSafeInteger(options.lastHistoryLimit) ? options.lastHistoryLimit : DEFAULT_LAST_HISTORY_LIMIT;
+  const n = Math.max(1, requestedLimit);
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("last", ["-n", String(n)], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
+  throwIfCollectorAborted(options.signal);
+  const shared = await readSharedLastHistory(options, runExec, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }), n);
+  const probe = shared.probe;
   if (probe.status === "ok") {
-    const { entries, malformed_count } = parseLastOutput(probe.stdout);
-    return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
+    const entries = shared.rows
+      .filter((row) => row.host && !isLocalLoginHost(row.host, row.tty))
+      .map((row) => ({ remote_user: row.user, remote_host: row.host }));
+    const malformed_count = shared.malformed;
+    const duplicate_count = shared.duplicate_count ?? finalizeCensus({ records: entries, identity: (entry) => JSON.stringify(entry), malformed: malformed_count }).duplicate_count;
+    return { status: malformed_count > 0 || duplicate_count > 0 || shared.truncated ? "partial" : "ok", entries, malformed_count, duplicate_count, truncated: shared.truncated === true, requested_n: n, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
@@ -192,49 +219,105 @@ async function collectSshLast(options) {
 // ---------------------------------------------------------------------------------------------
 
 async function wgShowInterfaces(runExec, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", "interfaces"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowPeers(runExec, iface, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", iface, "peers"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowEndpoints(runExec, iface, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", iface, "endpoints"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowLatestHandshakes(runExec, iface, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", iface, "latest-handshakes"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 
+function withMalformedCount(value, malformed_count) {
+  Object.defineProperty(value, "malformed_count", { value: malformed_count, enumerable: false });
+  return value;
+}
+
+function withCensusMetadata(value, metadata) {
+  for (const [key, entry] of Object.entries(metadata)) {
+    Object.defineProperty(value, key, { value: entry, enumerable: false });
+  }
+  return value;
+}
+
+function isWireguardPublicKey(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(value)) return false;
+  try {
+    const decoded = Buffer.from(value, "base64");
+    return decoded.length === 32 && decoded.toString("base64") === value;
+  } catch {
+    return false;
+  }
+}
+
 export function parseWgInterfaceList(stdout) {
-  return String(stdout ?? "").split(/\s+/).map((s) => s.trim()).filter(Boolean);
+  if (typeof stdout !== "string") return withCensusMetadata(withMalformedCount([], 1), { duplicate_count: 0 });
+  const values = [];
+  let malformed = 0;
+  for (const token of stdout.trim() ? stdout.trim().split(/\s+/) : []) {
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(token)) malformed += 1;
+    else values.push(token);
+  }
+  const census = finalizeCensus({ records: values, identity: (value) => value, malformed });
+  return withCensusMetadata(withMalformedCount(values, malformed), { duplicate_count: census.duplicate_count });
 }
 
 export function parseWgPeerList(stdout) {
-  return String(stdout ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  if (typeof stdout !== "string") return withCensusMetadata(withMalformedCount([], 1), { duplicate_count: 0 });
+  const values = [];
+  let malformed = 0;
+  for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/\s/.test(line) || !isWireguardPublicKey(line)) malformed += 1;
+    else values.push(line);
+  }
+  const census = finalizeCensus({ records: values, identity: (value) => value, malformed });
+  return withCensusMetadata(withMalformedCount(values, malformed), { duplicate_count: census.duplicate_count });
 }
 
 export function parseWgEndpoints(stdout) {
+  if (typeof stdout !== "string") return withCensusMetadata(withMalformedCount({}, 1), { duplicate_count: 0 });
   const map = {};
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  const keys = [];
+  let malformed = 0;
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    const [pubkey, endpoint] = line.split("\t");
-    if (!pubkey) continue;
+    const fields = line.split("\t");
+    if (fields.length !== 2 || !isWireguardPublicKey(fields[0]) || !fields[1]) { malformed += 1; continue; }
+    const [pubkey, endpoint] = fields;
+    keys.push(pubkey);
     map[pubkey] = endpoint && endpoint !== "(none)" ? endpoint : undefined;
   }
-  return map;
+  const census = finalizeCensus({ records: keys, identity: (value) => value, malformed });
+  return withCensusMetadata(withMalformedCount(map, malformed), { duplicate_count: census.duplicate_count });
 }
 
 export function parseWgHandshakes(stdout) {
+  if (typeof stdout !== "string") return withCensusMetadata(withMalformedCount({}, 1), { duplicate_count: 0 });
   const map = {};
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  const keys = [];
+  let malformed = 0;
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    const [pubkey, epochText] = line.split("\t");
-    if (!pubkey) continue;
-    const epoch = Number(epochText);
-    map[pubkey] = Number.isFinite(epoch) ? epoch : undefined;
+    const fields = line.split("\t");
+    if (fields.length !== 2 || !isWireguardPublicKey(fields[0]) || !/^[0-9]+$/.test(fields[1])) { malformed += 1; continue; }
+    const epoch = Number(fields[1]);
+    if (!Number.isSafeInteger(epoch)) { malformed += 1; continue; }
+    keys.push(fields[0]);
+    map[fields[0]] = epoch;
   }
-  return map;
+  const census = finalizeCensus({ records: keys, identity: (value) => value, malformed });
+  return withCensusMetadata(withMalformedCount(map, malformed), { duplicate_count: census.duplicate_count });
 }
 
 async function collectWireguardPeers(options) {
@@ -260,17 +343,33 @@ async function collectWireguardPeers(options) {
   }
 
   const allInterfaceNames = parseWgInterfaceList(listProbe.stdout);
-  const interfaceNames = allInterfaceNames.slice(0, MAX_WG_INTERFACES);
+  const interfaceCensus = finalizeCensus({
+    records: allInterfaceNames,
+    identity: (value) => value,
+    cap: MAX_WG_INTERFACES,
+    malformed: allInterfaceNames.malformed_count,
+  });
+  if (!interfaceCensus.complete && (allInterfaceNames.malformed_count > 0 || interfaceCensus.duplicate_count > 0)) {
+    return {
+      status: "partial",
+      interfaces: allInterfaceNames.map((name) => ({ name, status: "ok" })),
+      peers: [],
+      elevation_candidate: false,
+      malformed_count: allInterfaceNames.malformed_count,
+      duplicate_count: interfaceCensus.duplicate_count,
+      binary: listProbe.binary,
+    };
+  }
+  const interfaceNames = interfaceCensus.records;
   const interfaceStatuses = [];
   const peers = [];
   let anyElevationCandidate = false;
 
   for (const iface of interfaceNames) {
-    const [peersProbe, endpointsProbe, handshakesProbe] = await Promise.all([
-      wgShowPeers(runExec, iface, options),
-      wgShowEndpoints(runExec, iface, options),
-      wgShowLatestHandshakes(runExec, iface, options),
-    ]);
+    throwIfCollectorAborted(options.signal);
+    const peersProbe = await wgShowPeers(runExec, iface, options);
+    const endpointsProbe = await wgShowEndpoints(runExec, iface, options);
+    const handshakesProbe = await wgShowLatestHandshakes(runExec, iface, options);
 
     const degraded = [peersProbe, endpointsProbe, handshakesProbe].find((probe) => probe.status !== "ok");
     if (degraded) {
@@ -283,6 +382,13 @@ async function collectWireguardPeers(options) {
     const pubkeys = parseWgPeerList(peersProbe.stdout);
     const endpoints = parseWgEndpoints(endpointsProbe.stdout);
     const handshakes = parseWgHandshakes(handshakesProbe.stdout);
+    const keyReference = validateCrossReferenceKeys(pubkeys, Object.keys(endpoints), Object.keys(handshakes));
+    if (pubkeys.malformed_count > 0 || endpoints.malformed_count > 0 || handshakes.malformed_count > 0
+      || pubkeys.duplicate_count > 0 || endpoints.duplicate_count > 0 || handshakes.duplicate_count > 0
+      || !keyReference.ok) {
+      interfaceStatuses.push({ name: iface, status: "partial", ...(keyReference.ok ? {} : { error: "wireguard_key_set_mismatch" }) });
+      continue;
+    }
 
     for (const pubkey of pubkeys) {
       peers.push({
@@ -297,7 +403,8 @@ async function collectWireguardPeers(options) {
     interfaceStatuses.push({ name: iface, status: "ok" });
   }
 
-  const allInterfacesOk = interfaceStatuses.every((entry) => entry.status === "ok");
+  const interfacesTruncated = allInterfaceNames.length > MAX_WG_INTERFACES;
+  const allInterfacesOk = interfaceStatuses.every((entry) => entry.status === "ok") && !interfacesTruncated;
   return {
     // "ok" covers BOTH a fully-resolved tick AND the real "wg installed, zero interfaces
     // configured" zero -- interfaceNames.length === 0 falls through the loop untouched and
@@ -312,7 +419,8 @@ async function collectWireguardPeers(options) {
     // the per-tick peer-entity cap does (truncated + total_count), so a host with more configured
     // WireGuard interfaces than the cap shows an explicit indication rather than peers behind the
     // (cap+1)th interface vanishing from the census with no trace.
-    interfaces_truncated: allInterfaceNames.length > MAX_WG_INTERFACES,
+    interfaces_truncated: interfacesTruncated,
+    truncated: interfacesTruncated,
     total_interface_count: allInterfaceNames.length,
     binary: listProbe.binary,
   };
@@ -332,9 +440,10 @@ const VPN_SERVICE_TYPE_RE = /^(?:VPN:.*|IPSec|PPP:L2TP)$/i;
 const TAILSCALE_SERVICE_TYPE_IDS = new Set(["io.tailscale.ipn.macos", "io.tailscale.ipn.macsys"]);
 
 export function parseScutilNcListDetailed(stdout) {
+  if (typeof stdout !== "string") return { services: [], unparsed_count: 1 };
   const services = [];
   let unparsed_count = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     if (SCUTIL_NC_HEADER_RE.test(line)) continue;
@@ -354,7 +463,8 @@ export function parseScutilNcListDetailed(stdout) {
       is_tailscale,
     });
   }
-  return { services, unparsed_count };
+  const census = finalizeCensus({ records: services, identity: (service) => service.service_uuid, malformed: unparsed_count });
+  return { services, unparsed_count, duplicate_count: census.duplicate_count };
 }
 
 export function parseScutilNcList(stdout) {
@@ -366,6 +476,7 @@ async function collectVpnServices(options) {
   if (platform !== "darwin") return { status: "not_applicable", services: [] };
 
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("scutil", ["--nc", "list"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [], binary: probe.binary };
   if (probe.status !== "ok") {
@@ -375,9 +486,10 @@ async function collectVpnServices(options) {
   }
   const parsed = parseScutilNcListDetailed(probe.stdout);
   return {
-    status: parsed.unparsed_count > 0 ? "partial" : "ok",
+    status: parsed.unparsed_count > 0 || parsed.duplicate_count > 0 ? "partial" : "ok",
     services: parsed.services.filter((service) => service.is_vpn && !service.is_tailscale),
     unparsed_count: parsed.unparsed_count,
+    duplicate_count: parsed.duplicate_count,
     tailscale_entry_observed: parsed.services.some((service) => service.is_tailscale),
     binary: probe.binary,
   };
@@ -395,19 +507,23 @@ async function collectEstablishedInbound(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
 
   if (platform === "linux") {
+    throwIfCollectorAborted(options.signal);
     const probe = await runExec("ss", ["-H", "-tn", "state", "established"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
     if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
     if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
     if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
-    const lines = String(probe.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+    if (typeof probe.stdout !== "string") return { status: "unable", count: 0, error: "non_string_output", binary: probe.binary };
+    const lines = probe.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
     return { status: "ok", count: lines.length, binary: probe.binary };
   }
 
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("netstat", ["-an", "-p", "tcp"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
   if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
-  const count = String(probe.stdout ?? "").split("\n").filter((line) => /established/i.test(line)).length;
+  if (typeof probe.stdout !== "string") return { status: "unable", count: 0, error: "non_string_output", binary: probe.binary };
+  const count = probe.stdout.split("\n").filter((line) => /established/i.test(line)).length;
   return { status: "ok", count, binary: probe.binary };
 }
 
@@ -427,15 +543,21 @@ function dedupeKey(remoteUser, remoteHost) {
  * "unable"/confidence 0 only when every source degraded.
  */
 export async function collectVpnPeerStatusEvidence(options = {}) {
-  const cap = Math.min(MAX_PEER_ENTITY_LIMIT, Math.max(1, Number(options.peerLimit) || DEFAULT_PEER_ENTITY_LIMIT));
+  const requestedCap = typeof options.peerLimit === "number" && Number.isSafeInteger(options.peerLimit) ? options.peerLimit : DEFAULT_PEER_ENTITY_LIMIT;
+  const cap = Math.min(MAX_PEER_ENTITY_LIMIT, Math.max(1, requestedCap));
 
   return timedEnvelope(async () => {
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const platform = options.platform ?? process.platform;
 
     const who = await collectSshWho(options);
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const last = await collectSshLast(options);
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const wireguard = await collectWireguardPeers({ ...options, platform });
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const vpnServices = await collectVpnServices({ ...options, platform });
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const establishedInbound = await collectEstablishedInbound({ ...options, platform });
 
     const sshPeers = [];
@@ -462,50 +584,64 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
     }));
 
     const allPeers = [...(wireguard.peers ?? []), ...sshPeers, ...vpnServicePeers];
+    const allPeerCensus = finalizeCensus({
+      records: allPeers,
+      identity: (peer) => peer.source_type === "wireguard"
+        ? `wireguard\u0000${peer.public_key}`
+        : peer.source_type === "vpn_service"
+          ? `vpn_service\u0000${peer.service_uuid}`
+          : `ssh\u0000${peer.remote_user}\u0000${peer.remote_host}\u0000${peer.origin}`,
+      cap,
+    });
     const resolvedStatuses = [who.status, last.status, wireguard.status, vpnServices.status, establishedInbound.status];
     const anySourceAvailable = resolvedStatuses.some((status) => status === "ok" || status === "partial");
 
     return {
       platform,
       sources: {
-        ssh_who: { status: who.status, error: who.error, binary_provenance: binaryProvenance(who.binary) },
-        ssh_last: { status: last.status, error: last.error, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
+        ssh_who: { status: who.status, error: who.error, malformed_count: who.malformed_count ?? 0, binary_provenance: binaryProvenance(who.binary) },
+        ssh_last: { status: last.status, error: last.error, malformed_count: last.malformed_count ?? 0, truncated: last.truncated === true, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
         wireguard: {
           status: wireguard.status,
           error: wireguard.error,
           elevation_candidate: wireguard.elevation_candidate ?? false,
           interfaces: wireguard.interfaces ?? [],
           interfaces_truncated: wireguard.interfaces_truncated ?? false,
+          truncated: wireguard.truncated ?? false,
           total_interface_count: wireguard.total_interface_count ?? (wireguard.interfaces?.length ?? 0),
+          malformed_count: wireguard.malformed_count ?? 0,
           binary_provenance: binaryProvenance(wireguard.binary),
         },
         vpn_services: {
           status: vpnServices.status,
           error: vpnServices.error,
           unparsed_count: vpnServices.unparsed_count ?? 0,
+          duplicate_count: vpnServices.duplicate_count ?? 0,
           tailscale_entry_observed: vpnServices.tailscale_entry_observed ?? false,
           binary_provenance: binaryProvenance(vpnServices.binary),
         },
         established_inbound: { status: establishedInbound.status, error: establishedInbound.error, binary_provenance: binaryProvenance(establishedInbound.binary) },
       },
       any_source_available: anySourceAvailable,
-      total_count: allPeers.length,
-      peers: allPeers.slice(0, cap),
-      truncated: allPeers.length > cap,
+      total_count: allPeerCensus.total_count,
+      peers: allPeerCensus.records,
+      truncated: allPeerCensus.truncated || wireguard.truncated === true || last.truncated === true,
+      census_status: allPeerCensus.status === "ok" && wireguard.truncated !== true && !resolvedStatuses.includes("partial") ? "ok" : "partial",
+      duplicate_count: allPeerCensus.duplicate_count,
       cap,
     };
   }, (result) => evidenceEnvelope({
     id: "vpn-peer-status",
     status: result.any_source_available
-      ? (Object.values(result.sources).some((source) => source.status === "ok") ? "ok" : "warning")
+      ? (result.census_status === "partial" ? "warning" : Object.values(result.sources).some((source) => source.status === "ok") ? "ok" : "warning")
       : "unable",
     source: "vpn_peer_status",
     result,
     confidence: result.any_source_available
-      ? (Object.values(result.sources).some((source) => source.status === "ok") ? 1 : 0.4)
+      ? (result.census_status === "partial" ? 0.4 : Object.values(result.sources).some((source) => source.status === "ok") ? 1 : 0.4)
       : 0,
     reviewHint: result.any_source_available
-      ? (Object.values(result.sources).some((source) => source.status === "ok") ? "none" : "ambiguous")
+      ? (result.census_status === "partial" ? "ambiguous" : Object.values(result.sources).some((source) => source.status === "ok") ? "none" : "ambiguous")
       : "missing_permission",
     tool: "collect_vpn_peer_status",
     target: `cap=${result.cap}`,

@@ -20,6 +20,7 @@ import { readFile as fsReadFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { loadProvenanceConfig as defaultLoadProvenanceConfig, resolveProvenanceConfigPaths } from "../provenance-elevated-config.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -85,13 +86,15 @@ export async function readPtraceScopeDiagnostic({ readFile = fsReadFile } = {}) 
 // module, not the other way around).
 // ---------------------------------------------------------------------------------------------
 
-async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer } = {}) {
+async function runMinimalEnvExecFile(command, args, { timeout, maxBuffer, signal } = {}) {
   const argv = [command, ...args];
   try {
+    throwIfCollectorAborted(signal);
     const { stdout, stderr } = await execFileAsync(command, args, {
       timeout: timeout ?? DEFAULT_INVOKE_TIMEOUT_MS,
       maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER,
       env: { ...MINIMAL_ENV },
+      signal,
     });
     return { status: "ok", stdout, stderr, command: { argv, read_only: true } };
   } catch (error) {
@@ -121,6 +124,7 @@ export async function defaultProbeElevatedHelper(helperPath, options = {}) {
   const result = await runMinimalEnvExecFile(helperPath, ["--probe"], {
     timeout: options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
     maxBuffer: options.maxBuffer,
+    signal: options.signal,
   });
   return { available: result.status === "ok" };
 }
@@ -131,6 +135,7 @@ export async function defaultInvokeElevatedHelper(helperPath, argv, options = {}
   return runMinimalEnvExecFile(helperPath, argv, {
     timeout: options.invokeTimeoutMs ?? DEFAULT_INVOKE_TIMEOUT_MS,
     maxBuffer: options.maxBuffer,
+    signal: options.signal,
   });
 }
 

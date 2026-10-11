@@ -37,6 +37,29 @@ import {
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
+import {
+  factPointsFromHostLifecycleEvidence,
+  factPointsFromLoginSessionsEvidence,
+  factPointsFromNetConfigEvidence,
+  factPointsFromTailnetStateEvidence,
+  hostBootIdHmac,
+} from "./context-translators.js";
+import { collectNetConfigEvidence } from "./tools/net-config.js";
+import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
+import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
+import {
+  bootIdDigest,
+  boundaryCensusGaps,
+  currentDaemonInstance,
+  observeBootProbe,
+  readBootLedger,
+  suspendExposure,
+  verifyBootBoundary,
+  wakeMarkerOf,
+  writeBootLedger,
+} from "./boot-ledger.js";
+import { BOOT_MEASUREMENT_RESOLUTION_S } from "./tools/host-lifecycle.js";
+import { loadOrCreateContextKey } from "./context-key.js";
 import { computeCorrelationCandidates, CORRELATION_RULE_ID } from "./incident-correlation.js";
 import { computePeerBaselineCandidates, PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import {
@@ -70,6 +93,7 @@ import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
+import { collectHostLifecycleEvidence, readHostLifecycle } from "./tools/host-lifecycle.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
@@ -247,7 +271,23 @@ export function defaultDaemonProfile() {
         // produces no canary facts, regardless of watch.json's now-default-ON gate.
         canary: { enabled: true },
         "process-lineage": { enabled: true },
+        // Context plan C0.8/C0.9 (docs/plans/2026-10-06-context-aware-learned-baselines.md): boot
+        // identity and raw clock readings, read after the census. DATA only, no alert candidate.
+        "host-lifecycle": { enabled: true },
+        // Context plan C0.4: login origin with first-observed-tick dedupe. DATA only.
+        "login-sessions": { enabled: true },
+        // Context plan C0.5: net.config_fingerprint (HMAC'd with the per-install key). DATA only.
+        "net-config": { enabled: true },
       },
+      // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
+      // wake, borrowing the next structural slot (bounded; see runDaemonIteration). OFF by default
+      // (C0 review B1): the census it runs writes into the same session/peer families the
+      // incumbent session/peer detectors score and fold, so turning it on would change alerting
+      // (a census while the tailnet reconnects or before tmux-resurrect has run becomes the tick
+      // they score) -- not data-only. The plan routes +0/+2/+10 samples to tick_summary for the
+      // learners (§7.6, C2); until then the boundary is still recorded, at the next scheduled
+      // census, with its gap durations (host.boundary_census status "not_enabled").
+      boundary_census: { enabled: false },
     },
     safety: {
       read_only: true,
@@ -298,6 +338,11 @@ export function validateDaemonProfile(profile) {
     }
     if (structural.deadline_ms !== undefined && !isPositiveFiniteNumber(structural.deadline_ms)) {
       throw new Error(`Daemon profile structural.deadline_ms must be a positive finite number, got: ${JSON.stringify(structural.deadline_ms)}`);
+    }
+    for (const field of ["collector_deadline_ms", "context_collector_deadline_ms"]) {
+      if (structural[field] !== undefined && !isPositiveFiniteNumber(structural[field])) {
+        throw new Error(`Daemon profile structural.${field} must be a positive finite number, got: ${JSON.stringify(structural[field])}`);
+      }
     }
   }
 
@@ -399,28 +444,64 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
   return evidence;
 }
 
-/**
- * Sibling to collectDaemonEvidence for the slower structural (services/network/scheduled-jobs)
- * cadence — identical enabled-flag/injectable-collectors pattern, stable evidence ordering.
- */
-export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
+// Context plan C0.7 (docs/plans/2026-10-06-context-aware-learned-baselines.md §3, I25): the structural
+// collectors, in run order, as [profile key, envelope id, tool]. The CENSUS collectors (the existing
+// structural collectors, whose order is unchanged) run first; the CONTEXT collectors run strictly
+// after them, so a slow or hung context read can never cost the session/peer census.
+export const STRUCTURAL_CENSUS_COLLECTORS = Object.freeze([
+  ["services", "services", "collect_services"],
+  ["network", "network-basics", "collect_network_basics"],
+  ["scheduled-jobs", "scheduled-jobs", "collect_scheduled_jobs"],
+  ["provenance", "provenance-warnings", "collect_provenance_warnings"],
+  ["sessions", "sessions", "collect_sessions"],
+  ["vpn-peer-status", "vpn-peer-status", "collect_vpn_peer_status"],
+  ["tailscale-status", "tailscale-status", "collect_tailscale_status"],
+  ["canary", "canary", "collect_canary_evidence"],
+  ["process-lineage", "process-lineage-edges", "collect_process_lineage"],
+].map((entry) => Object.freeze(entry)));
+export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
+  ["host-lifecycle", "host-lifecycle", "collect_host_lifecycle"],
+  ["login-sessions", "login-sessions", "collect_login_sessions"],
+  ["net-config", "net-config", "collect_net_config"],
+].map((entry) => Object.freeze(entry)));
+
+// C0.7 (I25, class S): incumbent structural collectors retain main's whole-tick deadline semantics.
+// Only the new context collectors get independent sub-deadlines after the incumbent census has
+// completed. A context timeout is represented by an `unable` envelope for that context source and
+// does not discard the incumbent snapshot.
+export const DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS = 5 * 1000;
+const COLLECTOR_TIMED_OUT = Symbol("structural-collector-timed-out");
+const STRUCTURAL_TICK_TIMED_OUT = Symbol("structural-tick-timed-out");
+
+function unableCollectorEnvelope(id, tool, error, observation) {
+  return {
+    id,
+    status: "unable",
+    layer: "L0",
+    source: "daemon",
+    result: { status: "unable", error },
+    confidence: 0,
+    review_hint: "none",
+    trace: { tool, target: null, latency_ms: Math.max(0, observation.end_ms - observation.start_ms), ts: new Date(observation.end_ms).toISOString() },
+    observation,
+  };
+}
+
+/** The incumbent structural collection block, kept byte-for-byte equivalent to main's path. */
+export async function collectStructuralCensusEvidence(structuralProfile = {}, collectors = {}, options = {}) {
   const activeCollectors = {
     services: collectors.services ?? collectServiceEvidence,
     network: collectors.network ?? collectNetworkEvidence,
     "scheduled-jobs": collectors["scheduled-jobs"] ?? collectScheduledJobsEvidence,
     // Slice S4, additive fourth structural sub-collector: gated identically to its siblings
     // (structuralProfile.collectors.provenance.enabled), on the same slow cadence, subject to
-    // the same structural-tick deadline/discard discipline below. See plan section 4.
+    // the same structural-tick deadline discipline. See plan section 4.
     provenance: collectors.provenance ?? collectProvenanceWarningsEvidence,
     // Slice 1 (observed-incident collectors plan), additive fifth structural sub-collector:
-    // gated identically to its siblings (structuralProfile.collectors.sessions.enabled), on the
-    // same slow cadence, subject to the same structural-tick deadline/discard discipline below.
-    // Read-only tmux/screen census; NO alert candidates emitted by this slice.
+    // read-only tmux/screen census; NO alert candidates emitted by this slice.
     sessions: collectors.sessions ?? collectSessionEvidence,
     // Slice 3 (observed-incident collectors plan), additive sixth structural sub-collector:
-    // gated identically to its siblings (structuralProfile.collectors["vpn-peer-status"].enabled),
-    // on the same slow cadence, subject to the same structural-tick deadline/discard discipline
-    // below. Read-only SSH/VPN peer census; NO alert candidates emitted by this slice either.
+    // read-only SSH/VPN peer census; NO alert candidates emitted by this slice either.
     "vpn-peer-status": collectors["vpn-peer-status"] ?? collectVpnPeerStatusEvidence,
     // Tailscale/tailnet sibling: pure read-only L0 fact source, no alert candidates.
     "tailscale-status": collectors["tailscale-status"] ?? collectTailscaleStatusEvidence,
@@ -444,7 +525,56 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   return evidence;
 }
 
-const STRUCTURAL_TICK_TIMED_OUT = Symbol("structural-tick-timed-out");
+/** Context-only phase: independent per-source deadlines and cancellation, after census success. */
+export async function collectStructuralContextEvidence(structuralProfile = {}, collectors = {}, options = {}) {
+  const activeCollectors = {
+    "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
+    "login-sessions": collectors["login-sessions"] ?? collectLoginSessionsEvidence,
+    "net-config": collectors["net-config"] ?? collectNetConfigEvidence,
+  };
+  const { nowFn = Date.now, ...rest } = options;
+  const collectorOptions = {
+    ...rest,
+    trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    killSignal: options.killSignal ?? "SIGKILL",
+    lastHistoryCache: options.lastHistoryCache ?? {},
+  };
+  const capMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms)
+    ? structuralProfile.context_collector_deadline_ms
+    : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
+  const evidence = [];
+  for (const [key, id, tool] of STRUCTURAL_CONTEXT_COLLECTORS) {
+    if (!structuralProfile.collectors?.[key]?.enabled) continue;
+    const runStartMs = nowFn();
+    const controller = new AbortController();
+    let outcome;
+    try {
+      outcome = await withDeadline(
+        Promise.resolve().then(() => activeCollectors[key]({ ...collectorOptions, signal: controller.signal })),
+        capMs,
+        () => {
+          controller.abort();
+          return COLLECTOR_TIMED_OUT;
+        },
+      );
+    } catch {
+      controller.abort();
+      outcome = undefined;
+    }
+    const observation = { start_ms: runStartMs, end_ms: nowFn() };
+    if (outcome === COLLECTOR_TIMED_OUT) evidence.push(unableCollectorEnvelope(id, tool, "collector_deadline_exceeded", observation));
+    else if (!outcome || typeof outcome !== "object") evidence.push(unableCollectorEnvelope(id, tool, "collector_threw", observation));
+    else evidence.push(outcome.observation ? outcome : { ...outcome, observation });
+  }
+  return evidence;
+}
+
+/** Full structural phases for direct callers; the daemon wraps only the incumbent phase in main's deadline race. */
+export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
+  const structuralOptions = { ...options, lastHistoryCache: options.lastHistoryCache ?? {} };
+  const evidence = await collectStructuralCensusEvidence(structuralProfile, collectors, structuralOptions);
+  return [...evidence, ...await collectStructuralContextEvidence(structuralProfile, collectors, structuralOptions)];
+}
 
 /**
  * Races `promise` against a `deadlineMs` timer. On timeout, resolves to `onTimeout()`'s result
@@ -925,6 +1055,110 @@ function deepFreeze(value) {
   return value;
 }
 
+/**
+ * Context plan C0.8 / C0.9 / C0.12: from the boot ledger (as folded by this tick's "before" probe)
+ * and this structural tick's host-lifecycle envelope (the "after" probe), derive the host_lifecycle
+ * fact inputs and the next ledger. Pure. Returns { facts: { bracket, boundary, boundaryCensus,
+ * suspend }, ledger }.
+ *   - bracket: the boot id and wake marker read before the census equal those read after it
+ *     ("stable"), differ ("unstable"), or either read is missing ("unknown") (§4.4).
+ *   - boundary: a pending boot boundary is verified by the I41 conjunction against THIS census's
+ *     session evidence (the +0 census), then cleared.
+ *   - boundaryCensus: a pending boundary census is recorded with its gap durations, as "ran" when it
+ *     was detected this tick and "deferred_cost_cap" when it waited for a slot, then cleared.
+ *   - suspend: C0.9 no-go fallback exposure since the previous structural reading (same boot only).
+ * The after-probe is folded into the ledger last, so a change it reveals is pending for the next
+ * tick, never attributed to this census.
+ */
+export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvidence, nowMs, hmacKey, daemon = currentDaemonInstance(), boundaryCensusEnabled = false }) {
+  const envelope = (structuralEvidence ?? []).find((e) => e?.id === "host-lifecycle");
+  const probeAfter = envelope?.source === "daemon" ? undefined : envelope?.result;
+  const facts = {};
+  const beforeDigest = bootIdDigest(probeBefore?.boot?.boot_id);
+  const afterDigest = bootIdDigest(probeAfter?.boot?.boot_id);
+  // C0 review M1: "stable" needs BOTH reads of BOTH the boot id and the wake marker; an unreadable
+  // wake marker (older Linux kernels without /sys/power/suspend_stats, an unreadable kern.waketime)
+  // cannot rule out a wake, so it is "unknown", never stable (§4.4: a stable context may recover).
+  const beforeMarker = wakeMarkerOf(probeBefore);
+  const afterMarker = wakeMarkerOf(probeAfter);
+  if (!beforeDigest || !afterDigest) facts.bracket = "unknown";
+  else if (beforeDigest !== afterDigest) facts.bracket = "unstable";
+  else if (beforeMarker === undefined || afterMarker === undefined) facts.bracket = "unknown";
+  else facts.bracket = beforeMarker === afterMarker ? "stable" : "unstable";
+  if (!ledger) {
+    facts.suspend = { interval_basis: "unknown", exposure_upper_s: undefined };
+    return { facts, ledger: undefined };
+  }
+  const next = structuredClone(ledger);
+  if (next.pending_boundary) {
+    let verdict = verifyBootBoundary(next.pending_boundary, { sessionEvidence: structuralEvidence });
+    // C0 review L1: the pending boundary comes from the ledger FILE; it is never better than
+    // unverified unless this census's live after-read confirms the same new boot (id and boot time).
+    // Full ledger integrity is the trusted-state B-ledger's (daybreak) scope.
+    if (verdict.verdict !== "tripwire") {
+      const pendingCurrent = next.pending_boundary.current;
+      const liveBootTime = probeAfter?.boot?.boot_time_s;
+      let liveCheck;
+      if (!afterDigest) liveCheck = "live_boot_unread";
+      else if (afterDigest !== pendingCurrent?.boot_id_digest
+        || (Number.isSafeInteger(liveBootTime) && Number.isSafeInteger(pendingCurrent?.boot_time_s) && liveBootTime !== pendingCurrent.boot_time_s)) liveCheck = "live_boot_mismatch";
+      if (liveCheck) verdict = { ...verdict, verdict: "unverified", failing_conjunct: liveCheck };
+    }
+    facts.boundary = {
+      ...verdict,
+      superseded_count: next.pending_boundary.superseded_count ?? 0,
+      boot_id_hmac: next.pending_boundary.current?.boot_id_hmac,
+      prev_boot_id_hmac: next.pending_boundary.prev?.boot_id_hmac,
+      resolution_s: BOOT_MEASUREMENT_RESOLUTION_S,
+    };
+    next.pending_boundary = null;
+  }
+  if (next.pending_census) {
+    const gaps = boundaryCensusGaps(next.pending_census, nowMs);
+    // Review L3: why the census recording this boundary was not at +0. "ran": detected by this
+    // tick's before-probe and censused now. "detected_after_census": first seen by a previous tick's
+    // after-probe, so the earliest census that could record it is this one. "not_enabled": the +0
+    // boundary census is off (the default, B1). "deferred_cost_cap": on, but the slot could not be
+    // borrowed (or the +0 census's facts did not persist and it is recorded now).
+    let status;
+    if (next.pending_census.detected_ms === nowMs && next.pending_census.detected_by !== "after_probe") status = "ran";
+    else if (next.pending_census.detected_by === "after_probe") status = "detected_after_census";
+    else if (!boundaryCensusEnabled) status = "not_enabled";
+    else status = "deferred_cost_cap";
+    facts.boundaryCensus = {
+      trigger: next.pending_census.trigger,
+      status,
+      superseded_count: next.pending_census.superseded_count ?? 0,
+      boot_id_hmac: next.current?.boot_id_digest === next.pending_census.boot_id_digest ? next.current?.boot_id_hmac : undefined,
+      ...gaps,
+    };
+    next.pending_census = null;
+  }
+  next.last_census_ms = nowMs;
+  const wallMs = probeAfter?.clocks?.wall_ms;
+  const uptimeMs = probeAfter?.clocks?.os_uptime_ms;
+  facts.suspend = suspendExposure(next.last_structural_clock, { bootIdDigest: afterDigest, uptimeMs });
+  // C0 review M2: the reference keeps the uptime (the bound's clock); the wall reading is kept for
+  // the record only. A reading without an uptime still records the boot, so the next interval is
+  // unknown rather than cross_boot.
+  if (afterDigest) {
+    next.last_structural_clock = {
+      boot_id_digest: afterDigest,
+      wall_ms: Number.isSafeInteger(wallMs) ? wallMs : null,
+      uptime_ms: Number.isSafeInteger(uptimeMs) ? uptimeMs : null,
+    };
+  }
+  const folded = probeAfter
+    ? observeBootProbe(next, probeAfter, {
+      nowMs,
+      daemon,
+      detectedBy: "after_probe",
+      bootIdHmac: typeof probeAfter.boot?.boot_id === "string" ? hostBootIdHmac(hmacKey, probeAfter.boot.boot_id) : undefined,
+    }).ledger
+    : next;
+  return { facts, ledger: folded };
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
@@ -1063,6 +1297,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // feed this tick's own status.state/storage_write_error below.
   let structuralFactPersistError;
   let shadowEvaluation;
+  let contextKeyStatus;
+  let bootLedgerError;
+  let loginSeenError;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
@@ -1070,7 +1307,82 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       const readCheckpoint = options.readStructuralCheckpoint ?? readStructuralCheckpoint;
       const checkpoint = await readCheckpoint(descartesPaths);
       const lastRunMs = Number.isFinite(checkpoint?.last_structural_run_ms) ? checkpoint.last_structural_run_ms : -Infinity;
-      const structuralDue = nowMs - lastRunMs >= structuralProfile.interval_ms;
+
+      // Context plan C0.5/C0.6: the per-install HMAC key for context facts, loaded at most once per
+      // tick. An unusable key degrades every keyed context value to "unknown" (the translators never
+      // fall back to an unkeyed hash); its status is reported on the status record.
+      let contextKey;
+      const ensureContextKey = async () => {
+        if (contextKey) return contextKey;
+        const loadContextKey = options.loadContextKey ?? loadOrCreateContextKey;
+        try {
+          contextKey = await loadContextKey(descartesPaths);
+        } catch {
+          contextKey = { status: "unable", reason: "key_load_threw" };
+        }
+        contextKeyStatus = contextKey?.status === "ok" ? "ok" : `unable:${contextKey?.reason ?? "unknown"}`;
+        return contextKey;
+      };
+
+      // Context plan C0.8 / C0.12: the cheap boundary probe, on EVERY tick while the host-lifecycle
+      // context collector is enabled. It folds the boot id and the OS wake marker into the boot
+      // ledger; a new boot id or a wake makes a boundary census pending. It is also the "before" half
+      // of the census bracket (§4.4). DATA only: it never raises, recovers or admits anything.
+      const hostLifecycleEnabled = Boolean(structuralProfile.collectors?.["host-lifecycle"]?.enabled);
+      let bootLedger;
+      let bootProbeBefore;
+      if (hostLifecycleEnabled) {
+        try {
+          const probeHost = options.hostLifecycleProbe ?? readHostLifecycle;
+          // C0 review L7: this runs on EVERY fast tick, so it is bounded by the context sub-deadline
+          // (a hung sysctl costs one bounded wait and infers nothing). The ledger is still rewritten
+          // every tick: last_observed_ms is the "last observation of the previous boot" the gap
+          // conjunct needs at tick precision; it is one small atomic write.
+          const probeCapMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms) ? structuralProfile.context_collector_deadline_ms : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
+          const BOUNDARY_PROBE_TIMED_OUT = Symbol("boundary-probe-timed-out");
+          const boundaryController = new AbortController();
+          bootProbeBefore = await withDeadline(
+            Promise.resolve().then(() => probeHost({ ...collectorOptions, signal: boundaryController.signal })),
+            probeCapMs,
+            () => {
+              boundaryController.abort();
+              return BOUNDARY_PROBE_TIMED_OUT;
+            },
+          );
+          if (bootProbeBefore === BOUNDARY_PROBE_TIMED_OUT) {
+            bootProbeBefore = undefined;
+            throw new Error("boundary_probe_deadline_exceeded");
+          }
+          const ledgerRead = await (options.readBootLedger ?? readBootLedger)(descartesPaths);
+          if (ledgerRead.status === "corrupt") bootLedgerError = "boot_ledger_corrupt_restarted";
+          const key = await ensureContextKey();
+          const observed = observeBootProbe(ledgerRead.ledger, bootProbeBefore, {
+            nowMs,
+            daemon: options.daemonInstance ?? currentDaemonInstance(),
+            // The actual last census time (a borrowed checkpoint is ahead of it), else the checkpoint.
+            lastCensusMs: Number.isSafeInteger(ledgerRead.ledger.last_census_ms) ? ledgerRead.ledger.last_census_ms : Number.isFinite(lastRunMs) ? lastRunMs : undefined,
+            bootIdHmac: typeof bootProbeBefore?.boot?.boot_id === "string" ? hostBootIdHmac(key?.status === "ok" ? key.key : undefined, bootProbeBefore.boot.boot_id) : undefined,
+          });
+          bootLedger = observed.ledger;
+          await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, bootLedger);
+        } catch (error) {
+          bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_error";
+          console.warn(`[daemon] boot-identity probe/ledger failed this tick (${bootLedgerError}); no boundary is inferred from it`);
+          bootLedger = undefined;
+        }
+      }
+
+      // C0.12: a pending boundary census (new boot id or wake) runs at +0 when the scheduled census
+      // is not due, by BORROWING the next structural slot: the checkpoint advances by one interval
+      // instead of to now. A borrow is allowed only when the checkpoint is not already ahead of now
+      // (at most one slot of debt), so any window of length H holds at most H / interval + 2
+      // structural runs -- inside every family's T8 1.25 headroom -- and the census gap after a
+      // borrow is below two intervals. A census that cannot borrow stays pending and is recorded as
+      // deferred when it runs.
+      const scheduledDue = nowMs - lastRunMs >= structuralProfile.interval_ms;
+      const boundaryCensusEnabled = hostLifecycleEnabled && structuralProfile.boundary_census?.enabled === true;
+      const boundaryBorrow = !scheduledDue && boundaryCensusEnabled && Boolean(bootLedger?.pending_census) && lastRunMs <= nowMs;
+      const structuralDue = scheduledDue || boundaryBorrow;
       if (structuralDue) {
         const deadlineMs = structuralProfile.deadline_ms ?? DEFAULT_STRUCTURAL_TICK_DEADLINE_MS;
         let structuralCollectors = options.structuralCollectors;
@@ -1082,19 +1394,27 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             canary: structuralCollectors?.canary ?? (() => collectCanaryEvidence(canaries)),
           };
         }
+        // B2: this is main's incumbent path: the outer deadline race wraps only the unchanged
+        // sequential census block. The context phase is invoked only after this succeeds.
+        const structuralCollectorOptions = { ...collectorOptions, lastHistoryCache: {} };
         const outcome = await withDeadline(
-          collectStructuralEvidence(structuralProfile, structuralCollectors, collectorOptions),
+          collectStructuralCensusEvidence(structuralProfile, structuralCollectors, structuralCollectorOptions),
           deadlineMs,
           () => STRUCTURAL_TICK_TIMED_OUT,
         );
         if (outcome === STRUCTURAL_TICK_TIMED_OUT) {
-          // Partial results (if any) are discarded, not partially persisted, to avoid an
-          // inconsistent fact snapshot. The checkpoint still advances below so a repeatedly-slow
-          // host retries at the next full structural interval, not on every fast tick.
+          // Partial incumbent results are discarded, not partially persisted, exactly as on main.
+          // The checkpoint still advances below so a repeatedly-slow host retries next interval.
           structuralCollectorStatuses = [{ status: "unable", error: "structural_tick_deadline_exceeded" }];
         } else {
-          structuralEvidence = outcome;
-          structuralCollectorStatuses = structuralEvidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool }));
+          const contextEvidence = await collectStructuralContextEvidence(structuralProfile, structuralCollectors, structuralCollectorOptions);
+          structuralEvidence = [...outcome, ...contextEvidence];
+          structuralCollectorStatuses = structuralEvidence.map((envelope) => ({
+            id: envelope.id,
+            status: envelope.status,
+            tool: envelope.trace?.tool,
+            ...(envelope.source === "daemon" && typeof envelope.result?.error === "string" ? { error: envelope.result.error } : {}),
+          }));
 
           // Slice S6b, additive follow-up to S6a: translate this tick's structural evidence
           // into categorical fact-points and persist them. Only reachable here — i.e. only
@@ -1102,6 +1422,33 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // watch kill switch is enabled (already gated by the enclosing `if
           // (watchConfig.enabled)` block above) — never on a timed-out/partial tick, which
           // discards its evidence entirely rather than persisting a partial fact snapshot.
+          const loadedKey = await ensureContextKey();
+          const hmacKey = loadedKey?.status === "ok" ? loadedKey.key : undefined;
+          const hostContext = hostLifecycleEnabled
+            ? deriveHostLifecycleContext({ ledger: bootLedger, probeBefore: bootProbeBefore, structuralEvidence, nowMs, hmacKey, daemon: options.daemonInstance ?? currentDaemonInstance(), boundaryCensusEnabled })
+            : undefined;
+          // Context plan C0.4: first-observed-tick dedupe of login rows (a repeated sighting is not
+          // a repeated login). A seen-state that cannot be read re-emits as `reseeded`; one that
+          // cannot be written is reported, and the next tick re-reads the old state.
+          let loginDedupe;
+          if (structuralProfile.collectors?.["login-sessions"]?.enabled) {
+            const loginEnvelope = structuralEvidence.find((envelope) => envelope.id === "login-sessions" && envelope.source !== "daemon");
+            if (loginEnvelope) {
+              try {
+                const seenRead = await (options.readLoginSeen ?? readLoginSeen)(descartesPaths);
+                // C0 review L4/L6: keyed row digests; without a usable key there is no dedupe (no
+                // login row is emitted, and the census says dedupe_state: unavailable).
+                // C0 review M5: the boot salt is the ledger's current boot, else this census's own
+                // boot read; never "" (an unsalted logind id would merge across boots).
+                const hostEnvelope = structuralEvidence.find((envelope) => envelope.id === "host-lifecycle" && envelope.source !== "daemon");
+                const bootSalt = bootLedger?.current?.boot_id_digest ?? bootIdDigest(hostEnvelope?.result?.boot?.boot_id);
+                loginDedupe = selectNewLoginRows(seenRead.seen, loginEnvelope.result, { nowMs, bootSalt, hmacKey });
+              } catch (error) {
+                loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_error";
+                console.warn(`[daemon] login dedupe state failed this tick (${loginSeenError})`);
+              }
+            }
+          }
           const factPoints = [
             ...factPointsFromCanaryEvidence(structuralEvidence, { ts }),
             ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
@@ -1127,6 +1474,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // extraCandidates and no census marker; vpn-peer-status remains the sole shared
             // availability/regime anchor, avoiding same-tick marker collision.
             ...factPointsFromTailscaleStatusEvidence(structuralEvidence, { ts }),
+            // Context plan C0.3: the tailnet's own state, for EVERY probe outcome (a logged-out or
+            // missing daemon is a value, not a dropped tick). DATA only: no alert candidate.
+            ...factPointsFromTailnetStateEvidence(structuralEvidence, { ts, hmacKey }),
+            // Context plan C0.8/C0.9/C0.12: boot identity, raw clock readings, the C0.9 no-go
+            // suspend fallback, a boundary verdict and a boundary census record. DATA only.
+            ...(hostContext ? factPointsFromHostLifecycleEvidence(structuralEvidence, { ts, hmacKey, ...hostContext.facts }) : []),
+            // Context plan C0.4: login origin (session_context). DATA only.
+            ...factPointsFromLoginSessionsEvidence(structuralEvidence, { ts, hmacKey, dedupe: loginDedupe }),
+            // Context plan C0.5: the network-configuration fingerprint (network_context). DATA only.
+            ...factPointsFromNetConfigEvidence(structuralEvidence, { ts, hmacKey }),
             ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
             // Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-
             // gaps.md): scheduled-jobs structural evidence -> fact-points, same discipline as its
@@ -1162,6 +1519,38 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             structuralFacts = { written_count: 0, retention: undefined };
           }
 
+          // Context plan C0.4/C0.8/C0.12: the boot ledger (which consumes a pending boundary and
+          // census and advances the suspend reference) and the login seen-state (which marks rows
+          // seen) are committed only AFTER their family's facts were appended. If the append failed,
+          // the pending boundary/census stay pending and are re-derived at the next census, the
+          // exposure interval widens truthfully, and the login rows are offered again: never a
+          // consumed record that reached no fact history.
+          const familyPersisted = (family) => structuralFacts?.families !== undefined
+            && structuralFacts.families[family] !== undefined
+            && structuralFacts.families[family].append_error === undefined;
+          if (hostContext?.ledger) {
+            if (familyPersisted("host_lifecycle")) {
+              try {
+                await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, hostContext.ledger);
+              } catch (error) {
+                bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_write_failed";
+              }
+            } else {
+              bootLedgerError = "host_lifecycle_facts_not_persisted";
+            }
+          }
+          if (loginDedupe) {
+            if (familyPersisted("session_context")) {
+              try {
+                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginDedupe.next);
+              } catch (error) {
+                loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_write_failed";
+              }
+            } else {
+              loginSeenError = "session_context_facts_not_persisted";
+            }
+          }
+
           // Slice S7a, additive, RE-GATED (watch-by-default slice 1, plan §3.2): shadow-constraint
           // evaluation stays on the AUTHOR flag, nested INSIDE the WATCH block, as a genuine
           // two-flag AND — not a rename. It only means anything once the AUTHOR pipeline has
@@ -1180,7 +1569,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // constraints.json, never alerts.json/notifications (evaluateAndLogShadowConstraints
           // never imports alert-store.js).
           const learnedConfig = configSnapshot.learned; // §8.D: per-tick snapshot (loaded once above)
-          if (learnedConfig.enabled) {
+          // C0.7: shadow evaluation keeps its "successful structural tick only" discipline: it does
+          // not run on a tick where any collector overran or found the budget exhausted (an
+          // envelope the daemon synthesized), since its targets' freshness then depends on which
+          // collectors finished.
+          const incumbentIds = new Set(STRUCTURAL_CENSUS_COLLECTORS.map(([, id]) => id));
+          const structuralTickComplete = structuralEvidence
+            .filter((envelope) => incumbentIds.has(envelope.id))
+            .every((envelope) => envelope.source !== "daemon");
+          if (learnedConfig.enabled && structuralTickComplete) {
             const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
             shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
           }
@@ -1191,7 +1588,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
         await safeCandidates(
           "structural-checkpoint-persist",
-          () => writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts }),
+          // C0.12: a borrowed boundary census consumes the next slot (see boundaryBorrow above).
+          () => writeCheckpoint(descartesPaths, { last_structural_run_ms: boundaryBorrow ? lastRunMs + structuralProfile.interval_ms : nowMs, now: ts }),
           undefined,
         );
       }
@@ -1569,6 +1967,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     points_written: write.written_count,
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
+    ...(contextKeyStatus ? { context_key_status: contextKeyStatus } : {}),
+    ...(bootLedgerError ? { boot_ledger_error: bootLedgerError } : {}),
+    ...(loginSeenError ? { login_seen_error: loginSeenError } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),

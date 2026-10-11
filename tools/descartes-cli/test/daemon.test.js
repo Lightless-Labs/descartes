@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import {
   AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS,
@@ -25,10 +26,12 @@ import {
   runForegroundDaemonLoop,
   uninstallDaemonService,
   validateDaemonProfile,
+  deriveHostLifecycleContext,
   WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS,
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
+import { observeBootProbe } from "../src/boot-ledger.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPoints, enforceFactRetention, normalizeFactPoint, readFactPoints, resolveFactStorePaths, appendFactPointsByFamily } from "../src/fact-store.js";
 import { FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES } from "../src/fact-families.js";
@@ -51,6 +54,7 @@ import {
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   buildScheduledJobEntityKey,
+  factPointsFromSessionEvidence,
 } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
@@ -558,7 +562,10 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "net-config", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  // Review B1: the +0 boundary census writes into the session/peer families the incumbent
+  // detectors score and fold, so it ships OFF until C1a/C2 can route it away from them.
+  assert.deepEqual(profile.structural.boundary_census, { enabled: false });
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
@@ -869,7 +876,7 @@ test("writeDaemonStatus includes structural_collector_statuses only on a structu
   ]);
 });
 
-test("a hung structural collector is bounded by its deadline, marked unable, and still advances the checkpoint", async () => {
+test("B2: a hung incumbent structural collector discards the whole tick, as on main", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
@@ -900,8 +907,95 @@ test("a hung structural collector is bounded by its deadline, marked unable, and
   assert.deepEqual(result.status.structural_collector_statuses, [
     { status: "unable", error: "structural_tick_deadline_exceeded" },
   ]);
-  assert.equal(result.structuralEvidence, undefined);
+  assert.equal(result.structuralEvidence, undefined, "incumbent evidence is discarded as one structural snapshot");
+  assert.equal(result.structuralFacts, undefined, "a timed-out incumbent tick cannot persist partial facts");
   assert.equal(storedCheckpoint.last_structural_run_ms, 1000);
+});
+
+test("B2: a context collector timeout records only that context as unable after incumbents persist", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+    "login-sessions": () => new Promise(() => {}),
+  };
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({
+      deadline_ms: 100,
+      context_collector_deadline_ms: 10,
+      collectors: {
+        services: { enabled: true },
+        network: { enabled: false },
+        "scheduled-jobs": { enabled: false },
+        "login-sessions": { enabled: true },
+      },
+    }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.structuralEvidence.find((entry) => entry.id === "services").status, "ok");
+  const timedOut = result.structuralEvidence.find((entry) => entry.id === "login-sessions");
+  assert.equal(timedOut.status, "unable");
+  assert.equal(timedOut.result.error, "collector_deadline_exceeded");
+  assert.ok(result.structuralFacts, "incumbent evidence remains eligible for persistence");
+});
+
+test("B2: an incumbent rejection escapes like main and cannot advance the structural checkpoint", async () => {
+  const paths = await tempPaths();
+  let checkpointWrites = 0;
+  await assert.rejects(() => runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      services: async () => { throw new Error("boom"); },
+    },
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => { checkpointWrites += 1; },
+    loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  }), /boom/);
+  assert.equal(checkpointWrites, 0);
+});
+
+test("B2: a throwing context collector leaves incumbent evidence, facts, checkpoint, and alert inputs intact", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({
+      collectors: {
+        services: { enabled: true },
+        network: { enabled: false },
+        "scheduled-jobs": { enabled: false },
+        "host-lifecycle": { enabled: true },
+      },
+    }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+      "host-lifecycle": async () => { throw new Error("context boom"); },
+    },
+    hostLifecycleProbe: async () => undefined,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => checkpoint,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.structuralEvidence.find((entry) => entry.id === "services").status, "ok");
+  assert.equal(result.structuralEvidence.find((entry) => entry.id === "host-lifecycle").status, "unable");
+  assert.ok(result.structuralFacts);
+  assert.ok(result.status.structural_collector_statuses.some((entry) => entry.id === "services" && entry.status === "ok"));
 });
 
 test("a structural tick that completes well within its deadline is unaffected by the deadline machinery", async () => {
@@ -1070,8 +1164,9 @@ test("S6b wiring: no fact-points are persisted while the watch.json kill switch 
   await assertNoFactStoreWritten(paths);
 });
 
-test("S6b wiring: a timed-out structural tick discards its evidence entirely — no fact-points are persisted for a partial/timed-out tick", async () => {
+test("B2: an incumbent collector overrun discards every incumbent fact from the structural tick", async () => {
   const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", {
       manager: "systemd",
@@ -1086,17 +1181,21 @@ test("S6b wiring: a timed-out structural tick discards its evidence entirely —
     collectors: fastCollectorFakes(),
     structuralCollectors,
     evaluateAlerts: false,
-    ts: "2026-05-24T00:00:00.000Z",
-    now: 1000,
+    ts,
+    now: Date.parse(ts),
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  assert.equal(result.structuralEvidence, undefined);
   assert.equal(result.structuralFacts, undefined);
-  await assertNoFactStoreWritten(paths);
+  assert.equal(result.structuralEvidence, undefined);
+  assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
+  const service = await readFactPoints(paths, { family: "service", now: Date.parse(ts) });
+  assert.equal(service.points.length, 0);
+  const jobs = await readFactPoints(paths, { family: "scheduled_job", now: Date.parse(ts) });
+  assert.equal(jobs.points.length, 0, "the timed-out collector wrote nothing, not even a census marker (never a fabricated zero)");
 });
 
 test("S6b wiring: no fact-points are persisted when profile.structural is absent (regression, matches S6a's byte-identical-fast-path guarantee)", async () => {
@@ -1848,7 +1947,7 @@ test("S4 structural wiring: the provenance sub-collector runs on a structural-du
   assert.equal(warningPoint.attributes.active, "true");
 });
 
-test("S4 structural wiring: a timed-out structural tick (provenance hangs) discards its evidence entirely — no provenance fact-points are persisted", async () => {
+test("B2: a provenance incumbent hang discards its siblings and persists nothing", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
@@ -1873,8 +1972,8 @@ test("S4 structural wiring: a timed-out structural tick (provenance hangs) disca
 
   assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
   assert.equal(result.structuralEvidence, undefined);
-  assert.equal(result.structuralFacts, undefined);
-  await assertNoFactStoreWritten(paths);
+  const provenance = await readFactPoints(paths, { family: "provenance", now: 1000 });
+  assert.equal(provenance.points.length, 0);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -3106,7 +3205,7 @@ test("Slice 4b, Decision 3b: a due peer.count_spike is delivered through the det
 // on every tick to ever leave "provisional".
 // ---------------------------------------------------------------------------------------------
 
-function completePeerTickWithMarker(ts, count, signature = "v1:ok-ok-ok-ok-ok", entityPrefix = "peer.ssh.e") {
+function completePeerTickWithMarker(ts, count, signature = "v2:ok-ok-ok-ok-ok", entityPrefix = "peer.ssh.e") {
   return [
     ...completePeerTick(ts, count, entityPrefix),
     {
@@ -6115,4 +6214,652 @@ test("BLOCKER 1, phase-appropriate coverage: a containment-phase detector EXCEPT
 
   const persisted = await readAlertRecords(paths);
   assert.equal(persisted.find((a) => a.rule_id === "containment.recommend.block")?.status, "active");
+});
+
+// --- Context plan C0.3 wiring: net.tailnet_state reaches the network_context family on every outcome ---
+
+test("C0.3 wiring: a logged-out tailscale probe persists net.tailnet_state to network_context, and no peer fact", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "tailscale-status": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      "tailscale-status": async () => envelope("tailscale-status", "collect_tailscale_status", { status: "logged_out", peers: [], tailnet: { backend_state: "NeedsLogin" } }, "unable"),
+    },
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.ok(result.structuralFacts);
+  assert.equal(result.status.context_key_status, "ok");
+  const { points } = await readFactPoints(paths, { family: "network_context", now: Date.parse("2026-05-24T00:00:00.000Z") });
+  assert.equal(points.length, 1);
+  assert.equal(points[0].fact_name, "net.tailnet_state");
+  assert.equal(points[0].attributes.state, "unable");
+  assert.equal(points[0].attributes.collector_state, "unable");
+  const peer = await readFactPoints(paths, { family: "peer", now: Date.parse("2026-05-24T00:00:00.000Z") });
+  assert.equal(peer.points.length, 0);
+});
+
+// --- Context plan C0.7: per-collector sub-deadlines; context collectors after the census ---
+
+test("C0.7: census collectors run first in their existing order, context collectors strictly after them", async () => {
+  const order = [];
+  const make = (id) => async () => {
+    order.push(id);
+    return envelope(id, `collect_${id}`, {});
+  };
+  await collectStructuralEvidence({
+    collectors: { "host-lifecycle": { enabled: true }, sessions: { enabled: true }, services: { enabled: true }, "vpn-peer-status": { enabled: true } },
+  }, { "host-lifecycle": make("host-lifecycle"), sessions: make("sessions"), services: make("services"), "vpn-peer-status": make("vpn-peer-status") }, {});
+  assert.deepEqual(order, ["services", "sessions", "vpn-peer-status", "host-lifecycle"]);
+});
+
+test("C0.7: a hung context collector records unable and never costs the session/peer census", async () => {
+  const evidence = await collectStructuralEvidence({
+    context_collector_deadline_ms: 20,
+    collectors: { sessions: { enabled: true }, "vpn-peer-status": { enabled: true }, "host-lifecycle": { enabled: true } },
+  }, {
+    sessions: async () => envelope("sessions", "collect_sessions", { sessions: [], multiplexers: [{ multiplexer: "tmux", status: "ok" }] }),
+    "vpn-peer-status": async () => envelope("vpn-peer-status", "collect_vpn_peer_status", { peers: [], sources: {} }),
+    "host-lifecycle": () => new Promise(() => {}),
+  }, { deadlineMs: 5000 });
+  assert.deepEqual(evidence.map((e) => [e.id, e.status]), [["sessions", "ok"], ["vpn-peer-status", "ok"], ["host-lifecycle", "unable"]]);
+  assert.equal(evidence[2].result.error, "collector_deadline_exceeded");
+  const ts = "2026-05-24T00:00:00.000Z";
+  assert.ok(factPointsFromSessionEvidence(evidence, { ts }).length > 0, "the census marker is still emitted");
+});
+
+test("LOW: peer and login collectors share one parsed last-history read per structural tick", async () => {
+  const calls = [];
+  const last = "thomas ttys037 100.64.118.39 Sun Oct 11 12:53 still logged in\n";
+  const runFixedExecFile = async (command, args = []) => {
+    calls.push([command, ...args]);
+    const key = [command, ...args].join(" ");
+    if (key === "who") return { status: "ok", stdout: "", stderr: "" };
+    if (key === "last -n 50") return { status: "ok", stdout: last, stderr: "" };
+    if (key === "wg show interfaces") return { status: "ok", stdout: "", stderr: "" };
+    if (key === "scutil --nc list") return { status: "ok", stdout: "Available network connection services in the current set (*=enabled):\n", stderr: "" };
+    if (key === "netstat -an -p tcp") return { status: "ok", stdout: "", stderr: "" };
+    if (key === "ioreg -r -k IOConsoleUsers -d 1 -a") return { status: "ok", stdout: "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>IOConsoleUsers</key><array/></dict></plist>", stderr: "" };
+    throw new Error(`unexpected subprocess: ${key}`);
+  };
+  const evidence = await collectStructuralEvidence({
+    collectors: {
+      "vpn-peer-status": { enabled: true },
+      "login-sessions": { enabled: true },
+    },
+  }, {}, { platform: "darwin", runFixedExecFile });
+  assert.deepEqual(evidence.map((item) => item.id), ["vpn-peer-status", "login-sessions"]);
+  assert.equal(calls.filter(([command, ...args]) => [command, ...args].join(" ") === "last -n 50").length, 1);
+});
+
+test("MEDIUM: a timed-out context collector aborts its child and launches no later subprocess", async () => {
+  const calls = [];
+  let child;
+  const runFixedExecFile = async (command, args, options = {}) => {
+    calls.push(command);
+    if (command !== "tmux") throw new Error(`unexpected subprocess after abort: ${command}`);
+    child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+      signal: options.signal,
+      killSignal: options.killSignal,
+    });
+    return await new Promise((resolve, reject) => {
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => { stderr += chunk; });
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ status: code === 0 ? "ok" : "error", stdout: "", stderr, code, signal }));
+    });
+  };
+  const evidence = await collectStructuralEvidence({
+    context_collector_deadline_ms: 25,
+    collectors: { "host-lifecycle": { enabled: true } },
+  }, { "host-lifecycle": async (options) => {
+    calls.push("host-lifecycle");
+    child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+      signal: options.signal,
+      killSignal: options.killSignal,
+    });
+    return await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ status: code === 0 ? "ok" : "error", stdout: "", stderr: "", code, signal }));
+    });
+  } }, { deadlineMs: 1000 });
+
+  // Give the aborted child one event-loop turn to report its kill before asserting the resource
+  // boundary. The test cleans up explicitly if the pre-fix implementation failed to propagate it.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const childWasKilled = child?.killed === true || child?.exitCode !== null || child?.signalCode !== null;
+  if (!childWasKilled) child?.kill("SIGKILL");
+  assert.equal(evidence[0].result.error, "collector_deadline_exceeded");
+  assert.deepEqual(calls, ["host-lifecycle"], "no later subprocess is launched after the context collector is aborted");
+  assert.equal(childWasKilled, true, "the timed-out subprocess must be killed");
+});
+
+test("B2: the incumbent census propagates collector rejection to the outer caller", async () => {
+  await assert.rejects(() => collectStructuralEvidence({
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, provenance: { enabled: true } },
+  }, {
+    services: async () => { throw new Error("incumbent boom"); },
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": async () => envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }),
+    provenance: async () => envelope("provenance-warnings", "collect_provenance_warnings", { warnings: [] }),
+  }), /incumbent boom/);
+});
+
+test("C0.7: profile validation accepts positive sub-deadlines and rejects invalid ones", () => {
+  assert.doesNotThrow(() => validateDaemonProfile(structuralProfile({ collector_deadline_ms: 1000, context_collector_deadline_ms: 500 })));
+  assert.throws(() => validateDaemonProfile(structuralProfile({ collector_deadline_ms: 0 })), /collector_deadline_ms/);
+  assert.throws(() => validateDaemonProfile(structuralProfile({ context_collector_deadline_ms: -1 })), /context_collector_deadline_ms/);
+});
+
+// --- Context plan C0.8 / C0.12: boundary probe, boundary-triggered census at +0, host_lifecycle facts ---
+
+const BOOT_ONE = "11111111-2222-3333-4444-555555555555";
+const BOOT_TWO = "66666666-7777-8888-9999-AAAAAAAAAAAA";
+const C12_T0 = Date.parse("2026-10-11T08:00:00.000Z");
+const C12_HOUR = 3600000;
+
+function hostProbe(bootId, { bootTimeS, waketime = 0, sleeptime = 0, wallMs, uptimeMs }) {
+  return {
+    platform: "darwin",
+    status: "ok",
+    boot: { boot_id: bootId, boot_id_source: "kern.bootsessionuuid", boot_time_s: bootTimeS, os_build: "25C56", os_release: "25.2.0" },
+    clocks: { wall_ms: wallMs, uv_hrtime_ns: "1", uv_version: "1.52.1", os_uptime_ms: uptimeMs, kern_waketime_s: waketime, kern_sleeptime_s: sleeptime },
+  };
+}
+
+function c12Harness(paths) {
+  const state = { checkpoint: undefined, structuralRuns: 0, probe: undefined, afterProbe: undefined, sessions: [] };
+  const run = async (nowMs, { daemon = { nonce: "daemon-a", start_ms: C12_T0 - C12_HOUR } } = {}) => {
+    const ts = new Date(nowMs).toISOString();
+    return runDaemonIteration(paths, {
+      profile: structuralProfile({ collectors: { sessions: { enabled: true }, "host-lifecycle": { enabled: true } }, boundary_census: { enabled: true } }),
+      collectors: fastCollectorFakes(),
+      structuralCollectors: {
+        sessions: async () => {
+          state.structuralRuns += 1;
+          return envelope("sessions", "collect_sessions", { sessions: state.sessions, multiplexers: [{ multiplexer: "tmux", status: "ok" }], total_count: state.sessions.length, truncated: false });
+        },
+        "host-lifecycle": async () => ({ ...envelope("host-lifecycle", "collect_host_lifecycle", state.afterProbe ?? state.probe), observation: { start_ms: nowMs, end_ms: nowMs } }),
+      },
+      hostLifecycleProbe: async () => state.probe,
+      daemonInstance: daemon,
+      evaluateAlerts: false,
+      ts,
+      now: nowMs,
+      readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+      writeStructuralCheckpoint: async (_paths, checkpoint) => {
+        state.checkpoint = checkpoint.last_structural_run_ms;
+        return checkpoint;
+      },
+      loadLearnedConfig: async () => ({ enabled: false }),
+      loadWatchConfig: async () => ({ enabled: true }),
+    });
+  };
+  return { state, run };
+}
+
+async function hostFacts(paths, nowMs) {
+  const { points } = await readFactPoints(paths, { family: "host_lifecycle", now: nowMs });
+  return points;
+}
+
+test("C0.8/C0.12: first observation records the boot and triggers nothing; a new boot id runs a +0 census that borrows the next slot and records the boundary verdict with its gaps", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  const bootOneS = Math.floor((C12_T0 - 10 * 24 * C12_HOUR) / 1000);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: bootOneS, wallMs: C12_T0, uptimeMs: C12_T0 - bootOneS * 1000 });
+  await run(C12_T0);
+  assert.equal(state.structuralRuns, 1);
+  assert.equal(state.checkpoint, C12_T0);
+  let facts = await hostFacts(paths, C12_T0);
+  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
+  assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "no_previous_reading");
+  assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.bracket, "stable");
+
+  await run(C12_T0 + 60000);
+  assert.equal(state.structuralRuns, 1, "same boot, not due: no census");
+
+  // Reboot at T0 + 20 min; the new daemon observes it at T0 + 25 min (not due for 35 more minutes).
+  const bootTwoS = Math.floor((C12_T0 + 20 * 60000) / 1000);
+  const detectMs = C12_T0 + 25 * 60000;
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, wallMs: detectMs, uptimeMs: detectMs - bootTwoS * 1000 });
+  state.sessions = [{ multiplexer: "tmux", session_name: "s", created_at_epoch_seconds: bootTwoS + 60, attached: false, window_count: 1 }];
+  await run(detectMs, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  assert.equal(state.structuralRuns, 2, "the boundary census ran at +0");
+  assert.equal(state.checkpoint, C12_T0 + C12_HOUR, "it borrowed the next slot instead of resetting the cadence");
+  facts = await hostFacts(paths, detectMs);
+  const boundary = facts.find((p) => p.fact_name === "host.boot_boundary");
+  // Every independent conjunct passes; the uptime conjunct is not independent of the boot time
+  // (C0 review H3), so the boundary is fail-closed unverified, and no tripwire.
+  for (const key of ["c_never_seen", "c_daemon_restart", "c_boot_time_in_gap", "c_no_preboot_instance"]) assert.equal(boundary.attributes[key], "pass", key);
+  assert.equal(boundary.attributes.c_uptime_consistent, "not_independent");
+  assert.equal(boundary.attributes.verdict, "unverified", JSON.stringify(boundary.attributes));
+  assert.equal(boundary.attributes.failing_conjunct, "uptime_consistent");
+  assert.equal(boundary.attributes.tripwire, "none");
+  assert.equal(boundary.attributes.os_build_changed, "false");
+  assert.equal(boundary.attributes.gap_s, String(25 * 60 - 60), "previous boot last observed at T0 + 1 min");
+  const census = facts.find((p) => p.fact_name === "host.boundary_census");
+  assert.deepEqual(
+    { trigger: census.attributes.trigger, status: census.attributes.status, pre: census.attributes.pre_gap_s, post: census.attributes.post_gap_s },
+    { trigger: "boot", status: "ran", pre: String(20 * 60), post: String(5 * 60) },
+  );
+  assert.equal(census.attributes.boot_id_hmac, boundary.attributes.boot_id_hmac);
+  assert.notEqual(boundary.attributes.prev_boot_id_hmac, boundary.attributes.boot_id_hmac);
+  assert.equal(facts.filter((p) => p.fact_name === "host.suspend").at(-1).attributes.interval_basis, "cross_boot");
+
+  // A second boundary inside the borrowed slot cannot borrow again: it waits for the slot (cost cap).
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, waketime: Math.floor((C12_T0 + 30 * 60000) / 1000), sleeptime: Math.floor((C12_T0 + 27 * 60000) / 1000), wallMs: C12_T0 + 31 * 60000, uptimeMs: 1 });
+  await run(C12_T0 + 31 * 60000, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  assert.equal(state.structuralRuns, 2, "no second borrow while the checkpoint is ahead of now");
+  await run(C12_T0 + C12_HOUR + 60000, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  assert.equal(state.structuralRuns, 3, "it borrows once the slot it took has started");
+  facts = await hostFacts(paths, C12_T0 + C12_HOUR + 60000);
+  const deferred = facts.filter((p) => p.fact_name === "host.boundary_census").at(-1);
+  assert.equal(deferred.attributes.trigger, "wake");
+  assert.equal(deferred.attributes.status, "deferred_cost_cap");
+  assert.equal(deferred.attributes.pre_gap_s, String(2 * 60), "last census at T0 + 25 min -> sleep at T0 + 27 min");
+});
+
+test("C0.12: the boundary census is off when boundary_census is not enabled (the boundary is still recorded at the next scheduled census)", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  const runNoBoundary = async (nowMs) => runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => { state.structuralRuns += 1; return envelope("host-lifecycle", "collect_host_lifecycle", state.probe); } },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "d", start_ms: 0 },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  await runNoBoundary(C12_T0);
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: Math.floor((C12_T0 + 60000) / 1000), wallMs: C12_T0 + 120000, uptimeMs: 60000 });
+  await runNoBoundary(C12_T0 + 120000);
+  assert.equal(state.structuralRuns, 1);
+  await runNoBoundary(C12_T0 + C12_HOUR);
+  assert.equal(state.structuralRuns, 2);
+  const facts = await hostFacts(paths, C12_T0 + C12_HOUR);
+  assert.ok(facts.some((p) => p.fact_name === "host.boot_boundary"));
+  // Review L3: not a cost-cap deferral -- the boundary census is simply not enabled.
+  assert.equal(facts.find((p) => p.fact_name === "host.boundary_census").attributes.status, "not_enabled");
+});
+
+test("Review B1: with the DEFAULT profile a pending boundary never triggers an off-schedule census (the session/peer detectors keep their scheduled samples)", async () => {
+  const paths = await tempPaths();
+  const state = { checkpoint: undefined, structuralRuns: 0, probe: undefined };
+  const base = defaultDaemonProfile();
+  const profile = {
+    ...base,
+    structural: {
+      ...base.structural,
+      collectors: Object.fromEntries(Object.keys(base.structural.collectors).map((key) => [key, { enabled: key === "host-lifecycle" || key === "sessions" }])),
+    },
+  };
+  const tick = (nowMs) => runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      sessions: async () => { state.structuralRuns += 1; return envelope("sessions", "collect_sessions", { sessions: [], multiplexers: [{ multiplexer: "tmux", status: "ok" }], total_count: 0, truncated: false }); },
+      "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", state.probe),
+    },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "d", start_ms: 0 },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  await tick(C12_T0);
+  assert.equal(state.structuralRuns, 1);
+  // A reboot detected 20 minutes later: pending, but the census waits for its scheduled slot.
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: Math.floor((C12_T0 + 15 * 60000) / 1000), wallMs: C12_T0 + 20 * 60000, uptimeMs: 5 * 60000 });
+  await tick(C12_T0 + 20 * 60000);
+  assert.equal(state.structuralRuns, 1, "no +0 census: the default profile leaves the detector cadence alone");
+  assert.equal(state.checkpoint, C12_T0, "the checkpoint is not borrowed");
+  // A wake detected later in the same boot: still nothing off-schedule.
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: Math.floor((C12_T0 + 15 * 60000) / 1000), waketime: Math.floor((C12_T0 + 40 * 60000) / 1000), wallMs: C12_T0 + 41 * 60000, uptimeMs: 26 * 60000 });
+  await tick(C12_T0 + 41 * 60000);
+  assert.equal(state.structuralRuns, 1);
+  await tick(C12_T0 + C12_HOUR);
+  assert.equal(state.structuralRuns, 2, "the scheduled census runs at its slot");
+  assert.equal(state.checkpoint, C12_T0 + C12_HOUR);
+});
+
+test("Review L3: a wake first seen by the AFTER-census probe is recorded at the next census as detected_after_census, not as a cost-cap deferral", () => {
+  const before = hostProbe(BOOT_ONE, { bootTimeS: 1, waketime: 10, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  const after = hostProbe(BOOT_ONE, { bootTimeS: 1, waketime: 20, wallMs: C12_T0 + 1000, uptimeMs: C12_T0 });
+  const daemon = { nonce: "d", start_ms: 0 };
+  const { ledger: seeded } = observeBootProbe(undefined, before, { nowMs: C12_T0, daemon });
+  const first = deriveHostLifecycleContext({ ledger: seeded, probeBefore: before, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: C12_T0, daemon, boundaryCensusEnabled: true });
+  assert.equal(first.facts.boundaryCensus, undefined, "nothing was pending when this census ran");
+  assert.equal(first.ledger.pending_census.trigger, "wake");
+  assert.equal(first.ledger.pending_census.detected_by, "after_probe");
+  const next = deriveHostLifecycleContext({ ledger: first.ledger, probeBefore: after, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: C12_T0 + C12_HOUR, daemon, boundaryCensusEnabled: true });
+  assert.equal(next.facts.boundaryCensus.status, "detected_after_census");
+});
+
+test("C0.8 (§4.4 bracket): a boot read that differs before and after the census is unstable", () => {
+  const before = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: 1, uptimeMs: 1 });
+  const after = hostProbe(BOOT_ONE, { bootTimeS: 1, waketime: 99, wallMs: 2, uptimeMs: 1 });
+  const evidence = [envelope("host-lifecycle", "collect_host_lifecycle", after)];
+  assert.equal(deriveHostLifecycleContext({ probeBefore: before, structuralEvidence: evidence, nowMs: 5 }).facts.bracket, "unstable");
+  assert.equal(deriveHostLifecycleContext({ probeBefore: before, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", before)], nowMs: 5 }).facts.bracket, "stable");
+  assert.equal(deriveHostLifecycleContext({ probeBefore: undefined, structuralEvidence: evidence, nowMs: 5 }).facts.bracket, "unknown");
+});
+
+test("C0 review L1: a pending boundary whose new boot the live after-census read does not confirm is never better than unverified (the ledger file is not trusted on its own)", () => {
+  const daemon = { nonce: "d2", start_ms: C12_T0 + 2 * 60000 };
+  const before = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  const { ledger: seeded } = observeBootProbe(undefined, before, { nowMs: C12_T0, daemon: { nonce: "d1", start_ms: 0 } });
+  const bootTwoS = Math.floor((C12_T0 + 60000) / 1000);
+  const rebooted = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, wallMs: C12_T0 + 5 * 60000, uptimeMs: 4 * 60000 });
+  const { ledger } = observeBootProbe(seeded, rebooted, { nowMs: C12_T0 + 5 * 60000, daemon });
+  const derive = (after) => deriveHostLifecycleContext({ ledger, probeBefore: rebooted, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: C12_T0 + 5 * 60000, daemon }).facts.boundary;
+  assert.notEqual(derive(rebooted).failing_conjunct, "live_boot_mismatch", "the live read agrees");
+  const mismatch = derive(hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0 + 5 * 60000, uptimeMs: C12_T0 }));
+  assert.equal(mismatch.verdict, "unverified");
+  assert.equal(mismatch.failing_conjunct, "live_boot_mismatch");
+  const otherTime = derive(hostProbe(BOOT_TWO, { bootTimeS: bootTwoS - 600, wallMs: C12_T0 + 5 * 60000, uptimeMs: 14 * 60000 }));
+  assert.equal(otherTime.failing_conjunct, "live_boot_mismatch");
+  const unread = deriveHostLifecycleContext({ ledger, probeBefore: rebooted, structuralEvidence: [], nowMs: C12_T0 + 5 * 60000, daemon }).facts.boundary;
+  assert.equal(unread.verdict, "unverified");
+  assert.equal(unread.failing_conjunct, "live_boot_unread");
+});
+
+test("C0 review L7: the every-tick boundary probe runs under the context sub-deadline; a hung probe costs one bounded wait and infers nothing", async () => {
+  const paths = await tempPaths();
+  const started = Date.now();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ context_collector_deadline_ms: 50, collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: 1 })) },
+    hostLifecycleProbe: () => new Promise(() => {}),
+    evaluateAlerts: false,
+    ts: new Date(C12_T0).toISOString(),
+    now: C12_T0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: C12_T0 }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(result.status.boot_ledger_error, "boundary_probe_deadline_exceeded");
+});
+
+test("MEDIUM: the every-tick boundary deadline aborts the host probe", async () => {
+  const paths = await tempPaths();
+  let receivedSignal;
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ context_collector_deadline_ms: 5, collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", {}) },
+    hostLifecycleProbe: async ({ signal }) => {
+      receivedSignal = signal;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: 1 });
+    },
+    evaluateAlerts: false,
+    ts: new Date(C12_T0).toISOString(),
+    now: C12_T0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: C12_T0 }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.boot_ledger_error, "boundary_probe_deadline_exceeded");
+  assert.equal(receivedSignal?.aborted, true);
+});
+
+test("C0 review M1: the bracket is never stable when the wake marker is unreadable on either side", () => {
+  const noMarker = (bootId) => ({ platform: "linux", status: "ok", boot: { boot_id: bootId, boot_id_source: "proc_boot_id", boot_time_s: 1 }, clocks: { wall_ms: 1, os_uptime_ms: 1 } });
+  const withMarker = { ...noMarker(BOOT_ONE), clocks: { wall_ms: 1, os_uptime_ms: 1, suspend_stats_success: 3 } };
+  const bracket = (before, after) => deriveHostLifecycleContext({ probeBefore: before, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: 5 }).facts.bracket;
+  assert.equal(bracket(noMarker(BOOT_ONE), noMarker(BOOT_ONE)), "unknown", "an older kernel without /sys/power/suspend_stats: a wake cannot be ruled out");
+  assert.equal(bracket(withMarker, noMarker(BOOT_ONE)), "unknown");
+  assert.equal(bracket(noMarker(BOOT_ONE), withMarker), "unknown");
+  assert.equal(bracket(withMarker, withMarker), "stable");
+  assert.equal(bracket(noMarker(BOOT_ONE), noMarker(BOOT_TWO)), "unstable", "a boot-id change is a definite change whatever the wake marker");
+});
+
+test("C0.8: a failing boot probe or ledger write is reported and infers nothing (no boundary, no census)", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "host-lifecycle": { enabled: true } }, boundary_census: { enabled: true } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", { platform: "darwin", status: "unable", boot: {}, clocks: {} }, "unable") },
+    hostLifecycleProbe: async () => { throw new Error("probe exploded"); },
+    evaluateAlerts: false,
+    ts: new Date(C12_T0).toISOString(),
+    now: C12_T0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.boot_ledger_error, "probe exploded");
+  const facts = await hostFacts(paths, C12_T0);
+  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
+  assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.boot_id_hmac, "unknown");
+  assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "unknown");
+});
+
+test("C0 review H2: a structural tick whose host-lifecycle read timed out persists host.suspend as unknown, not cross_boot", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  await run(C12_T0);
+  // Next scheduled census: the before-probe works, the census's own host-lifecycle read is the
+  // daemon-synthesized unable envelope of a sub-deadline overrun (no boot id).
+  const nowMs = C12_T0 + C12_HOUR;
+  await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      "host-lifecycle": async () => ({ id: "host-lifecycle", status: "unable", layer: "L0", source: "daemon", result: { status: "unable", error: "collector_deadline_exceeded" }, confidence: 0, review_hint: "none", trace: { tool: "collect_host_lifecycle", target: null, latency_ms: 0, ts: new Date(nowMs).toISOString() }, observation: { start_ms: nowMs, end_ms: nowMs } }),
+    },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "daemon-a", start_ms: C12_T0 - C12_HOUR },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const facts = await hostFacts(paths, nowMs);
+  const suspend = facts.filter((p) => p.fact_name === "host.suspend").at(-1);
+  assert.equal(suspend.attributes.collector_state, "unable");
+  assert.equal(suspend.attributes.interval_basis, "unknown");
+});
+
+test("C0 review M2: across a backward wall-clock step the persisted suspend exposure is the uptime delta, an upper bound on any suspend in the interval", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  const uptime0 = 10 * C12_HOUR;
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: uptime0 });
+  await run(C12_T0);
+  // One real hour later, but the wall clock stepped back 1000 s.
+  const nowMs = C12_T0 + C12_HOUR - 1_000_000;
+  state.checkpoint = C12_T0 - C12_HOUR; // due
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: nowMs, uptimeMs: uptime0 + C12_HOUR });
+  await run(nowMs);
+  const suspend = (await hostFacts(paths, C12_T0 + C12_HOUR)).filter((p) => p.fact_name === "host.suspend").at(-1);
+  assert.equal(suspend.attributes.interval_basis, "same_boot_uptime_delta");
+  assert.equal(suspend.attributes.exposure_upper_s, String(3600 + 2));
+});
+
+test("C0.4 wiring: a login is written once, at its first-observed structural tick; the census marker is written every tick", async () => {
+  const paths = await tempPaths();
+  const loginResult = {
+    platform: "darwin", status: "ok", sources: { who: "ok", last: "absent", console: "ok", loginctl: "not_applicable" },
+    records: [{ source: "who", user: "alice", tty_class: "ttys", origin_class: "remote", service_class: "unknown", remote_host: "203.0.113.9", identity: "who\u0000alice\u0000ttys003\u0000203.0.113.9\u0000Oct 11 12:00" }],
+    history: [], presence: { screen_locked: "false", idle_hint: "not_applicable", source: "io_console" },
+  };
+  const tick = (nowMs) => runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "login-sessions": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "login-sessions": async () => envelope("login-sessions", "collect_login_sessions", loginResult) },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const t0 = Date.parse("2026-10-11T12:00:00.000Z");
+  await tick(t0);
+  await tick(t0 + 3600000);
+  const { points } = await readFactPoints(paths, { family: "session_context", now: t0 + 3600000 });
+  assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 1, "a repeated sighting is not a repeated login");
+  assert.equal(points.filter((p) => p.fact_name === "session.login_census").length, 2);
+  assert.deepEqual(points.filter((p) => p.fact_name === "session.login_census").map((p) => p.attributes.dedupe_state), ["reseeded", "fresh"]);
+});
+
+test("C0 review L6: without a usable context key no login row is written (never merged under an .unknown entity key); the census says dedupe unavailable", async () => {
+  const paths = await tempPaths();
+  const loginResult = {
+    platform: "darwin", status: "ok", sources: { who: "ok", last: "absent", console: "ok", loginctl: "not_applicable" },
+    records: [
+      { source: "who", user: "alice", tty_class: "ttys", origin_class: "remote", service_class: "unknown", remote_host: "203.0.113.9", identity: "who\u0000alice\u0000ttys003\u0000203.0.113.9\u0000Oct 11 12:00" },
+      { source: "who", user: "bob", tty_class: "ttys", origin_class: "remote", service_class: "unknown", remote_host: "203.0.113.10", identity: "who\u0000bob\u0000ttys004\u0000203.0.113.10\u0000Oct 11 12:01" },
+    ],
+    history: [], presence: { screen_locked: "false", idle_hint: "not_applicable", source: "io_console" },
+  };
+  const ts = "2026-10-11T12:00:00.000Z";
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "login-sessions": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "login-sessions": async () => envelope("login-sessions", "collect_login_sessions", loginResult) },
+    loadContextKey: async () => ({ status: "unable", reason: "mode_too_wide" }),
+    evaluateAlerts: false,
+    ts,
+    now: Date.parse(ts),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.context_key_status, "unable:mode_too_wide");
+  const { points } = await readFactPoints(paths, { family: "session_context", now: Date.parse(ts) });
+  assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 0);
+  const census = points.find((p) => p.fact_name === "session.login_census");
+  assert.equal(census.attributes.dedupe_state, "unavailable");
+  assert.equal(census.attributes.hmac_key_id, "unknown");
+  await assert.rejects(fs.stat(path.join(paths.stateDir, "daemon", "login-seen.json")), "no unkeyed seen-state is written");
+});
+
+test("C0 review M5: with host-lifecycle disabled, logind login rows are not deduped under an empty boot salt; the census says unavailable and the rows wait", async () => {
+  const paths = await tempPaths();
+  const loginResult = {
+    platform: "linux", status: "ok", sources: { who: "not_applicable", last: "absent", console: "not_applicable", loginctl: "ok" },
+    records: [{ source: "loginctl", user: "alice", tty_class: "pts", origin_class: "remote", service_class: "ssh", remote_host: "203.0.113.9", identity: "loginctl\u00005\u0000alice\u0000pts/0\u0000203.0.113.9\u0000sshd" }],
+    history: [], presence: { screen_locked: "false", idle_hint: "false", source: "loginctl" },
+  };
+  const ts = "2026-10-11T12:00:00.000Z";
+  await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "login-sessions": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "login-sessions": async () => envelope("login-sessions", "collect_login_sessions", loginResult) },
+    evaluateAlerts: false,
+    ts,
+    now: Date.parse(ts),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const { points } = await readFactPoints(paths, { family: "session_context", now: Date.parse(ts) });
+  assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 0);
+  assert.equal(points.find((p) => p.fact_name === "session.login_census").attributes.dedupe_state, "unavailable");
+  await assert.rejects(fs.stat(path.join(paths.stateDir, "daemon", "login-seen.json")), "nothing is marked seen");
+});
+
+test("C0.5 wiring: net.config_fingerprint reaches network_context, keyed by the per-install key, never with a raw component", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-10-11T12:00:00.000Z";
+  await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "net-config": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      "net-config": async () => envelope("net-config", "collect_net_config", {
+        platform: "darwin", status: "ok", route: { state: "ok", kind: "wifi" },
+        components: { gateway_mac: { state: "ok", value: "1e:f6:4c:23:af:64" }, ra_prefix: { state: "absent" }, dhcp_domain: { state: "absent" }, resolvers: { state: "ok", value: "192.168.64.1" } },
+      }),
+    },
+    evaluateAlerts: false,
+    ts,
+    now: Date.parse(ts),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const { points } = await readFactPoints(paths, { family: "network_context", now: Date.parse(ts) });
+  assert.equal(points.length, 1);
+  assert.match(points[0].attributes.fingerprint_hmac, /^[0-9a-f]{16}$/);
+  assert.equal(points[0].attributes.route_kind, "wifi");
+  assert.ok(!JSON.stringify(points).includes("1e:f6:4c"));
+  const raw = await fs.readFile(path.join(paths.stateDir, "learned", "facts", "network_context", "facts.jsonl"), "utf8");
+  assert.ok(!raw.includes("192.168.64.1"), "no raw resolver in fact history");
+});
+
+test("C0.8/C0.12 (ordering): when the host_lifecycle append fails, the boot ledger is not committed -- the pending boundary stays pending and is recorded at the next census", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  const bootOneS = Math.floor((C12_T0 - 10 * 24 * C12_HOUR) / 1000);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: bootOneS, wallMs: C12_T0, uptimeMs: C12_T0 - bootOneS * 1000 });
+  await run(C12_T0);
+  const bootTwoS = Math.floor((C12_T0 + 20 * 60000) / 1000);
+  const detectMs = C12_T0 + 25 * 60000;
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, wallMs: detectMs, uptimeMs: detectMs - bootTwoS * 1000 });
+  const failingAppend = async (descartesPaths, points, opts) => {
+    const result = await appendFactPointsByFamily(descartesPaths, points.filter((p) => !p.fact_name.startsWith("host.")), opts);
+    return { ...result, families: { ...result.families, host_lifecycle: { written_count: 0, append_error: "disk full" } }, append_error: "host_lifecycle: disk full" };
+  };
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { sessions: { enabled: true }, "host-lifecycle": { enabled: true } }, boundary_census: { enabled: true } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      sessions: async () => envelope("sessions", "collect_sessions", { sessions: [], multiplexers: [{ multiplexer: "tmux", status: "ok" }], total_count: 0, truncated: false }),
+      "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", state.probe),
+    },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 },
+    appendFactPoints: failingAppend,
+    evaluateAlerts: false,
+    ts: new Date(detectMs).toISOString(),
+    now: detectMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.boot_ledger_error, "host_lifecycle_facts_not_persisted");
+  const { readBootLedger } = await import("../src/boot-ledger.js");
+  const ledger = (await readBootLedger(paths)).ledger;
+  assert.ok(ledger.pending_boundary, "the boundary is still pending");
+  assert.ok(ledger.pending_census, "the census record is still pending");
+  // The next scheduled census records it.
+  await run(C12_T0 + C12_HOUR + 60000, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  const facts = await hostFacts(paths, C12_T0 + C12_HOUR + 60000);
+  assert.equal(facts.filter((p) => p.fact_name === "host.boot_boundary").length, 1);
+  assert.equal(facts.find((p) => p.fact_name === "host.boundary_census").attributes.status, "deferred_cost_cap");
 });
