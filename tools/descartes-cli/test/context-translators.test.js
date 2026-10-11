@@ -48,17 +48,17 @@ test("C0.3: a Running tailnet is a net.tailnet_state with the tailnet name HMAC'
 
 test("C0.3: every probe outcome is a value of net.tailnet_state, never a dropped tick and never a fabricated zero", () => {
   const cases = [
-    [{ status: "not_found_on_known_paths" }, "unable", "not_found_on_known_paths", "not_found_on_known_paths"],
+    [{ status: "not_found_on_known_paths" }, "unable", "unable", "unable"],
     [{ status: "untrusted_binary" }, "warning", "untrusted_binary", "untrusted_binary"],
-    [{ status: "missing_permission" }, "unable", "missing_permission", "missing_permission"],
+    [{ status: "missing_permission" }, "unable", "unable", "unable"],
     [{ status: "unable", error: "bad json" }, "unable", "unable", "unable"],
-    [{ status: "logged_out", tailnet: { backend_state: "NeedsLogin" } }, "unable", "ok", "needs_login"],
-    [{ status: "logged_out", tailnet: { backend_state: "Stopped" } }, "unable", "ok", "stopped"],
-    [{ status: "logged_out", tailnet: { backend_state: "NoState" } }, "unable", "ok", "no_state"],
-    [{ status: "logged_out", tailnet: { backend_state: "NeedsMachineAuth" } }, "unable", "ok", "needs_machine_auth"],
-    [{ status: "logged_out", tailnet: { backend_state: "Starting" } }, "unable", "ok", "starting"],
-    [{ status: "unable", tailnet: { backend_state: "SomethingNew" } }, "unable", "ok", "unrecognized_backend_state"],
-    [{ status: "unable", tailnet: { backend_state: "Running" }, error: "no valid Peer map" }, "unable", "ok", "running"],
+    [{ status: "logged_out", tailnet: { backend_state: "NeedsLogin" } }, "unable", "unable", "unable"],
+    [{ status: "logged_out", tailnet: { backend_state: "Stopped" } }, "unable", "unable", "unable"],
+    [{ status: "logged_out", tailnet: { backend_state: "NoState" } }, "unable", "unable", "unable"],
+    [{ status: "logged_out", tailnet: { backend_state: "NeedsMachineAuth" } }, "unable", "unable", "unable"],
+    [{ status: "logged_out", tailnet: { backend_state: "Starting" } }, "unable", "unable", "unable"],
+    [{ status: "unable", tailnet: { backend_state: "SomethingNew" } }, "unable", "unable", "unable"],
+    [{ status: "unable", tailnet: { backend_state: "Running" }, error: "no valid Peer map" }, "unable", "unable", "unable"],
     [{ error: "exec crashed" }, "unable", "unable", "unable"],
   ];
   for (const [result, envelopeStatus, collectorState, state] of cases) {
@@ -73,6 +73,16 @@ test("C0.3: every probe outcome is a value of net.tailnet_state, never a dropped
   assert.equal(loggedOut.attributes.health_issue_bucket, "unknown", "an absent Health list is unknown, never 0");
   assert.equal(loggedOut.attributes.current_tailnet_hmac, "unknown");
   assert.deepEqual(factPointsFromTailnetStateEvidence([], { ts: TS, hmacKey: KEY }), [], "no probe ran, no fact");
+});
+
+test("HIGH 2: an unable tailscale envelope stays unable even when backend_state parsed", () => {
+  const point = only(factPointsFromTailnetStateEvidence([tailscaleEnvelope({
+    status: "unable",
+    tailnet: { backend_state: "Running", self_online: true },
+  }, "unable")], { ts: TS, hmacKey: KEY }));
+  assert.equal(point.attributes.collector_state, "unable");
+  assert.equal(point.attributes.state, "unable");
+  assert.equal(point.attributes.self_online, "unknown");
 });
 
 test("C0.3: without a usable HMAC key the tailnet name is unknown, never an unkeyed hash", () => {

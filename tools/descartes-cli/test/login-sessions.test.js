@@ -103,6 +103,21 @@ test("parsers: who rows, last rows (login date only, hostless local rows), plist
   assert.throws(() => parseConsoleUsers('<?xml version="1.0"?><plist version="1.0"><array><dict/></array></plist>'), SyntaxError);
 });
 
+test("HIGH 1: a non-dict IOConsoleUsers entry makes the console source partial", async () => {
+  const malformedConsole = '<?xml version="1.0"?><plist version="1.0"><array><dict><key>IOConsoleUsers</key><array><integer>1</integer></array></dict></array></plist>';
+  const result = await readLoginSessions({
+    platform: "darwin",
+    runFixedExecFile: scripted({
+      "who": ok(""),
+      "last -n 50": ok(""),
+      "ioreg -r -k IOConsoleUsers -d 1 -a": ok(malformedConsole),
+    }),
+  });
+  assert.equal(result.sources.console, "partial");
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.records, []);
+});
+
 test("C0.4 last identity ignores the logout suffix: a session that ends is not a new row", () => {
   const before = parseLastRows("alice pts/1 203.0.113.9 Sun Oct 11 12:53   still logged in\n").rows[0];
   const after = parseLastRows("alice pts/1 203.0.113.9 Sun Oct 11 12:53 - 14:00  (01:07)\n").rows[0];
@@ -156,6 +171,34 @@ test("C0.4 linux collector: loginctl list + ONE show-session with fixed properti
     ["local_tty", "tty", "local_login", null],
   ]);
   assert.deepEqual(result.presence, { screen_locked: "true", idle_hint: "false", source: "loginctl" });
+});
+
+test("HIGH 1: malformed loginctl list rows are partial even when valid sessions remain", async () => {
+  const calls = [];
+  const result = await readLoginSessions({
+    platform: "linux",
+    runFixedExecFile: scripted({
+      "loginctl list-sessions --no-legend --no-pager": ok("2 1000 alice seat0 tty2\nMALFORMED\n"),
+      "loginctl show-session": ok(LOGINCTL_SHOW.split("\n\n")[0]),
+      "last -n 50": ok(""),
+    }, calls),
+  });
+  assert.equal(result.sources.loginctl, "partial");
+  assert.equal(result.records.length, 1);
+  assert.equal(calls.filter((call) => call.startsWith("loginctl show-session")).length, 1);
+});
+
+test("HIGH 1: malformed loginctl show-session fields are partial, never silently dropped", async () => {
+  const result = await readLoginSessions({
+    platform: "linux",
+    runFixedExecFile: scripted({
+      "loginctl list-sessions --no-legend --no-pager": ok("2 1000 alice seat0 tty2\n"),
+      "loginctl show-session": ok("Id=2\nName=alice\nBROKEN\n"),
+      "last -n 50": ok(""),
+    }),
+  });
+  assert.equal(result.sources.loginctl, "partial");
+  assert.equal(result.records.length, 1);
 });
 
 test("C0.4 linux parsers and classes", () => {

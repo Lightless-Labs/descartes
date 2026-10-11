@@ -72,6 +72,7 @@ const DIGITS_RE = /^[0-9]{1,24}$/;
 
 /** `sysctl a b c` prints "key: value" lines; unknown keys go to stderr. Only listed keys are kept. */
 export function parseSysctlKeyValues(stdout, keys = DARWIN_SYSCTL_KEYS) {
+  if (typeof stdout !== "string") return {};
   const allowed = new Set(keys);
   const values = {};
   for (const rawLine of String(stdout ?? "").split("\n")) {
@@ -86,24 +87,28 @@ export function parseSysctlKeyValues(stdout, keys = DARWIN_SYSCTL_KEYS) {
 
 /** "{ sec = 1788538230, usec = 201182 } Fri Sep  4 ..." -> 1788538230 (whole seconds), else undefined. */
 export function parseSysctlTimevalSeconds(value) {
-  const match = /^\{\s*sec\s*=\s*([0-9]{1,15}),\s*usec\s*=\s*[0-9]{1,7}\s*\}/.exec(String(value ?? ""));
+  if (typeof value !== "string") return undefined;
+  const match = /^\{\s*sec\s*=\s*([0-9]{1,15}),\s*usec\s*=\s*[0-9]{1,7}\s*\}/.exec(value);
   if (!match) return undefined;
   const seconds = Number(match[1]);
   return Number.isSafeInteger(seconds) ? seconds : undefined;
 }
 
 function digitsOrUndefined(value) {
-  const text = String(value ?? "").trim();
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
   return DIGITS_RE.test(text) ? text : undefined;
 }
 
 function versionTokenOrUndefined(value) {
-  const text = String(value ?? "").trim();
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
   return VERSION_TOKEN_RE.test(text) ? text : undefined;
 }
 
 export function parseProcStatBtime(text) {
-  const match = /^btime\s+([0-9]{1,15})\s*$/m.exec(String(text ?? ""));
+  if (typeof text !== "string") return undefined;
+  const match = /^btime\s+([0-9]{1,15})\s*$/m.exec(text);
   if (!match) return undefined;
   const seconds = Number(match[1]);
   return Number.isSafeInteger(seconds) ? seconds : undefined;
@@ -111,6 +116,7 @@ export function parseProcStatBtime(text) {
 
 /** /etc/os-release: BUILD_ID if present, else VERSION_ID; quotes stripped; bounded token only. */
 export function parseOsReleaseBuild(text) {
+  if (typeof text !== "string") return undefined;
   const fields = {};
   for (const rawLine of String(text ?? "").split("\n")) {
     const match = /^([A-Z_]+)=(.*)$/.exec(rawLine.trim());
@@ -121,7 +127,8 @@ export function parseOsReleaseBuild(text) {
 
 /** /proc/uptime: "12345.67 54321.00" -> "12345.67" (raw text of the CLOCK_BOOTTIME-based field). */
 export function parseProcUptime(text) {
-  const first = String(text ?? "").trim().split(/\s+/)[0];
+  if (typeof text !== "string") return undefined;
+  const first = text.trim().split(/\s+/)[0];
   return /^[0-9]{1,20}(\.[0-9]{1,9})?$/.test(first ?? "") ? first : undefined;
 }
 
@@ -129,7 +136,12 @@ function runtimeClocks(options) {
   const nowFn = options.nowFn ?? Date.now;
   const hrtimeFn = options.hrtimeFn ?? (() => process.hrtime.bigint());
   const uptimeFn = options.uptimeFn ?? os.uptime;
-  const uptime = Number(uptimeFn());
+  let uptime;
+  try {
+    uptime = Number(uptimeFn());
+  } catch {
+    uptime = Number.NaN;
+  }
   return {
     wall_ms: nowFn(),
     uv_hrtime_ns: String(hrtimeFn()),
@@ -179,7 +191,8 @@ async function readDarwin(options) {
 
 async function readTextFile(readFile, file) {
   try {
-    return { text: await readFile(file, "utf8") };
+    const text = await readFile(file, "utf8");
+    return typeof text === "string" ? { text } : { error: "non_string_output" };
   } catch (error) {
     return { error: error?.code ?? "read_failed" };
   }
@@ -195,21 +208,24 @@ async function readLinux(options) {
     readTextFile(readFile, LINUX_PATHS.uptime),
     readTextFile(readFile, LINUX_PATHS.suspend_success),
   ]);
-  const rawBootId = String(bootId.text ?? "").trim();
+  const rawBootId = typeof bootId.text === "string" ? bootId.text.trim() : "";
   const bootIdValue = UUID_RE.test(rawBootId) ? rawBootId.toUpperCase() : undefined;
-  const suspendCount = digitsOrUndefined(String(suspend.text ?? "").trim());
+  const suspendCount = digitsOrUndefined(suspend.text);
   const readsOk = [bootId, stat, osrelease, uptime].every((read) => read.text !== undefined);
+  const bootTime = parseProcStatBtime(stat.text);
+  const kernelRelease = versionTokenOrUndefined(osrelease.text);
+  const uptimeValue = parseProcUptime(uptime.text);
   return {
     status: bootIdValue && readsOk ? "ok" : bootIdValue || readsOk ? "partial" : "unable",
     boot: {
       boot_id: bootIdValue,
       boot_id_source: bootIdValue ? "proc_boot_id" : "unknown",
-      boot_time_s: parseProcStatBtime(stat.text),
+      boot_time_s: bootTime,
       os_build: parseOsReleaseBuild(osReleaseFile.text),
-      os_release: versionTokenOrUndefined(String(osrelease.text ?? "").trim()),
+      os_release: kernelRelease,
     },
     platform_clocks: {
-      proc_uptime_s: parseProcUptime(uptime.text),
+      proc_uptime_s: uptimeValue,
       // A kernel without CONFIG_PM_SLEEP has no suspend_stats: unknown, never zero.
       suspend_stats_success: suspendCount !== undefined ? Number(suspendCount) : undefined,
     },
@@ -231,9 +247,25 @@ export async function readHostLifecycle(options = {}) {
   // Runtime clocks are read AFTER the kernel read, as close to it as possible; the raw pairing is
   // what C0.9 needs, not an interpretation.
   const clocks = runtimeClocks(options);
+  const field_states = {
+    boot_id: typeof platformRead.boot?.boot_id === "string" ? "ok" : "unknown",
+    boot_time_s: Number.isSafeInteger(platformRead.boot?.boot_time_s) ? "ok" : "unknown",
+    kernel_release: typeof platformRead.boot?.os_release === "string" ? "ok" : "unknown",
+    uptime: platform === "linux"
+      ? typeof platformRead.platform_clocks?.proc_uptime_s === "string" ? "ok" : "unknown"
+      : Number.isSafeInteger(clocks.os_uptime_ms) ? "ok" : "unknown",
+  };
+  const requiredFieldsParsed = Object.values(field_states).every((state) => state === "ok");
+  const baseStatus = platformRead.status;
+  const status = baseStatus === "not_applicable" || baseStatus === "not_found_on_known_paths" || baseStatus === "untrusted_binary" || baseStatus === "missing_permission"
+    ? baseStatus
+    : baseStatus === "unable" && !requiredFieldsParsed
+      ? "unable"
+      : baseStatus === "partial" || !requiredFieldsParsed ? "partial" : "ok";
   return {
     platform,
-    status: platformRead.status,
+    status,
+    field_states,
     error: platformRead.error,
     boot: platformRead.boot ?? {},
     clocks: { ...clocks, ...(platformRead.platform_clocks ?? {}) },

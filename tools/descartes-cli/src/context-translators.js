@@ -90,7 +90,16 @@ const TAILNET_BACKEND_STATE_VALUES = Object.freeze({
   Starting: "starting",
 });
 
-const TAILNET_FAILURE_STATES = new Set(["not_found_on_known_paths", "untrusted_binary", "missing_permission", "unable"]);
+const TRANSLATOR_COLLECTOR_STATES = new Set(["ok", "partial", "unable", "not_applicable", "not_found_on_known_paths", "untrusted_binary", "missing_permission"]);
+
+function collectorStateFromEnvelope(envelope, result) {
+  if (envelope?.status === "unable") return "unable";
+  if (TRANSLATOR_COLLECTOR_STATES.has(result?.status)) {
+    if (envelope?.status === "warning" && result.status === "ok") return "partial";
+    return result.status;
+  }
+  return envelope?.status === "warning" ? "partial" : envelope?.status === "ok" ? "ok" : "unable";
+}
 
 function boolString(value) {
   return value === true ? "true" : value === false ? "false" : "unknown";
@@ -116,19 +125,17 @@ export function factPointsFromTailnetStateEvidence(evidence, { ts, hmacKey } = {
   const result = envelope.result ?? {};
   const { obsStartMs, obsEndMs } = observationInterval(envelope);
   const tailnet = result.tailnet && typeof result.tailnet === "object" ? result.tailnet : undefined;
+  const collectorState = collectorStateFromEnvelope(envelope, result);
   let state;
-  let collectorState;
-  if (tailnet && typeof tailnet.backend_state === "string") {
+  if (collectorState === "ok" && tailnet && typeof tailnet.backend_state === "string") {
     // The JSON was parsed: the backend state was observed, whatever the peer census made of it.
-    collectorState = "ok";
     state = Object.prototype.hasOwnProperty.call(TAILNET_BACKEND_STATE_VALUES, tailnet.backend_state)
       ? TAILNET_BACKEND_STATE_VALUES[tailnet.backend_state]
       : "unrecognized_backend_state";
   } else {
-    collectorState = TAILNET_FAILURE_STATES.has(result.status) ? result.status : "unable";
-    state = collectorState;
+    state = collectorState === "ok" && !tailnet ? "unable" : collectorState;
   }
-  const observed = collectorState === "ok";
+  const observed = collectorState === "ok" && tailnet !== undefined && typeof tailnet.backend_state === "string";
   const attributes = {
     collector_state: collectorState,
     obs_start_ms: msString(obsStartMs),
@@ -150,7 +157,6 @@ export function factPointsFromTailnetStateEvidence(evidence, { ts, hmacKey } = {
 // C0.8 / C0.9 / C0.12: host_lifecycle facts.
 // ------------------------------------------------------------------------------------------------
 
-const HOST_COLLECTOR_STATES = new Set(["ok", "partial", "unable", "not_applicable", "not_found_on_known_paths", "untrusted_binary", "missing_permission"]);
 const BOOT_ID_SOURCES = new Set(["kern.bootsessionuuid", "proc_boot_id"]);
 
 function intString(value) {
@@ -161,9 +167,13 @@ function tokenString(value) {
   return typeof value === "string" && value.length > 0 ? value : "unknown";
 }
 
-function platformValue(platform, wanted, value, toString) {
+function platformValue(platform, wanted, value, format) {
   if (platform !== wanted) return "not_applicable";
-  return value === undefined || value === null ? "unknown" : toString(value);
+  return value === undefined || value === null ? "unknown" : format(value);
+}
+
+function rawString(value) {
+  return typeof value === "string" && value.length > 0 ? value : "unknown";
 }
 
 export function hostBootIdHmac(hmacKey, rawBootId) {
@@ -183,7 +193,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
   if (!envelope) return [];
   const result = envelope.result ?? {};
   const { obsStartMs, obsEndMs } = observationInterval(envelope);
-  const collectorState = HOST_COLLECTOR_STATES.has(result.status) ? result.status : "unable";
+  const collectorState = collectorStateFromEnvelope(envelope, result);
   const boot = result.boot ?? {};
   const clocks = result.clocks ?? {};
   const platform = result.platform;
@@ -222,14 +232,14 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
       uv_hrtime_clock_id: "unverified",
       named_clocks: "unavailable_without_native",
       os_uptime_ms: intString(clocks.os_uptime_ms),
-      kern_monotonicclock_usecs: platformValue(platform, "darwin", clocks.kern_monotonicclock_usecs, String),
+      kern_monotonicclock_usecs: platformValue(platform, "darwin", clocks.kern_monotonicclock_usecs, rawString),
       kern_sleeptime_s: platformValue(platform, "darwin", clocks.kern_sleeptime_s, intString),
       kern_waketime_s: platformValue(platform, "darwin", clocks.kern_waketime_s, intString),
-      kern_sleep_abs_time: platformValue(platform, "darwin", clocks.kern_sleep_abs_time, String),
-      kern_wake_abs_time: platformValue(platform, "darwin", clocks.kern_wake_abs_time, String),
-      machdep_wake_abstime: platformValue(platform, "darwin", clocks.machdep_wake_abstime, String),
-      machdep_wake_conttime: platformValue(platform, "darwin", clocks.machdep_wake_conttime, String),
-      proc_uptime_s: platformValue(platform, "linux", clocks.proc_uptime_s, String),
+      kern_sleep_abs_time: platformValue(platform, "darwin", clocks.kern_sleep_abs_time, rawString),
+      kern_wake_abs_time: platformValue(platform, "darwin", clocks.kern_wake_abs_time, rawString),
+      machdep_wake_abstime: platformValue(platform, "darwin", clocks.machdep_wake_abstime, rawString),
+      machdep_wake_conttime: platformValue(platform, "darwin", clocks.machdep_wake_conttime, rawString),
+      proc_uptime_s: platformValue(platform, "linux", clocks.proc_uptime_s, rawString),
       suspend_stats_success: platformValue(platform, "linux", clocks.suspend_stats_success, intString),
     },
   }));
@@ -338,7 +348,7 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
   if (!envelope) return [];
   const result = envelope.result ?? {};
   const { obsStartMs, obsEndMs } = observationInterval(envelope);
-  const collectorState = HOST_COLLECTOR_STATES.has(result.status) ? result.status : "unable";
+  const collectorState = collectorStateFromEnvelope(envelope, result);
   const common = { collector_state: collectorState, obs_start_ms: msString(obsStartMs), obs_end_ms: msString(obsEndMs), rejected_field: "none" };
   const source = CONTEXT_ENVELOPE_SOURCES.login_sessions;
   const points = [];
@@ -429,12 +439,14 @@ const BENIGN_COMPONENT_STATES = new Set(["ok", "absent", "not_applicable", "not_
 // Folding either would give every such network one shared, fabricated identity.
 const UNOBSERVED_ROUTE_KINDS = new Set(["tunnel", "unknown"]);
 
-function componentState(component) {
-  return COMPONENT_STATE_VALUES.has(component?.state) ? component.state : "unable";
+function componentState(component, requireValue = false) {
+  if (!COMPONENT_STATE_VALUES.has(component?.state)) return "unable";
+  if (requireValue && component.state === "ok" && (typeof component.value !== "string" || component.value.length === 0)) return "unable";
+  return component.state;
 }
 
 function componentHmac(hmacKey, name, component) {
-  const state = componentState(component);
+  const state = componentState(component, true);
   if (state === "ok") return typeof component.value === "string" && component.value ? contextHmac(hmacKey, `net_${name}`, component.value) : "unknown";
   if (state === "absent" || state === "not_applicable") return "none";
   return "unknown";
@@ -454,7 +466,7 @@ export function netConfigAggregateInputs(result = {}) {
     const component = Object.prototype.hasOwnProperty.call(components, name)
       ? components[name]
       : name === "configured_search_domain" ? { state: "not_applicable" } : undefined;
-    const state = componentState(component);
+    const state = componentState(component, true);
     inputs.push({ field: `${name}_state`, provenance: NET_COMPONENT_PROVENANCE[name], value: state });
     inputs.push({ field: `${name}_value`, provenance: NET_COMPONENT_PROVENANCE[name], value: state === "ok" ? component.value : "" });
   }
@@ -474,7 +486,7 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
   if (!envelope) return [];
   const result = envelope.result ?? {};
   const { obsStartMs, obsEndMs } = observationInterval(envelope);
-  const collectorState = HOST_COLLECTOR_STATES.has(result.status) ? result.status : "unable";
+  const collectorState = collectorStateFromEnvelope(envelope, result);
   const routeState = componentState(result.route);
   const components = result.components ?? {};
   const attributes = {
@@ -493,7 +505,7 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
     const component = Object.prototype.hasOwnProperty.call(components, name)
       ? components[name]
       : name === "configured_search_domain" ? { state: "not_applicable" } : undefined;
-    const state = componentState(component);
+    const state = componentState(component, true);
     attributes[`${name}_state`] = state;
     attributes[`${name}_hmac`] = componentHmac(hmacKey, name, component);
     if (state === "ok") componentsOk += 1;

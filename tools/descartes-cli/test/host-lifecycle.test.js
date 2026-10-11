@@ -165,6 +165,24 @@ test("C0.9 linux: a kernel without suspend_stats leaves the counter unknown (nev
   assert.equal(noBootId.boot.boot_id_source, "unknown");
 });
 
+test("HIGH 3: malformed required lifecycle fields make the whole result partial with per-field unknown state", async () => {
+  const result = await readHostLifecycle({
+    platform: "linux",
+    readFile: linuxFiles({
+      [LINUX_PATHS.stat]: "not stat\n",
+      [LINUX_PATHS.osrelease]: 6.8,
+      [LINUX_PATHS.uptime]: 3186645,
+    }),
+    ...FIXED_CLOCKS,
+  });
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.field_states, { boot_id: "ok", boot_time_s: "unknown", kernel_release: "unknown", uptime: "unknown" });
+  assert.equal(result.boot.boot_id, "6F1C3A2E-7D4B-4C1A-9E8F-0123456789AB");
+  assert.equal(result.boot.boot_time_s, undefined);
+  assert.equal(result.boot.os_release, undefined);
+  assert.equal(result.clocks.proc_uptime_s, undefined);
+});
+
 test("an unsupported platform is not_applicable, with raw runtime clocks only", async () => {
   const result = await readHostLifecycle({ platform: "sunos", ...FIXED_CLOCKS });
   assert.equal(result.status, "not_applicable");
@@ -188,7 +206,7 @@ test("real darwin host: kern.bootsessionuuid is readable unprivileged and stable
   const first = await readHostLifecycle({ platform: "darwin" });
   const second = await readHostLifecycle({ platform: "darwin" });
   // A CI image whose resolver distrusts sysctl degrades explicitly; only an ok read is checked further.
-  if (first.status === "not_found_on_known_paths" || first.status === "untrusted_binary") return;
+  if (["partial", "unable", "not_found_on_known_paths", "untrusted_binary"].includes(first.status)) return;
   assert.match(first.boot.boot_id ?? "", /^[0-9A-F-]{36}$/);
   assert.equal(first.boot.boot_id, second.boot.boot_id);
   assert.ok(Number.isSafeInteger(first.boot.boot_time_s));

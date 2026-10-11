@@ -23,6 +23,7 @@ import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./bina
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { classifyLoginOrigin, ttyClassOf } from "./login-origin.js";
 import { parseLastRows, readSharedLastHistory } from "./last-history.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 export { parseLastRows } from "./last-history.js";
 
@@ -61,9 +62,10 @@ const WHO_ROW_RE = /^(\S+)\s+(\S+)\s+([^(]*?)\s*(?:\((.+)\))?\s*$/;
 
 /** who rows -> { user, tty, host, login_text } (login_text is identity material only, never a time). */
 export function parseWhoRows(stdout) {
+  if (typeof stdout !== "string") return { rows: [], malformed: 1 };
   const rows = [];
   let malformed = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     const match = WHO_ROW_RE.exec(line);
@@ -89,7 +91,8 @@ function decodeXmlText(text) {
  * then reports the console source `unable`, never a guessed value.
  */
 export function parsePlistXml(xml) {
-  const tokens = String(xml ?? "").match(/<[^>]+>|[^<]+/g) ?? [];
+  if (typeof xml !== "string") throw new SyntaxError("non-string plist output");
+  const tokens = xml.match(/<[^>]+>|[^<]+/g) ?? [];
   let index = 0;
   const next = () => tokens[index++];
   const skipWhitespace = () => {
@@ -161,51 +164,92 @@ export function parseConsoleUsers(xml) {
   const entries = Array.isArray(root) ? root : [root];
   const holder = entries.find((entry) => entry && typeof entry === "object" && Array.isArray(entry.IOConsoleUsers));
   if (!holder) throw new SyntaxError("no IOConsoleUsers array");
-  return {
-    users: holder.IOConsoleUsers
-      .filter((user) => user && typeof user === "object")
-      .map((user) => ({
+  let malformed_count = 0;
+  const users = [];
+  for (const user of holder.IOConsoleUsers) {
+    if (!user || typeof user !== "object" || Array.isArray(user)) {
+      malformed_count += 1;
+      continue;
+    }
+    users.push({
         user: typeof user.kCGSSessionUserNameKey === "string" ? user.kCGSSessionUserNameKey : undefined,
         on_console: user.kCGSSessionOnConsoleKey === true,
         screen_locked: typeof user.CGSSessionScreenIsLocked === "boolean" ? user.CGSSessionScreenIsLocked : undefined,
-      })),
-    console_locked: typeof holder.IOConsoleLocked === "boolean" ? holder.IOConsoleLocked : undefined,
-  };
+      });
+  }
+  const result = { users, console_locked: typeof holder.IOConsoleLocked === "boolean" ? holder.IOConsoleLocked : undefined };
+  if (malformed_count > 0) result.malformed_count = malformed_count;
+  return result;
 }
 
 // ----------------------------------------------------------------------------------------- loginctl
 
 export function parseLoginctlSessionIds(stdout) {
-  const ids = [];
-  for (const rawLine of String(stdout ?? "").split("\n")) {
-    const id = rawLine.trim().split(/\s+/)[0];
-    if (id && /^[A-Za-z0-9_-]{1,32}$/.test(id)) ids.push(id);
+  if (typeof stdout !== "string") {
+    const invalid = [];
+    Object.defineProperty(invalid, "malformed_count", { value: 1, enumerable: false });
+    return invalid;
   }
+  const ids = [];
+  let malformed_count = 0;
+  for (const rawLine of stdout.split("\n")) {
+    if (!rawLine.trim()) continue;
+    const fields = rawLine.trim().split(/\s+/);
+    const id = fields[0];
+    if (id && fields.length >= 2 && /^[A-Za-z0-9_-]{1,32}$/.test(id)) ids.push(id);
+    else malformed_count += 1;
+  }
+  Object.defineProperty(ids, "malformed_count", { value: malformed_count, enumerable: false });
   return ids;
+}
+
+function parseLoginctlSessionIdsDetailed(stdout) {
+  if (typeof stdout !== "string") return { ids: [], malformed_count: 1 };
+  const ids = [];
+  let malformed_count = 0;
+  for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const fields = line.split(/\s+/);
+    const id = fields[0];
+    if (!id || fields.length < 2 || !/^[A-Za-z0-9_-]{1,32}$/.test(id)) {
+      malformed_count += 1;
+      continue;
+    }
+    ids.push(id);
+  }
+  return { ids, malformed_count };
 }
 
 /** `loginctl show-session -p ... id1 id2` prints KEY=VALUE blocks separated by blank lines. */
 export function parseLoginctlShowSession(stdout) {
+  if (typeof stdout !== "string") {
+    const invalid = [];
+    Object.defineProperty(invalid, "malformed_count", { value: 1, enumerable: false });
+    return invalid;
+  }
   const sessions = [];
+  let malformed_count = 0;
   let current = {};
   const flush = () => {
     if (Object.keys(current).length > 0) sessions.push(current);
     current = {};
   };
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) {
       flush();
       continue;
     }
     const eq = line.indexOf("=");
-    if (eq <= 0) continue;
+    if (eq <= 0) { malformed_count += 1; continue; }
     const key = line.slice(0, eq);
-    if (!LOGINCTL_PROPERTIES.includes(key)) continue;
+    if (!LOGINCTL_PROPERTIES.includes(key)) { malformed_count += 1; continue; }
     if (key === "Id" && current.Id !== undefined) flush();
     current[key] = line.slice(eq + 1);
   }
   flush();
+  Object.defineProperty(sessions, "malformed_count", { value: malformed_count, enumerable: false });
   return sessions;
 }
 
@@ -233,6 +277,7 @@ export function loginctlOrigin(session) {
 // --------------------------------------------------------------------------------------- collector
 
 async function runWho(runExec, options) {
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("who", [], probeOptions(options));
   if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
   const { rows, malformed } = parseWhoRows(probe.stdout);
@@ -240,6 +285,7 @@ async function runWho(runExec, options) {
 }
 
 async function runLast(runExec, options) {
+  throwIfCollectorAborted(options.signal);
   const shared = await readSharedLastHistory(options, runExec, probeOptions(options), LOGIN_HISTORY_LIMIT);
   const probe = shared.probe;
   if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
@@ -248,26 +294,31 @@ async function runLast(runExec, options) {
 }
 
 async function runConsole(runExec, options) {
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("ioreg", ["-r", "-k", "IOConsoleUsers", "-d", "1", "-a"], probeOptions(options));
   if (probe.status !== "ok") return { state: failureState(probe) };
   try {
-    return { state: "ok", ...parseConsoleUsers(probe.stdout) };
+    const parsed = parseConsoleUsers(probe.stdout);
+    return { state: parsed.malformed_count > 0 ? "partial" : "ok", ...parsed };
   } catch {
     return { state: "unable" };
   }
 }
 
 async function runLoginctl(runExec, options) {
+  throwIfCollectorAborted(options.signal);
   const list = await runExec("loginctl", ["list-sessions", "--no-legend", "--no-pager"], probeOptions(options));
   if (list.status !== "ok") return { state: failureState(list), sessions: [] };
-  const allIds = parseLoginctlSessionIds(list.stdout);
+  const parsedIds = parseLoginctlSessionIdsDetailed(list.stdout);
+  const allIds = parsedIds.ids;
   const ids = allIds.slice(0, MAX_LOGINCTL_SESSIONS);
-  if (ids.length === 0) return { state: "absent", sessions: [] };
+  if (ids.length === 0) return { state: parsedIds.malformed_count > 0 ? "partial" : "absent", sessions: [], malformed_count: parsedIds.malformed_count };
   const args = ["show-session", "--no-pager", ...LOGINCTL_PROPERTIES.flatMap((property) => ["-p", property]), ...ids];
+  throwIfCollectorAborted(options.signal);
   const show = await runExec("loginctl", args, probeOptions(options));
   if (show.status !== "ok") return { state: failureState(show), sessions: [] };
   const sessions = parseLoginctlShowSession(show.stdout);
-  return { state: allIds.length > ids.length || sessions.length !== ids.length ? "partial" : "ok", sessions };
+  return { state: parsedIds.malformed_count > 0 || sessions.malformed_count > 0 || allIds.length > ids.length || sessions.length !== ids.length ? "partial" : "ok", sessions, malformed_count: parsedIds.malformed_count + (sessions.malformed_count ?? 0) };
 }
 
 function boolHint(value) {
@@ -286,7 +337,7 @@ export async function readLoginSessions(options = {}) {
   const records = [];
   const history = [];
   let presence = { screen_locked: "unknown", idle_hint: "unknown", source: "none" };
-  const abortIfNeeded = () => { if (options.signal?.aborted) throw new Error("collector_aborted"); };
+  const abortIfNeeded = () => throwIfCollectorAborted(options.signal);
 
   if (platform === "darwin" || platform === "linux") {
     abortIfNeeded();

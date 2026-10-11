@@ -227,6 +227,22 @@ test("HIGH: one malformed nmcli domain token makes the whole domain component un
   assert.equal(result.status, "partial");
 });
 
+test("HIGH 2: numeric Darwin DHCP stdout is rejected, never coerced into a domain", async () => {
+  const result = await readNetConfig({
+    platform: "darwin",
+    runFixedExecFile: scripted({
+      "netstat -rn -f inet": ok(NETSTAT_REAL),
+      "ifconfig -v en0": ok(IFCONFIG_REAL),
+      "arp -n 192.168.64.1": ok(ARP_REAL),
+      "ndp -p": ok(""),
+      "ipconfig getoption en0 domain_name": ok(123),
+      "scutil --dns": ok(SCUTIL_DNS_REAL),
+    }),
+  });
+  assert.deepEqual(result.components.dhcp_domain, { state: "unable" });
+  assert.equal(result.status, "partial");
+});
+
 test("MEDIUM: an aborted composite net read launches no subprocess after the blocked probe settles", async () => {
   const controller = new AbortController();
   const calls = [];
@@ -307,6 +323,16 @@ test("C0.5 translator: per-component availability and HMACs; the aggregate is a 
   assert.notEqual(fingerprintOf(HOME_NET, Buffer.alloc(CONTEXT_KEY_BYTES, 4)).attributes.fingerprint_hmac, point.attributes.fingerprint_hmac, "per-install key");
   const otherGateway = fingerprintOf({ ...HOME_NET, components: { ...HOME_NET.components, gateway_mac: { state: "ok", value: "00:11:22:33:44:55" } } });
   assert.notEqual(otherGateway.attributes.fingerprint_hmac, point.attributes.fingerprint_hmac, "a different gateway is a different configuration");
+});
+
+test("HIGH 2: an ok component with a non-string value is unable and excluded from the aggregate", () => {
+  const point = fingerprintOf({
+    ...HOME_NET,
+    components: { ...HOME_NET.components, dhcp_domain: { state: "ok", value: 123 } },
+  });
+  assert.equal(point.attributes.dhcp_domain_state, "unable");
+  assert.equal(point.attributes.dhcp_domain_hmac, "unknown");
+  assert.equal(point.attributes.fingerprint_hmac, "unknown");
 });
 
 test("HIGH: fingerprint provenance is derived from every actual aggregate input", () => {

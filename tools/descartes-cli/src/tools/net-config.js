@@ -353,8 +353,8 @@ async function readDarwin(runExec, options) {
 
   const domainProbe = await runProbe("ipconfig", ["getoption", iface, "domain_name"]);
   let dhcpDomain;
-  const domain = String(domainProbe.stdout ?? "").trim();
-  if (domainProbe.status === "ok") dhcpDomain = DOMAIN_RE.test(domain) ? { state: "ok", value: domain.toLowerCase() } : domain ? { state: "unable" } : { state: "absent" };
+  const domain = typeof domainProbe.stdout === "string" ? domainProbe.stdout.trim() : undefined;
+  if (domainProbe.status === "ok") dhcpDomain = domain === undefined ? { state: "unable" } : DOMAIN_RE.test(domain) ? { state: "ok", value: domain.toLowerCase() } : domain ? { state: "unable" } : { state: "absent" };
   // `ipconfig getoption` exits 1 with no output when the lease carries no such option.
   else if (domainProbe.code === 1 && !domain && !isBinaryNotFound(domainProbe) && !isBinaryUntrusted(domainProbe)) dhcpDomain = { state: "absent" };
   else dhcpDomain = { state: failureState(domainProbe) };
