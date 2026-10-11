@@ -1,6 +1,6 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-09
+**Last updated:** 2026-10-11
 
 ## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
@@ -369,6 +369,12 @@ Work is on `feat/fact-store-capacity-2026-10` in the current worktree. Nothing h
 - **Then (now done, see above):** S4 and S5.
 
 ## Current Status
+
+> **RESUME HERE (2026-10-11) — origin/main @414c6ef has capacity + notify-once + collector-sources; context plan v5 settled; C0 (context data prerequisites) built, in daybreak.**
+> - **Pushed (414c6ef):** fact-store capacity; notify-once (per-incident episodes; daybreak READY after 10 rounds); collector-sources (absolute-path binary resolution: macOS local-group trust incl. non-authenticating system accounts, explicit-evidence dscl reads, ACL fail-closed; Linux strict; content pin REMOVED as churn; per-source session census universes; macOS VPN parser; incomplete-census freezes; daybreak READY after 8 rounds). Accepted residual documented: a former member of any accepted component group keeps that GID in processes started before removal.
+> - **Plan** `docs/plans/2026-10-06-context-aware-learned-baselines.md` v5 + open-items addendum (§16.2 items 8–20 mapped to gating steps). No more revision rounds unless a BLOCKER. Operator D5: no ratification/approval/config chores; earned automatic, reversible, notified adaptation.
+> - **`feat/context-facts-c2-2026-10`** (worktree `context-c2`): **C0 built + reviewed + fixed** (tailnet state every probe, login origin via loginctl / who+IOConsoleUsers, HMAC-keyed `net.config_fingerprint`, closed per-field schemas at translator + normalizeFactPoint, per-collector sub-deadlines for all structural collectors, boot-identity primitive `boot-ledger.js`, raw clock capture with no-go fallback, boundary census shipped OFF by default; peer availability signature v2 (fabricated local `who`/`last` peers removed). Suite 2518/0 (+6 todo reboot conformance tests needing CI VMs). Daybreak gate running. **NEXT: C2** (L1 facts: tick_summary + chaining, per-family retention, created_vs_boot, attachment, transitions, daemon gaps, vpn service state, binary_state), then merge. C0.9 real-laptop clock measurement is a separate task (needs a laptop that sleeps).
+> - **REMIND OPERATOR:** CI looks stuck — Buildkite build for b60efc8 (#280) has been `pending` since 2026-10-09; root-helper branch build #279 failed (log unreadable without a token). `harden/root-helper-2026-10` still unmerged pending Linux CI.
 
 > **SUPERSEDED:** This pin-era section is stale; use the current **Collector-source pin removal and B3 closure — 2026-10-09** section at the top of this document.
 > - **Pushed to origin/main (b60efc8):** provenance + watch-fab + **fact-store capacity** (G3 READY; merge 1169d40 + status fix b60efc8, daybreak READY).
