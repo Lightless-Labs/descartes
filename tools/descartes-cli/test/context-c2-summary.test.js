@@ -379,6 +379,15 @@ test("C2 session.created_vs_boot: raw relation to the reported boot time; the ve
   assert.deepEqual(deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: [], bootVerdict: "verified", ts: t.ts, hmacKey: KEY }), []);
 });
 
+test("C2 review L4: session_key is the incumbent's UNKEYED session hash, declared as such (not an HMAC field)", () => {
+  for (const name of ["session.attachment", "session.created_vs_boot"]) {
+    const spec = CONTEXT_FACT_SCHEMAS.get(name).fields.session_key;
+    assert.equal(spec.kind, "pattern", name);
+    assert.equal(spec.unkeyed, true, `${name}: marked unkeyed (dictionary-reversible), unlike the keyed HMAC fields`);
+    assert.deepEqual(validateContextFact(name, { ...Object.fromEntries(Object.keys(CONTEXT_FACT_SCHEMAS.get(name).fields).map((f) => [f, "unknown"])), rejected_field: "none", session_key: "zz" }).ok, false);
+  }
+});
+
 test("C2 host.daemon_gap: the boot ledger folds the longest gap between daemon observations per interval; restarts and boots counted; the cause stays unknown", () => {
   const daemonA = { nonce: "a".repeat(16), start_ms: 0 };
   const daemonB = { nonce: "b".repeat(16), start_ms: 0 };

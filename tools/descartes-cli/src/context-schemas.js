@@ -61,6 +61,12 @@ function enumField(values, provenance, { required = true, unable } = {}) {
 function hmacField(provenance, sentinels = [SENTINEL_UNKNOWN], { required = true } = {}) {
   return { kind: "hmac", sentinels: new Set(sentinels), provenance, required };
 }
+// C2 review L4: a 16-hex hash that is NOT keyed (the incumbent session.presence entity hash, kept so a
+// context record joins its session). Dictionary-reversible over plausible session names, unlike an
+// HMAC field; declared as such so no reader mistakes it for a keyed value.
+function unkeyedHashField(provenance) {
+  return { ...patternField(HMAC_RE, HMAC_HEX_LENGTH, provenance), unkeyed: true };
+}
 function intField(min, max, provenance, sentinels = [SENTINEL_UNKNOWN], { required = true } = {}) {
   return { kind: "int", min, max, sentinels: new Set(sentinels), provenance, required };
 }
@@ -528,7 +534,7 @@ const FACT_SCHEMA_ENTRIES = [
     family: "session_context",
     fields: {
       ...commonFields(["tmux.server"]),
-      session_key: hmacField(["tmux.server"]),
+      session_key: unkeyedHashField(["tmux.server"]),
       client_tty_class: enumField(["console", "tty", "pts", "ttys", "unknown"], ["tmux.server"]),
       login_join: enumField(["matched", "no_login_row", "login_source_unusable", "unknown"], ["login.utmp", "login.logind", "tmux.server"]),
       login_origin_class: enumField(["console", "local_tty", "local_display", "remote", "remote_mosh", "unknown", "none"], ["login.utmp", "login.logind"]),
@@ -543,7 +549,7 @@ const FACT_SCHEMA_ENTRIES = [
     family: "session_context",
     fields: {
       ...commonFields(["tmux.server"]),
-      session_key: hmacField(["tmux.server"]),
+      session_key: unkeyedHashField(["tmux.server"]),
       multiplexer: enumField(["tmux", "screen", "unknown"], ["tmux.server"]),
       relation: enumField(["after_boot_time", "before_boot_time", "unknown"], ["tmux.server", "kernel.boot_session", "kernel.clock"]),
       created_vs_boot: enumField(["after_boot", "before_boot", "unknown"], ["tmux.server", "kernel.boot_session", "kernel.clock", "descartes.daemon"]),
