@@ -6564,6 +6564,32 @@ test("C0 review L6: without a usable context key no login row is written (never 
   await assert.rejects(fs.stat(path.join(paths.stateDir, "daemon", "login-seen.json")), "no unkeyed seen-state is written");
 });
 
+test("C0 review M5: with host-lifecycle disabled, logind login rows are not deduped under an empty boot salt; the census says unavailable and the rows wait", async () => {
+  const paths = await tempPaths();
+  const loginResult = {
+    platform: "linux", status: "ok", sources: { who: "not_applicable", last: "absent", console: "not_applicable", loginctl: "ok" },
+    records: [{ source: "loginctl", user: "alice", tty_class: "pts", origin_class: "remote", service_class: "ssh", remote_host: "203.0.113.9", identity: "loginctl\u00005\u0000alice\u0000pts/0\u0000203.0.113.9\u0000sshd" }],
+    history: [], presence: { screen_locked: "false", idle_hint: "false", source: "loginctl" },
+  };
+  const ts = "2026-10-11T12:00:00.000Z";
+  await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "login-sessions": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "login-sessions": async () => envelope("login-sessions", "collect_login_sessions", loginResult) },
+    evaluateAlerts: false,
+    ts,
+    now: Date.parse(ts),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const { points } = await readFactPoints(paths, { family: "session_context", now: Date.parse(ts) });
+  assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 0);
+  assert.equal(points.find((p) => p.fact_name === "session.login_census").attributes.dedupe_state, "unavailable");
+  await assert.rejects(fs.stat(path.join(paths.stateDir, "daemon", "login-seen.json")), "nothing is marked seen");
+});
+
 test("C0.5 wiring: net.config_fingerprint reaches network_context, keyed by the per-install key, never with a raw component", async () => {
   const paths = await tempPaths();
   const ts = "2026-10-11T12:00:00.000Z";

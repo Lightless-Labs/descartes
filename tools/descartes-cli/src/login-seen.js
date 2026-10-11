@@ -85,9 +85,14 @@ function prune(map, nowMs) {
  * ("reseeded"). `bootSalt` scopes logind session ids, which are per-boot counters (F1): the same id
  * in a new boot is a new login.
  */
-export function selectNewLoginRows(seen, result, { nowMs, bootSalt = "", hmacKey } = {}) {
+export function selectNewLoginRows(seen, result, { nowMs, bootSalt, hmacKey } = {}) {
   const keyId = contextKeyId(hmacKey);
   if (keyId === "unknown") return undefined;
+  // C0 review M5: a logind id restarts every boot; without the boot it cannot be scoped, and an
+  // unsalted digest would match a pre-boot login and silently drop the new one. No dedupe this tick
+  // (nothing emitted, nothing marked seen); the rows are offered again once the boot is known.
+  const hasLogind = (result?.records ?? []).some((record) => record?.source === "loginctl");
+  if (hasLogind && !(typeof bootSalt === "string" && bootSalt.length > 0)) return undefined;
   const usable = seen && seen.key_id === keyId ? seen : null;
   const dedupeState = usable ? "fresh" : "reseeded";
   const records = { ...(usable?.records ?? {}) };

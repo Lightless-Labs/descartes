@@ -191,6 +191,14 @@ test("C0.4 dedupe: a row is new only at its first observed tick; logind ids are 
   assert.equal(rebooted.next.records[loginRowDigest(DEDUPE_KEY, "who\u0000a")], 3000);
 });
 
+test("C0 review M5: without a boot salt logind rows cannot be scoped to their boot, so there is no dedupe that tick (never a cross-boot merge); who-only rows still dedupe", () => {
+  const logind = { records: [{ source: "loginctl", identity: "loginctl\u00005" }], history: [{ identity: "last\u0000x" }] };
+  assert.equal(selectNewLoginRows(null, logind, { nowMs: 1, hmacKey: DEDUPE_KEY }), undefined);
+  assert.equal(selectNewLoginRows(null, logind, { nowMs: 1, hmacKey: DEDUPE_KEY, bootSalt: "" }), undefined);
+  const who = { records: [{ source: "who", identity: "who\u0000a" }], history: [] };
+  assert.equal(selectNewLoginRows(null, who, { nowMs: 1, hmacKey: DEDUPE_KEY }).newRecords.length, 1);
+});
+
 test("C0 review L4: row digests are keyed (no dictionary reversal of user/tty/host/time); no usable key means no dedupe at all, never an unkeyed digest", () => {
   const identity = "who\u0000alice\u0000ttys003\u0000203.0.113.9\u0000Oct 11 12:00";
   const keyed = loginRowDigest(DEDUPE_KEY, identity);

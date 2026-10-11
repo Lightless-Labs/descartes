@@ -1385,7 +1385,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
                 const seenRead = await (options.readLoginSeen ?? readLoginSeen)(descartesPaths);
                 // C0 review L4/L6: keyed row digests; without a usable key there is no dedupe (no
                 // login row is emitted, and the census says dedupe_state: unavailable).
-                loginDedupe = selectNewLoginRows(seenRead.seen, loginEnvelope.result, { nowMs, bootSalt: bootLedger?.current?.boot_id_digest ?? "", hmacKey });
+                // C0 review M5: the boot salt is the ledger's current boot, else this census's own
+                // boot read; never "" (an unsalted logind id would merge across boots).
+                const hostEnvelope = structuralEvidence.find((envelope) => envelope.id === "host-lifecycle" && envelope.source !== "daemon");
+                const bootSalt = bootLedger?.current?.boot_id_digest ?? bootIdDigest(hostEnvelope?.result?.boot?.boot_id);
+                loginDedupe = selectNewLoginRows(seenRead.seen, loginEnvelope.result, { nowMs, bootSalt, hmacKey });
               } catch (error) {
                 loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_error";
                 console.warn(`[daemon] login dedupe state failed this tick (${loginSeenError})`);
