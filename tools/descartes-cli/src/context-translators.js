@@ -286,3 +286,111 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
   }
   return points;
 }
+
+// ------------------------------------------------------------------------------------------------
+// C0.4: session_context facts (login origin, first-observed tick, row-digest dedupe).
+// ------------------------------------------------------------------------------------------------
+
+const ORIGIN_CLASSES = new Set(["console", "local_tty", "local_display", "remote", "remote_mosh", "unknown"]);
+const TTY_CLASSES = new Set(["console", "tty", "pts", "ttys", "display", "none", "unknown"]);
+const SERVICE_CLASSES = new Set(["ssh", "local_login", "display_manager", "other", "none", "unknown"]);
+const COMPONENT_STATE_VALUES = new Set(["ok", "partial", "unable", "not_applicable", "not_found_on_known_paths", "untrusted_binary", "missing_permission", "absent"]);
+
+function remoteHostHmac(hmacKey, row) {
+  if (row.origin_class === "remote") return typeof row.remote_host === "string" && row.remote_host ? contextHmac(hmacKey, "login_remote_host", row.remote_host) : "unknown";
+  if (row.origin_class === "unknown") return "unknown";
+  return "none"; // console / local / remote_mosh: the row carries no remote host
+}
+
+function loginRowAttributes(row, hmacKey, dedupeState) {
+  return {
+    origin_class: ORIGIN_CLASSES.has(row.origin_class) ? row.origin_class : "unknown",
+    tty_class: TTY_CLASSES.has(row.tty_class) ? row.tty_class : "unknown",
+    remote_host_hmac: remoteHostHmac(hmacKey, row),
+    user_hmac: typeof row.user === "string" && row.user ? contextHmac(hmacKey, "login_user", row.user) : "unknown",
+    dedupe_state: dedupeState,
+  };
+}
+
+function loginEntityKey(factName, hmacKey, digest) {
+  const keyed = contextHmac(hmacKey, "login_row_entity", digest);
+  return `${factName}.${keyed}`;
+}
+
+/**
+ * evidence[] + the daemon's dedupe selection -> session_context points: one session.login_record
+ * per login observed for the first time (at most MAX_LOGIN_ARRIVALS_PER_TICK, the rest counted as
+ * overflow), one session.login_history_row per new `last` row (at most
+ * MAX_LOGIN_HISTORY_ROWS_PER_TICK), one session.login_census marker with every source's state and
+ * the counts, and one user.presence. Without a dedupe selection (no seen-state could be used), no
+ * record or history row is emitted and the census says so (`dedupe_state: unavailable`).
+ */
+export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, dedupe } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "login-sessions");
+  if (!envelope) return [];
+  const result = envelope.result ?? {};
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const collectorState = HOST_COLLECTOR_STATES.has(result.status) ? result.status : "unable";
+  const common = { collector_state: collectorState, obs_start_ms: msString(obsStartMs), obs_end_ms: msString(obsEndMs), rejected_field: "none" };
+  const source = CONTEXT_ENVELOPE_SOURCES.login_sessions;
+  const points = [];
+  const dedupeState = dedupe ? dedupe.dedupeState : "unavailable";
+  const newRecords = dedupe?.newRecords ?? [];
+  const newHistory = dedupe?.newHistory ?? [];
+  const emittedRecords = newRecords.slice(0, MAX_LOGIN_ARRIVALS_PER_TICK);
+  const emittedHistory = newHistory.slice(0, MAX_LOGIN_HISTORY_ROWS_PER_TICK);
+  for (const row of emittedRecords) {
+    points.push(contextFactPoint({
+      ts,
+      factName: SESSION_LOGIN_RECORD_FACT_NAME,
+      entityKey: loginEntityKey(SESSION_LOGIN_RECORD_FACT_NAME, hmacKey, row.digest),
+      source,
+      attributes: {
+        ...common,
+        source: ["who", "loginctl", "io_console"].includes(row.source) ? row.source : "unknown",
+        service_class: SERVICE_CLASSES.has(row.service_class) ? row.service_class : "unknown",
+        ...loginRowAttributes(row, hmacKey, dedupeState),
+      },
+    }));
+  }
+  for (const row of emittedHistory) {
+    points.push(contextFactPoint({
+      ts,
+      factName: SESSION_LOGIN_HISTORY_ROW_FACT_NAME,
+      entityKey: loginEntityKey(SESSION_LOGIN_HISTORY_ROW_FACT_NAME, hmacKey, row.digest),
+      source,
+      attributes: { ...common, ...loginRowAttributes(row, hmacKey, dedupeState) },
+    }));
+  }
+  const sources = result.sources ?? {};
+  const sourceState = (name) => (COMPONENT_STATE_VALUES.has(sources[name]) ? sources[name] : "unable");
+  const recordSourceUsable = ["who", "loginctl"].some((name) => ["ok", "absent"].includes(sources[name]));
+  const census = {
+    ...common,
+    who_state: sourceState("who"),
+    last_state: sourceState("last"),
+    console_state: sourceState("console"),
+    loginctl_state: sourceState("loginctl"),
+    current_count: recordSourceUsable && Array.isArray(result.records) ? String(result.records.length) : "unknown",
+    arrivals_emitted: String(emittedRecords.length),
+    arrivals_overflow: String(newRecords.length - emittedRecords.length),
+    history_emitted: String(emittedHistory.length),
+    history_overflow: String(newHistory.length - emittedHistory.length),
+    dedupe_state: dedupeState,
+  };
+  points.push(contextFactPoint({ ts, factName: SESSION_LOGIN_CENSUS_FACT_NAME, source, attributes: census }));
+  const presence = result.presence ?? {};
+  const flag = (value) => (["true", "false", "unknown", "not_applicable"].includes(value) ? value : "unknown");
+  points.push(contextFactPoint({
+    ts,
+    factName: USER_PRESENCE_FACT_NAME,
+    source,
+    attributes: {
+      ...common,
+      screen_locked: flag(presence.screen_locked),
+      idle_hint: flag(presence.idle_hint),
+      source: ["io_console", "loginctl", "none"].includes(presence.source) ? presence.source : "unknown",
+    },
+  }));
+  return points;
+}

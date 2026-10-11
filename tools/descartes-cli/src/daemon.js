@@ -37,7 +37,9 @@ import {
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
-import { factPointsFromHostLifecycleEvidence, factPointsFromTailnetStateEvidence, hostBootIdHmac } from "./context-translators.js";
+import { factPointsFromHostLifecycleEvidence, factPointsFromLoginSessionsEvidence, factPointsFromTailnetStateEvidence, hostBootIdHmac } from "./context-translators.js";
+import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
+import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
 import {
   bootIdDigest,
   boundaryCensusGaps,
@@ -265,6 +267,8 @@ export function defaultDaemonProfile() {
         // Context plan C0.8/C0.9 (docs/plans/2026-10-06-context-aware-learned-baselines.md): boot
         // identity and raw clock readings, read after the census. DATA only, no alert candidate.
         "host-lifecycle": { enabled: true },
+        // Context plan C0.4: login origin with first-observed-tick dedupe. DATA only.
+        "login-sessions": { enabled: true },
       },
       // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
       // wake, borrowing the next structural slot (bounded; see runDaemonIteration).
@@ -442,6 +446,7 @@ export const STRUCTURAL_CENSUS_COLLECTORS = Object.freeze([
 ].map((entry) => Object.freeze(entry)));
 export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
   ["host-lifecycle", "host-lifecycle", "collect_host_lifecycle"],
+  ["login-sessions", "login-sessions", "collect_login_sessions"],
 ].map((entry) => Object.freeze(entry)));
 
 // C0.7 (I25, class S): the per-collector sub-deadline. Each collector gets min(this, what is left of
@@ -498,6 +503,8 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
     // Context plan C0.8/C0.9: boot identity and raw clock readings (DATA only).
     "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
+    // Context plan C0.4: login origin (who + IOConsoleUsers / loginctl, bounded last). DATA only.
+    "login-sessions": collectors["login-sessions"] ?? collectLoginSessionsEvidence,
   };
   const { deadlineMs, nowFn = Date.now, ...rest } = options;
   const collectorOptions = {
@@ -1221,6 +1228,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let shadowEvaluation;
   let contextKeyStatus;
   let bootLedgerError;
+  let loginSeenError;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
@@ -1328,6 +1336,23 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
               bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_write_failed";
             }
           }
+          // Context plan C0.4: first-observed-tick dedupe of login rows (a repeated sighting is not
+          // a repeated login). A seen-state that cannot be read re-emits as `reseeded`; one that
+          // cannot be written is reported, and the next tick re-reads the old state.
+          let loginDedupe;
+          if (structuralProfile.collectors?.["login-sessions"]?.enabled) {
+            const loginEnvelope = structuralEvidence.find((envelope) => envelope.id === "login-sessions" && envelope.source !== "daemon");
+            if (loginEnvelope) {
+              try {
+                const seenRead = await (options.readLoginSeen ?? readLoginSeen)(descartesPaths);
+                loginDedupe = selectNewLoginRows(seenRead.seen, loginEnvelope.result, { nowMs, bootSalt: bootLedger?.current?.boot_id_digest ?? "" });
+                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginDedupe.next);
+              } catch (error) {
+                loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_error";
+                console.warn(`[daemon] login dedupe state failed this tick (${loginSeenError})`);
+              }
+            }
+          }
           const factPoints = [
             ...factPointsFromCanaryEvidence(structuralEvidence, { ts }),
             ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
@@ -1359,6 +1384,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // Context plan C0.8/C0.9/C0.12: boot identity, raw clock readings, the C0.9 no-go
             // suspend fallback, a boundary verdict and a boundary census record. DATA only.
             ...(hostContext ? factPointsFromHostLifecycleEvidence(structuralEvidence, { ts, hmacKey, ...hostContext.facts }) : []),
+            // Context plan C0.4: login origin (session_context). DATA only.
+            ...factPointsFromLoginSessionsEvidence(structuralEvidence, { ts, hmacKey, dedupe: loginDedupe }),
             ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
             // Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-
             // gaps.md): scheduled-jobs structural evidence -> fact-points, same discipline as its
@@ -1809,6 +1836,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
     ...(contextKeyStatus ? { context_key_status: contextKeyStatus } : {}),
     ...(bootLedgerError ? { boot_ledger_error: bootLedgerError } : {}),
+    ...(loginSeenError ? { login_seen_error: loginSeenError } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),

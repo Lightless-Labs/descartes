@@ -560,7 +560,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
   assert.deepEqual(profile.structural.boundary_census, { enabled: true });
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
@@ -6376,4 +6376,32 @@ test("C0.8: a failing boot probe or ledger write is reported and infers nothing 
   assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
   assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.boot_id_hmac, "unknown");
   assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "unknown");
+});
+
+test("C0.4 wiring: a login is written once, at its first-observed structural tick; the census marker is written every tick", async () => {
+  const paths = await tempPaths();
+  const loginResult = {
+    platform: "darwin", status: "ok", sources: { who: "ok", last: "absent", console: "ok", loginctl: "not_applicable" },
+    records: [{ source: "who", user: "alice", tty_class: "ttys", origin_class: "remote", service_class: "unknown", remote_host: "203.0.113.9", identity: "who\u0000alice\u0000ttys003\u0000203.0.113.9\u0000Oct 11 12:00" }],
+    history: [], presence: { screen_locked: "false", idle_hint: "not_applicable", source: "io_console" },
+  };
+  const tick = (nowMs) => runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "login-sessions": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "login-sessions": async () => envelope("login-sessions", "collect_login_sessions", loginResult) },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const t0 = Date.parse("2026-10-11T12:00:00.000Z");
+  await tick(t0);
+  await tick(t0 + 3600000);
+  const { points } = await readFactPoints(paths, { family: "session_context", now: t0 + 3600000 });
+  assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 1, "a repeated sighting is not a repeated login");
+  assert.equal(points.filter((p) => p.fact_name === "session.login_census").length, 2);
+  assert.deepEqual(points.filter((p) => p.fact_name === "session.login_census").map((p) => p.attributes.dedupe_state), ["reseeded", "fresh"]);
 });
