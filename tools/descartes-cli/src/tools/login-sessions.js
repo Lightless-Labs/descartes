@@ -21,7 +21,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
-import { classifyLoginOrigin, isLastDateStart, ttyClassOf } from "./login-origin.js";
+import { classifyLoginOrigin, ttyClassOf } from "./login-origin.js";
+import { parseLastRows, readSharedLastHistory } from "./last-history.js";
+
+export { parseLastRows } from "./last-history.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -70,40 +73,6 @@ export function parseWhoRows(stdout) {
     }
     const [, user, tty, loginText, host] = match;
     rows.push({ user, tty, host: host || undefined, login_text: loginText.trim() });
-  }
-  return { rows, malformed };
-}
-
-// --------------------------------------------------------------------------------------------- last
-
-/**
- * last rows -> { user, tty, host, login_text }. A row whose third token starts the date has no host
- * column (local). reboot/shutdown pseudo-rows and the wtmp trailer are skipped here (lifecycle rows
- * are a C2 fact). login_text is the 4-token login date ("Sun Oct 11 12:53"), used only for identity:
- * the logout/duration suffix changes after logout and must not make a row look new.
- */
-export function parseLastRows(stdout) {
-  const rows = [];
-  let malformed = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
-    const line = rawLine.trim();
-    if (!line || /^wtmp(x)? begins/i.test(line)) continue;
-    const tokens = line.split(/\s+/);
-    if (/^(reboot|shutdown)$/i.test(tokens[0] ?? "")) continue;
-    if (tokens.length < 6) {
-      malformed += 1;
-      continue;
-    }
-    const [user, tty] = tokens;
-    const hostless = isLastDateStart(tokens[2], tokens[3]);
-    const host = hostless ? undefined : tokens[2];
-    const dateStart = hostless ? 2 : 3;
-    const loginTokens = tokens.slice(dateStart, dateStart + 4);
-    if (loginTokens.length < 4 || !isLastDateStart(loginTokens[0], loginTokens[1])) {
-      malformed += 1;
-      continue;
-    }
-    rows.push({ user, tty, host, login_text: loginTokens.join(" ") });
   }
   return { rows, malformed };
 }
@@ -271,9 +240,10 @@ async function runWho(runExec, options) {
 }
 
 async function runLast(runExec, options) {
-  const probe = await runExec("last", ["-n", String(LOGIN_HISTORY_LIMIT)], probeOptions(options));
+  const shared = await readSharedLastHistory(options, runExec, probeOptions(options), LOGIN_HISTORY_LIMIT);
+  const probe = shared.probe;
   if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
-  const { rows, malformed } = parseLastRows(probe.stdout);
+  const { rows, malformed } = shared;
   return { state: malformed > 0 ? "partial" : rows.length === 0 ? "absent" : "ok", rows };
 }
 

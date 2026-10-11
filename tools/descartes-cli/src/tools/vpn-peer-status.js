@@ -36,6 +36,7 @@ import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { isLastDateStart, isLocalLoginHost } from "./login-origin.js";
+import { readSharedLastHistory } from "./last-history.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -167,9 +168,13 @@ export function parseLastOutput(stdout) {
 async function collectSshLast(options) {
   const n = Math.max(1, Number(options.lastHistoryLimit) || DEFAULT_LAST_HISTORY_LIMIT);
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
-  const probe = await runExec("last", ["-n", String(n)], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
+  const shared = await readSharedLastHistory(options, runExec, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }), n);
+  const probe = shared.probe;
   if (probe.status === "ok") {
-    const { entries, malformed_count } = parseLastOutput(probe.stdout);
+    const entries = shared.rows
+      .filter((row) => row.host && !isLocalLoginHost(row.host, row.tty))
+      .map((row) => ({ remote_user: row.user, remote_host: row.host }));
+    const malformed_count = shared.malformed;
     return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command, binary: probe.binary };

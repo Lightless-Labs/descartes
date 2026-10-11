@@ -529,6 +529,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     ...rest,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
     killSignal: options.killSignal ?? "SIGKILL",
+    lastHistoryCache: options.lastHistoryCache ?? {},
   };
   const budgetMs = isPositiveFiniteNumber(deadlineMs) ? deadlineMs : Infinity;
   const censusCapMs = isPositiveFiniteNumber(structuralProfile.collector_deadline_ms) ? structuralProfile.collector_deadline_ms : DEFAULT_STRUCTURAL_COLLECTOR_DEADLINE_MS;
