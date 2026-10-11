@@ -39,7 +39,8 @@ export async function readSharedLastHistory(options, runExec, probeOptions, limi
   const run = async () => {
     throwIfCollectorAborted(options.signal);
     const probe = await runExec("last", ["-n", String(limit)], probeOptions);
-    return { probe, ...parseLastRows(probe.stdout) };
+    const parsed = parseLastRows(probe.stdout);
+    return { probe, ...parsed, truncated: parsed.rows.length >= limit };
   };
   if (!cache) return run();
   if (cache.lastHistoryLimit !== limit || !cache.lastHistoryPromise) {

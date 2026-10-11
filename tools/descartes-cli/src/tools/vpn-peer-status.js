@@ -187,7 +187,7 @@ async function collectSshLast(options) {
       .map((row) => ({ remote_user: row.user, remote_host: row.host }));
     const malformed_count = shared.malformed;
     const duplicate_count = shared.duplicate_count ?? finalizeCensus({ records: entries, identity: (entry) => JSON.stringify(entry), malformed: malformed_count }).duplicate_count;
-    return { status: malformed_count > 0 || duplicate_count > 0 ? "partial" : "ok", entries, malformed_count, duplicate_count, requested_n: n, command: probe.command, binary: probe.binary };
+    return { status: malformed_count > 0 || duplicate_count > 0 || shared.truncated ? "partial" : "ok", entries, malformed_count, duplicate_count, truncated: shared.truncated === true, requested_n: n, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
@@ -600,7 +600,7 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
       platform,
       sources: {
         ssh_who: { status: who.status, error: who.error, malformed_count: who.malformed_count ?? 0, binary_provenance: binaryProvenance(who.binary) },
-        ssh_last: { status: last.status, error: last.error, malformed_count: last.malformed_count ?? 0, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
+        ssh_last: { status: last.status, error: last.error, malformed_count: last.malformed_count ?? 0, truncated: last.truncated === true, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
         wireguard: {
           status: wireguard.status,
           error: wireguard.error,
@@ -625,7 +625,7 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
       any_source_available: anySourceAvailable,
       total_count: allPeerCensus.total_count,
       peers: allPeerCensus.records,
-      truncated: allPeerCensus.truncated || wireguard.truncated === true,
+      truncated: allPeerCensus.truncated || wireguard.truncated === true || last.truncated === true,
       census_status: allPeerCensus.status === "ok" && wireguard.truncated !== true && !resolvedStatuses.includes("partial") ? "ok" : "partial",
       duplicate_count: allPeerCensus.duplicate_count,
       cap,
