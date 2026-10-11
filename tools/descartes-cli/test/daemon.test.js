@@ -3121,7 +3121,7 @@ test("Slice 4b, Decision 3b: a due peer.count_spike is delivered through the det
 // on every tick to ever leave "provisional".
 // ---------------------------------------------------------------------------------------------
 
-function completePeerTickWithMarker(ts, count, signature = "v1:ok-ok-ok-ok-ok", entityPrefix = "peer.ssh.e") {
+function completePeerTickWithMarker(ts, count, signature = "v2:ok-ok-ok-ok-ok", entityPrefix = "peer.ssh.e") {
   return [
     ...completePeerTick(ts, count, entityPrefix),
     {
