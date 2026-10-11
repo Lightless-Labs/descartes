@@ -358,9 +358,16 @@ test("C2 session.created_vs_boot: raw relation to the reported boot time; the ve
     assert.equal(attrs.basis, "boundary_unverified");
     assert.equal(attrs.arrivals_total, "3");
   }
-  const verified = deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: [`session.tmux.${hashSessionIdentity("tmux", "fresh")}`], bootVerdict: "verified", ts: t.ts, hmacKey: KEY });
+  const verified = deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: [`session.tmux.${hashSessionIdentity("tmux", "fresh")}`], bootVerdict: "verified", clockStep: false, ts: t.ts, hmacKey: KEY });
   assert.equal(verified.length, 1);
   assert.equal(verified[0].attributes.created_vs_boot, "after_boot");
+  // C2 review M4: a verified boundary with no clock-step knowledge (first tick, a restarted chain, an
+  // unknown cross-check) is unknown, never "no step".
+  for (const clockStep of [undefined, null]) {
+    const blind = deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: undefined, bootVerdict: "verified", clockStep, ts: t.ts, hmacKey: KEY });
+    assert.ok(blind.length > 0 && blind.every((p) => p.attributes.created_vs_boot === "unknown" && p.attributes.basis === "clock_step_unknown"));
+    for (const p of blind) assert.deepEqual(validateContextFact(p.fact_name, p.attributes), { ok: true });
+  }
   const stepped = deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: undefined, bootVerdict: "verified", clockStep: true, ts: t.ts, hmacKey: KEY });
   assert.ok(stepped.every((p) => p.attributes.created_vs_boot === "unknown" && p.attributes.basis === "clock_step_in_interval"));
   for (const p of verified) assert.deepEqual(validateContextFact(p.fact_name, p.attributes), { ok: true });

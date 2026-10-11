@@ -547,7 +547,7 @@ const FACT_SCHEMA_ENTRIES = [
       multiplexer: enumField(["tmux", "screen", "unknown"], ["tmux.server"]),
       relation: enumField(["after_boot_time", "before_boot_time", "unknown"], ["tmux.server", "kernel.boot_session", "kernel.clock"]),
       created_vs_boot: enumField(["after_boot", "before_boot", "unknown"], ["tmux.server", "kernel.boot_session", "kernel.clock", "descartes.daemon"]),
-      basis: enumField(["boundary_verified", "boundary_unverified", "no_boundary_observed", "no_creation_time", "clock_step_in_interval", "boot_time_unknown", "unknown"], ["descartes.daemon"]),
+      basis: enumField(["boundary_verified", "boundary_unverified", "no_boundary_observed", "no_creation_time", "clock_step_in_interval", "clock_step_unknown", "boot_time_unknown", "unknown"], ["descartes.daemon"]),
       arrivals_total: intField(0, 100000, ["descartes.daemon"]),
     },
   }],

@@ -662,8 +662,9 @@ function universeDigest(hmacKey, domain, source) {
  * instance in the census -- capped), its creation second against the current boot. `relation`: the
  * raw comparison with the reported boot time, "after_boot_time" at or after it, "before_boot_time"
  * more than the resolution before it, else unknown. `created_vs_boot`: the plan's value, which needs
- * the current boot's boundary to be VERIFIED and no clock step in the interval; otherwise unknown,
- * with the reason in `basis`.
+ * the current boot's boundary to be VERIFIED and the interval's wall cross-check to have seen no clock
+ * step (`clockStep === false`; true is a step, anything else is unknown); otherwise unknown, with the
+ * reason in `basis`.
  */
 export function deriveCreatedVsBoot({ evidence, snapshot, arrivedKeys, bootVerdict, clockStep, ts, hmacKey }) {
   const envelope = (evidence ?? []).find((e) => e?.id === "sessions" && e?.source !== "daemon");
@@ -688,8 +689,10 @@ export function deriveCreatedVsBoot({ evidence, snapshot, arrivedKeys, bootVerdi
     else {
       if (created >= bootTimeS) relation = "after_boot_time";
       else if (created < bootTimeS - BOOT_MEASUREMENT_RESOLUTION_S) relation = "before_boot_time";
-      basis = clockStep ? "clock_step_in_interval"
-        : bootVerdict === "verified" ? "boundary_verified"
+      // C2 review M4: `clockStep` is tri-state; only a cross-check that SAW no step (false) is "no
+      // step". Unknown (no previous reading, a restarted chain, an unknown cross-check) is unknown.
+      basis = clockStep === true ? "clock_step_in_interval"
+        : bootVerdict === "verified" ? (clockStep === false ? "boundary_verified" : "clock_step_unknown")
           : bootVerdict === undefined ? "no_boundary_observed" : "boundary_unverified";
     }
     const verified = basis === "boundary_verified" && relation !== "unknown";

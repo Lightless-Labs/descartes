@@ -94,7 +94,8 @@ export async function prepareContextC2({ descartesPaths, evidence, basePoints, h
     snapshot,
     arrivedKeys: sessionChurn.arrivedKeys,
     bootVerdict: VERDICTS.has(rawVerdict) ? rawVerdict : undefined,
-    clockStep: transitions.transitions.some((t) => t.dimension === "clock_step"),
+    // Tri-state (C2 review M4): a step, a cross-check that saw none, or unknown (no previous reading).
+    clockStep: transitions.transitions.some((t) => t.dimension === "clock_step") ? true : transitions.cross?.code === "c" ? false : undefined,
     ts,
     hmacKey,
   });
