@@ -135,6 +135,10 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
   }
   if (digest !== next.current.boot_id_digest) {
     const current = bootRecordFrom(probe, digest, { nowMs, daemon, bootIdHmac });
+    // C0 review L2: a boundary or census still pending (never recorded: no census ran since) is
+    // superseded, and counted, never silently lost.
+    const supersededBoundaries = next.pending_boundary ? (next.pending_boundary.superseded_count ?? 0) + 1 : 0;
+    const supersededCensuses = next.pending_census ? (next.pending_census.superseded_count ?? 0) + 1 : 0;
     next.pending_boundary = {
       prev: next.current,
       current,
@@ -144,6 +148,7 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
       daemon_nonce: daemon.nonce,
       daemon_start_ms: daemon.start_ms,
       uptime_ms_at_detection: isFiniteInt(probe?.clocks?.os_uptime_ms) ? probe.clocks.os_uptime_ms : null,
+      superseded_count: supersededBoundaries,
     };
     next.pending_census = {
       trigger: "boot",
@@ -153,6 +158,7 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
       event_s: current.boot_time_s,
       sleep_s: null,
       last_census_ms: isFiniteInt(lastCensusMs) ? lastCensusMs : null,
+      superseded_count: supersededCensuses,
     };
     next.current = current;
     next.seen = [...next.seen.filter((d) => d !== digest), digest].slice(-BOOT_LEDGER_SEEN_CAP);
@@ -174,6 +180,7 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
         event_s: isFiniteInt(probe?.clocks?.kern_waketime_s) ? probe.clocks.kern_waketime_s : null,
         sleep_s: isFiniteInt(probe?.clocks?.kern_sleeptime_s) ? probe.clocks.kern_sleeptime_s : null,
         last_census_ms: isFiniteInt(lastCensusMs) ? lastCensusMs : null,
+        superseded_count: next.pending_census ? (next.pending_census.superseded_count ?? 0) + 1 : 0,
       };
     }
     next.current.wake_marker = marker;

@@ -78,7 +78,7 @@ test("C0.8: a new boot id triggers a boot boundary with the previous record kept
   assert.equal(changed.ledger.pending_boundary.prev.last_observed_ms, T0 + MIN);
   assert.equal(changed.ledger.pending_boundary.seen_before, false);
   assert.equal(changed.ledger.current.boot_id_hmac, "0123456789abcdef");
-  assert.deepEqual(changed.ledger.pending_census, { trigger: "boot", detected_ms: bootB * 1000 + 5 * MIN, detected_by: "before_probe", boot_id_digest: bootIdDigest(BOOT_B), event_s: bootB, sleep_s: null, last_census_ms: T0 });
+  assert.deepEqual(changed.ledger.pending_census, { trigger: "boot", detected_ms: bootB * 1000 + 5 * MIN, detected_by: "before_probe", boot_id_digest: bootIdDigest(BOOT_B), event_s: bootB, sleep_s: null, last_census_ms: T0, superseded_count: 0 });
   assert.equal(ledger.pending_boundary, null, "pure: the input ledger is not mutated");
 });
 
@@ -86,7 +86,7 @@ test("C0.12: a changed OS wake marker within one boot triggers a wake census; an
   const ledger = bootedLedger();
   const wake = observeBootProbe(ledger, { ...probe(BOOT_A, { waketime: 1791720000 }), clocks: { kern_waketime_s: 1791720000, kern_sleeptime_s: 1791710000 } }, { nowMs: T0 + MIN, daemon: daemonOld, lastCensusMs: T0 - 20 * MIN });
   assert.equal(wake.trigger, "wake");
-  assert.deepEqual(wake.ledger.pending_census, { trigger: "wake", detected_ms: T0 + MIN, detected_by: "before_probe", boot_id_digest: bootIdDigest(BOOT_A), event_s: 1791720000, sleep_s: 1791710000, last_census_ms: T0 - 20 * MIN });
+  assert.deepEqual(wake.ledger.pending_census, { trigger: "wake", detected_ms: T0 + MIN, detected_by: "before_probe", boot_id_digest: bootIdDigest(BOOT_A), event_s: 1791720000, sleep_s: 1791710000, last_census_ms: T0 - 20 * MIN, superseded_count: 0 });
   const unreadable = observeBootProbe(ledger, { boot: { boot_id: BOOT_A }, clocks: {} }, { nowMs: T0 + MIN, daemon: daemonOld });
   assert.equal(unreadable.trigger, undefined);
   assert.equal(wakeMarkerOf({ clocks: { suspend_stats_success: 4 } }), "linux:4");
@@ -229,4 +229,22 @@ test("the seen ring is bounded", () => {
     ledger = observeBootProbe(ledger, probe(`CCCCCCCC-0000-0000-0000-${String(i).padStart(12, "0")}`, { bootTimeS: 1 }), { nowMs: T0 + i, daemon: daemonOld }).ledger;
   }
   assert.equal(ledger.seen.length, BOOT_LEDGER_SEEN_CAP);
+});
+
+test("C0 review L2: a second boot or wake before a census supersedes the pending record visibly: the count of superseded boundaries is kept", () => {
+  const BOOT_C = "CCCCCCCC-0000-0000-0000-000000000003";
+  let { ledger } = { ledger: bootedLedger() };
+  ({ ledger } = observeBootProbe(ledger, probe(BOOT_B, { bootTimeS: Math.floor((T0 + 10 * MIN) / 1000), waketime: 0 }), { nowMs: T0 + 15 * MIN, daemon: daemonNew(Math.floor((T0 + 10 * MIN) / 1000)) }));
+  assert.equal(ledger.pending_boundary.superseded_count, 0);
+  assert.equal(ledger.pending_census.superseded_count, 0);
+  ({ ledger } = observeBootProbe(ledger, probe(BOOT_C, { bootTimeS: Math.floor((T0 + 20 * MIN) / 1000), waketime: 0 }), { nowMs: T0 + 25 * MIN, daemon: daemonNew(Math.floor((T0 + 20 * MIN) / 1000)) }));
+  assert.equal(ledger.pending_boundary.superseded_count, 1, "the B boundary was never verified; it is counted, not silently lost");
+  assert.equal(ledger.pending_census.superseded_count, 1);
+  // Two wakes in the same boot before a census.
+  ({ ledger } = observeBootProbe(ledger, probe(BOOT_C, { waketime: 100 }), { nowMs: T0 + 30 * MIN, daemon: daemonOld }));
+  assert.equal(ledger.pending_census.trigger, "wake");
+  assert.equal(ledger.pending_census.superseded_count, 2);
+  ({ ledger } = observeBootProbe(ledger, probe(BOOT_C, { waketime: 200 }), { nowMs: T0 + 35 * MIN, daemon: daemonOld }));
+  assert.equal(ledger.pending_census.superseded_count, 3);
+  assert.equal(ledger.pending_boundary.superseded_count, 1, "a wake does not touch the pending boot boundary");
 });

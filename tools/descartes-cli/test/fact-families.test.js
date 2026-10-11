@@ -448,7 +448,7 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     worst[factName] = Buffer.byteLength(`${JSON.stringify(record)}\n`);
   }
   assert.deepEqual(worst, {
-    "host.boot": 698, "host.boot_boundary": 896, "host.clock_reading": 1147, "host.suspend": 581, "host.boundary_census": 580,
+    "host.boot": 698, "host.boot_boundary": 928, "host.clock_reading": 1147, "host.suspend": 581, "host.boundary_census": 613,
     "net.tailnet_state": 601, "net.config_fingerprint": 905,
     "session.login_record": 643, "session.login_history_row": 597, "session.login_census": 777, "user.presence": 508,
   }, "a schema change must revisit the pinned context tick shapes");

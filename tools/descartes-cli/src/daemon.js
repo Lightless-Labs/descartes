@@ -1079,9 +1079,22 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
   }
   const next = structuredClone(ledger);
   if (next.pending_boundary) {
-    const verdict = verifyBootBoundary(next.pending_boundary, { sessionEvidence: structuralEvidence });
+    let verdict = verifyBootBoundary(next.pending_boundary, { sessionEvidence: structuralEvidence });
+    // C0 review L1: the pending boundary comes from the ledger FILE; it is never better than
+    // unverified unless this census's live after-read confirms the same new boot (id and boot time).
+    // Full ledger integrity is the trusted-state B-ledger's (daybreak) scope.
+    if (verdict.verdict !== "tripwire") {
+      const pendingCurrent = next.pending_boundary.current;
+      const liveBootTime = probeAfter?.boot?.boot_time_s;
+      let liveCheck;
+      if (!afterDigest) liveCheck = "live_boot_unread";
+      else if (afterDigest !== pendingCurrent?.boot_id_digest
+        || (Number.isSafeInteger(liveBootTime) && Number.isSafeInteger(pendingCurrent?.boot_time_s) && liveBootTime !== pendingCurrent.boot_time_s)) liveCheck = "live_boot_mismatch";
+      if (liveCheck) verdict = { ...verdict, verdict: "unverified", failing_conjunct: liveCheck };
+    }
     facts.boundary = {
       ...verdict,
+      superseded_count: next.pending_boundary.superseded_count ?? 0,
       boot_id_hmac: next.pending_boundary.current?.boot_id_hmac,
       prev_boot_id_hmac: next.pending_boundary.prev?.boot_id_hmac,
       resolution_s: BOOT_MEASUREMENT_RESOLUTION_S,
@@ -1103,6 +1116,7 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
     facts.boundaryCensus = {
       trigger: next.pending_census.trigger,
       status,
+      superseded_count: next.pending_census.superseded_count ?? 0,
       boot_id_hmac: next.current?.boot_id_digest === next.pending_census.boot_id_digest ? next.current?.boot_id_hmac : undefined,
       ...gaps,
     };

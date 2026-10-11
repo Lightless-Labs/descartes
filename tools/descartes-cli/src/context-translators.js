@@ -269,6 +269,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
         prev_boot_id_hmac: typeof boundary.prev_boot_id_hmac === "string" ? boundary.prev_boot_id_hmac : "unknown",
         os_build_changed: boundary.os_build_changed,
         gap_s: intString(boundary.gap_s),
+        superseded_count: intString(boundary.superseded_count),
         resolution_s: intString(boundary.resolution_s),
       },
     }));
@@ -287,6 +288,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
         boot_id_hmac: typeof boundaryCensus.boot_id_hmac === "string" ? boundaryCensus.boot_id_hmac : bootIdHmac,
         pre_gap_s: intString(boundaryCensus.pre_gap_s),
         post_gap_s: intString(boundaryCensus.post_gap_s),
+        superseded_count: intString(boundaryCensus.superseded_count),
       },
     }));
   }

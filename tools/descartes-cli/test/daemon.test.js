@@ -6424,6 +6424,25 @@ test("C0.8 (§4.4 bracket): a boot read that differs before and after the census
   assert.equal(deriveHostLifecycleContext({ probeBefore: undefined, structuralEvidence: evidence, nowMs: 5 }).facts.bracket, "unknown");
 });
 
+test("C0 review L1: a pending boundary whose new boot the live after-census read does not confirm is never better than unverified (the ledger file is not trusted on its own)", () => {
+  const daemon = { nonce: "d2", start_ms: C12_T0 + 2 * 60000 };
+  const before = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  const { ledger: seeded } = observeBootProbe(undefined, before, { nowMs: C12_T0, daemon: { nonce: "d1", start_ms: 0 } });
+  const bootTwoS = Math.floor((C12_T0 + 60000) / 1000);
+  const rebooted = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, wallMs: C12_T0 + 5 * 60000, uptimeMs: 4 * 60000 });
+  const { ledger } = observeBootProbe(seeded, rebooted, { nowMs: C12_T0 + 5 * 60000, daemon });
+  const derive = (after) => deriveHostLifecycleContext({ ledger, probeBefore: rebooted, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: C12_T0 + 5 * 60000, daemon }).facts.boundary;
+  assert.notEqual(derive(rebooted).failing_conjunct, "live_boot_mismatch", "the live read agrees");
+  const mismatch = derive(hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0 + 5 * 60000, uptimeMs: C12_T0 }));
+  assert.equal(mismatch.verdict, "unverified");
+  assert.equal(mismatch.failing_conjunct, "live_boot_mismatch");
+  const otherTime = derive(hostProbe(BOOT_TWO, { bootTimeS: bootTwoS - 600, wallMs: C12_T0 + 5 * 60000, uptimeMs: 14 * 60000 }));
+  assert.equal(otherTime.failing_conjunct, "live_boot_mismatch");
+  const unread = deriveHostLifecycleContext({ ledger, probeBefore: rebooted, structuralEvidence: [], nowMs: C12_T0 + 5 * 60000, daemon }).facts.boundary;
+  assert.equal(unread.verdict, "unverified");
+  assert.equal(unread.failing_conjunct, "live_boot_unread");
+});
+
 test("C0 review M1: the bracket is never stable when the wake marker is unreadable on either side", () => {
   const noMarker = (bootId) => ({ platform: "linux", status: "ok", boot: { boot_id: bootId, boot_id_source: "proc_boot_id", boot_time_s: 1 }, clocks: { wall_ms: 1, os_uptime_ms: 1 } });
   const withMarker = { ...noMarker(BOOT_ONE), clocks: { wall_ms: 1, os_uptime_ms: 1, suspend_stats_success: 3 } };

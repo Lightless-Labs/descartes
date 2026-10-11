@@ -70,6 +70,7 @@ export const COMPONENT_STATES = Object.freeze([...COLLECTOR_STATES, "absent"]);
 const MAX_EPOCH_MS = 2 ** 47; // year ~6429; a bound, not a claim about time
 const MAX_EPOCH_S = 2 ** 37;
 const MAX_DURATION_S = 2 ** 37;
+const MAX_SUPERSEDED = 2 ** 31;
 const DIGITS_RE = /^[0-9]{1,24}$/;
 const DECIMAL_RE = /^[0-9]{1,20}(\.[0-9]{1,9})?$/;
 const VERSION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}$/;
@@ -109,7 +110,9 @@ const FACT_SCHEMA_ENTRIES = [
     fields: {
       ...commonFields(["kernel.boot_session"]),
       verdict: enumField(["verified", "unverified", "tripwire", "unknown"], ["kernel.boot_session", "kernel.clock", "login.utmp", "descartes.daemon"]),
-      failing_conjunct: enumField(["none", "unknown", "never_seen_boot_id", "daemon_restart", "boot_time_in_gap", "uptime_consistent", "no_preboot_instance"], ["descartes.daemon"]),
+      failing_conjunct: enumField(["none", "unknown", "never_seen_boot_id", "daemon_restart", "boot_time_in_gap", "uptime_consistent", "no_preboot_instance", "live_boot_mismatch", "live_boot_unread"], ["descartes.daemon", "kernel.boot_session"]),
+      // C0 review L2: boundaries detected and then superseded by a later one before any census.
+      superseded_count: intField(0, MAX_SUPERSEDED, ["kernel.boot_session", "descartes.daemon"]),
       tripwire: enumField(["none", "unknown", "boot_id_regression", "boot_id_change_without_daemon_restart", "boot_time_outside_gap", "uptime_inconsistent", "preboot_instance"], ["descartes.daemon"]),
       c_never_seen: enumField(BOOT_CONJUNCT, ["kernel.boot_session", "descartes.daemon"]),
       c_daemon_restart: enumField(BOOT_CONJUNCT, ["descartes.daemon", "kernel.boot_session"]),
@@ -169,6 +172,7 @@ const FACT_SCHEMA_ENTRIES = [
       ...commonFields(["kernel.boot_session", "kernel.power"]),
       trigger: enumField(["boot", "wake", "unknown"], ["kernel.boot_session", "kernel.power"]),
       status: enumField(["ran", "deferred_cost_cap", "not_enabled", "detected_after_census", "unknown"], ["descartes.daemon"]),
+      superseded_count: intField(0, MAX_SUPERSEDED, ["kernel.boot_session", "kernel.power", "descartes.daemon"]),
       boot_id_hmac: hmacField(["kernel.boot_session"]),
       pre_gap_s: intField(0, MAX_DURATION_S, ["kernel.boot_session", "kernel.power", "descartes.daemon"]),
       post_gap_s: intField(0, MAX_DURATION_S, ["kernel.boot_session", "kernel.power", "descartes.daemon"]),
