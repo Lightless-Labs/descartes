@@ -9,9 +9,11 @@ export function parseLastRows(stdout) {
   if (typeof stdout !== "string") return { rows: [], malformed: 1 };
   const rows = [];
   let malformed = 0;
+  let raw_count = 0;
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line || /^wtmp(x)? begins/i.test(line)) continue;
+    raw_count += 1;
     const tokens = line.split(/\s+/);
     if (LAST_PSEUDO_USER_RE.test(tokens[0] ?? "")) continue;
     if (tokens.length < 6) {
@@ -30,7 +32,7 @@ export function parseLastRows(stdout) {
     rows.push({ user, tty, host, login_text: loginTokens.join(" ") });
   }
   const census = finalizeCensus({ records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]), malformed });
-  return { rows, malformed, duplicate_count: census.duplicate_count };
+  return { rows, malformed, raw_count, duplicate_count: census.duplicate_count };
 }
 
 /** Run one bounded `last` probe per shared structural-tick cache and share its parsed rows. */
@@ -40,7 +42,7 @@ export async function readSharedLastHistory(options, runExec, probeOptions, limi
     throwIfCollectorAborted(options.signal);
     const probe = await runExec("last", ["-n", String(limit)], probeOptions);
     const parsed = parseLastRows(probe.stdout);
-    return { probe, ...parsed, truncated: parsed.rows.length >= limit };
+    return { probe, ...parsed, truncated: parsed.raw_count >= limit };
   };
   if (!cache) return run();
   if (cache.lastHistoryLimit !== limit || !cache.lastHistoryPromise) {
