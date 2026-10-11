@@ -74,22 +74,32 @@ const DAY_RE = /^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/;
 // Version and config hash (§8.1: "the Descartes version and config hash").
 // ------------------------------------------------------------------------------------------------
 
-let cachedVersion;
-export function descartesVersion() {
-  if (cachedVersion !== undefined) return cachedVersion;
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  cachedVersion = "unknown";
-  for (const candidate of [path.resolve(here, "../../../package.json"), path.resolve(here, "../package.json")]) {
+export const DESCARTES_PACKAGE_NAME = "@lightless-labs/descartes";
+
+/**
+ * The version of the first candidate package.json that is Descartes's own (C2 review L7: its `name`
+ * must match; an unrelated package.json higher up is never read as ours), or "unknown".
+ */
+export function readDescartesVersion(candidates) {
+  for (const candidate of candidates ?? []) {
     try {
-      const version = JSON.parse(fs.readFileSync(candidate, "utf8")).version;
-      if (typeof version === "string" && /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,4}$/.test(version)) {
-        cachedVersion = version;
-        break;
-      }
+      const parsed = JSON.parse(fs.readFileSync(candidate, "utf8"));
+      if (parsed?.name !== DESCARTES_PACKAGE_NAME) continue;
+      const version = parsed.version;
+      if (typeof version === "string" && /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,4}$/.test(version)) return version;
     } catch {
       // next candidate
     }
   }
+  return "unknown";
+}
+
+let cachedVersion;
+export function descartesVersion() {
+  if (cachedVersion !== undefined) return cachedVersion;
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  // The package's own manifest first (tools/descartes-cli/package.json).
+  cachedVersion = readDescartesVersion([path.resolve(here, "../package.json"), path.resolve(here, "../../../package.json")]);
   return cachedVersion;
 }
 

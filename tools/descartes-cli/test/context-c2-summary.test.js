@@ -20,10 +20,12 @@ import {
   deriveCreatedVsBoot,
   deriveStats,
   deriveTickSummary,
+  descartesVersion,
   extractTickSnapshot,
   factPointsFromDaemonGap,
   isValidSummaryChainState,
   readStatsState,
+  readDescartesVersion,
   readSummaryChainState,
   TICK_SUMMARY_MAX_RECORD_BYTES,
   tickSummaryDigest,
@@ -530,4 +532,17 @@ test("C2 context_stats T8: at most one episode and one daily record per tick, at
   };
   assert.deepEqual([exact("stats.episode"), exact("stats.daily")], [531, 442], "a schema change must revisit the context_stats tick shape");
   assert.equal(FAMILY_TICK_SHAPES.get("context_stats").worstTickBytes, 531 + 442);
+});
+
+test("C2 review L7: the recorded version is Descartes's own package.json, never an unrelated one found first", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-c2-version-test-"));
+  const foreign = path.join(dir, "foreign.json");
+  const ours = path.join(dir, "ours.json");
+  await fs.writeFile(foreign, JSON.stringify({ name: "some-monorepo-root", version: "9.9.9" }));
+  await fs.writeFile(ours, JSON.stringify({ name: "@lightless-labs/descartes", version: "0.0.50" }));
+  assert.equal(readDescartesVersion([foreign, ours]), "0.0.50");
+  assert.equal(readDescartesVersion([foreign]), "unknown");
+  assert.equal(readDescartesVersion([path.join(dir, "missing.json")]), "unknown");
+  const own = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(descartesVersion(), own.version);
 });
