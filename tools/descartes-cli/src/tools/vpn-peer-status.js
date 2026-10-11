@@ -35,6 +35,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { isLastDateStart, isLocalLoginHost } from "./login-origin.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -84,7 +85,12 @@ function isPermissionDenied(probe) {
 // local console/tty login has no trailing parens at all -- `remote_host` stays undefined for it,
 // which the collector treats as "not a peer" (a real, distinguishable local session), never as
 // malformed input.
-const WHO_LINE_RE = /^(\S+)\s+\S+\s+.*?(?:\(([^)]+)\))?\s*$/;
+//
+// Context plan C0.4 (Opus M3, Astra 12): the parenthetical is not always a remote host. An X display
+// "(:0)", a GNU screen tag "(:pts/3:S.0)" and a tmux tag "(tmux(1234).%0)" are LOCAL attachments
+// and are no longer read as peers (login-origin.js holds the explicit patterns). The whole trailing
+// parenthetical is captured, so a nested tmux tag is classified rather than half-matched.
+const WHO_LINE_RE = /^(\S+)\s+(\S+)\s+[^(]*?(?:\((.+)\))?\s*$/;
 
 export function parseWhoOutput(stdout) {
   const entries = [];
@@ -93,8 +99,9 @@ export function parseWhoOutput(stdout) {
     if (!line) continue;
     const match = line.match(WHO_LINE_RE);
     if (!match) continue; // unparseable line -- skipped, never fabricated into a partial entry
-    const [, user, remoteHost] = match;
-    entries.push({ remote_user: user, remote_host: remoteHost || undefined });
+    const [, user, tty, host] = match;
+    const remoteHost = host && !isLocalLoginHost(host, tty) ? host : undefined;
+    entries.push({ remote_user: user, remote_host: remoteHost });
   }
   return { entries };
 }
@@ -146,9 +153,12 @@ export function parseLastOutput(stdout) {
       malformedCount += 1;
       continue;
     }
-    const [user, , host] = tokens;
+    const [user, tty, host] = tokens;
     if (LAST_PSEUDO_USER_RE.test(user)) continue; // reboot/shutdown -- not a peer, not malformed
-    if (LAST_LOCAL_HOST_RE.test(host)) continue; // local session -- not a peer, not malformed
+    // C0.4: a local row has NO host column, so the third token is the date ("Fri Sep  4 ..."); it
+    // used to be read as a remote host named "Fri". An explicit local attachment tag is local too.
+    if (isLastDateStart(host, tokens[3])) continue;
+    if (LAST_LOCAL_HOST_RE.test(host) || isLocalLoginHost(host, tty)) continue; // local session -- not a peer, not malformed
     entries.push({ remote_user: user, remote_host: host });
   }
   return { entries, malformed_count: malformedCount };

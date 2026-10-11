@@ -588,3 +588,39 @@ test("an options.peerLimit above MAX_PEER_ENTITY_LIMIT is clamped down to it", a
   assert.equal(envelope.result.peers.length, MAX_PEER_ENTITY_LIMIT);
   assert.equal(envelope.result.truncated, true);
 });
+
+// --- Context plan C0.4: explicit local patterns stop fabricating peers ---
+
+test("C0.4: who's (:0), (:1.0), (:pts/3:S.0) and (tmux(1234).%0) are local attachments, not remote hosts; (mosh [pid]) and real hosts stay remote", () => {
+  const stdout = [
+    "alice    tty7         2026-10-11 08:00 (:0)",
+    "alice    pts/1        2026-10-11 08:01 (:1.0)",
+    "alice    pts/3        2026-10-11 08:02 (:pts/3:S.0)",
+    "alice    pts/4        2026-10-11 08:03 (tmux(1234).%0)",
+    "bob      pts/5        2026-10-11 08:04 (mosh [4321])",
+    "carol    pts/6        2026-10-11 08:05 (203.0.113.7)",
+    "dave     pts/7        2026-10-11 08:06 (laptop.example:10.0)",
+  ].join("\n");
+  assert.deepEqual(parseWhoOutput(stdout).entries, [
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "alice", remote_host: undefined },
+    { remote_user: "bob", remote_host: "mosh [4321]" },
+    { remote_user: "carol", remote_host: "203.0.113.7" },
+    { remote_user: "dave", remote_host: "laptop.example:10.0" },
+  ]);
+});
+
+test("C0.4: a macOS `last` local row has no host column -- its date is no longer read as a remote host named \"Fri\" (real-output fixture)", () => {
+  const stdout = [
+    "thomas     ttys037  100.64.118.39          Sun Oct 11 12:53   still logged in",
+    "thomas     ttys001                         Fri Sep  4 16:18   still logged in",
+    "thomas     console                         Fri Sep  4 16:17   still logged in",
+    "alice      pts/2    :pts/3:S.0             Fri Sep  4 16:17 - 16:20  (00:03)",
+    "reboot time                                Fri Sep  4 16:10",
+    "",
+    "wtmp begins Fri Sep  4 16:10:30 2026",
+  ].join("\n");
+  assert.deepEqual(parseLastOutput(stdout).entries, [{ remote_user: "thomas", remote_host: "100.64.118.39" }]);
+});
