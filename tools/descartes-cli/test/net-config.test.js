@@ -100,6 +100,54 @@ test("C0.5 parsers (linux formats)", () => {
   assert.equal(globalPrefix64("not-an-address"), undefined);
 });
 
+test("Linux route grammar accepts the formatter's standalone flags and real DHCP shape", () => {
+  const route = parseIpRouteDefault(
+    "default via 192.168.1.1 dev eth0 proto dhcp metric 100 linkdown",
+  );
+  assert.deepEqual(route, [{ gateway: "192.168.1.1", iface: "eth0" }]);
+
+  const flags = parseIpRouteDefault(
+    "default via 192.168.1.1 dev eth0 proto dhcp metric 100 dead onlink pervasive offload trap notify linkdown unresolved rt_offload rt_trap rt_offload_failed",
+  );
+  assert.deepEqual(flags, [{ gateway: "192.168.1.1", iface: "eth0" }]);
+});
+
+test("Linux route grammar accepts print_route key/value attributes in formatter order and rejects junk", () => {
+  const route = parseIpRouteDefault(
+    "default nhid 7 as to 10.0.0.0/8 tos cs1 via 192.168.1.1 dev eth0 table main proto dhcp scope global src 192.168.1.42 metric 100 mark 0x10 realms 1/2 uid 1000 expires -1sec error 1 users 2 used 3 age 4usec ipid 0x1 ts 0x2 tsage 3usec mtu 1500 window 10 rtt 5ms rttvar 2ms ssthresh 20 cwnd 30 advmss 1400 reordering 3 hoplimit 64 initcwnd 4 rto_min 1s initrwnd 5 features ecn tcp_usec_ts quickack 1 congctl cubic fastopen_no_cookie 0 iif eth0 pref high ttl-propogate enabled cache <local,notify>",
+  );
+  assert.deepEqual(route, [{ gateway: "192.168.1.1", iface: "eth0" }]);
+  assert.equal(parseIpRouteDefault("default via 192.168.1.1 dev eth0 metric 100 UNKNOWN"), undefined);
+  assert.equal(parseIpRouteDefault("default via 192.168.1.1 dev eth0 metric 100 mtu"), undefined);
+});
+
+test("Linux inet6 grammar accepts metric-before-scope, all IFA flags, and numeric protocols", () => {
+  const realShape = "inet6 2001:db8:1:2::1234/64 metric 1024 scope global dynamic mngtmpaddr noprefixroute proto kernel_ra";
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(realShape), {
+    state: "ok",
+    prefixes: ["2001:db8:1:2::/64"],
+  });
+  const flags = [
+    "secondary", "temporary", "nodad", "optimistic", "dadfailed", "home", "deprecated",
+    "tentative", "permanent", "dynamic", "mngtmpaddr", "noprefixroute", "autojoin", "stable-privacy",
+  ].join(" ");
+  assert.notEqual(
+    parseLinuxRouterAdvertisementPrefixes(`inet6 2001:db8:1:2::1234/64 metric 1 scope global ${flags} proto 0x7f`).state,
+    "partial",
+  );
+  assert.notEqual(
+    parseLinuxRouterAdvertisementPrefixes("inet6 2001:db8:1:2::1234/64 scope global dynamic flags 80 proto kernel_ra").state,
+    "partial",
+  );
+  assert.notEqual(
+    parseLinuxRouterAdvertisementPrefixes("inet6 2001:db8:1:2::1234/64 scope global proto 127").state,
+    "partial",
+  );
+  assert.equal(parseLinuxRouterAdvertisementPrefixes(`${realShape} trailing_junk`).state, "partial");
+  assert.equal(parseLinuxRouterAdvertisementPrefixes(realShape.replace("kernel_ra", "unknown_proto")).state, "partial");
+  assert.equal(parseLinuxRouterAdvertisementPrefixes("inet6 2001:db8:1:2::1234/64 scope global flags nope").state, "partial");
+});
+
 test("HIGH 2 reproduction: an unparseable Darwin or Linux route line is not absence", () => {
   assert.equal(parseNetstatDefaultRoutes("MALFORMED\n"), undefined);
   assert.equal(parseIpRouteDefault("MALFORMED\n"), undefined);

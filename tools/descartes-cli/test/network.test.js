@@ -38,6 +38,14 @@ test("parseLinuxDefaultRoutes parses default route facts", () => {
   }]);
 });
 
+test("parseLinuxDefaultRoutes accepts iproute2 route flags after key/value attributes", () => {
+  const routes = parseLinuxDefaultRoutes(
+    "default via 192.168.1.1 dev eth0 proto dhcp metric 100 dead onlink pervasive offload trap notify linkdown unresolved rt_offload rt_trap rt_offload_failed\n",
+  );
+  assert.equal(routes.length, 1);
+  assert.equal(routes.malformed_count, 0);
+});
+
 test("parseMacDefaultRoute parses route -n get default output", () => {
   const routes = parseMacDefaultRoute(`   route to: default\ndestination: default\n    gateway: 192.168.1.1\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,GLOBAL>\n`);
 
