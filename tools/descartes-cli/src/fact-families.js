@@ -41,6 +41,10 @@ export const FACT_FAMILY_IDS = Object.freeze([
   "session_context",
   // Context plan C2 (§3 C0.1, §4.2): per-binary availability/trust verdicts. DATA ONLY.
   "collector_state",
+  // Context plan C2 (§8.2): the long-lived statistics skeleton (derived; DATA ONLY).
+  "context_stats",
+  // Context plan C2 (§8.1): one summary record per structural tick (derived; DATA ONLY).
+  "tick_summary",
 ]);
 
 const KNOWN_FAMILIES = new Set(FACT_FAMILY_IDS);
@@ -79,6 +83,12 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["session.attachment_census", "session_context"],
   ["session.attachment", "session_context"],
   ["collector.binary_state", "collector_state"],
+  ["host.daemon_gap", "host_lifecycle"],
+  ["context.transition", "network_context"],
+  ["session.created_vs_boot", "session_context"],
+  ["tick.summary", "tick_summary"],
+  ["stats.episode", "context_stats"],
+  ["stats.daily", "context_stats"],
 ];
 
 function buildFactFamilyByName(pairs) {
@@ -277,15 +287,23 @@ const FAMILY_BUDGET_ENTRIES = [
   // against the 30-day declared data horizon (DATA_FAMILY_HORIZON_ENTRIES), with the 4x ceiling still
   // admitting a 15-minute interval and not raising MIN_STRUCTURAL_INTERVAL_MS. Floors (1 h interval):
   // host_lifecycle 3,570,300 B; network_context 1,467,000 B; session_context 10,415,700 B.
-  // C2: + at most 4 host.lifecycle_record per tick.
+  // C2: + host.daemon_gap and at most 4 host.lifecycle_record per tick.
   ["host_lifecycle", 7 * MIB],
-  // C2: + the VPN service census marker and at most 8 net.vpn_service_state records per tick.
-  ["network_context", 6 * MIB],
-  // C2: + the attachment census marker and at most 8 session.attachment records per tick.
-  ["session_context", 17 * MIB],
+  // C2: + the VPN service census marker, at most 8 net.vpn_service_state and at most 8
+  // context.transition (one per dimension) records per tick.
+  ["network_context", 13 * MIB],
+  // C2: + the attachment census marker, at most 8 session.attachment and at most 8
+  // session.created_vs_boot records per tick.
+  ["session_context", 21 * MIB],
   // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
   // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
   ["collector_state", 8 * MIB],
+  // C2 derived families. tick_summary: one record of at most 1,013 B per structural tick; 3 MiB holds the
+  // 90-day retention at a 1 h interval (the 30-day floor is 911,700 B). context_stats: at most one
+  // episode and one daily record per tick (899 B); 2 MiB holds the 30-day floor (809,100 B) and, at
+  // typical volume (rare episodes, one daily record per day), the 365-day retention.
+  ["context_stats", 2 * MIB],
+  ["tick_summary", 3 * MIB],
 ];
 
 // The pinned worst-case tick shape per family (§15.3): the maximum normalized record size the REAL
@@ -319,15 +337,20 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // records of at most 643 B.
   // A boundary census (C0.12) borrows the next structural slot, so a horizon holds at most two extra
   // ticks, inside the 1.25 headroom.
-  // C2: records: MAX_LIFECYCLE_RECORDS_PER_TICK x host.lifecycle_record 721.
-  ["host_lifecycle", { maxRecordBytes: 721, markerBytes: 3967, entityCap: 4 }],
-  // C2: markers + vpn_service_census 614; records: MAX_VPN_SERVICE_STATES_PER_TICK x vpn_service_state 528.
-  ["network_context", { maxRecordBytes: 528, markerBytes: 2244, entityCap: 8 }],
+  // C2: + host.daemon_gap 679 as a marker; records: MAX_LIFECYCLE_RECORDS_PER_TICK x host.lifecycle_record 721.
+  ["host_lifecycle", { maxRecordBytes: 721, markerBytes: 4646, entityCap: 4 }],
+  // C2: markers + vpn_service_census 614; records: MAX_VPN_SERVICE_STATES_PER_TICK (8) x vpn_service_state
+  // 528 and MAX_TRANSITIONS_PER_TICK (8) x context.transition 699, counted at 699.
+  ["network_context", { maxRecordBytes: 699, markerBytes: 2244, entityCap: 16 }],
   // C2: + session.attachment_census 608 as a marker; + MAX_SESSION_ATTACHMENTS_PER_TICK (8) records of
   // at most 573 B, counted at the family's 643 B record maximum.
-  ["session_context", { maxRecordBytes: 643, markerBytes: 1893, entityCap: 24 }],
+  // + MAX_CREATED_VS_BOOT_PER_TICK (8) session.created_vs_boot records of at most 623 B.
+  ["session_context", { maxRecordBytes: 643, markerBytes: 1893, entityCap: 32 }],
   // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
   ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
+  // C2: the exact worst cases (no envelope source, fixed entity key; pinned in context-c2-summary.test.js).
+  ["context_stats", { maxRecordBytes: 0, markerBytes: 899, entityCap: 0 }],
+  ["tick_summary", { maxRecordBytes: 0, markerBytes: 1013, entityCap: 0 }],
 ];
 
 export const BUDGET_INVARIANT_HEADROOM = 1.25;
@@ -371,6 +394,11 @@ const DATA_FAMILY_HORIZON_ENTRIES = [
   ["network_context", 30 * DAY_MS],
   ["session_context", 30 * DAY_MS],
   ["collector_state", 30 * DAY_MS],
+  // §8.1: the S floor of tick_summary's memory (at least 30 days, held at worst-case volume by the
+  // budget); retention beyond it (90 days, FAMILY_RETENTION_MS) is an O choice held at typical volume.
+  // Declared here, not in RULE_HORIZONS (C2 deviation): RULE_HORIZONS is the alert-rule registry.
+  ["tick_summary", 30 * DAY_MS],
+  ["context_stats", 30 * DAY_MS],
 ];
 
 function buildDataFamilyHorizons(entries) {
@@ -396,7 +424,12 @@ export const DATA_FAMILY_HORIZONS = buildDataFamilyHorizons(DATA_FAMILY_HORIZON_
 // family's declared horizon (rule or data): retention shorter than the memory a family promises would
 // make that promise unkeepable by construction (checked at module init).
 export const DEFAULT_FAMILY_RETENTION_MS = 30 * DAY_MS;
-const FAMILY_RETENTION_ENTRIES = [];
+const FAMILY_RETENTION_ENTRIES = [
+  // §8.1 / §16.1: tick_summary is kept beyond the raw window; default 90 days (O).
+  ["tick_summary", 90 * DAY_MS],
+  // §8.2: the long-lived statistics outlive tick_summary; default 365 days (O).
+  ["context_stats", 365 * DAY_MS],
+];
 
 function buildFamilyRetention(entries) {
   const map = new Map();
@@ -424,7 +457,7 @@ export function familyRetentionMs(family) {
 // derivation step: the daemon's generic per-tick write (appendFactPointsByFamily) neither appends to
 // them nor runs a retention sweep over them -- a sweep would advance the very pass id the stamp names,
 // and the stamp would never validate (the record's own pass runs retention anyway).
-const DERIVED_FAMILY_ENTRIES = [];
+const DERIVED_FAMILY_ENTRIES = ["tick_summary", "context_stats"];
 export const DERIVED_FAMILIES = Object.freeze(new Set(DERIVED_FAMILY_ENTRIES.map((family) => {
   if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: derived family ${family} is unknown`);
   return family;

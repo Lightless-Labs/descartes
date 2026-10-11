@@ -274,11 +274,11 @@ test("T8: every family's default budget meets (H_max / interval) x worst-case ti
     service: 18 * MIB, process_lineage: 10 * MIB, scheduled_job: 5 * MIB, session: 4 * MIB,
     peer: 16 * MIB, canary: 4 * MIB, network: 4 * MIB, provenance: 4 * MIB,
     // Context families (C0; context plan §4): 17 MiB, sized by the data-family T8 test below.
-    host_lifecycle: 7 * MIB, network_context: 6 * MIB, session_context: 17 * MIB,
+    host_lifecycle: 7 * MIB, network_context: 13 * MIB, session_context: 21 * MIB,
     // Context plan C2 families, sized by their own T8 tests (context-c2-*.test.js).
-    collector_state: 8 * MIB,
+    collector_state: 8 * MIB, context_stats: 2 * MIB, tick_summary: 3 * MIB,
   });
-  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 103 * MIB);
+  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 119 * MIB);
 });
 
 test("T8 config floor: resolveFactStoreBudgets rejects a value below the horizon invariant (budget_below_horizon_floor) and falls back to the default; accepts one at or above it", () => {
@@ -430,6 +430,7 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
   const { CONTEXT_FACT_SCHEMAS } = await import("../src/context-schemas.js");
   const { normalizeFactPoint } = await import("../src/fact-store.js");
   const { MAX_LOGIN_ARRIVALS_PER_TICK, MAX_LOGIN_HISTORY_ROWS_PER_TICK, MAX_VPN_SERVICE_STATES_PER_TICK, MAX_LIFECYCLE_RECORDS_PER_TICK, MAX_SESSION_ATTACHMENTS_PER_TICK, CONTEXT_ENVELOPE_SOURCES } = await import("../src/context-translators.js");
+  const { MAX_TRANSITIONS_PER_TICK, MAX_CREATED_VS_BOOT_PER_TICK } = await import("../src/context-summary.js");
   // Worst-case normalized record per context fact, from its closed schema: every field at its longest
   // valid value, the longest envelope id/tool, a digest-suffixed entity key, confidence 0.
   const longestSource = Object.values(CONTEXT_ENVELOPE_SOURCES).reduce((a, b) => (a.id.length + a.tool.length >= b.id.length + b.tool.length ? a : b));
@@ -460,16 +461,21 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     // C2 facts (their families' T8 are pinned in context-c2-*.test.js).
     "collector.binary_state": 668, "net.vpn_service_census": 614, "net.vpn_service_state": 528,
     "host.lifecycle_record": 721, "session.attachment_census": 608, "session.attachment": 573,
+    "host.daemon_gap": 679, "context.transition": 699, "session.created_vs_boot": 623,
+    // Derived records: an upper bound under this generic shape (a longest envelope source, a suffixed
+    // entity key, confidence, rejected_field); their exact worst cases are pinned in
+    // context-c2-summary.test.js (tick.summary 1,013 B <= 1 KiB).
+    "tick.summary": 1159, "stats.episode": 648, "stats.daily": 539,
   }, "a schema change must revisit the pinned context tick shapes");
   assert.equal(FAMILY_TICK_SHAPES.get("collector_state").maxRecordBytes, worst["collector.binary_state"]);
   const tick = {
     host_lifecycle: worst["host.boot"] + worst["host.boot_boundary"] + worst["host.clock_reading"] + worst["host.suspend"] + worst["host.boundary_census"]
-      + MAX_LIFECYCLE_RECORDS_PER_TICK * worst["host.lifecycle_record"],
+      + worst["host.daemon_gap"] + MAX_LIFECYCLE_RECORDS_PER_TICK * worst["host.lifecycle_record"],
     network_context: worst["net.tailnet_state"] + worst["net.config_fingerprint"] + worst["net.vpn_service_census"]
-      + MAX_VPN_SERVICE_STATES_PER_TICK * worst["net.vpn_service_state"],
+      + MAX_VPN_SERVICE_STATES_PER_TICK * worst["net.vpn_service_state"] + MAX_TRANSITIONS_PER_TICK * worst["context.transition"],
     session_context: worst["session.login_census"] + worst["user.presence"] + worst["session.attachment_census"]
       + (MAX_LOGIN_ARRIVALS_PER_TICK + MAX_LOGIN_HISTORY_ROWS_PER_TICK) * Math.max(worst["session.login_record"], worst["session.login_history_row"])
-      + MAX_SESSION_ATTACHMENTS_PER_TICK * worst["session.attachment"],
+      + MAX_SESSION_ATTACHMENTS_PER_TICK * worst["session.attachment"] + MAX_CREATED_VS_BOOT_PER_TICK * worst["session.created_vs_boot"],
   };
   for (const family of ["host_lifecycle", "network_context", "session_context"]) {
     assert.equal(DATA_FAMILY_HORIZONS.get(family), 30 * DAY, `${family} declares the 30-day raw retention as its data horizon`);

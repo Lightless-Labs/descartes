@@ -51,6 +51,7 @@ import {
   bootIdDigest,
   boundaryCensusGaps,
   currentDaemonInstance,
+  emptyDaemonGap,
   observeBootProbe,
   readBootLedger,
   suspendExposure,
@@ -1134,6 +1135,10 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
     };
     next.pending_census = null;
   }
+  // C2 (§4.1 host.daemon_gap): the gaps folded since the previous structural census are this
+  // interval's; the accumulator restarts here (the after-probe below folds into the next one).
+  facts.daemonGap = next.daemon_gap && typeof next.daemon_gap === "object" ? { ...next.daemon_gap } : undefined;
+  next.daemon_gap = emptyDaemonGap(nowMs);
   next.last_census_ms = nowMs;
   const wallMs = probeAfter?.clocks?.wall_ms;
   const uptimeMs = probeAfter?.clocks?.os_uptime_ms;

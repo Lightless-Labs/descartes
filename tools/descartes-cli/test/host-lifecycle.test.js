@@ -35,7 +35,7 @@ const DARWIN_SYSCTL_REAL = [
   "",
 ].join("\n");
 
-const FIXED_CLOCKS = { nowFn: () => 1_791_724_875_400, hrtimeFn: () => 76_479_557_408_294n, uptimeFn: () => 3_186_645.2, uvVersion: "1.52.1" };
+const FIXED_CLOCKS = { nowFn: () => 1_791_724_875_400, hrtimeFn: () => 76_479_557_408_294n, uptimeFn: () => 3_186_645.2, uvVersion: "1.52.1", timeZoneFn: () => "Europe/Paris", utcOffsetFn: () => 120 };
 
 test("parsers: sysctl key/value lines keep only the fixed key list; timeval seconds; btime; os-release; /proc/uptime", () => {
   const values = parseSysctlKeyValues(`${DARWIN_SYSCTL_REAL}evil.key: x\nkern.osversion: SECOND\n`);
@@ -83,6 +83,8 @@ test("C0.8/C0.9 darwin: boot id, boot time, OS build and raw clock readings from
     os_release: "25.2.0",
   });
   assert.deepEqual(result.clocks, {
+    tz_id: "Europe/Paris",
+    utc_offset_min: 120,
     wall_ms: 1_791_724_875_400,
     uv_hrtime_ns: "76479557408294",
     uv_version: "1.52.1",
@@ -247,3 +249,14 @@ for (const name of [
 ]) {
   test(name, { todo: "needs a rebootable VM in CI (deferred; context plan C0 addendum)" }, () => {});
 }
+
+test("C2: the timezone id and UTC offset are read raw with the clocks; an invalid or throwing source is unknown, never guessed", async () => {
+  const bad = await readHostLifecycle({ platform: "freebsd", ...FIXED_CLOCKS, timeZoneFn: () => "../etc/passwd x", utcOffsetFn: () => 9999 });
+  assert.equal(bad.clocks.tz_id, undefined);
+  assert.equal(bad.clocks.utc_offset_min, undefined);
+  const threw = await readHostLifecycle({ platform: "freebsd", ...FIXED_CLOCKS, timeZoneFn: () => { throw new Error("x"); }, utcOffsetFn: () => { throw new Error("x"); } });
+  assert.equal(threw.clocks.tz_id, undefined);
+  assert.equal(threw.clocks.utc_offset_min, undefined);
+  const utc = await readHostLifecycle({ platform: "freebsd", ...FIXED_CLOCKS, utcOffsetFn: () => -0 });
+  assert.ok(Object.is(utc.clocks.utc_offset_min, 0));
+});

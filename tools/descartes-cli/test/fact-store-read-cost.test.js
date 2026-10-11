@@ -120,6 +120,8 @@ test("T9: one fast tick's fact-store reads, costed at every family's default bud
     session_context: 0,
     // Context plan C2 families: DATA only, no fast-tick reader either.
     collector_state: 0,
+    context_stats: 0,
+    tick_summary: 0,
   });
   const seenSetReads = reads.reduce((sum, read) => sum + read.seenSetFamilies.length, 0);
   assert.equal(seenSetReads, 6, "the daemon veto and the three novelty detectors each read their family's seen-set");
