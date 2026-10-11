@@ -160,6 +160,12 @@ test("C0.9 no-go fallback: suspend exposure is [0, wall delta] within one boot o
   assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 9_000 }, { bootIdDigest: digest, wallMs: 1_000 }), { interval_basis: "wall_regressed", exposure_upper_s: undefined });
 });
 
+test("C0 review H2: an unreadable boot id is an unknown interval, never a boot boundary (cross_boot)", () => {
+  const previous = { boot_id_digest: bootIdDigest(BOOT_A), wall_ms: 1_000, uptime_ms: 1_000 };
+  assert.deepEqual(suspendExposure(previous, { bootIdDigest: undefined, wallMs: 9_000, uptimeMs: 9_000 }), { interval_basis: "unknown", exposure_upper_s: undefined });
+  assert.deepEqual(suspendExposure(null, { bootIdDigest: undefined, wallMs: 9_000, uptimeMs: 9_000 }), { interval_basis: "unknown", exposure_upper_s: undefined });
+});
+
 test("ledger I/O: atomic 0600 write and round trip; a corrupt or oversized ledger is reported and restarts as a first observation", async () => {
   const paths = await tempPaths();
   assert.equal((await readBootLedger(paths)).status, "missing");

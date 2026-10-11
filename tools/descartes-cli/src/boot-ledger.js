@@ -309,8 +309,11 @@ export function boundaryCensusGaps(pendingCensus, censusMs) {
  * within one boot; the wall delta across a boot does not bound a suspend inside one boot either).
  */
 export function suspendExposure(lastStructuralClock, { bootIdDigest: digest, wallMs }) {
+  // C0 review H2: a boot id that could not be read this tick (a timed-out or failed host-lifecycle
+  // read) says nothing about a boot boundary: the interval is unknown, never "cross_boot".
+  if (!digest) return { interval_basis: "unknown", exposure_upper_s: undefined };
   if (!lastStructuralClock || !isFiniteInt(lastStructuralClock.wall_ms)) return { interval_basis: "no_previous_reading", exposure_upper_s: undefined };
-  if (!digest || lastStructuralClock.boot_id_digest !== digest) return { interval_basis: "cross_boot", exposure_upper_s: undefined };
+  if (lastStructuralClock.boot_id_digest !== digest) return { interval_basis: "cross_boot", exposure_upper_s: undefined };
   if (!isFiniteInt(wallMs) || wallMs < lastStructuralClock.wall_ms) return { interval_basis: "wall_regressed", exposure_upper_s: undefined };
   return { interval_basis: "same_boot_wall_delta", exposure_upper_s: Math.ceil((wallMs - lastStructuralClock.wall_ms) / 1000) };
 }

@@ -6440,6 +6440,36 @@ test("C0.8: a failing boot probe or ledger write is reported and infers nothing 
   assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "unknown");
 });
 
+test("C0 review H2: a structural tick whose host-lifecycle read timed out persists host.suspend as unknown, not cross_boot", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  await run(C12_T0);
+  // Next scheduled census: the before-probe works, the census's own host-lifecycle read is the
+  // daemon-synthesized unable envelope of a sub-deadline overrun (no boot id).
+  const nowMs = C12_T0 + C12_HOUR;
+  await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      "host-lifecycle": async () => ({ id: "host-lifecycle", status: "unable", layer: "L0", source: "daemon", result: { status: "unable", error: "collector_deadline_exceeded" }, confidence: 0, review_hint: "none", trace: { tool: "collect_host_lifecycle", target: null, latency_ms: 0, ts: new Date(nowMs).toISOString() }, observation: { start_ms: nowMs, end_ms: nowMs } }),
+    },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "daemon-a", start_ms: C12_T0 - C12_HOUR },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const facts = await hostFacts(paths, nowMs);
+  const suspend = facts.filter((p) => p.fact_name === "host.suspend").at(-1);
+  assert.equal(suspend.attributes.collector_state, "unable");
+  assert.equal(suspend.attributes.interval_basis, "unknown");
+});
+
 test("C0.4 wiring: a login is written once, at its first-observed structural tick; the census marker is written every tick", async () => {
   const paths = await tempPaths();
   const loginResult = {
