@@ -1064,9 +1064,15 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
   const facts = {};
   const beforeDigest = bootIdDigest(probeBefore?.boot?.boot_id);
   const afterDigest = bootIdDigest(probeAfter?.boot?.boot_id);
-  facts.bracket = beforeDigest && afterDigest
-    ? (beforeDigest === afterDigest && wakeMarkerOf(probeBefore) === wakeMarkerOf(probeAfter) ? "stable" : "unstable")
-    : "unknown";
+  // C0 review M1: "stable" needs BOTH reads of BOTH the boot id and the wake marker; an unreadable
+  // wake marker (older Linux kernels without /sys/power/suspend_stats, an unreadable kern.waketime)
+  // cannot rule out a wake, so it is "unknown", never stable (§4.4: a stable context may recover).
+  const beforeMarker = wakeMarkerOf(probeBefore);
+  const afterMarker = wakeMarkerOf(probeAfter);
+  if (!beforeDigest || !afterDigest) facts.bracket = "unknown";
+  else if (beforeDigest !== afterDigest) facts.bracket = "unstable";
+  else if (beforeMarker === undefined || afterMarker === undefined) facts.bracket = "unknown";
+  else facts.bracket = beforeMarker === afterMarker ? "stable" : "unstable";
   if (!ledger) {
     facts.suspend = { interval_basis: "unknown", exposure_upper_s: undefined };
     return { facts, ledger: undefined };

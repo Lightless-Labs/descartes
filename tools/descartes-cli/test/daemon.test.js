@@ -6424,6 +6424,17 @@ test("C0.8 (§4.4 bracket): a boot read that differs before and after the census
   assert.equal(deriveHostLifecycleContext({ probeBefore: undefined, structuralEvidence: evidence, nowMs: 5 }).facts.bracket, "unknown");
 });
 
+test("C0 review M1: the bracket is never stable when the wake marker is unreadable on either side", () => {
+  const noMarker = (bootId) => ({ platform: "linux", status: "ok", boot: { boot_id: bootId, boot_id_source: "proc_boot_id", boot_time_s: 1 }, clocks: { wall_ms: 1, os_uptime_ms: 1 } });
+  const withMarker = { ...noMarker(BOOT_ONE), clocks: { wall_ms: 1, os_uptime_ms: 1, suspend_stats_success: 3 } };
+  const bracket = (before, after) => deriveHostLifecycleContext({ probeBefore: before, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: 5 }).facts.bracket;
+  assert.equal(bracket(noMarker(BOOT_ONE), noMarker(BOOT_ONE)), "unknown", "an older kernel without /sys/power/suspend_stats: a wake cannot be ruled out");
+  assert.equal(bracket(withMarker, noMarker(BOOT_ONE)), "unknown");
+  assert.equal(bracket(noMarker(BOOT_ONE), withMarker), "unknown");
+  assert.equal(bracket(withMarker, withMarker), "stable");
+  assert.equal(bracket(noMarker(BOOT_ONE), noMarker(BOOT_TWO)), "unstable", "a boot-id change is a definite change whatever the wake marker");
+});
+
 test("C0.8: a failing boot probe or ledger write is reported and infers nothing (no boundary, no census)", async () => {
   const paths = await tempPaths();
   const result = await runDaemonIteration(paths, {
