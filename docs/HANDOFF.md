@@ -2,6 +2,25 @@
 
 **Last updated:** 2026-10-11
 
+## Context facts C2b re-gate closure — 2026-10-11 — local, not pushed
+
+Closed the remaining B1/B2/HIGH/MEDIUM/LOW findings on `feat/context-facts-c2b-2026-10` in five
+local atomic commits: `afddaa0` (red regressions), `ff11982` (fail-closed, ledger-stamped gap
+state), `9fdcf63` (one-time rollback marker consumption for chain and stats), `a97f46a` (mandatory
+per-summary certificates and tuple-verdict consistency), and `4efe565` (count-derived daily mixed
+labels and HMAC-protected `session.created_vs_boot` entity keys). No push or merge.
+
+Gap state now persists a clean zero-count record stamped to the tick-summary ledger; missing,
+unreadable, invalid, or lineage-mismatched state over an existing summary store forces an unknown
+gap and prevents churn folding. Future-fact rollback markers are recorded as consumed in both
+derived state files, so the rollback causes exactly one restart/memory loss and subsequent clean
+ticks continue. Every new-format summary requires its certificate sibling, and the summary label
+must agree with all certificate tuple verdicts. Focused C2/context/integrity verification passes
+**86/86**. Fresh-XDG full `npm test` completed with **2,678 total: 2,615 passed, 22 failed, 35
+skipped, 6 todo**. The 22 failures are environment-only: 17 notifier-reuse and 3 tap-bump
+loopback test-server cases fail with `listen EPERM`, and 2 live-process provenance checks return
+`unknown` under restricted process introspection. No changed-area product test failed.
+
 ## Context facts C2b rework — 2026-10-11 — local, not pushed
 
 Closed the daybreak BLOCKER/HIGH/MEDIUM/LOW findings on `feat/context-facts-c2b-2026-10`.
