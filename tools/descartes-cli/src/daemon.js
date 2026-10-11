@@ -37,7 +37,19 @@ import {
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
-import { factPointsFromTailnetStateEvidence } from "./context-translators.js";
+import { factPointsFromHostLifecycleEvidence, factPointsFromTailnetStateEvidence, hostBootIdHmac } from "./context-translators.js";
+import {
+  bootIdDigest,
+  boundaryCensusGaps,
+  currentDaemonInstance,
+  observeBootProbe,
+  readBootLedger,
+  suspendExposure,
+  verifyBootBoundary,
+  wakeMarkerOf,
+  writeBootLedger,
+} from "./boot-ledger.js";
+import { BOOT_MEASUREMENT_RESOLUTION_S } from "./tools/host-lifecycle.js";
 import { loadOrCreateContextKey } from "./context-key.js";
 import { computeCorrelationCandidates, CORRELATION_RULE_ID } from "./incident-correlation.js";
 import { computePeerBaselineCandidates, PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
@@ -72,7 +84,7 @@ import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
-import { collectHostLifecycleEvidence } from "./tools/host-lifecycle.js";
+import { collectHostLifecycleEvidence, readHostLifecycle } from "./tools/host-lifecycle.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
@@ -250,7 +262,13 @@ export function defaultDaemonProfile() {
         // produces no canary facts, regardless of watch.json's now-default-ON gate.
         canary: { enabled: true },
         "process-lineage": { enabled: true },
+        // Context plan C0.8/C0.9 (docs/plans/2026-10-06-context-aware-learned-baselines.md): boot
+        // identity and raw clock readings, read after the census. DATA only, no alert candidate.
+        "host-lifecycle": { enabled: true },
       },
+      // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
+      // wake, borrowing the next structural slot (bounded; see runDaemonIteration).
+      boundary_census: { enabled: true },
     },
     safety: {
       read_only: true,
@@ -1000,6 +1018,69 @@ function deepFreeze(value) {
   return value;
 }
 
+/**
+ * Context plan C0.8 / C0.9 / C0.12: from the boot ledger (as folded by this tick's "before" probe)
+ * and this structural tick's host-lifecycle envelope (the "after" probe), derive the host_lifecycle
+ * fact inputs and the next ledger. Pure. Returns { facts: { bracket, boundary, boundaryCensus,
+ * suspend }, ledger }.
+ *   - bracket: the boot id and wake marker read before the census equal those read after it
+ *     ("stable"), differ ("unstable"), or either read is missing ("unknown") (§4.4).
+ *   - boundary: a pending boot boundary is verified by the I41 conjunction against THIS census's
+ *     session evidence (the +0 census), then cleared.
+ *   - boundaryCensus: a pending boundary census is recorded with its gap durations, as "ran" when it
+ *     was detected this tick and "deferred_cost_cap" when it waited for a slot, then cleared.
+ *   - suspend: C0.9 no-go fallback exposure since the previous structural reading (same boot only).
+ * The after-probe is folded into the ledger last, so a change it reveals is pending for the next
+ * tick, never attributed to this census.
+ */
+export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvidence, nowMs, hmacKey, daemon = currentDaemonInstance() }) {
+  const envelope = (structuralEvidence ?? []).find((e) => e?.id === "host-lifecycle");
+  const probeAfter = envelope?.source === "daemon" ? undefined : envelope?.result;
+  const facts = {};
+  const beforeDigest = bootIdDigest(probeBefore?.boot?.boot_id);
+  const afterDigest = bootIdDigest(probeAfter?.boot?.boot_id);
+  facts.bracket = beforeDigest && afterDigest
+    ? (beforeDigest === afterDigest && wakeMarkerOf(probeBefore) === wakeMarkerOf(probeAfter) ? "stable" : "unstable")
+    : "unknown";
+  if (!ledger) {
+    facts.suspend = { interval_basis: "unknown", exposure_upper_s: undefined };
+    return { facts, ledger: undefined };
+  }
+  const next = structuredClone(ledger);
+  if (next.pending_boundary) {
+    const verdict = verifyBootBoundary(next.pending_boundary, { sessionEvidence: structuralEvidence });
+    facts.boundary = {
+      ...verdict,
+      boot_id_hmac: next.pending_boundary.current?.boot_id_hmac,
+      prev_boot_id_hmac: next.pending_boundary.prev?.boot_id_hmac,
+      resolution_s: BOOT_MEASUREMENT_RESOLUTION_S,
+    };
+    next.pending_boundary = null;
+  }
+  if (next.pending_census) {
+    const gaps = boundaryCensusGaps(next.pending_census, nowMs);
+    facts.boundaryCensus = {
+      trigger: next.pending_census.trigger,
+      status: next.pending_census.detected_ms === nowMs ? "ran" : "deferred_cost_cap",
+      boot_id_hmac: next.current?.boot_id_digest === next.pending_census.boot_id_digest ? next.current?.boot_id_hmac : undefined,
+      ...gaps,
+    };
+    next.pending_census = null;
+  }
+  next.last_census_ms = nowMs;
+  const wallMs = probeAfter?.clocks?.wall_ms;
+  facts.suspend = suspendExposure(next.last_structural_clock, { bootIdDigest: afterDigest, wallMs });
+  if (afterDigest && Number.isSafeInteger(wallMs)) next.last_structural_clock = { boot_id_digest: afterDigest, wall_ms: wallMs };
+  const folded = probeAfter
+    ? observeBootProbe(next, probeAfter, {
+      nowMs,
+      daemon,
+      bootIdHmac: typeof probeAfter.boot?.boot_id === "string" ? hostBootIdHmac(hmacKey, probeAfter.boot.boot_id) : undefined,
+    }).ledger
+    : next;
+  return { facts, ledger: folded };
+}
+
 export async function runDaemonIteration(descartesPaths, options = {}) {
   const profile = options.profile ?? defaultDaemonProfile();
   validateDaemonProfile(profile);
@@ -1139,6 +1220,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let structuralFactPersistError;
   let shadowEvaluation;
   let contextKeyStatus;
+  let bootLedgerError;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
@@ -1146,7 +1228,64 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       const readCheckpoint = options.readStructuralCheckpoint ?? readStructuralCheckpoint;
       const checkpoint = await readCheckpoint(descartesPaths);
       const lastRunMs = Number.isFinite(checkpoint?.last_structural_run_ms) ? checkpoint.last_structural_run_ms : -Infinity;
-      const structuralDue = nowMs - lastRunMs >= structuralProfile.interval_ms;
+
+      // Context plan C0.5/C0.6: the per-install HMAC key for context facts, loaded at most once per
+      // tick. An unusable key degrades every keyed context value to "unknown" (the translators never
+      // fall back to an unkeyed hash); its status is reported on the status record.
+      let contextKey;
+      const ensureContextKey = async () => {
+        if (contextKey) return contextKey;
+        const loadContextKey = options.loadContextKey ?? loadOrCreateContextKey;
+        try {
+          contextKey = await loadContextKey(descartesPaths);
+        } catch {
+          contextKey = { status: "unable", reason: "key_load_threw" };
+        }
+        contextKeyStatus = contextKey?.status === "ok" ? "ok" : `unable:${contextKey?.reason ?? "unknown"}`;
+        return contextKey;
+      };
+
+      // Context plan C0.8 / C0.12: the cheap boundary probe, on EVERY tick while the host-lifecycle
+      // context collector is enabled. It folds the boot id and the OS wake marker into the boot
+      // ledger; a new boot id or a wake makes a boundary census pending. It is also the "before" half
+      // of the census bracket (§4.4). DATA only: it never raises, recovers or admits anything.
+      const hostLifecycleEnabled = Boolean(structuralProfile.collectors?.["host-lifecycle"]?.enabled);
+      let bootLedger;
+      let bootProbeBefore;
+      if (hostLifecycleEnabled) {
+        try {
+          const probeHost = options.hostLifecycleProbe ?? readHostLifecycle;
+          bootProbeBefore = await probeHost(collectorOptions);
+          const ledgerRead = await (options.readBootLedger ?? readBootLedger)(descartesPaths);
+          if (ledgerRead.status === "corrupt") bootLedgerError = "boot_ledger_corrupt_restarted";
+          const key = await ensureContextKey();
+          const observed = observeBootProbe(ledgerRead.ledger, bootProbeBefore, {
+            nowMs,
+            daemon: options.daemonInstance ?? currentDaemonInstance(),
+            // The actual last census time (a borrowed checkpoint is ahead of it), else the checkpoint.
+            lastCensusMs: Number.isSafeInteger(ledgerRead.ledger.last_census_ms) ? ledgerRead.ledger.last_census_ms : Number.isFinite(lastRunMs) ? lastRunMs : undefined,
+            bootIdHmac: typeof bootProbeBefore?.boot?.boot_id === "string" ? hostBootIdHmac(key?.status === "ok" ? key.key : undefined, bootProbeBefore.boot.boot_id) : undefined,
+          });
+          bootLedger = observed.ledger;
+          await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, bootLedger);
+        } catch (error) {
+          bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_error";
+          console.warn(`[daemon] boot-identity probe/ledger failed this tick (${bootLedgerError}); no boundary is inferred from it`);
+          bootLedger = undefined;
+        }
+      }
+
+      // C0.12: a pending boundary census (new boot id or wake) runs at +0 when the scheduled census
+      // is not due, by BORROWING the next structural slot: the checkpoint advances by one interval
+      // instead of to now. A borrow is allowed only when the checkpoint is not already ahead of now
+      // (at most one slot of debt), so any window of length H holds at most H / interval + 2
+      // structural runs -- inside every family's T8 1.25 headroom -- and the census gap after a
+      // borrow is below two intervals. A census that cannot borrow stays pending and is recorded as
+      // deferred when it runs.
+      const scheduledDue = nowMs - lastRunMs >= structuralProfile.interval_ms;
+      const boundaryCensusEnabled = hostLifecycleEnabled && structuralProfile.boundary_census?.enabled === true;
+      const boundaryBorrow = !scheduledDue && boundaryCensusEnabled && Boolean(bootLedger?.pending_census) && lastRunMs <= nowMs;
+      const structuralDue = scheduledDue || boundaryBorrow;
       if (structuralDue) {
         const deadlineMs = structuralProfile.deadline_ms ?? DEFAULT_STRUCTURAL_TICK_DEADLINE_MS;
         let structuralCollectors = options.structuralCollectors;
@@ -1177,18 +1316,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // watch kill switch is enabled (already gated by the enclosing `if
           // (watchConfig.enabled)` block above) — never on a timed-out/partial tick, which
           // discards its evidence entirely rather than persisting a partial fact snapshot.
-          // Context plan C0.5/C0.6: the per-install HMAC key for context facts, loaded once per
-          // structural tick. An unusable key degrades every keyed context value to "unknown" (the
-          // translators never fall back to an unkeyed hash); its status is reported on the record.
-          const loadContextKey = options.loadContextKey ?? loadOrCreateContextKey;
-          let contextKey;
-          try {
-            contextKey = await loadContextKey(descartesPaths);
-          } catch (error) {
-            contextKey = { status: "unable", reason: "key_load_threw" };
+          const loadedKey = await ensureContextKey();
+          const hmacKey = loadedKey?.status === "ok" ? loadedKey.key : undefined;
+          const hostContext = hostLifecycleEnabled
+            ? deriveHostLifecycleContext({ ledger: bootLedger, probeBefore: bootProbeBefore, structuralEvidence, nowMs, hmacKey, daemon: options.daemonInstance ?? currentDaemonInstance() })
+            : undefined;
+          if (hostContext?.ledger) {
+            try {
+              await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, hostContext.ledger);
+            } catch (error) {
+              bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_write_failed";
+            }
           }
-          const hmacKey = contextKey?.status === "ok" ? contextKey.key : undefined;
-          contextKeyStatus = contextKey?.status === "ok" ? "ok" : `unable:${contextKey?.reason ?? "unknown"}`;
           const factPoints = [
             ...factPointsFromCanaryEvidence(structuralEvidence, { ts }),
             ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
@@ -1217,6 +1356,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // Context plan C0.3: the tailnet's own state, for EVERY probe outcome (a logged-out or
             // missing daemon is a value, not a dropped tick). DATA only: no alert candidate.
             ...factPointsFromTailnetStateEvidence(structuralEvidence, { ts, hmacKey }),
+            // Context plan C0.8/C0.9/C0.12: boot identity, raw clock readings, the C0.9 no-go
+            // suspend fallback, a boundary verdict and a boundary census record. DATA only.
+            ...(hostContext ? factPointsFromHostLifecycleEvidence(structuralEvidence, { ts, hmacKey, ...hostContext.facts }) : []),
             ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
             // Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-
             // gaps.md): scheduled-jobs structural evidence -> fact-points, same discipline as its
@@ -1286,7 +1428,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         const writeCheckpoint = options.writeStructuralCheckpoint ?? writeStructuralCheckpoint;
         await safeCandidates(
           "structural-checkpoint-persist",
-          () => writeCheckpoint(descartesPaths, { last_structural_run_ms: nowMs, now: ts }),
+          // C0.12: a borrowed boundary census consumes the next slot (see boundaryBorrow above).
+          () => writeCheckpoint(descartesPaths, { last_structural_run_ms: boundaryBorrow ? lastRunMs + structuralProfile.interval_ms : nowMs, now: ts }),
           undefined,
         );
       }
@@ -1665,6 +1808,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
     ...(contextKeyStatus ? { context_key_status: contextKeyStatus } : {}),
+    ...(bootLedgerError ? { boot_ledger_error: bootLedgerError } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),

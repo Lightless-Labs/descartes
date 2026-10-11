@@ -25,6 +25,7 @@ import {
   runForegroundDaemonLoop,
   uninstallDaemonService,
   validateDaemonProfile,
+  deriveHostLifecycleContext,
   WATCH_OWNED_HISTORY_DEPENDENT_RULE_IDS,
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
@@ -559,7 +560,8 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(profile.structural.boundary_census, { enabled: true });
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
@@ -6211,4 +6213,167 @@ test("C0.7: profile validation accepts positive sub-deadlines and rejects invali
   assert.doesNotThrow(() => validateDaemonProfile(structuralProfile({ collector_deadline_ms: 1000, context_collector_deadline_ms: 500 })));
   assert.throws(() => validateDaemonProfile(structuralProfile({ collector_deadline_ms: 0 })), /collector_deadline_ms/);
   assert.throws(() => validateDaemonProfile(structuralProfile({ context_collector_deadline_ms: -1 })), /context_collector_deadline_ms/);
+});
+
+// --- Context plan C0.8 / C0.12: boundary probe, boundary-triggered census at +0, host_lifecycle facts ---
+
+const BOOT_ONE = "11111111-2222-3333-4444-555555555555";
+const BOOT_TWO = "66666666-7777-8888-9999-AAAAAAAAAAAA";
+const C12_T0 = Date.parse("2026-10-11T08:00:00.000Z");
+const C12_HOUR = 3600000;
+
+function hostProbe(bootId, { bootTimeS, waketime = 0, sleeptime = 0, wallMs, uptimeMs }) {
+  return {
+    platform: "darwin",
+    status: "ok",
+    boot: { boot_id: bootId, boot_id_source: "kern.bootsessionuuid", boot_time_s: bootTimeS, os_build: "25C56", os_release: "25.2.0" },
+    clocks: { wall_ms: wallMs, uv_hrtime_ns: "1", uv_version: "1.52.1", os_uptime_ms: uptimeMs, kern_waketime_s: waketime, kern_sleeptime_s: sleeptime },
+  };
+}
+
+function c12Harness(paths) {
+  const state = { checkpoint: undefined, structuralRuns: 0, probe: undefined, afterProbe: undefined, sessions: [] };
+  const run = async (nowMs, { daemon = { nonce: "daemon-a", start_ms: C12_T0 - C12_HOUR } } = {}) => {
+    const ts = new Date(nowMs).toISOString();
+    return runDaemonIteration(paths, {
+      profile: structuralProfile({ collectors: { sessions: { enabled: true }, "host-lifecycle": { enabled: true } }, boundary_census: { enabled: true } }),
+      collectors: fastCollectorFakes(),
+      structuralCollectors: {
+        sessions: async () => {
+          state.structuralRuns += 1;
+          return envelope("sessions", "collect_sessions", { sessions: state.sessions, multiplexers: [{ multiplexer: "tmux", status: "ok" }], total_count: state.sessions.length, truncated: false });
+        },
+        "host-lifecycle": async () => ({ ...envelope("host-lifecycle", "collect_host_lifecycle", state.afterProbe ?? state.probe), observation: { start_ms: nowMs, end_ms: nowMs } }),
+      },
+      hostLifecycleProbe: async () => state.probe,
+      daemonInstance: daemon,
+      evaluateAlerts: false,
+      ts,
+      now: nowMs,
+      readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+      writeStructuralCheckpoint: async (_paths, checkpoint) => {
+        state.checkpoint = checkpoint.last_structural_run_ms;
+        return checkpoint;
+      },
+      loadLearnedConfig: async () => ({ enabled: false }),
+      loadWatchConfig: async () => ({ enabled: true }),
+    });
+  };
+  return { state, run };
+}
+
+async function hostFacts(paths, nowMs) {
+  const { points } = await readFactPoints(paths, { family: "host_lifecycle", now: nowMs });
+  return points;
+}
+
+test("C0.8/C0.12: first observation records the boot and triggers nothing; a new boot id runs a +0 census that borrows the next slot and records a verified boundary with its gaps", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  const bootOneS = Math.floor((C12_T0 - 10 * 24 * C12_HOUR) / 1000);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: bootOneS, wallMs: C12_T0, uptimeMs: C12_T0 - bootOneS * 1000 });
+  await run(C12_T0);
+  assert.equal(state.structuralRuns, 1);
+  assert.equal(state.checkpoint, C12_T0);
+  let facts = await hostFacts(paths, C12_T0);
+  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
+  assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "no_previous_reading");
+  assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.bracket, "stable");
+
+  await run(C12_T0 + 60000);
+  assert.equal(state.structuralRuns, 1, "same boot, not due: no census");
+
+  // Reboot at T0 + 20 min; the new daemon observes it at T0 + 25 min (not due for 35 more minutes).
+  const bootTwoS = Math.floor((C12_T0 + 20 * 60000) / 1000);
+  const detectMs = C12_T0 + 25 * 60000;
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, wallMs: detectMs, uptimeMs: detectMs - bootTwoS * 1000 });
+  state.sessions = [{ multiplexer: "tmux", session_name: "s", created_at_epoch_seconds: bootTwoS + 60, attached: false, window_count: 1 }];
+  await run(detectMs, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  assert.equal(state.structuralRuns, 2, "the boundary census ran at +0");
+  assert.equal(state.checkpoint, C12_T0 + C12_HOUR, "it borrowed the next slot instead of resetting the cadence");
+  facts = await hostFacts(paths, detectMs);
+  const boundary = facts.find((p) => p.fact_name === "host.boot_boundary");
+  assert.equal(boundary.attributes.verdict, "verified", JSON.stringify(boundary.attributes));
+  assert.equal(boundary.attributes.os_build_changed, "false");
+  assert.equal(boundary.attributes.gap_s, String(25 * 60 - 60), "previous boot last observed at T0 + 1 min");
+  const census = facts.find((p) => p.fact_name === "host.boundary_census");
+  assert.deepEqual(
+    { trigger: census.attributes.trigger, status: census.attributes.status, pre: census.attributes.pre_gap_s, post: census.attributes.post_gap_s },
+    { trigger: "boot", status: "ran", pre: String(20 * 60), post: String(5 * 60) },
+  );
+  assert.equal(census.attributes.boot_id_hmac, boundary.attributes.boot_id_hmac);
+  assert.notEqual(boundary.attributes.prev_boot_id_hmac, boundary.attributes.boot_id_hmac);
+  assert.equal(facts.filter((p) => p.fact_name === "host.suspend").at(-1).attributes.interval_basis, "cross_boot");
+
+  // A second boundary inside the borrowed slot cannot borrow again: it waits for the slot (cost cap).
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, waketime: Math.floor((C12_T0 + 30 * 60000) / 1000), sleeptime: Math.floor((C12_T0 + 27 * 60000) / 1000), wallMs: C12_T0 + 31 * 60000, uptimeMs: 1 });
+  await run(C12_T0 + 31 * 60000, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  assert.equal(state.structuralRuns, 2, "no second borrow while the checkpoint is ahead of now");
+  await run(C12_T0 + C12_HOUR + 60000, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  assert.equal(state.structuralRuns, 3, "it borrows once the slot it took has started");
+  facts = await hostFacts(paths, C12_T0 + C12_HOUR + 60000);
+  const deferred = facts.filter((p) => p.fact_name === "host.boundary_census").at(-1);
+  assert.equal(deferred.attributes.trigger, "wake");
+  assert.equal(deferred.attributes.status, "deferred_cost_cap");
+  assert.equal(deferred.attributes.pre_gap_s, String(2 * 60), "last census at T0 + 25 min -> sleep at T0 + 27 min");
+});
+
+test("C0.12: the boundary census is off when boundary_census is not enabled (the boundary is still recorded at the next scheduled census)", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  const runNoBoundary = async (nowMs) => runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => { state.structuralRuns += 1; return envelope("host-lifecycle", "collect_host_lifecycle", state.probe); } },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "d", start_ms: 0 },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  await runNoBoundary(C12_T0);
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: Math.floor((C12_T0 + 60000) / 1000), wallMs: C12_T0 + 120000, uptimeMs: 60000 });
+  await runNoBoundary(C12_T0 + 120000);
+  assert.equal(state.structuralRuns, 1);
+  await runNoBoundary(C12_T0 + C12_HOUR);
+  assert.equal(state.structuralRuns, 2);
+  const facts = await hostFacts(paths, C12_T0 + C12_HOUR);
+  assert.ok(facts.some((p) => p.fact_name === "host.boot_boundary"));
+  assert.equal(facts.find((p) => p.fact_name === "host.boundary_census").attributes.status, "deferred_cost_cap");
+});
+
+test("C0.8 (§4.4 bracket): a boot read that differs before and after the census is unstable", () => {
+  const before = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: 1, uptimeMs: 1 });
+  const after = hostProbe(BOOT_ONE, { bootTimeS: 1, waketime: 99, wallMs: 2, uptimeMs: 1 });
+  const evidence = [envelope("host-lifecycle", "collect_host_lifecycle", after)];
+  assert.equal(deriveHostLifecycleContext({ probeBefore: before, structuralEvidence: evidence, nowMs: 5 }).facts.bracket, "unstable");
+  assert.equal(deriveHostLifecycleContext({ probeBefore: before, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", before)], nowMs: 5 }).facts.bracket, "stable");
+  assert.equal(deriveHostLifecycleContext({ probeBefore: undefined, structuralEvidence: evidence, nowMs: 5 }).facts.bracket, "unknown");
+});
+
+test("C0.8: a failing boot probe or ledger write is reported and infers nothing (no boundary, no census)", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "host-lifecycle": { enabled: true } }, boundary_census: { enabled: true } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", { platform: "darwin", status: "unable", boot: {}, clocks: {} }, "unable") },
+    hostLifecycleProbe: async () => { throw new Error("probe exploded"); },
+    evaluateAlerts: false,
+    ts: new Date(C12_T0).toISOString(),
+    now: C12_T0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.boot_ledger_error, "probe exploded");
+  const facts = await hostFacts(paths, C12_T0);
+  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
+  assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.boot_id_hmac, "unknown");
+  assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "unknown");
 });

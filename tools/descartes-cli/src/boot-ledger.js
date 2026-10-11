@@ -54,7 +54,7 @@ function validBootRecord(record) {
 }
 
 function emptyLedger() {
-  return { version: BOOT_LEDGER_VERSION, current: null, seen: [], pending_boundary: null, pending_census: null, last_structural_clock: null };
+  return { version: BOOT_LEDGER_VERSION, current: null, seen: [], pending_boundary: null, pending_census: null, last_structural_clock: null, last_census_ms: null };
 }
 
 function validLedger(parsed) {
