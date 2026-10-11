@@ -57,12 +57,16 @@ function parsePeer(peer) {
   if (!peer || typeof peer !== "object" || Array.isArray(peer) || typeof peer.PublicKey !== "string" || peer.PublicKey.length === 0) {
     return undefined;
   }
+  for (const field of ["Online", "ExitNode", "ExitNodeOption"]) {
+    if (Object.prototype.hasOwnProperty.call(peer, field) && typeof peer[field] !== "boolean") return undefined;
+  }
+  if (Object.prototype.hasOwnProperty.call(peer, "LastHandshake") && parseLastHandshake(peer.LastHandshake) === undefined) return undefined;
   return {
     source_type: "tailscale",
     presence_state: peer.Online ? "observed_active" : "observed_historical",
     node_public_key: peer.PublicKey,
-    is_exit_node_active: Boolean(peer.ExitNode),
-    is_exit_node_option: Boolean(peer.ExitNodeOption),
+    is_exit_node_active: peer.ExitNode === true,
+    is_exit_node_option: peer.ExitNodeOption === true,
     latest_handshake_epoch_seconds: parseLastHandshake(peer.LastHandshake),
   };
 }
@@ -75,13 +79,36 @@ function isPlainObject(value) {
 // Running). Each field is undefined when the JSON does not carry it: an absent Health list or Self
 // object is unknown, never a zero or a false. CurrentTailnet.Name is raw here, in memory only;
 // context-translators.js HMACs it before any fact point is built.
-function parseTailnetState(parsed, peerMapValid, peers) {
+function validateTailnetFields(parsed) {
+  if (Object.prototype.hasOwnProperty.call(parsed, "Self")) {
+    if (!isPlainObject(parsed.Self)) return false;
+    if (Object.prototype.hasOwnProperty.call(parsed.Self, "Online") && typeof parsed.Self.Online !== "boolean") return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "ExitNodeStatus")) {
+    if (!isPlainObject(parsed.ExitNodeStatus)) return false;
+    if (Object.prototype.hasOwnProperty.call(parsed.ExitNodeStatus, "ID") && typeof parsed.ExitNodeStatus.ID !== "string") return false;
+    if (Object.prototype.hasOwnProperty.call(parsed.ExitNodeStatus, "Online") && typeof parsed.ExitNodeStatus.Online !== "boolean") return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "Health")) {
+    if (!Array.isArray(parsed.Health) || parsed.Health.some((issue) => typeof issue !== "string")) return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "CurrentTailnet")) {
+    if (!isPlainObject(parsed.CurrentTailnet)) return false;
+    const tailnet = parsed.CurrentTailnet;
+    if (Object.prototype.hasOwnProperty.call(tailnet, "Name") && (typeof tailnet.Name !== "string" || tailnet.Name.length === 0)) return false;
+    if (Object.prototype.hasOwnProperty.call(tailnet, "MagicDNSSuffix") && typeof tailnet.MagicDNSSuffix !== "string") return false;
+    if (Object.prototype.hasOwnProperty.call(tailnet, "MagicDNSEnabled") && typeof tailnet.MagicDNSEnabled !== "boolean") return false;
+  }
+  return true;
+}
+
+function parseTailnetState(parsed, peerMapValid, peers, valid) {
   const self = isPlainObject(parsed.Self) ? parsed.Self : undefined;
   let exitNodeInUse;
-  if (isPlainObject(parsed.ExitNodeStatus)) exitNodeInUse = true;
-  else if (peerMapValid && peers.some((peer) => peer.is_exit_node_active)) exitNodeInUse = true;
-  else if (peerMapValid && parsed.BackendState === "Running") exitNodeInUse = false;
-  return {
+  if (valid && isPlainObject(parsed.ExitNodeStatus)) exitNodeInUse = true;
+  else if (valid && peerMapValid && peers.some((peer) => peer.is_exit_node_active)) exitNodeInUse = true;
+  else if (valid && peerMapValid && parsed.BackendState === "Running") exitNodeInUse = false;
+  const state = {
     backend_state: parsed.BackendState,
     self_online: typeof self?.Online === "boolean" ? self.Online : undefined,
     exit_node_in_use: exitNodeInUse,
@@ -90,6 +117,8 @@ function parseTailnetState(parsed, peerMapValid, peers) {
       ? parsed.CurrentTailnet.Name
       : undefined,
   };
+  if (!valid) state.valid = false;
+  return state;
 }
 
 /**
@@ -119,7 +148,7 @@ export function redactTailscaleEnvelopeForModel(envelope) {
  */
 export function parseTailscaleStatusJson(stdout) {
   const parsed = JSON.parse(String(stdout ?? ""));
-  if (!isPlainObject(parsed) || typeof parsed.BackendState !== "string") {
+  if (!isPlainObject(parsed) || typeof parsed.BackendState !== "string" || parsed.BackendState.length === 0) {
     throw new SyntaxError("tailscale status JSON has no valid BackendState");
   }
   const peerEntries = isPlainObject(parsed.Peer) ? Object.entries(parsed.Peer) : [];
@@ -128,13 +157,17 @@ export function parseTailscaleStatusJson(stdout) {
   // remaining entries falsely prove that no exit node is in use.
   const parsedPeers = peerEntries.map(([, peer]) => parsePeer(peer));
   const peerMapValid = isPlainObject(parsed.Peer) && parsedPeers.every((peer) => peer !== undefined);
+  const peerShapeValid = !Object.prototype.hasOwnProperty.call(parsed, "Peer") || peerMapValid;
   const peers = peerMapValid ? parsedPeers : [];
+  const tailnetValid = validateTailnetFields(parsed);
 
   return {
     backend_state: parsed.BackendState,
     peer_map_valid: peerMapValid,
+    peer_shape_valid: peerShapeValid,
     peers,
-    tailnet: parseTailnetState(parsed, peerMapValid, peers),
+    tailnet: parseTailnetState(parsed, peerMapValid, peers, tailnetValid),
+    tailnet_valid: tailnetValid,
   };
 }
 
@@ -188,6 +221,9 @@ export async function collectTailscaleStatusEvidence(options = {}) {
     // misreport a working daemon as a collection failure. Only an UNRECOGNIZED value falls through
     // to the `unable` fallback below (fail-safe: an unknown state is genuinely suspect).
     if (["NeedsLogin", "NoState", "Stopped", "NeedsMachineAuth", "Starting"].includes(parsed.backend_state)) {
+      if (!parsed.tailnet_valid || !parsed.peer_shape_valid) {
+        return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has malformed fields" });
+      }
       return {
         status: "logged_out",
         backend_state: parsed.backend_state,
@@ -204,6 +240,9 @@ export async function collectTailscaleStatusEvidence(options = {}) {
 
     if (parsed.backend_state !== "Running") {
       return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet });
+    }
+    if (!parsed.tailnet_valid) {
+      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has malformed tailnet fields" });
     }
     // C0.3: a Running daemon whose Peer map is missing or malformed is not a peer census (never an
     // ok zero), but its tailnet state was observed and is kept.
