@@ -313,3 +313,15 @@ test("C0.3: an unrecognized BackendState keeps the peer envelope unable and reco
   assert.equal(envelope.result.status, "unable");
   assert.equal(envelope.result.tailnet.backend_state, "Weird");
 });
+
+test("C0 review H1: redactTailscaleEnvelopeForModel strips the raw tailnet name (presence flag only) without mutating its input", async () => {
+  const { redactTailscaleEnvelopeForModel } = await import("../src/tools/tailscale-status.js");
+  const envelope = { id: "tailscale-status", result: { status: "ok", tailnet: { backend_state: "Running", self_online: true, current_tailnet_name: "corp.example.ts.net" } } };
+  const redacted = redactTailscaleEnvelopeForModel(envelope);
+  assert.ok(!JSON.stringify(redacted).includes("corp.example"));
+  assert.equal(redacted.result.tailnet.current_tailnet_name_present, true);
+  assert.equal(redacted.result.tailnet.self_online, true);
+  assert.equal(envelope.result.tailnet.current_tailnet_name, "corp.example.ts.net", "input not mutated");
+  const absent = { id: "tailscale-status", result: { status: "unable" } };
+  assert.equal(redactTailscaleEnvelopeForModel(absent), absent);
+});

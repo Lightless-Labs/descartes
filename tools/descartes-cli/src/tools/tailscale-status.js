@@ -93,6 +93,23 @@ function parseTailnetState(parsed, peerMapValid, peers) {
 }
 
 /**
+ * C0 review H1: the envelope as it may leave this process for a model provider (the
+ * collect_tailscale_status triage tool). The raw `CurrentTailnet.Name` is only for the daemon's own
+ * translator, which HMACs it with the per-install key before any fact point; it is stripped here and
+ * replaced by a presence flag, so the tool result never carries it (README data table: "not sent").
+ * Pure; the input is not mutated.
+ */
+export function redactTailscaleEnvelopeForModel(envelope) {
+  const tailnet = envelope?.result?.tailnet;
+  if (!tailnet || typeof tailnet !== "object" || !Object.prototype.hasOwnProperty.call(tailnet, "current_tailnet_name")) return envelope;
+  const { current_tailnet_name: name, ...rest } = tailnet;
+  return {
+    ...envelope,
+    result: { ...envelope.result, tailnet: { ...rest, current_tailnet_name_present: typeof name === "string" && name.length > 0 } },
+  };
+}
+
+/**
  * Pure parser for `tailscale status --json` output. Raw public keys remain in this in-memory
  * shape only; fact-translators.js hashes them before producing persisted fact points.
  *

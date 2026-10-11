@@ -21,7 +21,7 @@ import { collectSessionEvidence, DEFAULT_SESSION_ENTITY_LIMIT } from "./tools/se
 import { collectSystemEvidence } from "./tools/system.js";
 import { collectTimeSyncEvidence } from "./tools/time-sync.js";
 import { collectVmEvidence } from "./tools/vms.js";
-import { collectTailscaleStatusEvidence, DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT } from "./tools/tailscale-status.js";
+import { collectTailscaleStatusEvidence, DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT, redactTailscaleEnvelopeForModel } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence, DEFAULT_PEER_ENTITY_LIMIT } from "./tools/vpn-peer-status.js";
 import { collectAllEvidence } from "./tools/collect.js";
 import { deriveFindings } from "./tools/findings.js";
@@ -238,7 +238,8 @@ export function createEvidenceTools(paths) {
       description: "Collect a read-only baseline of Tailscale/tailnet peer identity from local daemon state (`tailscale status --json`): node presence, exit-node role, handshake recency. No traffic content is inspected, no admin/control-plane API is called, no privilege is escalated, and no host actions are taken.",
       parameters: Type.Object({ peer_limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })) }),
       executionMode: "parallel",
-      execute: async (_id, params) => jsonToolResult(registerEvidence(await collectTailscaleStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT, ...(await collectorOptions()) }))),
+      // C0 review H1: the raw tailnet name is stripped before the envelope is registered or returned.
+      execute: async (_id, params) => jsonToolResult(registerEvidence(redactTailscaleEnvelopeForModel(await collectTailscaleStatusEvidence({ peerLimit: params.peer_limit ?? DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT, ...(await collectorOptions()) })))),
     }),
     defineTool({
       name: "inspect_process",
