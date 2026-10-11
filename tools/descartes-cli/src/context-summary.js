@@ -879,7 +879,8 @@ export function certifySourcePasses({ familyResults, ledgers, contributed, tsMs 
   }
   const tuples = Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [family, families[family]]));
   const material = canonicalJson({ tsMs, tuples });
-  return { cert: certified ? "certified" : "uncertified", certd: crypto.createHash("sha256").update(`descartes.tick_summary.cert.v1\u0000${material}`).digest("hex").slice(0, 16), families, tuples };
+  const everyTupleCertified = SUMMARY_SOURCE_FAMILIES.every((family) => tuples[family]?.verdict === "certified");
+  return { cert: everyTupleCertified ? "certified" : "uncertified", certd: crypto.createHash("sha256").update(`descartes.tick_summary.cert.v1\u0000${material}`).digest("hex").slice(0, 16), families, tuples };
 }
 
 function certificateToken(value) {
@@ -1081,7 +1082,6 @@ export function verifyTickSummaryChain(points) {
     const tuples = Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [family, certificateTupleFromRow(attrs[SUMMARY_FAMILY_CODES[family]], family)]));
     if (Number.isSafeInteger(seq)) certificates.set(seq, { point, attrs, tuples });
   }
-  const enforceCertificates = certificates.size > 0;
   let previous;
   for (const point of summaries) {
     const attrs = point.attributes ?? {};
@@ -1093,12 +1093,14 @@ export function verifyTickSummaryChain(points) {
       } else if (attrs.chain === "restarted" || attrs.chain === "gap") reason = attrs.chain;
       else reason = attrs.chain === "started" ? "started_after_records" : "chain_unknown";
     } else if (attrs.chain === "restarted" || attrs.chain === "gap") reason = attrs.chain;
-    if (enforceCertificates) {
+    const requiresCertificate = attrs.cert !== undefined || attrs.cd !== undefined;
+    if (requiresCertificate) {
       const certificate = certificates.get(Number(attrs.seq));
       const tuples = certificate?.tuples;
       const complete = tuples && SUMMARY_SOURCE_FAMILIES.every((family) => tuples[family] !== undefined);
       if (!certificate) reason = reason ?? "certificate_missing";
       else if (!complete || certificate.attrs.certd !== attrs.cd || certificate.attrs.ts_ms !== String(Date.parse(point.ts)) || certificateDigest(Date.parse(point.ts), tuples) !== attrs.cd) reason = reason ?? "certificate_mismatch";
+      else if (attrs.cert !== (SUMMARY_SOURCE_FAMILIES.every((family) => tuples[family].verdict === "certified") ? "certified" : "uncertified")) reason = reason ?? "certificate_mismatch";
     }
     if (reason) losses.push({ ts: point.ts, reason });
     records.push(point);

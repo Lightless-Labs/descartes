@@ -298,7 +298,7 @@ test("summary_valid_after_source_byte_eviction and summary_own_chain_break_is_lo
   const sessionRead = await readFactPoints(paths, { family: "session", now: new Date(T0 + 4 * HOUR).toISOString() });
   assert.equal(sessionRead.points.length, 0, "the source facts are gone (intentional byte eviction)");
   const read = await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 4 * HOUR).toISOString() });
-  assert.equal(read.points.length, 4);
+  assert.equal(read.points.length, 8);
   assert.deepEqual(verifyTickSummaryChain(read.points).losses, [], "summary_valid_after_source_byte_eviction");
   // Remove a middle record: a break in the summary's own chain is loss, never silence.
   const broken = read.points.filter((point) => !(point.attributes?.seq === "1"));
@@ -318,7 +318,7 @@ test("C2 review L6: the chain is walked in seq order, so a small backward clock 
     tick({ ms: T0 + HOUR, sessions: { a: 1 }, uptimeMs: 1000 + HOUR }),
     tick({ ms: T0 + HOUR - 30_000, sessions: { a: 1 }, uptimeMs: 1000 + 2 * HOUR }),
   ]);
-  const points = ticks.map(({ summary }) => summary.point);
+  const points = ticks.flatMap(({ summary }) => [summary.point, summary.certificatePoint]);
   assert.deepEqual(verifyTickSummaryChain(points).losses, []);
   assert.deepEqual(verifyTickSummaryChain([...points].reverse()).losses, [], "input order does not matter");
 });
@@ -396,7 +396,7 @@ test("C2 certification at derivation (I70): every contributing family's committe
   const ledger = (generation, passId, extra = {}) => ({ generation, continuity: { last_committed_pass_id: passId, continuity_ok: true, last_rewrite_newest_ts: new Date(T0).toISOString() }, bytecap_floor_ts: null, age_floor_ts: null, ...extra });
   const contributed = new Set(["session", "host_lifecycle"]);
   const certified = certifySourcePasses({ familyResults: { session: ok("g1", 4), host_lifecycle: ok("g2", 9) }, ledgers: { session: ledger("g1", 4), host_lifecycle: ledger("g2", 9) }, contributed, tsMs: T0 });
-  assert.equal(certified.cert, "certified");
+  assert.equal(certified.cert, "uncertified", "a summary is certified only when every certificate tuple is certified");
   assert.match(certified.certd, /^[0-9a-f]{16}$/);
   assert.equal(certified.families.peer.verdict, "not_contributing");
   const mismatch = certifySourcePasses({ familyResults: { session: ok("g1", 4), host_lifecycle: ok("g2", 9) }, ledgers: { session: ledger("g1", 5), host_lifecycle: ledger("g2", 9) }, contributed, tsMs: T0 });
@@ -414,8 +414,16 @@ test("C2 certification at derivation (I70): every contributing family's committe
   const summary = deriveTickSummary({ snapshot: snapshotOf(t), prior: { status: "missing" }, storeHadSummaries: false, certification: certified, transitions: deriveContextTransitions(undefined, snapshotOf(t)), hmacKey: KEY, version: "0.0.50", cfg: "0123456789abcdef" });
   assert.ok(summary.certificatePoint, "the full tuple set is persisted in the sibling record");
   assert.deepEqual(verifyTickSummaryChain([summary.point, summary.certificatePoint]).losses, []);
+  const inconsistent = { ...summary.point, attributes: { ...summary.point.attributes, cert: "certified" } };
+  assert.equal(verifyTickSummaryChain([inconsistent, summary.certificatePoint]).losses[0].reason, "certificate_mismatch");
   const tampered = { ...summary.certificatePoint, attributes: { ...summary.certificatePoint.attributes, s: `${summary.certificatePoint.attributes.s}|tampered` } };
   assert.equal(verifyTickSummaryChain([summary.point, tampered]).losses[0].reason, "certificate_mismatch");
+});
+
+test("C2 verification requires a certificate for every new-format summary", () => {
+  const [{ summary }] = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1 })]);
+  assert.equal(summary.point.attributes.cert, "certified");
+  assert.equal(verifyTickSummaryChain([summary.point]).losses[0].reason, "certificate_missing");
 });
 
 test("C2 statistics exclude uncertified ticks from churn, exposure and episodes while counting their exposure separately", () => {
