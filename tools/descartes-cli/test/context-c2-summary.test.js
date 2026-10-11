@@ -186,7 +186,7 @@ test("summary_chain_broken_unknown: a missing or invalid chain state makes the i
   const moved = tick({ ms: T0 + HOUR, sessions: {}, uptimeMs: 2 });
   moved.evidence[0].result.multiplexers = [{ multiplexer: "tmux", status: "not_found_on_known_paths" }, { multiplexer: "screen", status: "ok" }];
   moved.points = factPointsFromSessionEvidence(moved.evidence, { ts: moved.ts });
-  const next = deriveTickSummary({ snapshot: snapshotOf(moved), prior: { status: "valid", state: first.summary.nextState("g", 1) }, storeHadSummaries: true, transitions: { transitions: [], events: "-" }, hmacKey: KEY });
+  const next = deriveTickSummary({ snapshot: snapshotOf(moved), prior: { status: "valid", state: first.summary.nextState("g", 1) }, storeHadSummaries: true, transitions: { transitions: [], events: "--------" }, hmacKey: KEY });
   assert.equal(next.point.attributes.sd, "unknown");
 });
 
@@ -202,18 +202,19 @@ test("l1_clock_step_detected and l1_no_false_step_on_suspend: a wall step agains
   assert.equal(clock.new_value, "forward");
   assert.equal(clock.magnitude, "1m_1h");
   assert.equal(clock.semantics, "clock_semantics_unverified");
-  assert.equal(step.events, "c");
+  assert.equal(step.events, "--uuuc--", "positional: tailnet, vpn and net_config were not read in this fixture");
   // An 8-hour suspend: wall and uptime (which includes suspended time) both advance by 8 h.
   const suspended = snapshotOf(tick({ ms: T0 + 8 * HOUR, ...base, wallMs: T0 + 8 * HOUR + 1500, uptimeMs: 5_000_000 + 8 * HOUR }));
   const noStep = deriveContextTransitions(prev, suspended);
   assert.equal(noStep.transitions.length, 0, "l1_no_false_step_on_suspend");
-  assert.equal(noStep.events, "-");
+  assert.equal(noStep.events, "--uuu---");
   assert.equal(wallCrossCheck(prev.context, suspended).code, "c");
   // Across a boot no clock delta is taken (F2): unknown, never a step.
   const rebooted = snapshotOf(tick({ ms: T0 + HOUR, ...base, wallMs: T0 + 10 * HOUR, uptimeMs: 10_000, bootId: "99999999-2222-3333-4444-555555555555" }));
   assert.equal(wallCrossCheck(prev.context, rebooted).code, "u");
   assert.ok(!deriveContextTransitions(prev, rebooted).transitions.some((t) => t.dimension === "clock_step"));
   assert.ok(deriveContextTransitions(prev, rebooted).transitions.some((t) => t.dimension === "boot"));
+  assert.equal(deriveContextTransitions(prev, rebooted).events, "b.uuu.--", "wake and clock_step are not applicable across a known boot change");
 });
 
 test("C2 context.transition: old/new with the interval (previous observation, this observation]; only between two known readings", () => {
@@ -226,12 +227,44 @@ test("C2 context.transition: old/new with the interval (previous observation, th
   assert.deepEqual([offset.old_value, offset.new_value], ["120", "-240"]);
   assert.equal(offset.interval_start_ms, T0 + 500);
   assert.equal(offset.interval_end_ms, T0 + HOUR + 500);
-  assert.equal(events, "zo");
+  assert.equal(events, "--uuu-zo");
   const timezone = transitions.find((t) => t.dimension === "timezone");
   assert.equal(timezone.new_value, contextHmac(KEY, "timezone_id", "America/New_York"), "the timezone id is HMAC'd, never raw");
   // An unknown reading on either side is no transition (the context is unknown, not changed).
   const unknownTz = tick({ ms: T0 + HOUR, uptimeMs: 1000 + HOUR, tz: undefined, offset: undefined });
   assert.equal(deriveContextTransitions(prev, snapshotOf(unknownTz)).transitions.length, 0);
+});
+
+test("C2 review M3: an uncomparable dimension is 'u' in ev, never 'no event'; a change across an unreadable tick is recorded at the next reading, over the whole gap", () => {
+  const withTailnet = (t, state) => {
+    if (state) t.points.push({ ts: t.ts, fact_name: "net.tailnet_state", entity_key: "net.tailnet_state", attributes: { state, self_online: "true" } });
+    t.evidence.push({ id: "tailscale-status", status: "ok", observation: { start_ms: t.ms + 600, end_ms: t.ms + 700 }, result: {} });
+    return t;
+  };
+  const first = withTailnet(tick({ ms: T0, uptimeMs: 100_000 }), "running");
+  // Tick 2: the host-lifecycle read and the tailnet state are unreadable.
+  const blind = withTailnet(tick({ ms: T0 + HOUR, uptimeMs: 100_000 + HOUR }), undefined);
+  blind.evidence = blind.evidence.filter((e) => e.id !== "host-lifecycle");
+  // Tick 3: rebooted meanwhile, and the tailnet is stopped.
+  const after = withTailnet(tick({ ms: T0 + 2 * HOUR, uptimeMs: 5000, bootId: "99999999-2222-3333-4444-555555555555" }), "stopped");
+  const [, b, c] = chainTicks([first, blind, after]);
+  // Positional, in TRANSITION_DIMENSIONS order (boot wake tailnet vpn net_config clock_step timezone utc_offset).
+  assert.equal(b.transitions.events, "uuuuuuuu", "nothing comparable on tick 2: every dimension unknown, never '-'");
+  assert.equal(b.summary.point.attributes.ev, "uuuuuuuu");
+  const dims = c.transitions.transitions.map((t) => t.dimension);
+  assert.ok(dims.includes("boot"), "the boot change across the unreadable tick is recorded");
+  assert.ok(dims.includes("tailnet"), "the tailnet change across the unreadable tick is recorded");
+  const boot = c.transitions.transitions.find((t) => t.dimension === "boot");
+  assert.equal(boot.interval_start_ms, T0 + 500, "from the last KNOWN reading's observation end");
+  assert.equal(boot.interval_end_ms, T0 + 2 * HOUR + 500);
+  const tailnet = c.transitions.transitions.find((t) => t.dimension === "tailnet");
+  assert.deepEqual([tailnet.old_value, tailnet.new_value, tailnet.interval_start_ms], ["running", "stopped", T0 + 700]);
+  // wake is not applicable across a boot ("."); the clock has no previous reading (tick 2) so it is
+  // unknown; vpn and net_config were never read; timezone and offset compared with the carried reading.
+  assert.equal(c.transitions.events, "b.tuuu--");
+  assert.deepEqual(validateContextFact("tick.summary", c.summary.point.attributes), { ok: true });
+  // The clock readings are never carried: the clock is compared only between consecutive readings.
+  assert.equal(c.summary.point.attributes.wx, "u");
 });
 
 test("summary_suspend_bounds_recomputable: the raw clock readings and boot id kept in consecutive records recompute the exposure bound", () => {

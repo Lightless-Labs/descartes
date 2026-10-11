@@ -125,7 +125,7 @@ test("C2 wiring: each completed structural tick appends one chained, certified t
   assert.deepEqual(summaries.map((p) => p.attributes.cert), ["certified", "certified", "certified"]);
   assert.deepEqual(verifyTickSummaryChain(summaries).losses, []);
   assert.deepEqual(summaries.map((p) => [p.attributes.sa, p.attributes.sd]), [["unknown", "unknown"], ["1", "0"], ["0", "0"]]);
-  assert.equal(summaries[2].attributes.ev, "zo");
+  assert.equal(summaries[2].attributes.ev, "--u-u-zo", "positional: no tailscale or net-config collector in this harness");
   assert.equal(status.status?.context_c2?.summary ?? status.context_c2?.summary, "committed");
   const network = (await readFactPoints(paths, { family: "network_context", now })).points;
   assert.deepEqual(network.filter((p) => p.fact_name === "context.transition").map((p) => p.attributes.dimension).sort(), ["timezone", "utc_offset"]);

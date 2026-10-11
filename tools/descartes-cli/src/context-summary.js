@@ -24,6 +24,7 @@ import {
   enforceContextSchema,
   SUMMARY_COLLECTOR_ORDER,
   SUMMARY_EVENT_CODES,
+  SUMMARY_EVENTS_RE,
   SUMMARY_TAILNET_STATE_CODES,
   TRANSITION_DIMENSIONS,
 } from "./context-schemas.js";
@@ -60,7 +61,8 @@ export const SUMMARY_MAX_SESSION_ENTITIES = 200;
 export const SUMMARY_MAX_PEER_ENTITIES = 400;
 const RESOLUTION_MS = BOOT_MEASUREMENT_RESOLUTION_S * 1000;
 
-const CHAIN_STATE_VERSION = 1;
+// v2 (C2 review M3): the context holds the last known reading per dimension, with its own observation end.
+const CHAIN_STATE_VERSION = 2;
 const STATS_STATE_VERSION = 1;
 const HEX16_RE = /^[0-9a-f]{16}$/;
 const HEX32_RE = /^[0-9a-f]{32}$/;
@@ -348,8 +350,22 @@ function validSourceState(value, cap) {
     && validEntityList(value.entities, cap);
 }
 
-const CONTEXT_STATE_KEYS = ["boot_digest", "boot_hmac", "wall_ms", "uptime_ms", "wake_marker", "tailnet", "vpn_digest", "net", "tz_hmac", "utc_offset_min", "obs_end"];
-const OBS_END_KEYS = ["host", "tailnet", "vpn", "net"];
+// The previous context (C2 review M3). Each categorical dimension holds its LAST KNOWN reading and that
+// reading's own observation end (carried across a tick that could not read it), so a change across an
+// unreadable tick is still recorded, over the whole gap. The wake marker is carried with the boot it
+// was read in. The clock readings (wall, uptime, and the boot they were read in) are THIS tick's only,
+// never carried: a cross-check is taken only between consecutive readings of one boot.
+const CONTEXT_STATE_KEYS = [
+  "boot_digest", "boot_hmac", "boot_end",
+  "wake_marker", "wake_boot_digest", "wake_end",
+  "tailnet", "tailnet_end",
+  "vpn_digest", "vpn_end",
+  "net", "net_end",
+  "tz_hmac", "tz_end",
+  "utc_offset_min", "utc_offset_end",
+  "wall_ms", "uptime_ms", "clock_boot_digest", "clock_end",
+];
+const CONTEXT_INT_KEYS = ["boot_end", "wake_end", "tailnet_end", "vpn_end", "net_end", "tz_end", "utc_offset_end", "wall_ms", "uptime_ms", "clock_end"];
 const CHAIN_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "hmac_key_id", "seq", "record_digest", "record_ts", "session", "peer", "context"];
 const TOKEN_RE = /^[A-Za-z0-9_.:+-]{1,64}$/;
 
@@ -368,11 +384,11 @@ export function isValidSummaryChainState(value) {
   if (!exactKeys(c, CONTEXT_STATE_KEYS)) return false;
   return optionalString(c.boot_digest, HEX32_RE)
     && optionalString(c.boot_hmac, /^([0-9a-f]{16}|unknown)$/)
-    && optionalInt(c.wall_ms) && optionalInt(c.uptime_ms)
+    && optionalString(c.wake_boot_digest, HEX32_RE) && optionalString(c.clock_boot_digest, HEX32_RE)
     && optionalString(c.wake_marker, TOKEN_RE) && optionalString(c.tailnet, TOKEN_RE)
     && optionalString(c.vpn_digest, TOKEN_RE) && optionalString(c.net, TOKEN_RE)
     && optionalString(c.tz_hmac, TOKEN_RE) && optionalInt(c.utc_offset_min)
-    && exactKeys(c.obs_end, OBS_END_KEYS) && OBS_END_KEYS.every((key) => optionalInt(c.obs_end[key]));
+    && CONTEXT_INT_KEYS.every((key) => optionalInt(c[key]));
 }
 
 /**
@@ -413,35 +429,53 @@ function magnitudeBucket(ms) {
 
 /**
  * The wall-clock cross-check of open item 20: within one boot, the wall delta against the uptime
- * delta (the bound's own clock). "c" consistent to the resolution, "f"/"b" a forward/backward wall
- * step, "u" unknown (no previous reading, another boot, a missing reading). Also returns both deltas.
+ * delta (the bound's own clock), between CONSECUTIVE readings only (the previous context's clock
+ * readings are never carried across a tick that could not read them). "c" consistent to the
+ * resolution, "f"/"b" a forward/backward wall step, "u" unknown (no previous reading, another boot, a
+ * missing reading). `crossBoot` is true when both readings' boots are known and differ (a clock delta
+ * across a boot is not applicable, F2). On macOS the uptime is itself now - kern.boottime, so there
+ * the check only sees a moved kern.boottime (C2 review M5; unverified until C0.9).
  */
 export function wallCrossCheck(prevContext, snapshot) {
-  const sameBoot = Boolean(prevContext?.boot_digest) && prevContext.boot_digest === snapshot.boot?.digest;
+  const prevBoot = prevContext?.clock_boot_digest;
+  const curBoot = snapshot.boot?.digest;
+  const sameBoot = Boolean(prevBoot) && prevBoot === curBoot;
+  const crossBoot = Boolean(prevBoot) && Boolean(curBoot) && prevBoot !== curBoot;
   const wallDeltaMs = Number.isSafeInteger(prevContext?.wall_ms) && Number.isSafeInteger(snapshot.clocks?.wallMs) ? snapshot.clocks.wallMs - prevContext.wall_ms : undefined;
   const uptimeDeltaMs = sameBoot && Number.isSafeInteger(prevContext?.uptime_ms) && Number.isSafeInteger(snapshot.clocks?.uptimeMs) ? snapshot.clocks.uptimeMs - prevContext.uptime_ms : undefined;
-  if (wallDeltaMs === undefined || uptimeDeltaMs === undefined || uptimeDeltaMs < 0) return { code: "u", wallDeltaMs, uptimeDeltaMs };
+  if (wallDeltaMs === undefined || uptimeDeltaMs === undefined || uptimeDeltaMs < 0) return { code: "u", wallDeltaMs, uptimeDeltaMs, crossBoot };
   const gap = wallDeltaMs - uptimeDeltaMs;
-  if (gap > RESOLUTION_MS) return { code: "f", wallDeltaMs, uptimeDeltaMs, stepMs: gap };
-  if (gap < -RESOLUTION_MS) return { code: "b", wallDeltaMs, uptimeDeltaMs, stepMs: gap };
-  return { code: "c", wallDeltaMs, uptimeDeltaMs };
+  if (gap > RESOLUTION_MS) return { code: "f", wallDeltaMs, uptimeDeltaMs, stepMs: gap, crossBoot };
+  if (gap < -RESOLUTION_MS) return { code: "b", wallDeltaMs, uptimeDeltaMs, stepMs: gap, crossBoot };
+  return { code: "c", wallDeltaMs, uptimeDeltaMs, crossBoot };
 }
 
 function tokenOrUnknown(value) {
   return typeof value === "string" && TOKEN_RE.test(value) && value.length <= 32 ? value : "unknown";
 }
 
+// ev (C2 review M3): one character per dimension, in TRANSITION_DIMENSIONS order: the dimension's
+// code when it changed, "-" compared and unchanged, "u" not comparable (a reading unknown on either
+// side), "." not applicable (wake and clock_step across a known boot change).
+const EVENT_UNKNOWN = "u";
+const EVENT_SAME = "-";
+const EVENT_NOT_APPLICABLE = ".";
+
 /**
  * Previous (chain-state) context vs this snapshot -> the transitions of this interval, one per
- * dimension at most, each with the interval (previous observation end, this observation end]. A
- * dimension is compared only when BOTH readings are known; with no valid previous state there are no
- * transitions and the events are unknown (`events: undefined`), never "none".
+ * dimension at most, each with the interval (the last known reading's observation end, this
+ * observation end]. A dimension is compared only when this tick's reading is known and a previous
+ * reading is known (the last known one, carried across ticks that could not read it); otherwise its
+ * event is "u". With no valid previous state there are no transitions and the events are unknown
+ * (`events: undefined`), never "none".
  */
 export function deriveContextTransitions(prevChain, snapshot) {
   if (!prevChain) return { transitions: [], events: undefined };
   const prev = prevChain.context;
+  // THIS tick's readings only (nothing carried): a carried value is never compared with itself.
   const cur = snapshotContextState(snapshot);
   const transitions = [];
+  const codes = {};
   const push = (dimension, oldValue, newValue, startMs, endMs, extra = {}) => transitions.push({
     dimension,
     old_value: tokenOrUnknown(oldValue),
@@ -452,22 +486,36 @@ export function deriveContextTransitions(prevChain, snapshot) {
     semantics: "observed",
     ...extra,
   });
-  const known = (value) => typeof value === "string" && value !== "unknown";
-  if (known(prev.boot_hmac) && known(cur.boot_hmac) && prev.boot_hmac !== cur.boot_hmac) push("boot", prev.boot_hmac, cur.boot_hmac, prev.obs_end.host, cur.obs_end.host);
-  if (known(prev.wake_marker) && known(cur.wake_marker) && prev.boot_digest === cur.boot_digest && prev.wake_marker !== cur.wake_marker) push("wake", prev.wake_marker, cur.wake_marker, prev.obs_end.host, cur.obs_end.host);
-  if (known(prev.tailnet) && known(cur.tailnet) && prev.tailnet !== cur.tailnet) push("tailnet", prev.tailnet, cur.tailnet, prev.obs_end.tailnet, cur.obs_end.tailnet);
-  if (known(prev.vpn_digest) && known(cur.vpn_digest) && prev.vpn_digest !== cur.vpn_digest) push("vpn", prev.vpn_digest, cur.vpn_digest, prev.obs_end.vpn, cur.obs_end.vpn);
-  if (known(prev.net) && known(cur.net) && prev.net !== cur.net) push("net_config", prev.net, cur.net, prev.obs_end.net, cur.obs_end.net);
+  const known = (value) => (typeof value === "string" && value !== "unknown") || Number.isSafeInteger(value);
+  const compare = (dimension, prevValue, curValue, prevEnd, curEnd, { oldShown = prevValue, newShown = curValue } = {}) => {
+    if (!known(prevValue) || !known(curValue)) {
+      codes[dimension] = EVENT_UNKNOWN;
+      return;
+    }
+    if (prevValue === curValue) {
+      codes[dimension] = EVENT_SAME;
+      return;
+    }
+    codes[dimension] = SUMMARY_EVENT_CODES[dimension];
+    push(dimension, typeof oldShown === "number" ? String(oldShown) : oldShown, typeof newShown === "number" ? String(newShown) : newShown, prevEnd, curEnd);
+  };
+  // A boot is a boot-id change (the raw id's digest); the transition carries the keyed HMACs.
+  compare("boot", prev.boot_digest, cur.boot_digest, prev.boot_end, cur.boot_end, { oldShown: prev.boot_hmac ?? "unknown", newShown: cur.boot_hmac ?? "unknown" });
+  if (known(prev.wake_boot_digest) && known(cur.boot_digest) && prev.wake_boot_digest !== cur.boot_digest) codes.wake = EVENT_NOT_APPLICABLE;
+  else compare("wake", prev.wake_boot_digest ? prev.wake_marker : null, cur.wake_marker, prev.wake_end, cur.wake_end);
+  compare("tailnet", prev.tailnet, cur.tailnet, prev.tailnet_end, cur.tailnet_end);
+  compare("vpn", prev.vpn_digest, cur.vpn_digest, prev.vpn_end, cur.vpn_end);
+  compare("net_config", prev.net, cur.net, prev.net_end, cur.net_end);
   const cross = wallCrossCheck(prev, snapshot);
   if (cross.code === "f" || cross.code === "b") {
-    push("clock_step", "none", cross.code === "f" ? "forward" : "backward", prev.obs_end.host, cur.obs_end.host, { magnitude: magnitudeBucket(cross.stepMs), semantics: "clock_semantics_unverified" });
-  }
-  if (known(prev.tz_hmac) && known(cur.tz_hmac) && prev.tz_hmac !== cur.tz_hmac) push("timezone", prev.tz_hmac, cur.tz_hmac, prev.obs_end.host, cur.obs_end.host);
-  if (Number.isSafeInteger(prev.utc_offset_min) && Number.isSafeInteger(cur.utc_offset_min) && prev.utc_offset_min !== cur.utc_offset_min) {
-    push("utc_offset", String(prev.utc_offset_min), String(cur.utc_offset_min), prev.obs_end.host, cur.obs_end.host);
-  }
-  const events = transitions.length === 0 ? "-" : TRANSITION_DIMENSIONS.filter((d) => transitions.some((t) => t.dimension === d)).map((d) => SUMMARY_EVENT_CODES[d]).join("");
-  return { transitions: transitions.slice(0, MAX_TRANSITIONS_PER_TICK), events, cross };
+    codes.clock_step = SUMMARY_EVENT_CODES.clock_step;
+    push("clock_step", "none", cross.code === "f" ? "forward" : "backward", prev.clock_end, cur.clock_end, { magnitude: magnitudeBucket(cross.stepMs), semantics: "clock_semantics_unverified" });
+  } else codes.clock_step = cross.code === "c" ? EVENT_SAME : cross.crossBoot ? EVENT_NOT_APPLICABLE : EVENT_UNKNOWN;
+  compare("timezone", prev.tz_hmac, cur.tz_hmac, prev.tz_end, cur.tz_end);
+  compare("utc_offset", prev.utc_offset_min, cur.utc_offset_min, prev.utc_offset_end, cur.utc_offset_end);
+  const events = TRANSITION_DIMENSIONS.map((dimension) => codes[dimension] ?? EVENT_UNKNOWN).join("");
+  const ordered = TRANSITION_DIMENSIONS.flatMap((dimension) => transitions.filter((t) => t.dimension === dimension));
+  return { transitions: ordered.slice(0, MAX_TRANSITIONS_PER_TICK), events, cross };
 }
 
 export function factPointsFromTransitions(transitions, { ts, hmacKey } = {}) {
@@ -508,27 +556,59 @@ function contextPoint({ ts, hmacKey, factName, entityKey, attributes, source = C
   });
 }
 
-/** The context part of the chain state, from a snapshot (null for unknown). */
-export function snapshotContextState(snapshot) {
+/**
+ * The context part of the chain state (null for unknown). With `carryFrom` (the previous chain state's
+ * context), a dimension this snapshot could not read keeps its last known reading and that reading's
+ * observation end (C2 review M3); the clock readings are never carried. Without it: this tick only.
+ */
+export function snapshotContextState(snapshot, carryFrom) {
   const tn = snapshot.tailnet?.state;
-  return {
-    boot_digest: snapshot.boot?.digest ?? null,
-    boot_hmac: snapshot.boot?.hmac && snapshot.boot.hmac !== "unknown" ? snapshot.boot.hmac : null,
-    wall_ms: snapshot.clocks?.wallMs ?? null,
-    uptime_ms: snapshot.clocks?.uptimeMs ?? null,
-    wake_marker: typeof snapshot.clocks?.wakeMarker === "string" && TOKEN_RE.test(snapshot.clocks.wakeMarker) ? snapshot.clocks.wakeMarker : null,
+  const end = (value) => (Number.isSafeInteger(value) ? value : null);
+  const bootDigest = typeof snapshot.boot?.digest === "string" && HEX32_RE.test(snapshot.boot.digest) ? snapshot.boot.digest : null;
+  const hostEnd = end(snapshot.obsEnd?.host);
+  const wake = typeof snapshot.clocks?.wakeMarker === "string" && TOKEN_RE.test(snapshot.clocks.wakeMarker) && bootDigest ? snapshot.clocks.wakeMarker : null;
+  const read = {
+    boot_digest: bootDigest,
+    boot_hmac: bootDigest && snapshot.boot?.hmac && snapshot.boot.hmac !== "unknown" ? snapshot.boot.hmac : null,
+    boot_end: bootDigest ? hostEnd : null,
+    wake_marker: wake,
+    wake_boot_digest: wake ? bootDigest : null,
+    wake_end: wake ? hostEnd : null,
     tailnet: typeof tn === "string" && tn !== "unable" && TOKEN_RE.test(tn) ? tn : null,
-    vpn_digest: typeof snapshot.vpn?.digest === "string" && snapshot.vpn.digest !== "unknown" ? snapshot.vpn.digest : null,
-    net: typeof snapshot.net === "string" && snapshot.net !== "unknown" ? snapshot.net : null,
-    tz_hmac: snapshot.clocks?.tzHmac && snapshot.clocks.tzHmac !== "unknown" ? snapshot.clocks.tzHmac : null,
-    utc_offset_min: snapshot.clocks?.utcOffsetMin ?? null,
-    obs_end: {
-      host: snapshot.obsEnd?.host ?? null,
-      tailnet: snapshot.obsEnd?.tailnet ?? null,
-      vpn: snapshot.obsEnd?.vpn ?? null,
-      net: snapshot.obsEnd?.net ?? null,
-    },
+    tailnet_end: end(snapshot.obsEnd?.tailnet),
+    vpn_digest: typeof snapshot.vpn?.digest === "string" && snapshot.vpn.digest !== "unknown" && TOKEN_RE.test(snapshot.vpn.digest) ? snapshot.vpn.digest : null,
+    vpn_end: end(snapshot.obsEnd?.vpn),
+    net: typeof snapshot.net === "string" && snapshot.net !== "unknown" && TOKEN_RE.test(snapshot.net) ? snapshot.net : null,
+    net_end: end(snapshot.obsEnd?.net),
+    tz_hmac: snapshot.clocks?.tzHmac && snapshot.clocks.tzHmac !== "unknown" && TOKEN_RE.test(snapshot.clocks.tzHmac) ? snapshot.clocks.tzHmac : null,
+    tz_end: hostEnd,
+    utc_offset_min: Number.isSafeInteger(snapshot.clocks?.utcOffsetMin) ? snapshot.clocks.utcOffsetMin : null,
+    utc_offset_end: hostEnd,
+    wall_ms: Number.isSafeInteger(snapshot.clocks?.wallMs) ? snapshot.clocks.wallMs : null,
+    uptime_ms: Number.isSafeInteger(snapshot.clocks?.uptimeMs) ? snapshot.clocks.uptimeMs : null,
+    clock_boot_digest: bootDigest,
+    clock_end: hostEnd,
   };
+  // A reading's end is meaningful only beside its value.
+  for (const [value, endKey] of [["tailnet", "tailnet_end"], ["vpn_digest", "vpn_end"], ["net", "net_end"], ["tz_hmac", "tz_end"], ["utc_offset_min", "utc_offset_end"]]) {
+    if (read[value] === null) read[endKey] = null;
+  }
+  if (!carryFrom) return read;
+  const carried = { ...read };
+  const groups = [
+    ["boot_digest", ["boot_digest", "boot_hmac", "boot_end"]],
+    ["wake_marker", ["wake_marker", "wake_boot_digest", "wake_end"]],
+    ["tailnet", ["tailnet", "tailnet_end"]],
+    ["vpn_digest", ["vpn_digest", "vpn_end"]],
+    ["net", ["net", "net_end"]],
+    ["tz_hmac", ["tz_hmac", "tz_end"]],
+    ["utc_offset_min", ["utc_offset_min", "utc_offset_end"]],
+  ];
+  for (const [value, keys] of groups) {
+    if (read[value] !== null) continue;
+    for (const key of keys) carried[key] = carryFrom[key] ?? null;
+  }
+  return carried;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -816,7 +896,7 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
     record_ts: snapshot.ts,
     session: sourceStateOf(snapshot.session),
     peer: sourceStateOf(snapshot.peer),
-    context: snapshotContextState(snapshot),
+    context: snapshotContextState(snapshot, prevState?.context),
   });
   return { point, digest, seq, chain, sessionChurn, peerChurn, nextState };
 }
@@ -875,7 +955,7 @@ export function isValidStatsState(value) {
   if (value.episode !== null) {
     const e = value.episode;
     if (!exactKeys(e, EPISODE_KEYS) || !validCounter(e.eseq) || ![...TRANSITION_DIMENSIONS].includes(e.kind)) return false;
-    if (typeof e.ev !== "string" || !/^(-|[bwtvnczo]{1,8})$/.test(e.ev) || !Number.isSafeInteger(e.offset) || e.offset < 0 || e.offset > EPISODE_MAX_OFFSET) return false;
+    if (typeof e.ev !== "string" || !SUMMARY_EVENTS_RE.test(e.ev) || !Number.isSafeInteger(e.offset) || e.offset < 0 || e.offset > EPISODE_MAX_OFFSET) return false;
     if (!validSourceState(e.pre_session, SUMMARY_MAX_SESSION_ENTITIES) || !validSourceState(e.pre_peer, SUMMARY_MAX_PEER_ENTITIES)) return false;
   }
   if (value.daily !== null) {
@@ -998,7 +1078,7 @@ export function deriveStats({ prior, storeExisted, prevChain, snapshot, transiti
   let episode = prevState?.episode ?? null;
   const kind = EPISODE_KIND_PRIORITY.find((dimension) => (transitions?.transitions ?? []).some((t) => t.dimension === dimension));
   if (kind) {
-    episode = { eseq: summary.seq, kind, ev: transitions.events ?? "-", offset: 0, pre_session: prevChain?.session ?? null, pre_peer: prevChain?.peer ?? null };
+    episode = { eseq: summary.seq, kind, ev: transitions.events ?? "uuuuuuuu", offset: 0, pre_session: prevChain?.session ?? null, pre_peer: prevChain?.peer ?? null };
     if (!prevChain) episode = { ...episode, pre_session: null, pre_peer: null };
   } else if (episode) {
     episode = { ...episode, offset: episode.offset + 1 };

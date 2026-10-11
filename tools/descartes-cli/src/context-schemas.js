@@ -126,8 +126,11 @@ export const BINARY_TRUST_REASONS = Object.freeze([
 //     m needs_machine_auth, g starting, z unrecognized, f not_found_on_known_paths, t untrusted_binary,
 //     p missing_permission, u unable/unknown. Online: t, f, u.
 //   presence (pr): screen-locked letter + idle letter, each t true, f false, n not_applicable, u unknown
-//   interval events (ev): b boot, w wake, t tailnet, v vpn, n net_config, c clock_step, z timezone,
-//     o utc_offset; "-" none (at most one code per dimension, so no overflow is possible)
+//   interval events (ev): exactly 8 characters, one per dimension in the order boot, wake, tailnet,
+//     vpn, net_config, clock_step, timezone, utc_offset; each is the dimension's code when it changed
+//     (b w t v n c z o), "-" compared and unchanged, "u" not comparable (a reading unknown on either
+//     side; never read as "no event"), "." not applicable (wake and clock_step across a known boot
+//     change); "unknown" when there is no previous context at all
 //   collector states (cs), fixed order sessions, vpn-peer-status, tailscale-status, host-lifecycle,
 //     login-sessions, net-config, tmux-clients: o ok, p partial, u unable, n not_applicable,
 //     f not_found_on_known_paths, t untrusted_binary, m missing_permission, a no envelope (disabled),
@@ -154,6 +157,10 @@ const HEX8_RE = /^[0-9a-f]{8}$/;
 const DIGITS20_RE = /^[0-9]{1,20}$/;
 // The transition dimensions (§4.2 context.transition) and the episode kinds (§8.2).
 export const TRANSITION_DIMENSIONS = Object.freeze(["boot", "wake", "tailnet", "vpn", "net_config", "clock_step", "timezone", "utc_offset"]);
+// ev (C2 review M3): positional, one character per dimension in TRANSITION_DIMENSIONS order: the
+// dimension's code (changed), "-" (compared, unchanged), "u" (not comparable), "." (not applicable:
+// wake and clock_step across a known boot change).
+export const SUMMARY_EVENTS_RE = /^[bu-][wu.-][tu-][vu-][nu-][cu.-][zu-][ou-]$/;
 const TRANSITION_VALUE_RE = /^[A-Za-z0-9_.:+-]{1,32}$/;
 
 const FACT_SCHEMA_ENTRIES = [
@@ -414,7 +421,7 @@ const FACT_SCHEMA_ENTRIES = [
       tzo: patternField(/^-?[0-9]{1,4}$/, 5, ["kernel.clock"]),
       tz: hmacField(["kernel.clock"]),
       pr: enumField(PRESENCE_CODE_VALUES, ["login.console", "login.logind"], { unable: "uu" }),
-      ev: patternField(/^(-|[bwtvnczo]{1,8})$/, 8, ["descartes.daemon"]),
+      ev: patternField(SUMMARY_EVENTS_RE, 8, ["descartes.daemon"]),
       wo: patternField(/^-?[0-9]{1,6}$/, 7, ["kernel.clock"]),
       hr: patternField(DIGITS20_RE, 20, ["kernel.clock"]),
       upm: intField(0, MAX_EPOCH_MS, ["kernel.clock", "kernel.boot_session"]),
@@ -434,7 +441,7 @@ const FACT_SCHEMA_ENTRIES = [
       eseq: intField(0, 2 ** 32, ["descartes.daemon"]),
       sseq: intField(0, 2 ** 32, ["descartes.daemon"]),
       kind: enumField([...TRANSITION_DIMENSIONS, "unknown"], ["descartes.daemon"]),
-      ev: patternField(/^(-|[bwtvnczo]{1,8})$/, 8, ["descartes.daemon"]),
+      ev: patternField(SUMMARY_EVENTS_RE, 8, ["descartes.daemon"]),
       off: intField(0, 2, ["descartes.daemon"]),
       ...Object.fromEntries(["s", "p"].flatMap((source) => {
         const provenance = source === "s" ? ["tmux.server"] : PEER_VALUE_PROVENANCE;
