@@ -907,15 +907,21 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
 /**
  * The reader's validity rule (I70): a record is valid while its OWN chain and family ledger are
  * continuous; the source families' current spans are never re-checked (intentional age or byte
- * eviction of the source facts is not loss). Walks ts-ordered tick.summary points and returns
+ * eviction of the source facts is not loss). Walks seq-ordered tick.summary points and returns
  * { records, losses: [{ ts, reason }] }. The first retained record's predecessor may have been evicted
  * on purpose (not a loss); a "restarted" record, a broken prev link, a seq that does not follow, or a
  * later "started" is a loss marker at that record, never silence. The records themselves stay valid
  * data (each passed its closed schema); a loss marks the GAP before a record.
  */
 export function verifyTickSummaryChain(points) {
+  // C2 review L6: walked in seq order (ts only breaks a tie), so a backward wall step between two
+  // records is never a spurious prev_mismatch. seq never decreases across a restart (lastSeq + 1).
+  const seqOf = (point) => {
+    const seq = Number(point.attributes?.seq);
+    return Number.isSafeInteger(seq) ? seq : Number.MAX_SAFE_INTEGER;
+  };
   const summaries = (points ?? []).filter((p) => p?.fact_name === TICK_SUMMARY_FACT_NAME)
-    .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+    .sort((a, b) => seqOf(a) - seqOf(b) || Date.parse(a.ts) - Date.parse(b.ts));
   const records = [];
   const losses = [];
   let previous;

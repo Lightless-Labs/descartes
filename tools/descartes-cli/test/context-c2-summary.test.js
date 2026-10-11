@@ -305,6 +305,18 @@ test("summary_valid_after_source_byte_eviction and summary_own_chain_break_is_lo
   assert.equal(tickSummaryDigest(read.points[0]), ticks[0].summary.digest, "the digest is recomputable from the stored record");
 });
 
+test("C2 review L6: the chain is walked in seq order, so a small backward clock step between records is no loss", () => {
+  // The third record's ts is 30 s BEFORE the second's (a backward wall step); its seq still follows.
+  const ticks = chainTicks([
+    tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1000 }),
+    tick({ ms: T0 + HOUR, sessions: { a: 1 }, uptimeMs: 1000 + HOUR }),
+    tick({ ms: T0 + HOUR - 30_000, sessions: { a: 1 }, uptimeMs: 1000 + 2 * HOUR }),
+  ]);
+  const points = ticks.map(({ summary }) => summary.point);
+  assert.deepEqual(verifyTickSummaryChain(points).losses, []);
+  assert.deepEqual(verifyTickSummaryChain([...points].reverse()).losses, [], "input order does not matter");
+});
+
 test("C2 chain state: ledger-stamped like a seen-set; a mismatched pass, a pending pass, another key or any shape error is not valid", async () => {
   const paths = await tempPaths();
   const [{ summary }] = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1 })]);
