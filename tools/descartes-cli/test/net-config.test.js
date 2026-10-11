@@ -111,7 +111,7 @@ test("HIGH 2 reproduction: malformed route output makes the collector partial an
     runFixedExecFile: async () => ({ status: "ok", stdout: "MALFORMED\n", stderr: "" }),
   });
   assert.equal(result.result.status, "partial");
-  assert.equal(result.result.route.state, "unable");
+  assert.equal(result.result.route.state, "partial");
   const [point] = factPointsFromNetConfigEvidence([result], { ts: "2026-10-11T10:00:00.000Z", hmacKey: Buffer.alloc(CONTEXT_KEY_BYTES, 7) });
   assert.equal(point.attributes.fingerprint_hmac, "unknown");
 });

@@ -69,12 +69,14 @@ export function parseNetstatDefaultRoutes(stdout) {
   if (typeof stdout !== "string") return undefined;
   const routes = [];
   for (const rawLine of stdout.split("\n")) {
-    const tokens = rawLine.trim().split(/\s+/);
-    if (tokens[0] !== "default") continue;
+    const line = rawLine.trim();
+    if (!line || /^Routing tables$/i.test(line) || /^Internet(?:6)?\s*:$/i.test(line) || /^Destination\s+Gateway\s+Flags\s+Netif(?:\s+Expire)?$/i.test(line)) continue;
+    const tokens = line.split(/\s+/);
     if (tokens.length < 4) return undefined;
-    const iface = tokens[3];
-    if (!IFACE_RE.test(iface) || !(IPV4_RE.test(tokens[1]) || /^link#[0-9]+$/.test(tokens[1]))) return undefined;
-    routes.push({ gateway: IPV4_RE.test(tokens[1]) ? tokens[1] : undefined, iface });
+    const [destination, gateway, flags, iface, ...extra] = tokens;
+    if (!destination || !(IPV4_RE.test(gateway) || /^link#[0-9]+$/.test(gateway)) || !/^[A-Za-z]+$/.test(flags) || !IFACE_RE.test(iface)) return undefined;
+    if (extra.some((token) => !/^[0-9]+$/.test(token))) return undefined;
+    if (destination === "default") routes.push({ gateway: IPV4_RE.test(gateway) ? gateway : undefined, iface });
   }
   return routes;
 }
@@ -85,11 +87,30 @@ export function parseIpRouteDefault(stdout) {
   const routes = [];
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
-    if (!/^default(?:\s|$)/.test(line)) continue;
-    const dev = /\bdev\s+(\S+)/.exec(line)?.[1];
-    const via = /\bvia\s+(\S+)/.exec(line)?.[1];
-    if (!dev || !IFACE_RE.test(dev) || (via !== undefined && !IPV4_RE.test(via))) return undefined;
-    routes.push({ gateway: via && IPV4_RE.test(via) ? via : undefined, iface: dev });
+    if (!line) continue;
+    const tokens = line.split(/\s+/);
+    if (tokens[0] !== "default") return undefined;
+    let dev;
+    let via;
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      const value = tokens[index + 1];
+      if (["via", "dev", "proto", "scope", "src", "metric", "mtu", "advmss", "pref", "table", "realm", "onlink"].includes(token)) {
+        if (token === "onlink") continue;
+        if (!value || ["via", "dev", "proto", "scope", "src", "metric", "mtu", "advmss", "pref", "table", "realm", "onlink"].includes(value)) return undefined;
+        if (token === "via" && !IPV4_RE.test(value)) return undefined;
+        if (token === "dev" && !IFACE_RE.test(value)) return undefined;
+        if (["metric", "mtu", "advmss", "pref", "table"].includes(token) && !/^[0-9]+$/.test(value)) return undefined;
+        if (token === "src" && !IPV4_RE.test(value)) return undefined;
+        if (token === "via") via = value;
+        if (token === "dev") dev = value;
+        index += 1;
+        continue;
+      }
+      return undefined;
+    }
+    if (!dev) return undefined;
+    routes.push({ gateway: via, iface: dev });
   }
   return routes;
 }
@@ -327,7 +348,7 @@ async function readDarwin(runExec, options) {
   const routesProbe = await runProbe("netstat", ["-rn", "-f", "inet"]);
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
   const parsedRoutes = parseNetstatDefaultRoutes(routesProbe.stdout);
-  if (!parsedRoutes) return { route: { state: "unable", kind: "unknown" } };
+  if (!parsedRoutes) return { route: { state: "partial", kind: "unknown" } };
   const chosen = choosePhysicalDefault(parsedRoutes);
   if (chosen.state !== "ok" || chosen.tunnel_only) return { route: chosen };
   const { iface, gateway } = chosen;
@@ -404,7 +425,7 @@ async function readLinux(runExec, options) {
   const routesProbe = await runProbe("ip", ["route", "show", "default"]);
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
   const parsedRoutes = parseIpRouteDefault(routesProbe.stdout);
-  if (!parsedRoutes) return { route: { state: "unable", kind: "unknown" } };
+  if (!parsedRoutes) return { route: { state: "partial", kind: "unknown" } };
   const chosen = choosePhysicalDefault(parsedRoutes);
   if (chosen.state !== "ok" || chosen.tunnel_only) return { route: chosen };
   const { iface, gateway } = chosen;

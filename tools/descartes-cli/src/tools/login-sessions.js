@@ -34,6 +34,17 @@ export const MAX_LOGIN_RECORDS = 256;
 export const MAX_LOGINCTL_SESSIONS = 64;
 const LOGINCTL_PROPERTIES = ["Id", "Name", "Remote", "RemoteHost", "Service", "Type", "Class", "TTY", "State", "IdleHint", "LockedHint"];
 
+function loginctlSessionBlocksMatchRequest(sessions, requestedIds) {
+  if (!sessions.every((session) => LOGINCTL_PROPERTIES.every((property) => Object.prototype.hasOwnProperty.call(session, property)))) return false;
+  const returnedIds = sessions.map((session) => session.Id);
+  if (returnedIds.some((id) => typeof id !== "string" || id.length === 0)) return false;
+  const requested = new Set(requestedIds);
+  const returned = new Set(returnedIds);
+  return returnedIds.length === requestedIds.length
+    && returned.size === requested.size
+    && [...requested].every((id) => returned.has(id));
+}
+
 async function defaultRunFixedExecFile(command, args, options = {}) {
   return runResolvedExecFile(command, args, {
     ...options,
@@ -318,7 +329,15 @@ async function runLoginctl(runExec, options) {
   const show = await runExec("loginctl", args, probeOptions(options));
   if (show.status !== "ok") return { state: failureState(show), sessions: [] };
   const sessions = parseLoginctlShowSession(show.stdout);
-  return { state: parsedIds.malformed_count > 0 || sessions.malformed_count > 0 || allIds.length > ids.length || sessions.length !== ids.length ? "partial" : "ok", sessions, malformed_count: parsedIds.malformed_count + (sessions.malformed_count ?? 0) };
+  const showComplete = sessions.malformed_count === 0 && loginctlSessionBlocksMatchRequest(sessions, ids);
+  const complete = parsedIds.malformed_count === 0
+    && allIds.length === ids.length
+    && showComplete;
+  return {
+    state: complete ? "ok" : "partial",
+    sessions: showComplete ? sessions : [],
+    malformed_count: parsedIds.malformed_count + (sessions.malformed_count ?? 0),
+  };
 }
 
 function boolHint(value) {
