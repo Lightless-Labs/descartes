@@ -166,6 +166,29 @@ test("B2: Linux iproute2 kernel_ra output is recognized as router-advertised evi
   ), { state: "ok", prefixes: ["2001:db8:1:2::/64"] });
 });
 
+test("B2 regression: Linux inet6 accepts documented address flags and address protocols", () => {
+  const realShape = "inet6 2001:db8:1:2::1234/64 scope global dynamic mngtmpaddr noprefixroute proto kernel_ra";
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(realShape), {
+    state: "ok",
+    prefixes: ["2001:db8:1:2::/64"],
+  });
+  const documentedFlags = [
+    "secondary", "temporary", "nodad", "optimistic", "dadfailed", "home", "deprecated",
+    "tentative", "permanent", "dynamic", "mngtmpaddr", "noprefixroute", "autojoin", "stable-privacy",
+  ].join(" ");
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(
+    `inet6 2001:db8:1:2::1234/64 scope global ${documentedFlags} proto kernel_ra`,
+  ), { state: "ok", prefixes: ["2001:db8:1:2::/64"] });
+  for (const proto of ["kernel_lo", "kernel_ra", "kernel_ll"]) {
+    const parsed = parseLinuxRouterAdvertisementPrefixes(
+      `inet6 2001:db8:1:2::1234/64 scope global dynamic mngtmpaddr proto ${proto}`,
+    );
+    assert.notEqual(parsed.state, "partial", `documented proto ${proto} must be syntactically accepted`);
+  }
+  assert.equal(parseLinuxRouterAdvertisementPrefixes(`${realShape} UNKNOWN_FLAG`).state, "partial");
+  assert.equal(parseLinuxRouterAdvertisementPrefixes(realShape.replace("kernel_ra", "unknown_proto")).state, "partial");
+});
+
 test("B2: macOS ra_prefix comes only from ndp router-advertisement prefix records, with their observed length", () => {
   const ndp = "2001:db8:abcd:12::/56 if=en0 flags=LAO vltime=infinity, pltime=infinity, expire=Never, ref=1\n  No advertising router\n";
   assert.deepEqual(parseNdpRouterAdvertisementPrefixes(ndp, "en0"), ["2001:db8:abcd::/56"]);
