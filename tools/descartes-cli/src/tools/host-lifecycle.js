@@ -137,14 +137,25 @@ function runtimeClocks(options) {
   const hrtimeFn = options.hrtimeFn ?? (() => process.hrtime.bigint());
   const uptimeFn = options.uptimeFn ?? os.uptime;
   let uptime;
+  let hrtime;
   try {
-    uptime = Number(uptimeFn());
+    const value = uptimeFn();
+    uptime = typeof value === "number" && Number.isFinite(value) ? value : Number.NaN;
   } catch {
     uptime = Number.NaN;
   }
+  try {
+    const value = hrtimeFn();
+    hrtime = typeof value === "bigint"
+      ? value.toString()
+      : typeof value === "string" && /^[0-9]{1,30}$/.test(value) ? value : undefined;
+  } catch {
+    hrtime = undefined;
+  }
+  const wallMs = nowFn();
   return {
-    wall_ms: nowFn(),
-    uv_hrtime_ns: String(hrtimeFn()),
+    wall_ms: typeof wallMs === "number" && Number.isFinite(wallMs) ? wallMs : undefined,
+    uv_hrtime_ns: hrtime,
     uv_version: versionTokenOrUndefined(options.uvVersion ?? process.versions.uv),
     os_uptime_ms: Number.isFinite(uptime) && uptime >= 0 ? Math.round(uptime * 1000) : undefined,
   };

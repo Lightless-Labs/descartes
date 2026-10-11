@@ -70,8 +70,8 @@ export function observationInterval(envelope) {
     return { obsStartMs: stamped.start_ms, obsEndMs: stamped.end_ms };
   }
   const endMs = Date.parse(envelope?.trace?.ts ?? "");
-  const latency = Number(envelope?.trace?.latency_ms);
-  if (Number.isFinite(endMs) && Number.isFinite(latency) && latency >= 0) {
+  const latency = envelope?.trace?.latency_ms;
+  if (Number.isFinite(endMs) && typeof latency === "number" && Number.isFinite(latency) && latency >= 0) {
     return { obsStartMs: Math.max(0, Math.round(endMs - latency)), obsEndMs: Math.round(endMs) };
   }
   return { obsStartMs: undefined, obsEndMs: undefined };
