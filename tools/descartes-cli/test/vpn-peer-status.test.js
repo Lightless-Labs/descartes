@@ -188,6 +188,28 @@ test("HIGH 2 reproduction: exactly 50 last rows exhaust the shared cap, mark ssh
   assert.ok(points.some((point) => point.attributes.overflow === "true"));
 });
 
+test("HIGH 2 regression: a reboot row still exhausts the raw last cap and engages the correlation overflow veto", async () => {
+  const remoteRows = Array.from({ length: DEFAULT_LAST_HISTORY_LIMIT - 1 }, (_, index) =>
+    `user${index} pts/${index} host-${index}.example Sun Oct 11 12:00 still logged in`).join("\n");
+  const rebootRow = "reboot   system boot  6.1.0  Sun Oct 11 00:00";
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["last", "-n", String(DEFAULT_LAST_HISTORY_LIMIT)])]: ok(`${remoteRows}\n${rebootRow}\n`),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_last.status, "partial");
+  assert.equal(envelope.result.sources.ssh_last.truncated, true);
+  assert.equal(envelope.result.truncated, true);
+
+  const { factPointsFromVpnPeerEvidence } = await import("../src/fact-translators.js");
+  const { findQualifyingPeerObservations } = await import("../src/incident-correlation.js");
+  const points = factPointsFromVpnPeerEvidence([envelope], { ts: "2026-10-11T12:00:00.000Z" });
+  const overflow = points.find((point) => point.attributes.overflow === "true");
+  assert.ok(overflow, "raw-cap exhaustion must emit the peer overflow marker");
+  assert.deepEqual(findQualifyingPeerObservations(points, { first_seen_ms: Date.parse("2026-10-11T12:00:00.000Z") }), []);
+});
+
 // ---------------------------------------------------------------------------------------------
 // WireGuard parsers
 // ---------------------------------------------------------------------------------------------
