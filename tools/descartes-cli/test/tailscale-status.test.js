@@ -308,6 +308,20 @@ test("C0.3: Running without a Peer map is NOT an ok zero-peer tick for the peer 
   assert.equal(envelope.result.tailnet.self_online, true);
 });
 
+test("B3 daybreak reproduction: one malformed Peer entry invalidates the whole population and makes exit-node use unknown", async () => {
+  const malformed = JSON.stringify({ BackendState: "Running", Peer: { bad: { Online: true } }, Self: { Online: true } });
+  const parsed = parseTailscaleStatusJson(malformed);
+  assert.equal(parsed.peer_map_valid, false);
+  assert.deepEqual(parsed.peers, []);
+  assert.equal(parsed.tailnet.exit_node_in_use, undefined);
+
+  const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(malformed))) });
+  assert.equal(envelope.result.status, "unable");
+  assert.equal(envelope.result.total_count, 0);
+  assert.deepEqual(envelope.result.peers, []);
+  assert.equal(envelope.result.tailnet.exit_node_in_use, undefined);
+});
+
 test("C0.3: an unrecognized BackendState keeps the peer envelope unable and records the raw state for the translator to classify", async () => {
   const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(JSON.stringify({ BackendState: "Weird", Peer: {} })))) });
   assert.equal(envelope.result.status, "unable");
