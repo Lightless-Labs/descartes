@@ -1339,7 +1339,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // conjunct needs at tick precision; it is one small atomic write.
           const probeCapMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms) ? structuralProfile.context_collector_deadline_ms : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
           const BOUNDARY_PROBE_TIMED_OUT = Symbol("boundary-probe-timed-out");
-          bootProbeBefore = await withDeadline(Promise.resolve().then(() => probeHost(collectorOptions)), probeCapMs, () => BOUNDARY_PROBE_TIMED_OUT);
+          const boundaryController = new AbortController();
+          bootProbeBefore = await withDeadline(
+            Promise.resolve().then(() => probeHost({ ...collectorOptions, signal: boundaryController.signal })),
+            probeCapMs,
+            () => {
+              boundaryController.abort();
+              return BOUNDARY_PROBE_TIMED_OUT;
+            },
+          );
           if (bootProbeBefore === BOUNDARY_PROBE_TIMED_OUT) {
             bootProbeBefore = undefined;
             throw new Error("boundary_probe_deadline_exceeded");
