@@ -32,7 +32,7 @@ const execFileAsync = promisify(execFile);
 const IFACE_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,14}$/;
 const IPV4_RE = /^(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$/;
 const MAC_RE = /^[0-9A-Fa-f]{1,2}(?::[0-9A-Fa-f]{1,2}){5}$/;
-const DOMAIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252})$/;
+const DOMAIN_RE = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$/;
 const TUNNEL_IFACE_RE = /^(utun|ipsec|ppp|tun|tap|wg|gif|stf|tailscale|zt|vpn|nordlynx|proton)/;
 const MAGIC_DNS = new Set(["100.100.100.100", "fd7a:115c:a1e0::53"]);
 
@@ -66,12 +66,14 @@ export function isTunnelInterface(iface) {
 
 /** `netstat -rn -f inet` -> [{ gateway, iface }] for every default route, in table order. */
 export function parseNetstatDefaultRoutes(stdout) {
+  if (typeof stdout !== "string") return undefined;
   const routes = [];
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const tokens = rawLine.trim().split(/\s+/);
-    if (tokens[0] !== "default" || tokens.length < 4) continue;
+    if (tokens[0] !== "default") continue;
+    if (tokens.length < 4) return undefined;
     const iface = tokens[3];
-    if (!IFACE_RE.test(iface)) continue;
+    if (!IFACE_RE.test(iface) || !(IPV4_RE.test(tokens[1]) || /^link#[0-9]+$/.test(tokens[1]))) return undefined;
     routes.push({ gateway: IPV4_RE.test(tokens[1]) ? tokens[1] : undefined, iface });
   }
   return routes;
@@ -79,13 +81,14 @@ export function parseNetstatDefaultRoutes(stdout) {
 
 /** `ip route show default` -> [{ gateway, iface }]. */
 export function parseIpRouteDefault(stdout) {
+  if (typeof stdout !== "string") return undefined;
   const routes = [];
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
-    if (!line.startsWith("default")) continue;
+    if (!/^default(?:\s|$)/.test(line)) continue;
     const dev = /\bdev\s+(\S+)/.exec(line)?.[1];
     const via = /\bvia\s+(\S+)/.exec(line)?.[1];
-    if (!dev || !IFACE_RE.test(dev)) continue;
+    if (!dev || !IFACE_RE.test(dev) || (via !== undefined && !IPV4_RE.test(via))) return undefined;
     routes.push({ gateway: via && IPV4_RE.test(via) ? via : undefined, iface: dev });
   }
   return routes;
@@ -101,8 +104,10 @@ export function choosePhysicalDefault(routes) {
 
 /** `ifconfig -v <if>`: "type: Wi-Fi|Ethernet|Cellular|..." and global inet6 addresses. */
 export function parseIfconfigVerbose(stdout) {
-  const text = String(stdout ?? "");
-  const type = /^\s*type:\s*(.+?)\s*$/m.exec(text)?.[1];
+  if (typeof stdout !== "string") return undefined;
+  const typeLines = stdout.split("\n").filter((line) => /^\s*type\s*:/i.test(line));
+  if (typeLines.some((line) => !/^\s*type\s*:\s*\S.*$/i.test(line)) || typeLines.length > 1) return undefined;
+  const type = /^\s*type:\s*(.+?)\s*$/m.exec(stdout)?.[1];
   const kind = !type ? "unknown"
     : /wi-?fi|802\.11|airport/i.test(type) ? "wifi"
       : /^ethernet$/i.test(type) ? "ethernet"
@@ -172,16 +177,19 @@ export function globalPrefix64(address) {
  * deliberately unable rather than converted to a guessed /64.
  */
 export function parseLinuxRouterAdvertisementPrefixes(stdout) {
+  if (typeof stdout !== "string") return { state: "unable", prefixes: [] };
   const prefixes = new Set();
   let sawGlobalAddress = false;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
+    if (/\binet6\b/.test(rawLine) && !/\binet6\s+[^\s/]+\/\d+\s+.+$/.test(rawLine.trim())) return { state: "unable", prefixes: [] };
     const match = /\binet6\s+([^\s/]+)\/(\d+)\s+(.+)$/.exec(rawLine.trim());
     if (!match) continue;
     const [, address, lengthText, flags] = match;
     const prefixLength = Number(lengthText);
-    if (!isGlobalIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) continue;
+    if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return { state: "unable", prefixes: [] };
+    if (!isGlobalIpv6(address)) continue;
     sawGlobalAddress = true;
-    if (/\bproto\s+ra\b/.test(flags) && /\b(?:dynamic|mngtmpaddr)\b/.test(flags)) {
+    if (/\bproto\s+(?:ra|kernel_ra)\b/.test(flags) && /\b(?:dynamic|mngtmpaddr)\b/.test(flags)) {
       const prefix = canonicalIpv6Prefix(address, prefixLength);
       if (prefix) prefixes.add(prefix);
     }
@@ -192,12 +200,15 @@ export function parseLinuxRouterAdvertisementPrefixes(stdout) {
 
 /** `ndp -p` -> sorted unique global prefixes for the selected interface, preserving /len. */
 export function parseNdpRouterAdvertisementPrefixes(stdout, iface) {
+  if (typeof stdout !== "string") return undefined;
   const prefixes = new Set();
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
+    if (/\//.test(rawLine) && !/^\s*[^\s/]+\/\d+\s+if=[^\s]+/.test(rawLine)) return undefined;
     const match = /^\s*([^\s/]+)\/(\d+)\s+if=([^\s]+)/.exec(rawLine);
     if (!match || match[3] !== iface) continue;
     const address = match[1];
     const prefixLength = Number(match[2]);
+    if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return undefined;
     if (!isGlobalIpv6(address)) continue;
     const prefix = canonicalIpv6Prefix(address, prefixLength);
     if (prefix) prefixes.add(prefix);
@@ -212,19 +223,54 @@ export function parseIpAddrInet6(stdout) {
 
 /** `arp -n <gw>` / `ip neigh show <gw> dev <if>` -> the lowercased MAC, or undefined (incomplete). */
 export function parseNeighborMac(stdout) {
-  const text = String(stdout ?? "");
-  const match = /\bat\s+([0-9A-Fa-f:]{11,17})\b/.exec(text) ?? /\blladdr\s+([0-9A-Fa-f:]{11,17})\b/.exec(text);
-  return match && MAC_RE.test(match[1]) ? match[1].toLowerCase().split(":").map((p) => p.padStart(2, "0")).join(":") : undefined;
+  return parseNeighborMacStrict(stdout).value;
+}
+
+function parseNeighborMacStrict(stdout) {
+  if (typeof stdout !== "string") return { valid: false, value: undefined };
+  let value;
+  for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const at = /\bat\s+(\S+)/.exec(line)?.[1];
+    const lladdr = /\blladdr\s+(\S+)/.exec(line)?.[1];
+    const candidate = at ?? lladdr;
+    if (candidate && candidate !== "(incomplete)") {
+      if (!MAC_RE.test(candidate)) return { valid: false, value: undefined };
+      value = candidate.toLowerCase().split(":").map((part) => part.padStart(2, "0")).join(":");
+      continue;
+    }
+    if (candidate === "(incomplete)" || /\b(?:INCOMPLETE|FAILED|NOARP)\b/i.test(line)) continue;
+    if (!(/^[?]\s+\([^)]*\)/.test(line) || /\bdev\s+\S+\b/.test(line))) return { valid: false, value: undefined };
+  }
+  return { valid: true, value };
+}
+
+function normalizeDnsServer(token) {
+  return token.replace(/%[A-Za-z0-9_.-]+$/, "").replace(/#[0-9]+$/, "");
+}
+
+function isDnsServer(token) {
+  if (typeof token !== "string" || !token) return false;
+  const normalized = normalizeDnsServer(token);
+  return IPV4_RE.test(normalized) || Boolean(expandIpv6(normalized)?.every((part) => /^[0-9a-f]{1,4}$/.test(part)));
 }
 
 /** `scutil --dns` -> nameservers of the resolvers scoped to `iface` (if_index : N (iface)), MagicDNS excluded. */
 export function parseScutilDnsForInterface(stdout, iface) {
+  if (typeof stdout !== "string") return undefined;
   const servers = new Set();
-  for (const block of String(stdout ?? "").split(/\n(?=resolver #)/)) {
+  for (const block of stdout.split(/\n(?=resolver #)/)) {
+    const scopeLine = block.split("\n").find((line) => /if_index/i.test(line));
+    if (scopeLine && !/if_index\s*:\s*[0-9]+\s*\(([^)]+)\)/.test(scopeLine)) return undefined;
     const scope = /if_index\s*:\s*[0-9]+\s*\(([^)]+)\)/.exec(block)?.[1];
     if (scope !== iface) continue;
-    for (const match of block.matchAll(/nameserver\[[0-9]+\]\s*:\s*(\S+)/g)) {
-      if (!MAGIC_DNS.has(match[1])) servers.add(match[1]);
+    for (const line of block.split("\n")) {
+      if (!/nameserver\[/i.test(line)) continue;
+      const match = /nameserver\[[0-9]+\]\s*:\s*(\S+)/i.exec(line);
+      if (!match || !isDnsServer(match[1])) return undefined;
+      const server = normalizeDnsServer(match[1]);
+      if (!MAGIC_DNS.has(server)) servers.add(server);
     }
   }
   return [...servers].sort();
@@ -232,13 +278,18 @@ export function parseScutilDnsForInterface(stdout, iface) {
 
 /** `resolvectl dns <if>` -> "Link 2 (eth0): 1.1.1.1 9.9.9.9" -> sorted servers, MagicDNS excluded. */
 export function parseResolvectlDns(stdout) {
+  if (typeof stdout !== "string") return undefined;
   const servers = new Set();
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
+    if (/^\s*Link\b/.test(rawLine) && !/^\s*Link\s+[0-9]+\s+\([^)]*\):(?:\s+.*)?$/.test(rawLine)) return undefined;
     const colon = rawLine.indexOf("):");
     if (colon < 0) continue;
-    for (const token of rawLine.slice(colon + 2).trim().split(/\s+/)) {
-      const server = token.replace(/%.*$/, "").replace(/#.*$/, "");
-      if (server && !MAGIC_DNS.has(server)) servers.add(server);
+    const rest = rawLine.slice(colon + 2).trim();
+    if (!rest) continue;
+    for (const token of rest.split(/\s+/)) {
+      if (!isDnsServer(token)) return undefined;
+      const server = normalizeDnsServer(token);
+      if (!MAGIC_DNS.has(server)) servers.add(server);
     }
   }
   return [...servers].sort();
@@ -249,44 +300,53 @@ function listComponent(values, state = "ok") {
 }
 
 function parseNmcliDomains(stdout, { lease = false } = {}) {
+  if (typeof stdout !== "string") return undefined;
   const values = [];
-  for (const rawLine of String(stdout ?? "").split(/[\n|]/)) {
+  for (const rawLine of stdout.split(/[\n|]/)) {
     const line = rawLine.trim();
     if (!line) continue;
     const value = lease ? /^domain_name\s*=\s*(.*)$/i.exec(line)?.[1] : line;
     if (value === undefined) continue;
-    for (const domain of value.split(/[,\s]+/).map((item) => item.trim().toLowerCase()).filter(Boolean)) {
-      if (DOMAIN_RE.test(domain)) values.push(domain);
+    const domains = value.trim() ? value.split(/[,\s]+/).map((item) => item.trim().toLowerCase()) : [];
+    for (const domain of domains) {
+      if (!DOMAIN_RE.test(domain)) return undefined;
+      values.push(domain);
     }
   }
   return [...new Set(values)].sort();
 }
 
 async function readDarwin(runExec, options) {
-  const routesProbe = await runExec("netstat", ["-rn", "-f", "inet"], probeOptions(options));
+  const abortIfNeeded = () => { if (options.signal?.aborted) throw new Error("collector_aborted"); };
+  const runProbe = async (command, args) => { abortIfNeeded(); return runExec(command, args, probeOptions(options)); };
+  const routesProbe = await runProbe("netstat", ["-rn", "-f", "inet"]);
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
-  const chosen = choosePhysicalDefault(parseNetstatDefaultRoutes(routesProbe.stdout));
+  const parsedRoutes = parseNetstatDefaultRoutes(routesProbe.stdout);
+  if (!parsedRoutes) return { route: { state: "unable", kind: "unknown" } };
+  const chosen = choosePhysicalDefault(parsedRoutes);
   if (chosen.state !== "ok" || chosen.tunnel_only) return { route: chosen };
   const { iface, gateway } = chosen;
-  const ifconfigProbe = await runExec("ifconfig", ["-v", iface], probeOptions(options));
+  const ifconfigProbe = await runProbe("ifconfig", ["-v", iface]);
   const ifconfig = ifconfigProbe.status === "ok" ? parseIfconfigVerbose(ifconfigProbe.stdout) : undefined;
-  const route = { state: "ok", kind: ifconfig?.kind ?? "unknown", iface };
+  const route = { state: ifconfigProbe.status !== "ok" ? failureState(ifconfigProbe) : ifconfig ? "ok" : "unable", kind: ifconfig?.kind ?? "unknown", iface };
 
   let gatewayMac;
   if (!gateway) gatewayMac = { state: "absent" };
   else {
-    const arp = await runExec("arp", ["-n", gateway], probeOptions(options));
-    const mac = arp.status === "ok" ? parseNeighborMac(arp.stdout) : undefined;
+    const arp = await runProbe("arp", ["-n", gateway]);
+    const parsedMac = arp.status === "ok" ? parseNeighborMacStrict(arp.stdout) : { valid: true, value: undefined };
     // C0 review M6(a): the gateway exists, so a missing or incomplete neighbour entry (a cache miss
     // right after wake) is an unread value, never "absent".
-    gatewayMac = arp.status !== "ok" ? { state: failureState(arp) } : mac ? { state: "ok", value: mac } : { state: "unable" };
+    gatewayMac = arp.status !== "ok" ? { state: failureState(arp) } : !parsedMac.valid ? { state: "unable" } : parsedMac.value ? { state: "ok", value: parsedMac.value } : { state: "unable" };
   }
-  const ndpProbe = await runExec("ndp", ["-p"], probeOptions(options));
-  const raPrefix = ndpProbe.status === "ok"
-    ? listComponent(parseNdpRouterAdvertisementPrefixes(ndpProbe.stdout, iface))
+  const ndpProbe = await runProbe("ndp", ["-p"]);
+  const parsedNdp = ndpProbe.status === "ok" ? parseNdpRouterAdvertisementPrefixes(ndpProbe.stdout, iface) : undefined;
+  const raPrefix = ndpProbe.status === "ok" && parsedNdp !== undefined
+    ? listComponent(parsedNdp)
     : { state: failureState(ndpProbe) };
+  if (ndpProbe.status === "ok" && parsedNdp === undefined) raPrefix.state = "unable";
 
-  const domainProbe = await runExec("ipconfig", ["getoption", iface, "domain_name"], probeOptions(options));
+  const domainProbe = await runProbe("ipconfig", ["getoption", iface, "domain_name"]);
   let dhcpDomain;
   const domain = String(domainProbe.stdout ?? "").trim();
   if (domainProbe.status === "ok") dhcpDomain = DOMAIN_RE.test(domain) ? { state: "ok", value: domain.toLowerCase() } : domain ? { state: "unable" } : { state: "absent" };
@@ -294,8 +354,9 @@ async function readDarwin(runExec, options) {
   else if (domainProbe.code === 1 && !domain && !isBinaryNotFound(domainProbe) && !isBinaryUntrusted(domainProbe)) dhcpDomain = { state: "absent" };
   else dhcpDomain = { state: failureState(domainProbe) };
 
-  const dnsProbe = await runExec("scutil", ["--dns"], probeOptions(options));
-  const resolvers = dnsProbe.status === "ok" ? listComponent(parseScutilDnsForInterface(dnsProbe.stdout, iface)) : { state: failureState(dnsProbe) };
+  const dnsProbe = await runProbe("scutil", ["--dns"]);
+  const parsedDns = dnsProbe.status === "ok" ? parseScutilDnsForInterface(dnsProbe.stdout, iface) : undefined;
+  const resolvers = dnsProbe.status === "ok" && parsedDns !== undefined ? listComponent(parsedDns) : { state: dnsProbe.status === "ok" ? "unable" : failureState(dnsProbe) };
   return {
     route,
     components: {
@@ -319,7 +380,9 @@ async function linuxKind(iface, readFile, stat) {
     return "bridge";
   } catch { /* not a bridge */ }
   try {
-    const type = Number(String(await readFile(`${base}/type`, "utf8")).trim());
+    const typeText = await readFile(`${base}/type`, "utf8");
+    if (typeof typeText !== "string" || !/^[0-9]+$/.test(typeText.trim())) return "unknown";
+    const type = Number(typeText.trim());
     if (type === 1) return "ethernet";
     if (type === 772) return "loopback";
     if (type === 65534) return "tunnel";
@@ -331,9 +394,13 @@ async function linuxKind(iface, readFile, stat) {
 async function readLinux(runExec, options) {
   const readFile = options.readFile ?? fs.readFile;
   const stat = options.stat ?? fs.stat;
-  const routesProbe = await runExec("ip", ["route", "show", "default"], probeOptions(options));
+  const abortIfNeeded = () => { if (options.signal?.aborted) throw new Error("collector_aborted"); };
+  const runProbe = async (command, args) => { abortIfNeeded(); return runExec(command, args, probeOptions(options)); };
+  const routesProbe = await runProbe("ip", ["route", "show", "default"]);
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
-  const chosen = choosePhysicalDefault(parseIpRouteDefault(routesProbe.stdout));
+  const parsedRoutes = parseIpRouteDefault(routesProbe.stdout);
+  if (!parsedRoutes) return { route: { state: "unable", kind: "unknown" } };
+  const chosen = choosePhysicalDefault(parsedRoutes);
   if (chosen.state !== "ok" || chosen.tunnel_only) return { route: chosen };
   const { iface, gateway } = chosen;
   const route = { state: "ok", kind: await linuxKind(iface, readFile, stat), iface };
@@ -341,27 +408,32 @@ async function readLinux(runExec, options) {
   let gatewayMac;
   if (!gateway) gatewayMac = { state: "absent" };
   else {
-    const neigh = await runExec("ip", ["neigh", "show", gateway, "dev", iface], probeOptions(options));
-    const mac = neigh.status === "ok" ? parseNeighborMac(neigh.stdout) : undefined;
+    const neigh = await runProbe("ip", ["neigh", "show", gateway, "dev", iface]);
+    const parsedMac = neigh.status === "ok" ? parseNeighborMacStrict(neigh.stdout) : { valid: true, value: undefined };
     // C0 review M6(a): empty output, INCOMPLETE or FAILED for an existing gateway is unread, not absent.
-    gatewayMac = neigh.status !== "ok" ? { state: failureState(neigh) } : mac ? { state: "ok", value: mac } : { state: "unable" };
+    gatewayMac = neigh.status !== "ok" ? { state: failureState(neigh) } : !parsedMac.valid ? { state: "unable" } : parsedMac.value ? { state: "ok", value: parsedMac.value } : { state: "unable" };
   }
-  const addr = await runExec("ip", ["-6", "addr", "show", "dev", iface, "scope", "global"], probeOptions(options));
+  const addr = await runProbe("ip", ["-6", "addr", "show", "dev", iface, "scope", "global"]);
   const raPrefixes = addr.status === "ok" ? parseLinuxRouterAdvertisementPrefixes(addr.stdout) : undefined;
   const raPrefix = addr.status !== "ok" ? { state: failureState(addr) } : raPrefixes.state === "ok" ? listComponent(raPrefixes.prefixes) : { state: raPrefixes.state };
 
-  const configuredProbe = await runExec("nmcli", ["-g", "IP4.DOMAIN", "device", "show", iface], probeOptions(options));
-  const configuredSearchDomain = configuredProbe.status === "ok"
-    ? listComponent(parseNmcliDomains(configuredProbe.stdout))
+  const configuredProbe = await runProbe("nmcli", ["-g", "IP4.DOMAIN", "device", "show", iface]);
+  const configuredDomains = configuredProbe.status === "ok" ? parseNmcliDomains(configuredProbe.stdout) : undefined;
+  const configuredSearchDomain = configuredProbe.status === "ok" && configuredDomains !== undefined
+    ? listComponent(configuredDomains)
     : { state: failureState(configuredProbe) };
+  if (configuredProbe.status === "ok" && configuredDomains === undefined) configuredSearchDomain.state = "unable";
   // IP4.DOMAIN is NetworkManager's effective configuration, not lease provenance. Read the
   // DHCP option namespace separately; an IP4.DOMAIN value must never be copied into dhcp_domain.
-  const dhcpProbe = await runExec("nmcli", ["-g", "DHCP4.OPTION", "device", "show", iface], probeOptions(options));
-  const dhcpDomain = dhcpProbe.status === "ok"
-    ? listComponent(parseNmcliDomains(dhcpProbe.stdout, { lease: true }))
+  const dhcpProbe = await runProbe("nmcli", ["-g", "DHCP4.OPTION", "device", "show", iface]);
+  const dhcpDomains = dhcpProbe.status === "ok" ? parseNmcliDomains(dhcpProbe.stdout, { lease: true }) : undefined;
+  const dhcpDomain = dhcpProbe.status === "ok" && dhcpDomains !== undefined
+    ? listComponent(dhcpDomains)
     : { state: failureState(dhcpProbe) };
-  const dns = await runExec("resolvectl", ["dns", iface], probeOptions(options));
-  const resolvers = dns.status === "ok" ? listComponent(parseResolvectlDns(dns.stdout)) : { state: failureState(dns) };
+  if (dhcpProbe.status === "ok" && dhcpDomains === undefined) dhcpDomain.state = "unable";
+  const dns = await runProbe("resolvectl", ["dns", iface]);
+  const parsedDns = dns.status === "ok" ? parseResolvectlDns(dns.stdout) : undefined;
+  const resolvers = dns.status === "ok" && parsedDns !== undefined ? listComponent(parsedDns) : { state: dns.status === "ok" ? "unable" : failureState(dns) };
   return {
     route,
     components: {
