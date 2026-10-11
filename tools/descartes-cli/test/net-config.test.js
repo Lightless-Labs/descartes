@@ -7,6 +7,8 @@ import {
   isTunnelInterface,
   parseIfconfigVerbose,
   parseIpAddrInet6,
+  parseLinuxRouterAdvertisementPrefixes,
+  parseNdpRouterAdvertisementPrefixes,
   parseIpRouteDefault,
   parseNeighborMac,
   parseNetstatDefaultRoutes,
@@ -95,6 +97,38 @@ test("C0.5 parsers (linux formats)", () => {
   assert.equal(globalPrefix64("fe80::1"), undefined);
   assert.equal(globalPrefix64("fd7a:115c:a1e0::1"), undefined, "ULA is not a router-advertised global prefix");
   assert.equal(globalPrefix64("not-an-address"), undefined);
+});
+
+test("B2: Linux ra_prefix preserves the observed RA prefix length and rejects static addresses", () => {
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(
+    "    inet6 2001:db8:1:2::1234/48 scope global dynamic mngtmpaddr proto ra\n",
+  ), { state: "ok", prefixes: ["2001:db8:1::/48"] });
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(
+    "    inet6 2001:db8:1:2::1234/128 scope global\n",
+  ), { state: "unable", prefixes: [] });
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(""), { state: "absent", prefixes: [] });
+});
+
+test("B2: macOS ra_prefix comes only from ndp router-advertisement prefix records, with their observed length", () => {
+  const ndp = "2001:db8:abcd:12::/56 if=en0 flags=LAO vltime=infinity, pltime=infinity, expire=Never, ref=1\n  No advertising router\n";
+  assert.deepEqual(parseNdpRouterAdvertisementPrefixes(ndp, "en0"), ["2001:db8:abcd::/56"]);
+  assert.deepEqual(parseNdpRouterAdvertisementPrefixes("fd7a:115c:a1e0::/48 if=utun4 flags=LSO\n  No advertising router\n", "en0"), []);
+});
+
+test("B2 reproduction: a static Linux /128 never becomes a guessed /64 ra_prefix", async () => {
+  const result = await readNetConfig({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({
+      "ip route show default": ok("default via 192.168.1.1 dev eth0 proto dhcp\n"),
+      "ip neigh show 192.168.1.1 dev eth0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
+      "ip -6 addr show dev eth0 scope global": ok("    inet6 2001:db8:1:2::1234/128 scope global\n"),
+      "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
+    }),
+  });
+  assert.deepEqual(result.components.ra_prefix, { state: "unable" });
+  assert.equal(result.components.ra_prefix.value, undefined);
 });
 
 test("C0.5 darwin collector: fixed argv per component, through the resolver; the tunnel default route is never the physical interface", async () => {
