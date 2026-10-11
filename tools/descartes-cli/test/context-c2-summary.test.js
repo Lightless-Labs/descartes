@@ -499,8 +499,14 @@ test("C2 context_stats T8: at most one episode and one daily record per tick, at
       return Buffer.byteLength(`${JSON.stringify(record)}\n`);
     };
     const longestField = Object.keys(schema.fields).sort((a, b) => b.length - a.length)[0];
-    return Math.max(size(attributes), size(unableContextAttributes(name, { rejectedField: longestField })));
+    // C2 review L1: a rejected record also carries enforceContextSchema's confidence:0.
+    const unable = (attrs) => {
+      const record = normalizeFactPoint({ ts: "2026-10-11T00:00:00.000Z", fact_name: "x".repeat(name.length), entity_key: `${name}.4294967296`, attributes: attrs, confidence: 0 });
+      record.fact_name = name;
+      return Buffer.byteLength(`${JSON.stringify(record)}\n`);
+    };
+    return Math.max(size(attributes), unable(unableContextAttributes(name, { rejectedField: longestField })));
   };
-  assert.deepEqual([exact("stats.episode"), exact("stats.daily")], [516, 427], "a schema change must revisit the context_stats tick shape");
-  assert.equal(FAMILY_TICK_SHAPES.get("context_stats").worstTickBytes, 516 + 427);
+  assert.deepEqual([exact("stats.episode"), exact("stats.daily")], [531, 442], "a schema change must revisit the context_stats tick shape");
+  assert.equal(FAMILY_TICK_SHAPES.get("context_stats").worstTickBytes, 531 + 442);
 });
