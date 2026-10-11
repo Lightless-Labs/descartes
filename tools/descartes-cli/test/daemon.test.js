@@ -560,7 +560,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "net-config", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
   assert.deepEqual(profile.structural.boundary_census, { enabled: true });
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
@@ -6404,4 +6404,33 @@ test("C0.4 wiring: a login is written once, at its first-observed structural tic
   assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 1, "a repeated sighting is not a repeated login");
   assert.equal(points.filter((p) => p.fact_name === "session.login_census").length, 2);
   assert.deepEqual(points.filter((p) => p.fact_name === "session.login_census").map((p) => p.attributes.dedupe_state), ["reseeded", "fresh"]);
+});
+
+test("C0.5 wiring: net.config_fingerprint reaches network_context, keyed by the per-install key, never with a raw component", async () => {
+  const paths = await tempPaths();
+  const ts = "2026-10-11T12:00:00.000Z";
+  await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "net-config": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      "net-config": async () => envelope("net-config", "collect_net_config", {
+        platform: "darwin", status: "ok", route: { state: "ok", kind: "wifi" },
+        components: { gateway_mac: { state: "ok", value: "1e:f6:4c:23:af:64" }, ra_prefix: { state: "absent" }, dhcp_domain: { state: "absent" }, resolvers: { state: "ok", value: "192.168.64.1" } },
+      }),
+    },
+    evaluateAlerts: false,
+    ts,
+    now: Date.parse(ts),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  const { points } = await readFactPoints(paths, { family: "network_context", now: Date.parse(ts) });
+  assert.equal(points.length, 1);
+  assert.match(points[0].attributes.fingerprint_hmac, /^[0-9a-f]{16}$/);
+  assert.equal(points[0].attributes.route_kind, "wifi");
+  assert.ok(!JSON.stringify(points).includes("1e:f6:4c"));
+  const raw = await fs.readFile(path.join(paths.stateDir, "learned", "facts", "network_context", "facts.jsonl"), "utf8");
+  assert.ok(!raw.includes("192.168.64.1"), "no raw resolver in fact history");
 });

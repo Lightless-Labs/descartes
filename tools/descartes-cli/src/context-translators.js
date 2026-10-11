@@ -394,3 +394,61 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
   }));
   return points;
 }
+
+// ------------------------------------------------------------------------------------------------
+// C0.5: net.config_fingerprint (per-component availability, HMAC'd with the per-install key).
+// ------------------------------------------------------------------------------------------------
+
+const NET_COMPONENTS = ["gateway_mac", "ra_prefix", "dhcp_domain", "resolvers"];
+const ROUTE_KINDS = new Set(["wifi", "ethernet", "cellular", "tunnel", "bridge", "loopback", "other", "none", "unknown"]);
+const BENIGN_COMPONENT_STATES = new Set(["ok", "absent", "not_applicable"]);
+
+function componentState(component) {
+  return COMPONENT_STATE_VALUES.has(component?.state) ? component.state : "unable";
+}
+
+function componentHmac(hmacKey, name, component) {
+  const state = componentState(component);
+  if (state === "ok") return typeof component.value === "string" && component.value ? contextHmac(hmacKey, `net_${name}`, component.value) : "unknown";
+  if (state === "absent" || state === "not_applicable") return "none";
+  return "unknown";
+}
+
+/**
+ * evidence[] -> one net.config_fingerprint point whenever the net-config collector produced an
+ * envelope. Each component carries its own state and HMAC. The aggregate fingerprint is an HMAC of
+ * the route kind and every component's (state, value); it is "unknown" when the route or any
+ * component FAILED this tick (a failure is never folded into a configuration identity) or when no
+ * key is usable.
+ */
+export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "net-config");
+  if (!envelope) return [];
+  const result = envelope.result ?? {};
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const collectorState = HOST_COLLECTOR_STATES.has(result.status) ? result.status : "unable";
+  const routeState = componentState(result.route);
+  const components = result.components ?? {};
+  const attributes = {
+    collector_state: collectorState,
+    obs_start_ms: msString(obsStartMs),
+    obs_end_ms: msString(obsEndMs),
+    rejected_field: "none",
+    route_kind: ROUTE_KINDS.has(result.route?.kind) ? result.route.kind : "unknown",
+    route_state: routeState,
+  };
+  let componentsOk = 0;
+  for (const name of NET_COMPONENTS) {
+    const state = Object.prototype.hasOwnProperty.call(components, name) ? componentState(components[name]) : "unable";
+    attributes[`${name}_state`] = state;
+    attributes[`${name}_hmac`] = componentHmac(hmacKey, name, components[name]);
+    if (state === "ok") componentsOk += 1;
+  }
+  if (routeState === "ok") componentsOk += 1;
+  attributes.components_ok = String(componentsOk);
+  const allObserved = BENIGN_COMPONENT_STATES.has(routeState) && NET_COMPONENTS.every((name) => BENIGN_COMPONENT_STATES.has(attributes[`${name}_state`]));
+  attributes.fingerprint_hmac = allObserved
+    ? contextHmac(hmacKey, "net_config_fingerprint", JSON.stringify([attributes.route_kind, routeState, ...NET_COMPONENTS.map((name) => [attributes[`${name}_state`], components[name]?.state === "ok" ? components[name].value : ""])]))
+    : "unknown";
+  return [contextFactPoint({ ts, factName: NET_CONFIG_FINGERPRINT_FACT_NAME, source: CONTEXT_ENVELOPE_SOURCES.net_config, attributes })];
+}

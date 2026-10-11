@@ -37,7 +37,14 @@ import {
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
-import { factPointsFromHostLifecycleEvidence, factPointsFromLoginSessionsEvidence, factPointsFromTailnetStateEvidence, hostBootIdHmac } from "./context-translators.js";
+import {
+  factPointsFromHostLifecycleEvidence,
+  factPointsFromLoginSessionsEvidence,
+  factPointsFromNetConfigEvidence,
+  factPointsFromTailnetStateEvidence,
+  hostBootIdHmac,
+} from "./context-translators.js";
+import { collectNetConfigEvidence } from "./tools/net-config.js";
 import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
 import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
 import {
@@ -269,6 +276,8 @@ export function defaultDaemonProfile() {
         "host-lifecycle": { enabled: true },
         // Context plan C0.4: login origin with first-observed-tick dedupe. DATA only.
         "login-sessions": { enabled: true },
+        // Context plan C0.5: net.config_fingerprint (HMAC'd with the per-install key). DATA only.
+        "net-config": { enabled: true },
       },
       // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
       // wake, borrowing the next structural slot (bounded; see runDaemonIteration).
@@ -447,6 +456,7 @@ export const STRUCTURAL_CENSUS_COLLECTORS = Object.freeze([
 export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
   ["host-lifecycle", "host-lifecycle", "collect_host_lifecycle"],
   ["login-sessions", "login-sessions", "collect_login_sessions"],
+  ["net-config", "net-config", "collect_net_config"],
 ].map((entry) => Object.freeze(entry)));
 
 // C0.7 (I25, class S): the per-collector sub-deadline. Each collector gets min(this, what is left of
@@ -505,6 +515,8 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
     // Context plan C0.4: login origin (who + IOConsoleUsers / loginctl, bounded last). DATA only.
     "login-sessions": collectors["login-sessions"] ?? collectLoginSessionsEvidence,
+    // Context plan C0.5: the network-configuration fingerprint components. DATA only.
+    "net-config": collectors["net-config"] ?? collectNetConfigEvidence,
   };
   const { deadlineMs, nowFn = Date.now, ...rest } = options;
   const collectorOptions = {
@@ -1386,6 +1398,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             ...(hostContext ? factPointsFromHostLifecycleEvidence(structuralEvidence, { ts, hmacKey, ...hostContext.facts }) : []),
             // Context plan C0.4: login origin (session_context). DATA only.
             ...factPointsFromLoginSessionsEvidence(structuralEvidence, { ts, hmacKey, dedupe: loginDedupe }),
+            // Context plan C0.5: the network-configuration fingerprint (network_context). DATA only.
+            ...factPointsFromNetConfigEvidence(structuralEvidence, { ts, hmacKey }),
             ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
             // Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-
             // gaps.md): scheduled-jobs structural evidence -> fact-points, same discipline as its
