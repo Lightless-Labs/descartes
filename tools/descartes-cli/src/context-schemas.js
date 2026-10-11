@@ -43,6 +43,8 @@ export const PROVENANCE_TAGS = Object.freeze([
   "fs.collector_binary", // a collector binary's filesystem object (path, owner, mode, content)
   "vpn.service_config", // the OS VPN service list (scutil --nc)
   "tmux.server", // the tmux server's session/client tables
+  "net.wireguard", // the WireGuard interface peer table (wg show)
+  "net.socket_table", // the kernel TCP socket table (netstat / ss established count)
 ]);
 const KNOWN_TAGS = new Set(PROVENANCE_TAGS);
 
@@ -131,6 +133,15 @@ export const BINARY_TRUST_REASONS = Object.freeze([
 //     f not_found_on_known_paths, t untrusted_binary, m missing_permission, a no envelope (disabled),
 //     d daemon-synthesized (deadline exceeded or collector threw)
 export const SUMMARY_CENSUS_CODES = Object.freeze(["c", "p", "a", "u"]);
+// C2 review M6: the summary's peer population (vpn-peer-status, Tailscale and OS VPN services
+// excluded) is the who/last rows and the WireGuard peer table: a known count, arrival, departure or
+// set digest takes its VALUE from those objects only. Whether it is known at all (the census state)
+// and which universe it belongs to (the availability signature) also depend on the other sources the
+// incumbent census reads: scutil's VPN service list and the socket table's established count. A
+// value field names its value objects; the census-state and universe fields name all of them. (An
+// unknown value is unknown because of its census state, which carries the knownness provenance.)
+const PEER_VALUE_PROVENANCE = Object.freeze(["login.utmp", "net.wireguard"]);
+const PEER_KNOWNNESS_PROVENANCE = Object.freeze(["login.utmp", "net.wireguard", "vpn.service_config", "net.socket_table"]);
 export const SUMMARY_TAILNET_STATE_CODES = Object.freeze({
   running: "r", needs_login: "l", no_state: "s", stopped: "x", needs_machine_auth: "m", starting: "g",
   unrecognized_backend_state: "z", not_found_on_known_paths: "f", untrusted_binary: "t", missing_permission: "p", unable: "u", unknown: "u",
@@ -383,12 +394,12 @@ const FACT_SCHEMA_ENTRIES = [
       sd: intField(0, 100000, ["tmux.server"]),
       su: patternField(HEX8_RE, 8, ["fs.collector_binary", "tmux.server"], [SENTINEL_UNKNOWN, "none"]),
       ss: hmacField(["tmux.server"], [SENTINEL_UNKNOWN, "none"]),
-      pn: intField(0, 100000, ["login.utmp", "vpn.service_config"]),
-      pcs: enumField(SUMMARY_CENSUS_CODES, ["login.utmp", "vpn.service_config"], { unable: "u" }),
-      pa: intField(0, 100000, ["login.utmp", "vpn.service_config"]),
-      pd: intField(0, 100000, ["login.utmp", "vpn.service_config"]),
-      pu: patternField(HEX8_RE, 8, ["login.utmp", "vpn.service_config"], [SENTINEL_UNKNOWN, "none"]),
-      ps: hmacField(["login.utmp", "vpn.service_config"], [SENTINEL_UNKNOWN, "none"]),
+      pn: intField(0, 100000, PEER_VALUE_PROVENANCE),
+      pcs: enumField(SUMMARY_CENSUS_CODES, PEER_KNOWNNESS_PROVENANCE, { unable: "u" }),
+      pa: intField(0, 100000, PEER_VALUE_PROVENANCE),
+      pd: intField(0, 100000, PEER_VALUE_PROVENANCE),
+      pu: patternField(HEX8_RE, 8, PEER_KNOWNNESS_PROVENANCE, [SENTINEL_UNKNOWN, "none"]),
+      ps: hmacField(PEER_VALUE_PROVENANCE, [SENTINEL_UNKNOWN, "none"]),
       boot: hmacField(["kernel.boot_session"]),
       bv: enumField(["n", "v", "u", "t", "x"], ["kernel.boot_session", "kernel.clock", "descartes.daemon"], { unable: "x" }),
       ex: patternField(/^[0-9]{1,10}-[0-9]{1,10}$/, 21, ["kernel.clock", "descartes.daemon"]),
@@ -426,7 +437,7 @@ const FACT_SCHEMA_ENTRIES = [
       ev: patternField(/^(-|[bwtvnczo]{1,8})$/, 8, ["descartes.daemon"]),
       off: intField(0, 2, ["descartes.daemon"]),
       ...Object.fromEntries(["s", "p"].flatMap((source) => {
-        const provenance = source === "s" ? ["tmux.server"] : ["login.utmp", "vpn.service_config"];
+        const provenance = source === "s" ? ["tmux.server"] : PEER_VALUE_PROVENANCE;
         return [
           ...["pre", "post", "same", "recr", "dep", "arr"].map((stat) => [`${source}_${stat}`, intField(0, 100000, provenance)]),
           [`${source}_st`, enumField(["ok", "census_incomplete", "universe_changed", "no_pre_set", "unknown"], ["descartes.daemon"])],
@@ -441,11 +452,11 @@ const FACT_SCHEMA_ENTRIES = [
       memory: enumField(["continuous", "first_run", "cold_start_after_loss", "unknown"], ["descartes.daemon"]),
       intervals: intField(0, 100000, ["descartes.daemon"]),
       s_known: intField(0, 100000, ["tmux.server"]),
-      p_known: intField(0, 100000, ["login.utmp", "vpn.service_config"]),
+      p_known: intField(0, 100000, PEER_KNOWNNESS_PROVENANCE),
       s_arr: intField(0, 10000000, ["tmux.server"]),
       s_dep: intField(0, 10000000, ["tmux.server"]),
-      p_arr: intField(0, 10000000, ["login.utmp", "vpn.service_config"]),
-      p_dep: intField(0, 10000000, ["login.utmp", "vpn.service_config"]),
+      p_arr: intField(0, 10000000, PEER_VALUE_PROVENANCE),
+      p_dep: intField(0, 10000000, PEER_VALUE_PROVENANCE),
       ex_hi_s: intField(0, MAX_DURATION_S, ["kernel.clock"]),
       ex_known: intField(0, 100000, ["descartes.daemon"]),
       first_seq: intField(0, 2 ** 32, ["descartes.daemon"]),

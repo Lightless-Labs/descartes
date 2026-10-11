@@ -156,6 +156,19 @@ test("C2 review H1: an OS VPN service is VPN context, never a peer in the summar
   assert.deepEqual([attrs.pn, attrs.pa, attrs.pd], ["1", "0", "0"], "connecting a VPN is no peer arrival");
 });
 
+test("C2 review M6: the peer fields' provenance names every object their value or knownness depends on (I5 input)", () => {
+  const tags = (name, field) => [...CONTEXT_FACT_SCHEMAS.get(name).fields[field].provenance].sort();
+  // Values: the peer objects themselves (who/last rows, the WireGuard peer table).
+  const values = ["login.utmp", "net.wireguard"];
+  // Knownness and universe: every source in the incumbent availability signature and census status.
+  const knownness = ["login.utmp", "net.socket_table", "net.wireguard", "vpn.service_config"];
+  for (const field of ["pn", "pa", "pd", "ps"]) assert.deepEqual(tags("tick.summary", field), values, field);
+  for (const field of ["pcs", "pu"]) assert.deepEqual(tags("tick.summary", field), knownness, field);
+  for (const stat of ["pre", "post", "same", "recr", "dep", "arr"]) assert.deepEqual(tags("stats.episode", `p_${stat}`), values, stat);
+  for (const field of ["p_arr", "p_dep"]) assert.deepEqual(tags("stats.daily", field), values, field);
+  assert.deepEqual(tags("stats.daily", "p_known"), knownness);
+});
+
 test("summary_chain_broken_unknown: a missing or invalid chain state makes the interval's transitions unknown, never zero, and the chain restarted", () => {
   const t = tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1000 });
   const snapshot = snapshotOf(t);
