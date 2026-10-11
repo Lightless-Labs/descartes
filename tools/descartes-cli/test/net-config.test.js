@@ -116,6 +116,40 @@ test("HIGH 2 reproduction: malformed route output makes the collector partial an
   assert.equal(point.attributes.fingerprint_hmac, "unknown");
 });
 
+test("HIGH 1 reproduction: a loose-looking ip header and invalid lifetime are partial, never absent or ok", async () => {
+  const result = await readNetConfig({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({
+      "ip route show default": ok("default via 192.168.1.1 dev eth0 proto dhcp\n"),
+      "ip neigh show 192.168.1.1 dev eth0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
+      "ip -6 addr show dev eth0 scope global": ok("2: eth0: MALFORMED\n valid_lft MALFORMED\n"),
+      "nmcli -g IP4.DOMAIN device show eth0": ok(""),
+      "nmcli -g DHCP4.OPTION device show eth0": ok(""),
+      "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
+    }),
+  });
+  assert.equal(result.status, "partial");
+  assert.equal(result.components.ra_prefix.state, "partial");
+
+  const envelope = await collectNetConfigEvidence({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({
+      "ip route show default": ok("default via 192.168.1.1 dev eth0 proto dhcp\n"),
+      "ip neigh show 192.168.1.1 dev eth0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
+      "ip -6 addr show dev eth0 scope global": ok("2: eth0: MALFORMED\n valid_lft MALFORMED\n"),
+      "nmcli -g IP4.DOMAIN device show eth0": ok(""),
+      "nmcli -g DHCP4.OPTION device show eth0": ok(""),
+      "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
+    }),
+  });
+  const [point] = factPointsFromNetConfigEvidence([envelope], { ts: "2026-10-11T10:00:00.000Z", hmacKey: Buffer.alloc(CONTEXT_KEY_BYTES, 7) });
+  assert.equal(point.attributes.fingerprint_hmac, "unknown");
+});
+
 test("B2: Linux ra_prefix preserves the observed RA prefix length and rejects static addresses", () => {
   assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(
     "    inet6 2001:db8:1:2::1234/48 scope global dynamic mngtmpaddr proto ra\n",

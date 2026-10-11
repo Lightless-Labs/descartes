@@ -170,6 +170,24 @@ test("B1: a malformed last row makes ssh_last partial even when valid history re
   assert.equal(envelope.result.sources.ssh_last.malformed_count, 1);
 });
 
+test("HIGH 2 reproduction: exactly 50 last rows exhaust the shared cap, mark ssh_last partial/truncated, and emit overflow", async () => {
+  const rows = Array.from({ length: DEFAULT_LAST_HISTORY_LIMIT }, (_, index) =>
+    `user${index} pts/${index} host-${index}.example Sun Oct 11 12:00 still logged in`).join("\n");
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["last", "-n", String(DEFAULT_LAST_HISTORY_LIMIT)])]: ok(`${rows}\n`),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_last.status, "partial");
+  assert.equal(envelope.result.sources.ssh_last.truncated, true);
+  assert.equal(envelope.result.truncated, true);
+
+  const { factPointsFromVpnPeerEvidence } = await import("../src/fact-translators.js");
+  const points = factPointsFromVpnPeerEvidence([envelope], { ts: "2026-10-11T12:00:00.000Z" });
+  assert.ok(points.some((point) => point.attributes.overflow === "true"));
+});
+
 // ---------------------------------------------------------------------------------------------
 // WireGuard parsers
 // ---------------------------------------------------------------------------------------------

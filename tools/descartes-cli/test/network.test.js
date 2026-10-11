@@ -48,16 +48,30 @@ test("parseMacDefaultRoute parses route -n get default output", () => {
   }]);
 });
 
-test("DNS resolver parsers deduplicate and bound resolver addresses", () => {
+test("DNS resolver parsers preserve duplicate rows and expose census metadata", () => {
   assert.deepEqual(parseResolvConf(`# comment\nnameserver 1.1.1.1\nnameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\n`), [
+    { address: "1.1.1.1", source: "/etc/resolv.conf" },
     { address: "1.1.1.1", source: "/etc/resolv.conf" },
     { address: "2606:4700:4700::1111", source: "/etc/resolv.conf" },
   ]);
+  assert.equal(parseResolvConf("nameserver 1.1.1.1\nnameserver 1.1.1.1\n").duplicate_count, 1);
 
   assert.deepEqual(parseScutilDns(`resolver #1\n  nameserver[0] : 192.168.1.1\nresolver #2\n  nameserver[0] : 9.9.9.9\n  nameserver[1] : 9.9.9.9\n`), [
     { address: "192.168.1.1", source: "scutil --dns" },
     { address: "9.9.9.9", source: "scutil --dns" },
+    { address: "9.9.9.9", source: "scutil --dns" },
   ]);
+  assert.equal(parseScutilDns("resolver #1\nnameserver[0] : 9.9.9.9\nnameserver[1] : 9.9.9.9\n").duplicate_count, 1);
+});
+
+test("network populations preserve duplicate routes and sockets for census validation", () => {
+  const routes = parseLinuxDefaultRoutes("default via 192.168.1.1 dev eth0 metric 100\ndefault via 192.168.1.1 dev eth0 metric 100\n");
+  assert.equal(routes.length, 2);
+  assert.equal(routes.duplicate_count, 1);
+
+  const sockets = parseLinuxListeningSockets("tcp LISTEN 0 128 127.0.0.1:22 0.0.0.0:*\ntcp LISTEN 0 128 127.0.0.1:22 0.0.0.0:*\n");
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets.duplicate_count, 1);
 });
 
 test("parseLinuxListeningSockets parses ss listener rows with address families", () => {

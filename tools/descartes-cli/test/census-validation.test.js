@@ -8,6 +8,7 @@ import {
 import {
   parseWgEndpoints,
   parseWgHandshakes,
+  parseWgInterfaceList,
   parseWgPeerList,
 } from "../src/tools/vpn-peer-status.js";
 import { collectTailscaleStatusEvidence, parseTailscaleStatusJson } from "../src/tools/tailscale-status.js";
@@ -16,8 +17,16 @@ import {
   parseNdpRouterAdvertisementPrefixes,
   parseResolvectlDns,
 } from "../src/tools/net-config.js";
-import { parseLoginctlSessionIds, readLoginSessions } from "../src/tools/login-sessions.js";
+import { parseLoginctlSessionIds, parseLastRows, parseWhoRows, readLoginSessions } from "../src/tools/login-sessions.js";
+import { parseLastRows as parseSharedLastRows } from "../src/tools/last-history.js";
 import { observationInterval } from "../src/context-translators.js";
+import * as netConfigParsers from "../src/tools/net-config.js";
+import * as networkParsers from "../src/tools/network.js";
+import * as vpnParsers from "../src/tools/vpn-peer-status.js";
+import * as loginParsers from "../src/tools/login-sessions.js";
+import * as lastHistoryParsers from "../src/tools/last-history.js";
+import * as hostLifecycleParsers from "../src/tools/host-lifecycle.js";
+import * as tailscaleParsers from "../src/tools/tailscale-status.js";
 
 const KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -50,7 +59,7 @@ test("cross-reference validation is one-to-one, not set-collapse", () => {
 test("strict RFC3339 accepts only timestamp strings and handles Tailscale zero time separately", () => {
   assert.equal(isStrictRfc3339("2026-10-11T12:00:00Z"), true);
   assert.equal(isStrictRfc3339("2026-10-11T12:00:00.123Z"), true);
-  for (const value of ["0", "2026-10-11", "10/11/2026", new String("2026-10-11T12:00:00Z")]) {
+  for (const value of ["0", "2026-10-11", "10/11/2026", "2026-02-31T00:00:00Z", new String("2026-10-11T12:00:00Z")]) {
     assert.equal(isStrictRfc3339(value), false, String(value));
   }
 });
@@ -127,7 +136,7 @@ test("WireGuard cap, malformed IPv6, NDP, and DNS output cannot become complete 
   });
   assert.equal(result.result.sources.wireguard.status, "partial");
   assert.equal(result.result.sources.wireguard.interfaces_truncated, true);
-  assert.equal(parseLinuxRouterAdvertisementPrefixes("MALFORMED").state, "unable");
+  assert.equal(parseLinuxRouterAdvertisementPrefixes("MALFORMED").state, "partial");
   assert.equal(parseNdpRouterAdvertisementPrefixes("MALFORMED", "en0"), undefined);
   assert.equal(parseResolvectlDns("MALFORMED"), undefined);
 });
@@ -159,13 +168,42 @@ test("loginctl duplicate IDs degrade the source, and malformed stamped metadata 
 
 test("registered census parsers stay fail-closed across adversarial generated inputs", () => {
   const registered = [
+    { name: "net-config.parseNetstatDefaultRoutes", parse: netConfigParsers.parseNetstatDefaultRoutes, trusted: (value) => value !== undefined },
+    { name: "net-config.parseIpRouteDefault", parse: netConfigParsers.parseIpRouteDefault, trusted: (value) => value !== undefined },
+    { name: "net-config.parseIfconfigVerbose", parse: netConfigParsers.parseIfconfigVerbose, trusted: (value) => value !== undefined && value.kind !== "unknown" },
+    { name: "net-config.parseLinuxRouterAdvertisementPrefixes", parse: netConfigParsers.parseLinuxRouterAdvertisementPrefixes, trusted: (value) => !["partial", "unable"].includes(value?.state) },
+    { name: "net-config.parseNdpRouterAdvertisementPrefixes", parse: (value) => netConfigParsers.parseNdpRouterAdvertisementPrefixes(value, "en0"), trusted: (value) => value !== undefined },
+    { name: "net-config.parseIpAddrInet6", parse: netConfigParsers.parseIpAddrInet6, trusted: (value, input) => input === "" || value.length > 0 },
+    { name: "net-config.parseNeighborMac", parse: netConfigParsers.parseNeighborMac, trusted: (value) => value !== undefined },
+    { name: "net-config.parseScutilDnsForInterface", parse: (value) => netConfigParsers.parseScutilDnsForInterface(value, "en0"), trusted: (value) => value !== undefined },
+    { name: "net-config.parseResolvectlDns", parse: netConfigParsers.parseResolvectlDns, trusted: (value) => value !== undefined },
+    { name: "network.parseLinuxDefaultRoutes", parse: networkParsers.parseLinuxDefaultRoutes, trusted: (value) => value.malformed_count === 0 },
+    { name: "network.parseMacDefaultRoute", parse: networkParsers.parseMacDefaultRoute, trusted: (value) => value.malformed_count === 0 },
+    { name: "network.parseResolvConf", parse: networkParsers.parseResolvConf, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "network.parseScutilDns", parse: networkParsers.parseScutilDns, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "network.parseLinuxListeningSockets", parse: networkParsers.parseLinuxListeningSockets, trusted: (value) => value.rejected_count === 0 && value.duplicate_count === 0 },
+    { name: "network.parseMacLsofListeningSocketsDetailed", parse: networkParsers.parseMacLsofListeningSocketsDetailed, trusted: (value) => value.rejected === 0 && value.duplicate_count === 0 },
+    { name: "network.parseMacLsofListeningSockets", parse: networkParsers.parseMacLsofListeningSockets, trusted: (value) => value.length > 0 },
+    { name: "vpn.parseWhoOutput", parse: vpnParsers.parseWhoOutput, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "vpn.parseLastOutput", parse: vpnParsers.parseLastOutput, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "vpn.parseWgInterfaceList", parse: parseWgInterfaceList, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
     { name: "wireguard.peers", parse: parseWgPeerList, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
     { name: "wireguard.endpoints", parse: parseWgEndpoints, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
     { name: "wireguard.handshakes", parse: parseWgHandshakes, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "vpn.parseScutilNcListDetailed", parse: vpnParsers.parseScutilNcListDetailed, trusted: (value) => value.unparsed_count === 0 && value.duplicate_count === 0 },
+    { name: "vpn.parseScutilNcList", parse: vpnParsers.parseScutilNcList, trusted: (value) => value.length > 0 },
+    { name: "login.parseWhoRows", parse: parseWhoRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
+    { name: "last-history.parseLastRows", parse: parseSharedLastRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
     { name: "loginctl.ids", parse: parseLoginctlSessionIds, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
-    { name: "linux.ipv6", parse: parseLinuxRouterAdvertisementPrefixes, trusted: (value) => value.state !== "unable" },
-    { name: "ndp", parse: (value) => parseNdpRouterAdvertisementPrefixes(value, "en0"), trusted: (value) => value !== undefined },
-    { name: "resolvectl", parse: parseResolvectlDns, trusted: (value) => value !== undefined },
+    { name: "login.parsePlistXml", parse: loginParsers.parsePlistXml, trusted: () => false },
+    { name: "login.parseConsoleUsers", parse: loginParsers.parseConsoleUsers, trusted: () => false },
+    { name: "login.parseLoginctlShowSession", parse: loginParsers.parseLoginctlShowSession, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "host.parseSysctlKeyValues", parse: hostLifecycleParsers.parseSysctlKeyValues, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "host.parseSysctlTimevalSeconds", parse: hostLifecycleParsers.parseSysctlTimevalSeconds, trusted: (value) => value !== undefined },
+    { name: "host.parseProcStatBtime", parse: hostLifecycleParsers.parseProcStatBtime, trusted: (value) => value !== undefined },
+    { name: "host.parseOsReleaseBuild", parse: hostLifecycleParsers.parseOsReleaseBuild, trusted: (value) => value !== undefined },
+    { name: "host.parseProcUptime", parse: hostLifecycleParsers.parseProcUptime, trusted: (value) => value !== undefined },
+    { name: "tailscale.parseTailscaleStatusJson", parse: tailscaleParsers.parseTailscaleStatusJson, trusted: () => false },
   ];
   const generated = [
     "MALFORMED",
@@ -186,11 +224,33 @@ test("registered census parsers stay fail-closed across adversarial generated in
         continue;
       }
       if (typeof input === "string" && /MALFORMED/.test(input)) {
-        assert.equal(parser.trusted(result), false, `${parser.name} trusted ${JSON.stringify(input)}`);
+        assert.equal(parser.trusted(result, input), false, `${parser.name} trusted ${JSON.stringify(input)}`);
       }
       if (input !== "" && (typeof input !== "string" || input === null)) {
-        assert.equal(parser.trusted(result), false, `${parser.name} trusted wrong type`);
+        assert.equal(parser.trusted(result, input), false, `${parser.name} trusted wrong type`);
       }
     }
   }
+});
+
+test("every exported parse* function in the touched parser modules is explicitly registered", () => {
+  const modules = [
+    ["net-config", netConfigParsers], ["network", networkParsers], ["vpn", vpnParsers],
+    ["login", loginParsers], ["last-history", lastHistoryParsers], ["host", hostLifecycleParsers], ["tailscale", tailscaleParsers],
+  ];
+  const registeredNames = new Set([
+    "net-config.parseNetstatDefaultRoutes", "net-config.parseIpRouteDefault", "net-config.parseIfconfigVerbose",
+    "net-config.parseLinuxRouterAdvertisementPrefixes", "net-config.parseNdpRouterAdvertisementPrefixes", "net-config.parseIpAddrInet6",
+    "net-config.parseNeighborMac", "net-config.parseScutilDnsForInterface", "net-config.parseResolvectlDns",
+    "network.parseLinuxDefaultRoutes", "network.parseMacDefaultRoute", "network.parseResolvConf", "network.parseScutilDns",
+    "network.parseLinuxListeningSockets", "network.parseMacLsofListeningSocketsDetailed", "network.parseMacLsofListeningSockets",
+    "vpn.parseWhoOutput", "vpn.parseLastOutput", "vpn.parseWgInterfaceList", "vpn.parseWgPeerList", "vpn.parseWgEndpoints",
+    "vpn.parseWgHandshakes", "vpn.parseScutilNcListDetailed", "vpn.parseScutilNcList", "login.parseWhoRows", "login.parsePlistXml",
+    "login.parseConsoleUsers", "login.parseLoginctlSessionIds", "login.parseLoginctlShowSession", "last-history.parseLastRows",
+    "host.parseSysctlKeyValues", "host.parseSysctlTimevalSeconds", "host.parseProcStatBtime", "host.parseOsReleaseBuild",
+    "host.parseProcUptime", "tailscale.parseTailscaleStatusJson",
+  ]);
+  const exportedNames = modules.flatMap(([prefix, module]) => Object.keys(module)
+    .filter((name) => /^parse[A-Z]/.test(name)).map((name) => `${prefix}.${name}`));
+  assert.deepEqual(exportedNames.filter((name) => !registeredNames.has(name)), []);
 });

@@ -227,6 +227,24 @@ test("HIGH 1 reproduction: a show-session block for a different Id is partial", 
   assert.deepEqual(result.records, []);
 });
 
+test("HIGH 3 reproduction: duplicate non-Id loginctl properties make the block malformed", async () => {
+  const duplicateRemote = LOGINCTL_SHOW.split("\n\n")[1]
+    .replace("RemoteHost=203.0.113.4", "RemoteHost=attacker.example\nRemote=no");
+  const parsed = parseLoginctlShowSession(duplicateRemote);
+  assert.equal(parsed.duplicate_count, 1);
+
+  const result = await readLoginSessions({
+    platform: "linux",
+    runFixedExecFile: scripted({
+      "loginctl list-sessions --no-legend --no-pager": ok("5 1000 alice pts/0\n"),
+      "loginctl show-session": ok(duplicateRemote),
+      "last -n 50": ok(""),
+    }),
+  });
+  assert.equal(result.sources.loginctl, "partial");
+  assert.deepEqual(result.records, []);
+});
+
 test("C0.4 linux parsers and classes", () => {
   assert.deepEqual(parseLoginctlSessionIds(LOGINCTL_LIST), ["2", "5", "7"]);
   assert.equal(parseLoginctlShowSession(LOGINCTL_SHOW).length, 3);
