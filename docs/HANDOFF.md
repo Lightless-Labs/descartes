@@ -2,23 +2,21 @@
 
 **Last updated:** 2026-10-11
 
-## Context facts C2 daybreak rework — 2026-10-11 — local, not pushed
+## Context facts C2 census validation rework — 2026-10-11 — local, not pushed
 
-On `feat/context-facts-c2-2026-10`, closed the reported findings in six atomic commits:
-`a39a4e9` pins the reproductions; `34f7eb0` validates WireGuard keys and cross-source key sets;
-`ffd7273` makes loginctl and route parsing fail closed; `5d0276c` guards every subprocess launch
-with the shared abort helper; `620a803` rejects coerced typed evidence; and `62e9337` restores
-main’s incumbent structural collection/deadline/rejection boundary while running host/login/net
-context collectors afterward under independent cancellation and sub-deadlines. No product alert
-family or mutating action was added. No push or merge.
+On `feat/context-facts-c2-2026-10`, closed the reported census-validation findings in two
+atomic commits: `cc78fad` adds the red regressions and `f37db5a` introduces the shared
+`census-validate` finalizer, wires it through the incumbent peer/session/network/host parsers,
+rejects coercive metadata and non-RFC3339 timestamps, makes truncation and cross-reference
+mismatches partial, and checks every collector launch call site. No product alert family or
+mutating action was added. No push or merge.
 
-Focused verification passed: **306 passed, 0 failed, 1 skipped, 6 todo, 313 total**; `git
-diff --check` is clean. Fresh-XDG full `npm test` in the managed sandbox completed with **2,536
-passed, 22 failed, 35 skipped, 6 todo, 2,599 total**. All 22 failures are environmental: 17
-notifier-reuse and 3 tap-bump loopback test-server cases fail with `listen EPERM` because the
-sandbox forbids binding `127.0.0.1`, and 2 live-process provenance checks return `unknown` under
-sandbox process introspection. The four affected files rerun with local network binding and host
-access passed **75/75**. No changed-area product test failed.
+Focused verification passed: **168 passed, 0 failed, 1 skipped, 6 todo, 175 total**; `git
+diff --check` is clean. Fresh-XDG full `npm test` completed with **2,547 passed, 22 failed, 35
+skipped, 6 todo, 2,610 total**. All 22 failures are environmental: 17 notifier-reuse and 3
+tap-bump loopback test-server cases fail with `listen EPERM` because the sandbox forbids binding
+`127.0.0.1`, and 2 live-process provenance checks return `unknown` under sandbox process
+introspection. No changed-area product test failed.
 
 ## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
