@@ -165,9 +165,12 @@ export function sessionCensusOf(points) {
 }
 
 /**
- * The VPN-signed peer census of this tick (the incumbent's counted universe: active, non-Tailscale
- * peers under the vpn-peer-status census marker). Complete only when the marker is present, there is
- * no VPN overflow and the envelope's own census is ok. Peers carry no instance fingerprint ("").
+ * The VPN-signed peer census of this tick: active peers under the vpn-peer-status census marker,
+ * excluding Tailscale peers and the OS VPN services themselves. A VPN service's connection state is
+ * VPN CONTEXT (vn/vc/vd, net.vpn_service_state, the `vpn` transition); counting it as a peer too
+ * would restate the context inside the target it conditions (§4.2, Astra 4; C2 review H1). Complete
+ * only when the marker is present, there is no VPN overflow and the envelope's own census is ok.
+ * Peers carry no instance fingerprint ("").
  */
 export function peerCensusOf(points, evidence) {
   const presence = pointsNamed(points, "peer.presence");
@@ -180,7 +183,8 @@ export function peerCensusOf(points, evidence) {
   const entities = new Map();
   for (const point of presence) {
     if (point.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY || point.entity_key === PEER_OVERFLOW_ENTITY_KEY) continue;
-    if (point.attributes?.presence_state === "observed_historical" || point.attributes?.source_type === "tailscale") continue;
+    if (point.attributes?.presence_state === "observed_historical") continue;
+    if (point.attributes?.source_type === "tailscale" || point.attributes?.source_type === "vpn_service") continue;
     if (!KEY_RE.test(point.entity_key ?? "") || entities.has(point.entity_key)) {
       census = "p";
       continue;

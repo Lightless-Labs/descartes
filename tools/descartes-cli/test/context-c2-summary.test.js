@@ -141,6 +141,21 @@ test("summary_chain_no_double_count: departures and arrivals for (r_{i-1}, r_i] 
   assert.equal(attrs[0].scs, "c");
 });
 
+test("C2 review H1: an OS VPN service is VPN context, never a peer in the summary's peer population (no target leakage)", () => {
+  const withService = (ms, connected) => {
+    const t = tick({ ms, peers: ["h1"], uptimeMs: 1000 + ms - T0 });
+    t.evidence[1].result.peers.push({ source_type: "vpn_service", presence_state: connected ? "observed_active" : "observed_historical", service_uuid: "AAAA-BBBB", service_name: "Work VPN" });
+    t.points = [...factPointsFromSessionEvidence(t.evidence, { ts: t.ts }), ...factPointsFromVpnPeerEvidence(t.evidence, { ts: t.ts })];
+    return t;
+  };
+  const [off, on] = chainTicks([withService(T0, false), withService(T0 + HOUR, true)]);
+  assert.equal(off.snapshot.peer.count, 1);
+  assert.equal(on.snapshot.peer.count, 1, "a connected VPN service is not a peer");
+  assert.ok(![...on.snapshot.peer.entities.keys()].some((key) => key.startsWith("peer.vpn_service.")));
+  const attrs = on.summary.point.attributes;
+  assert.deepEqual([attrs.pn, attrs.pa, attrs.pd], ["1", "0", "0"], "connecting a VPN is no peer arrival");
+});
+
 test("summary_chain_broken_unknown: a missing or invalid chain state makes the interval's transitions unknown, never zero, and the chain restarted", () => {
   const t = tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1000 });
   const snapshot = snapshotOf(t);
