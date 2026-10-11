@@ -275,8 +275,10 @@ test("T8: every family's default budget meets (H_max / interval) x worst-case ti
     peer: 16 * MIB, canary: 4 * MIB, network: 4 * MIB, provenance: 4 * MIB,
     // Context families (C0; context plan §4): 17 MiB, sized by the data-family T8 test below.
     host_lifecycle: 4 * MIB, network_context: 2 * MIB, session_context: 11 * MIB,
+    // Context plan C2 families, sized by their own T8 tests (context-c2-*.test.js).
+    collector_state: 8 * MIB,
   });
-  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 82 * MIB);
+  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 90 * MIB);
 });
 
 test("T8 config floor: resolveFactStoreBudgets rejects a value below the horizon invariant (budget_below_horizon_floor) and falls back to the default; accepts one at or above it", () => {
@@ -455,7 +457,10 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     "host.boot": 698, "host.boot_boundary": 928, "host.clock_reading": 1147, "host.suspend": 581, "host.boundary_census": 613,
     "net.tailnet_state": 601, "net.config_fingerprint": 1029,
     "session.login_record": 643, "session.login_history_row": 597, "session.login_census": 777, "user.presence": 508,
+    // C2 facts (their families' T8 are pinned in context-c2-*.test.js).
+    "collector.binary_state": 668,
   }, "a schema change must revisit the pinned context tick shapes");
+  assert.equal(FAMILY_TICK_SHAPES.get("collector_state").maxRecordBytes, worst["collector.binary_state"]);
   const tick = {
     host_lifecycle: worst["host.boot"] + worst["host.boot_boundary"] + worst["host.clock_reading"] + worst["host.suspend"] + worst["host.boundary_census"],
     network_context: worst["net.tailnet_state"] + worst["net.config_fingerprint"],

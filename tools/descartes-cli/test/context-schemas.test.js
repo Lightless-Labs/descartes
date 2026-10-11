@@ -27,7 +27,7 @@ async function tempPaths() {
 test("C0.6: every context schema field carries a non-empty physical-object provenance tag from the closed set", () => {
   assert.ok(CONTEXT_FACT_SCHEMAS.size >= 11);
   for (const [factName, schema] of CONTEXT_FACT_SCHEMAS) {
-    assert.ok(["host_lifecycle", "network_context", "session_context"].includes(schema.family), factName);
+    assert.ok(["host_lifecycle", "network_context", "session_context", "collector_state"].includes(schema.family), factName);
     for (const [field, spec] of Object.entries(schema.fields)) {
       assert.ok(spec.provenance.length > 0, `${factName}.${field}`);
       for (const tag of spec.provenance) assert.ok(PROVENANCE_TAGS.includes(tag), `${factName}.${field}: ${tag}`);

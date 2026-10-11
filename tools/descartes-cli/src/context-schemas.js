@@ -39,6 +39,10 @@ export const PROVENANCE_TAGS = Object.freeze([
   "login.logind", // systemd-logind sessions
   "login.console", // macOS IOConsoleUsers
   "descartes.daemon", // the daemon's own clock, ledgers and collection bookkeeping
+  // C2 additions.
+  "fs.collector_binary", // a collector binary's filesystem object (path, owner, mode, content)
+  "vpn.service_config", // the OS VPN service list (scutil --nc)
+  "tmux.server", // the tmux server's session/client tables
 ]);
 const KNOWN_TAGS = new Set(PROVENANCE_TAGS);
 
@@ -90,6 +94,21 @@ function commonFields(stateProvenance = ["descartes.daemon"]) {
 
 // "not_independent" (C0 review H3): a conjunct with no measurement independent of another one.
 const BOOT_CONJUNCT = ["pass", "fail", "unknown", "not_independent"];
+
+// C2: collector.binary_state (§3 C0.1, §4.2). The closed list of collector binaries the resolver is
+// asked for (tools/*.js); a name outside it is never written (its state is not attributed).
+export const COLLECTOR_BINARY_NAMES = Object.freeze([
+  "arp", "codesign", "crontab", "df", "id", "ifconfig", "ioreg", "ip", "ipconfig", "last", "launchctl", "loginctl",
+  "lsof", "ndp", "netstat", "nmcli", "ps", "resolvectl", "screen", "scutil", "spctl", "ss", "sysctl", "systemctl",
+  "tailscale", "tmux", "wg", "who",
+]);
+// binary-resolver.js trust_reason values (closed); anything else is "other", never echoed.
+export const BINARY_TRUST_REASONS = Object.freeze([
+  "realpath_failed", "stat_failed", "not_regular_executable", "not_directory", "foreign_owner", "group_writable",
+  "writer_set_not_subset_allowed", "acl_present", "acl_unknown", "script_probe_failed", "shell_wrapper_not_allowed",
+  "realpath_changed", "file_recheck_failed", "file_identity_changed", "content_read_failed",
+  "group_membership_unverifiable", "directory_bound",
+]);
 
 const FACT_SCHEMA_ENTRIES = [
   // ---------------------------------------------------------------- host_lifecycle
@@ -212,6 +231,21 @@ const FACT_SCHEMA_ENTRIES = [
       configured_search_domain_state: enumField(COMPONENT_STATES, ["net.configured_search_domain"]),
       resolvers_hmac: hmacField(["net.resolver_config"], [SENTINEL_UNKNOWN, "none"]),
       resolvers_state: enumField(COMPONENT_STATES, ["net.resolver_config"]),
+    },
+  }],
+  // ---------------------------------------------------------------- collector_state (C2)
+  ["collector.binary_state", {
+    family: "collector_state",
+    fields: {
+      ...commonFields(["fs.collector_binary"]),
+      binary: enumField([...COLLECTOR_BINARY_NAMES, "unknown"], ["descartes.daemon"]),
+      // C0.1's states, plus "inconsistent": two reads of the same binary in one tick disagreed.
+      state: enumField(["resolved", "operator_trusted", "not_found_on_known_paths", "untrusted_binary", "unable", "inconsistent"], ["fs.collector_binary"]),
+      trust_reason: enumField(["none", "other", "unknown", ...BINARY_TRUST_REASONS], ["fs.collector_binary"]),
+      path_hmac: hmacField(["fs.collector_binary"], [SENTINEL_UNKNOWN, "none"]),
+      content_hmac: hmacField(["fs.collector_binary"], [SENTINEL_UNKNOWN, "none"]),
+      same_uid_writable: enumField(["true", "false", "unknown"], ["fs.collector_binary"]),
+      observations: intField(1, 64, ["descartes.daemon"]),
     },
   }],
   // ---------------------------------------------------------------- session_context

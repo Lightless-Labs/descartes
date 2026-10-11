@@ -12,7 +12,7 @@
 //     yields the schema's unable shape, never the value (C0.6).
 
 import { contextHmac, contextKeyId } from "./context-key.js";
-import { enforceContextSchema } from "./context-schemas.js";
+import { BINARY_TRUST_REASONS, COLLECTOR_BINARY_NAMES, enforceContextSchema } from "./context-schemas.js";
 import { strictRfc3339EpochMilliseconds } from "./tools/census-validate.js";
 
 // Fixed entity keys for the per-tick context facts. Literal constants (not computed) so the T12
@@ -28,6 +28,7 @@ export const SESSION_LOGIN_RECORD_FACT_NAME = "session.login_record";
 export const SESSION_LOGIN_HISTORY_ROW_FACT_NAME = "session.login_history_row";
 export const SESSION_LOGIN_CENSUS_FACT_NAME = "session.login_census";
 export const USER_PRESENCE_FACT_NAME = "user.presence";
+export const COLLECTOR_BINARY_STATE_FACT_NAME = "collector.binary_state";
 
 // The envelope ids and tool names the context collectors stamp (bounded, closed).
 export const CONTEXT_ENVELOPE_SOURCES = Object.freeze({
@@ -35,6 +36,8 @@ export const CONTEXT_ENVELOPE_SOURCES = Object.freeze({
   tailscale: Object.freeze({ id: "tailscale-status", tool: "collect_tailscale_status" }),
   net_config: Object.freeze({ id: "net-config", tool: "collect_net_config" }),
   login_sessions: Object.freeze({ id: "login-sessions", tool: "collect_login_sessions" }),
+  // C2: facts DERIVED by the daemon from the structural evidence it already holds (no new read).
+  derived: Object.freeze({ id: "derived", tool: "derive_context" }),
 });
 
 // Per-tick emission caps for the session_context family (its T8 budget is sized on them).
@@ -521,4 +524,117 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
     ? contextHmac(hmacKey, "net_config_fingerprint", JSON.stringify(netConfigAggregateInputs(result).map((input) => input.value)))
     : "unknown";
   return [contextFactPoint({ hmacKey, ts, factName: NET_CONFIG_FINGERPRINT_FACT_NAME, source: CONTEXT_ENVELOPE_SOURCES.net_config, attributes })];
+}
+
+// ------------------------------------------------------------------------------------------------
+// C2 (§3 C0.1, §4.2): collector.binary_state, from the binary provenance the structural collectors
+// already report. No new read: every verdict below is one the binary resolver produced this tick.
+// ------------------------------------------------------------------------------------------------
+
+const BINARY_NAME_SET = new Set(COLLECTOR_BINARY_NAMES);
+const TRUST_REASON_SET = new Set(BINARY_TRUST_REASONS);
+// Bounds on the evidence walk (envelope results are bounded already; this keeps the walk itself
+// bounded whatever shape a result takes).
+const BINARY_WALK_MAX_DEPTH = 4;
+const BINARY_WALK_MAX_ARRAY = 64;
+const BINARY_WALK_MAX_OBSERVATIONS = 256;
+// The envelopes that report binary provenance today. Bounding the walk to them bounds the per-tick
+// record count (collector_state's T8 shape): sessions (tmux, screen), vpn-peer-status (who, last, wg,
+// scutil, lsof/ss), tailscale-status (tailscale), host-lifecycle (sysctl).
+const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle"]);
+export const MAX_BINARY_STATES_PER_TICK = 12;
+
+function binaryStateOf(provenance) {
+  switch (provenance?.trust_verdict) {
+    case "trusted": return "resolved";
+    case "operator_trusted": return "operator_trusted";
+    case "not_found_on_known_paths": return "not_found_on_known_paths";
+    case "untrusted_binary": return "untrusted_binary";
+    default: return "unable";
+  }
+}
+
+function collectBinaryProvenance(value, depth, out) {
+  if (out.length >= BINARY_WALK_MAX_OBSERVATIONS || depth > BINARY_WALK_MAX_DEPTH || value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, BINARY_WALK_MAX_ARRAY)) collectBinaryProvenance(item, depth + 1, out);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "binary_provenance") {
+      if (child && typeof child === "object" && !Array.isArray(child) && typeof child.requested_binary === "string") out.push(child);
+      continue;
+    }
+    collectBinaryProvenance(child, depth + 1, out);
+  }
+}
+
+/**
+ * evidence[] -> one collector.binary_state point per closed-list binary whose resolver verdict appears
+ * in this tick's structural evidence (sessions' multiplexers, the VPN/peer sources, tailscale, the
+ * host-lifecycle sysctl). A binary no collector reported this tick is absent (not observed), never
+ * "not installed". Two disagreeing verdicts in one tick are "inconsistent", never one of them. Paths
+ * and content hashes are HMAC'd; the offending component is never written.
+ */
+export function factPointsFromBinaryStateEvidence(evidence, { ts, hmacKey } = {}) {
+  const byBinary = new Map();
+  for (const envelope of evidence ?? []) {
+    if (!envelope || typeof envelope !== "object" || envelope.source === "daemon") continue;
+    if (!BINARY_PROVENANCE_ENVELOPE_IDS.has(envelope.id)) continue;
+    const found = [];
+    collectBinaryProvenance(envelope.result, 0, found);
+    if (found.length === 0) continue;
+    const { obsStartMs, obsEndMs } = observationInterval(envelope);
+    for (const provenance of found) {
+      if (!BINARY_NAME_SET.has(provenance.requested_binary)) continue;
+      if (!byBinary.has(provenance.requested_binary)) byBinary.set(provenance.requested_binary, { observations: [], starts: [], ends: [] });
+      const entry = byBinary.get(provenance.requested_binary);
+      entry.observations.push(provenance);
+      entry.starts.push(obsStartMs);
+      entry.ends.push(obsEndMs);
+    }
+  }
+  const points = [];
+  for (const binary of COLLECTOR_BINARY_NAMES) {
+    const entry = byBinary.get(binary);
+    if (!entry || points.length >= MAX_BINARY_STATES_PER_TICK) continue;
+    const states = new Set(entry.observations.map(binaryStateOf));
+    const paths = new Set(entry.observations.map((p) => (typeof p.resolved_path === "string" ? p.resolved_path : "")));
+    const hashes = new Set(entry.observations.map((p) => (typeof p.content_hash === "string" ? p.content_hash : "")));
+    const reasons = new Set(entry.observations.map((p) => (typeof p.trust_reason === "string" ? p.trust_reason : "")));
+    const consistent = states.size === 1 && paths.size === 1 && hashes.size === 1 && reasons.size === 1;
+    const first = entry.observations[0];
+    const state = consistent ? binaryStateOf(first) : "inconsistent";
+    const resolved = state === "resolved" || state === "operator_trusted";
+    const reason = !consistent ? "other"
+      : typeof first.trust_reason !== "string" ? "none"
+        : TRUST_REASON_SET.has(first.trust_reason) ? first.trust_reason : "other";
+    const writable = Array.isArray(first.same_uid_writable_components) ? first.same_uid_writable_components.length > 0 : undefined;
+    const allKnown = (values) => values.every((value) => Number.isSafeInteger(value));
+    const attributes = {
+      collector_state: consistent ? "ok" : "partial",
+      obs_start_ms: allKnown(entry.starts) ? msString(Math.min(...entry.starts)) : "unknown",
+      obs_end_ms: allKnown(entry.ends) ? msString(Math.max(...entry.ends)) : "unknown",
+      binary,
+      state,
+      trust_reason: reason,
+      path_hmac: !consistent ? "unknown"
+        : typeof first.resolved_path === "string" && first.resolved_path ? contextHmac(hmacKey, "collector_binary_path", first.resolved_path)
+          : state === "not_found_on_known_paths" ? "none" : "unknown",
+      content_hmac: !consistent || !resolved ? (state === "not_found_on_known_paths" ? "none" : "unknown")
+        : typeof first.content_hash === "string" && first.content_hash ? contextHmac(hmacKey, "collector_binary_content", first.content_hash) : "unknown",
+      same_uid_writable: consistent && resolved && writable !== undefined ? String(writable) : "unknown",
+      observations: String(Math.min(entry.observations.length, 64)),
+      rejected_field: "none",
+    };
+    points.push(contextFactPoint({
+      hmacKey,
+      ts,
+      factName: COLLECTOR_BINARY_STATE_FACT_NAME,
+      entityKey: `${COLLECTOR_BINARY_STATE_FACT_NAME}.${binary}`,
+      attributes,
+      source: CONTEXT_ENVELOPE_SOURCES.derived,
+    }));
+  }
+  return points;
 }

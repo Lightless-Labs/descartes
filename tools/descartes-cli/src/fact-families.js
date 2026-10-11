@@ -39,6 +39,8 @@ export const FACT_FAMILY_IDS = Object.freeze([
   "host_lifecycle",
   "network_context",
   "session_context",
+  // Context plan C2 (§3 C0.1, §4.2): per-binary availability/trust verdicts. DATA ONLY.
+  "collector_state",
 ]);
 
 const KNOWN_FAMILIES = new Set(FACT_FAMILY_IDS);
@@ -71,6 +73,7 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["session.login_history_row", "session_context"],
   ["session.login_census", "session_context"],
   ["user.presence", "session_context"],
+  ["collector.binary_state", "collector_state"],
 ];
 
 function buildFactFamilyByName(pairs) {
@@ -272,6 +275,9 @@ const FAMILY_BUDGET_ENTRIES = [
   ["host_lifecycle", 4 * MIB],
   ["network_context", 2 * MIB],
   ["session_context", 11 * MIB],
+  // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
+  // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
+  ["collector_state", 8 * MIB],
 ];
 
 // The pinned worst-case tick shape per family (§15.3): the maximum normalized record size the REAL
@@ -308,6 +314,8 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   ["host_lifecycle", { maxRecordBytes: 0, markerBytes: 3967, entityCap: 0 }],
   ["network_context", { maxRecordBytes: 0, markerBytes: 1630, entityCap: 0 }],
   ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],
+  // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
+  ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
 ];
 
 export const BUDGET_INVARIANT_HEADROOM = 1.25;
@@ -350,6 +358,7 @@ const DATA_FAMILY_HORIZON_ENTRIES = [
   ["host_lifecycle", 30 * DAY_MS],
   ["network_context", 30 * DAY_MS],
   ["session_context", 30 * DAY_MS],
+  ["collector_state", 30 * DAY_MS],
 ];
 
 function buildDataFamilyHorizons(entries) {
