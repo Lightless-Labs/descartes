@@ -1322,7 +1322,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       if (hostLifecycleEnabled) {
         try {
           const probeHost = options.hostLifecycleProbe ?? readHostLifecycle;
-          bootProbeBefore = await probeHost(collectorOptions);
+          // C0 review L7: this runs on EVERY fast tick, so it is bounded by the context sub-deadline
+          // (a hung sysctl costs one bounded wait and infers nothing). The ledger is still rewritten
+          // every tick: last_observed_ms is the "last observation of the previous boot" the gap
+          // conjunct needs at tick precision; it is one small atomic write.
+          const probeCapMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms) ? structuralProfile.context_collector_deadline_ms : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
+          const BOUNDARY_PROBE_TIMED_OUT = Symbol("boundary-probe-timed-out");
+          bootProbeBefore = await withDeadline(Promise.resolve().then(() => probeHost(collectorOptions)), probeCapMs, () => BOUNDARY_PROBE_TIMED_OUT);
+          if (bootProbeBefore === BOUNDARY_PROBE_TIMED_OUT) {
+            bootProbeBefore = undefined;
+            throw new Error("boundary_probe_deadline_exceeded");
+          }
           const ledgerRead = await (options.readBootLedger ?? readBootLedger)(descartesPaths);
           if (ledgerRead.status === "corrupt") bootLedgerError = "boot_ledger_corrupt_restarted";
           const key = await ensureContextKey();

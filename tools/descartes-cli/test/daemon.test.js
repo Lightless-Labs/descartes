@@ -6443,6 +6443,26 @@ test("C0 review L1: a pending boundary whose new boot the live after-census read
   assert.equal(unread.failing_conjunct, "live_boot_unread");
 });
 
+test("C0 review L7: the every-tick boundary probe runs under the context sub-deadline; a hung probe costs one bounded wait and infers nothing", async () => {
+  const paths = await tempPaths();
+  const started = Date.now();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ context_collector_deadline_ms: 50, collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: 1 })) },
+    hostLifecycleProbe: () => new Promise(() => {}),
+    evaluateAlerts: false,
+    ts: new Date(C12_T0).toISOString(),
+    now: C12_T0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: C12_T0 }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(result.status.boot_ledger_error, "boundary_probe_deadline_exceeded");
+});
+
 test("C0 review M1: the bracket is never stable when the wake marker is unreadable on either side", () => {
   const noMarker = (bootId) => ({ platform: "linux", status: "ok", boot: { boot_id: bootId, boot_id_source: "proc_boot_id", boot_time_s: 1 }, clocks: { wall_ms: 1, os_uptime_ms: 1 } });
   const withMarker = { ...noMarker(BOOT_ONE), clocks: { wall_ms: 1, os_uptime_ms: 1, suspend_stats_success: 3 } };
