@@ -1770,7 +1770,7 @@ Branch `feat/context-facts-c2b-2026-10` (from `main` @ 122e650, which contains t
 
 ### C2 review fixes (2026-10-11)
 
-Adversarial review of C2 at c910f54 (NEEDS-REWORK: 0 BLOCKER, 1 HIGH, 7 MEDIUM, 13 LOW). Every finding was checked against the code; each accepted one has a failing test first and its own commit.
+Adversarial review of C2 at c910f54 (NEEDS-REWORK: 0 BLOCKER, 1 HIGH, 7 MEDIUM, 13 LOW). Every finding was checked against the code; each accepted one has a test and its own commit. Each test was run failing before its fix, except M3 and M6, whose before-state is the reviewer's probe output and the old tag lists; their tests were first run after the fix.
 
 | Finding | Disposition |
 |---|---|
@@ -1781,7 +1781,7 @@ Adversarial review of C2 at c910f54 (NEEDS-REWORK: 0 BLOCKER, 1 HIGH, 7 MEDIUM, 
 | M4 unknown clock-step status treated as "no step" | Accepted. Tri-state; `basis: clock_step_unknown` unless a cross-check saw no step. |
 | M5 open item 20 not met on macOS; addendum overclaimed | Accepted as a label and documentation fix (deviation 12; code table). No macOS clock is validated yet, so the bound is not re-derived. |
 | M6 incomplete peer provenance tags | Accepted, with a correction. WireGuard peers are real (new tag `net.wireguard`). The established-inbound read never yields a peer: it only enters the census state and universe (new tag `net.socket_table`). Value fields name `login.utmp` and `net.wireguard`; `pcs`, `pu` and `p_known` also name `vpn.service_config` and `net.socket_table`. |
-| M7 a wiped derived directory reads as a first run | Accepted. Each derived family vouches for the other: one present makes the other's absence a loss. A restarted chain seeds its `seq` from the statistics so no episode id is reused. Both wiped together is still undetectable here (B-ledger scope). |
+| M7 a wiped derived directory reads as a first run | Accepted. Each derived family vouches for the other: one present makes the other's absence a loss. A restarted chain seeds its `seq` from the statistics so no episode id is reused. Both wiped together is still undetectable here (B-ledger scope). If the very first tick's `tick_summary` append commits and its `context_stats` append fails, the next tick reports `memory_lost` for a store that never existed. This errs toward loss, like L9. |
 | L1 `context_stats` pin omits `confidence:0` | Accepted. 531 + 442 = 973 B; the 30-day floor is 875,700 B. |
 | L2 daemon-gap interval lost on C2 failure | Accepted. The reset accumulator is merged into the next interval's. |
 | L3 raw `relation` beside the verified value | Not changed: deviation 8 keeps the raw comparison on purpose so the data is not lost while no boundary is verified, and `created_vs_boot`/`basis` carry the verdict. |
