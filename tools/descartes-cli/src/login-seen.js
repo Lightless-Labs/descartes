@@ -130,5 +130,26 @@ export function selectNewLoginRows(seen, result, { nowMs, bootSalt, hmacKey } = 
     dedupeState,
     lifecycleDedupeState,
     next: { version: LOGIN_SEEN_VERSION, key_id: keyId, records: prune(records, nowMs), history: prune(history, nowMs), lifecycle: prune(lifecycle, nowMs) },
+    // C2 review M1: the next state with the lifecycle map left as it was (the rows NOT marked seen),
+    // for a tick whose host.lifecycle_record facts did not reach the fact history. No usable prior map
+    // (a C0-era or reseeded state) leaves none, so the rows re-emit as "reseeded".
+    nextWithoutLifecycle: {
+      version: LOGIN_SEEN_VERSION,
+      key_id: keyId,
+      records: prune(records, nowMs),
+      history: prune(history, nowMs),
+      ...(usable?.lifecycle !== undefined ? { lifecycle: { ...usable.lifecycle } } : {}),
+    },
   };
+}
+
+/**
+ * C2 review M1: the seen-state to commit. The lifecycle rows of this tick are marked seen only when
+ * there were none, or their host.lifecycle_record facts reached the fact history (`lifecycleRecorded`);
+ * otherwise the rows stay unseen and are offered again next tick (never a consumed row with no fact).
+ */
+export function loginSeenToCommit(dedupe, { lifecycleRecorded } = {}) {
+  if (!dedupe) return undefined;
+  const pending = Array.isArray(dedupe.newLifecycle) && dedupe.newLifecycle.length > 0;
+  return pending && lifecycleRecorded !== true ? dedupe.nextWithoutLifecycle : dedupe.next;
 }

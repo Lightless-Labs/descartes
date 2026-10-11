@@ -12,6 +12,7 @@ import { readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { DERIVED_FAMILIES, FACT_FAMILY_IDS } from "../src/fact-families.js";
 import { finalizeContextC2, prepareContextC2 } from "../src/context-c2-daemon.js";
 import { resolveStatsStatePath, resolveSummaryChainPath, verifyTickSummaryChain } from "../src/context-summary.js";
+import { readLoginSeen } from "../src/login-seen.js";
 
 const T0 = Date.parse("2026-10-11T08:00:00.000Z");
 const HOUR = 3_600_000;
@@ -203,4 +204,56 @@ test("C2 finalize: a summary whose pass did not commit leaves the chain state un
   const next = await prepareContextC2({ descartesPaths: paths, evidence: [], basePoints: [], ts: new Date(T0 + HOUR).toISOString(), daemonIntervalMs: 60000 });
   assert.equal(next.context.chainRead.status, "missing");
   assert.equal(next.context.transitions.events, undefined);
+});
+
+// C2 review M1: a reboot/shutdown row is marked seen only when its host.lifecycle_record reached the
+// fact history (C2 admitted and host_lifecycle persisted): never a consumed row with no fact.
+test("C2 host.lifecycle_record: a row is consumed only when its fact persisted; a failed or disabled C2 step offers it again", async () => {
+  const lifecycleRow = { kind: "reboot", start_text: "Fri Sep 4 16:10", end_state: "none", duration_text: "none", os_release: "none", identity: ["lifecycle", "reboot", "Fri Sep 4 16:10", "none"].join("\u0000") };
+  const withLogin = (paths, overrides = {}) => {
+    const { state, run } = harness(paths, overrides);
+    const login = async () => ({
+      ...envelope("login-sessions", "collect_login_sessions", { platform: "darwin", status: "ok", sources: { who: "ok", last: "ok", console: "not_applicable", loginctl: "not_applicable" }, records: [], history: [], presence: { screen_locked: "unknown", idle_hint: "unknown", source: "none" }, truncated: false, lifecycle: { state: "ok", rows: [lifecycleRow] } }),
+      observation: { start_ms: state.nowMs + 20, end_ms: state.nowMs + 30 },
+    });
+    const runWith = (nowMs, extra = {}) => run(nowMs, {
+      profile: { interval_ms: 60000, collectors: { system: { enabled: true }, processes: { enabled: true }, disks: { enabled: true } }, structural: { interval_ms: HOUR, collectors: { sessions: { enabled: true }, "host-lifecycle": { enabled: true }, "login-sessions": { enabled: true } } } },
+      structuralCollectors: {
+        sessions: async () => envelope("sessions", "collect_sessions", { multiplexers: [{ multiplexer: "tmux", status: "ok" }], sessions: [], total_count: 0, truncated: false }),
+        "host-lifecycle": async () => ({ ...envelope("host-lifecycle", "collect_host_lifecycle", { platform: "darwin", status: "ok", boot: { boot_id: BOOT, boot_time_s: 1_000_000 }, clocks: { wall_ms: nowMs, os_uptime_ms: nowMs - 1_000_000_000 } }), observation: { start_ms: nowMs + 10, end_ms: nowMs + 20 } }),
+        "login-sessions": login,
+      },
+      ...extra,
+    });
+    return runWith;
+  };
+  const records = async (paths) => (await readFactPoints(paths, { family: "host_lifecycle", now: new Date(T0 + 2 * HOUR).toISOString() })).points.filter((p) => p.fact_name === "host.lifecycle_record");
+  const lifecycleSeen = async (paths) => Object.keys((await readLoginSeen(paths)).seen?.lifecycle ?? {}).length;
+  // Control: recorded once, then deduped.
+  {
+    const paths = await tempPaths();
+    const run = withLogin(paths);
+    await run(T0);
+    await run(T0 + HOUR);
+    assert.equal((await records(paths)).length, 1);
+    assert.equal(await lifecycleSeen(paths), 1);
+  }
+  for (const [label, firstTick] of [
+    ["prepare failed", { prepareContextC2: async () => { throw new Error("transient c2 failure"); } }],
+    ["C2 off", { contextC2: false }],
+    ["host_lifecycle not persisted", { appendFactPoints: async (descartesPaths, points, options) => {
+      const { appendFactPointsByFamily } = await import("../src/fact-store.js");
+      const result = await appendFactPointsByFamily(descartesPaths, points.filter((p) => !p.fact_name.startsWith("host.")), options);
+      return { ...result, families: { ...result.families, host_lifecycle: { append_error: "simulated" } } };
+    } }],
+  ]) {
+    const paths = await tempPaths();
+    const run = withLogin(paths);
+    await run(T0, firstTick);
+    assert.equal(await lifecycleSeen(paths), 0, `${label}: the row is not marked seen`);
+    await run(T0 + HOUR);
+    const written = await records(paths);
+    assert.equal(written.length, 1, `${label}: the row reaches the fact history on the next tick`);
+    assert.equal(await lifecycleSeen(paths), 1);
+  }
 });

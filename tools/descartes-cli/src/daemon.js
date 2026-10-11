@@ -45,7 +45,7 @@ import {
   hostBootIdHmac,
 } from "./context-translators.js";
 import { collectNetConfigEvidence } from "./tools/net-config.js";
-import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
+import { loginSeenToCommit, readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
 import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
 import { collectSessionAttachmentEvidence } from "./tools/session-attachment.js";
 import { admitContextC2Points, finalizeContextC2, prepareContextC2 } from "./context-c2-daemon.js";
@@ -1584,7 +1584,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           if (loginDedupe) {
             if (familyPersisted("session_context")) {
               try {
-                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginDedupe.next);
+                // C2 review M1: the reboot/shutdown rows (host.lifecycle_record, C2) are marked seen
+                // only when the C2 points were admitted to this pass and host_lifecycle persisted.
+                const lifecycleRecorded = contextC2Prepared !== undefined && familyPersisted("host_lifecycle");
+                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginSeenToCommit(loginDedupe, { lifecycleRecorded }));
               } catch (error) {
                 loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_write_failed";
               }
