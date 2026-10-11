@@ -22,6 +22,7 @@ test("observationInterval prefers the daemon's own stamp, falls back to the enve
   assert.deepEqual(observationInterval(tailscaleEnvelope({})), { obsStartMs: Date.parse("2026-10-11T10:00:00.460Z"), obsEndMs: Date.parse("2026-10-11T10:00:00.500Z") });
   assert.deepEqual(observationInterval({}), { obsStartMs: undefined, obsEndMs: undefined });
   assert.deepEqual(observationInterval({ observation: { start_ms: 9, end_ms: 5 } }), { obsStartMs: undefined, obsEndMs: undefined });
+  assert.deepEqual(observationInterval({ trace: { ts: TS, latency_ms: { toString: () => "999" } } }), { obsStartMs: undefined, obsEndMs: undefined });
 });
 
 test("C0.3: a Running tailnet is a net.tailnet_state with the tailnet name HMAC'd at source", () => {

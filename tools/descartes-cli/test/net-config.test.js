@@ -100,6 +100,22 @@ test("C0.5 parsers (linux formats)", () => {
   assert.equal(globalPrefix64("not-an-address"), undefined);
 });
 
+test("HIGH 2 reproduction: an unparseable Darwin or Linux route line is not absence", () => {
+  assert.equal(parseNetstatDefaultRoutes("MALFORMED\n"), undefined);
+  assert.equal(parseIpRouteDefault("MALFORMED\n"), undefined);
+});
+
+test("HIGH 2 reproduction: malformed route output makes the collector partial and the aggregate fingerprint unknown", async () => {
+  const result = await collectNetConfigEvidence({
+    platform: "darwin",
+    runFixedExecFile: async () => ({ status: "ok", stdout: "MALFORMED\n", stderr: "" }),
+  });
+  assert.equal(result.result.status, "partial");
+  assert.equal(result.result.route.state, "unable");
+  const [point] = factPointsFromNetConfigEvidence([result], { ts: "2026-10-11T10:00:00.000Z", hmacKey: Buffer.alloc(CONTEXT_KEY_BYTES, 7) });
+  assert.equal(point.attributes.fingerprint_hmac, "unknown");
+});
+
 test("B2: Linux ra_prefix preserves the observed RA prefix length and rejects static addresses", () => {
   assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(
     "    inet6 2001:db8:1:2::1234/48 scope global dynamic mngtmpaddr proto ra\n",

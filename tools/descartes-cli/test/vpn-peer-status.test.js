@@ -19,6 +19,8 @@ import {
 } from "../src/tools/vpn-peer-status.js";
 
 const SRC_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "tools", "vpn-peer-status.js");
+const WG_KEY_A = "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=";
+const WG_KEY_B = "xTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=";
 
 function ok(stdout, stderr = "") {
   return { status: "ok", stdout, stderr, command: { argv: ["fixture"], read_only: true } };
@@ -174,22 +176,22 @@ test("parseWgInterfaceList splits on whitespace, tolerates a single or multiple 
 });
 
 test("parseWgPeerList returns one pubkey per line, empty for a real zero-peers interface", () => {
-  const stdout = "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=\nxTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=\n";
+  const stdout = `${WG_KEY_A}\n${WG_KEY_B}\n`;
   assert.deepEqual(parseWgPeerList(stdout), [
-    "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=",
-    "xTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=",
+    WG_KEY_A,
+    WG_KEY_B,
   ]);
   assert.deepEqual(parseWgPeerList(""), []);
 });
 
 test("parseWgEndpoints maps pubkey -> endpoint, treating '(none)' as no endpoint", () => {
-  const stdout = "keyA\t203.0.113.10:51820\nkeyB\t(none)\n";
-  assert.deepEqual(parseWgEndpoints(stdout), { keyA: "203.0.113.10:51820", keyB: undefined });
+  const stdout = `${WG_KEY_A}\t203.0.113.10:51820\n${WG_KEY_B}\t(none)\n`;
+  assert.deepEqual(parseWgEndpoints(stdout), { [WG_KEY_A]: "203.0.113.10:51820", [WG_KEY_B]: undefined });
 });
 
 test("parseWgHandshakes maps pubkey -> epoch seconds, 0 means never handshaked", () => {
-  const stdout = "keyA\t1720000000\nkeyB\t0\n";
-  assert.deepEqual(parseWgHandshakes(stdout), { keyA: 1720000000, keyB: 0 });
+  const stdout = `${WG_KEY_A}\t1720000000\n${WG_KEY_B}\t0\n`;
+  assert.deepEqual(parseWgHandshakes(stdout), { [WG_KEY_A]: 1720000000, [WG_KEY_B]: 0 });
 });
 
 test("B1: WireGuard malformed rows are partial and never coerced into peers", async () => {
@@ -197,14 +199,42 @@ test("B1: WireGuard malformed rows are partial and never coerced into peers", as
     platform: "linux",
     runFixedExecFile: scriptedExec(baseScript({
       [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
-      [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\nMALFORMED ROW\n"),
-      [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok("keyA\t203.0.113.10:51820\n"),
-      [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok("keyA\t1720000000\n"),
+      [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${WG_KEY_A}\nMALFORMED ROW\n`),
+      [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${WG_KEY_A}\t203.0.113.10:51820\n`),
+      [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${WG_KEY_A}\t1720000000\n`),
     })),
   });
   assert.equal(envelope.result.sources.wireguard.status, "partial");
   assert.deepEqual(envelope.result.sources.wireguard.interfaces, [{ name: "wg0", status: "partial" }]);
   assert.equal(envelope.result.peers.some((peer) => peer.source_type === "wireguard"), false);
+});
+
+test("B1 daybreak reproduction: malformed or mismatched WireGuard key populations are partial and emit no peers", async () => {
+  const cases = [
+    {
+      peers: "not-a-wireguard-public-key\n",
+      endpoints: `${WG_KEY_B}\t203.0.113.10:51820\n`,
+      handshakes: `${WG_KEY_B}\t1720000000\n`,
+    },
+    {
+      peers: `${WG_KEY_A}\n`,
+      endpoints: `${WG_KEY_B}\t203.0.113.10:51820\n`,
+      handshakes: `${WG_KEY_B}\t1720000000\n`,
+    },
+  ];
+  for (const fixture of cases) {
+    const envelope = await collectVpnPeerStatusEvidence({
+      platform: "linux",
+      runFixedExecFile: scriptedExec(baseScript({
+        [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
+        [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(fixture.peers),
+        [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(fixture.endpoints),
+        [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(fixture.handshakes),
+      })),
+    });
+    assert.equal(envelope.result.sources.wireguard.status, "partial");
+    assert.deepEqual(envelope.result.peers, []);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -322,9 +352,9 @@ test("BEHAVIORAL: across multiple interfaces (including an adversarial interface
   const adversarialIface = "wg0; wg show wg0 dump"; // a crafted/compromised interface name
   const script = {
     [JSON.stringify(["wg", "show", "interfaces"])]: ok(["wg0", adversarialIface].join(" ")),
-    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\n"),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok("keyA\t203.0.113.10:51820\n"),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok("keyA\t1720000000\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${WG_KEY_A}\n`),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${WG_KEY_A}\t203.0.113.10:51820\n`),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${WG_KEY_A}\t1720000000\n`),
     [JSON.stringify(["wg", "show", adversarialIface, "peers"])]: ok(""),
     [JSON.stringify(["wg", "show", adversarialIface, "endpoints"])]: ok(""),
     [JSON.stringify(["wg", "show", adversarialIface, "latest-handshakes"])]: ok(""),
@@ -455,9 +485,9 @@ test("an untrusted vpn_services binary is incomplete and its resolved-path trust
 test("WireGuard present with peers, SSH not found -> exactly the WG peers, no fabricated SSH data", async () => {
   const runFixedExecFile = scriptedExec(baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
-    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\nkeyB\n"),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok("keyA\t203.0.113.10:51820\nkeyB\t(none)\n"),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok("keyA\t1720000000\nkeyB\t0\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${WG_KEY_A}\n${WG_KEY_B}\n`),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${WG_KEY_A}\t203.0.113.10:51820\n${WG_KEY_B}\t(none)\n`),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${WG_KEY_A}\t1720000000\n${WG_KEY_B}\t0\n`),
   }));
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile });
   assert.equal(envelope.status, "ok");
@@ -503,7 +533,7 @@ test("MEDIUM: aborting during wg0 prevents every later wg subprocess launch", as
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0 wg1\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: () => {
       controller.abort();
-      return ok("keyA\n");
+      return ok(`${WG_KEY_A}\n`);
     },
   });
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", signal: controller.signal, runFixedExecFile: scriptedExec(script, calls) });

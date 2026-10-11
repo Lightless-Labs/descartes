@@ -183,6 +183,20 @@ test("HIGH 3: malformed required lifecycle fields make the whole result partial 
   assert.equal(result.clocks.proc_uptime_s, undefined);
 });
 
+test("MEDIUM 2 reproduction: typed runtime clocks reject coercible strings and objects", async () => {
+  const result = await readHostLifecycle({
+    platform: "darwin",
+    runFixedExecFile: async () => ({ status: "ok", stdout: DARWIN_SYSCTL_REAL, stderr: "" }),
+    nowFn: () => 1_791_724_875_400,
+    uptimeFn: () => "12.5",
+    hrtimeFn: () => ({ toString: () => "999" }),
+    uvVersion: "1.52.1",
+  });
+  assert.equal(result.status, "partial");
+  assert.equal(result.clocks.os_uptime_ms, undefined);
+  assert.equal(result.clocks.uv_hrtime_ns, undefined);
+});
+
 test("an unsupported platform is not_applicable, with raw runtime clocks only", async () => {
   const result = await readHostLifecycle({ platform: "sunos", ...FIXED_CLOCKS });
   assert.equal(result.status, "not_applicable");

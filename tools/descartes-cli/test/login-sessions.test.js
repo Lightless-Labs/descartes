@@ -198,7 +198,33 @@ test("HIGH 1: malformed loginctl show-session fields are partial, never silently
     }),
   });
   assert.equal(result.sources.loginctl, "partial");
-  assert.equal(result.records.length, 1);
+  assert.equal(result.records.length, 0);
+});
+
+test("HIGH 1 reproduction: a show-session block containing only Id is partial", async () => {
+  const result = await readLoginSessions({
+    platform: "linux",
+    runFixedExecFile: scripted({
+      "loginctl list-sessions --no-legend --no-pager": ok("1 1000 alice seat0 tty2\n"),
+      "loginctl show-session": ok("Id=1\n"),
+      "last -n 50": ok(""),
+    }),
+  });
+  assert.equal(result.sources.loginctl, "partial");
+  assert.deepEqual(result.records, []);
+});
+
+test("HIGH 1 reproduction: a show-session block for a different Id is partial", async () => {
+  const result = await readLoginSessions({
+    platform: "linux",
+    runFixedExecFile: scripted({
+      "loginctl list-sessions --no-legend --no-pager": ok("1 1000 alice seat0 tty2\n"),
+      "loginctl show-session": ok(LOGINCTL_SHOW.split("\n\n")[0].replace("Id=2", "Id=2")),
+      "last -n 50": ok(""),
+    }),
+  });
+  assert.equal(result.sources.loginctl, "partial");
+  assert.deepEqual(result.records, []);
 });
 
 test("C0.4 linux parsers and classes", () => {

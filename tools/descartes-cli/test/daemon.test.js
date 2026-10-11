@@ -947,6 +947,57 @@ test("B2: a context collector timeout records only that context as unable after 
   assert.ok(result.structuralFacts, "incumbent evidence remains eligible for persistence");
 });
 
+test("B2: an incumbent rejection escapes like main and cannot advance the structural checkpoint", async () => {
+  const paths = await tempPaths();
+  let checkpointWrites = 0;
+  await assert.rejects(() => runDaemonIteration(paths, {
+    profile: structuralProfile(),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      services: async () => { throw new Error("boom"); },
+    },
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => { checkpointWrites += 1; },
+    loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  }), /boom/);
+  assert.equal(checkpointWrites, 0);
+});
+
+test("B2: a throwing context collector leaves incumbent evidence, facts, checkpoint, and alert inputs intact", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({
+      collectors: {
+        services: { enabled: true },
+        network: { enabled: false },
+        "scheduled-jobs": { enabled: false },
+        "host-lifecycle": { enabled: true },
+      },
+    }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+      "host-lifecycle": async () => { throw new Error("context boom"); },
+    },
+    hostLifecycleProbe: async () => undefined,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => checkpoint,
+    loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.structuralEvidence.find((entry) => entry.id === "services").status, "ok");
+  assert.equal(result.structuralEvidence.find((entry) => entry.id === "host-lifecycle").status, "unable");
+  assert.ok(result.structuralFacts);
+  assert.ok(result.status.structural_collector_statuses.some((entry) => entry.id === "services" && entry.status === "ok"));
+});
+
 test("a structural tick that completes well within its deadline is unaffected by the deadline machinery", async () => {
   const paths = await tempPaths();
   const result = await runDaemonIteration(paths, {
