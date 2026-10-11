@@ -21,6 +21,11 @@ import {
 const SRC_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "tools", "vpn-peer-status.js");
 const WG_KEY_A = "+zx8L34dHV/wYi9YWNSKB2VBRTZ2hkQtwT8daVGVOX8=";
 const WG_KEY_B = "xTIBA5rboUvnH4htodjb6e697QjLERt1TrOxweBWSQ8=";
+function wgKeyFor(index) {
+  const bytes = Buffer.alloc(32);
+  bytes.writeUInt32BE(index, 28);
+  return bytes.toString("base64");
+}
 
 function ok(stdout, stderr = "") {
   return { status: "ok", stdout, stderr, command: { argv: ["fixture"], read_only: true } };
@@ -632,12 +637,14 @@ test("a custom lastHistoryLimit is honored and still bounded (fixture-pinned per
 
 test("a peer flood above the cap is bounded at the cap, with truncated:true and the real total preserved", async () => {
   const cap = 5;
-  const pubkeys = Array.from({ length: cap * 4 }, (_, i) => `key-${i}`).join("\n");
+  const pubkeys = Array.from({ length: cap * 4 }, (_, i) => wgKeyFor(i)).join("\n");
+  const endpoints = Array.from({ length: cap * 4 }, (_, i) => `${wgKeyFor(i)}\t(none)`).join("\n");
+  const handshakes = Array.from({ length: cap * 4 }, (_, i) => `${wgKeyFor(i)}\t0`).join("\n");
   const script = baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(endpoints),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(handshakes),
   });
   const runFixedExecFile = scriptedExec(script);
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile, peerLimit: cap });
@@ -649,12 +656,14 @@ test("a peer flood above the cap is bounded at the cap, with truncated:true and 
 
 test("a peer count at or below the cap is never marked truncated", async () => {
   const cap = 5;
-  const pubkeys = Array.from({ length: cap }, (_, i) => `key-${i}`).join("\n");
+  const pubkeys = Array.from({ length: cap }, (_, i) => wgKeyFor(i)).join("\n");
+  const endpoints = Array.from({ length: cap }, (_, i) => `${wgKeyFor(i)}\t(none)`).join("\n");
+  const handshakes = Array.from({ length: cap }, (_, i) => `${wgKeyFor(i)}\t0`).join("\n");
   const script = baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(endpoints),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(handshakes),
   });
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: scriptedExec(script), peerLimit: cap });
   assert.equal(envelope.result.peers.length, cap);
@@ -663,12 +672,15 @@ test("a peer count at or below the cap is never marked truncated", async () => {
 
 // Fact-store capacity plan §2/S4: the peer cap is a hard UPPER clamp (T8 sizes the peer budget on it).
 test("an options.peerLimit above MAX_PEER_ENTITY_LIMIT is clamped down to it", async () => {
-  const pubkeys = Array.from({ length: MAX_PEER_ENTITY_LIMIT + 20 }, (_, i) => `key-${i}`).join("\n");
+  const count = MAX_PEER_ENTITY_LIMIT + 20;
+  const pubkeys = Array.from({ length: count }, (_, i) => wgKeyFor(i)).join("\n");
+  const endpoints = Array.from({ length: count }, (_, i) => `${wgKeyFor(i)}\t(none)`).join("\n");
+  const handshakes = Array.from({ length: count }, (_, i) => `${wgKeyFor(i)}\t0`).join("\n");
   const script = baseScript({
     [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
     [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(pubkeys),
-    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(""),
-    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(""),
+    [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(endpoints),
+    [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(handshakes),
   });
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: scriptedExec(script), peerLimit: 100_000 });
   assert.equal(envelope.result.cap, MAX_PEER_ENTITY_LIMIT);

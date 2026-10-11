@@ -234,6 +234,16 @@ function withMalformedCount(value, malformed_count) {
   return value;
 }
 
+function isWireguardPublicKey(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(value)) return false;
+  try {
+    const decoded = Buffer.from(value, "base64");
+    return decoded.length === 32 && decoded.toString("base64") === value;
+  } catch {
+    return false;
+  }
+}
+
 export function parseWgInterfaceList(stdout) {
   if (typeof stdout !== "string") return withMalformedCount([], 1);
   const values = [];
@@ -252,7 +262,7 @@ export function parseWgPeerList(stdout) {
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    if (/\s/.test(line)) malformed += 1;
+    if (/\s/.test(line) || !isWireguardPublicKey(line)) malformed += 1;
     else values.push(line);
   }
   return withMalformedCount(values, malformed);
@@ -266,7 +276,7 @@ export function parseWgEndpoints(stdout) {
     const line = rawLine.trim();
     if (!line) continue;
     const fields = line.split("\t");
-    if (fields.length !== 2 || !fields[0] || !fields[1]) { malformed += 1; continue; }
+    if (fields.length !== 2 || !isWireguardPublicKey(fields[0]) || !fields[1]) { malformed += 1; continue; }
     const [pubkey, endpoint] = fields;
     map[pubkey] = endpoint && endpoint !== "(none)" ? endpoint : undefined;
   }
@@ -281,7 +291,7 @@ export function parseWgHandshakes(stdout) {
     const line = rawLine.trim();
     if (!line) continue;
     const fields = line.split("\t");
-    if (fields.length !== 2 || !fields[0] || !/^[0-9]+$/.test(fields[1])) { malformed += 1; continue; }
+    if (fields.length !== 2 || !isWireguardPublicKey(fields[0]) || !/^[0-9]+$/.test(fields[1])) { malformed += 1; continue; }
     const epoch = Number(fields[1]);
     if (!Number.isSafeInteger(epoch)) { malformed += 1; continue; }
     map[fields[0]] = epoch;
@@ -344,8 +354,14 @@ async function collectWireguardPeers(options) {
     const pubkeys = parseWgPeerList(peersProbe.stdout);
     const endpoints = parseWgEndpoints(endpointsProbe.stdout);
     const handshakes = parseWgHandshakes(handshakesProbe.stdout);
-    if (pubkeys.malformed_count > 0 || endpoints.malformed_count > 0 || handshakes.malformed_count > 0) {
-      interfaceStatuses.push({ name: iface, status: "partial" });
+    const peerKeys = new Set(pubkeys);
+    const endpointKeys = new Set(Object.keys(endpoints));
+    const handshakeKeys = new Set(Object.keys(handshakes));
+    const sameKeySet = peerKeys.size === endpointKeys.size
+      && peerKeys.size === handshakeKeys.size
+      && [...peerKeys].every((key) => endpointKeys.has(key) && handshakeKeys.has(key));
+    if (pubkeys.malformed_count > 0 || endpoints.malformed_count > 0 || handshakes.malformed_count > 0 || !sameKeySet) {
+      interfaceStatuses.push({ name: iface, status: "partial", ...(sameKeySet ? {} : { error: "wireguard_key_set_mismatch" }) });
       continue;
     }
 
