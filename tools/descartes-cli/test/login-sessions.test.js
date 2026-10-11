@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,8 +16,8 @@ import {
   parseWhoRows,
   readLoginSessions,
 } from "../src/tools/login-sessions.js";
-import { LOGIN_SEEN_CAP, loginRowDigest, readLoginSeen, resolveLoginSeenPath, selectNewLoginRows, writeLoginSeen } from "../src/login-seen.js";
-import { CONTEXT_KEY_BYTES, contextHmac } from "../src/context-key.js";
+import { LOGIN_SEEN_CAP, LOGIN_SEEN_VERSION, loginRowDigest, readLoginSeen, resolveLoginSeenPath, selectNewLoginRows, writeLoginSeen } from "../src/login-seen.js";
+import { CONTEXT_KEY_BYTES, contextHmac, contextKeyId } from "../src/context-key.js";
 import { validateContextFact } from "../src/context-schemas.js";
 import { factPointsFromLoginSessionsEvidence, MAX_LOGIN_ARRIVALS_PER_TICK } from "../src/context-translators.js";
 import { resolveDescartesPaths } from "../src/paths.js";
@@ -173,26 +174,49 @@ test("collectLoginSessionsEvidence wraps the read in a login-sessions envelope",
 
 // --- first-observed-tick dedupe ---
 
+const DEDUPE_KEY = Buffer.alloc(CONTEXT_KEY_BYTES, 7);
+
 test("C0.4 dedupe: a row is new only at its first observed tick; logind ids are scoped to the boot; loss re-emits as reseeded", () => {
   const result = { records: [{ source: "who", identity: "who\u0000a" }, { source: "loginctl", identity: "loginctl\u00005" }], history: [{ identity: "last\u0000x" }] };
-  const first = selectNewLoginRows(null, result, { nowMs: 1000, bootSalt: "boot1" });
+  const first = selectNewLoginRows(null, result, { nowMs: 1000, bootSalt: "boot1", hmacKey: DEDUPE_KEY });
   assert.equal(first.dedupeState, "reseeded");
   assert.equal(first.newRecords.length, 2);
   assert.equal(first.newHistory.length, 1);
-  const second = selectNewLoginRows(first.next, result, { nowMs: 2000, bootSalt: "boot1" });
+  const second = selectNewLoginRows(first.next, result, { nowMs: 2000, bootSalt: "boot1", hmacKey: DEDUPE_KEY });
   assert.equal(second.dedupeState, "fresh");
   assert.equal(second.newRecords.length, 0, "a repeated sighting is not a repeated login");
   assert.equal(second.newHistory.length, 0);
-  const rebooted = selectNewLoginRows(second.next, result, { nowMs: 3000, bootSalt: "boot2" });
+  const rebooted = selectNewLoginRows(second.next, result, { nowMs: 3000, bootSalt: "boot2", hmacKey: DEDUPE_KEY });
   assert.deepEqual(rebooted.newRecords.map((r) => r.source), ["loginctl"], "a logind id in a new boot is a new login (F1: per-boot counter)");
-  assert.equal(rebooted.next.records[loginRowDigest("who\u0000a")], 3000);
+  assert.equal(rebooted.next.records[loginRowDigest(DEDUPE_KEY, "who\u0000a")], 3000);
 });
 
-test("C0.4 dedupe state is bounded and aged; the file is 0600 and a corrupt file reads as corrupt", async () => {
+test("C0 review L4: row digests are keyed (no dictionary reversal of user/tty/host/time); no usable key means no dedupe at all, never an unkeyed digest", () => {
+  const identity = "who\u0000alice\u0000ttys003\u0000203.0.113.9\u0000Oct 11 12:00";
+  const keyed = loginRowDigest(DEDUPE_KEY, identity);
+  assert.match(keyed, /^[0-9a-f]{32}$/);
+  assert.notEqual(keyed, loginRowDigest(Buffer.alloc(CONTEXT_KEY_BYTES, 8), identity), "a different install key gives a different digest");
+  const unkeyed = crypto.createHash("sha256").update(`descartes.login_row.v1\u0000\u0000${identity}`).digest("hex").slice(0, 32);
+  assert.notEqual(keyed, unkeyed);
+  assert.equal(loginRowDigest(undefined, identity), undefined);
+  assert.equal(selectNewLoginRows(null, { records: [{ source: "who", identity }], history: [] }, { nowMs: 1, hmacKey: undefined }), undefined);
+});
+
+test("C0 review M7: the seen-state records the key id; a re-keyed install re-emits as reseeded, never as fresh arrivals", () => {
+  const result = { records: [{ source: "who", identity: "who\u0000a" }], history: [] };
+  const first = selectNewLoginRows(null, result, { nowMs: 1, hmacKey: DEDUPE_KEY });
+  assert.equal(first.next.key_id, contextKeyId(DEDUPE_KEY));
+  const rekeyed = selectNewLoginRows(first.next, result, { nowMs: 2, hmacKey: Buffer.alloc(CONTEXT_KEY_BYTES, 8) });
+  assert.equal(rekeyed.dedupeState, "reseeded");
+  assert.equal(rekeyed.newRecords.length, 1);
+  assert.deepEqual(Object.keys(rekeyed.next.records).length, 1, "the old key's digests are dropped, not carried");
+});
+
+test("C0.4 dedupe state is bounded and aged; the file is 0600 and a corrupt (or pre-key v1) file reads as corrupt", async () => {
   const many = { records: Array.from({ length: LOGIN_SEEN_CAP + 20 }, (_, i) => ({ source: "who", identity: `who\u0000${i}` })), history: [] };
-  const { next } = selectNewLoginRows(null, many, { nowMs: 5 });
+  const { next } = selectNewLoginRows(null, many, { nowMs: 5, hmacKey: DEDUPE_KEY });
   assert.equal(Object.keys(next.records).length, LOGIN_SEEN_CAP);
-  const aged = selectNewLoginRows({ version: 1, records: { [loginRowDigest("old")]: 0 }, history: {} }, { records: [], history: [] }, { nowMs: 31 * 24 * 3600 * 1000 });
+  const aged = selectNewLoginRows({ version: LOGIN_SEEN_VERSION, key_id: contextKeyId(DEDUPE_KEY), records: { [loginRowDigest(DEDUPE_KEY, "old")]: 0 }, history: {} }, { records: [], history: [] }, { nowMs: 31 * 24 * 3600 * 1000, hmacKey: DEDUPE_KEY });
   assert.deepEqual(aged.next.records, {});
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "descartes-login-seen-"));
   const paths = resolveDescartesPaths({ HOME: root, XDG_STATE_HOME: path.join(root, "s"), XDG_CONFIG_HOME: path.join(root, "c"), XDG_DATA_HOME: path.join(root, "d"), XDG_CACHE_HOME: path.join(root, "x") });
@@ -200,6 +224,8 @@ test("C0.4 dedupe state is bounded and aged; the file is 0600 and a corrupt file
   await writeLoginSeen(paths, next);
   assert.equal((await fs.stat(resolveLoginSeenPath(paths))).mode & 0o777, 0o600);
   assert.equal((await readLoginSeen(paths)).status, "ok");
+  await fs.writeFile(resolveLoginSeenPath(paths), JSON.stringify({ version: 1, records: {}, history: {} }));
+  assert.equal((await readLoginSeen(paths)).status, "corrupt", "an unkeyed v1 state is not reused");
   await fs.writeFile(resolveLoginSeenPath(paths), "{");
   assert.equal((await readLoginSeen(paths)).status, "corrupt");
 });
@@ -212,7 +238,7 @@ const TS = "2026-10-11T12:00:00.000Z";
 test("C0.4 translator: arrivals at their first-observed tick with every identifying value HMAC'd; census and presence each tick", async () => {
   const result = await readLoginSessions({ platform: "darwin", runFixedExecFile: scripted({ "who": ok(WHO_REAL), "last -n 50": ok(LAST_REAL), "ioreg -r -k IOConsoleUsers -d 1 -a": ok(IOREG_REAL) }) });
   const envelope = { id: "login-sessions", status: "ok", result, observation: { start_ms: 10, end_ms: 20 } };
-  const dedupe = selectNewLoginRows({ version: 1, records: {}, history: {} }, result, { nowMs: 1 });
+  const dedupe = selectNewLoginRows({ version: LOGIN_SEEN_VERSION, key_id: contextKeyId(KEY), records: {}, history: {} }, result, { nowMs: 1, hmacKey: KEY });
   const points = factPointsFromLoginSessionsEvidence([envelope], { ts: TS, hmacKey: KEY, dedupe });
   for (const point of points) assert.deepEqual(validateContextFact(point.fact_name, point.attributes), { ok: true }, `${point.fact_name} ${JSON.stringify(point.attributes)}`);
   const records = points.filter((p) => p.fact_name === "session.login_record");
@@ -233,7 +259,7 @@ test("C0.4 translator: arrivals beyond the per-tick cap are counted as overflow;
   const records = Array.from({ length: MAX_LOGIN_ARRIVALS_PER_TICK + 3 }, (_, i) => ({ source: "who", user: "u", origin_class: "remote", tty_class: "pts", remote_host: `h${i}`, identity: `who\u0000${i}` }));
   const result = { platform: "darwin", status: "ok", sources: { who: "ok", last: "absent", console: "ok", loginctl: "not_applicable" }, records, history: [], presence: {} };
   const envelope = { id: "login-sessions", status: "ok", result };
-  const dedupe = selectNewLoginRows(null, result, { nowMs: 1 });
+  const dedupe = selectNewLoginRows(null, result, { nowMs: 1, hmacKey: KEY });
   const points = factPointsFromLoginSessionsEvidence([envelope], { ts: TS, hmacKey: KEY, dedupe });
   assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, MAX_LOGIN_ARRIVALS_PER_TICK);
   const census = points.find((p) => p.fact_name === "session.login_census");

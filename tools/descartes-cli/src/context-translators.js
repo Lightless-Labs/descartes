@@ -11,7 +11,7 @@
 //   - Every point passes its closed schema (context-schemas.js) on the way out. A rejected field
 //     yields the schema's unable shape, never the value (C0.6).
 
-import { contextHmac } from "./context-key.js";
+import { contextHmac, contextKeyId } from "./context-key.js";
 import { enforceContextSchema } from "./context-schemas.js";
 
 // Fixed entity keys for the per-tick context facts. Literal constants (not computed) so the T12
@@ -41,12 +41,13 @@ export const MAX_LOGIN_ARRIVALS_PER_TICK = 8;
 export const MAX_LOGIN_HISTORY_ROWS_PER_TICK = 8;
 
 /** The one point builder every context translator uses: it always applies the closed schema. */
-export function contextFactPoint({ ts, factName, entityKey, attributes, source }) {
+export function contextFactPoint({ ts, factName, entityKey, attributes, source, hmacKey }) {
   return enforceContextSchema({
     ts,
     fact_name: factName,
     entity_key: entityKey ?? factName,
-    attributes,
+    // C0 review M7: every point names the key its HMACs were made with.
+    attributes: { ...attributes, hmac_key_id: contextKeyId(hmacKey) },
     source_envelope_id: source?.id,
     source_tool: source?.tool,
     sensitivity: "operational",
@@ -142,7 +143,7 @@ export function factPointsFromTailnetStateEvidence(evidence, { ts, hmacKey } = {
       : "unknown",
     rejected_field: "none",
   };
-  return [contextFactPoint({ ts, factName: NET_TAILNET_STATE_FACT_NAME, attributes, source: CONTEXT_ENVELOPE_SOURCES.tailscale })];
+  return [contextFactPoint({ hmacKey, ts, factName: NET_TAILNET_STATE_FACT_NAME, attributes, source: CONTEXT_ENVELOPE_SOURCES.tailscale })];
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -192,6 +193,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
   const points = [];
 
   points.push(contextFactPoint({
+    hmacKey,
     ts,
     factName: HOST_BOOT_FACT_NAME,
     source,
@@ -207,6 +209,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
   }));
 
   points.push(contextFactPoint({
+    hmacKey,
     ts,
     factName: HOST_CLOCK_READING_FACT_NAME,
     source,
@@ -232,6 +235,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
   }));
 
   points.push(contextFactPoint({
+    hmacKey,
     ts,
     factName: HOST_SUSPEND_FACT_NAME,
     source,
@@ -247,6 +251,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
 
   if (boundary) {
     points.push(contextFactPoint({
+      hmacKey,
       ts,
       factName: HOST_BOOT_BOUNDARY_FACT_NAME,
       source,
@@ -271,6 +276,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
 
   if (boundaryCensus) {
     points.push(contextFactPoint({
+      hmacKey,
       ts,
       factName: HOST_BOUNDARY_CENSUS_FACT_NAME,
       source,
@@ -341,6 +347,7 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
   const emittedHistory = newHistory.slice(0, MAX_LOGIN_HISTORY_ROWS_PER_TICK);
   for (const row of emittedRecords) {
     points.push(contextFactPoint({
+      hmacKey,
       ts,
       factName: SESSION_LOGIN_RECORD_FACT_NAME,
       entityKey: loginEntityKey(SESSION_LOGIN_RECORD_FACT_NAME, hmacKey, row.digest),
@@ -355,6 +362,7 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
   }
   for (const row of emittedHistory) {
     points.push(contextFactPoint({
+      hmacKey,
       ts,
       factName: SESSION_LOGIN_HISTORY_ROW_FACT_NAME,
       entityKey: loginEntityKey(SESSION_LOGIN_HISTORY_ROW_FACT_NAME, hmacKey, row.digest),
@@ -378,10 +386,11 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
     history_overflow: String(newHistory.length - emittedHistory.length),
     dedupe_state: dedupeState,
   };
-  points.push(contextFactPoint({ ts, factName: SESSION_LOGIN_CENSUS_FACT_NAME, source, attributes: census }));
+  points.push(contextFactPoint({ hmacKey, ts, factName: SESSION_LOGIN_CENSUS_FACT_NAME, source, attributes: census }));
   const presence = result.presence ?? {};
   const flag = (value) => (["true", "false", "unknown", "not_applicable"].includes(value) ? value : "unknown");
   points.push(contextFactPoint({
+    hmacKey,
     ts,
     factName: USER_PRESENCE_FACT_NAME,
     source,
@@ -461,5 +470,5 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
   attributes.fingerprint_hmac = allObserved
     ? contextHmac(hmacKey, "net_config_fingerprint", JSON.stringify([attributes.route_kind, routeState, ...NET_COMPONENTS.map((name) => [attributes[`${name}_state`], components[name]?.state === "ok" ? components[name].value : ""])]))
     : "unknown";
-  return [contextFactPoint({ ts, factName: NET_CONFIG_FINGERPRINT_FACT_NAME, source: CONTEXT_ENVELOPE_SOURCES.net_config, attributes })];
+  return [contextFactPoint({ hmacKey, ts, factName: NET_CONFIG_FINGERPRINT_FACT_NAME, source: CONTEXT_ENVELOPE_SOURCES.net_config, attributes })];
 }

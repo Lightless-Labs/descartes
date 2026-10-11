@@ -6531,6 +6531,39 @@ test("C0.4 wiring: a login is written once, at its first-observed structural tic
   assert.deepEqual(points.filter((p) => p.fact_name === "session.login_census").map((p) => p.attributes.dedupe_state), ["reseeded", "fresh"]);
 });
 
+test("C0 review L6: without a usable context key no login row is written (never merged under an .unknown entity key); the census says dedupe unavailable", async () => {
+  const paths = await tempPaths();
+  const loginResult = {
+    platform: "darwin", status: "ok", sources: { who: "ok", last: "absent", console: "ok", loginctl: "not_applicable" },
+    records: [
+      { source: "who", user: "alice", tty_class: "ttys", origin_class: "remote", service_class: "unknown", remote_host: "203.0.113.9", identity: "who\u0000alice\u0000ttys003\u0000203.0.113.9\u0000Oct 11 12:00" },
+      { source: "who", user: "bob", tty_class: "ttys", origin_class: "remote", service_class: "unknown", remote_host: "203.0.113.10", identity: "who\u0000bob\u0000ttys004\u0000203.0.113.10\u0000Oct 11 12:01" },
+    ],
+    history: [], presence: { screen_locked: "false", idle_hint: "not_applicable", source: "io_console" },
+  };
+  const ts = "2026-10-11T12:00:00.000Z";
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "login-sessions": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "login-sessions": async () => envelope("login-sessions", "collect_login_sessions", loginResult) },
+    loadContextKey: async () => ({ status: "unable", reason: "mode_too_wide" }),
+    evaluateAlerts: false,
+    ts,
+    now: Date.parse(ts),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.context_key_status, "unable:mode_too_wide");
+  const { points } = await readFactPoints(paths, { family: "session_context", now: Date.parse(ts) });
+  assert.equal(points.filter((p) => p.fact_name === "session.login_record").length, 0);
+  const census = points.find((p) => p.fact_name === "session.login_census");
+  assert.equal(census.attributes.dedupe_state, "unavailable");
+  assert.equal(census.attributes.hmac_key_id, "unknown");
+  await assert.rejects(fs.stat(path.join(paths.stateDir, "daemon", "login-seen.json")), "no unkeyed seen-state is written");
+});
+
 test("C0.5 wiring: net.config_fingerprint reaches network_context, keyed by the per-install key, never with a raw component", async () => {
   const paths = await tempPaths();
   const ts = "2026-10-11T12:00:00.000Z";

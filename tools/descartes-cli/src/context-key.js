@@ -96,3 +96,13 @@ export function contextHmac(key, domain, value) {
   if (typeof value !== "string" || value.length === 0) return "unknown";
   return crypto.createHmac("sha256", key).update(`descartes.context.${domain}.v1\u0000${value}`).digest("hex").slice(0, CONTEXT_HMAC_HEX_LENGTH);
 }
+
+/**
+ * C0 review M7: the id of a context key, as an HMAC of a fixed constant under it (domain-separated
+ * from every value HMAC). Every context fact carries it (`hmac_key_id`), so a deleted-and-recreated
+ * key is visible as a key change: a consumer never reads "every network, tailnet and user is new"
+ * when only the key changed. It reveals nothing about the key. "unknown" without a usable key.
+ */
+export function contextKeyId(key) {
+  return contextHmac(key, "key_id", "descartes.context.key_id.v1");
+}

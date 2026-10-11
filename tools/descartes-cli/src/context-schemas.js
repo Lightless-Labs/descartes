@@ -80,6 +80,9 @@ function commonFields(stateProvenance = ["descartes.daemon"]) {
     collector_state: enumField(COLLECTOR_STATES, stateProvenance),
     obs_start_ms: intField(0, MAX_EPOCH_MS, ["descartes.daemon"]),
     obs_end_ms: intField(0, MAX_EPOCH_MS, ["descartes.daemon"]),
+    // C0 review M7: the id of the per-install key this point's HMACs were made with (context-key.js
+    // contextKeyId), "unknown" when no key was usable.
+    hmac_key_id: hmacField(["descartes.daemon"]),
   };
 }
 

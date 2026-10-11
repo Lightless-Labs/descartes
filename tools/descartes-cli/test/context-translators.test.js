@@ -41,6 +41,7 @@ test("C0.3: a Running tailnet is a net.tailnet_state with the tailnet name HMAC'
     health_issue_bucket: "2-4",
     current_tailnet_hmac: contextHmac(KEY, "tailnet_name", "corp.example"),
     rejected_field: "none",
+    hmac_key_id: contextHmac(KEY, "key_id", "descartes.context.key_id.v1"),
   });
   assert.ok(!JSON.stringify(point).includes("corp.example"), "the tailnet name never reaches the fact point");
 });
@@ -154,4 +155,34 @@ test("C0.8/C0.12: boundary verdict and boundary census become host.boot_boundary
   assert.equal(rejected.attributes.collector_state, "unable");
   assert.equal(rejected.attributes.rejected_field, "verdict");
   assert.equal(rejected.attributes.verdict, "unknown");
+});
+
+test("C0 review M7: every context point carries the id of the key its HMACs were made with, so a re-keyed install is visible as a key change, not as every value changing", async () => {
+  const { contextKeyId } = await import("../src/context-key.js");
+  const { factPointsFromNetConfigEvidence, factPointsFromLoginSessionsEvidence } = await import("../src/context-translators.js");
+  const keyId = contextKeyId(KEY);
+  assert.match(keyId, /^[0-9a-f]{16}$/);
+  assert.equal(contextKeyId(KEY), keyId, "deterministic per key");
+  assert.notEqual(contextKeyId(Buffer.alloc(CONTEXT_KEY_BYTES, 8)), keyId);
+  assert.notEqual(keyId, contextHmac(KEY, "tailnet_name", "corp.example"), "domain-separated from every value HMAC");
+  assert.equal(contextKeyId(undefined), "unknown");
+  const evidence = [
+    tailscaleEnvelope({ status: "ok", tailnet: { backend_state: "Running" } }),
+    { id: "host-lifecycle", status: "ok", result: { platform: "darwin", status: "ok", boot: { boot_id: "B" }, clocks: {} } },
+    { id: "net-config", status: "ok", result: { platform: "darwin", status: "ok", route: { state: "absent", kind: "none" }, components: {} } },
+    { id: "login-sessions", status: "ok", result: { platform: "darwin", status: "ok", sources: {}, records: [], history: [], presence: {} } },
+  ];
+  for (const hmacKey of [KEY, undefined]) {
+    const points = [
+      ...factPointsFromTailnetStateEvidence(evidence, { ts: TS, hmacKey }),
+      ...factPointsFromHostLifecycleEvidence(evidence, { ts: TS, hmacKey, boundary: { verdict: "unverified", failing_conjunct: "uptime_consistent", tripwire: "none", c_never_seen: "pass", c_daemon_restart: "pass", c_boot_time_in_gap: "pass", c_uptime_consistent: "not_independent", c_no_preboot_instance: "pass", os_build_changed: "unknown" }, boundaryCensus: { trigger: "boot", status: "not_enabled" } }),
+      ...factPointsFromNetConfigEvidence(evidence, { ts: TS, hmacKey }),
+      ...factPointsFromLoginSessionsEvidence(evidence, { ts: TS, hmacKey }),
+    ];
+    assert.equal(points.length, 9, "tailnet 1 + host 5 + net 1 + login census and presence 2");
+    for (const point of points) {
+      assert.deepEqual(validateContextFact(point.fact_name, point.attributes), { ok: true }, point.fact_name);
+      assert.equal(point.attributes.hmac_key_id, hmacKey ? keyId : "unknown", point.fact_name);
+    }
+  }
 });
