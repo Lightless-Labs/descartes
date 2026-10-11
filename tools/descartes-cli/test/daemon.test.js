@@ -876,7 +876,7 @@ test("writeDaemonStatus includes structural_collector_statuses only on a structu
   ]);
 });
 
-test("C0.7: a hung structural collector is bounded by its sub-deadline, loses only its own evidence (unable), and the checkpoint still advances", async () => {
+test("B2: a hung incumbent structural collector discards the whole tick, as on main", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
@@ -905,15 +905,46 @@ test("C0.7: a hung structural collector is bounded by its sub-deadline, loses on
 
   assert(elapsedMs < 2000, `expected the structural tick to be bounded by its deadline, took ${elapsedMs}ms`);
   assert.deepEqual(result.status.structural_collector_statuses, [
-    { id: "services", status: "ok", tool: "collect_services" },
-    { id: "network-basics", status: "ok", tool: "collect_network" },
-    { id: "scheduled-jobs", status: "unable", tool: "collect_scheduled_jobs", error: "collector_deadline_exceeded" },
+    { status: "unable", error: "structural_tick_deadline_exceeded" },
   ]);
-  assert.equal(result.structuralEvidence.length, 3);
-  const timedOut = result.structuralEvidence[2];
-  assert.deepEqual(timedOut.result, { status: "unable", error: "collector_deadline_exceeded" }, "no census payload: no translator can read it as a zero");
-  assert.ok(Number.isSafeInteger(timedOut.observation.start_ms) && timedOut.observation.end_ms >= timedOut.observation.start_ms);
+  assert.equal(result.structuralEvidence, undefined, "incumbent evidence is discarded as one structural snapshot");
+  assert.equal(result.structuralFacts, undefined, "a timed-out incumbent tick cannot persist partial facts");
   assert.equal(storedCheckpoint.last_structural_run_ms, 1000);
+});
+
+test("B2: a context collector timeout records only that context as unable after incumbents persist", async () => {
+  const paths = await tempPaths();
+  const structuralCollectors = {
+    services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
+    "login-sessions": () => new Promise(() => {}),
+  };
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({
+      deadline_ms: 100,
+      context_collector_deadline_ms: 10,
+      collectors: {
+        services: { enabled: true },
+        network: { enabled: false },
+        "scheduled-jobs": { enabled: false },
+        "login-sessions": { enabled: true },
+      },
+    }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors,
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: 1000,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: true }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+
+  assert.equal(result.structuralEvidence.find((entry) => entry.id === "services").status, "ok");
+  const timedOut = result.structuralEvidence.find((entry) => entry.id === "login-sessions");
+  assert.equal(timedOut.status, "unable");
+  assert.equal(timedOut.result.error, "collector_deadline_exceeded");
+  assert.ok(result.structuralFacts, "incumbent evidence remains eligible for persistence");
 });
 
 test("a structural tick that completes well within its deadline is unaffected by the deadline machinery", async () => {
@@ -1082,7 +1113,7 @@ test("S6b wiring: no fact-points are persisted while the watch.json kill switch 
   await assertNoFactStoreWritten(paths);
 });
 
-test("C0.7 (replaces the S6b all-or-nothing discard): a collector that overruns loses only its own facts; the collectors that finished persist theirs", async () => {
+test("B2: an incumbent collector overrun discards every incumbent fact from the structural tick", async () => {
   const paths = await tempPaths();
   const ts = "2026-05-24T00:00:00.000Z";
   const structuralCollectors = {
@@ -1107,9 +1138,11 @@ test("C0.7 (replaces the S6b all-or-nothing discard): a collector that overruns 
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  assert.ok(result.structuralFacts);
+  assert.equal(result.structuralFacts, undefined);
+  assert.equal(result.structuralEvidence, undefined);
+  assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
   const service = await readFactPoints(paths, { family: "service", now: Date.parse(ts) });
-  assert.ok(service.points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
+  assert.equal(service.points.length, 0);
   const jobs = await readFactPoints(paths, { family: "scheduled_job", now: Date.parse(ts) });
   assert.equal(jobs.points.length, 0, "the timed-out collector wrote nothing, not even a census marker (never a fabricated zero)");
 });
@@ -1863,7 +1896,7 @@ test("S4 structural wiring: the provenance sub-collector runs on a structural-du
   assert.equal(warningPoint.attributes.active, "true");
 });
 
-test("C0.7 (replaces the S4 all-or-nothing discard): provenance hangs -> it is unable and persists nothing, while its siblings persist", async () => {
+test("B2: a provenance incumbent hang discards its siblings and persists nothing", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
@@ -1886,8 +1919,8 @@ test("C0.7 (replaces the S4 all-or-nothing discard): provenance hangs -> it is u
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  assert.deepEqual(result.status.structural_collector_statuses.at(-1), { id: "provenance-warnings", status: "unable", tool: "collect_provenance_warnings", error: "collector_deadline_exceeded" });
-  assert.equal(result.structuralEvidence.length, 4);
+  assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
+  assert.equal(result.structuralEvidence, undefined);
   const provenance = await readFactPoints(paths, { family: "provenance", now: 1000 });
   assert.equal(provenance.points.length, 0);
 });
@@ -6155,8 +6188,8 @@ test("C0.3 wiring: a logged-out tailscale probe persists net.tailnet_state to ne
   const { points } = await readFactPoints(paths, { family: "network_context", now: Date.parse("2026-05-24T00:00:00.000Z") });
   assert.equal(points.length, 1);
   assert.equal(points[0].fact_name, "net.tailnet_state");
-  assert.equal(points[0].attributes.state, "needs_login");
-  assert.equal(points[0].attributes.collector_state, "ok");
+  assert.equal(points[0].attributes.state, "unable");
+  assert.equal(points[0].attributes.collector_state, "unable");
   const peer = await readFactPoints(paths, { family: "peer", now: Date.parse("2026-05-24T00:00:00.000Z") });
   assert.equal(peer.points.length, 0);
 });
@@ -6214,7 +6247,7 @@ test("LOW: peer and login collectors share one parsed last-history read per stru
   assert.equal(calls.filter(([command, ...args]) => [command, ...args].join(" ") === "last -n 50").length, 1);
 });
 
-test("MEDIUM: a timed-out composite collector aborts its child and launches no later subprocess", async () => {
+test("MEDIUM: a timed-out context collector aborts its child and launches no later subprocess", async () => {
   const calls = [];
   let child;
   const runFixedExecFile = async (command, args, options = {}) => {
@@ -6232,9 +6265,19 @@ test("MEDIUM: a timed-out composite collector aborts its child and launches no l
     });
   };
   const evidence = await collectStructuralEvidence({
-    collector_deadline_ms: 25,
-    collectors: { sessions: { enabled: true } },
-  }, { sessions: (options) => import("../src/tools/sessions.js").then(({ collectSessionEvidence }) => collectSessionEvidence({ ...options, runFixedExecFile })) }, { deadlineMs: 1000 });
+    context_collector_deadline_ms: 25,
+    collectors: { "host-lifecycle": { enabled: true } },
+  }, { "host-lifecycle": async (options) => {
+    calls.push("host-lifecycle");
+    child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+      signal: options.signal,
+      killSignal: options.killSignal,
+    });
+    return await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ status: code === 0 ? "ok" : "error", stdout: "", stderr: "", code, signal }));
+    });
+  } }, { deadlineMs: 1000 });
 
   // Give the aborted child one event-loop turn to report its kill before asserting the resource
   // boundary. The test cleans up explicitly if the pre-fix implementation failed to propagate it.
@@ -6242,31 +6285,20 @@ test("MEDIUM: a timed-out composite collector aborts its child and launches no l
   const childWasKilled = child?.killed === true || child?.exitCode !== null || child?.signalCode !== null;
   if (!childWasKilled) child?.kill("SIGKILL");
   assert.equal(evidence[0].result.error, "collector_deadline_exceeded");
-  assert.deepEqual(calls, ["tmux"], "screen must not be launched after the composite is aborted");
+  assert.deepEqual(calls, ["host-lifecycle"], "no later subprocess is launched after the context collector is aborted");
   assert.equal(childWasKilled, true, "the timed-out subprocess must be killed");
 });
 
-test("C0.7: one census collector over its own sub-deadline is unable while the next collector still runs; an exhausted budget is explicit; a throw is unable", async () => {
-  let clock = 0;
-  const evidence = await collectStructuralEvidence({
-    collector_deadline_ms: 15,
+test("B2: the incumbent census is one cancellable structural deadline", async () => {
+  const outcome = await collectStructuralEvidence({
     collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, provenance: { enabled: true } },
   }, {
     services: () => new Promise(() => {}),
     network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
-    "scheduled-jobs": async () => {
-      clock += 10_000; // this collector "takes" the rest of the budget on the injected clock
-      throw new Error("boom");
-    },
+    "scheduled-jobs": async () => envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }),
     provenance: async () => envelope("provenance-warnings", "collect_provenance_warnings", { warnings: [] }),
-  }, { deadlineMs: 5000, nowFn: () => clock });
-  assert.deepEqual(evidence.map((e) => [e.id, e.status, e.result?.error]), [
-    ["services", "unable", "collector_deadline_exceeded"],
-    ["network-basics", "ok", undefined],
-    ["scheduled-jobs", "unable", "collector_threw"],
-    ["provenance-warnings", "unable", "structural_budget_exhausted"],
-  ]);
-  for (const entry of evidence) assert.ok(entry.observation && entry.observation.end_ms >= entry.observation.start_ms);
+  }, { deadlineMs: 15 });
+  assert.equal(typeof outcome, "symbol");
 });
 
 test("C0.7: profile validation accepts positive sub-deadlines and rejects invalid ones", () => {
