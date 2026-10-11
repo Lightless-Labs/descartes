@@ -72,6 +72,7 @@ import { collectScheduledJobsEvidence } from "./tools/scheduled-jobs.js";
 import { collectServiceEvidence } from "./tools/services.js";
 import { collectSessionEvidence } from "./tools/sessions.js";
 import { collectSystemEvidence } from "./tools/system.js";
+import { collectHostLifecycleEvidence } from "./tools/host-lifecycle.js";
 import { collectTailscaleStatusEvidence } from "./tools/tailscale-status.js";
 import { collectVpnPeerStatusEvidence } from "./tools/vpn-peer-status.js";
 import { collectCanaryEvidence } from "./tools/canary.js";
@@ -301,6 +302,11 @@ export function validateDaemonProfile(profile) {
     if (structural.deadline_ms !== undefined && !isPositiveFiniteNumber(structural.deadline_ms)) {
       throw new Error(`Daemon profile structural.deadline_ms must be a positive finite number, got: ${JSON.stringify(structural.deadline_ms)}`);
     }
+    for (const field of ["collector_deadline_ms", "context_collector_deadline_ms"]) {
+      if (structural[field] !== undefined && !isPositiveFiniteNumber(structural[field])) {
+        throw new Error(`Daemon profile structural.${field} must be a positive finite number, got: ${JSON.stringify(structural[field])}`);
+      }
+    }
   }
 
   return true;
@@ -401,9 +407,57 @@ export async function collectDaemonEvidence(profile = defaultDaemonProfile(), co
   return evidence;
 }
 
+// Context plan C0.7 (docs/plans/2026-10-06-context-aware-learned-baselines.md §3, I25): the structural
+// collectors, in run order, as [profile key, envelope id, tool]. The CENSUS collectors (the existing
+// structural collectors, whose order is unchanged) run first; the CONTEXT collectors run strictly
+// after them, so a slow or hung context read can never cost the session/peer census.
+export const STRUCTURAL_CENSUS_COLLECTORS = Object.freeze([
+  ["services", "services", "collect_services"],
+  ["network", "network-basics", "collect_network_basics"],
+  ["scheduled-jobs", "scheduled-jobs", "collect_scheduled_jobs"],
+  ["provenance", "provenance-warnings", "collect_provenance_warnings"],
+  ["sessions", "sessions", "collect_sessions"],
+  ["vpn-peer-status", "vpn-peer-status", "collect_vpn_peer_status"],
+  ["tailscale-status", "tailscale-status", "collect_tailscale_status"],
+  ["canary", "canary", "collect_canary_evidence"],
+  ["process-lineage", "process-lineage-edges", "collect_process_lineage"],
+].map((entry) => Object.freeze(entry)));
+export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
+  ["host-lifecycle", "host-lifecycle", "collect_host_lifecycle"],
+].map((entry) => Object.freeze(entry)));
+
+// C0.7 (I25, class S): the per-collector sub-deadline. Each collector gets min(this, what is left of
+// the structural tick's deadline_ms). A collector that overruns loses only its own evidence (an
+// `unable` envelope), never the whole tick's. Context collectors get a shorter cap: they are cheap
+// reads, and they only ever spend what the census left.
+export const DEFAULT_STRUCTURAL_COLLECTOR_DEADLINE_MS = 20 * 1000;
+export const DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS = 5 * 1000;
+const COLLECTOR_TIMED_OUT = Symbol("structural-collector-timed-out");
+
+function unableCollectorEnvelope(id, tool, error, observation) {
+  return {
+    id,
+    status: "unable",
+    layer: "L0",
+    source: "daemon",
+    result: { status: "unable", error },
+    confidence: 0,
+    review_hint: "none",
+    trace: { tool, target: null, latency_ms: Math.max(0, observation.end_ms - observation.start_ms), ts: new Date(observation.end_ms).toISOString() },
+    observation,
+  };
+}
+
 /**
  * Sibling to collectDaemonEvidence for the slower structural (services/network/scheduled-jobs)
  * cadence — identical enabled-flag/injectable-collectors pattern, stable evidence ordering.
+ *
+ * C0.7: each enabled collector runs under its own sub-deadline (min of its cap and the time left of
+ * `options.deadlineMs`), census collectors first and context collectors after them. A collector that
+ * times out, throws, or finds the budget exhausted yields an `unable` envelope with a closed error
+ * (collector_deadline_exceeded / structural_budget_exhausted / collector_threw) and no census payload,
+ * so no translator can read it as a zero. Every envelope is stamped with its own observation interval
+ * (`observation.start_ms` / `end_ms`, §4.4), distinct from the tick ts.
  */
 export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
   const activeCollectors = {
@@ -412,41 +466,60 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     "scheduled-jobs": collectors["scheduled-jobs"] ?? collectScheduledJobsEvidence,
     // Slice S4, additive fourth structural sub-collector: gated identically to its siblings
     // (structuralProfile.collectors.provenance.enabled), on the same slow cadence, subject to
-    // the same structural-tick deadline/discard discipline below. See plan section 4.
+    // the same structural-tick deadline discipline. See plan section 4.
     provenance: collectors.provenance ?? collectProvenanceWarningsEvidence,
     // Slice 1 (observed-incident collectors plan), additive fifth structural sub-collector:
-    // gated identically to its siblings (structuralProfile.collectors.sessions.enabled), on the
-    // same slow cadence, subject to the same structural-tick deadline/discard discipline below.
-    // Read-only tmux/screen census; NO alert candidates emitted by this slice.
+    // read-only tmux/screen census; NO alert candidates emitted by this slice.
     sessions: collectors.sessions ?? collectSessionEvidence,
     // Slice 3 (observed-incident collectors plan), additive sixth structural sub-collector:
-    // gated identically to its siblings (structuralProfile.collectors["vpn-peer-status"].enabled),
-    // on the same slow cadence, subject to the same structural-tick deadline/discard discipline
-    // below. Read-only SSH/VPN peer census; NO alert candidates emitted by this slice either.
+    // read-only SSH/VPN peer census; NO alert candidates emitted by this slice either.
     "vpn-peer-status": collectors["vpn-peer-status"] ?? collectVpnPeerStatusEvidence,
     // Tailscale/tailnet sibling: pure read-only L0 fact source, no alert candidates.
     "tailscale-status": collectors["tailscale-status"] ?? collectTailscaleStatusEvidence,
     canary: collectors.canary ?? (() => collectCanaryEvidence([])),
     "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
+    // Context plan C0.8/C0.9: boot identity and raw clock readings (DATA only).
+    "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
   };
+  const { deadlineMs, nowFn = Date.now, ...rest } = options;
   const collectorOptions = {
-    ...options,
+    ...rest,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
   };
+  const budgetMs = isPositiveFiniteNumber(deadlineMs) ? deadlineMs : Infinity;
+  const censusCapMs = isPositiveFiniteNumber(structuralProfile.collector_deadline_ms) ? structuralProfile.collector_deadline_ms : DEFAULT_STRUCTURAL_COLLECTOR_DEADLINE_MS;
+  const contextCapMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms) ? structuralProfile.context_collector_deadline_ms : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
+  const startedMs = nowFn();
   const evidence = [];
-  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(collectorOptions));
-  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network(collectorOptions));
-  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"](collectorOptions));
-  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance(collectorOptions));
-  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
-  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
-  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"](collectorOptions));
-  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary(collectorOptions));
-  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"](collectorOptions));
+  const runPhase = async (entries, capMs) => {
+    for (const [key, id, tool] of entries) {
+      if (!structuralProfile.collectors?.[key]?.enabled) continue;
+      const remainingMs = budgetMs - (nowFn() - startedMs);
+      const runStartMs = nowFn();
+      if (!(remainingMs > 0)) {
+        evidence.push(unableCollectorEnvelope(id, tool, "structural_budget_exhausted", { start_ms: runStartMs, end_ms: runStartMs }));
+        continue;
+      }
+      let outcome;
+      try {
+        outcome = await withDeadline(Promise.resolve().then(() => activeCollectors[key](collectorOptions)), Math.min(remainingMs, capMs), () => COLLECTOR_TIMED_OUT);
+      } catch {
+        outcome = undefined;
+      }
+      const observation = { start_ms: runStartMs, end_ms: nowFn() };
+      if (outcome === COLLECTOR_TIMED_OUT) {
+        evidence.push(unableCollectorEnvelope(id, tool, "collector_deadline_exceeded", observation));
+      } else if (!outcome || typeof outcome !== "object") {
+        evidence.push(unableCollectorEnvelope(id, tool, "collector_threw", observation));
+      } else {
+        evidence.push(outcome.observation ? outcome : { ...outcome, observation });
+      }
+    }
+  };
+  await runPhase(STRUCTURAL_CENSUS_COLLECTORS, censusCapMs);
+  await runPhase(STRUCTURAL_CONTEXT_COLLECTORS, contextCapMs);
   return evidence;
 }
-
-const STRUCTURAL_TICK_TIMED_OUT = Symbol("structural-tick-timed-out");
 
 /**
  * Races `promise` against a `deadlineMs` timer. On timeout, resolves to `onTimeout()`'s result
@@ -1085,19 +1158,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             canary: structuralCollectors?.canary ?? (() => collectCanaryEvidence(canaries)),
           };
         }
-        const outcome = await withDeadline(
-          collectStructuralEvidence(structuralProfile, structuralCollectors, collectorOptions),
-          deadlineMs,
-          () => STRUCTURAL_TICK_TIMED_OUT,
-        );
-        if (outcome === STRUCTURAL_TICK_TIMED_OUT) {
-          // Partial results (if any) are discarded, not partially persisted, to avoid an
-          // inconsistent fact snapshot. The checkpoint still advances below so a repeatedly-slow
-          // host retries at the next full structural interval, not on every fast tick.
-          structuralCollectorStatuses = [{ status: "unable", error: "structural_tick_deadline_exceeded" }];
-        } else {
+        // C0.7: no tick-wide all-or-nothing race any more. Each collector runs under its own
+        // sub-deadline inside deadlineMs (collectStructuralEvidence), so an overrun loses that one
+        // collector's evidence (an unable envelope), never the whole tick's.
+        const outcome = await collectStructuralEvidence(structuralProfile, structuralCollectors, { ...collectorOptions, deadlineMs });
+        {
           structuralEvidence = outcome;
-          structuralCollectorStatuses = structuralEvidence.map((envelope) => ({ id: envelope.id, status: envelope.status, tool: envelope.trace?.tool }));
+          structuralCollectorStatuses = structuralEvidence.map((envelope) => ({
+            id: envelope.id,
+            status: envelope.status,
+            tool: envelope.trace?.tool,
+            ...(envelope.source === "daemon" && typeof envelope.result?.error === "string" ? { error: envelope.result.error } : {}),
+          }));
 
           // Slice S6b, additive follow-up to S6a: translate this tick's structural evidence
           // into categorical fact-points and persist them. Only reachable here — i.e. only
@@ -1198,7 +1270,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // constraints.json, never alerts.json/notifications (evaluateAndLogShadowConstraints
           // never imports alert-store.js).
           const learnedConfig = configSnapshot.learned; // §8.D: per-tick snapshot (loaded once above)
-          if (learnedConfig.enabled) {
+          // C0.7: shadow evaluation keeps its "successful structural tick only" discipline: it does
+          // not run on a tick where any collector overran or found the budget exhausted (an
+          // envelope the daemon synthesized), since its targets' freshness then depends on which
+          // collectors finished.
+          const structuralTickComplete = !structuralEvidence.some((envelope) => envelope.source === "daemon");
+          if (learnedConfig.enabled && structuralTickComplete) {
             const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
             shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
           }

@@ -51,6 +51,7 @@ import {
   SERVICE_CENSUS_MARKER_ENTITY_KEY,
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   buildScheduledJobEntityKey,
+  factPointsFromSessionEvidence,
 } from "../src/fact-translators.js";
 import { SESSION_CHURN_RULE_ID, SESSION_COUNT_DROP_RULE_ID, computeSessionBaselineCandidates, loadSessionBaselineStore, writeSessionBaselineStore } from "../src/session-baseline.js";
 import { CORRELATION_RULE_ID } from "../src/incident-correlation.js";
@@ -869,7 +870,7 @@ test("writeDaemonStatus includes structural_collector_statuses only on a structu
   ]);
 });
 
-test("a hung structural collector is bounded by its deadline, marked unable, and still advances the checkpoint", async () => {
+test("C0.7: a hung structural collector is bounded by its sub-deadline, loses only its own evidence (unable), and the checkpoint still advances", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
@@ -898,9 +899,14 @@ test("a hung structural collector is bounded by its deadline, marked unable, and
 
   assert(elapsedMs < 2000, `expected the structural tick to be bounded by its deadline, took ${elapsedMs}ms`);
   assert.deepEqual(result.status.structural_collector_statuses, [
-    { status: "unable", error: "structural_tick_deadline_exceeded" },
+    { id: "services", status: "ok", tool: "collect_services" },
+    { id: "network-basics", status: "ok", tool: "collect_network" },
+    { id: "scheduled-jobs", status: "unable", tool: "collect_scheduled_jobs", error: "collector_deadline_exceeded" },
   ]);
-  assert.equal(result.structuralEvidence, undefined);
+  assert.equal(result.structuralEvidence.length, 3);
+  const timedOut = result.structuralEvidence[2];
+  assert.deepEqual(timedOut.result, { status: "unable", error: "collector_deadline_exceeded" }, "no census payload: no translator can read it as a zero");
+  assert.ok(Number.isSafeInteger(timedOut.observation.start_ms) && timedOut.observation.end_ms >= timedOut.observation.start_ms);
   assert.equal(storedCheckpoint.last_structural_run_ms, 1000);
 });
 
@@ -1070,8 +1076,9 @@ test("S6b wiring: no fact-points are persisted while the watch.json kill switch 
   await assertNoFactStoreWritten(paths);
 });
 
-test("S6b wiring: a timed-out structural tick discards its evidence entirely — no fact-points are persisted for a partial/timed-out tick", async () => {
+test("C0.7 (replaces the S6b all-or-nothing discard): a collector that overruns loses only its own facts; the collectors that finished persist theirs", async () => {
   const paths = await tempPaths();
+  const ts = "2026-05-24T00:00:00.000Z";
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", {
       manager: "systemd",
@@ -1086,17 +1093,19 @@ test("S6b wiring: a timed-out structural tick discards its evidence entirely —
     collectors: fastCollectorFakes(),
     structuralCollectors,
     evaluateAlerts: false,
-    ts: "2026-05-24T00:00:00.000Z",
-    now: 1000,
+    ts,
+    now: Date.parse(ts),
     readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
     writeStructuralCheckpoint: async () => ({}),
     loadLearnedConfig: async () => ({ enabled: true }),
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  assert.equal(result.structuralEvidence, undefined);
-  assert.equal(result.structuralFacts, undefined);
-  await assertNoFactStoreWritten(paths);
+  assert.ok(result.structuralFacts);
+  const service = await readFactPoints(paths, { family: "service", now: Date.parse(ts) });
+  assert.ok(service.points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
+  const jobs = await readFactPoints(paths, { family: "scheduled_job", now: Date.parse(ts) });
+  assert.equal(jobs.points.length, 0, "the timed-out collector wrote nothing, not even a census marker (never a fabricated zero)");
 });
 
 test("S6b wiring: no fact-points are persisted when profile.structural is absent (regression, matches S6a's byte-identical-fast-path guarantee)", async () => {
@@ -1848,7 +1857,7 @@ test("S4 structural wiring: the provenance sub-collector runs on a structural-du
   assert.equal(warningPoint.attributes.active, "true");
 });
 
-test("S4 structural wiring: a timed-out structural tick (provenance hangs) discards its evidence entirely — no provenance fact-points are persisted", async () => {
+test("C0.7 (replaces the S4 all-or-nothing discard): provenance hangs -> it is unable and persists nothing, while its siblings persist", async () => {
   const paths = await tempPaths();
   const structuralCollectors = {
     services: async () => envelope("services", "collect_services", { manager: "systemd", services: [] }),
@@ -1871,10 +1880,10 @@ test("S4 structural wiring: a timed-out structural tick (provenance hangs) disca
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  assert.deepEqual(result.status.structural_collector_statuses, [{ status: "unable", error: "structural_tick_deadline_exceeded" }]);
-  assert.equal(result.structuralEvidence, undefined);
-  assert.equal(result.structuralFacts, undefined);
-  await assertNoFactStoreWritten(paths);
+  assert.deepEqual(result.status.structural_collector_statuses.at(-1), { id: "provenance-warnings", status: "unable", tool: "collect_provenance_warnings", error: "collector_deadline_exceeded" });
+  assert.equal(result.structuralEvidence.length, 4);
+  const provenance = await readFactPoints(paths, { family: "provenance", now: 1000 });
+  assert.equal(provenance.points.length, 0);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -6144,4 +6153,62 @@ test("C0.3 wiring: a logged-out tailscale probe persists net.tailnet_state to ne
   assert.equal(points[0].attributes.collector_state, "ok");
   const peer = await readFactPoints(paths, { family: "peer", now: Date.parse("2026-05-24T00:00:00.000Z") });
   assert.equal(peer.points.length, 0);
+});
+
+// --- Context plan C0.7: per-collector sub-deadlines; context collectors after the census ---
+
+test("C0.7: census collectors run first in their existing order, context collectors strictly after them", async () => {
+  const order = [];
+  const make = (id) => async () => {
+    order.push(id);
+    return envelope(id, `collect_${id}`, {});
+  };
+  await collectStructuralEvidence({
+    collectors: { "host-lifecycle": { enabled: true }, sessions: { enabled: true }, services: { enabled: true }, "vpn-peer-status": { enabled: true } },
+  }, { "host-lifecycle": make("host-lifecycle"), sessions: make("sessions"), services: make("services"), "vpn-peer-status": make("vpn-peer-status") }, {});
+  assert.deepEqual(order, ["services", "sessions", "vpn-peer-status", "host-lifecycle"]);
+});
+
+test("C0.7: a hung context collector records unable and never costs the session/peer census", async () => {
+  const evidence = await collectStructuralEvidence({
+    context_collector_deadline_ms: 20,
+    collectors: { sessions: { enabled: true }, "vpn-peer-status": { enabled: true }, "host-lifecycle": { enabled: true } },
+  }, {
+    sessions: async () => envelope("sessions", "collect_sessions", { sessions: [], multiplexers: [{ multiplexer: "tmux", status: "ok" }] }),
+    "vpn-peer-status": async () => envelope("vpn-peer-status", "collect_vpn_peer_status", { peers: [], sources: {} }),
+    "host-lifecycle": () => new Promise(() => {}),
+  }, { deadlineMs: 5000 });
+  assert.deepEqual(evidence.map((e) => [e.id, e.status]), [["sessions", "ok"], ["vpn-peer-status", "ok"], ["host-lifecycle", "unable"]]);
+  assert.equal(evidence[2].result.error, "collector_deadline_exceeded");
+  const ts = "2026-05-24T00:00:00.000Z";
+  assert.ok(factPointsFromSessionEvidence(evidence, { ts }).length > 0, "the census marker is still emitted");
+});
+
+test("C0.7: one census collector over its own sub-deadline is unable while the next collector still runs; an exhausted budget is explicit; a throw is unable", async () => {
+  let clock = 0;
+  const evidence = await collectStructuralEvidence({
+    collector_deadline_ms: 15,
+    collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, provenance: { enabled: true } },
+  }, {
+    services: () => new Promise(() => {}),
+    network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
+    "scheduled-jobs": async () => {
+      clock += 10_000; // this collector "takes" the rest of the budget on the injected clock
+      throw new Error("boom");
+    },
+    provenance: async () => envelope("provenance-warnings", "collect_provenance_warnings", { warnings: [] }),
+  }, { deadlineMs: 5000, nowFn: () => clock });
+  assert.deepEqual(evidence.map((e) => [e.id, e.status, e.result?.error]), [
+    ["services", "unable", "collector_deadline_exceeded"],
+    ["network-basics", "ok", undefined],
+    ["scheduled-jobs", "unable", "collector_threw"],
+    ["provenance-warnings", "unable", "structural_budget_exhausted"],
+  ]);
+  for (const entry of evidence) assert.ok(entry.observation && entry.observation.end_ms >= entry.observation.start_ms);
+});
+
+test("C0.7: profile validation accepts positive sub-deadlines and rejects invalid ones", () => {
+  assert.doesNotThrow(() => validateDaemonProfile(structuralProfile({ collector_deadline_ms: 1000, context_collector_deadline_ms: 500 })));
+  assert.throws(() => validateDaemonProfile(structuralProfile({ collector_deadline_ms: 0 })), /collector_deadline_ms/);
+  assert.throws(() => validateDaemonProfile(structuralProfile({ context_collector_deadline_ms: -1 })), /context_collector_deadline_ms/);
 });
