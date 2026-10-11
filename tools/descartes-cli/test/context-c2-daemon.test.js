@@ -232,12 +232,13 @@ test("C2 failed ticks leave a durable gap: the next success is marked gap and do
   await run(T0 + HOUR);
   state.sessions = { third: 1_000_300 };
   await run(T0 + 2 * HOUR);
-  const summaries = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 2 * HOUR).toISOString() })).points.filter((p) => p.fact_name === "tick.summary");
+  const summaryPoints = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 2 * HOUR).toISOString() })).points;
+  const summaries = summaryPoints.filter((p) => p.fact_name === "tick.summary");
   assert.deepEqual(summaries.map((p) => p.attributes.chain), ["started", "gap"]);
   assert.equal(summaries[1].attributes.g, "1");
   assert.equal(summaries[1].attributes.sa, "unknown");
   assert.equal(summaries[1].attributes.sd, "unknown");
-  assert.deepEqual(verifyTickSummaryChain(summaries).losses.map((loss) => loss.reason), ["gap"]);
+  assert.deepEqual(verifyTickSummaryChain(summaryPoints).losses.map((loss) => loss.reason), ["gap"]);
 });
 
 for (const [label, damage] of [

@@ -778,7 +778,7 @@ export function deriveCreatedVsBoot({ evidence, snapshot, arrivedKeys, bootVerdi
       ts,
       hmacKey,
       factName: SESSION_CREATED_VS_BOOT_FACT_NAME,
-      entityKey: `${SESSION_CREATED_VS_BOOT_FACT_NAME}.${key.split(".").pop()}`,
+      entityKey: `${SESSION_CREATED_VS_BOOT_FACT_NAME}.${contextHmac(hmacKey, "session_join", key.split(".").pop())}`,
       source: CONTEXT_ENVELOPE_SOURCES.derived,
       attributes: {
         collector_state: "ok",
@@ -1243,8 +1243,8 @@ export function deriveStats({ prior, storeExisted, prevChain, snapshot, transiti
   daily.intervals += 1;
   daily.last_seq = summary.seq;
   if (!certified) {
-    daily.cert = daily.uncertified_ticks === 0 && daily.cert === "certified" ? "uncertified" : "mixed";
     daily.uncertified_ticks += 1;
+    daily.cert = daily.uncertified_ticks === daily.intervals ? "uncertified" : "mixed";
     if (Number.isSafeInteger(snapshot.suspend?.exposure_upper_s)) daily.uncertified_exposure_s += snapshot.suspend.exposure_upper_s;
   } else {
     daily.cert = daily.uncertified_ticks > 0 ? "mixed" : "certified";
