@@ -137,3 +137,26 @@ test("C0.5: contextHmac is keyed and domain-separated, and degrades to unknown w
   assert.equal(contextHmac(keyA, "gateway_mac", ""), "unknown");
   assert.equal(contextHmac(keyA, "gateway_mac", undefined), "unknown");
 });
+
+test("C0 review L8: the fact store re-validates context points against their closed schema at append (and on read), not only in the translators", async () => {
+  const { appendFactPointsByFamily, readFactPoints, resolveFactStorePaths } = await import("../src/fact-store.js");
+  const paths = await tempPaths();
+  const ts = "2026-10-11T12:00:00.000Z";
+  const good = { ts, fact_name: "user.presence", entity_key: "user.presence", attributes: unableContextAttributes("user.presence"), sensitivity: "operational" };
+  const bad = { ...good, attributes: { ...good.attributes, screen_locked: "definitely" } };
+  const rejected = await appendFactPointsByFamily(paths, [bad], {});
+  assert.match(rejected.families.session_context.append_error ?? "", /schema/);
+  assert.equal(rejected.written_count, 0);
+  const extra = { ...good, attributes: { ...good.attributes, raw_user: "alice" } };
+  assert.match((await appendFactPointsByFamily(paths, [extra], {})).families.session_context.append_error ?? "", /schema/);
+  const ok = await appendFactPointsByFamily(paths, [good], {});
+  assert.equal(ok.written_count, 1);
+  // A line edited on disk to carry an out-of-schema value is dropped on read, never returned.
+  const file = resolveFactStorePaths(paths, "session_context").factsFile;
+  const line = JSON.parse((await fs.readFile(file, "utf8")).trim());
+  line.attributes.screen_locked = "definitely";
+  await fs.appendFile(file, `${JSON.stringify({ ...line, ts: "2026-10-11T12:00:01.000Z" })}\n`);
+  const read = await readFactPoints(paths, { family: "session_context", now: Date.parse(ts) + 5000 });
+  assert.equal(read.points.length, 1);
+  assert.equal(read.points[0].attributes.screen_locked, good.attributes.screen_locked);
+});

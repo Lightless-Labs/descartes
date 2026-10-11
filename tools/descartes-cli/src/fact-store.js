@@ -13,6 +13,7 @@ import {
   writeFactIntegrityLedger,
 } from "./fact-store-integrity.js";
 import { foldNoveltySeenSets, readNoveltySeenSet } from "./novelty-seen-set.js";
+import { CONTEXT_FACT_SCHEMAS, validateContextFact } from "./context-schemas.js";
 import {
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
@@ -179,6 +180,15 @@ export function normalizeFactPoint(point, defaults = {}) {
   const confidence = Number(point.confidence);
   if (point.confidence !== undefined && Number.isFinite(confidence)) {
     normalized.confidence = confidence;
+  }
+
+  // C0 review L8: a context fact is held to its closed schema (context-schemas.js, a leaf module) by
+  // the store itself, at append AND on read (isStoredFactPoint drops a failing line), not only by
+  // the translators: a point built outside contextFactPoint, or a line edited on disk, never lands
+  // or reads back with an out-of-schema field.
+  if (CONTEXT_FACT_SCHEMAS.has(factName)) {
+    const verdict = validateContextFact(factName, normalized.attributes);
+    if (!verdict.ok) throw new Error(`Context fact ${factName} fails its closed schema (${verdict.field}: ${verdict.reason})`);
   }
 
   return normalized;

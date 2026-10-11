@@ -441,10 +441,14 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
       if (spec.kind === "pattern") candidates.push("9".repeat(spec.maxLength));
       attributes[field] = candidates.sort((a, b) => b.length - a.length)[0];
     }
+    // The per-field maxima are an UPPER BOUND, not necessarily one valid record (e.g. a pattern
+    // field at its max length), and the store now enforces the context schema (C0 review L8): the
+    // shape is normalized under a same-length placeholder name, then the real name is put back.
     const record = normalizeFactPoint({
-      ts: "2026-10-11T00:00:00.000Z", fact_name: factName, entity_key: `${factName}.${"f".repeat(16)}`, attributes,
+      ts: "2026-10-11T00:00:00.000Z", fact_name: "x".repeat(factName.length), entity_key: `${factName}.${"f".repeat(16)}`, attributes,
       source_envelope_id: longestSource.id, source_tool: longestSource.tool, sensitivity: "operational", confidence: 0,
     });
+    record.fact_name = factName;
     worst[factName] = Buffer.byteLength(`${JSON.stringify(record)}\n`);
   }
   assert.deepEqual(worst, {
