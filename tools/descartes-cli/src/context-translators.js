@@ -144,3 +144,145 @@ export function factPointsFromTailnetStateEvidence(evidence, { ts, hmacKey } = {
   };
   return [contextFactPoint({ ts, factName: NET_TAILNET_STATE_FACT_NAME, attributes, source: CONTEXT_ENVELOPE_SOURCES.tailscale })];
 }
+
+// ------------------------------------------------------------------------------------------------
+// C0.8 / C0.9 / C0.12: host_lifecycle facts.
+// ------------------------------------------------------------------------------------------------
+
+const HOST_COLLECTOR_STATES = new Set(["ok", "partial", "unable", "not_applicable", "not_found_on_known_paths", "untrusted_binary", "missing_permission"]);
+const BOOT_ID_SOURCES = new Set(["kern.bootsessionuuid", "proc_boot_id"]);
+
+function intString(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? String(value) : "unknown";
+}
+
+function tokenString(value) {
+  return typeof value === "string" && value.length > 0 ? value : "unknown";
+}
+
+function platformValue(platform, wanted, value, toString) {
+  if (platform !== wanted) return "not_applicable";
+  return value === undefined || value === null ? "unknown" : toString(value);
+}
+
+export function hostBootIdHmac(hmacKey, rawBootId) {
+  return contextHmac(hmacKey, "boot_id", rawBootId);
+}
+
+/**
+ * evidence[] + the daemon's ledger-derived context -> host_lifecycle points. Emits host.boot,
+ * host.clock_reading and host.suspend whenever the host-lifecycle collector produced an envelope
+ * (whatever its status), plus host.boot_boundary when a boundary verdict is supplied and
+ * host.boundary_census when a boundary census record is supplied. The verdict, the census gaps and
+ * the suspend exposure are computed by boot-ledger.js (pure) from the ledger; this function only
+ * shapes and validates them.
+ */
+export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bracket, boundary, boundaryCensus, suspend } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "host-lifecycle");
+  if (!envelope) return [];
+  const result = envelope.result ?? {};
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const collectorState = HOST_COLLECTOR_STATES.has(result.status) ? result.status : "unable";
+  const boot = result.boot ?? {};
+  const clocks = result.clocks ?? {};
+  const platform = result.platform;
+  const bootIdHmac = typeof boot.boot_id === "string" ? hostBootIdHmac(hmacKey, boot.boot_id) : "unknown";
+  const common = { collector_state: collectorState, obs_start_ms: msString(obsStartMs), obs_end_ms: msString(obsEndMs), rejected_field: "none" };
+  const source = CONTEXT_ENVELOPE_SOURCES.host_lifecycle;
+  const points = [];
+
+  points.push(contextFactPoint({
+    ts,
+    factName: HOST_BOOT_FACT_NAME,
+    source,
+    attributes: {
+      ...common,
+      boot_id_hmac: bootIdHmac,
+      boot_id_source: BOOT_ID_SOURCES.has(boot.boot_id_source) && typeof boot.boot_id === "string" ? boot.boot_id_source : "unknown",
+      boot_time_s: intString(boot.boot_time_s),
+      os_build: tokenString(boot.os_build),
+      os_release: tokenString(boot.os_release),
+      bracket: ["stable", "unstable"].includes(bracket) ? bracket : "unknown",
+    },
+  }));
+
+  points.push(contextFactPoint({
+    ts,
+    factName: HOST_CLOCK_READING_FACT_NAME,
+    source,
+    attributes: {
+      ...common,
+      boot_id_hmac: bootIdHmac,
+      wall_ms: intString(clocks.wall_ms),
+      uv_hrtime_ns: typeof clocks.uv_hrtime_ns === "string" && /^[0-9]{1,24}$/.test(clocks.uv_hrtime_ns) ? clocks.uv_hrtime_ns : "unknown",
+      uv_version: tokenString(clocks.uv_version),
+      uv_hrtime_clock_id: "unverified",
+      named_clocks: "unavailable_without_native",
+      os_uptime_ms: intString(clocks.os_uptime_ms),
+      kern_monotonicclock_usecs: platformValue(platform, "darwin", clocks.kern_monotonicclock_usecs, String),
+      kern_sleeptime_s: platformValue(platform, "darwin", clocks.kern_sleeptime_s, intString),
+      kern_waketime_s: platformValue(platform, "darwin", clocks.kern_waketime_s, intString),
+      kern_sleep_abs_time: platformValue(platform, "darwin", clocks.kern_sleep_abs_time, String),
+      kern_wake_abs_time: platformValue(platform, "darwin", clocks.kern_wake_abs_time, String),
+      machdep_wake_abstime: platformValue(platform, "darwin", clocks.machdep_wake_abstime, String),
+      machdep_wake_conttime: platformValue(platform, "darwin", clocks.machdep_wake_conttime, String),
+      proc_uptime_s: platformValue(platform, "linux", clocks.proc_uptime_s, String),
+      suspend_stats_success: platformValue(platform, "linux", clocks.suspend_stats_success, intString),
+    },
+  }));
+
+  points.push(contextFactPoint({
+    ts,
+    factName: HOST_SUSPEND_FACT_NAME,
+    source,
+    attributes: {
+      ...common,
+      state: "unknown",
+      reason: "f3_inactive_c09_pending",
+      exposure_lower_s: "0",
+      exposure_upper_s: intString(suspend?.exposure_upper_s),
+      interval_basis: ["same_boot_wall_delta", "cross_boot", "no_previous_reading", "wall_regressed"].includes(suspend?.interval_basis) ? suspend.interval_basis : "unknown",
+    },
+  }));
+
+  if (boundary) {
+    points.push(contextFactPoint({
+      ts,
+      factName: HOST_BOOT_BOUNDARY_FACT_NAME,
+      source,
+      attributes: {
+        ...common,
+        verdict: boundary.verdict,
+        failing_conjunct: boundary.failing_conjunct,
+        tripwire: boundary.tripwire,
+        c_never_seen: boundary.c_never_seen,
+        c_daemon_restart: boundary.c_daemon_restart,
+        c_boot_time_in_gap: boundary.c_boot_time_in_gap,
+        c_uptime_consistent: boundary.c_uptime_consistent,
+        c_no_preboot_instance: boundary.c_no_preboot_instance,
+        boot_id_hmac: typeof boundary.boot_id_hmac === "string" ? boundary.boot_id_hmac : bootIdHmac,
+        prev_boot_id_hmac: typeof boundary.prev_boot_id_hmac === "string" ? boundary.prev_boot_id_hmac : "unknown",
+        os_build_changed: boundary.os_build_changed,
+        gap_s: intString(boundary.gap_s),
+        resolution_s: intString(boundary.resolution_s),
+      },
+    }));
+  }
+
+  if (boundaryCensus) {
+    points.push(contextFactPoint({
+      ts,
+      factName: HOST_BOUNDARY_CENSUS_FACT_NAME,
+      source,
+      attributes: {
+        ...common,
+        trigger: boundaryCensus.trigger,
+        status: boundaryCensus.status,
+        boot_id_hmac: typeof boundaryCensus.boot_id_hmac === "string" ? boundaryCensus.boot_id_hmac : bootIdHmac,
+        pre_gap_s: intString(boundaryCensus.pre_gap_s),
+        post_gap_s: intString(boundaryCensus.post_gap_s),
+      },
+    }));
+  }
+  return points;
+}

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CONTEXT_KEY_BYTES, contextHmac } from "../src/context-key.js";
 import { validateContextFact } from "../src/context-schemas.js";
-import { factPointsFromTailnetStateEvidence, observationInterval } from "../src/context-translators.js";
+import { factPointsFromHostLifecycleEvidence, factPointsFromTailnetStateEvidence, hostBootIdHmac, observationInterval } from "../src/context-translators.js";
 
 const TS = "2026-10-11T10:00:00.000Z";
 const KEY = Buffer.alloc(CONTEXT_KEY_BYTES, 7);
@@ -79,4 +79,79 @@ test("C0.3: without a usable HMAC key the tailnet name is unknown, never an unke
   assert.equal(point.attributes.current_tailnet_hmac, "unknown");
   assert.equal(point.attributes.self_online, "unknown");
   assert.equal(point.attributes.exit_node_in_use, "unknown");
+});
+
+// --- C0.8 / C0.9 / C0.12: host_lifecycle facts ---
+
+
+function hostEnvelope(result) {
+  return { id: "host-lifecycle", status: "ok", result, observation: { start_ms: 100, end_ms: 120 }, trace: { tool: "collect_host_lifecycle", ts: TS, latency_ms: 20 } };
+}
+
+const DARWIN_RESULT = {
+  platform: "darwin",
+  status: "ok",
+  boot: { boot_id: "EFD29ED2-27A4-488A-96ED-7DB3B021B706", boot_id_source: "kern.bootsessionuuid", boot_time_s: 1788538230, os_build: "25C56", os_release: "25.2.0" },
+  clocks: {
+    wall_ms: 1791724875400, uv_hrtime_ns: "76479557408294", uv_version: "1.52.1", os_uptime_ms: 3186645200,
+    kern_monotonicclock_usecs: "1791724875400525 76479557408294", kern_sleeptime_s: 0, kern_waketime_s: 0,
+    kern_sleep_abs_time: "0", kern_wake_abs_time: "0", machdep_wake_abstime: "0", machdep_wake_conttime: "0",
+  },
+};
+
+test("C0.8/C0.9: host.boot, host.clock_reading and host.suspend from one host-lifecycle envelope; boot id HMAC'd; named clocks never substituted", () => {
+  const points = factPointsFromHostLifecycleEvidence([hostEnvelope(DARWIN_RESULT)], { ts: TS, hmacKey: KEY, bracket: "stable", suspend: { interval_basis: "same_boot_wall_delta", exposure_upper_s: 3600 } });
+  assert.deepEqual(points.map((p) => p.fact_name), ["host.boot", "host.clock_reading", "host.suspend"]);
+  for (const point of points) assert.deepEqual(validateContextFact(point.fact_name, point.attributes), { ok: true }, point.fact_name);
+  const [boot, clock, suspend] = points;
+  assert.equal(boot.attributes.boot_id_hmac, hostBootIdHmac(KEY, "EFD29ED2-27A4-488A-96ED-7DB3B021B706"));
+  assert.ok(!JSON.stringify(points).includes("EFD29ED2"), "the raw boot id never reaches a fact");
+  assert.equal(boot.attributes.boot_time_s, "1788538230");
+  assert.equal(boot.attributes.os_build, "25C56");
+  assert.equal(boot.attributes.bracket, "stable");
+  assert.equal(boot.attributes.obs_start_ms, "100");
+  assert.equal(clock.attributes.uv_hrtime_clock_id, "unverified");
+  assert.equal(clock.attributes.named_clocks, "unavailable_without_native");
+  assert.equal(clock.attributes.kern_monotonicclock_usecs, "1791724875400525 76479557408294");
+  assert.equal(clock.attributes.proc_uptime_s, "not_applicable");
+  assert.equal(clock.attributes.suspend_stats_success, "not_applicable");
+  assert.deepEqual(
+    { state: suspend.attributes.state, reason: suspend.attributes.reason, lower: suspend.attributes.exposure_lower_s, upper: suspend.attributes.exposure_upper_s, basis: suspend.attributes.interval_basis },
+    { state: "unknown", reason: "f3_inactive_c09_pending", lower: "0", upper: "3600", basis: "same_boot_wall_delta" },
+  );
+});
+
+test("C0.8: an unreadable boot read degrades every value to unknown, never a fabricated boot", () => {
+  const points = factPointsFromHostLifecycleEvidence([hostEnvelope({ platform: "linux", status: "unable", boot: {}, clocks: { wall_ms: 5 } })], { ts: TS, hmacKey: KEY });
+  const boot = points[0];
+  assert.equal(boot.attributes.collector_state, "unable");
+  assert.equal(boot.attributes.boot_id_hmac, "unknown");
+  assert.equal(boot.attributes.boot_id_source, "unknown");
+  assert.equal(boot.attributes.bracket, "unknown");
+  assert.equal(points[1].attributes.proc_uptime_s, "unknown");
+  assert.equal(points[1].attributes.kern_sleeptime_s, "not_applicable");
+  assert.equal(points[2].attributes.interval_basis, "unknown");
+  assert.equal(points[2].attributes.exposure_upper_s, "unknown");
+  assert.deepEqual(factPointsFromHostLifecycleEvidence([], { ts: TS }), []);
+});
+
+test("C0.8/C0.12: boundary verdict and boundary census become host.boot_boundary and host.boundary_census; a rejected value is unable, never written", () => {
+  const boundary = {
+    verdict: "verified", failing_conjunct: "none", tripwire: "none",
+    c_never_seen: "pass", c_daemon_restart: "pass", c_boot_time_in_gap: "pass", c_uptime_consistent: "pass", c_no_preboot_instance: "pass",
+    prev_boot_id_hmac: "0123456789abcdef", os_build_changed: "false", gap_s: 2400, resolution_s: 2,
+  };
+  const census = { trigger: "boot", status: "ran", pre_gap_s: 600, post_gap_s: 90 };
+  const points = factPointsFromHostLifecycleEvidence([hostEnvelope(DARWIN_RESULT)], { ts: TS, hmacKey: KEY, boundary, boundaryCensus: census });
+  const byName = Object.fromEntries(points.map((p) => [p.fact_name, p]));
+  assert.equal(byName["host.boot_boundary"].attributes.verdict, "verified");
+  assert.equal(byName["host.boot_boundary"].attributes.prev_boot_id_hmac, "0123456789abcdef");
+  assert.equal(byName["host.boot_boundary"].attributes.gap_s, "2400");
+  assert.equal(byName["host.boundary_census"].attributes.pre_gap_s, "600");
+  assert.equal(byName["host.boundary_census"].attributes.boot_id_hmac, byName["host.boot"].attributes.boot_id_hmac);
+  const bad = factPointsFromHostLifecycleEvidence([hostEnvelope(DARWIN_RESULT)], { ts: TS, hmacKey: KEY, boundary: { ...boundary, verdict: "probably_fine" } });
+  const rejected = bad.find((p) => p.fact_name === "host.boot_boundary");
+  assert.equal(rejected.attributes.collector_state, "unable");
+  assert.equal(rejected.attributes.rejected_field, "verdict");
+  assert.equal(rejected.attributes.verdict, "unknown");
 });
