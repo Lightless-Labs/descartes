@@ -251,6 +251,8 @@ test("C2 session.attachment parser: exactly tty<TAB>name per line, known /dev tt
   assert.equal(parsed.malformed_count, 0);
   for (const bad of ["/dev/ttys003 work", "/tmp/x\twork", "/dev/ttys003\t", "/dev/ttys003\ta\tb", "MALFORMED"]) assert.ok(parseTmuxClients(bad).malformed_count > 0, bad);
   assert.equal(parseTmuxClients("/dev/ttys1\ta\n/dev/ttys1\tb\n").duplicate_count, 1);
+  // C2 review L12: a duplicate tty is counted (partial) but never kept twice (one point per entity).
+  assert.deepEqual(parseTmuxClients("/dev/ttys1\ta\n/dev/ttys1\tb\n").clients, [{ tty: "ttys1", session_name: "a" }]);
   assert.equal(parseTmuxClients(null).malformed_count, 1);
 });
 
@@ -263,6 +265,11 @@ test("C2 session.attachment collector: one fixed argv through the resolver; no s
   assert.equal(ok.total_count, 1);
   const noServer = await readSessionAttachments({ platform: "linux", runFixedExecFile: run({ status: "error", stdout: "", stderr: "no server running on /tmp/tmux-1000/default\n" }) });
   assert.equal(noServer.status, "absent");
+  const stale = await readSessionAttachments({ platform: "darwin", runFixedExecFile: run({ status: "error", stdout: "", stderr: "error connecting to /private/tmp/tmux-501/default (No such file or directory)\n" }) });
+  assert.equal(stale.status, "absent");
+  // C2 review L13: a socket we may not open is a permission problem, never "no server".
+  const denied = await readSessionAttachments({ platform: "darwin", runFixedExecFile: run({ status: "error", stdout: "", stderr: "error connecting to /private/tmp/tmux-501/default (Permission denied)\n" }) });
+  assert.equal(denied.status, "missing_permission");
   const other = await readSessionAttachments({ platform: "linux", runFixedExecFile: run({ status: "error", stdout: "", stderr: "lost server" }) });
   assert.equal(other.status, "unable");
   const missing = await readSessionAttachments({ platform: "darwin", runFixedExecFile: run({ status: "not_found_on_known_paths", availability: "not_found_on_known_paths", stdout: "" }) });
