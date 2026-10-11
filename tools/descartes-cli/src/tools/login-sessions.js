@@ -328,7 +328,9 @@ export async function readLoginSessions(options = {}) {
 
   if (platform === "darwin") {
     const who = await runWho(runExec, options);
-    sources.who = who.state;
+    // C0 review L5: rows beyond the per-read cap are not records, so the census is partial (the
+    // translator then reports the current count as unknown, never the truncated number).
+    sources.who = who.state === "ok" && who.rows.length > MAX_LOGIN_RECORDS ? "partial" : who.state;
     for (const row of who.rows.slice(0, MAX_LOGIN_RECORDS)) {
       const { origin_class: originClass, remote_host: remoteHost } = classifyLoginOrigin(row);
       records.push({ source: "who", user: row.user, tty_class: ttyClassOf(row.tty), origin_class: originClass, service_class: "unknown", remote_host: remoteHost, identity: ["who", row.user, row.tty, row.host ?? "", row.login_text].join("\u0000") });

@@ -172,6 +172,18 @@ test("collectLoginSessionsEvidence wraps the read in a login-sessions envelope",
   assert.equal(envelope.result.status, "not_applicable");
 });
 
+test("C0 review L5: more who rows than the per-read cap make the who source partial and the current count unknown, never a truncated count reported as definite", async () => {
+  const { MAX_LOGIN_RECORDS } = await import("../src/tools/login-sessions.js");
+  const many = Array.from({ length: MAX_LOGIN_RECORDS + 5 }, (_, i) => `u${i}             ttys${String(i).padStart(3, "0")}      Oct 11 12:53 `).join("\n");
+  const result = await readLoginSessions({ platform: "darwin", runFixedExecFile: scripted({ "who": ok(many), "last -n 50": ok(""), "ioreg -r -k IOConsoleUsers -d 1 -a": ok(IOREG_REAL) }) });
+  assert.equal(result.records.length, MAX_LOGIN_RECORDS);
+  assert.equal(result.sources.who, "partial");
+  const points = factPointsFromLoginSessionsEvidence([{ id: "login-sessions", status: "ok", result }], { ts: "2026-10-11T12:00:00.000Z" });
+  assert.equal(points.find((p) => p.fact_name === "session.login_census").attributes.current_count, "unknown");
+  const exact = await readLoginSessions({ platform: "darwin", runFixedExecFile: scripted({ "who": ok(WHO_REAL), "last -n 50": ok(""), "ioreg -r -k IOConsoleUsers -d 1 -a": ok(IOREG_REAL) }) });
+  assert.equal(exact.sources.who, "ok");
+});
+
 // --- first-observed-tick dedupe ---
 
 const DEDUPE_KEY = Buffer.alloc(CONTEXT_KEY_BYTES, 7);
