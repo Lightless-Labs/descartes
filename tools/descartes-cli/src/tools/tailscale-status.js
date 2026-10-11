@@ -147,7 +147,8 @@ export function redactTailscaleEnvelopeForModel(envelope) {
  * reports a Running daemon as an ok zero-peer census.
  */
 export function parseTailscaleStatusJson(stdout) {
-  const parsed = JSON.parse(String(stdout ?? ""));
+  if (typeof stdout !== "string") throw new SyntaxError("tailscale status JSON must be a string");
+  const parsed = JSON.parse(stdout);
   if (!isPlainObject(parsed) || typeof parsed.BackendState !== "string" || parsed.BackendState.length === 0) {
     throw new SyntaxError("tailscale status JSON has no valid BackendState");
   }
