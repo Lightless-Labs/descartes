@@ -13,6 +13,7 @@
 **Revised:** 2026-10-09 (v4 — §6 arbitration/pending redesign; v3 re-review folded; citations updated to merged main)
 **Revised:** 2026-10-09 (v5 — no operator ratification; earned automatic adaptation; C1a narrowed; v4 Opus+Astra reviews folded)
 **Addendum:** 2026-10-11 — C0 execution on `feat/context-facts-c2-2026-10`: the C0 rows C2 collects from (C0.3–C0.8, C0.12, and C0.9's raw capture only) are implemented; deviations and deferred items are listed in "Addendum: C0 execution (2026-10-11)" at the end of this plan. The C0.9 real-laptop measurement write-up is a separate, later task.
+**Reviewed:** 2026-10-11 (C0 adversarial review, NEEDS-REWORK; every finding dispositioned in "C0 review fixes (2026-10-11)" at the end of this plan)
 **Origin:** `todos/2026-10-06-session-peer-tuning.md` (operator reframe, 2026-10-06). This plan realizes Slice 12 of `docs/plans/2026-07-09-self-learning-stratified-monitoring.md:183` and generalizes it from time to all context.
 
 **Inputs to v5:**
@@ -1691,3 +1692,30 @@ Branch `feat/context-facts-c2-2026-10` (from `main` @ 414c6ef, which contains th
 - C2 items not started: `tick_summary` and chaining, per-family retention, `session.created_vs_boot`, `session.attachment`, `context.transition`, `host.clock` step/timezone events, `host.daemon_gap`, `host.lifecycle_record` (`last` reboot/shutdown rows), `net.vpn_service_state`, the `collector.binary_state` family, and the I5 static check over the provenance tags (C3).
 - Out of this step's scope: C0.1b (`census.universe_changed`), C0.2's Linux VPN source, C0.10, C0.11, C0.13 (F-cards).
 
+### C0 review fixes (2026-10-11)
+
+Adversarial review of C0 at 9bd265d. Every finding was checked against the code; each accepted one has a failing test first and its own commit.
+
+| Finding | Disposition |
+|---|---|
+| B1 +0 census feeds the session/peer detectors | Accepted. `boundary_census` ships disabled (deviation 1); boundaries are still recorded at the next scheduled census. |
+| H1 raw tailnet name reaches the model | Accepted. The `collect_tailscale_status` tool strips it (`redactTailscaleEnvelopeForModel`, presence flag only). |
+| H2 unread boot id written as `cross_boot` | Accepted. `interval_basis: unknown`. |
+| H3 `c_uptime_consistent` cannot fail | Accepted. `not_independent` (deviation 7): fail-closed, no boundary `verified` until C0.9 or an I41 amendment. |
+| M1 bracket `stable` with no wake marker | Accepted. `unknown`. |
+| M2 wall delta is not an upper bound | Accepted. Uptime delta + resolution, within one boot. |
+| M3 clock step produces a tripwire | Accepted, widened to the daemon start-time branch: clock-dependent contradictions are `unverified` (deviation 8). |
+| M4 peer parser change without a regime bump | Accepted. Peer availability signature `v2`; `v1` stays a valid, different regime. |
+| M5 empty boot salt for logind dedupe | Accepted. Salt falls back to the census's own boot read; with none, no dedupe that tick (census `unavailable`). |
+| M6 fabricated/guessed fingerprint (a–d) | Accepted, all four. |
+| M7 silent re-key | Accepted. `hmac_key_id` on every context fact; login seen-state keyed and discarded on key change. |
+| M8 markerless peer tick after a VPN sub-deadline overrun | Accepted. No tailscale peer points when the VPN envelope is daemon-synthesized. |
+| L1 ledger file trusted alone | Partly: the verdict needs the live after-read to confirm the boot (`live_boot_mismatch` / `live_boot_unread`). Ledger integrity itself stays B-ledger / daybreak scope. |
+| L2 superseded pending boundary lost | Accepted. `superseded_count` on `host.boot_boundary` and `host.boundary_census`. |
+| L3 `deferred_cost_cap` mislabel | Accepted. `not_enabled`, `detected_after_census`. |
+| L4 unkeyed login digests | Accepted. HMAC under the per-install key (seen-state v2). |
+| L5 truncated `who` count reported as definite | Accepted. Source `partial`, count `unknown`. |
+| L6 `.unknown` entity-key collapse | Accepted. No key, no login row. |
+| L7 unbounded every-tick probe, per-tick ledger write | Probe bounded by the context sub-deadline. The per-tick write is kept on purpose: it gives `last_observed_ms` tick precision for the gap conjunct. |
+| L8 schema only in translators | Accepted. `normalizeFactPoint` enforces it at append and on read. |
+| L9 `last` read twice, §0.5 ids, HANDOFF | Not changed here: the first two are already listed as known follow-ups (deviation 4, C0.10). Updating `docs/HANDOFF.md` is the parent agent's job. |
