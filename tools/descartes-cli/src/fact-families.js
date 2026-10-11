@@ -76,6 +76,8 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["session.login_history_row", "session_context"],
   ["session.login_census", "session_context"],
   ["user.presence", "session_context"],
+  ["session.attachment_census", "session_context"],
+  ["session.attachment", "session_context"],
   ["collector.binary_state", "collector_state"],
 ];
 
@@ -279,7 +281,8 @@ const FAMILY_BUDGET_ENTRIES = [
   ["host_lifecycle", 7 * MIB],
   // C2: + the VPN service census marker and at most 8 net.vpn_service_state records per tick.
   ["network_context", 6 * MIB],
-  ["session_context", 11 * MIB],
+  // C2: + the attachment census marker and at most 8 session.attachment records per tick.
+  ["session_context", 17 * MIB],
   // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
   // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
   ["collector_state", 8 * MIB],
@@ -320,7 +323,9 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   ["host_lifecycle", { maxRecordBytes: 721, markerBytes: 3967, entityCap: 4 }],
   // C2: markers + vpn_service_census 614; records: MAX_VPN_SERVICE_STATES_PER_TICK x vpn_service_state 528.
   ["network_context", { maxRecordBytes: 528, markerBytes: 2244, entityCap: 8 }],
-  ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],
+  // C2: + session.attachment_census 608 as a marker; + MAX_SESSION_ATTACHMENTS_PER_TICK (8) records of
+  // at most 573 B, counted at the family's 643 B record maximum.
+  ["session_context", { maxRecordBytes: 643, markerBytes: 1893, entityCap: 24 }],
   // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
   ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
 ];

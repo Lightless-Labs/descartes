@@ -426,7 +426,8 @@ export async function readLoginSessions(options = {}) {
     truncated ||= who.truncated === true;
     for (const row of who.rows.slice(0, MAX_LOGIN_RECORDS)) {
       const { origin_class: originClass, remote_host: remoteHost } = classifyLoginOrigin(row);
-      records.push({ source: "who", user: row.user, tty_class: ttyClassOf(row.tty), origin_class: originClass, service_class: "unknown", remote_host: remoteHost, identity: ["who", row.user, row.tty, row.host ?? "", row.login_text].join("\u0000") });
+      // C2: `tty` (the raw terminal name) lets session.attachment join a tmux client to this login.
+      records.push({ source: "who", user: row.user, tty: row.tty, tty_class: ttyClassOf(row.tty), origin_class: originClass, service_class: "unknown", remote_host: remoteHost, identity: ["who", row.user, row.tty, row.host ?? "", row.login_text].join("\u0000") });
     }
     abortIfNeeded();
     const consoleRead = await runConsole(runExec, options);
@@ -452,6 +453,7 @@ export async function readLoginSessions(options = {}) {
       records.push({
         source: "loginctl",
         user: session.Name,
+        tty: typeof session.TTY === "string" && session.TTY ? session.TTY : undefined,
         tty_class: ["x11", "wayland", "mir"].includes(session.Type) && !session.TTY ? "display" : ttyClassOf(session.TTY),
         origin_class: originClass,
         service_class: loginctlServiceClass(session.Service),

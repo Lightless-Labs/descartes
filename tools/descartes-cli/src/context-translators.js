@@ -14,6 +14,8 @@
 import { contextHmac, contextKeyId } from "./context-key.js";
 import { BINARY_TRUST_REASONS, COLLECTOR_BINARY_NAMES, enforceContextSchema } from "./context-schemas.js";
 import { strictRfc3339EpochMilliseconds } from "./tools/census-validate.js";
+import { hashSessionIdentity } from "./fact-translators.js";
+import { ttyClassOf } from "./tools/login-origin.js";
 
 // Fixed entity keys for the per-tick context facts. Literal constants (not computed) so the T12
 // source scan in fact-families.test.js resolves every emitted fact_name.
@@ -30,6 +32,9 @@ export const SESSION_LOGIN_CENSUS_FACT_NAME = "session.login_census";
 export const USER_PRESENCE_FACT_NAME = "user.presence";
 export const COLLECTOR_BINARY_STATE_FACT_NAME = "collector.binary_state";
 export const HOST_LIFECYCLE_RECORD_FACT_NAME = "host.lifecycle_record";
+export const SESSION_ATTACHMENT_CENSUS_FACT_NAME = "session.attachment_census";
+export const SESSION_ATTACHMENT_FACT_NAME = "session.attachment";
+export const MAX_SESSION_ATTACHMENTS_PER_TICK = 8;
 export const MAX_LIFECYCLE_RECORDS_PER_TICK = 4;
 export const NET_VPN_SERVICE_CENSUS_FACT_NAME = "net.vpn_service_census";
 export const NET_VPN_SERVICE_STATE_FACT_NAME = "net.vpn_service_state";
@@ -41,6 +46,7 @@ export const CONTEXT_ENVELOPE_SOURCES = Object.freeze({
   tailscale: Object.freeze({ id: "tailscale-status", tool: "collect_tailscale_status" }),
   net_config: Object.freeze({ id: "net-config", tool: "collect_net_config" }),
   login_sessions: Object.freeze({ id: "login-sessions", tool: "collect_login_sessions" }),
+  session_attachment: Object.freeze({ id: "tmux-clients", tool: "collect_tmux_clients" }),
   // C2: facts DERIVED by the daemon from the structural evidence it already holds (no new read).
   derived: Object.freeze({ id: "derived", tool: "derive_context" }),
 });
@@ -547,7 +553,7 @@ const BINARY_WALK_MAX_OBSERVATIONS = 256;
 // The envelopes that report binary provenance today. Bounding the walk to them bounds the per-tick
 // record count (collector_state's T8 shape): sessions (tmux, screen), vpn-peer-status (who, last, wg,
 // scutil, lsof/ss), tailscale-status (tailscale), host-lifecycle (sysctl).
-const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle"]);
+const BINARY_PROVENANCE_ENVELOPE_IDS = new Set(["sessions", "vpn-peer-status", "tailscale-status", "host-lifecycle", "tmux-clients"]);
 export const MAX_BINARY_STATES_PER_TICK = 12;
 
 function binaryStateOf(provenance) {
@@ -754,6 +760,75 @@ export function factPointsFromLifecycleRecordEvidence(evidence, { ts, hmacKey, d
         os_release: typeof row.os_release === "string" ? row.os_release : "unknown",
         new_rows_total: String(Math.min(total, 1000)),
         dedupe_state: ["fresh", "reseeded"].includes(dedupe.lifecycleDedupeState) ? dedupe.lifecycleDedupeState : "unknown",
+      },
+    }));
+  }
+  return points;
+}
+
+// ------------------------------------------------------------------------------------------------
+// C2 (§4.3): session.attachment -- tmux clients joined to the login on the same tty.
+// ------------------------------------------------------------------------------------------------
+
+const ATTACHMENT_TTY_CLASSES = new Set(["console", "tty", "pts", "ttys"]);
+
+/**
+ * evidence[] -> one session.attachment_census marker plus at most MAX_SESSION_ATTACHMENTS_PER_TICK
+ * session.attachment points whenever the session-attachment envelope exists. Each client is joined
+ * to the login-sessions record on the same tty: "matched" (with that login's origin class),
+ * "no_login_row" (the login census was usable and has no row on that tty), or
+ * "login_source_unusable" (no usable login census: never read as "no login").
+ */
+export function factPointsFromSessionAttachmentEvidence(evidence, { ts, hmacKey } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "tmux-clients");
+  if (!envelope) return [];
+  const result = envelope.result ?? {};
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const daemonSynthesized = envelope.source === "daemon";
+  const sourceState = daemonSynthesized ? "unable" : COMPONENT_STATE_VALUES.has(result.status) ? result.status : "unable";
+  const login = (evidence ?? []).find((e) => e?.id === "login-sessions" && e?.source !== "daemon")?.result;
+  const loginSources = login?.sources ?? {};
+  const recordSource = ["who", "loginctl"].find((name) => loginSources[name] !== undefined && loginSources[name] !== "not_applicable");
+  const loginSourceState = recordSource && COMPONENT_STATE_VALUES.has(loginSources[recordSource]) ? loginSources[recordSource] : "unable";
+  const loginUsable = ["ok", "absent"].includes(loginSourceState);
+  const clients = ["ok", "partial"].includes(sourceState) && Array.isArray(result.clients) ? result.clients : [];
+  const counted = ["ok", "absent"].includes(sourceState);
+  const emitted = clients.slice(0, MAX_SESSION_ATTACHMENTS_PER_TICK);
+  const collectorState = sourceState === "absent" ? "ok" : COLLECTOR_STATE_SET.has(sourceState) ? sourceState : "unable";
+  const common = { collector_state: collectorState, obs_start_ms: msString(obsStartMs), obs_end_ms: msString(obsEndMs), rejected_field: "none" };
+  const source = CONTEXT_ENVELOPE_SOURCES.session_attachment;
+  const points = [contextFactPoint({
+    hmacKey,
+    ts,
+    factName: SESSION_ATTACHMENT_CENSUS_FACT_NAME,
+    source,
+    attributes: {
+      ...common,
+      source_state: sourceState,
+      login_source_state: loginSourceState,
+      clients_total: counted && Number.isSafeInteger(result.total_count) ? String(result.total_count) : "unknown",
+      emitted: String(emitted.length),
+      overflow: counted && Number.isSafeInteger(result.total_count) ? String(Math.max(0, result.total_count - emitted.length)) : "unknown",
+    },
+  })];
+  // Without a usable key there is no per-client entity key: the census still counts, nothing is guessed.
+  for (const client of contextKeyId(hmacKey) === "unknown" ? [] : emitted) {
+    if (typeof client?.tty !== "string" || typeof client?.session_name !== "string") continue;
+    const ttyClass = ttyClassOf(client.tty);
+    const match = loginUsable ? (login.records ?? []).find((record) => record?.tty === client.tty) : undefined;
+    const join = !loginUsable ? "login_source_unusable" : match ? "matched" : "no_login_row";
+    points.push(contextFactPoint({
+      hmacKey,
+      ts,
+      factName: SESSION_ATTACHMENT_FACT_NAME,
+      entityKey: `${SESSION_ATTACHMENT_FACT_NAME}.${contextHmac(hmacKey, "session_attachment_entity", `${client.tty}\u0000${client.session_name}`)}`,
+      source,
+      attributes: {
+        ...common,
+        session_key: hashSessionIdentity("tmux", client.session_name),
+        client_tty_class: ATTACHMENT_TTY_CLASSES.has(ttyClass) ? ttyClass : "unknown",
+        login_join: join,
+        login_origin_class: match ? (ORIGIN_CLASSES.has(match.origin_class) ? match.origin_class : "unknown") : join === "no_login_row" ? "none" : "unknown",
       },
     }));
   }

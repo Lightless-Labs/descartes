@@ -332,6 +332,29 @@ const FACT_SCHEMA_ENTRIES = [
       dedupe_state: enumField(["fresh", "reseeded", "unavailable", "unknown"], ["descartes.daemon"]),
     },
   }],
+  // C2 (§4.3): tmux clients joined to the login on their tty (Opus L1). The session key is the
+  // incumbent session.presence entity hash (fact-translators.js hashSessionIdentity), so the two join.
+  ["session.attachment_census", {
+    family: "session_context",
+    fields: {
+      ...commonFields(["tmux.server"]),
+      source_state: enumField(COMPONENT_STATES, ["tmux.server"]),
+      login_source_state: enumField(COMPONENT_STATES, ["login.utmp", "login.logind"]),
+      clients_total: intField(0, 100000, ["tmux.server"]),
+      emitted: intField(0, 8, ["descartes.daemon"]),
+      overflow: intField(0, 100000, ["descartes.daemon"]),
+    },
+  }],
+  ["session.attachment", {
+    family: "session_context",
+    fields: {
+      ...commonFields(["tmux.server"]),
+      session_key: hmacField(["tmux.server"]),
+      client_tty_class: enumField(["console", "tty", "pts", "ttys", "unknown"], ["tmux.server"]),
+      login_join: enumField(["matched", "no_login_row", "login_source_unusable", "unknown"], ["login.utmp", "login.logind", "tmux.server"]),
+      login_origin_class: enumField(["console", "local_tty", "local_display", "remote", "remote_mosh", "unknown", "none"], ["login.utmp", "login.logind"]),
+    },
+  }],
   ["user.presence", {
     family: "session_context",
     fields: {

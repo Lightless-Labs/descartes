@@ -9,9 +9,13 @@ import { FACT_FAMILY_BY_NAME, FAMILY_DEFAULT_BUDGET_BYTES, FAMILY_TICK_SHAPES, f
 import { parseLastLifecycleRows, parseLastRows } from "../src/tools/last-history.js";
 import { readLoginSessions } from "../src/tools/login-sessions.js";
 import { selectNewLoginRows } from "../src/login-seen.js";
+import { parseTmuxClients, readSessionAttachments, TMUX_CLIENT_FORMAT } from "../src/tools/session-attachment.js";
+import { hashSessionIdentity } from "../src/fact-translators.js";
 import {
   factPointsFromBinaryStateEvidence,
   factPointsFromLifecycleRecordEvidence,
+  factPointsFromSessionAttachmentEvidence,
+  MAX_SESSION_ATTACHMENTS_PER_TICK,
   MAX_LIFECYCLE_RECORDS_PER_TICK,
   factPointsFromVpnServiceEvidence,
   MAX_BINARY_STATES_PER_TICK,
@@ -239,4 +243,81 @@ test("C2 host.lifecycle_record: first-observed dedupe through the keyed login se
   assert.equal(capped.length, MAX_LIFECYCLE_RECORDS_PER_TICK);
   assert.equal(capped[0].attributes.new_rows_total, "7");
   assert.deepEqual(factPointsFromLifecycleRecordEvidence([envelope], { ts: TS, hmacKey: KEY }), []);
+});
+
+test("C2 session.attachment parser: exactly tty<TAB>name per line, known /dev tty shapes, one client per tty; anything else is partial", () => {
+  const parsed = parseTmuxClients("/dev/ttys003\twork\n/dev/pts/2\tmain session\n");
+  assert.deepEqual(parsed.clients, [{ tty: "ttys003", session_name: "work" }, { tty: "pts/2", session_name: "main session" }]);
+  assert.equal(parsed.malformed_count, 0);
+  for (const bad of ["/dev/ttys003 work", "/tmp/x\twork", "/dev/ttys003\t", "/dev/ttys003\ta\tb", "MALFORMED"]) assert.ok(parseTmuxClients(bad).malformed_count > 0, bad);
+  assert.equal(parseTmuxClients("/dev/ttys1\ta\n/dev/ttys1\tb\n").duplicate_count, 1);
+  assert.equal(parseTmuxClients(null).malformed_count, 1);
+});
+
+test("C2 session.attachment collector: one fixed argv through the resolver; no server is absent; a missing or untrusted tmux is its state; an aborted signal launches nothing", async () => {
+  const calls = [];
+  const run = (reply) => async (command, args) => { calls.push([command, ...args]); return reply; };
+  const ok = await readSessionAttachments({ platform: "darwin", runFixedExecFile: run({ status: "ok", stdout: "/dev/ttys003\twork\n", stderr: "" }) });
+  assert.deepEqual(calls[0], ["tmux", "list-clients", "-F", TMUX_CLIENT_FORMAT]);
+  assert.equal(ok.status, "ok");
+  assert.equal(ok.total_count, 1);
+  const noServer = await readSessionAttachments({ platform: "linux", runFixedExecFile: run({ status: "error", stdout: "", stderr: "no server running on /tmp/tmux-1000/default\n" }) });
+  assert.equal(noServer.status, "absent");
+  const other = await readSessionAttachments({ platform: "linux", runFixedExecFile: run({ status: "error", stdout: "", stderr: "lost server" }) });
+  assert.equal(other.status, "unable");
+  const missing = await readSessionAttachments({ platform: "darwin", runFixedExecFile: run({ status: "not_found_on_known_paths", availability: "not_found_on_known_paths", stdout: "" }) });
+  assert.equal(missing.status, "not_found_on_known_paths");
+  const untrusted = await readSessionAttachments({ platform: "darwin", runFixedExecFile: run({ status: "untrusted_binary", availability: "untrusted_binary", stdout: "" }) });
+  assert.equal(untrusted.status, "untrusted_binary");
+  assert.equal((await readSessionAttachments({ platform: "win32" })).status, "not_applicable");
+  const controller = new AbortController();
+  controller.abort();
+  calls.length = 0;
+  await assert.rejects(readSessionAttachments({ platform: "darwin", signal: controller.signal, runFixedExecFile: run({ status: "ok", stdout: "" }) }), /collector_aborted/);
+  assert.equal(calls.length, 0);
+});
+
+function attachmentEvidence(attachment, login) {
+  return [
+    { id: "tmux-clients", status: "ok", observation: { start_ms: 5, end_ms: 6 }, result: attachment },
+    ...(login ? [{ id: "login-sessions", status: "ok", result: login }] : []),
+  ];
+}
+
+test("C2 session.attachment: each client joined to the login on its tty; session key equals the incumbent session entity hash; no tty or name written raw", () => {
+  const evidence = attachmentEvidence(
+    { status: "ok", total_count: 2, clients: [{ tty: "ttys003", session_name: "work" }, { tty: "ttys009", session_name: "other" }] },
+    { sources: { who: "ok", last: "ok", console: "ok", loginctl: "not_applicable" }, records: [{ source: "who", tty: "ttys003", origin_class: "remote" }] },
+  );
+  const [census, ...attachments] = valid(factPointsFromSessionAttachmentEvidence(evidence, { ts: TS, hmacKey: KEY }));
+  assert.equal(census.attributes.clients_total, "2");
+  assert.equal(census.attributes.login_source_state, "ok");
+  assert.equal(attachments.length, 2);
+  assert.equal(attachments[0].attributes.session_key, hashSessionIdentity("tmux", "work"));
+  assert.equal(attachments[0].attributes.login_join, "matched");
+  assert.equal(attachments[0].attributes.login_origin_class, "remote");
+  assert.equal(attachments[0].attributes.client_tty_class, "ttys");
+  assert.equal(attachments[1].attributes.login_join, "no_login_row");
+  assert.equal(attachments[1].attributes.login_origin_class, "none");
+  assert.ok(!JSON.stringify(attachments).includes("ttys003") && !JSON.stringify(attachments).includes("\"work\""));
+  for (const p of [census, ...attachments]) assert.equal(FACT_FAMILY_BY_NAME.get(p.fact_name), "session_context");
+});
+
+test("C2 session.attachment: an unusable login census is never 'no login'; an unusable tmux read counts nothing; at most 8 per tick; no key, no per-client fact", () => {
+  const clients = Array.from({ length: 11 }, (_, i) => ({ tty: `ttys${i}`, session_name: `s${i}` }));
+  const unusableLogin = valid(factPointsFromSessionAttachmentEvidence(attachmentEvidence({ status: "ok", total_count: 11, clients }, { sources: { who: "unable" }, records: [] }), { ts: TS, hmacKey: KEY }));
+  assert.equal(unusableLogin.length, 1 + MAX_SESSION_ATTACHMENTS_PER_TICK);
+  assert.equal(unusableLogin[0].attributes.overflow, "3");
+  for (const p of unusableLogin.slice(1)) {
+    assert.equal(p.attributes.login_join, "login_source_unusable");
+    assert.equal(p.attributes.login_origin_class, "unknown");
+  }
+  const failed = valid(factPointsFromSessionAttachmentEvidence(attachmentEvidence({ status: "unable", clients: [], total_count: 0 }), { ts: TS, hmacKey: KEY }));
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].attributes.clients_total, "unknown");
+  assert.equal(failed[0].attributes.collector_state, "unable");
+  const absent = valid(factPointsFromSessionAttachmentEvidence(attachmentEvidence({ status: "absent", clients: [], total_count: 0 }), { ts: TS, hmacKey: KEY }));
+  assert.equal(absent[0].attributes.clients_total, "0");
+  const noKey = valid(factPointsFromSessionAttachmentEvidence(attachmentEvidence({ status: "ok", total_count: 1, clients: clients.slice(0, 1) }), { ts: TS }));
+  assert.equal(noKey.length, 1);
 });
