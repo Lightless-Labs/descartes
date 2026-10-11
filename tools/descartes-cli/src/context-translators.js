@@ -410,7 +410,7 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
 // C0.5: net.config_fingerprint (per-component availability, HMAC'd with the per-install key).
 // ------------------------------------------------------------------------------------------------
 
-const NET_COMPONENTS = ["gateway_mac", "ra_prefix", "dhcp_domain", "resolvers"];
+const NET_COMPONENTS = ["gateway_mac", "ra_prefix", "dhcp_domain", "configured_search_domain", "resolvers"];
 const ROUTE_KINDS = new Set(["wifi", "ethernet", "cellular", "tunnel", "bridge", "loopback", "other", "none", "unknown"]);
 // States a configuration identity may fold. `not_found_on_known_paths` is OUTSIDE the universe (I49:
 // a source whose binary is not installed, e.g. nmcli or resolvectl), so the rest still fingerprints;
@@ -459,9 +459,15 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
   };
   let componentsOk = 0;
   for (const name of NET_COMPONENTS) {
-    const state = Object.prototype.hasOwnProperty.call(components, name) ? componentState(components[name]) : "unable";
+    // The configured-search-domain field was added after the original C0.5 result shape. Treat
+    // its absence in an old in-memory fixture as not_applicable, while a collector result always
+    // carries the field explicitly.
+    const component = Object.prototype.hasOwnProperty.call(components, name)
+      ? components[name]
+      : name === "configured_search_domain" ? { state: "not_applicable" } : undefined;
+    const state = componentState(component);
     attributes[`${name}_state`] = state;
-    attributes[`${name}_hmac`] = componentHmac(hmacKey, name, components[name]);
+    attributes[`${name}_hmac`] = componentHmac(hmacKey, name, component);
     if (state === "ok") componentsOk += 1;
   }
   if (routeState === "ok") componentsOk += 1;

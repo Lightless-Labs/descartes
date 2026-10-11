@@ -151,6 +151,7 @@ test("C0.5 darwin collector: fixed argv per component, through the resolver; the
     gateway_mac: { state: "ok", value: "1e:f6:4c:23:af:64" },
     ra_prefix: { state: "ok", value: "2001:db8:abcd:12::/64" },
     dhcp_domain: { state: "absent" },
+    configured_search_domain: { state: "not_applicable" },
     resolvers: { state: "ok", value: "192.168.64.1" },
   });
 });
@@ -171,15 +172,16 @@ test("C0.5 linux collector: ip route / ip neigh / ip -6 addr / nmcli / resolvect
       "ip neigh show 192.168.1.1 dev wlp2s0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
       "ip -6 addr show dev wlp2s0 scope global": ok(""),
       "nmcli -g IP4.DOMAIN device show wlp2s0": ok("configured.example\n"),
-      "nmcli -g DHCP4.OPTION.domain_name device show wlp2s0": ok(""),
+      "nmcli -g DHCP4.OPTION device show wlp2s0": ok(""),
       "resolvectl dns wlp2s0": ok("Link 3 (wlp2s0): 192.168.1.1\n"),
     }),
   });
   assert.deepEqual(result.route, { state: "ok", kind: "wifi" });
   assert.deepEqual(result.components.gateway_mac, { state: "ok", value: "aa:bb:cc:dd:ee:ff" });
   assert.deepEqual(result.components.ra_prefix, { state: "absent" });
-  assert.deepEqual(result.components.dhcp_domain, { state: "not_found_on_known_paths" });
-  assert.equal(result.status, "partial");
+  assert.deepEqual(result.components.configured_search_domain, { state: "ok", value: "configured.example" });
+  assert.deepEqual(result.components.dhcp_domain, { state: "absent" });
+  assert.equal(result.status, "ok");
 });
 
 test("HIGH: Linux IP4.DOMAIN is configured-search-domain provenance, not a DHCP lease", async () => {
@@ -192,7 +194,7 @@ test("HIGH: Linux IP4.DOMAIN is configured-search-domain provenance, not a DHCP 
       "ip neigh show 192.168.1.1 dev eth0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
       "ip -6 addr show dev eth0 scope global": ok(""),
       "nmcli -g IP4.DOMAIN device show eth0": ok("manually.configured.example\n"),
-      "nmcli -g DHCP4.OPTION.domain_name device show eth0": ok(""),
+      "nmcli -g DHCP4.OPTION device show eth0": ok(""),
       "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
     }),
   });

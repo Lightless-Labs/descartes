@@ -33,6 +33,7 @@ export const PROVENANCE_TAGS = Object.freeze([
   "net.gateway_neighbor", // the gateway's link-layer neighbour entry
   "net.router_advertisement", // IPv6 RA-derived global prefixes
   "net.dhcp_lease", // DHCP-provided options
+  "net.configured_search_domain", // effective configured search-domain options, not lease provenance
   "net.resolver_config", // interface-scoped resolvers
   "login.utmp", // who / last (utmpx / wtmp)
   "login.logind", // systemd-logind sessions
@@ -198,7 +199,7 @@ const FACT_SCHEMA_ENTRIES = [
     fields: {
       ...commonFields(["net.route_table"]),
       fingerprint_hmac: hmacField(["net.route_table", "net.gateway_neighbor", "net.router_advertisement", "net.dhcp_lease", "net.resolver_config"]),
-      components_ok: intField(0, 5, ["descartes.daemon"]),
+      components_ok: intField(0, 6, ["descartes.daemon"]),
       route_kind: enumField(["wifi", "ethernet", "cellular", "tunnel", "bridge", "loopback", "other", "none", "unknown"], ["net.route_table"]),
       route_state: enumField(COMPONENT_STATES, ["net.route_table"]),
       gateway_mac_hmac: hmacField(["net.gateway_neighbor"], [SENTINEL_UNKNOWN, "none"]),
@@ -207,6 +208,8 @@ const FACT_SCHEMA_ENTRIES = [
       ra_prefix_state: enumField(COMPONENT_STATES, ["net.router_advertisement"]),
       dhcp_domain_hmac: hmacField(["net.dhcp_lease"], [SENTINEL_UNKNOWN, "none"]),
       dhcp_domain_state: enumField(COMPONENT_STATES, ["net.dhcp_lease"]),
+      configured_search_domain_hmac: hmacField(["net.configured_search_domain"], [SENTINEL_UNKNOWN, "none"]),
+      configured_search_domain_state: enumField(COMPONENT_STATES, ["net.configured_search_domain"]),
       resolvers_hmac: hmacField(["net.resolver_config"], [SENTINEL_UNKNOWN, "none"]),
       resolvers_state: enumField(COMPONENT_STATES, ["net.resolver_config"]),
     },

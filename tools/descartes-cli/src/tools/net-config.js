@@ -248,6 +248,20 @@ function listComponent(values, state = "ok") {
   return values.length > 0 ? { state, value: values.join(",") } : { state: "absent" };
 }
 
+function parseNmcliDomains(stdout, { lease = false } = {}) {
+  const values = [];
+  for (const rawLine of String(stdout ?? "").split(/[\n|]/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const value = lease ? /^domain_name\s*=\s*(.*)$/i.exec(line)?.[1] : line;
+    if (value === undefined) continue;
+    for (const domain of value.split(/[,\s]+/).map((item) => item.trim().toLowerCase()).filter(Boolean)) {
+      if (DOMAIN_RE.test(domain)) values.push(domain);
+    }
+  }
+  return [...new Set(values)].sort();
+}
+
 async function readDarwin(runExec, options) {
   const routesProbe = await runExec("netstat", ["-rn", "-f", "inet"], probeOptions(options));
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
@@ -282,7 +296,16 @@ async function readDarwin(runExec, options) {
 
   const dnsProbe = await runExec("scutil", ["--dns"], probeOptions(options));
   const resolvers = dnsProbe.status === "ok" ? listComponent(parseScutilDnsForInterface(dnsProbe.stdout, iface)) : { state: failureState(dnsProbe) };
-  return { route, components: { gateway_mac: gatewayMac, ra_prefix: raPrefix, dhcp_domain: dhcpDomain, resolvers } };
+  return {
+    route,
+    components: {
+      gateway_mac: gatewayMac,
+      ra_prefix: raPrefix,
+      dhcp_domain: dhcpDomain,
+      configured_search_domain: { state: "not_applicable" },
+      resolvers,
+    },
+  };
 }
 
 async function linuxKind(iface, readFile, stat) {
@@ -327,16 +350,28 @@ async function readLinux(runExec, options) {
   const raPrefixes = addr.status === "ok" ? parseLinuxRouterAdvertisementPrefixes(addr.stdout) : undefined;
   const raPrefix = addr.status !== "ok" ? { state: failureState(addr) } : raPrefixes.state === "ok" ? listComponent(raPrefixes.prefixes) : { state: raPrefixes.state };
 
-  const nmcli = await runExec("nmcli", ["-g", "IP4.DOMAIN", "device", "show", iface], probeOptions(options));
-  let dhcpDomain;
-  if (nmcli.status !== "ok") dhcpDomain = { state: failureState(nmcli) };
-  else {
-    const domains = String(nmcli.stdout ?? "").split(/[\n|]/).map((d) => d.trim().toLowerCase()).filter(Boolean);
-    dhcpDomain = domains.every((d) => DOMAIN_RE.test(d)) ? listComponent([...new Set(domains)].sort()) : { state: "unable" };
-  }
+  const configuredProbe = await runExec("nmcli", ["-g", "IP4.DOMAIN", "device", "show", iface], probeOptions(options));
+  const configuredSearchDomain = configuredProbe.status === "ok"
+    ? listComponent(parseNmcliDomains(configuredProbe.stdout))
+    : { state: failureState(configuredProbe) };
+  // IP4.DOMAIN is NetworkManager's effective configuration, not lease provenance. Read the
+  // DHCP option namespace separately; an IP4.DOMAIN value must never be copied into dhcp_domain.
+  const dhcpProbe = await runExec("nmcli", ["-g", "DHCP4.OPTION", "device", "show", iface], probeOptions(options));
+  const dhcpDomain = dhcpProbe.status === "ok"
+    ? listComponent(parseNmcliDomains(dhcpProbe.stdout, { lease: true }))
+    : { state: failureState(dhcpProbe) };
   const dns = await runExec("resolvectl", ["dns", iface], probeOptions(options));
   const resolvers = dns.status === "ok" ? listComponent(parseResolvectlDns(dns.stdout)) : { state: failureState(dns) };
-  return { route, components: { gateway_mac: gatewayMac, ra_prefix: raPrefix, dhcp_domain: dhcpDomain, resolvers } };
+  return {
+    route,
+    components: {
+      gateway_mac: gatewayMac,
+      ra_prefix: raPrefix,
+      dhcp_domain: dhcpDomain,
+      configured_search_domain: configuredSearchDomain,
+      resolvers,
+    },
+  };
 }
 
 export async function readNetConfig(options = {}) {
@@ -347,7 +382,11 @@ export async function readNetConfig(options = {}) {
   else if (platform === "linux") read = await readLinux(runExec, options);
   else read = { route: { state: "not_applicable", kind: "unknown" } };
   const components = read.components ?? {
-    gateway_mac: NOT_APPLICABLE, ra_prefix: NOT_APPLICABLE, dhcp_domain: NOT_APPLICABLE, resolvers: NOT_APPLICABLE,
+    gateway_mac: NOT_APPLICABLE,
+    ra_prefix: NOT_APPLICABLE,
+    dhcp_domain: NOT_APPLICABLE,
+    configured_search_domain: NOT_APPLICABLE,
+    resolvers: NOT_APPLICABLE,
   };
   const states = [read.route.state, ...Object.values(components).map((c) => c.state)];
   const status = read.route.state === "not_applicable" ? "not_applicable"
