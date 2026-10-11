@@ -401,7 +401,15 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
 
 const NET_COMPONENTS = ["gateway_mac", "ra_prefix", "dhcp_domain", "resolvers"];
 const ROUTE_KINDS = new Set(["wifi", "ethernet", "cellular", "tunnel", "bridge", "loopback", "other", "none", "unknown"]);
-const BENIGN_COMPONENT_STATES = new Set(["ok", "absent", "not_applicable"]);
+// States a configuration identity may fold. `not_found_on_known_paths` is OUTSIDE the universe (I49:
+// a source whose binary is not installed, e.g. nmcli or resolvectl), so the rest still fingerprints;
+// the state itself is folded, so installing the binary is a regime change. `untrusted_binary`,
+// `unable`, `partial` and `missing_permission` are always incomplete (C0 review M6(c)).
+const BENIGN_COMPONENT_STATES = new Set(["ok", "absent", "not_applicable", "not_found_on_known_paths"]);
+// Route kinds whose physical network is not observed (C0 review M6(b,d)): behind a tunnel-only default
+// route the physical components are not_applicable, and an unknown kind is an unread /sys or ifconfig.
+// Folding either would give every such network one shared, fabricated identity.
+const UNOBSERVED_ROUTE_KINDS = new Set(["tunnel", "unknown"]);
 
 function componentState(component) {
   return COMPONENT_STATE_VALUES.has(component?.state) ? component.state : "unable";
@@ -418,7 +426,8 @@ function componentHmac(hmacKey, name, component) {
  * evidence[] -> one net.config_fingerprint point whenever the net-config collector produced an
  * envelope. Each component carries its own state and HMAC. The aggregate fingerprint is an HMAC of
  * the route kind and every component's (state, value); it is "unknown" when the route or any
- * component FAILED this tick (a failure is never folded into a configuration identity) or when no
+ * component FAILED this tick (a failure is never folded into a configuration identity), when the
+ * physical network is unobserved (tunnel-only default route, unknown interface kind), or when no
  * key is usable.
  */
 export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) {
@@ -446,7 +455,9 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
   }
   if (routeState === "ok") componentsOk += 1;
   attributes.components_ok = String(componentsOk);
-  const allObserved = BENIGN_COMPONENT_STATES.has(routeState) && NET_COMPONENTS.every((name) => BENIGN_COMPONENT_STATES.has(attributes[`${name}_state`]));
+  const allObserved = BENIGN_COMPONENT_STATES.has(routeState)
+    && !UNOBSERVED_ROUTE_KINDS.has(attributes.route_kind)
+    && NET_COMPONENTS.every((name) => BENIGN_COMPONENT_STATES.has(attributes[`${name}_state`]));
   attributes.fingerprint_hmac = allObserved
     ? contextHmac(hmacKey, "net_config_fingerprint", JSON.stringify([attributes.route_kind, routeState, ...NET_COMPONENTS.map((name) => [attributes[`${name}_state`], components[name]?.state === "ok" ? components[name].value : ""])]))
     : "unknown";

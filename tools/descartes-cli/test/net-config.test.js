@@ -200,6 +200,60 @@ test("C0.5 translator: an absent component is 'none' and still fingerprints; a F
   assert.equal(keyless.attributes.gateway_mac_hmac, "unknown");
 });
 
+test("C0 review M6(a): a gateway that exists but has no resolved neighbour entry is unable (a cache miss after wake), never absent", async () => {
+  const linux = async (neigh) => (await readNetConfig({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({
+      "ip route show default": ok("default via 192.168.1.1 dev eth0 proto dhcp\n"),
+      "ip neigh show 192.168.1.1 dev eth0": ok(neigh),
+      "ip -6 addr show dev eth0 scope global": ok(""),
+      "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
+    }),
+  })).components.gateway_mac;
+  assert.deepEqual(await linux(""), { state: "unable" }, "empty neighbour table for an existing gateway");
+  assert.deepEqual(await linux("192.168.1.1 dev eth0 INCOMPLETE\n"), { state: "unable" });
+  assert.deepEqual(await linux("192.168.1.1 dev eth0 FAILED\n"), { state: "unable" });
+  const darwin = await readNetConfig({
+    platform: "darwin",
+    runFixedExecFile: scripted({
+      "netstat -rn -f inet": ok(NETSTAT_REAL),
+      "ifconfig -v en0": ok(IFCONFIG_REAL),
+      "arp -n 192.168.64.1": ok("? (192.168.64.1) at (incomplete) on en0 ifscope [ethernet]\n"),
+      "ipconfig getoption en0 domain_name": { status: "error", code: 1, stdout: "", stderr: "" },
+      "scutil --dns": ok(SCUTIL_DNS_REAL),
+    }),
+  });
+  assert.deepEqual(darwin.components.gateway_mac, { state: "unable" });
+  // A default route with no gateway at all (point-to-point) still has no gateway MAC to read.
+  const noGateway = await readNetConfig({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({ "ip route show default": ok("default dev eth0 scope link\n"), "ip -6 addr show dev eth0 scope global": ok(""), "resolvectl dns eth0": ok("") }),
+  });
+  assert.deepEqual(noGateway.components.gateway_mac, { state: "absent" });
+});
+
+test("C0 review M6(b,c,d): the aggregate is unknown behind a tunnel-only default route or with an unknown interface kind; a binary not found on known paths is outside the universe", () => {
+  const tunnelOnly = fingerprintOf({
+    platform: "darwin", status: "ok", route: { state: "ok", kind: "tunnel" },
+    components: { gateway_mac: { state: "not_applicable" }, ra_prefix: { state: "not_applicable" }, dhcp_domain: { state: "not_applicable" }, resolvers: { state: "not_applicable" } },
+  });
+  assert.equal(tunnelOnly.attributes.route_kind, "tunnel");
+  assert.equal(tunnelOnly.attributes.fingerprint_hmac, "unknown", "the physical network behind a full tunnel is unobserved, not one shared identity");
+  const unknownKind = fingerprintOf({ ...HOME_NET, route: { state: "ok", kind: "unknown" } });
+  assert.equal(unknownKind.attributes.fingerprint_hmac, "unknown", "an unreadable /sys (or a failed ifconfig) is never folded into the identity");
+  const noNmcli = fingerprintOf({ ...HOME_NET, platform: "linux", components: { ...HOME_NET.components, dhcp_domain: { state: "not_found_on_known_paths" } } });
+  assert.equal(noNmcli.attributes.dhcp_domain_state, "not_found_on_known_paths");
+  assert.match(noNmcli.attributes.fingerprint_hmac, /^[0-9a-f]{16}$/, "I49: a missing source is outside the universe, not a permanent unknown");
+  const absentDomain = fingerprintOf({ ...HOME_NET, platform: "linux", components: { ...HOME_NET.components, dhcp_domain: { state: "absent" } } });
+  assert.notEqual(noNmcli.attributes.fingerprint_hmac, absentDomain.attributes.fingerprint_hmac, "the availability is part of the identity: installing nmcli is a regime change");
+  const untrusted = fingerprintOf({ ...HOME_NET, components: { ...HOME_NET.components, dhcp_domain: { state: "untrusted_binary" } } });
+  assert.equal(untrusted.attributes.fingerprint_hmac, "unknown", "untrusted stays incomplete");
+});
+
 test("real darwin host: the collector runs unprivileged and yields only closed, schema-valid states", { skip: process.platform !== "darwin" }, async () => {
   const result = await readNetConfig({ platform: "darwin" });
   // Any closed state is acceptable here (a CI image may resolve a binary as untrusted); the point is

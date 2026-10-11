@@ -12,6 +12,7 @@
 //     tailscale... -- is skipped; if only tunnels carry a default route the kind is `tunnel` and the
 //     physical components are not_applicable: the physical interface is never guessed);
 //   - the gateway's link-layer address (macOS `arp -n <gw>`, Linux `ip neigh show <gw> dev <if>`);
+//     `absent` only when the default route has no gateway; an unresolved entry is `unable`;
 //   - the IPv6 router-advertised global /64 prefixes on that interface;
 //   - the DHCP-provided domain (macOS `ipconfig getoption <if> domain_name`; Linux via nmcli when
 //     installed, else not_found_on_known_paths);
@@ -200,7 +201,9 @@ async function readDarwin(runExec, options) {
   else {
     const arp = await runExec("arp", ["-n", gateway], probeOptions(options));
     const mac = arp.status === "ok" ? parseNeighborMac(arp.stdout) : undefined;
-    gatewayMac = arp.status !== "ok" ? { state: failureState(arp) } : mac ? { state: "ok", value: mac } : { state: "absent" };
+    // C0 review M6(a): the gateway exists, so a missing or incomplete neighbour entry (a cache miss
+    // right after wake) is an unread value, never "absent".
+    gatewayMac = arp.status !== "ok" ? { state: failureState(arp) } : mac ? { state: "ok", value: mac } : { state: "unable" };
   }
   const raPrefix = ifconfig ? listComponent(ifconfig.prefixes) : { state: failureState(ifconfigProbe) };
 
@@ -252,7 +255,8 @@ async function readLinux(runExec, options) {
   else {
     const neigh = await runExec("ip", ["neigh", "show", gateway, "dev", iface], probeOptions(options));
     const mac = neigh.status === "ok" ? parseNeighborMac(neigh.stdout) : undefined;
-    gatewayMac = neigh.status !== "ok" ? { state: failureState(neigh) } : mac ? { state: "ok", value: mac } : { state: "absent" };
+    // C0 review M6(a): empty output, INCOMPLETE or FAILED for an existing gateway is unread, not absent.
+    gatewayMac = neigh.status !== "ok" ? { state: failureState(neigh) } : mac ? { state: "ok", value: mac } : { state: "unable" };
   }
   const addr = await runExec("ip", ["-6", "addr", "show", "dev", iface, "scope", "global"], probeOptions(options));
   const raPrefix = addr.status === "ok" ? listComponent(parseIpAddrInet6(addr.stdout)) : { state: failureState(addr) };
