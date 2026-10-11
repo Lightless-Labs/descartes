@@ -14,11 +14,14 @@ import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.
 import { combineFamilyCompleteness } from "./fact-store-integrity.js";
 import { migrateLegacyFactStore } from "./fact-store-migration.js";
 import {
+  C2_ONLY_FAMILIES,
+  DATA_ONLY_FAMILIES,
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
   FAMILY_TICK_SHAPES,
   familyBudgetCeilingBytes,
   familyBudgetFloorBytes,
+  factFamilyForName,
   MIN_STRUCTURAL_INTERVAL_MS,
   HISTORY_HORIZON_SHORT_ALERT_TICKS,
   NOVELTY_FAMILIES,
@@ -45,12 +48,16 @@ import {
   hostBootIdHmac,
 } from "./context-translators.js";
 import { collectNetConfigEvidence } from "./tools/net-config.js";
-import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
+import { loginSeenToCommit, readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
 import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
+import { collectSessionAttachmentEvidence } from "./tools/session-attachment.js";
+import { admitContextC2Points, finalizeContextC2, prepareContextC2, recordContextC2Gap } from "./context-c2-daemon.js";
 import {
   bootIdDigest,
   boundaryCensusGaps,
   currentDaemonInstance,
+  emptyDaemonGap,
+  mergeDaemonGap,
   observeBootProbe,
   readBootLedger,
   suspendExposure,
@@ -278,6 +285,8 @@ export function defaultDaemonProfile() {
         "login-sessions": { enabled: true },
         // Context plan C0.5: net.config_fingerprint (HMAC'd with the per-install key). DATA only.
         "net-config": { enabled: true },
+        // Context plan C2 (§4.3 session.attachment): tmux clients joined to their login tty. DATA only.
+        "tmux-clients": { enabled: true },
       },
       // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
       // wake, borrowing the next structural slot (bounded; see runDaemonIteration). OFF by default
@@ -463,6 +472,7 @@ export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
   ["host-lifecycle", "host-lifecycle", "collect_host_lifecycle"],
   ["login-sessions", "login-sessions", "collect_login_sessions"],
   ["net-config", "net-config", "collect_net_config"],
+  ["tmux-clients", "tmux-clients", "collect_tmux_clients"],
 ].map((entry) => Object.freeze(entry)));
 
 // C0.7 (I25, class S): incumbent structural collectors retain main's whole-tick deadline semantics.
@@ -531,6 +541,7 @@ export async function collectStructuralContextEvidence(structuralProfile = {}, c
     "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
     "login-sessions": collectors["login-sessions"] ?? collectLoginSessionsEvidence,
     "net-config": collectors["net-config"] ?? collectNetConfigEvidence,
+    "tmux-clients": collectors["tmux-clients"] ?? collectSessionAttachmentEvidence,
   };
   const { nowFn = Date.now, ...rest } = options;
   const collectorOptions = {
@@ -1104,6 +1115,9 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
         || (Number.isSafeInteger(liveBootTime) && Number.isSafeInteger(pendingCurrent?.boot_time_s) && liveBootTime !== pendingCurrent.boot_time_s)) liveCheck = "live_boot_mismatch";
       if (liveCheck) verdict = { ...verdict, verdict: "unverified", failing_conjunct: liveCheck };
     }
+    // C2 (§4.3 created_vs_boot): the verdict is kept on the boot it verified (or not), so a later
+    // structural tick in the same boot still knows whether this boot's boundary was verified.
+    if (next.current && next.current.boot_id_digest === next.pending_boundary.current?.boot_id_digest) next.current.boundary_verdict = verdict.verdict;
     facts.boundary = {
       ...verdict,
       superseded_count: next.pending_boundary.superseded_count ?? 0,
@@ -1134,6 +1148,11 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
     };
     next.pending_census = null;
   }
+  // C2 (§4.1 host.daemon_gap): the gaps folded since the previous structural census are this
+  // interval's; the accumulator restarts here (the after-probe below folds into the next one).
+  facts.daemonGap = next.daemon_gap && typeof next.daemon_gap === "object" ? { ...next.daemon_gap } : undefined;
+  facts.currentBootVerdict = ["verified", "unverified", "tripwire"].includes(next.current?.boundary_verdict) ? next.current.boundary_verdict : undefined;
+  next.daemon_gap = emptyDaemonGap(nowMs);
   next.last_census_ms = nowMs;
   const wallMs = probeAfter?.clocks?.wall_ms;
   const uptimeMs = probeAfter?.clocks?.os_uptime_ms;
@@ -1300,6 +1319,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let contextKeyStatus;
   let bootLedgerError;
   let loginSeenError;
+  let contextC2Status;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
@@ -1492,6 +1512,37 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // — alerting on a novel scheduled job (scheduled_job.appeared) is Slice B's job.
             ...factPointsFromScheduledJobsEvidence(structuralEvidence, { ts }),
           ];
+          // Context plan C2 (§4, §8): the facts that need the previous tick (transitions,
+          // created_vs_boot, the daemon gap) and the stateless C2 facts. DATA only, appended to the
+          // context families with this tick's other facts. Isolated: a failure here is reported and
+          // drops only the C2 points; the incumbent and C0 points above are untouched.
+          let contextC2Prepared;
+          let contextC2OnlyFacts;
+          let contextC2GapReason;
+          if (options.contextC2 !== false) {
+            try {
+              contextC2Prepared = await (options.prepareContextC2 ?? prepareContextC2)({
+                descartesPaths,
+                evidence: structuralEvidence,
+                basePoints: factPoints,
+                hostFacts: hostContext?.facts,
+                loginDedupe,
+                ts,
+                hmacKey,
+                daemonIntervalMs: profile.interval_ms,
+              });
+              // Isolation guard: a C2 point the shared pass would reject (an unregistered name refuses
+              // the WHOLE batch, incumbents included) never joins it.
+              const admitted = admitContextC2Points(contextC2Prepared.points);
+              factPoints.push(...admitted.filter((point) => !C2_ONLY_FAMILIES.has(factFamilyForName(point.fact_name))));
+              contextC2Prepared.points = admitted;
+            } catch (error) {
+              contextC2Prepared = undefined;
+              contextC2GapReason = "prepare_failed";
+              contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_prepare_failed" };
+              console.warn(`[daemon] context C2 derivation failed this tick (${contextC2Status.error}); incumbent and C0 facts persist as before`);
+            }
+          }
           // Finding F4: same isolation as the metric-persist call above -- a storage fault here must
           // not abort the tick before evaluateAndPersistAlerts, and must not fabricate a retention
           // outcome that did not happen. Finding F4-B1/F4-B2 re-gate: inline try/catch, not
@@ -1507,8 +1558,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // is reported (combined into storage_write_error/retention_error below) and never stops
           // another family from persisting. The DI seam keeps its historical name.
           const persistFacts = options.appendFactPoints ?? appendFactPointsByFamily;
+          const incumbentPoints = factPoints.filter((point) => !C2_ONLY_FAMILIES.has(factFamilyForName(point.fact_name)));
           try {
-            structuralFacts = await persistFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, budgets: effectiveBudgets });
+            structuralFacts = await persistFacts(descartesPaths, incumbentPoints, { ts, now: options.now ?? ts, budgets: effectiveBudgets, families: FACT_FAMILY_IDS.filter((family) => !DATA_ONLY_FAMILIES.has(family)) });
             if (structuralFacts?.append_error) {
               structuralFactPersistError = structuralFacts.append_error;
               console.warn(`[daemon] structural-fact-persist failed for some families this tick (${structuralFactPersistError}); the others persisted`);
@@ -1517,6 +1569,27 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
             console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
             structuralFacts = { written_count: 0, retention: undefined };
+          }
+
+          // C2-only families are a second, explicit pass. Their outcome is carried on context_c2 and
+          // is never merged into structuralFactPersistError or the incumbent retention state.
+          if (contextC2Prepared) {
+            const c2OnlyPoints = contextC2Prepared.points.filter((point) => C2_ONLY_FAMILIES.has(factFamilyForName(point.fact_name)));
+            if (c2OnlyPoints.length > 0) {
+              try {
+                contextC2OnlyFacts = await persistFacts(descartesPaths, c2OnlyPoints, {
+                  ts,
+                  now: options.now ?? ts,
+                  budgets: effectiveBudgets,
+                  families: [...C2_ONLY_FAMILIES],
+                });
+              } catch (error) {
+                const message = (error instanceof Error ? error.message : String(error)) || "context_c2_data_only_persist_failed";
+                contextC2OnlyFacts = { written_count: 0, families: { collector_state: { append_error: message } }, append_error: message };
+              }
+            }
+          } else if (contextC2GapReason === undefined && options.contextC2 === false) {
+            contextC2GapReason = "skipped";
           }
 
           // Context plan C0.4/C0.8/C0.12: the boot ledger (which consumes a pending boundary and
@@ -1529,6 +1602,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             && structuralFacts.families[family] !== undefined
             && structuralFacts.families[family].append_error === undefined;
           if (hostContext?.ledger) {
+            // C2 review L2: the interval's gap accumulator was reset for a host.daemon_gap fact that the
+            // C2 step did not produce (it failed or is off): carry it into the next interval instead.
+            if (contextC2Prepared === undefined && hostContext.facts?.daemonGap) {
+              hostContext.ledger.daemon_gap = mergeDaemonGap(hostContext.facts.daemonGap, hostContext.ledger.daemon_gap);
+            }
             if (familyPersisted("host_lifecycle")) {
               try {
                 await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, hostContext.ledger);
@@ -1542,12 +1620,59 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           if (loginDedupe) {
             if (familyPersisted("session_context")) {
               try {
-                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginDedupe.next);
+                // C2 review M1: the reboot/shutdown rows (host.lifecycle_record, C2) are marked seen
+                // only when the C2 points were admitted to this pass and host_lifecycle persisted.
+                const lifecycleRecorded = contextC2Prepared !== undefined && familyPersisted("host_lifecycle");
+                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginSeenToCommit(loginDedupe, { lifecycleRecorded }));
               } catch (error) {
                 loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_write_failed";
               }
             } else {
               loginSeenError = "session_context_facts_not_persisted";
+            }
+          }
+
+          // Context plan C2 (§8.1-§8.2): the tick_summary record (certified against the passes that just
+          // committed, I70) and the statistics skeleton, each in its own derived family, each state file
+          // stamped with its own pass. DATA only; reported, never fatal.
+          if (contextC2Prepared) {
+            try {
+              contextC2Status = await (options.finalizeContextC2 ?? finalizeContextC2)({
+                descartesPaths,
+                prepared: contextC2Prepared,
+                factPoints,
+                structuralFacts,
+                ts,
+                hmacKey,
+                configForHash: { watch: configSnapshot.watch, profile },
+                budgets: effectiveBudgets,
+              });
+              if (contextC2OnlyFacts?.append_error || contextC2OnlyFacts?.retention_error) {
+                contextC2GapReason = "data_only_persist_failed";
+                contextC2Status = {
+                  ...contextC2Status,
+                  data_only: {
+                    error: contextC2OnlyFacts.append_error ?? contextC2OnlyFacts.retention_error,
+                    ...(contextC2OnlyFacts.families ? { families: contextC2OnlyFacts.families } : {}),
+                  },
+                };
+              }
+            } catch (error) {
+              contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_finalize_failed" };
+              contextC2GapReason = "finalize_failed";
+              console.warn(`[daemon] context C2 summary failed this tick (${contextC2Status.error})`);
+            }
+          }
+
+          if (contextC2Prepared && contextC2Status && (contextC2Status.error || contextC2Status.summary !== "committed" || contextC2Status.stats?.error)) {
+            contextC2GapReason ??= "finalize_failed";
+          }
+          if (contextC2GapReason !== undefined) {
+            try {
+              await recordContextC2Gap(descartesPaths, { ts, reason: contextC2GapReason });
+              contextC2Status = { ...(contextC2Status ?? {}), gap: "recorded", gap_reason: contextC2GapReason };
+            } catch (error) {
+              contextC2Status = { ...(contextC2Status ?? {}), gap: "unrecorded", gap_error: (error instanceof Error ? error.message : String(error)) || "context_c2_gap_write_failed" };
             }
           }
 
@@ -1926,6 +2051,16 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
       const failingFor = retentionSince !== undefined && nowMs - Date.parse(retentionSince) >= HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs;
       const oversize = Number.isSafeInteger(readBytes) && readBytes > budgetBytes + (FAMILY_TICK_SHAPES.get(family)?.worstTickBytes ?? 0);
+      if (DATA_ONLY_FAMILIES.has(family)) {
+        // C2 data-only families (collector_state and the derived summaries/statistics) are shown for
+        // sizing only. Their append/retention outcomes live on context_c2 and never become incumbent
+        // storage errors, carried retention failures, daemon health, or the incumbent retention alert.
+        delete entry.retention_error;
+        delete entry.retention_error_since_ts;
+        if (oversize) entry.data_only_oversize = true;
+        families[family] = entry;
+        continue;
+      }
       if (failingFor || oversize || retentionFailing) entry.retention_failing = true;
       if (entry.retention_error || entry.retention_failing === true) carriedRetentionFailure = true;
       families[family] = entry;
@@ -1970,6 +2105,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(contextKeyStatus ? { context_key_status: contextKeyStatus } : {}),
     ...(bootLedgerError ? { boot_ledger_error: bootLedgerError } : {}),
     ...(loginSeenError ? { login_seen_error: loginSeenError } : {}),
+    // Context plan C2: the tick_summary/statistics outcome (data only; never part of `state`).
+    ...(contextC2Status ? { context_c2: contextC2Status } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),

@@ -39,6 +39,12 @@ export const FACT_FAMILY_IDS = Object.freeze([
   "host_lifecycle",
   "network_context",
   "session_context",
+  // Context plan C2 (§3 C0.1, §4.2): per-binary availability/trust verdicts. DATA ONLY.
+  "collector_state",
+  // Context plan C2 (§8.2): the long-lived statistics skeleton (derived; DATA ONLY).
+  "context_stats",
+  // Context plan C2 (§8.1): one summary record per structural tick (derived; DATA ONLY).
+  "tick_summary",
 ]);
 
 const KNOWN_FAMILIES = new Set(FACT_FAMILY_IDS);
@@ -65,12 +71,25 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["host.clock_reading", "host_lifecycle"],
   ["host.suspend", "host_lifecycle"],
   ["host.boundary_census", "host_lifecycle"],
+  ["host.lifecycle_record", "host_lifecycle"],
   ["net.tailnet_state", "network_context"],
   ["net.config_fingerprint", "network_context"],
+  ["net.vpn_service_census", "network_context"],
+  ["net.vpn_service_state", "network_context"],
   ["session.login_record", "session_context"],
   ["session.login_history_row", "session_context"],
   ["session.login_census", "session_context"],
   ["user.presence", "session_context"],
+  ["session.attachment_census", "session_context"],
+  ["session.attachment", "session_context"],
+  ["collector.binary_state", "collector_state"],
+  ["host.daemon_gap", "host_lifecycle"],
+  ["context.transition", "network_context"],
+  ["session.created_vs_boot", "session_context"],
+  ["tick.summary", "tick_summary"],
+  ["tick.summary_certificate", "tick_summary"],
+  ["stats.episode", "context_stats"],
+  ["stats.daily", "context_stats"],
 ];
 
 function buildFactFamilyByName(pairs) {
@@ -269,9 +288,23 @@ const FAMILY_BUDGET_ENTRIES = [
   // against the 30-day declared data horizon (DATA_FAMILY_HORIZON_ENTRIES), with the 4x ceiling still
   // admitting a 15-minute interval and not raising MIN_STRUCTURAL_INTERVAL_MS. Floors (1 h interval):
   // host_lifecycle 3,570,300 B; network_context 1,467,000 B; session_context 10,415,700 B.
-  ["host_lifecycle", 4 * MIB],
-  ["network_context", 2 * MIB],
-  ["session_context", 11 * MIB],
+  // C2: + host.daemon_gap and at most 4 host.lifecycle_record per tick.
+  ["host_lifecycle", 7 * MIB],
+  // C2: + the VPN service census marker, at most 8 net.vpn_service_state and at most 8
+  // context.transition (one per dimension) records per tick.
+  ["network_context", 13 * MIB],
+  // C2: + the attachment census marker, at most 8 session.attachment and at most 8
+  // session.created_vs_boot records per tick.
+  ["session_context", 21 * MIB],
+  // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
+  // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
+  ["collector_state", 8 * MIB],
+  // C2 derived families. tick_summary carries a 1,024 B summary plus a 974 B certificate sibling per
+  // structural tick; 3 MiB holds the 90-day retention at a 1 h interval. context_stats carries at
+  // most one episode and one daily record per tick (548 + 556 = 1,104 B with their entity keys);
+  // 2 MiB holds the 30-day floor and, at typical volume, the 365-day retention.
+  ["context_stats", 2 * MIB],
+  ["tick_summary", 3 * MIB],
 ];
 
 // The pinned worst-case tick shape per family (§15.3): the maximum normalized record size the REAL
@@ -305,9 +338,22 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // records of at most 643 B.
   // A boundary census (C0.12) borrows the next structural slot, so a horizon holds at most two extra
   // ticks, inside the 1.25 headroom.
-  ["host_lifecycle", { maxRecordBytes: 0, markerBytes: 3967, entityCap: 0 }],
-  ["network_context", { maxRecordBytes: 0, markerBytes: 1630, entityCap: 0 }],
-  ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],
+  // C2: + host.daemon_gap 679 as a marker; records: MAX_LIFECYCLE_RECORDS_PER_TICK x host.lifecycle_record 721.
+  ["host_lifecycle", { maxRecordBytes: 721, markerBytes: 4646, entityCap: 4 }],
+  // C2: markers + vpn_service_census 614; records: MAX_VPN_SERVICE_STATES_PER_TICK (8) x vpn_service_state
+  // 528 and MAX_TRANSITIONS_PER_TICK (8) x context.transition 699, counted at 699.
+  ["network_context", { maxRecordBytes: 699, markerBytes: 2244, entityCap: 16 }],
+  // C2: + session.attachment_census 608 as a marker; + MAX_SESSION_ATTACHMENTS_PER_TICK (8) records of
+  // at most 573 B, counted at the family's 643 B record maximum.
+  // + MAX_CREATED_VS_BOOT_PER_TICK (8) session.created_vs_boot records of at most 623 B.
+  ["session_context", { maxRecordBytes: 643, markerBytes: 1893, entityCap: 32 }],
+  // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
+  ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
+  // C2: the exact worst cases (no envelope source, fixed entity key; pinned in context-c2-summary.test.js).
+  ["context_stats", { maxRecordBytes: 0, markerBytes: 548 + 556, entityCap: 0 }],
+  // C2 H1: one compact sibling certificate table accompanies each summary. The summary itself remains
+  // capped at 1 KiB; the sibling carries the full source-pass tuples referenced by its digest.
+  ["tick_summary", { maxRecordBytes: 0, markerBytes: 1024 + 974, entityCap: 0 }],
 ];
 
 export const BUDGET_INVARIANT_HEADROOM = 1.25;
@@ -350,6 +396,12 @@ const DATA_FAMILY_HORIZON_ENTRIES = [
   ["host_lifecycle", 30 * DAY_MS],
   ["network_context", 30 * DAY_MS],
   ["session_context", 30 * DAY_MS],
+  ["collector_state", 30 * DAY_MS],
+  // §8.1: the S floor of tick_summary's memory (at least 30 days, held at worst-case volume by the
+  // budget); retention beyond it (90 days, FAMILY_RETENTION_MS) is an O choice held at typical volume.
+  // Declared here, not in RULE_HORIZONS (C2 deviation): RULE_HORIZONS is the alert-rule registry.
+  ["tick_summary", 30 * DAY_MS],
+  ["context_stats", 30 * DAY_MS],
 ];
 
 function buildDataFamilyHorizons(entries) {
@@ -368,6 +420,63 @@ function buildDataFamilyHorizons(entries) {
 
 export const DATA_FAMILY_HORIZONS = buildDataFamilyHorizons(DATA_FAMILY_HORIZON_ENTRIES);
 
+// Context plan C2 / §8.1 ("Horizon and retention"): per-family retention. Before C2 every family
+// shared fact-store.js's 30-day DEFAULT_FACT_RETENTION_MS (`fact-store.js:31`); long-memory families
+// must outlive the raw window, so the age cutoff is resolved per family here. A family with no entry
+// keeps the 30-day default. Each value is an O resource choice (§16.1), and must be at least the
+// family's declared horizon (rule or data): retention shorter than the memory a family promises would
+// make that promise unkeepable by construction (checked at module init).
+export const DEFAULT_FAMILY_RETENTION_MS = 30 * DAY_MS;
+const FAMILY_RETENTION_ENTRIES = [
+  // §8.1 / §16.1: tick_summary is kept beyond the raw window; default 90 days (O).
+  ["tick_summary", 90 * DAY_MS],
+  // §8.2: the long-lived statistics outlive tick_summary; default 365 days (O).
+  ["context_stats", 365 * DAY_MS],
+];
+
+function buildFamilyRetention(entries) {
+  const map = new Map();
+  for (const [family, retentionMs] of entries) {
+    if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: retention for unknown family ${family}`);
+    if (map.has(family)) throw new Error(`fact-families: family ${family} has two retentions`);
+    if (!Number.isFinite(retentionMs) || retentionMs <= 0) throw new Error(`fact-families: family ${family} has an invalid retention`);
+    map.set(family, retentionMs);
+  }
+  for (const family of FACT_FAMILY_IDS) if (!map.has(family)) map.set(family, DEFAULT_FAMILY_RETENTION_MS);
+  return map;
+}
+
+export const FAMILY_RETENTION_MS = buildFamilyRetention(FAMILY_RETENTION_ENTRIES);
+
+/** The age-retention of one family's store (§8.1, C2). Throws on an unknown family. */
+export function familyRetentionMs(family) {
+  requireFactFamily(family);
+  return FAMILY_RETENTION_MS.get(family);
+}
+
+// Derived families (context plan C2, §8.1-§8.2): their records are DERIVED from the other families'
+// committed passes (tick_summary is certified at derivation, I70), and each carries a lineage stamp
+// that names its own family's last committed pass. They are therefore appended ONLY by their own
+// derivation step: the daemon's generic per-tick write (appendFactPointsByFamily) neither appends to
+// them nor runs a retention sweep over them -- a sweep would advance the very pass id the stamp names,
+// and the stamp would never validate (the record's own pass runs retention anyway).
+const DERIVED_FAMILY_ENTRIES = ["tick_summary", "context_stats"];
+export const DERIVED_FAMILIES = Object.freeze(new Set(DERIVED_FAMILY_ENTRIES.map((family) => {
+  if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: derived family ${family} is unknown`);
+  return family;
+})));
+
+// Families whose writes are observational C2 data and must never influence incumbent health. The
+// derived families are already isolated from the generic pass; collector_state is C2-only but is
+// intentionally retained in its own post-incumbent pass so a storage failure cannot become a daemon
+// storage error or a retention alert.
+export const DATA_ONLY_FAMILIES = Object.freeze(new Set([
+  "collector_state",
+  ...DERIVED_FAMILIES,
+]));
+
+export const C2_ONLY_FAMILIES = Object.freeze(new Set(["collector_state"]));
+
 // H_max(f): the longest eligibility horizon of any history-dependent rule reading family f (§4.5),
 // or, for a data family, its declared data horizon.
 function buildFamilyHorizonMax() {
@@ -383,6 +492,10 @@ function buildFamilyHorizonMax() {
 }
 
 export const FAMILY_HORIZON_MAX_MS = buildFamilyHorizonMax();
+
+for (const [family, horizonMs] of FAMILY_HORIZON_MAX_MS) {
+  if (FAMILY_RETENTION_MS.get(family) < horizonMs) throw new Error(`fact-families: family ${family}'s retention is shorter than its horizon`);
+}
 
 /**
  * The T8 budget invariant / config floor (§4.5): (H_max / interval) x worst-case tick bytes x 1.25.

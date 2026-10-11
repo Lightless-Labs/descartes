@@ -2,6 +2,55 @@
 
 **Last updated:** 2026-10-11
 
+## Context facts C2b per-family rollback markers — 2026-10-11 — local, not pushed
+
+Split future-fact loss consumption by derived family. `tick_summary` chain state now reads,
+compares, and persists only the `tick_summary` ledger marker; `context_stats` state does the same
+independently for the `context_stats` ledger marker. Stats no longer treats an intact own ledger as
+memory loss merely because the sibling summary chain restarted. Added asymmetric daemon regressions
+for stats-only, chain-only, and both-ledger rollback markers; each affected family restarts once and
+then continues. Focused C2 daemon verification passes **14/14**. Fresh-XDG full `npm test` completed
+with **2,680 total: 2,617 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are
+environment-only: 17 notifier-reuse and 3 tap-bump loopback test-server cases fail with `listen
+EPERM`, and 2 live-process provenance checks return `unknown` under restricted process
+introspection. No changed-area product test failed. No push or merge.
+
+## Context facts C2b re-gate closure — 2026-10-11 — local, not pushed
+
+Closed the remaining B1/B2/HIGH/MEDIUM/LOW findings on `feat/context-facts-c2b-2026-10` in five
+local atomic commits: `afddaa0` (red regressions), `ff11982` (fail-closed, ledger-stamped gap
+state), `9fdcf63` (one-time rollback marker consumption for chain and stats), `a97f46a` (mandatory
+per-summary certificates and tuple-verdict consistency), and `4efe565` (count-derived daily mixed
+labels and HMAC-protected `session.created_vs_boot` entity keys). No push or merge.
+
+Gap state now persists a clean zero-count record stamped to the tick-summary ledger; missing,
+unreadable, invalid, or lineage-mismatched state over an existing summary store forces an unknown
+gap and prevents churn folding. Future-fact rollback markers are recorded as consumed in both
+derived state files, so the rollback causes exactly one restart/memory loss and subsequent clean
+ticks continue. Every new-format summary requires its certificate sibling, and the summary label
+must agree with all certificate tuple verdicts. Focused C2/context/integrity verification passes
+**86/86**. Fresh-XDG full `npm test` completed with **2,678 total: 2,615 passed, 22 failed, 35
+skipped, 6 todo**. The 22 failures are environment-only: 17 notifier-reuse and 3 tap-bump
+loopback test-server cases fail with `listen EPERM`, and 2 live-process provenance checks return
+`unknown` under restricted process introspection. No changed-area product test failed.
+
+## Context facts C2b rework — 2026-10-11 — local, not pushed
+
+Closed the daybreak BLOCKER/HIGH/MEDIUM/LOW findings on `feat/context-facts-c2b-2026-10`.
+C2-only `collector_state` writes now run in a separate post-incumbent data-only pass, with
+failures confined to `context_c2`; derived-family health/retention accounting uses one registry
+flag. Continuity readers treat a broken, missing, edited, or rollback-discarded facts ledger as
+loss. Failed or skipped C2 ticks persist a durable gap count, and the next summary emits `chain:gap`
+with unknown interval churn. Certification now persists a compact sibling tuple table and verifies
+its digest; uncertified summaries are counted separately and excluded from churn/exposure/episode
+statistics. UTC-day buckets only advance forward, and session joins use the per-install HMAC token.
+
+Focused C2/data-family verification passes **79/79**. Fresh-XDG full `npm test` completed with
+**2,673 total: 2,610 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1` (`listen EPERM`), and 2 live-process
+provenance checks return `unknown` under restricted process introspection. No changed-area product
+test failed. No push or merge.
+
 ## Linux iproute2 route and inet6 grammar completion — 2026-10-11 — local, not pushed
 
 Added TDD coverage and a shared strict Linux iproute2 route grammar. The route parsers now accept

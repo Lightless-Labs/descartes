@@ -71,6 +71,7 @@ export const LINUX_PATHS = Object.freeze({
 const UUID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
 const VERSION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}$/;
 const DIGITS_RE = /^[0-9]{1,24}$/;
+const TZ_ID_RE = /^[A-Za-z0-9_+\-/]{1,64}$/;
 
 /** `sysctl a b c` prints "key: value" lines; unknown keys go to stderr. Only listed keys are kept. */
 export function parseSysctlKeyValues(stdout, keys = DARWIN_SYSCTL_KEYS) {
@@ -165,7 +166,25 @@ function runtimeClocks(options) {
     hrtime = undefined;
   }
   const wallMs = nowFn();
+  // C2 (§4.1 host.clock, Astra 10): the local timezone id and UTC offset at this reading, so local-time
+  // features use the STORED offset, never the current timezone. Raw here; the id is HMAC'd downstream.
+  let tzId;
+  let utcOffsetMin;
+  try {
+    const zone = (options.timeZoneFn ?? (() => Intl.DateTimeFormat().resolvedOptions().timeZone))();
+    tzId = typeof zone === "string" && TZ_ID_RE.test(zone) ? zone : undefined;
+  } catch {
+    tzId = undefined;
+  }
+  try {
+    const offset = (options.utcOffsetFn ?? ((ms) => -new Date(ms).getTimezoneOffset()))(wallMs);
+    utcOffsetMin = Number.isSafeInteger(offset) && Math.abs(offset) <= 24 * 60 ? offset + 0 : undefined;
+  } catch {
+    utcOffsetMin = undefined;
+  }
   return {
+    tz_id: tzId,
+    utc_offset_min: utcOffsetMin,
     wall_ms: typeof wallMs === "number" && Number.isFinite(wallMs) ? wallMs : undefined,
     uv_hrtime_ns: hrtime,
     uv_version: versionTokenOrUndefined(options.uvVersion ?? process.versions.uv),

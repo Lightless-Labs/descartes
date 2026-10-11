@@ -54,7 +54,53 @@ function validBootRecord(record) {
 }
 
 function emptyLedger() {
-  return { version: BOOT_LEDGER_VERSION, current: null, seen: [], pending_boundary: null, pending_census: null, last_structural_clock: null, last_census_ms: null };
+  return { version: BOOT_LEDGER_VERSION, current: null, seen: [], pending_boundary: null, pending_census: null, last_structural_clock: null, last_census_ms: null, daemon_gap: null };
+}
+
+/**
+ * C2 (§4.1 host.daemon_gap): a fresh per-structural-interval accumulator of the gaps between
+ * consecutive daemon observations (boundary probes). Additive to the v1 ledger (an older ledger has
+ * none: its first interval's gap is then unknown).
+ */
+export function emptyDaemonGap(sinceMs) {
+  return { since_ms: Number.isSafeInteger(sinceMs) ? sinceMs : null, max_gap_ms: 0, max_gap_uptime_ms: 0, uptime_known: true, wall_known: true, observations: 0, restarts: 0, boot_changed: false };
+}
+
+/**
+ * C2 review L2: two consecutive accumulators as one (the older interval's gap fact was never written,
+ * so it is carried into the next record rather than lost). Maxima and counts combine; a maximum is
+ * known only when both halves knew it.
+ */
+export function mergeDaemonGap(older, newer) {
+  const a = older && typeof older === "object" ? older : undefined;
+  const b = newer && typeof newer === "object" ? newer : undefined;
+  if (!a) return b;
+  if (!b) return a;
+  const int = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : 0);
+  return {
+    since_ms: Number.isSafeInteger(a.since_ms) ? a.since_ms : null,
+    max_gap_ms: Math.max(int(a.max_gap_ms), int(b.max_gap_ms)),
+    max_gap_uptime_ms: Math.max(int(a.max_gap_uptime_ms), int(b.max_gap_uptime_ms)),
+    uptime_known: a.uptime_known === true && b.uptime_known === true,
+    wall_known: a.wall_known === true && b.wall_known === true,
+    observations: int(a.observations) + int(b.observations),
+    restarts: int(a.restarts) + int(b.restarts),
+    boot_changed: a.boot_changed === true || b.boot_changed === true,
+  };
+}
+
+function foldDaemonGap(ledger, { gapMs, uptimeGapMs, restarted, bootChanged }) {
+  const acc = ledger.daemon_gap && typeof ledger.daemon_gap === "object" ? ledger.daemon_gap : { ...emptyDaemonGap(null), wall_known: false, uptime_known: false };
+  acc.observations = (Number.isSafeInteger(acc.observations) ? acc.observations : 0) + 1;
+  if (restarted) acc.restarts = (Number.isSafeInteger(acc.restarts) ? acc.restarts : 0) + 1;
+  if (bootChanged) acc.boot_changed = true;
+  // Degrade, never clamp: a negative wall gap (a backward step) or a missing reading makes the
+  // maximum unknown for this interval, never zero.
+  if (Number.isSafeInteger(gapMs) && gapMs >= 0) acc.max_gap_ms = Math.max(Number.isSafeInteger(acc.max_gap_ms) ? acc.max_gap_ms : 0, gapMs);
+  else acc.wall_known = false;
+  if (Number.isSafeInteger(uptimeGapMs) && uptimeGapMs >= 0) acc.max_gap_uptime_ms = Math.max(Number.isSafeInteger(acc.max_gap_uptime_ms) ? acc.max_gap_uptime_ms : 0, uptimeGapMs);
+  else acc.uptime_known = false;
+  ledger.daemon_gap = acc;
 }
 
 function validLedger(parsed) {
@@ -128,12 +174,22 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
   const next = structuredClone(ledger ?? emptyLedger());
   const digest = bootIdDigest(probe?.boot?.boot_id);
   if (!digest) return { ledger: next, trigger: undefined };
+  const uptimeMs = isFiniteInt(probe?.clocks?.os_uptime_ms) ? probe.clocks.os_uptime_ms : undefined;
   if (!next.current) {
     next.current = bootRecordFrom(probe, digest, { nowMs, daemon, bootIdHmac });
+    next.current.last_uptime_ms = uptimeMs ?? null;
     next.seen = [digest];
+    next.daemon_gap = { ...emptyDaemonGap(nowMs), observations: 1 };
     return { ledger: next, trigger: undefined };
   }
   if (digest !== next.current.boot_id_digest) {
+    // C2: the gap since the previous boot's last observation (wall only: no uptime delta spans a boot).
+    foldDaemonGap(next, {
+      gapMs: isFiniteInt(next.current.last_observed_ms) ? nowMs - next.current.last_observed_ms : undefined,
+      uptimeGapMs: undefined,
+      restarted: next.current.daemon_nonce !== daemon.nonce,
+      bootChanged: true,
+    });
     const current = bootRecordFrom(probe, digest, { nowMs, daemon, bootIdHmac });
     // C0 review L2: a boundary or census still pending (never recorded: no census ran since) is
     // superseded, and counted, never silently lost.
@@ -161,9 +217,17 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
       superseded_count: supersededCensuses,
     };
     next.current = current;
+    next.current.last_uptime_ms = uptimeMs ?? null;
     next.seen = [...next.seen.filter((d) => d !== digest), digest].slice(-BOOT_LEDGER_SEEN_CAP);
     return { ledger: next, trigger: "boot" };
   }
+  foldDaemonGap(next, {
+    gapMs: isFiniteInt(next.current.last_observed_ms) ? nowMs - next.current.last_observed_ms : undefined,
+    uptimeGapMs: uptimeMs !== undefined && isFiniteInt(next.current.last_uptime_ms) ? uptimeMs - next.current.last_uptime_ms : undefined,
+    restarted: next.current.daemon_nonce !== daemon.nonce,
+    bootChanged: false,
+  });
+  next.current.last_uptime_ms = uptimeMs ?? null;
   next.current.last_observed_ms = nowMs;
   next.current.daemon_nonce = daemon.nonce;
   if (typeof bootIdHmac === "string" && bootIdHmac !== "unknown") next.current.boot_id_hmac = bootIdHmac;

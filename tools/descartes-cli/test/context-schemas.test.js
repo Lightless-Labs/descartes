@@ -27,12 +27,15 @@ async function tempPaths() {
 test("C0.6: every context schema field carries a non-empty physical-object provenance tag from the closed set", () => {
   assert.ok(CONTEXT_FACT_SCHEMAS.size >= 11);
   for (const [factName, schema] of CONTEXT_FACT_SCHEMAS) {
-    assert.ok(["host_lifecycle", "network_context", "session_context"].includes(schema.family), factName);
+    assert.ok(["host_lifecycle", "network_context", "session_context", "collector_state", "tick_summary", "context_stats"].includes(schema.family), factName);
     for (const [field, spec] of Object.entries(schema.fields)) {
       assert.ok(spec.provenance.length > 0, `${factName}.${field}`);
       for (const tag of spec.provenance) assert.ok(PROVENANCE_TAGS.includes(tag), `${factName}.${field}: ${tag}`);
     }
-    for (const common of ["collector_state", "obs_start_ms", "obs_end_ms", "rejected_field"]) assert.ok(schema.fields[common], `${factName} lacks ${common}`);
+    // C2 derived records (tick_summary, context_stats) are derivations, not collector reads: no
+    // collector state or observation interval of their own.
+    const commons = ["tick_summary", "context_stats"].includes(schema.family) ? ["rejected_field"] : ["collector_state", "obs_start_ms", "obs_end_ms", "rejected_field"];
+    for (const common of commons) assert.ok(schema.fields[common], `${factName} lacks ${common}`);
   }
 });
 
@@ -40,14 +43,16 @@ test("C0.6: the unable shape of every schema validates, names the rejected field
   for (const factName of CONTEXT_FACT_SCHEMAS.keys()) {
     const attrs = unableContextAttributes(factName, { rejectedField: "unknown_field", obsStartMs: 1000, obsEndMs: 2000 });
     assert.deepEqual(validateContextFact(factName, attrs), { ok: true }, factName);
-    assert.equal(attrs.collector_state, "unable");
+    const derived = ["tick_summary", "context_stats"].includes(CONTEXT_FACT_SCHEMAS.get(factName).family);
+    assert.equal(attrs.collector_state, derived ? undefined : "unable");
     assert.equal(attrs.rejected_field, "unknown_field");
-    assert.equal(attrs.obs_start_ms, "1000");
+    assert.equal(attrs.obs_start_ms, derived ? undefined : "1000");
     for (const [field, value] of Object.entries(attrs)) {
       if (["collector_state", "rejected_field", "obs_start_ms", "obs_end_ms"].includes(field)) continue;
       const spec = CONTEXT_FACT_SCHEMAS.get(factName).fields[field];
       const singleValued = (spec.kind === "enum" && spec.values.size === 1) || (spec.kind === "int" && spec.min === spec.max);
-      assert.ok(["unknown", "unable"].includes(value) || singleValued, `${factName}.${field} = ${value} in the unable shape`);
+      // C2 compact codes declare their own unable value (context-schemas.js code table).
+      assert.ok(["unknown", "unable"].includes(value) || singleValued || value === spec.unable, `${factName}.${field} = ${value} in the unable shape`);
     }
   }
 });

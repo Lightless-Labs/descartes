@@ -14,7 +14,7 @@ function toolFiles() {
 }
 
 test("MEDIUM 1: every runner launch call site is individually behind the shared abort-before-launch helper", () => {
-  const files = ["vpn-peer-status.js", "login-sessions.js", "last-history.js", "net-config.js", "tailscale-status.js", "host-lifecycle.js", "network.js"];
+  const files = ["vpn-peer-status.js", "login-sessions.js", "last-history.js", "net-config.js", "tailscale-status.js", "host-lifecycle.js", "network.js", "session-attachment.js"];
   const offenders = [];
   let callSiteCount = 0;
   for (const file of files) {

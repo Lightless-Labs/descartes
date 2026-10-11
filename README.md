@@ -610,6 +610,12 @@ For the complete safety-invariant list, see `AGENTS.md`.
 | network-configuration components: gateway MAC, IPv6 router-advertised /64 prefixes, DHCP domain, interface-scoped resolvers (never MagicDNS) | keyed HMAC per component plus a keyed aggregate (`net.config_fingerprint`); the default-route interface kind (wifi, ethernet, tunnel, ...) is a closed value | not sent |
 | login user name and remote host (who / loginctl / last) | keyed HMAC (`session.login_record`, `session.login_history_row`); origin, tty and service classes are closed values; the local dedupe state keeps only row digests keyed with the same per-install key (a row's user, tty, host and time are too guessable for a plain hash); without a usable key no login row is recorded | not sent |
 | console screen-lock and idle hints | closed values (`user.presence`) | not sent |
+| collector binary trust verdicts (resolved / not found / untrusted, with the resolver's closed reason) | closed values (`collector.binary_state`); the resolved path and content hash are keyed HMACs, the offending path component is never kept | not sent |
+| OS VPN services (scutil) | keyed HMAC of the service uuid, connected / not connected (`net.vpn_service_state`), totals and a keyed state digest (`net.vpn_service_census`); never the service name | not sent |
+| `last` reboot/shutdown rows | kind, the row's own local minute without a year, end state, duration and (Linux) kernel release (`host.lifecycle_record`), first observation only, deduped by keyed row digest | not sent |
+| tmux clients (terminal and session) | the session's existing session hash, the terminal class and the joined login's origin class (`session.attachment`); never the terminal or session name | not sent |
+| timezone id and UTC offset | keyed HMAC of the timezone id; the offset in minutes (`tick.summary`, `context.transition`) | not sent |
+| per-tick context summary (`tick_summary`, 90 days) and statistics (`context_stats`, 365 days) | counts, closed codes, keyed set/universe digests and raw clock readings; no entity key in a record; hash-chained. The ledger-stamped chain state and statistics state under their family directories hold one previous census's entity keys (the same hashes the session and peer families already keep), to compute departures and episode statistics | not sent |
 
 **The context HMAC key.** Every "keyed HMAC" above uses one per-install key: 32 random bytes in
 `$XDG_STATE_HOME/descartes/keys/context-hmac.key`, created on first use as a `0600` file in a

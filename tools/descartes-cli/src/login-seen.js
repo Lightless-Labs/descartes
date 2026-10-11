@@ -57,6 +57,8 @@ export async function readLoginSeen(descartesPaths) {
   try {
     const parsed = JSON.parse(contents);
     if (parsed?.version !== LOGIN_SEEN_VERSION || !KEY_ID_RE.test(parsed.key_id ?? "") || !validMap(parsed.records) || !validMap(parsed.history)) return { status: "corrupt", seen: null };
+    // C2: the lifecycle (reboot/shutdown row) map is optional (a C0-era state has none).
+    if (parsed.lifecycle !== undefined && !validMap(parsed.lifecycle)) return { status: "corrupt", seen: null };
     return { status: "ok", seen: parsed };
   } catch {
     return { status: "corrupt", seen: null };
@@ -97,8 +99,12 @@ export function selectNewLoginRows(seen, result, { nowMs, bootSalt, hmacKey } = 
   const dedupeState = usable ? "fresh" : "reseeded";
   const records = { ...(usable?.records ?? {}) };
   const history = { ...(usable?.history ?? {}) };
+  // C2: a C0-era state has no lifecycle map; its lifecycle rows are then "reseeded", not "fresh".
+  const lifecycle = { ...(usable?.lifecycle ?? {}) };
+  const lifecycleDedupeState = usable && usable.lifecycle !== undefined ? "fresh" : "reseeded";
   const newRecords = [];
   const newHistory = [];
+  const newLifecycle = [];
   for (const record of result?.records ?? []) {
     const digest = loginRowDigest(hmacKey, record.identity, record.source === "loginctl" ? bootSalt : "");
     if (!digest) continue;
@@ -111,10 +117,39 @@ export function selectNewLoginRows(seen, result, { nowMs, bootSalt, hmacKey } = 
     if (history[digest] === undefined) newHistory.push({ ...row, digest });
     history[digest] = nowMs;
   }
+  for (const row of result?.lifecycle?.rows ?? []) {
+    const digest = loginRowDigest(hmacKey, row.identity);
+    if (!digest) continue;
+    if (lifecycle[digest] === undefined) newLifecycle.push({ ...row, digest });
+    lifecycle[digest] = nowMs;
+  }
   return {
     newRecords,
     newHistory,
+    newLifecycle,
     dedupeState,
-    next: { version: LOGIN_SEEN_VERSION, key_id: keyId, records: prune(records, nowMs), history: prune(history, nowMs) },
+    lifecycleDedupeState,
+    next: { version: LOGIN_SEEN_VERSION, key_id: keyId, records: prune(records, nowMs), history: prune(history, nowMs), lifecycle: prune(lifecycle, nowMs) },
+    // C2 review M1: the next state with the lifecycle map left as it was (the rows NOT marked seen),
+    // for a tick whose host.lifecycle_record facts did not reach the fact history. No usable prior map
+    // (a C0-era or reseeded state) leaves none, so the rows re-emit as "reseeded".
+    nextWithoutLifecycle: {
+      version: LOGIN_SEEN_VERSION,
+      key_id: keyId,
+      records: prune(records, nowMs),
+      history: prune(history, nowMs),
+      ...(usable?.lifecycle !== undefined ? { lifecycle: { ...usable.lifecycle } } : {}),
+    },
   };
+}
+
+/**
+ * C2 review M1: the seen-state to commit. The lifecycle rows of this tick are marked seen only when
+ * there were none, or their host.lifecycle_record facts reached the fact history (`lifecycleRecorded`);
+ * otherwise the rows stay unseen and are offered again next tick (never a consumed row with no fact).
+ */
+export function loginSeenToCommit(dedupe, { lifecycleRecorded } = {}) {
+  if (!dedupe) return undefined;
+  const pending = Array.isArray(dedupe.newLifecycle) && dedupe.newLifecycle.length > 0;
+  return pending && lifecycleRecorded !== true ? dedupe.nextWithoutLifecycle : dedupe.next;
 }

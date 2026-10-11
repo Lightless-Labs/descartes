@@ -7,6 +7,7 @@ import {
   FUTURE_FACT_TOLERANCE_MS,
   prepareFactIntegrityLedger,
   combineFamilyCompleteness,
+  observeFactContinuity,
   readFactIntegrityLedger,
   resolveFactIntegrityPaths,
   resolvePriorBytecapFloor,
@@ -15,9 +16,11 @@ import {
 import { foldNoveltySeenSets, readNoveltySeenSet } from "./novelty-seen-set.js";
 import { CONTEXT_FACT_SCHEMAS, validateContextFact } from "./context-schemas.js";
 import {
+  DERIVED_FAMILIES,
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
   factFamilyForName,
+  familyRetentionMs,
   groupFactPointsByFamily,
   NOVELTY_FAMILIES,
   requireFactFamily,
@@ -281,7 +284,9 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
 async function runFactRetention(descartesPaths, options, internal = {}) {
   const family = requireFactFamily(options.family);
   const storePaths = resolveFactStorePaths(descartesPaths, family);
-  const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
+  // C2 (§8.1): the family's own retention unless the caller names one (a test seam / the explicit
+  // enforceFactRetention entry point).
+  const retentionMs = options.retentionMs ?? familyRetentionMs(family);
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
   // daybreak-blue security sweep, fact-store BLOCKER #1: a non-finite retentionMs (e.g.
   // "garbage" -> NaN cutoff) makes every valid record satisfy neither `tsMs < cutoff`
@@ -494,6 +499,11 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     future_fact_dropped_count: futureDropped.length,
     bytes: usedBytes,
     seen_set_fold: seenSetFold,
+    // C2 (I70): the pass this call committed, so a derivation step can cite (or a lineage stamp can
+    // name) it without re-reading the ledger.
+    ledger_generation: finalizedLedger.generation,
+    pass_id: prepared.passId,
+    pass_time_ms: Date.parse(nowIso),
   };
 }
 
@@ -560,6 +570,7 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
     // one structural tick, which status compares against the budget (cap_below_tick).
     appended_bytes: Buffer.byteLength(encoded),
     retention,
+    ...(retention ? { pass_time_ms: Date.parse(normalizeTimestamp(options.now ?? options.ts)) } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
   };
 }
@@ -623,14 +634,33 @@ export async function factStoreFileBytes(descartesPaths, family) {
  */
 export async function appendFactPointsByFamily(descartesPaths, factPoints, options = {}) {
   const grouped = groupFactPointsByFamily(factPoints);
-  const { budgets, maxBytes, ...passOptions } = options;
+  const { budgets, maxBytes, families: selectedFamilies, ...passOptions } = options;
+  const familiesToProcess = selectedFamilies ?? FACT_FAMILY_IDS;
+  if (!Array.isArray(familiesToProcess) || familiesToProcess.length === 0) throw new Error("fact-store: families must be a non-empty array");
+  const selected = new Set(familiesToProcess);
+  for (const family of selected) requireFactFamily(family);
+  for (const family of grouped.keys()) {
+    if (!selected.has(family)) throw new Error(`fact-store: ${family} is outside the selected family pass`);
+  }
   const families = {};
   let writtenCount = 0;
   const appendErrors = [];
   const retentionErrors = [];
   for (const family of FACT_FAMILY_IDS) {
+    if (!selected.has(family)) continue;
     const budgetBytes = budgets?.[family] ?? maxBytes ?? FAMILY_DEFAULT_BUDGET_BYTES.get(family);
     const familyOptions = { ...passOptions, family, maxBytes: budgetBytes };
+    // C2: a derived family (fact-families.js DERIVED_FAMILIES) is written only by its own derivation
+    // step, never here: no append (refused, reported) and no sweep (it would advance the pass id its
+    // lineage stamp names).
+    if (DERIVED_FAMILIES.has(family)) {
+      if (grouped.has(family)) {
+        const message = "derived family is appended only by its own derivation step";
+        families[family] = { written_count: 0, budget_bytes: budgetBytes, append_error: message };
+        appendErrors.push(`${family}: ${message}`);
+      }
+      continue;
+    }
     if (grouped.has(family)) {
       try {
         const result = await appendFactPoints(descartesPaths, grouped.get(family), familyOptions);
@@ -757,12 +787,12 @@ async function readFamilyFactPoints(descartesPaths, family, options) {
   // LOW-6 (review fold): certified_after_ts (below) reports max(floor, retention cutoff) -- the
   // cutoff must be the SAME retentionMs the caller's own write-side retention pass actually uses,
   // or this surface over/under-claims relative to what that pass really kept. Defaults to
-  // DEFAULT_FACT_RETENTION_MS, mirroring enforceFactRetention's own default exactly; validated the
-  // same way as windowMs just above.
+  // the family's own retention (fact-families.js familyRetentionMs, C2 §8.1), mirroring the write
+  // side's default exactly; validated the same way as windowMs just above.
   if (options.retentionMs !== undefined && (!Number.isFinite(options.retentionMs) || options.retentionMs < 0)) {
     throw new Error("readFactPoints requires a finite, non-negative retentionMs");
   }
-  const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
+  const retentionMs = options.retentionMs ?? familyRetentionMs(family);
   const sinceMs = options.windowMs !== undefined ? nowMs - options.windowMs : undefined;
   const { records, corrupt_count, bytes, raw_bytes: rawBytes, exists } = await readJsonLines(storePaths.factsFile);
   const integrity = await readFactIntegrityLedger(descartesPaths, family);
@@ -832,6 +862,7 @@ async function readFamilyFactPoints(descartesPaths, family, options) {
     corrupt_count,
     schema_invalid_count: schemaInvalidCount,
     completeness,
+    continuity_observation: observeFactContinuity(integrity.ledger, live),
     family,
     // S4 status: the store's on-disk size, and whether it was ever created (facts.jsonl or ledger on
     // disk) -- a never-created store reads as `not observed (no store)`, not "still learning".
