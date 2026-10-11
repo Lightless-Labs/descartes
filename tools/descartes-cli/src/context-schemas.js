@@ -164,7 +164,7 @@ const FACT_SCHEMA_ENTRIES = [
     fields: {
       ...commonFields(["kernel.boot_session", "kernel.power"]),
       trigger: enumField(["boot", "wake", "unknown"], ["kernel.boot_session", "kernel.power"]),
-      status: enumField(["ran", "deferred_cost_cap", "unknown"], ["descartes.daemon"]),
+      status: enumField(["ran", "deferred_cost_cap", "not_enabled", "detected_after_census", "unknown"], ["descartes.daemon"]),
       boot_id_hmac: hmacField(["kernel.boot_session"]),
       pre_gap_s: intField(0, MAX_DURATION_S, ["kernel.boot_session", "kernel.power", "descartes.daemon"]),
       post_gap_s: intField(0, MAX_DURATION_S, ["kernel.boot_session", "kernel.power", "descartes.daemon"]),

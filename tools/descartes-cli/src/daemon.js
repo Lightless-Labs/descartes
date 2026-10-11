@@ -280,8 +280,14 @@ export function defaultDaemonProfile() {
         "net-config": { enabled: true },
       },
       // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
-      // wake, borrowing the next structural slot (bounded; see runDaemonIteration).
-      boundary_census: { enabled: true },
+      // wake, borrowing the next structural slot (bounded; see runDaemonIteration). OFF by default
+      // (C0 review B1): the census it runs writes into the same session/peer families the
+      // incumbent session/peer detectors score and fold, so turning it on would change alerting
+      // (a census while the tailnet reconnects or before tmux-resurrect has run becomes the tick
+      // they score) -- not data-only. The plan routes +0/+2/+10 samples to tick_summary for the
+      // learners (§7.6, C2); until then the boundary is still recorded, at the next scheduled
+      // census, with its gap durations (host.boundary_census status "not_enabled").
+      boundary_census: { enabled: false },
     },
     safety: {
       read_only: true,
@@ -1052,7 +1058,7 @@ function deepFreeze(value) {
  * The after-probe is folded into the ledger last, so a change it reveals is pending for the next
  * tick, never attributed to this census.
  */
-export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvidence, nowMs, hmacKey, daemon = currentDaemonInstance() }) {
+export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvidence, nowMs, hmacKey, daemon = currentDaemonInstance(), boundaryCensusEnabled = false }) {
   const envelope = (structuralEvidence ?? []).find((e) => e?.id === "host-lifecycle");
   const probeAfter = envelope?.source === "daemon" ? undefined : envelope?.result;
   const facts = {};
@@ -1078,9 +1084,19 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
   }
   if (next.pending_census) {
     const gaps = boundaryCensusGaps(next.pending_census, nowMs);
+    // Review L3: why the census recording this boundary was not at +0. "ran": detected by this
+    // tick's before-probe and censused now. "detected_after_census": first seen by a previous tick's
+    // after-probe, so the earliest census that could record it is this one. "not_enabled": the +0
+    // boundary census is off (the default, B1). "deferred_cost_cap": on, but the slot could not be
+    // borrowed (or the +0 census's facts did not persist and it is recorded now).
+    let status;
+    if (next.pending_census.detected_ms === nowMs && next.pending_census.detected_by !== "after_probe") status = "ran";
+    else if (next.pending_census.detected_by === "after_probe") status = "detected_after_census";
+    else if (!boundaryCensusEnabled) status = "not_enabled";
+    else status = "deferred_cost_cap";
     facts.boundaryCensus = {
       trigger: next.pending_census.trigger,
-      status: next.pending_census.detected_ms === nowMs ? "ran" : "deferred_cost_cap",
+      status,
       boot_id_hmac: next.current?.boot_id_digest === next.pending_census.boot_id_digest ? next.current?.boot_id_hmac : undefined,
       ...gaps,
     };
@@ -1094,6 +1110,7 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
     ? observeBootProbe(next, probeAfter, {
       nowMs,
       daemon,
+      detectedBy: "after_probe",
       bootIdHmac: typeof probeAfter.boot?.boot_id === "string" ? hostBootIdHmac(hmacKey, probeAfter.boot.boot_id) : undefined,
     }).ledger
     : next;
@@ -1339,7 +1356,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           const loadedKey = await ensureContextKey();
           const hmacKey = loadedKey?.status === "ok" ? loadedKey.key : undefined;
           const hostContext = hostLifecycleEnabled
-            ? deriveHostLifecycleContext({ ledger: bootLedger, probeBefore: bootProbeBefore, structuralEvidence, nowMs, hmacKey, daemon: options.daemonInstance ?? currentDaemonInstance() })
+            ? deriveHostLifecycleContext({ ledger: bootLedger, probeBefore: bootProbeBefore, structuralEvidence, nowMs, hmacKey, daemon: options.daemonInstance ?? currentDaemonInstance(), boundaryCensusEnabled })
             : undefined;
           // Context plan C0.4: first-observed-tick dedupe of login rows (a repeated sighting is not
           // a repeated login). A seen-state that cannot be read re-emits as `reseeded`; one that

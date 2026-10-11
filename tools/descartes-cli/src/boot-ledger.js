@@ -121,9 +121,10 @@ function bootRecordFrom(probe, digest, { nowMs, daemon, bootIdHmac }) {
  * "boot" (a boot id different from the ledger's current one), "wake" (the OS wake marker changed
  * within the same boot) or undefined. The first-ever observation triggers nothing (there is no
  * previous boot to compare, so no boundary can be claimed). `lastCensusMs` is the last structural
- * census before this probe (the structural checkpoint), for the pre-boundary gap.
+ * census before this probe (the structural checkpoint), for the pre-boundary gap. `detectedBy`
+ * ("before_probe" | "after_probe") records which half of the census bracket saw the change first.
  */
-export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, bootIdHmac } = {}) {
+export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, bootIdHmac, detectedBy = "before_probe" } = {}) {
   const next = structuredClone(ledger ?? emptyLedger());
   const digest = bootIdDigest(probe?.boot?.boot_id);
   if (!digest) return { ledger: next, trigger: undefined };
@@ -147,6 +148,7 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
     next.pending_census = {
       trigger: "boot",
       detected_ms: nowMs,
+      detected_by: detectedBy,
       boot_id_digest: digest,
       event_s: current.boot_time_s,
       sleep_s: null,
@@ -167,6 +169,7 @@ export function observeBootProbe(ledger, probe, { nowMs, daemon, lastCensusMs, b
       next.pending_census = {
         trigger: "wake",
         detected_ms: nowMs,
+        detected_by: detectedBy,
         boot_id_digest: digest,
         event_s: isFiniteInt(probe?.clocks?.kern_waketime_s) ? probe.clocks.kern_waketime_s : null,
         sleep_s: isFiniteInt(probe?.clocks?.kern_sleeptime_s) ? probe.clocks.kern_sleeptime_s : null,

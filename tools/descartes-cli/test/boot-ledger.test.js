@@ -78,7 +78,7 @@ test("C0.8: a new boot id triggers a boot boundary with the previous record kept
   assert.equal(changed.ledger.pending_boundary.prev.last_observed_ms, T0 + MIN);
   assert.equal(changed.ledger.pending_boundary.seen_before, false);
   assert.equal(changed.ledger.current.boot_id_hmac, "0123456789abcdef");
-  assert.deepEqual(changed.ledger.pending_census, { trigger: "boot", detected_ms: bootB * 1000 + 5 * MIN, boot_id_digest: bootIdDigest(BOOT_B), event_s: bootB, sleep_s: null, last_census_ms: T0 });
+  assert.deepEqual(changed.ledger.pending_census, { trigger: "boot", detected_ms: bootB * 1000 + 5 * MIN, detected_by: "before_probe", boot_id_digest: bootIdDigest(BOOT_B), event_s: bootB, sleep_s: null, last_census_ms: T0 });
   assert.equal(ledger.pending_boundary, null, "pure: the input ledger is not mutated");
 });
 
@@ -86,7 +86,7 @@ test("C0.12: a changed OS wake marker within one boot triggers a wake census; an
   const ledger = bootedLedger();
   const wake = observeBootProbe(ledger, { ...probe(BOOT_A, { waketime: 1791720000 }), clocks: { kern_waketime_s: 1791720000, kern_sleeptime_s: 1791710000 } }, { nowMs: T0 + MIN, daemon: daemonOld, lastCensusMs: T0 - 20 * MIN });
   assert.equal(wake.trigger, "wake");
-  assert.deepEqual(wake.ledger.pending_census, { trigger: "wake", detected_ms: T0 + MIN, boot_id_digest: bootIdDigest(BOOT_A), event_s: 1791720000, sleep_s: 1791710000, last_census_ms: T0 - 20 * MIN });
+  assert.deepEqual(wake.ledger.pending_census, { trigger: "wake", detected_ms: T0 + MIN, detected_by: "before_probe", boot_id_digest: bootIdDigest(BOOT_A), event_s: 1791720000, sleep_s: 1791710000, last_census_ms: T0 - 20 * MIN });
   const unreadable = observeBootProbe(ledger, { boot: { boot_id: BOOT_A }, clocks: {} }, { nowMs: T0 + MIN, daemon: daemonOld });
   assert.equal(unreadable.trigger, undefined);
   assert.equal(wakeMarkerOf({ clocks: { suspend_stats_success: 4 } }), "linux:4");

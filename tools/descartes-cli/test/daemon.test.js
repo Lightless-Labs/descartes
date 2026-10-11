@@ -30,6 +30,7 @@ import {
   writeStructuralCheckpoint,
 } from "../src/daemon.js";
 import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../src/constraint-store.js";
+import { observeBootProbe } from "../src/boot-ledger.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPoints, enforceFactRetention, normalizeFactPoint, readFactPoints, resolveFactStorePaths, appendFactPointsByFamily } from "../src/fact-store.js";
 import { FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES } from "../src/fact-families.js";
@@ -561,7 +562,9 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
   assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "net-config", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
-  assert.deepEqual(profile.structural.boundary_census, { enabled: true });
+  // Review B1: the +0 boundary census writes into the session/peer families the incumbent
+  // detectors score and fold, so it ships OFF until C1a/C2 can route it away from them.
+  assert.deepEqual(profile.structural.boundary_census, { enabled: false });
   assert(profile.structural.collectors.services.enabled);
   assert(profile.structural.collectors.network.enabled);
   assert(profile.structural.collectors["scheduled-jobs"].enabled);
@@ -6344,7 +6347,66 @@ test("C0.12: the boundary census is off when boundary_census is not enabled (the
   assert.equal(state.structuralRuns, 2);
   const facts = await hostFacts(paths, C12_T0 + C12_HOUR);
   assert.ok(facts.some((p) => p.fact_name === "host.boot_boundary"));
-  assert.equal(facts.find((p) => p.fact_name === "host.boundary_census").attributes.status, "deferred_cost_cap");
+  // Review L3: not a cost-cap deferral -- the boundary census is simply not enabled.
+  assert.equal(facts.find((p) => p.fact_name === "host.boundary_census").attributes.status, "not_enabled");
+});
+
+test("Review B1: with the DEFAULT profile a pending boundary never triggers an off-schedule census (the session/peer detectors keep their scheduled samples)", async () => {
+  const paths = await tempPaths();
+  const state = { checkpoint: undefined, structuralRuns: 0, probe: undefined };
+  const base = defaultDaemonProfile();
+  const profile = {
+    ...base,
+    structural: {
+      ...base.structural,
+      collectors: Object.fromEntries(Object.keys(base.structural.collectors).map((key) => [key, { enabled: key === "host-lifecycle" || key === "sessions" }])),
+    },
+  };
+  const tick = (nowMs) => runDaemonIteration(paths, {
+    profile,
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      sessions: async () => { state.structuralRuns += 1; return envelope("sessions", "collect_sessions", { sessions: [], multiplexers: [{ multiplexer: "tmux", status: "ok" }], total_count: 0, truncated: false }); },
+      "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", state.probe),
+    },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "d", start_ms: 0 },
+    evaluateAlerts: false,
+    ts: new Date(nowMs).toISOString(),
+    now: nowMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  await tick(C12_T0);
+  assert.equal(state.structuralRuns, 1);
+  // A reboot detected 20 minutes later: pending, but the census waits for its scheduled slot.
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: Math.floor((C12_T0 + 15 * 60000) / 1000), wallMs: C12_T0 + 20 * 60000, uptimeMs: 5 * 60000 });
+  await tick(C12_T0 + 20 * 60000);
+  assert.equal(state.structuralRuns, 1, "no +0 census: the default profile leaves the detector cadence alone");
+  assert.equal(state.checkpoint, C12_T0, "the checkpoint is not borrowed");
+  // A wake detected later in the same boot: still nothing off-schedule.
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: Math.floor((C12_T0 + 15 * 60000) / 1000), waketime: Math.floor((C12_T0 + 40 * 60000) / 1000), wallMs: C12_T0 + 41 * 60000, uptimeMs: 26 * 60000 });
+  await tick(C12_T0 + 41 * 60000);
+  assert.equal(state.structuralRuns, 1);
+  await tick(C12_T0 + C12_HOUR);
+  assert.equal(state.structuralRuns, 2, "the scheduled census runs at its slot");
+  assert.equal(state.checkpoint, C12_T0 + C12_HOUR);
+});
+
+test("Review L3: a wake first seen by the AFTER-census probe is recorded at the next census as detected_after_census, not as a cost-cap deferral", () => {
+  const before = hostProbe(BOOT_ONE, { bootTimeS: 1, waketime: 10, wallMs: C12_T0, uptimeMs: C12_T0 - 1000 });
+  const after = hostProbe(BOOT_ONE, { bootTimeS: 1, waketime: 20, wallMs: C12_T0 + 1000, uptimeMs: C12_T0 });
+  const daemon = { nonce: "d", start_ms: 0 };
+  const { ledger: seeded } = observeBootProbe(undefined, before, { nowMs: C12_T0, daemon });
+  const first = deriveHostLifecycleContext({ ledger: seeded, probeBefore: before, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: C12_T0, daemon, boundaryCensusEnabled: true });
+  assert.equal(first.facts.boundaryCensus, undefined, "nothing was pending when this census ran");
+  assert.equal(first.ledger.pending_census.trigger, "wake");
+  assert.equal(first.ledger.pending_census.detected_by, "after_probe");
+  const next = deriveHostLifecycleContext({ ledger: first.ledger, probeBefore: after, structuralEvidence: [envelope("host-lifecycle", "collect_host_lifecycle", after)], nowMs: C12_T0 + C12_HOUR, daemon, boundaryCensusEnabled: true });
+  assert.equal(next.facts.boundaryCensus.status, "detected_after_census");
 });
 
 test("C0.8 (§4.4 bracket): a boot read that differs before and after the census is unstable", () => {
