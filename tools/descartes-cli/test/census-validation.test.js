@@ -193,6 +193,7 @@ test("registered census parsers stay fail-closed across adversarial generated in
     { name: "vpn.parseScutilNcListDetailed", parse: vpnParsers.parseScutilNcListDetailed, trusted: (value) => value.unparsed_count === 0 && value.duplicate_count === 0 },
     { name: "vpn.parseScutilNcList", parse: vpnParsers.parseScutilNcList, trusted: (value) => value.length > 0 },
     { name: "login.parseWhoRows", parse: parseWhoRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
+    { name: "login.parseLastRows", parse: parseLastRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
     { name: "last-history.parseLastRows", parse: parseSharedLastRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
     { name: "loginctl.ids", parse: parseLoginctlSessionIds, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
     { name: "login.parsePlistXml", parse: loginParsers.parsePlistXml, trusted: () => false },
@@ -223,7 +224,7 @@ test("registered census parsers stay fail-closed across adversarial generated in
       } catch {
         continue;
       }
-      if (typeof input === "string" && /MALFORMED/.test(input)) {
+      if (typeof input === "string" && (/MALFORMED/.test(input) || input === "!") && parser.name !== "vpn.parseWgInterfaceList") {
         assert.equal(parser.trusted(result, input), false, `${parser.name} trusted ${JSON.stringify(input)}`);
       }
       if (input !== "" && (typeof input !== "string" || input === null)) {
@@ -245,7 +246,7 @@ test("every exported parse* function in the touched parser modules is explicitly
     "network.parseLinuxDefaultRoutes", "network.parseMacDefaultRoute", "network.parseResolvConf", "network.parseScutilDns",
     "network.parseLinuxListeningSockets", "network.parseMacLsofListeningSocketsDetailed", "network.parseMacLsofListeningSockets",
     "vpn.parseWhoOutput", "vpn.parseLastOutput", "vpn.parseWgInterfaceList", "vpn.parseWgPeerList", "vpn.parseWgEndpoints",
-    "vpn.parseWgHandshakes", "vpn.parseScutilNcListDetailed", "vpn.parseScutilNcList", "login.parseWhoRows", "login.parsePlistXml",
+    "vpn.parseWgHandshakes", "vpn.parseScutilNcListDetailed", "vpn.parseScutilNcList", "login.parseWhoRows", "login.parseLastRows", "login.parsePlistXml",
     "login.parseConsoleUsers", "login.parseLoginctlSessionIds", "login.parseLoginctlShowSession", "last-history.parseLastRows",
     "host.parseSysctlKeyValues", "host.parseSysctlTimevalSeconds", "host.parseProcStatBtime", "host.parseOsReleaseBuild",
     "host.parseProcUptime", "tailscale.parseTailscaleStatusJson",

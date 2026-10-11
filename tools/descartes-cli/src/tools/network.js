@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus } from "./census-validate.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
@@ -34,18 +35,6 @@ async function runFixedCommand(command, args, options = {}) {
     stdout: truncate(result.stdout ?? "", 2048),
     stderr: truncate(result.stderr ?? "", 2048),
   };
-}
-
-function uniqueBy(items, keyFn) {
-  const seen = new Set();
-  const result = [];
-  for (const item of items) {
-    const key = keyFn(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(item);
-  }
-  return result;
 }
 
 export function normalizeSocketProtocol(protocol) {
@@ -121,25 +110,41 @@ export function parseLinuxDefaultRoutes(stdout) {
       raw: line,
     });
   }
-  return attachCensusMetadata(routes, { malformed_count });
+  const census = finalizeCensus({
+    records: routes,
+    identity: (route) => JSON.stringify([route.destination, route.gateway, route.interface, route.source, route.protocol, route.metric]),
+    malformed: malformed_count,
+  });
+  return attachCensusMetadata(census.records, {
+    malformed_count,
+    duplicate_count: census.duplicate_count,
+    truncated: census.truncated,
+  });
 }
 
 export function parseMacDefaultRoute(stdout) {
   if (typeof stdout !== "string") return attachCensusMetadata([], { malformed_count: 1 });
   const fields = {};
   let malformed_count = 0;
+  let duplicate_count = 0;
   for (const line of stdout.split("\n")) {
     if (line.trim() && !/^\s*[^:]+:\s*.*$/.test(line)) { malformed_count += 1; continue; }
     const match = line.match(/^\s*([^:]+):\s*(.*?)\s*$/);
-    if (match) fields[match[1].trim()] = match[2].trim();
+    if (match) {
+      const key = match[1].trim();
+      if (Object.prototype.hasOwnProperty.call(fields, key)) { duplicate_count += 1; continue; }
+      fields[key] = match[2].trim();
+    }
   }
-  if (!fields.gateway && !fields.interface) return attachCensusMetadata([], { malformed_count });
-  return attachCensusMetadata([{
+  if (!fields.gateway && !fields.interface) return attachCensusMetadata([], { malformed_count, duplicate_count });
+  const routes = [{
     destination: fields.destination || fields["route to"] || "default",
     gateway: fields.gateway,
     interface: fields.interface,
     flags: fields.flags,
-  }], { malformed_count });
+  }];
+  const census = finalizeCensus({ records: routes, identity: (route) => JSON.stringify(route), malformed: malformed_count + duplicate_count });
+  return attachCensusMetadata(census.records, { malformed_count, duplicate_count: duplicate_count + census.duplicate_count, truncated: census.truncated });
 }
 
 export function parseResolvConf(contents) {
@@ -153,7 +158,12 @@ export function parseResolvConf(contents) {
     if (match) resolvers.push({ address: match[1], source: "/etc/resolv.conf" });
     else malformed_count += 1;
   }
-  return attachCensusMetadata(uniqueBy(resolvers, (item) => item.address).slice(0, 8), { malformed_count, truncated: resolvers.length > 8 });
+  const census = finalizeCensus({ records: resolvers, identity: (item) => item.address, cap: 8, malformed: malformed_count });
+  return attachCensusMetadata(census.records, {
+    malformed_count,
+    duplicate_count: census.duplicate_count,
+    truncated: census.truncated,
+  });
 }
 
 export function parseScutilDns(stdout) {
@@ -168,7 +178,12 @@ export function parseScutilDns(stdout) {
     if (match) resolvers.push({ address: match[1], source: "scutil --dns" });
     else malformed_count += 1;
   }
-  return attachCensusMetadata(uniqueBy(resolvers, (item) => item.address).slice(0, 8), { malformed_count, truncated: resolvers.length > 8 });
+  const census = finalizeCensus({ records: resolvers, identity: (item) => item.address, cap: 8, malformed: malformed_count });
+  return attachCensusMetadata(census.records, {
+    malformed_count,
+    duplicate_count: census.duplicate_count,
+    truncated: census.truncated,
+  });
 }
 
 function parseAddressPort(endpoint) {
@@ -203,11 +218,25 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
       raw: line,
     };
   }).filter(Boolean);
-  return attachCensusMetadata(entries.slice(0, limit), { rejected_count, truncated: entries.length > limit });
+  const census = finalizeCensus({
+    records: entries,
+    identity: (entry) => JSON.stringify([entry.protocol, entry.state, entry.local_address, entry.local_port]),
+    cap: limit,
+    malformed: rejected_count,
+  });
+  return attachCensusMetadata(census.records, {
+    rejected_count,
+    duplicate_count: census.duplicate_count,
+    truncated: census.truncated,
+  });
 }
 
 export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}) {
   if (typeof stdout !== "string") return { entries: [], rejected: 1, truncated: false };
+  const firstLine = stdout.split("\n").find((line) => line.trim());
+  if (firstLine && !/^COMMAND\s+PID\s+USER\s+FD\s+TYPE\b/.test(firstLine.trim())) {
+    return { entries: [], rejected: 1, duplicate_count: 0, truncated: false };
+  }
   const entries = [];
   let rejected = 0;
   for (const line of stdout.split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
@@ -242,7 +271,14 @@ export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}
       local_port: local.port,
     });
   }
-  return { entries: entries.slice(0, limit), rejected, truncated: entries.length > limit };
+  const census = finalizeCensus({
+    records: entries,
+    identity: (entry) => JSON.stringify([entry.protocol, entry.state, entry.command, entry.pid, entry.local_address, entry.local_port]),
+    cap: limit,
+    malformed: rejected,
+  });
+  const boundedEntries = attachCensusMetadata(census.records, { duplicate_count: census.duplicate_count });
+  return { entries: boundedEntries, rejected, duplicate_count: census.duplicate_count, truncated: census.truncated };
 }
 
 export function parseMacLsofListeningSockets(stdout, { limit = 50 } = {}) {
@@ -254,7 +290,7 @@ async function collectDefaultRoutes(options = {}) {
     const command = await runFixedCommand("ip", ["route", "show", "default"], options);
     const routes = command.status === "ok" ? parseLinuxDefaultRoutes(command.stdout) : [];
     return {
-      status: command.status === "ok" && routes.malformed_count === 0 ? "ok" : command.status === "ok" ? "partial" : command.status,
+      status: command.status === "ok" && routes.malformed_count === 0 && routes.duplicate_count === 0 ? "ok" : command.status === "ok" ? "partial" : command.status,
       routes,
       command: command.command,
       error: command.error,
@@ -265,7 +301,7 @@ async function collectDefaultRoutes(options = {}) {
     const command = await runFixedCommand("route", ["-n", "get", "default"], options);
     const routes = command.status === "ok" ? parseMacDefaultRoute(command.stdout) : [];
     return {
-      status: command.status === "ok" && routes.malformed_count === 0 ? "ok" : command.status === "ok" ? "partial" : command.status,
+      status: command.status === "ok" && routes.malformed_count === 0 && routes.duplicate_count === 0 ? "ok" : command.status === "ok" ? "partial" : command.status,
       routes,
       command: command.command,
       error: command.error,
@@ -279,7 +315,7 @@ async function collectDnsResolvers(options = {}) {
   if (process.platform === "linux") {
     try {
       const resolvers = parseResolvConf(await fs.readFile("/etc/resolv.conf", "utf8"));
-      return { status: resolvers.malformed_count === 0 && !resolvers.truncated ? "ok" : "partial", resolvers, sources: ["/etc/resolv.conf"] };
+      return { status: resolvers.malformed_count === 0 && resolvers.duplicate_count === 0 && !resolvers.truncated ? "ok" : "partial", resolvers, sources: ["/etc/resolv.conf"] };
     } catch (error) {
       return { status: "unable", resolvers: [], sources: ["/etc/resolv.conf"], error: error instanceof Error ? error.message : String(error) };
     }
@@ -288,7 +324,7 @@ async function collectDnsResolvers(options = {}) {
     const command = await runFixedCommand("scutil", ["--dns"], { ...options, timeout: 2500, maxBuffer: 1024 * 512 });
     const resolvers = command.status === "ok" ? parseScutilDns(command.stdout) : [];
     return {
-      status: command.status === "ok" && resolvers.malformed_count === 0 && !resolvers.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
+      status: command.status === "ok" && resolvers.malformed_count === 0 && resolvers.duplicate_count === 0 && !resolvers.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
       resolvers,
       sources: ["scutil --dns"],
       command: command.command,
@@ -331,7 +367,7 @@ async function collectListeningSockets(limit, options = {}) {
     const command = await runFixedCommand("ss", ["-H", "-ltnu"], { ...options, timeout: 2500, maxBuffer: 1024 * 512 });
     const sockets = command.status === "ok" ? parseLinuxListeningSockets(command.stdout, { limit }) : [];
     return {
-      status: command.status === "ok" && sockets.rejected_count === 0 && !sockets.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
+      status: command.status === "ok" && sockets.rejected_count === 0 && sockets.duplicate_count === 0 && !sockets.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
       sockets,
       command: command.command,
       error: command.error,
@@ -343,7 +379,7 @@ async function collectListeningSockets(limit, options = {}) {
     const command = await runFixedCommand("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { ...options, timeout: 3500, maxBuffer: 1024 * 512 });
     const detailed = command.status === "ok" ? parseMacLsofListeningSocketsDetailed(command.stdout, { limit }) : { entries: [], rejected: 0, truncated: false };
     return {
-      status: command.status === "ok" && detailed.rejected === 0 && !detailed.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
+      status: command.status === "ok" && detailed.rejected === 0 && detailed.duplicate_count === 0 && !detailed.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
       sockets: detailed.entries,
       command: command.command,
       error: command.error,
