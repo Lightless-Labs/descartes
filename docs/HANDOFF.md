@@ -2,23 +2,25 @@
 
 **Last updated:** 2026-10-11
 
-## Context facts C2 review closure — 2026-10-11 — local, not pushed
+## Context facts C2 daybreak rework — 2026-10-11 — local, not pushed
 
-On `feat/context-facts-c2-2026-10`, closed the remaining B1/B2/B3, HIGH, MEDIUM, and LOW
-findings in atomic test-first commits. Peer availability alert identities now include the v2
-signature regime; legacy v1 identities fold but are never evaluated for recovery or new alerts.
-Router-advertisement prefixes require positive RA evidence and preserve the observed prefix
-length. Tailscale peer populations fail closed on any malformed entry. Linux configured search
-domains are tagged `net.configured_search_domain`; DHCP domains require an actual lease source.
-Collector sub-deadlines abort subprocesses and prevent later composite launches. Peer and login
-collectors share one parsed `last -n 50` result per structural tick.
+On `feat/context-facts-c2-2026-10`, reworked all reported findings in atomic test-first commits.
+Tailscale now validates every consumed field without truthiness or string coercion and fails peer
+populations closed on malformed values. Network parsers fail closed on malformed fields and domain
+tokens, fingerprint provenance is derived from the aggregate inputs and includes
+`net.configured_search_domain`, and Linux RA parsing accepts the real `proto kernel_ra` spelling
+while still rejecting static addresses. Composite collectors check cancellation before every
+subprocess launch; fast-tick boundary probes abort their subprocess at the deadline.
 
-The focused context/peer verification passes **267/267**, and the baseline/fact-family/daemon
-regression set passes **243/243**. Required fresh-XDG `npm test` reports **2,505 passing, 23
-environment failures, 35 skipped, 6 todo, 2,569 total**. The 23 failures are one sandbox
-`uv_uptime` denial, 20 sandbox loopback `listen EPERM` notifier/tap tests, and two live-process
-provenance checks that return `unknown` under sandbox restrictions; no product-behavior failure
-remains in the task scope. No push or merge.
+Focused verification: Tailscale **29/29**, net-config **20/20**, combined context/parser suites
+**65/65**, and the targeted daemon deadline test **1/1**. Fresh-XDG sandbox `npm test` reports
+**2,513 passing, 23 environment failures, 35 skipped, 6 todo, 2,577 total**: one macOS
+`uv_uptime` `EPERM`, 17 notifier-reuse and 3 tap-bump loopback `listen EPERM` tests, and two
+live-process provenance checks returning `unknown` under sandbox restrictions. Fresh-XDG
+host-access `npm test` is clean: **2,536 passing, 0 failures, 35 skipped, 6 todo, 2,577 total**.
+
+Implementation/test commits: `afcbfd2`, `ce230d2`, `ca5b433`, `4d71d11`, `b6f1242`, `4c6602a`,
+`af4c461`, `9c43984`, `958e7bf`, `217e0c0`, `5bad058`, `7e4485e`. No push or merge.
 
 ## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
