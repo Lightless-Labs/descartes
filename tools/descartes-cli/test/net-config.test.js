@@ -18,7 +18,8 @@ import {
 } from "../src/tools/net-config.js";
 import { CONTEXT_KEY_BYTES, contextHmac } from "../src/context-key.js";
 import { validateContextFact } from "../src/context-schemas.js";
-import { factPointsFromNetConfigEvidence } from "../src/context-translators.js";
+import { factPointsFromNetConfigEvidence, netConfigAggregateInputs } from "../src/context-translators.js";
+import { contextSchemaFor } from "../src/context-schemas.js";
 
 // Real outputs captured on the Darwin 25.2 dev VM (2026-10-11): an Ethernet en0 and a Tailscale utun4
 // that also carries a default route and MagicDNS.
@@ -107,6 +108,12 @@ test("B2: Linux ra_prefix preserves the observed RA prefix length and rejects st
     "    inet6 2001:db8:1:2::1234/128 scope global\n",
   ), { state: "unable", prefixes: [] });
   assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(""), { state: "absent", prefixes: [] });
+});
+
+test("B2: Linux iproute2 kernel_ra output is recognized as router-advertised evidence", () => {
+  assert.deepEqual(parseLinuxRouterAdvertisementPrefixes(
+    "    inet6 2001:db8:1:2::1234/64 scope global dynamic mngtmpaddr proto kernel_ra\n",
+  ), { state: "ok", prefixes: ["2001:db8:1:2::/64"] });
 });
 
 test("B2: macOS ra_prefix comes only from ndp router-advertisement prefix records, with their observed length", () => {
@@ -202,6 +209,24 @@ test("HIGH: Linux IP4.DOMAIN is configured-search-domain provenance, not a DHCP 
   assert.deepEqual(result.components.dhcp_domain, { state: "absent" });
 });
 
+test("HIGH: one malformed nmcli domain token makes the whole domain component unable", async () => {
+  const result = await readNetConfig({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({
+      "ip route show default": ok("default via 192.168.1.1 dev eth0 proto dhcp\n"),
+      "ip neigh show 192.168.1.1 dev eth0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
+      "ip -6 addr show dev eth0 scope global": ok(""),
+      "nmcli -g IP4.DOMAIN device show eth0": ok("good.example bad_domain\n"),
+      "nmcli -g DHCP4.OPTION device show eth0": ok("domain_name = lease.example\n"),
+      "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
+    }),
+  });
+  assert.deepEqual(result.components.configured_search_domain, { state: "unable" });
+  assert.equal(result.status, "partial");
+});
+
 test("HIGH: the translator keeps configured search domain separate from DHCP lease provenance", () => {
   const point = fingerprintOf({
     ...HOME_NET,
@@ -259,6 +284,14 @@ test("C0.5 translator: per-component availability and HMACs; the aggregate is a 
   assert.notEqual(fingerprintOf(HOME_NET, Buffer.alloc(CONTEXT_KEY_BYTES, 4)).attributes.fingerprint_hmac, point.attributes.fingerprint_hmac, "per-install key");
   const otherGateway = fingerprintOf({ ...HOME_NET, components: { ...HOME_NET.components, gateway_mac: { state: "ok", value: "00:11:22:33:44:55" } } });
   assert.notEqual(otherGateway.attributes.fingerprint_hmac, point.attributes.fingerprint_hmac, "a different gateway is a different configuration");
+});
+
+test("HIGH: fingerprint provenance is derived from every actual aggregate input", () => {
+  const inputs = netConfigAggregateInputs(HOME_NET);
+  const derived = [...new Set(inputs.map((input) => input.provenance))].sort();
+  const declared = [...contextSchemaFor("net.config_fingerprint").fields.fingerprint_hmac.provenance].sort();
+  assert.deepEqual(declared, derived);
+  assert.ok(derived.includes("net.configured_search_domain"));
 });
 
 test("C0.5 translator: an absent component is 'none' and still fingerprints; a FAILED component makes the aggregate unknown; no key makes everything unknown", () => {
