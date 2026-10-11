@@ -406,7 +406,7 @@ test("groupPeerFactsByTick (security-sweep F6, supersedes 'Decision 6 sentinel u
 });
 
 test("groupPeerFactsByTick (security-sweep F6): a GARBLED-BUT-STRING-TYPED availability_signature (e.g. empty string, or a shape that does not match buildPeerAvailabilitySignature's 'v1:<5 closed-enum codes>' format) coerces to the PEER_SIGNATURE_INVALID sentinel, DISTINCT from marker-less undefined -- a type-only guard is NOT enough (Stage 2 adversarial-review fix, 2026-07-23; hardened 2026-09-04 so an invalid marker can no longer silently pool with the trusted legacy-markerless regime)", () => {
-  for (const garbled of ["", "garbage", "v1:ok-ok-ok-ok", "v1:ok-ok-ok-ok-ok-ok", "v2:ok-ok-ok-ok-ok", "v1:ok-ok-injected-ok-ok", "not-even-versioned"]) {
+  for (const garbled of ["", "garbage", "v1:ok-ok-ok-ok", "v1:ok-ok-ok-ok-ok-ok", "v3:ok-ok-ok-ok-ok", "v2:ok-ok-injected-ok-ok", "v1:ok-ok-injected-ok-ok", "not-even-versioned"]) {
     const marker = { ...censusMarkerPoint(tickTs(0)), attributes: { availability_signature: garbled } };
     const groups = groupPeerFactsByTick([...activeTick(tickTs(0), 3), marker]);
     assert.equal(groups[0].availabilitySignature, PEER_SIGNATURE_INVALID, `expected garbled signature ${JSON.stringify(garbled)} to coerce to PEER_SIGNATURE_INVALID`);
@@ -790,6 +790,20 @@ test("computeWindowedPeerStats regime-keyed fold: TRANSITIONAL post-upgrade mixe
     const candidate = buildCountSpikeCandidate({ confidence_state: windowed.confidence_state, last_observation: windowed.last_observation });
     assert.equal(candidate, undefined, "no spike candidate is built off the reset");
   });
+});
+
+test("C0 review M4: the C0.4 who/last parser fix bumps the peer availability signature to v2, so v1 history is a different (valid) regime: the counts re-warm honestly instead of scoring a parser change as a drop", () => {
+  const ticks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT + 5; i += 1) ticks.push(...activeTickWithMarker(tickTs(i), 4, "v1:ok-ok-ok-ok-ok")); // tmux/X rows counted as peers
+  ticks.push(...activeTickWithMarker(tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + 5), 1, "v2:ok-ok-ok-ok-ok")); // after the upgrade
+  const groups = groupPeerFactsByTick(ticks);
+  assert.equal(groups[0].availabilitySignature, "v1:ok-ok-ok-ok-ok", "v1 markers stay valid regime keys, never the invalid sentinel");
+  assert.equal(groups.at(-1).availabilitySignature, "v2:ok-ok-ok-ok-ok");
+  const drop = computeWindowedPeerDropStats(groups, { minSampleCount: DEFAULT_PEER_MIN_SAMPLE_COUNT });
+  assert.equal(drop.confidence_state, "provisional", "the v2 regime starts from zero");
+  assert.equal(buildCountDropCandidate({ confidence_state: drop.confidence_state, last_observation: drop.last_observation }), undefined);
+  // Not every string is a regime: an unknown version is still the invalid sentinel.
+  assert.equal(groupPeerFactsByTick(activeTickWithMarker(tickTs(0), 1, "v9:ok-ok-ok-ok-ok"))[0].availabilitySignature, PEER_SIGNATURE_INVALID);
 });
 
 // ---------------------------------------------------------------------------------------------

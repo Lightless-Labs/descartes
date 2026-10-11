@@ -854,7 +854,9 @@ function normalizedSourceStatus(status) {
 // not a contract) -- a stable, versioned signature format lets peer-baseline.js compare two
 // signatures with simple string equality.
 const PEER_AVAILABILITY_SOURCE_ORDER = ["ssh_who", "ssh_last", "wireguard", "vpn_services", "established_inbound"];
-const PEER_AVAILABILITY_SIGNATURE_VERSION = "v1";
+// C0 review M4: v2 from the C0.4 who/last parser fix, which changes what counts as a peer; a new
+// version is a new regime (peer-baseline.js accepts v1 and v2), so the baseline re-warms honestly.
+const PEER_AVAILABILITY_SIGNATURE_VERSION = "v2";
 
 // Degrade-not-fabricate: a missing/malformed `sources` object (e.g. a simplified test fixture)
 // degrades every source to "unknown" rather than throwing -- mirrors censusStateFor's own

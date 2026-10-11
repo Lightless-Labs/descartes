@@ -1031,9 +1031,9 @@ test("factPointsFromVpnPeerEvidence: emits a census marker on every successful e
   assert.equal(marker.confidence, 0);
   assert.match(
     marker.attributes.availability_signature,
-    /^v1:(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)$/,
+    /^v2:(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)-(ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)$/,
   );
-  assert.equal(marker.attributes.availability_signature, "v1:ok-ok-ok-ok-ok");
+  assert.equal(marker.attributes.availability_signature, "v2:ok-ok-ok-ok-ok");
 });
 
 test("factPointsFromVpnPeerEvidence: a genuinely zero-peer tick still emits exactly the census marker, no fabricated peer facts", () => {
@@ -1047,15 +1047,15 @@ test("factPointsFromVpnPeerEvidence: a degraded source (wireguard missing_permis
   const degraded = [peerEnvelope({ peers: [], sources: allOkSources({ wireguard: { status: "missing_permission" } }), truncated: false })];
   const points = factPointsFromVpnPeerEvidence(degraded, { ts: TS });
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(marker.attributes.availability_signature, "v1:ok-ok-missing_permission-ok-ok");
-  assert.notEqual(marker.attributes.availability_signature, "v1:ok-ok-ok-ok-ok");
+  assert.equal(marker.attributes.availability_signature, "v2:ok-ok-missing_permission-ok-ok");
+  assert.notEqual(marker.attributes.availability_signature, "v2:ok-ok-ok-ok-ok");
 });
 
 test("factPointsFromVpnPeerEvidence: an untrusted vpn_services source is preserved in the availability signature", () => {
   const evidence = [peerEnvelope({ peers: [], sources: allOkSources({ vpn_services: { status: "untrusted_binary" } }), truncated: false })];
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(marker.attributes.availability_signature, "v1:ok-ok-ok-untrusted_binary-ok");
+  assert.equal(marker.attributes.availability_signature, "v2:ok-ok-ok-untrusted_binary-ok");
 });
 
 test("factPointsFromVpnPeerEvidence: the who-fails/last-succeeds SSH-only fixture produces its own distinct signature", () => {
@@ -1070,7 +1070,7 @@ test("factPointsFromVpnPeerEvidence: the who-fails/last-succeeds SSH-only fixtur
     { ts: TS },
   );
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(marker.attributes.availability_signature, "v1:unable-ok-absent-absent-absent");
+  assert.equal(marker.attributes.availability_signature, "v2:unable-ok-absent-absent-absent");
 });
 
 test("factPointsFromVpnPeerEvidence: an unrecognized/future status literal in any source slot degrades to 'unknown', never throws, never embeds the raw literal", () => {
@@ -1078,7 +1078,7 @@ test("factPointsFromVpnPeerEvidence: an unrecognized/future status literal in an
   const evidence = [peerEnvelope({ peers: [], sources: allOkSources({ ssh_who: { status: rawFutureStatus } }), truncated: false })];
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(marker.attributes.availability_signature, "v1:unknown-ok-ok-ok-ok");
+  assert.equal(marker.attributes.availability_signature, "v2:unknown-ok-ok-ok-ok");
   assert.equal(JSON.stringify(marker).includes(rawFutureStatus), false);
 });
 
@@ -1086,7 +1086,7 @@ test("factPointsFromVpnPeerEvidence: a malformed/missing result.sources object d
   const evidence = [peerEnvelope({ peers: [], truncated: false })]; // no `sources` key at all
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
-  assert.equal(marker.attributes.availability_signature, "v1:unknown-unknown-unknown-unknown-unknown");
+  assert.equal(marker.attributes.availability_signature, "v2:unknown-unknown-unknown-unknown-unknown");
 });
 
 test("factPointsFromVpnPeerEvidence: the census marker's availability_signature never leaks a raw source status beyond the 6-value closed set", () => {
@@ -1095,7 +1095,7 @@ test("factPointsFromVpnPeerEvidence: the census marker's availability_signature 
   const points = factPointsFromVpnPeerEvidence(evidence, { ts: TS });
   const marker = points.find((p) => p.entity_key === PEER_CENSUS_MARKER_ENTITY_KEY);
   const [version, codesPart] = marker.attributes.availability_signature.split(":");
-  assert.equal(version, "v1");
+  assert.equal(version, "v2", "C0 review M4: bumped by the C0.4 who/last parser fix");
   const codes = codesPart.split("-");
   assert.equal(codes.length, 5);
   for (const code of codes) assert.ok(CLOSED_SOURCE_STATUS_VALUES.has(code), `unrecognized code in signature: ${code}`);

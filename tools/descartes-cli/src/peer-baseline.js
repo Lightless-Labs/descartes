@@ -41,7 +41,10 @@ const PEER_FACT_NAME = "peer.presence";
 // a future/incompatible marker producer) is NOT a legitimate regime key -- see
 // groupPeerFactsByTick's own use of this pattern below for why a type-only guard is insufficient.
 const PEER_AVAILABILITY_SOURCE_CODE = "(?:ok|partial|absent|not_found_on_known_paths|untrusted_binary|missing_permission|unable|not_applicable|unknown)";
-const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v1:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
+// C0 review M4: "v2" since the C0.4 who/last parser fix (local tmux/X/screen attachments and
+// weekday-as-host rows are no longer peers). v1 history stays a VALID regime key -- just a different
+// one -- so the count re-warms under v2 instead of scoring the parser change as a drop or a spike.
+const PEER_AVAILABILITY_SIGNATURE_PATTERN = new RegExp(`^v[12]:${PEER_AVAILABILITY_SOURCE_CODE}(?:-${PEER_AVAILABILITY_SOURCE_CODE}){4}$`);
 
 export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
 // Slice 4c (observed-incident collectors plan) — the sign-flipped mirror of PEER_COUNT_SPIKE_RULE_ID.
