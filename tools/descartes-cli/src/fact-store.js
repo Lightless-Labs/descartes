@@ -15,9 +15,11 @@ import {
 import { foldNoveltySeenSets, readNoveltySeenSet } from "./novelty-seen-set.js";
 import { CONTEXT_FACT_SCHEMAS, validateContextFact } from "./context-schemas.js";
 import {
+  DERIVED_FAMILIES,
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
   factFamilyForName,
+  familyRetentionMs,
   groupFactPointsByFamily,
   NOVELTY_FAMILIES,
   requireFactFamily,
@@ -281,7 +283,9 @@ export async function enforceFactRetention(descartesPaths, options = {}) {
 async function runFactRetention(descartesPaths, options, internal = {}) {
   const family = requireFactFamily(options.family);
   const storePaths = resolveFactStorePaths(descartesPaths, family);
-  const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
+  // C2 (§8.1): the family's own retention unless the caller names one (a test seam / the explicit
+  // enforceFactRetention entry point).
+  const retentionMs = options.retentionMs ?? familyRetentionMs(family);
   const maxBytes = options.maxBytes ?? DEFAULT_FACT_MAX_BYTES;
   // daybreak-blue security sweep, fact-store BLOCKER #1: a non-finite retentionMs (e.g.
   // "garbage" -> NaN cutoff) makes every valid record satisfy neither `tsMs < cutoff`
@@ -494,6 +498,10 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     future_fact_dropped_count: futureDropped.length,
     bytes: usedBytes,
     seen_set_fold: seenSetFold,
+    // C2 (I70): the pass this call committed, so a derivation step can cite (or a lineage stamp can
+    // name) it without re-reading the ledger.
+    ledger_generation: finalizedLedger.generation,
+    pass_id: prepared.passId,
   };
 }
 
@@ -631,6 +639,17 @@ export async function appendFactPointsByFamily(descartesPaths, factPoints, optio
   for (const family of FACT_FAMILY_IDS) {
     const budgetBytes = budgets?.[family] ?? maxBytes ?? FAMILY_DEFAULT_BUDGET_BYTES.get(family);
     const familyOptions = { ...passOptions, family, maxBytes: budgetBytes };
+    // C2: a derived family (fact-families.js DERIVED_FAMILIES) is written only by its own derivation
+    // step, never here: no append (refused, reported) and no sweep (it would advance the pass id its
+    // lineage stamp names).
+    if (DERIVED_FAMILIES.has(family)) {
+      if (grouped.has(family)) {
+        const message = "derived family is appended only by its own derivation step";
+        families[family] = { written_count: 0, budget_bytes: budgetBytes, append_error: message };
+        appendErrors.push(`${family}: ${message}`);
+      }
+      continue;
+    }
     if (grouped.has(family)) {
       try {
         const result = await appendFactPoints(descartesPaths, grouped.get(family), familyOptions);
@@ -757,12 +776,12 @@ async function readFamilyFactPoints(descartesPaths, family, options) {
   // LOW-6 (review fold): certified_after_ts (below) reports max(floor, retention cutoff) -- the
   // cutoff must be the SAME retentionMs the caller's own write-side retention pass actually uses,
   // or this surface over/under-claims relative to what that pass really kept. Defaults to
-  // DEFAULT_FACT_RETENTION_MS, mirroring enforceFactRetention's own default exactly; validated the
-  // same way as windowMs just above.
+  // the family's own retention (fact-families.js familyRetentionMs, C2 §8.1), mirroring the write
+  // side's default exactly; validated the same way as windowMs just above.
   if (options.retentionMs !== undefined && (!Number.isFinite(options.retentionMs) || options.retentionMs < 0)) {
     throw new Error("readFactPoints requires a finite, non-negative retentionMs");
   }
-  const retentionMs = options.retentionMs ?? DEFAULT_FACT_RETENTION_MS;
+  const retentionMs = options.retentionMs ?? familyRetentionMs(family);
   const sinceMs = options.windowMs !== undefined ? nowMs - options.windowMs : undefined;
   const { records, corrupt_count, bytes, raw_bytes: rawBytes, exists } = await readJsonLines(storePaths.factsFile);
   const integrity = await readFactIntegrityLedger(descartesPaths, family);

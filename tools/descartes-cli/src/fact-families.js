@@ -368,6 +368,47 @@ function buildDataFamilyHorizons(entries) {
 
 export const DATA_FAMILY_HORIZONS = buildDataFamilyHorizons(DATA_FAMILY_HORIZON_ENTRIES);
 
+// Context plan C2 / §8.1 ("Horizon and retention"): per-family retention. Before C2 every family
+// shared fact-store.js's 30-day DEFAULT_FACT_RETENTION_MS (`fact-store.js:31`); long-memory families
+// must outlive the raw window, so the age cutoff is resolved per family here. A family with no entry
+// keeps the 30-day default. Each value is an O resource choice (§16.1), and must be at least the
+// family's declared horizon (rule or data): retention shorter than the memory a family promises would
+// make that promise unkeepable by construction (checked at module init).
+export const DEFAULT_FAMILY_RETENTION_MS = 30 * DAY_MS;
+const FAMILY_RETENTION_ENTRIES = [];
+
+function buildFamilyRetention(entries) {
+  const map = new Map();
+  for (const [family, retentionMs] of entries) {
+    if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: retention for unknown family ${family}`);
+    if (map.has(family)) throw new Error(`fact-families: family ${family} has two retentions`);
+    if (!Number.isFinite(retentionMs) || retentionMs <= 0) throw new Error(`fact-families: family ${family} has an invalid retention`);
+    map.set(family, retentionMs);
+  }
+  for (const family of FACT_FAMILY_IDS) if (!map.has(family)) map.set(family, DEFAULT_FAMILY_RETENTION_MS);
+  return map;
+}
+
+export const FAMILY_RETENTION_MS = buildFamilyRetention(FAMILY_RETENTION_ENTRIES);
+
+/** The age-retention of one family's store (§8.1, C2). Throws on an unknown family. */
+export function familyRetentionMs(family) {
+  requireFactFamily(family);
+  return FAMILY_RETENTION_MS.get(family);
+}
+
+// Derived families (context plan C2, §8.1-§8.2): their records are DERIVED from the other families'
+// committed passes (tick_summary is certified at derivation, I70), and each carries a lineage stamp
+// that names its own family's last committed pass. They are therefore appended ONLY by their own
+// derivation step: the daemon's generic per-tick write (appendFactPointsByFamily) neither appends to
+// them nor runs a retention sweep over them -- a sweep would advance the very pass id the stamp names,
+// and the stamp would never validate (the record's own pass runs retention anyway).
+const DERIVED_FAMILY_ENTRIES = [];
+export const DERIVED_FAMILIES = Object.freeze(new Set(DERIVED_FAMILY_ENTRIES.map((family) => {
+  if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: derived family ${family} is unknown`);
+  return family;
+})));
+
 // H_max(f): the longest eligibility horizon of any history-dependent rule reading family f (§4.5),
 // or, for a data family, its declared data horizon.
 function buildFamilyHorizonMax() {
@@ -383,6 +424,10 @@ function buildFamilyHorizonMax() {
 }
 
 export const FAMILY_HORIZON_MAX_MS = buildFamilyHorizonMax();
+
+for (const [family, horizonMs] of FAMILY_HORIZON_MAX_MS) {
+  if (FAMILY_RETENTION_MS.get(family) < horizonMs) throw new Error(`fact-families: family ${family}'s retention is shorter than its horizon`);
+}
 
 /**
  * The T8 budget invariant / config floor (§4.5): (H_max / interval) x worst-case tick bytes x 1.25.
