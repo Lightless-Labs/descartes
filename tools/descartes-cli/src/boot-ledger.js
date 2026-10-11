@@ -304,16 +304,25 @@ export function boundaryCensusGaps(pendingCensus, censusMs) {
 }
 
 /**
- * C0.9 no-go fallback: host.suspend is unknown, with exposure [0, wall delta] between this structural
+ * C0.9 no-go fallback: host.suspend is unknown, with exposure [0, upper] between this structural
  * reading and the previous one, ONLY within one boot (F2: boot-relative clocks share an epoch only
- * within one boot; the wall delta across a boot does not bound a suspend inside one boot either).
+ * within one boot; no delta across a boot bounds a suspend inside one boot either).
+ *
+ * C0 review M2: the upper bound is the delta of the OS uptime (`os.uptime()`: on Linux CLOCK_BOOTTIME
+ * via /proc/uptime; on macOS now - kern.boottime, which the kernel moves with a calendar set), NOT the
+ * wall-clock delta: a backward wall step shrinks the wall delta below the real elapsed time, so it
+ * would not bound a real suspend. The uptime delta includes suspended time, so it is an upper bound,
+ * widened by the one measurement resolution (I66: whole-second uptime plus non-atomic reads). A
+ * missing uptime on either side is unknown, never the wall delta. Pure; `wallMs` is accepted for the
+ * caller's convenience and not used for the bound.
  */
-export function suspendExposure(lastStructuralClock, { bootIdDigest: digest, wallMs }) {
+export function suspendExposure(lastStructuralClock, { bootIdDigest: digest, uptimeMs } = {}) {
   // C0 review H2: a boot id that could not be read this tick (a timed-out or failed host-lifecycle
   // read) says nothing about a boot boundary: the interval is unknown, never "cross_boot".
   if (!digest) return { interval_basis: "unknown", exposure_upper_s: undefined };
-  if (!lastStructuralClock || !isFiniteInt(lastStructuralClock.wall_ms)) return { interval_basis: "no_previous_reading", exposure_upper_s: undefined };
+  if (!lastStructuralClock || typeof lastStructuralClock.boot_id_digest !== "string") return { interval_basis: "no_previous_reading", exposure_upper_s: undefined };
   if (lastStructuralClock.boot_id_digest !== digest) return { interval_basis: "cross_boot", exposure_upper_s: undefined };
-  if (!isFiniteInt(wallMs) || wallMs < lastStructuralClock.wall_ms) return { interval_basis: "wall_regressed", exposure_upper_s: undefined };
-  return { interval_basis: "same_boot_wall_delta", exposure_upper_s: Math.ceil((wallMs - lastStructuralClock.wall_ms) / 1000) };
+  if (!isFiniteInt(lastStructuralClock.uptime_ms) || !isFiniteInt(uptimeMs)) return { interval_basis: "unknown", exposure_upper_s: undefined };
+  if (uptimeMs < lastStructuralClock.uptime_ms) return { interval_basis: "uptime_regressed", exposure_upper_s: undefined };
+  return { interval_basis: "same_boot_uptime_delta", exposure_upper_s: Math.ceil((uptimeMs - lastStructuralClock.uptime_ms) / 1000) + BOOT_MEASUREMENT_RESOLUTION_S };
 }

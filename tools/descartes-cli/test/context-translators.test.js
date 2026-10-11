@@ -100,7 +100,7 @@ const DARWIN_RESULT = {
 };
 
 test("C0.8/C0.9: host.boot, host.clock_reading and host.suspend from one host-lifecycle envelope; boot id HMAC'd; named clocks never substituted", () => {
-  const points = factPointsFromHostLifecycleEvidence([hostEnvelope(DARWIN_RESULT)], { ts: TS, hmacKey: KEY, bracket: "stable", suspend: { interval_basis: "same_boot_wall_delta", exposure_upper_s: 3600 } });
+  const points = factPointsFromHostLifecycleEvidence([hostEnvelope(DARWIN_RESULT)], { ts: TS, hmacKey: KEY, bracket: "stable", suspend: { interval_basis: "same_boot_uptime_delta", exposure_upper_s: 3600 } });
   assert.deepEqual(points.map((p) => p.fact_name), ["host.boot", "host.clock_reading", "host.suspend"]);
   for (const point of points) assert.deepEqual(validateContextFact(point.fact_name, point.attributes), { ok: true }, point.fact_name);
   const [boot, clock, suspend] = points;
@@ -117,7 +117,7 @@ test("C0.8/C0.9: host.boot, host.clock_reading and host.suspend from one host-li
   assert.equal(clock.attributes.suspend_stats_success, "not_applicable");
   assert.deepEqual(
     { state: suspend.attributes.state, reason: suspend.attributes.reason, lower: suspend.attributes.exposure_lower_s, upper: suspend.attributes.exposure_upper_s, basis: suspend.attributes.interval_basis },
-    { state: "unknown", reason: "f3_inactive_c09_pending", lower: "0", upper: "3600", basis: "same_boot_wall_delta" },
+    { state: "unknown", reason: "f3_inactive_c09_pending", lower: "0", upper: "3600", basis: "same_boot_uptime_delta" },
   );
 });
 

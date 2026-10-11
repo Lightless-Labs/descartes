@@ -152,12 +152,24 @@ test("C0.12: boundary-census gaps are durations from the last census to the boot
   assert.deepEqual(boundaryCensusGaps({ trigger: "wake", event_s: null, sleep_s: null, last_census_ms: 1 }, 5_000), { pre_gap_s: undefined, post_gap_s: undefined }, "a Linux wake has no wake instant: unknown");
 });
 
-test("C0.9 no-go fallback: suspend exposure is [0, wall delta] within one boot only", () => {
+test("C0.9 no-go fallback (C0 review M2): suspend exposure is [0, uptime delta + resolution] within one boot only, immune to a wall-clock step", () => {
   const digest = bootIdDigest(BOOT_A);
-  assert.deepEqual(suspendExposure(null, { bootIdDigest: digest, wallMs: 10 }), { interval_basis: "no_previous_reading", exposure_upper_s: undefined });
-  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 1_000 }, { bootIdDigest: digest, wallMs: 3_601_000 }), { interval_basis: "same_boot_wall_delta", exposure_upper_s: 3600 });
-  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 1_000 }, { bootIdDigest: bootIdDigest(BOOT_B), wallMs: 9_000 }), { interval_basis: "cross_boot", exposure_upper_s: undefined });
-  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 9_000 }, { bootIdDigest: digest, wallMs: 1_000 }), { interval_basis: "wall_regressed", exposure_upper_s: undefined });
+  assert.deepEqual(suspendExposure(null, { bootIdDigest: digest, wallMs: 10, uptimeMs: 10 }), { interval_basis: "no_previous_reading", exposure_upper_s: undefined });
+  assert.deepEqual(
+    suspendExposure({ boot_id_digest: digest, wall_ms: 1_000, uptime_ms: 1_000 }, { bootIdDigest: digest, wallMs: 3_601_000, uptimeMs: 3_601_000 }),
+    { interval_basis: "same_boot_uptime_delta", exposure_upper_s: 3600 + 2 },
+  );
+  // 3600 s really elapsed, the wall clock stepped back 1000 s: the wall delta (2600 s) would not
+  // bound a real 3000 s suspend; the uptime delta still does.
+  assert.deepEqual(
+    suspendExposure({ boot_id_digest: digest, wall_ms: 1_000, uptime_ms: 1_000 }, { bootIdDigest: digest, wallMs: 2_601_000, uptimeMs: 3_601_000 }),
+    { interval_basis: "same_boot_uptime_delta", exposure_upper_s: 3600 + 2 },
+  );
+  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 1_000, uptime_ms: 1_000 }, { bootIdDigest: bootIdDigest(BOOT_B), wallMs: 9_000, uptimeMs: 9_000 }), { interval_basis: "cross_boot", exposure_upper_s: undefined });
+  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 1_000, uptime_ms: 9_000 }, { bootIdDigest: digest, wallMs: 9_000, uptimeMs: 1_000 }), { interval_basis: "uptime_regressed", exposure_upper_s: undefined });
+  // A previous reading without an uptime (an older ledger), or no uptime now: unknown, never the wall delta.
+  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 1_000 }, { bootIdDigest: digest, wallMs: 9_000, uptimeMs: 9_000 }), { interval_basis: "unknown", exposure_upper_s: undefined });
+  assert.deepEqual(suspendExposure({ boot_id_digest: digest, wall_ms: 1_000, uptime_ms: 1_000 }, { bootIdDigest: digest, wallMs: 9_000, uptimeMs: undefined }), { interval_basis: "unknown", exposure_upper_s: undefined });
 });
 
 test("C0 review H2: an unreadable boot id is an unknown interval, never a boot boundary (cross_boot)", () => {

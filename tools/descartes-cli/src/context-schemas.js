@@ -156,7 +156,7 @@ const FACT_SCHEMA_ENTRIES = [
       reason: enumField(["f3_inactive_c09_pending"], ["descartes.daemon"]),
       exposure_lower_s: intField(0, 0, ["descartes.daemon"]),
       exposure_upper_s: intField(0, MAX_DURATION_S, ["kernel.clock", "descartes.daemon"]),
-      interval_basis: enumField(["same_boot_wall_delta", "cross_boot", "no_previous_reading", "wall_regressed", "unknown"], ["kernel.boot_session", "kernel.clock", "descartes.daemon"]),
+      interval_basis: enumField(["same_boot_uptime_delta", "cross_boot", "no_previous_reading", "uptime_regressed", "unknown"], ["kernel.boot_session", "kernel.clock", "descartes.daemon"]),
     },
   }],
   ["host.boundary_census", {

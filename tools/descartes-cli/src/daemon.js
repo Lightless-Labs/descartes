@@ -1104,8 +1104,18 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
   }
   next.last_census_ms = nowMs;
   const wallMs = probeAfter?.clocks?.wall_ms;
-  facts.suspend = suspendExposure(next.last_structural_clock, { bootIdDigest: afterDigest, wallMs });
-  if (afterDigest && Number.isSafeInteger(wallMs)) next.last_structural_clock = { boot_id_digest: afterDigest, wall_ms: wallMs };
+  const uptimeMs = probeAfter?.clocks?.os_uptime_ms;
+  facts.suspend = suspendExposure(next.last_structural_clock, { bootIdDigest: afterDigest, uptimeMs });
+  // C0 review M2: the reference keeps the uptime (the bound's clock); the wall reading is kept for
+  // the record only. A reading without an uptime still records the boot, so the next interval is
+  // unknown rather than cross_boot.
+  if (afterDigest) {
+    next.last_structural_clock = {
+      boot_id_digest: afterDigest,
+      wall_ms: Number.isSafeInteger(wallMs) ? wallMs : null,
+      uptime_ms: Number.isSafeInteger(uptimeMs) ? uptimeMs : null,
+    };
+  }
   const folded = probeAfter
     ? observeBootProbe(next, probeAfter, {
       nowMs,

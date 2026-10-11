@@ -6470,6 +6470,22 @@ test("C0 review H2: a structural tick whose host-lifecycle read timed out persis
   assert.equal(suspend.attributes.interval_basis, "unknown");
 });
 
+test("C0 review M2: across a backward wall-clock step the persisted suspend exposure is the uptime delta, an upper bound on any suspend in the interval", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  const uptime0 = 10 * C12_HOUR;
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: uptime0 });
+  await run(C12_T0);
+  // One real hour later, but the wall clock stepped back 1000 s.
+  const nowMs = C12_T0 + C12_HOUR - 1_000_000;
+  state.checkpoint = C12_T0 - C12_HOUR; // due
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: nowMs, uptimeMs: uptime0 + C12_HOUR });
+  await run(nowMs);
+  const suspend = (await hostFacts(paths, C12_T0 + C12_HOUR)).filter((p) => p.fact_name === "host.suspend").at(-1);
+  assert.equal(suspend.attributes.interval_basis, "same_boot_uptime_delta");
+  assert.equal(suspend.attributes.exposure_upper_s, String(3600 + 2));
+});
+
 test("C0.4 wiring: a login is written once, at its first-observed structural tick; the census marker is written every tick", async () => {
   const paths = await tempPaths();
   const loginResult = {

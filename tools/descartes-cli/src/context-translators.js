@@ -241,7 +241,7 @@ export function factPointsFromHostLifecycleEvidence(evidence, { ts, hmacKey, bra
       reason: "f3_inactive_c09_pending",
       exposure_lower_s: "0",
       exposure_upper_s: intString(suspend?.exposure_upper_s),
-      interval_basis: ["same_boot_wall_delta", "cross_boot", "no_previous_reading", "wall_regressed"].includes(suspend?.interval_basis) ? suspend.interval_basis : "unknown",
+      interval_basis: ["same_boot_uptime_delta", "cross_boot", "no_previous_reading", "uptime_regressed"].includes(suspend?.interval_basis) ? suspend.interval_basis : "unknown",
     },
   }));
 
