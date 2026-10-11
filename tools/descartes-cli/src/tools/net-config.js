@@ -37,6 +37,12 @@ const MAC_RE = /^[0-9A-Fa-f]{1,2}(?::[0-9A-Fa-f]{1,2}){5}$/;
 const DOMAIN_RE = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$/;
 const TUNNEL_IFACE_RE = /^(utun|ipsec|ppp|tun|tap|wg|gif|stf|tailscale|zt|vpn|nordlynx|proton)/;
 const MAGIC_DNS = new Set(["100.100.100.100", "fd7a:115c:a1e0::53"]);
+const LINUX_INET6_FLAGS = new Set([
+  "secondary", "primary", "temporary", "nodad", "optimistic", "dadfailed", "home", "deprecated",
+  "tentative", "permanent", "dynamic", "mngtmpaddr", "noprefixroute", "autojoin", "stable-privacy",
+  "autoconf",
+]);
+const LINUX_INET6_PROTOCOLS = new Set(["unspec", "ra", "kernel_lo", "kernel_ra", "kernel_ll"]);
 
 async function defaultRunFixedExecFile(command, args, options = {}) {
   throwIfCollectorAborted(options.signal);
@@ -222,13 +228,14 @@ export function parseLinuxRouterAdvertisementPrefixes(stdout) {
     if (!match) return { state: "partial", prefixes: [] };
     const [, address, lengthText, _scope, flags = ""] = match;
     const flagTokens = flags ? flags.split(/\s+/) : [];
-    const validFlags = new Set(["dynamic", "mngtmpaddr", "temporary", "autoconf", "deprecated", "dadfailed", "tentative", "optimistic", "home", "stable-privacy", "nodad"]);
     for (let index = 0; index < flagTokens.length; index += 1) {
-      if (flagTokens[index] === "proto" && ["ra", "kernel_ra"].includes(flagTokens[index + 1])) {
+      if (flagTokens[index] === "proto") {
+        const proto = flagTokens[index + 1];
+        if (proto === undefined || (!LINUX_INET6_PROTOCOLS.has(proto) && !/^\d+$/.test(proto))) return { state: "partial", prefixes: [] };
         index += 1;
         continue;
       }
-      if (!validFlags.has(flagTokens[index])) return { state: "partial", prefixes: [] };
+      if (!LINUX_INET6_FLAGS.has(flagTokens[index])) return { state: "partial", prefixes: [] };
     }
     const prefixLength = Number(lengthText);
     if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return { state: "partial", prefixes: [] };
