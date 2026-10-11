@@ -212,14 +212,29 @@ export function preBootInstanceCheck(sessionEvidence, bootTimeS) {
 
 /**
  * I41: a boot boundary is verified by CONJUNCTION and fails closed. Pure. Every conjunct is pass /
- * fail / unknown; a contradiction is a tripwire (forgery, snapshot restore or a collector bug, never
- * "this host is different"). Checked to within BOOT_MEASUREMENT_RESOLUTION_S (I66).
- *   c_never_seen         the new boot id is not in the bounded seen ring (else: regression/duplicate)
- *   c_daemon_restart     the daemon observing it is a different process from the one that last
- *                        observed the previous boot, and it started after the new boot time
- *   c_boot_time_in_gap   the reported boot time lies in (last observation of the previous boot, now]
- *   c_uptime_consistent  uptime at detection agrees with (detection - boot time)
+ * fail / unknown (or not_independent, below). Checked to within BOOT_MEASUREMENT_RESOLUTION_S (I66).
+ *   c_never_seen          the new boot id is not in the bounded seen ring (else: regression/duplicate)
+ *   c_daemon_restart      the daemon observing it is a different process from the one that last
+ *                         observed the previous boot, and it started after the new boot time
+ *   c_boot_time_in_gap    the reported boot time lies in (last observation of the previous boot, now]
+ *   c_uptime_consistent   NOT INDEPENDENT (C0 review H3), see below
  *   c_no_preboot_instance no session in the post-boot census was created before the boot time
+ *
+ * c_uptime_consistent: both platforms derive the reported boot time from the uptime and the wall
+ * clock at read time (Linux /proc/stat btime = realtime - CLOCK_BOOTTIME; macOS libuv uptime =
+ * time(NULL) - kern.boottime). "(detection - boot time) agrees with uptime" is then an identity, and
+ * "uptime fits the gap" is algebraically c_boot_time_in_gap. No captured clock is independent of it
+ * (kern.monotonicclock_usecs is unvalidated until C0.9), so the conjunct is reported as
+ * `not_independent`: never "pass" for a check that cannot fail. It is not a pass, so the verdict is
+ * fail-closed `unverified` until C0.9 names an independent clock or I41 is amended (plan addendum).
+ *
+ * Tripwires (C0 review M3): only the clock-INDEPENDENT contradictions -- a boot id seen before
+ * (regression/duplicate) and a boot-id change under the SAME daemon process (nonce) -- are tripwires.
+ * A contradiction that rests on comparing wall-clock readings taken at different instants (boot time
+ * outside the gap, a session apparently created before the boot, a daemon apparently started before
+ * the boot) is also what a benign clock step produces (a lagging RTC, then an NTP step), and there is
+ * no clock-step detection yet (host.clock, C2): it fails its conjunct and the verdict is
+ * `unverified`, never `tripwire`.
  */
 export function verifyBootBoundary(pending, { sessionEvidence } = {}) {
   const resolutionMs = BOOT_MEASUREMENT_RESOLUTION_S * 1000;
@@ -233,31 +248,26 @@ export function verifyBootBoundary(pending, { sessionEvidence } = {}) {
 
   let daemonRestart;
   if (typeof pending?.daemon_nonce === "string" && typeof prev?.daemon_nonce === "string") {
-    if (pending.daemon_nonce === prev.daemon_nonce) daemonRestart = false;
-    else if (bootTimeMs !== undefined && isFiniteInt(pending.daemon_start_ms)) daemonRestart = pending.daemon_start_ms >= bootTimeMs - resolutionMs;
+    if (pending.daemon_nonce === prev.daemon_nonce) {
+      daemonRestart = false;
+      tripwires.push("boot_id_change_without_daemon_restart");
+    } else if (bootTimeMs !== undefined && isFiniteInt(pending.daemon_start_ms)) {
+      daemonRestart = pending.daemon_start_ms >= bootTimeMs - resolutionMs; // wall-derived: fail, never a tripwire
+    }
   }
-  if (daemonRestart === false) tripwires.push("boot_id_change_without_daemon_restart");
 
   let bootTimeInGap;
   if (bootTimeMs !== undefined && isFiniteInt(prev?.last_observed_ms) && isFiniteInt(pending?.detected_ms)) {
     bootTimeInGap = bootTimeMs > prev.last_observed_ms - resolutionMs && bootTimeMs <= pending.detected_ms + resolutionMs;
   }
-  if (bootTimeInGap === false) tripwires.push("boot_time_outside_gap");
-
-  let uptimeConsistent;
-  if (bootTimeMs !== undefined && isFiniteInt(pending?.uptime_ms_at_detection) && isFiniteInt(pending?.detected_ms)) {
-    uptimeConsistent = Math.abs((pending.detected_ms - bootTimeMs) - pending.uptime_ms_at_detection) <= resolutionMs;
-  }
-  if (uptimeConsistent === false) tripwires.push("uptime_inconsistent");
 
   const noPreboot = preBootInstanceCheck(sessionEvidence, current?.boot_time_s);
-  if (noPreboot === false) tripwires.push("preboot_instance");
 
   const conjuncts = {
     c_never_seen: conjunct(neverSeen),
     c_daemon_restart: conjunct(daemonRestart),
     c_boot_time_in_gap: conjunct(bootTimeInGap),
-    c_uptime_consistent: conjunct(uptimeConsistent),
+    c_uptime_consistent: "not_independent",
     c_no_preboot_instance: conjunct(noPreboot),
   };
   const order = [
@@ -267,7 +277,11 @@ export function verifyBootBoundary(pending, { sessionEvidence } = {}) {
     ["c_uptime_consistent", "uptime_consistent"],
     ["c_no_preboot_instance", "no_preboot_instance"],
   ];
-  const failing = order.find(([key]) => conjuncts[key] !== "pass");
+  // The most informative non-pass conjunct is named: a fail first, then an unknown, then the
+  // permanently not-independent one (which would otherwise mask every later conjunct).
+  const failing = order.find(([key]) => conjuncts[key] === "fail")
+    ?? order.find(([key]) => conjuncts[key] === "unknown")
+    ?? order.find(([key]) => conjuncts[key] !== "pass");
   const verdict = tripwires.length > 0 ? "tripwire" : failing ? "unverified" : "verified";
   const gapMs = isFiniteInt(prev?.last_observed_ms) && isFiniteInt(pending?.detected_ms) ? pending.detected_ms - prev.last_observed_ms : undefined;
   return {

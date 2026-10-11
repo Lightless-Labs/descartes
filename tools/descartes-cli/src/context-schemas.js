@@ -83,7 +83,8 @@ function commonFields(stateProvenance = ["descartes.daemon"]) {
   };
 }
 
-const BOOT_CONJUNCT = ["pass", "fail", "unknown"];
+// "not_independent" (C0 review H3): a conjunct with no measurement independent of another one.
+const BOOT_CONJUNCT = ["pass", "fail", "unknown", "not_independent"];
 
 const FACT_SCHEMA_ENTRIES = [
   // ---------------------------------------------------------------- host_lifecycle

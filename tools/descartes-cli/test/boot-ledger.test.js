@@ -106,35 +106,63 @@ function freshBoundary({ bootOffsetMs = 30 * MIN, uptimeSkewMs = 0, daemon, sess
   return verifyBootBoundary(next.pending_boundary, { sessionEvidence: sessions(sessionList) });
 }
 
-test("I41: an ordinary boot boundary with every conjunct true is verified", () => {
+test("I41 (C0 review H3): an ordinary boot boundary has every independent conjunct true, yet stays unverified: the uptime conjunct is not independent of the boot time", () => {
   const verdict = freshBoundary({ sessionList: [{ created_at_epoch_seconds: Math.floor((T0 + 35 * MIN) / 1000) }] });
-  assert.equal(verdict.verdict, "verified");
-  assert.equal(verdict.failing_conjunct, "none");
+  for (const key of ["c_never_seen", "c_daemon_restart", "c_boot_time_in_gap", "c_no_preboot_instance"]) assert.equal(verdict[key], "pass", key);
+  // Both platforms derive the reported boot time as wall_now - uptime (Linux btime; macOS
+  // kern.boottime), so "uptime consistent with the gap" is the same measurement as
+  // c_boot_time_in_gap. Reporting it as "pass" would claim a fifth check that cannot fail.
+  assert.equal(verdict.c_uptime_consistent, "not_independent");
+  assert.equal(verdict.verdict, "unverified", "fail closed until an independent clock (C0.9) or an I41 amendment");
+  assert.equal(verdict.failing_conjunct, "uptime_consistent");
   assert.equal(verdict.tripwire, "none");
   assert.equal(verdict.os_build_changed, "false");
   assert.equal(verdict.gap_s, 40 * 60, "previous boot last observed at T0, new boot detected at T0 + 40 min");
+  // Whatever uptime the probe reports, the conjunct never claims pass or fail.
+  assert.equal(freshBoundary({ uptimeSkewMs: 10 * MIN }).c_uptime_consistent, "not_independent");
+  assert.equal(freshBoundary({ uptimeSkewMs: 10 * MIN }).tripwire, "none");
 });
 
-test("I41 tripwires: boot-id regression, no daemon restart, boot time outside the gap, inconsistent uptime, a pre-boot instance", () => {
+test("I41 tripwires are the clock-independent contradictions only: boot-id regression and a boot-id change under the SAME daemon process", () => {
   assert.equal(freshBoundary({ seenBefore: true }).tripwire, "boot_id_regression");
-  assert.equal(freshBoundary({ daemon: { nonce: "old-daemon", start_ms: daemonOld.start_ms } }).tripwire, "boot_id_change_without_daemon_restart");
-  assert.equal(freshBoundary({ bootOffsetMs: -60 * MIN }).tripwire, "boot_time_outside_gap", "a boot time before the previous boot's last observation");
-  assert.equal(freshBoundary({ uptimeSkewMs: 10 * MIN }).tripwire, "uptime_inconsistent");
-  const preboot = freshBoundary({ sessionList: [{ created_at_epoch_seconds: Math.floor((T0 - 60 * MIN) / 1000) }] });
-  assert.equal(preboot.verdict, "tripwire");
-  assert.equal(preboot.tripwire, "preboot_instance");
-  assert.equal(preboot.c_no_preboot_instance, "fail");
+  assert.equal(freshBoundary({ seenBefore: true }).verdict, "tripwire");
+  const sameDaemon = freshBoundary({ daemon: { nonce: daemonOld.nonce, start_ms: daemonOld.start_ms } });
+  assert.equal(sameDaemon.tripwire, "boot_id_change_without_daemon_restart");
+  assert.equal(sameDaemon.verdict, "tripwire");
 });
 
-test("I66: the conjunction tolerates exactly the measurement resolution, no more", () => {
-  assert.equal(freshBoundary({ uptimeSkewMs: 2000 }).c_uptime_consistent, "pass");
-  assert.equal(freshBoundary({ uptimeSkewMs: 2001 }).c_uptime_consistent, "fail");
+test("C0 review M3: a wall-clock-dependent contradiction is unverified with its conjunct named, never a tripwire (no clock-step detection yet)", () => {
+  // A boot time before the previous boot's last observation: a lagging RTC after a quick reboot
+  // looks exactly like this.
+  const outside = freshBoundary({ bootOffsetMs: -60 * MIN });
+  assert.equal(outside.c_boot_time_in_gap, "fail");
+  assert.equal(outside.verdict, "unverified");
+  assert.equal(outside.tripwire, "none");
+  assert.equal(outside.failing_conjunct, "boot_time_in_gap");
+  // A tmux session that appears to predate the boot: an NTP step after a lagging RTC.
+  const preboot = freshBoundary({ sessionList: [{ created_at_epoch_seconds: Math.floor((T0 - 60 * MIN) / 1000) }] });
+  assert.equal(preboot.c_no_preboot_instance, "fail");
+  assert.equal(preboot.verdict, "unverified");
+  assert.equal(preboot.tripwire, "none");
+  assert.equal(preboot.failing_conjunct, "no_preboot_instance", "a failing conjunct is named before a not-independent one");
+  // A different daemon process whose start time appears to precede the new boot time: two wall
+  // readings at different instants, so a step between them produces it.
+  const early = freshBoundary({ daemon: { nonce: "new-daemon", start_ms: T0 } });
+  assert.equal(early.c_daemon_restart, "fail");
+  assert.equal(early.verdict, "unverified");
+  assert.equal(early.tripwire, "none");
+});
+
+test("I66: the gap conjunct tolerates exactly the measurement resolution, no more", () => {
+  // The previous boot was last observed at T0; the interval is (T0 - resolution, now + resolution].
+  assert.equal(freshBoundary({ bootOffsetMs: -1000 }).c_boot_time_in_gap, "pass");
+  assert.equal(freshBoundary({ bootOffsetMs: -2000 }).c_boot_time_in_gap, "fail");
 });
 
 test("I41 fails closed: an unknown conjunct (screen sessions without creation time, no usable census) is unverified, never verified", () => {
   const screen = freshBoundary({ sessionList: [{ multiplexer: "screen" }] });
   assert.equal(screen.verdict, "unverified");
-  assert.equal(screen.failing_conjunct, "no_preboot_instance");
+  assert.equal(screen.failing_conjunct, "no_preboot_instance", "an unknown conjunct is named before a not-independent one");
   assert.equal(screen.c_no_preboot_instance, "unknown");
   assert.equal(preBootInstanceCheck([], 100), undefined, "no session census this tick");
   assert.equal(preBootInstanceCheck(sessions([], "unable"), 100), undefined, "an incomplete census");

@@ -6270,7 +6270,7 @@ async function hostFacts(paths, nowMs) {
   return points;
 }
 
-test("C0.8/C0.12: first observation records the boot and triggers nothing; a new boot id runs a +0 census that borrows the next slot and records a verified boundary with its gaps", async () => {
+test("C0.8/C0.12: first observation records the boot and triggers nothing; a new boot id runs a +0 census that borrows the next slot and records the boundary verdict with its gaps", async () => {
   const paths = await tempPaths();
   const { state, run } = c12Harness(paths);
   const bootOneS = Math.floor((C12_T0 - 10 * 24 * C12_HOUR) / 1000);
@@ -6296,7 +6296,13 @@ test("C0.8/C0.12: first observation records the boot and triggers nothing; a new
   assert.equal(state.checkpoint, C12_T0 + C12_HOUR, "it borrowed the next slot instead of resetting the cadence");
   facts = await hostFacts(paths, detectMs);
   const boundary = facts.find((p) => p.fact_name === "host.boot_boundary");
-  assert.equal(boundary.attributes.verdict, "verified", JSON.stringify(boundary.attributes));
+  // Every independent conjunct passes; the uptime conjunct is not independent of the boot time
+  // (C0 review H3), so the boundary is fail-closed unverified, and no tripwire.
+  for (const key of ["c_never_seen", "c_daemon_restart", "c_boot_time_in_gap", "c_no_preboot_instance"]) assert.equal(boundary.attributes[key], "pass", key);
+  assert.equal(boundary.attributes.c_uptime_consistent, "not_independent");
+  assert.equal(boundary.attributes.verdict, "unverified", JSON.stringify(boundary.attributes));
+  assert.equal(boundary.attributes.failing_conjunct, "uptime_consistent");
+  assert.equal(boundary.attributes.tripwire, "none");
   assert.equal(boundary.attributes.os_build_changed, "false");
   assert.equal(boundary.attributes.gap_s, String(25 * 60 - 60), "previous boot last observed at T0 + 1 min");
   const census = facts.find((p) => p.fact_name === "host.boundary_census");
