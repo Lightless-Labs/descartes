@@ -125,7 +125,7 @@ export async function prepareContextC2({ descartesPaths, evidence, basePoints, h
   const points = [...stateless, ...created, ...gap, ...factPointsFromTransitions(transitions.transitions, { ts, hmacKey })];
   return {
     points,
-    context: { snapshot, transitions, chainRead, statsRead, prevChain, gapCount, summaryLedgerReason: summaryLedger.reason, statsLedgerReason: statsLedger.reason },
+    context: { snapshot, transitions, chainRead, statsRead, prevChain, gapCount, futureLossMarker: summaryLedger.ledger?.last_future_fact_ts ?? null, summaryLedgerReason: summaryLedger.reason, statsLedgerReason: statsLedger.reason },
   };
 }
 
@@ -163,7 +163,7 @@ function statsLastSeq(statsRead) {
 export async function finalizeContextC2({ descartesPaths, prepared, factPoints, structuralFacts, ts, hmacKey, configForHash, budgets, deps = {} }) {
   const readLedger = deps.readFactIntegrityLedger ?? readFactIntegrityLedger;
   const append = deps.appendFactPoints ?? appendFactPoints;
-  const { snapshot, transitions, chainRead, statsRead, prevChain, gapCount = 0 } = prepared.context;
+  const { snapshot, transitions, chainRead, statsRead, prevChain, gapCount = 0, futureLossMarker = null } = prepared.context;
   const contributed = new Set((factPoints ?? []).map((point) => factFamilyForName(point?.fact_name)).filter((family) => SUMMARY_SOURCE_FAMILIES.includes(family)));
   const ledgers = {};
   for (const family of SUMMARY_SOURCE_FAMILIES) {
@@ -189,6 +189,7 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
     version: descartesVersion(),
     cfg: configHash(hmacKey, configForHash),
     gapCount,
+    futureLossMarker,
   });
   const status = {
     chain: summary.chain,
@@ -206,7 +207,7 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
   }
   await (deps.writeSummaryChainState ?? writeSummaryChainState)(descartesPaths, summary.nextState(summaryWrite.retention.ledger_generation, summaryWrite.retention.pass_id));
   const statsStoreExisted = statsExisted || summaryExisted;
-  const stats = deriveStats({ prior: statsRead, storeExisted: statsStoreExisted, prevChain, snapshot, transitions, summary, nowIso: ts });
+  const stats = deriveStats({ prior: statsRead, storeExisted: statsStoreExisted, prevChain, snapshot, transitions, summary, nowIso: ts, futureLossMarker });
   const statsWrite = await append(descartesPaths, stats.points, { family: "context_stats", ts, now: ts, ...(budgets?.context_stats ? { maxBytes: budgets.context_stats } : {}) });
   const statsStatus = { state: statsRead.status, memory_lost: stats.memoryLost, points: stats.points.length };
   if (!statsWrite?.retention || statsWrite.retention_error) {

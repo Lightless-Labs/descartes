@@ -64,8 +64,8 @@ export const SUMMARY_MAX_PEER_ENTITIES = 400;
 const RESOLUTION_MS = BOOT_MEASUREMENT_RESOLUTION_S * 1000;
 
 // v2 (C2 review M3): the context holds the last known reading per dimension, with its own observation end.
-const CHAIN_STATE_VERSION = 2;
-const STATS_STATE_VERSION = 1;
+const CHAIN_STATE_VERSION = 3;
+const STATS_STATE_VERSION = 2;
 const HEX16_RE = /^[0-9a-f]{16}$/;
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const KEY_RE = /^[A-Za-z0-9._:+-]{1,256}$/;
@@ -385,6 +385,10 @@ function optionalString(value, re) {
   return value === null || (typeof value === "string" && re.test(value));
 }
 
+function optionalTimestamp(value) {
+  return value === null || (typeof value === "string" && Number.isFinite(Date.parse(value)));
+}
+
 function validEntityList(list, cap) {
   if (list === null) return true;
   if (!Array.isArray(list) || list.length > cap) return false;
@@ -421,7 +425,7 @@ const CONTEXT_STATE_KEYS = [
   "wall_ms", "uptime_ms", "clock_boot_digest", "clock_end",
 ];
 const CONTEXT_INT_KEYS = ["boot_end", "wake_end", "tailnet_end", "vpn_end", "net_end", "tz_end", "utc_offset_end", "wall_ms", "uptime_ms", "clock_end"];
-const CHAIN_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "hmac_key_id", "seq", "record_digest", "record_ts", "session", "peer", "context"];
+const CHAIN_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "future_loss_marker", "hmac_key_id", "seq", "record_digest", "record_ts", "session", "peer", "context"];
 const TOKEN_RE = /^[A-Za-z0-9_.:+-]{1,64}$/;
 
 /** The closed shape of the chain state (any other shape is invalid, never partially trusted). */
@@ -430,6 +434,7 @@ export function isValidSummaryChainState(value) {
   if (value.schema_version !== CHAIN_STATE_VERSION || value.family !== "tick_summary") return false;
   if (typeof value.ledger_generation !== "string" || value.ledger_generation.length === 0 || value.ledger_generation.length > 64) return false;
   if (!Number.isSafeInteger(value.ledger_pass_id) || value.ledger_pass_id < 0) return false;
+  if (!optionalTimestamp(value.future_loss_marker)) return false;
   if (!HEX16_RE.test(value.hmac_key_id ?? "") && value.hmac_key_id !== "unknown") return false;
   if (!Number.isSafeInteger(value.seq) || value.seq < 0 || value.seq > 2 ** 32) return false;
   if (!HEX16_RE.test(value.record_digest ?? "")) return false;
@@ -446,16 +451,18 @@ export function isValidSummaryChainState(value) {
     && CONTEXT_INT_KEYS.every((key) => optionalInt(c[key]));
 }
 
-async function familyLedgerHasLoss(descartesPaths, family, ledger) {
+async function familyLedgerHasLoss(descartesPaths, family, ledger, consumedFutureLossMarker = null) {
   if (!ledger || ledger.continuity?.continuity_ok === false) return true;
   // A future record discarded by retention is a rollback loss even when the remaining file is
   // otherwise byte-consistent. The next derived record must re-anchor instead of continuing.
-  if (ledger.last_future_fact_ts !== null && ledger.last_future_fact_ts !== undefined) return true;
+  const newFutureLoss = ledger.last_future_fact_ts !== null && ledger.last_future_fact_ts !== undefined && ledger.last_future_fact_ts !== consumedFutureLossMarker;
+  if (newFutureLoss) return true;
   try {
     const read = await readFactPoints(descartesPaths, { family, now: new Date().toISOString() });
     const completeness = read.completeness ?? {};
     return read.continuity_observation === "broken"
-      || ["this_read_loss", "future_fact"].includes(completeness.degraded_reason);
+      || completeness.degraded_reason === "this_read_loss"
+      || completeness.degraded_reason === "future_fact" && newFutureLoss;
   } catch {
     return true;
   }
@@ -475,7 +482,7 @@ export async function readSummaryChainState(descartesPaths, { ledger, hmacKeyId 
   const state = read.value;
   if (!ledger) return { status: "no_ledger" };
   if (ledger.continuity?.pending_pass) return { status: "pending_pass" };
-  if (await familyLedgerHasLoss(descartesPaths, "tick_summary", ledger)) return { status: "continuity_lost" };
+  if (await familyLedgerHasLoss(descartesPaths, "tick_summary", ledger, state.future_loss_marker)) return { status: "continuity_lost" };
   if (state.ledger_generation !== ledger.generation || state.ledger_pass_id !== ledger.continuity?.last_committed_pass_id) return { status: "lineage_mismatch" };
   if (state.hmac_key_id !== hmacKeyId) return { status: "key_changed" };
   return { status: "valid", state };
@@ -964,7 +971,7 @@ function presenceCode(value) {
  * missing state over an existing store is a restart, never a fresh start); `lastSeq` is the last seq
  * found in the store (only used to keep seq increasing across a restart).
  */
-export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq, certification, transitions, hmacKey, version, cfg, gapCount = 0 }) {
+export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq, certification, transitions, hmacKey, version, cfg, gapCount = 0, futureLossMarker = null }) {
   const prevState = prior?.status === "valid" ? prior.state : undefined;
   const hasGap = gapCount === "unknown" || Number.isSafeInteger(gapCount) && gapCount > 0;
   const chain = hasGap ? "gap" : prevState ? "continued" : storeHadSummaries ? "restarted" : "started";
@@ -1034,6 +1041,7 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
     family: "tick_summary",
     ledger_generation: generation,
     ledger_pass_id: passId,
+    future_loss_marker: futureLossMarker ?? prevState?.future_loss_marker ?? null,
     hmac_key_id: contextKeyId(hmacKey),
     seq: Math.min(seq, 2 ** 32),
     record_digest: digest,
@@ -1103,7 +1111,7 @@ export function verifyTickSummaryChain(points) {
 // Long-lived statistics skeleton (§8.2). DATA ONLY.
 // ------------------------------------------------------------------------------------------------
 
-const STATS_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "episode", "daily", "memory_lost_count", "memory_lost_ts"];
+const STATS_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "future_loss_marker", "episode", "daily", "memory_lost_count", "memory_lost_ts"];
 const EPISODE_KEYS = ["eseq", "kind", "ev", "offset", "cert", "pre_session", "pre_peer"];
 const DAILY_KEYS = ["day", "memory", "cert", "clock_step", "intervals", "uncertified_ticks", "uncertified_exposure_s", "s_known", "p_known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"];
 const DAILY_COUNTERS = DAILY_KEYS.filter((key) => !["day", "memory", "cert", "clock_step"].includes(key));
@@ -1117,6 +1125,7 @@ export function isValidStatsState(value) {
   if (value.schema_version !== STATS_STATE_VERSION || value.family !== "context_stats") return false;
   if (typeof value.ledger_generation !== "string" || value.ledger_generation.length === 0 || value.ledger_generation.length > 64) return false;
   if (!validCounter(value.ledger_pass_id) || !validCounter(value.memory_lost_count)) return false;
+  if (!optionalTimestamp(value.future_loss_marker)) return false;
   if (value.memory_lost_ts !== null && (typeof value.memory_lost_ts !== "string" || !Number.isFinite(Date.parse(value.memory_lost_ts)))) return false;
   if (value.episode !== null) {
     const e = value.episode;
@@ -1146,7 +1155,7 @@ export async function readStatsState(descartesPaths, { ledger } = {}) {
   const state = read.value;
   if (!ledger) return { status: "no_ledger" };
   if (ledger.continuity?.pending_pass) return { status: "pending_pass" };
-  if (await familyLedgerHasLoss(descartesPaths, "context_stats", ledger)) return { status: "continuity_lost" };
+  if (await familyLedgerHasLoss(descartesPaths, "context_stats", ledger, state.future_loss_marker)) return { status: "continuity_lost" };
   if (state.ledger_generation !== ledger.generation || state.ledger_pass_id !== ledger.continuity?.last_committed_pass_id) return { status: "lineage_mismatch" };
   return { status: "valid", state };
 }
@@ -1212,7 +1221,7 @@ const EPISODE_KIND_PRIORITY = ["boot", "wake", "tailnet", "vpn", "net_config"];
  * the opening tick, then 1 and 2) are computed here, while the raw census sets exist; the pre-event set
  * is the previous chain state's. Daily records close when the UTC day changes.
  */
-export function deriveStats({ prior, storeExisted, prevChain, snapshot, transitions, summary, nowIso }) {
+export function deriveStats({ prior, storeExisted, prevChain, snapshot, transitions, summary, nowIso, futureLossMarker = null }) {
   const prevState = prior?.status === "valid" ? prior.state : undefined;
   const summaryChain = summary.point?.attributes?.chain;
   const certified = summary.point?.attributes?.cert === "certified";
@@ -1281,6 +1290,7 @@ export function deriveStats({ prior, storeExisted, prevChain, snapshot, transiti
     family: "context_stats",
     ledger_generation: generation,
     ledger_pass_id: passId,
+    future_loss_marker: futureLossMarker ?? prevState?.future_loss_marker ?? null,
     episode: episode ? {
       ...episode,
       pre_session: episode.pre_session && isPlainObject(episode.pre_session) ? episode.pre_session : { census: "u", universe: null, entities: null },
