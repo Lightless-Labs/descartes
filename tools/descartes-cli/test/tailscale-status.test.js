@@ -322,6 +322,42 @@ test("B3 daybreak reproduction: one malformed Peer entry invalidates the whole p
   assert.equal(envelope.result.tailnet.exit_node_in_use, undefined);
 });
 
+test("B1 daybreak reproduction: string boolean peer fields invalidate the population and exit-node use", async () => {
+  const malformed = JSON.stringify({
+    BackendState: "Running",
+    Peer: {
+      [PUBLIC_KEY_A]: {
+        PublicKey: PUBLIC_KEY_A,
+        Online: "false",
+        ExitNode: "false",
+        ExitNodeOption: "false",
+      },
+    },
+    Self: { Online: true },
+  });
+  const parsed = parseTailscaleStatusJson(malformed);
+  assert.equal(parsed.peer_map_valid, false);
+  assert.deepEqual(parsed.peers, []);
+  assert.equal(parsed.tailnet.exit_node_in_use, undefined);
+
+  const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(malformed))) });
+  assert.equal(envelope.result.status, "unable");
+  assert.equal(envelope.result.tailnet.exit_node_in_use, undefined);
+  assert.deepEqual(envelope.result.peers, []);
+});
+
+test("B1: malformed consumed tailnet fields invalidate the source instead of becoming absent or false", () => {
+  for (const [field, value] of [
+    ["Self", { Online: "false" }],
+    ["CurrentTailnet", { Name: false }],
+    ["Health", ["healthy", 7]],
+  ]) {
+    const parsed = parseTailscaleStatusJson(JSON.stringify({ BackendState: "Running", Peer: {}, [field]: value }));
+    assert.equal(parsed.tailnet.valid, false, field);
+    assert.equal(parsed.tailnet.exit_node_in_use, undefined, field);
+  }
+});
+
 test("C0.3: an unrecognized BackendState keeps the peer envelope unable and records the raw state for the translator to classify", async () => {
   const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(JSON.stringify({ BackendState: "Weird", Peer: {} })))) });
   assert.equal(envelope.result.status, "unable");
