@@ -6434,3 +6434,46 @@ test("C0.5 wiring: net.config_fingerprint reaches network_context, keyed by the 
   const raw = await fs.readFile(path.join(paths.stateDir, "learned", "facts", "network_context", "facts.jsonl"), "utf8");
   assert.ok(!raw.includes("192.168.64.1"), "no raw resolver in fact history");
 });
+
+test("C0.8/C0.12 (ordering): when the host_lifecycle append fails, the boot ledger is not committed -- the pending boundary stays pending and is recorded at the next census", async () => {
+  const paths = await tempPaths();
+  const { state, run } = c12Harness(paths);
+  const bootOneS = Math.floor((C12_T0 - 10 * 24 * C12_HOUR) / 1000);
+  state.probe = hostProbe(BOOT_ONE, { bootTimeS: bootOneS, wallMs: C12_T0, uptimeMs: C12_T0 - bootOneS * 1000 });
+  await run(C12_T0);
+  const bootTwoS = Math.floor((C12_T0 + 20 * 60000) / 1000);
+  const detectMs = C12_T0 + 25 * 60000;
+  state.probe = hostProbe(BOOT_TWO, { bootTimeS: bootTwoS, wallMs: detectMs, uptimeMs: detectMs - bootTwoS * 1000 });
+  const failingAppend = async (descartesPaths, points, opts) => {
+    const result = await appendFactPointsByFamily(descartesPaths, points.filter((p) => !p.fact_name.startsWith("host.")), opts);
+    return { ...result, families: { ...result.families, host_lifecycle: { written_count: 0, append_error: "disk full" } }, append_error: "host_lifecycle: disk full" };
+  };
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { sessions: { enabled: true }, "host-lifecycle": { enabled: true } }, boundary_census: { enabled: true } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      sessions: async () => envelope("sessions", "collect_sessions", { sessions: [], multiplexers: [{ multiplexer: "tmux", status: "ok" }], total_count: 0, truncated: false }),
+      "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", state.probe),
+    },
+    hostLifecycleProbe: async () => state.probe,
+    daemonInstance: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 },
+    appendFactPoints: failingAppend,
+    evaluateAlerts: false,
+    ts: new Date(detectMs).toISOString(),
+    now: detectMs,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: state.checkpoint }),
+    writeStructuralCheckpoint: async (_paths, checkpoint) => { state.checkpoint = checkpoint.last_structural_run_ms; return checkpoint; },
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.boot_ledger_error, "host_lifecycle_facts_not_persisted");
+  const { readBootLedger } = await import("../src/boot-ledger.js");
+  const ledger = (await readBootLedger(paths)).ledger;
+  assert.ok(ledger.pending_boundary, "the boundary is still pending");
+  assert.ok(ledger.pending_census, "the census record is still pending");
+  // The next scheduled census records it.
+  await run(C12_T0 + C12_HOUR + 60000, { daemon: { nonce: "daemon-b", start_ms: bootTwoS * 1000 + 30000 } });
+  const facts = await hostFacts(paths, C12_T0 + C12_HOUR + 60000);
+  assert.equal(facts.filter((p) => p.fact_name === "host.boot_boundary").length, 1);
+  assert.equal(facts.find((p) => p.fact_name === "host.boundary_census").attributes.status, "deferred_cost_cap");
+});

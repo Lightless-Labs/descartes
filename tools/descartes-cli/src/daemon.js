@@ -1341,13 +1341,6 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           const hostContext = hostLifecycleEnabled
             ? deriveHostLifecycleContext({ ledger: bootLedger, probeBefore: bootProbeBefore, structuralEvidence, nowMs, hmacKey, daemon: options.daemonInstance ?? currentDaemonInstance() })
             : undefined;
-          if (hostContext?.ledger) {
-            try {
-              await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, hostContext.ledger);
-            } catch (error) {
-              bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_write_failed";
-            }
-          }
           // Context plan C0.4: first-observed-tick dedupe of login rows (a repeated sighting is not
           // a repeated login). A seen-state that cannot be read re-emits as `reseeded`; one that
           // cannot be written is reported, and the next tick re-reads the old state.
@@ -1358,7 +1351,6 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
               try {
                 const seenRead = await (options.readLoginSeen ?? readLoginSeen)(descartesPaths);
                 loginDedupe = selectNewLoginRows(seenRead.seen, loginEnvelope.result, { nowMs, bootSalt: bootLedger?.current?.boot_id_digest ?? "" });
-                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginDedupe.next);
               } catch (error) {
                 loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_error";
                 console.warn(`[daemon] login dedupe state failed this tick (${loginSeenError})`);
@@ -1433,6 +1425,38 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
             console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
             structuralFacts = { written_count: 0, retention: undefined };
+          }
+
+          // Context plan C0.4/C0.8/C0.12: the boot ledger (which consumes a pending boundary and
+          // census and advances the suspend reference) and the login seen-state (which marks rows
+          // seen) are committed only AFTER their family's facts were appended. If the append failed,
+          // the pending boundary/census stay pending and are re-derived at the next census, the
+          // exposure interval widens truthfully, and the login rows are offered again: never a
+          // consumed record that reached no fact history.
+          const familyPersisted = (family) => structuralFacts?.families !== undefined
+            && structuralFacts.families[family] !== undefined
+            && structuralFacts.families[family].append_error === undefined;
+          if (hostContext?.ledger) {
+            if (familyPersisted("host_lifecycle")) {
+              try {
+                await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, hostContext.ledger);
+              } catch (error) {
+                bootLedgerError = (error instanceof Error ? error.message : String(error)) || "boot_ledger_write_failed";
+              }
+            } else {
+              bootLedgerError = "host_lifecycle_facts_not_persisted";
+            }
+          }
+          if (loginDedupe) {
+            if (familyPersisted("session_context")) {
+              try {
+                await (options.writeLoginSeen ?? writeLoginSeen)(descartesPaths, loginDedupe.next);
+              } catch (error) {
+                loginSeenError = (error instanceof Error ? error.message : String(error)) || "login_seen_write_failed";
+              }
+            } else {
+              loginSeenError = "session_context_facts_not_persisted";
+            }
           }
 
           // Slice S7a, additive, RE-GATED (watch-by-default slice 1, plan §3.2): shadow-constraint
