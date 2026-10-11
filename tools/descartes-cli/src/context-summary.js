@@ -327,20 +327,30 @@ async function writeJsonFile(file, value) {
   await fsp.rename(tmp, file);
 }
 
-const GAP_STATE_KEYS = ["schema_version", "missing_count", "first_ts", "reason"];
+const GAP_STATE_KEYS = ["schema_version", "ledger_generation", "ledger_pass_id", "missing_count", "first_ts", "reason"];
 
 function isValidGapState(value) {
   return exactKeys(value, GAP_STATE_KEYS)
     && value.schema_version === 1
-    && Number.isSafeInteger(value.missing_count) && value.missing_count > 0 && value.missing_count <= 2 ** 32
-    && typeof value.first_ts === "string" && Number.isFinite(Date.parse(value.first_ts))
+    && (value.ledger_generation === null || typeof value.ledger_generation === "string" && value.ledger_generation.length > 0 && value.ledger_generation.length <= 64)
+    && (value.ledger_pass_id === null || Number.isSafeInteger(value.ledger_pass_id) && value.ledger_pass_id >= 0)
+    && ((value.ledger_generation === null) === (value.ledger_pass_id === null))
+    && Number.isSafeInteger(value.missing_count) && value.missing_count >= 0 && value.missing_count <= 2 ** 32
+    && (value.missing_count === 0
+      ? value.first_ts === null && value.reason === "none"
+      : typeof value.first_ts === "string" && Number.isFinite(Date.parse(value.first_ts))
+        && value.reason !== "none")
     && typeof value.reason === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(value.reason);
 }
 
-export async function readSummaryGapState(descartesPaths) {
+export async function readSummaryGapState(descartesPaths, { ledger } = {}) {
   const read = await readJsonFile(resolveSummaryGapPath(descartesPaths));
   if (read.status !== "ok") return { status: read.status };
-  return isValidGapState(read.value) ? { status: "valid", state: read.value } : { status: "invalid" };
+  if (!isValidGapState(read.value)) return { status: "invalid" };
+  if (ledger && (read.value.ledger_generation !== ledger.generation || read.value.ledger_pass_id !== ledger.continuity?.last_committed_pass_id)) {
+    return { status: "lineage_mismatch" };
+  }
+  return { status: "valid", state: read.value };
 }
 
 export async function writeSummaryGapState(descartesPaths, state) {
@@ -956,7 +966,7 @@ function presenceCode(value) {
  */
 export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq, certification, transitions, hmacKey, version, cfg, gapCount = 0 }) {
   const prevState = prior?.status === "valid" ? prior.state : undefined;
-  const hasGap = Number.isSafeInteger(gapCount) && gapCount > 0;
+  const hasGap = gapCount === "unknown" || Number.isSafeInteger(gapCount) && gapCount > 0;
   const chain = hasGap ? "gap" : prevState ? "continued" : storeHadSummaries ? "restarted" : "started";
   const seq = prevState ? prevState.seq + 1 : Number.isSafeInteger(lastSeq) ? lastSeq + 1 : 0;
   const sessionChurn = intervalChurn(hasGap ? undefined : prevState?.session, snapshot.session);
@@ -972,7 +982,7 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
     seq: String(Math.min(seq, 2 ** 32)),
     prev: prevState ? prevState.record_digest : chain === "started" ? "none" : "unknown",
     chain,
-    g: Math.min(hasGap ? gapCount : 0, 2 ** 32).toString(36),
+    g: gapCount === "unknown" ? "unknown" : Math.min(hasGap ? gapCount : 0, 2 ** 32).toString(36),
     cert: certification?.cert ?? "unknown",
     cd: certification?.certd ?? "unknown",
     kid: contextKeyId(hmacKey),
