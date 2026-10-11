@@ -205,7 +205,9 @@ export function parseNdpRouterAdvertisementPrefixes(stdout, iface) {
   for (const rawLine of stdout.split("\n")) {
     if (/\//.test(rawLine) && !/^\s*[^\s/]+\/\d+\s+if=[^\s]+/.test(rawLine)) return undefined;
     const match = /^\s*([^\s/]+)\/(\d+)\s+if=([^\s]+)/.exec(rawLine);
-    if (!match || match[3] !== iface) continue;
+    if (!match) continue;
+    if (!IFACE_RE.test(match[3])) return undefined;
+    if (match[3] !== iface) continue;
     const address = match[1];
     const prefixLength = Number(match[2]);
     if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return undefined;
@@ -306,7 +308,10 @@ function parseNmcliDomains(stdout, { lease = false } = {}) {
     const line = rawLine.trim();
     if (!line) continue;
     const value = lease ? /^domain_name\s*=\s*(.*)$/i.exec(line)?.[1] : line;
-    if (value === undefined) continue;
+    if (value === undefined) {
+      if (lease && /^domain_name\b/i.test(line)) return undefined;
+      continue;
+    }
     const domains = value.trim() ? value.split(/[,\s]+/).map((item) => item.trim().toLowerCase()) : [];
     for (const domain of domains) {
       if (!DOMAIN_RE.test(domain)) return undefined;
