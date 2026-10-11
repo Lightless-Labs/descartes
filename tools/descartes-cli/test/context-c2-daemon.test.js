@@ -293,3 +293,39 @@ test("C2 derived families: an oversize tick_summary store never turns the daemon
     assert.deepEqual(strip(after.fact_store_budgets.families[family]), strip(off.fact_store_budgets.families[family]), family);
   }
 });
+
+// C2 review M7: wiping one derived family's whole directory is loss, not a first run, while the other
+// derived family survives (§8.2: wiping the store is never cheaper than a volume attack).
+test("C2 derived families: a wiped context_stats or tick_summary directory beside a surviving sibling is loss, never a first run", async () => {
+  const statusOf = (result) => result.status ?? result;
+  {
+    const paths = await tempPaths();
+    const { run } = harness(paths);
+    await run(T0);
+    await run(T0 + HOUR);
+    await fs.rm(resolveFactStorePaths(paths, "context_stats").dir, { recursive: true, force: true });
+    const c2 = statusOf(await run(T0 + 2 * HOUR)).context_c2;
+    assert.equal(c2.stats.memory_lost, true, "context_stats wiped while tick_summary survives: memory lost");
+    assert.equal(c2.stats.memory_lost_count, 1);
+    assert.equal(c2.chain, "continued");
+  }
+  {
+    const paths = await tempPaths();
+    const { run } = harness(paths);
+    await run(T0);
+    const second = statusOf(await run(T0 + HOUR)).context_c2;
+    await fs.rm(resolveFactStorePaths(paths, "tick_summary").dir, { recursive: true, force: true });
+    const c2 = statusOf(await run(T0 + 2 * HOUR)).context_c2;
+    assert.equal(c2.chain, "restarted", "tick_summary wiped while context_stats survives: a restart (loss), never started");
+    assert.ok(c2.seq > second.seq, "seq keeps increasing from the statistics' last seq (no episode id reuse)");
+    const summaries = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 2 * HOUR).toISOString() })).points;
+    assert.deepEqual(verifyTickSummaryChain(summaries).losses.map((l) => l.reason), ["restarted"]);
+  }
+  {
+    // Control: a genuine first run (neither store) is a first run.
+    const paths = await tempPaths();
+    const c2 = statusOf(await harness(paths).run(T0)).context_c2;
+    assert.equal(c2.chain, "started");
+    assert.equal(c2.stats.memory_lost, false);
+  }
+});

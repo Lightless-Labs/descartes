@@ -124,6 +124,18 @@ async function lastSummarySeq(descartesPaths, now) {
   }
 }
 
+function maxDefined(...values) {
+  const known = values.filter(Number.isSafeInteger);
+  return known.length > 0 ? Math.max(...known) : undefined;
+}
+
+// The last seq the (valid) statistics state saw, so a wiped tick_summary never reuses a seq (an
+// episode id) the long-lived statistics already hold.
+function statsLastSeq(statsRead) {
+  if (statsRead?.status !== "valid") return undefined;
+  return maxDefined(statsRead.state?.daily?.last_seq, statsRead.state?.episode?.eseq);
+}
+
 /**
  * Pass-2 half. Certifies, derives and appends the tick_summary record and the statistics, and
  * commits their stamped states only after their own append committed. Returns the status entry.
@@ -139,8 +151,13 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
     ledgers[family] = (await readLedger(descartesPaths, family)).ledger ?? undefined;
   }
   const certification = certifySourcePasses({ familyResults: structuralFacts?.families, ledgers, contributed, tsMs: snapshot.tsMs });
-  const storeHadSummaries = prepared.context.summaryLedgerReason !== "missing" || await factStoreExists(descartesPaths, "tick_summary");
-  const lastSeq = chainRead.status === "valid" || !storeHadSummaries ? undefined : await lastSummarySeq(descartesPaths, ts);
+  // C2 review M7: the two derived families vouch for each other. One family's whole directory wiped
+  // while the other survives is LOSS (a restarted chain, a memory-lost cold start), never a first
+  // run. (Both wiped together is not detectable from here; the trusted-state ledger is the B-ledger's.)
+  const summaryExisted = prepared.context.summaryLedgerReason !== "missing" || await factStoreExists(descartesPaths, "tick_summary");
+  const statsExisted = prepared.context.statsLedgerReason !== "missing" || await factStoreExists(descartesPaths, "context_stats");
+  const storeHadSummaries = summaryExisted || statsExisted;
+  const lastSeq = chainRead.status === "valid" || !storeHadSummaries ? undefined : maxDefined(await lastSummarySeq(descartesPaths, ts), statsLastSeq(statsRead));
   const summary = deriveTickSummary({
     snapshot,
     prior: chainRead,
@@ -166,7 +183,7 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
     return { ...status, summary: "appended_unstamped", error: summaryWrite?.retention_error ?? "tick_summary_retention_missing" };
   }
   await (deps.writeSummaryChainState ?? writeSummaryChainState)(descartesPaths, summary.nextState(summaryWrite.retention.ledger_generation, summaryWrite.retention.pass_id));
-  const statsStoreExisted = prepared.context.statsLedgerReason !== "missing" || await factStoreExists(descartesPaths, "context_stats");
+  const statsStoreExisted = statsExisted || summaryExisted;
   const stats = deriveStats({ prior: statsRead, storeExisted: statsStoreExisted, prevChain, snapshot, transitions, summary, nowIso: ts });
   const statsWrite = await append(descartesPaths, stats.points, { family: "context_stats", ts, now: ts, ...(budgets?.context_stats ? { maxBytes: budgets.context_stats } : {}) });
   const statsStatus = { state: statsRead.status, memory_lost: stats.memoryLost, points: stats.points.length };
