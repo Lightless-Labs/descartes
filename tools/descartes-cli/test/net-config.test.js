@@ -170,6 +170,8 @@ test("C0.5 linux collector: ip route / ip neigh / ip -6 addr / nmcli / resolvect
       "ip route show default": ok("default via 192.168.1.1 dev wlp2s0 proto dhcp metric 600\n"),
       "ip neigh show 192.168.1.1 dev wlp2s0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
       "ip -6 addr show dev wlp2s0 scope global": ok(""),
+      "nmcli -g IP4.DOMAIN device show wlp2s0": ok("configured.example\n"),
+      "nmcli -g DHCP4.OPTION.domain_name device show wlp2s0": ok(""),
       "resolvectl dns wlp2s0": ok("Link 3 (wlp2s0): 192.168.1.1\n"),
     }),
   });
@@ -178,6 +180,40 @@ test("C0.5 linux collector: ip route / ip neigh / ip -6 addr / nmcli / resolvect
   assert.deepEqual(result.components.ra_prefix, { state: "absent" });
   assert.deepEqual(result.components.dhcp_domain, { state: "not_found_on_known_paths" });
   assert.equal(result.status, "partial");
+});
+
+test("HIGH: Linux IP4.DOMAIN is configured-search-domain provenance, not a DHCP lease", async () => {
+  const result = await readNetConfig({
+    platform: "linux",
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: scripted({
+      "ip route show default": ok("default via 192.168.1.1 dev eth0 proto dhcp\n"),
+      "ip neigh show 192.168.1.1 dev eth0": ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"),
+      "ip -6 addr show dev eth0 scope global": ok(""),
+      "nmcli -g IP4.DOMAIN device show eth0": ok("manually.configured.example\n"),
+      "nmcli -g DHCP4.OPTION.domain_name device show eth0": ok(""),
+      "resolvectl dns eth0": ok("Link 2 (eth0): 192.168.1.1\n"),
+    }),
+  });
+  assert.deepEqual(result.components.configured_search_domain, { state: "ok", value: "manually.configured.example" });
+  assert.deepEqual(result.components.dhcp_domain, { state: "absent" });
+});
+
+test("HIGH: the translator keeps configured search domain separate from DHCP lease provenance", () => {
+  const point = fingerprintOf({
+    ...HOME_NET,
+    platform: "linux",
+    components: {
+      ...HOME_NET.components,
+      configured_search_domain: { state: "ok", value: "manually.configured.example" },
+      dhcp_domain: { state: "unable" },
+    },
+  });
+  assert.equal(point.attributes.dhcp_domain_hmac, "unknown");
+  assert.equal(point.attributes.dhcp_domain_state, "unable");
+  assert.equal(point.attributes.configured_search_domain_hmac, contextHmac(KEY, "net_configured_search_domain", "manually.configured.example"));
+  assert.equal(point.attributes.configured_search_domain_state, "ok");
 });
 
 test("C0.5: a failing route read is the collector's state, never a fabricated 'no network'", async () => {
