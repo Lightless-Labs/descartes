@@ -27,6 +27,7 @@ import {
   readStatsState,
   readDescartesVersion,
   readSummaryChainState,
+  SUMMARY_SOURCE_FAMILIES,
   TICK_SUMMARY_MAX_RECORD_BYTES,
   tickSummaryDigest,
   verifyTickSummaryChain,
@@ -84,7 +85,10 @@ function chainTicks(ticks) {
   for (const [index, t] of ticks.entries()) {
     const snapshot = snapshotOf(t, t.hostFacts);
     const transitions = deriveContextTransitions(prior.status === "valid" ? prior.state : undefined, snapshot);
-    const summary = deriveTickSummary({ snapshot, prior, storeHadSummaries: index > 0, transitions, hmacKey: KEY, version: "0.0.50", cfg: "0123456789abcdef", certification: { cert: "certified", certd: "fedcba9876543210" } });
+    const familyResults = Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [family, { retention: { ledger_generation: `${family}-generation`, pass_id: index + 1, pass_time_ms: t.ms } }]));
+    const ledgers = Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [family, { generation: `${family}-generation`, continuity: { last_committed_pass_id: index + 1, last_rewrite_newest_ts: t.ts, continuity_ok: true }, bytecap_floor_ts: null, age_floor_ts: null }]));
+    const certification = certifySourcePasses({ familyResults, ledgers, contributed: new Set(SUMMARY_SOURCE_FAMILIES), tsMs: t.ms });
+    const summary = deriveTickSummary({ snapshot, prior, storeHadSummaries: index > 0, transitions, hmacKey: KEY, version: "0.0.50", cfg: "0123456789abcdef", certification });
     out.push({ snapshot, transitions, summary });
     prior = { status: "valid", state: summary.nextState("gen", index + 1) };
   }
@@ -289,7 +293,7 @@ test("summary_valid_after_source_byte_eviction and summary_own_chain_break_is_lo
   for (const [i, { summary }] of ticks.entries()) {
     // The source family is appended, then byte-evicted hard (a budget smaller than one tick).
     await appendFactPoints(paths, tick({ ms: T0 + i * HOUR, sessions: { a: 1 } }).points.filter((p) => p.fact_name === "session.presence"), { family: "session", now: new Date(T0 + i * HOUR).toISOString(), maxBytes: 10 });
-    await appendFactPoints(paths, [summary.point], { family: "tick_summary", now: new Date(T0 + i * HOUR).toISOString() });
+    await appendFactPoints(paths, [summary.point, summary.certificatePoint], { family: "tick_summary", now: new Date(T0 + i * HOUR).toISOString() });
   }
   const sessionRead = await readFactPoints(paths, { family: "session", now: new Date(T0 + 4 * HOUR).toISOString() });
   assert.equal(sessionRead.points.length, 0, "the source facts are gone (intentional byte eviction)");
@@ -297,13 +301,13 @@ test("summary_valid_after_source_byte_eviction and summary_own_chain_break_is_lo
   assert.equal(read.points.length, 4);
   assert.deepEqual(verifyTickSummaryChain(read.points).losses, [], "summary_valid_after_source_byte_eviction");
   // Remove a middle record: a break in the summary's own chain is loss, never silence.
-  const broken = read.points.filter((_, i) => i !== 1);
+  const broken = read.points.filter((point) => !(point.attributes?.seq === "1"));
   assert.deepEqual(verifyTickSummaryChain(broken).losses.map((l) => l.reason), ["prev_mismatch"], "summary_own_chain_break_is_loss");
   // Edit a record's content: its digest no longer matches the next record's prev.
-  const edited = read.points.map((p, i) => (i === 1 ? { ...p, attributes: { ...p.attributes, sn: "7" } } : p));
+  const edited = read.points.map((p) => (p.fact_name === "tick.summary" && p.attributes?.seq === "1" ? { ...p, attributes: { ...p.attributes, sn: "7" } } : p));
   assert.deepEqual(verifyTickSummaryChain(edited).losses.map((l) => l.reason), ["prev_mismatch"]);
   // Age eviction of the oldest summaries is not loss: the first retained record's predecessor is gone on purpose.
-  assert.deepEqual(verifyTickSummaryChain(read.points.slice(2)).losses, []);
+  assert.deepEqual(verifyTickSummaryChain(read.points.filter((point) => Number(point.attributes?.seq) >= 2)).losses, []);
   assert.equal(tickSummaryDigest(read.points[0]), ticks[0].summary.digest, "the digest is recomputable from the stored record");
 });
 
@@ -356,6 +360,37 @@ test("C2 state readers treat continuity loss and a missing facts file as loss, n
   assert.equal((await readSummaryChainState(paths, { ledger, hmacKeyId: contextKeyId(KEY) })).status, "continuity_lost", "rollback-discarded future records are loss");
 });
 
+test("C2 rollback loss is consumed once by both state readers", async () => {
+  const paths = await tempPaths();
+  const [{ summary }] = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1 })]);
+  const summaryPass = await appendFactPoints(paths, [summary.point, summary.certificatePoint], { family: "tick_summary", now: new Date(T0).toISOString() });
+  const chainState = summary.nextState(summaryPass.retention.ledger_generation, summaryPass.retention.pass_id);
+  await writeSummaryChainState(paths, chainState);
+  const [{ summary: statsSummary, snapshot, transitions }] = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1 })]);
+  const stats = deriveStats({ prior: { status: "missing" }, storeExisted: false, prevChain: undefined, snapshot, transitions, summary: statsSummary, nowIso: snapshot.ts });
+  const statsPass = await appendFactPoints(paths, stats.points, { family: "context_stats", now: new Date(T0).toISOString() });
+  await writeStatsState(paths, stats.nextState(statsPass.retention.ledger_generation, statsPass.retention.pass_id));
+
+  const marker = new Date(T0 + HOUR).toISOString();
+  const { ledger: chainLedger } = await readFactIntegrityLedger(paths, "tick_summary");
+  const { ledger: statsLedger } = await readFactIntegrityLedger(paths, "context_stats");
+  const stamped = (ledger) => ({ ...ledger, future_fact_dropped_total: 1, last_future_fact_ts: marker });
+  const { writeFactIntegrityLedger } = await import("../src/fact-store-integrity.js");
+  await writeFactIntegrityLedger(paths, "tick_summary", stamped(chainLedger));
+  await writeFactIntegrityLedger(paths, "context_stats", stamped(statsLedger));
+  const changedChain = (await readFactIntegrityLedger(paths, "tick_summary")).ledger;
+  const changedStats = (await readFactIntegrityLedger(paths, "context_stats")).ledger;
+  assert.equal((await readSummaryChainState(paths, { ledger: changedChain, hmacKeyId: contextKeyId(KEY) })).status, "continuity_lost");
+  assert.equal((await readStatsState(paths, { ledger: changedStats })).status, "continuity_lost");
+
+  const consumedChain = { ...chainState, future_loss_marker: marker };
+  const consumedStats = { ...stats.nextState(statsPass.retention.ledger_generation, statsPass.retention.pass_id), future_loss_marker: marker };
+  await writeSummaryChainState(paths, consumedChain);
+  await writeStatsState(paths, consumedStats);
+  assert.equal((await readSummaryChainState(paths, { ledger: changedChain, hmacKeyId: contextKeyId(KEY) })).status, "valid");
+  assert.equal((await readStatsState(paths, { ledger: changedStats })).status, "valid");
+});
+
 test("C2 certification at derivation (I70): every contributing family's committed pass must be the ledger's and the tick inside its span", () => {
   const ok = (generation, passId) => ({ retention: { ledger_generation: generation, pass_id: passId, pass_time_ms: T0 } });
   const ledger = (generation, passId, extra = {}) => ({ generation, continuity: { last_committed_pass_id: passId, continuity_ok: true, last_rewrite_newest_ts: new Date(T0).toISOString() }, bytecap_floor_ts: null, age_floor_ts: null, ...extra });
@@ -394,6 +429,16 @@ test("C2 statistics exclude uncertified ticks from churn, exposure and episodes 
   assert.equal(next.daily.s_known, 0);
   assert.equal(next.daily.ex_known, 0);
   assert.equal(stats.points.every((point) => point.attributes.cert === "uncertified"), true);
+});
+
+test("C2 daily certification is mixed when a bucket contains both certified and uncertified ticks", () => {
+  const first = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1000 })])[0];
+  const initial = deriveStats({ prior: { status: "missing" }, storeExisted: false, prevChain: undefined, snapshot: first.snapshot, transitions: first.transitions, summary: first.summary, nowIso: first.snapshot.ts });
+  const state = initial.nextState("g", 1);
+  const second = chainTicks([tick({ ms: T0 + HOUR, sessions: { a: 1 }, uptimeMs: 1000 + HOUR })])[0];
+  const uncertified = { ...second.summary, point: { ...second.summary.point, attributes: { ...second.summary.point.attributes, cert: "uncertified" } } };
+  const next = deriveStats({ prior: { status: "valid", state }, storeExisted: true, prevChain: state, snapshot: second.snapshot, transitions: second.transitions, summary: uncertified, nowIso: second.snapshot.ts });
+  assert.equal(next.nextState("g", 2).daily.cert, "mixed");
 });
 
 test("C2 UTC-day aggregation only advances forward and records a backward clock_step on the current bucket", () => {
@@ -460,6 +505,7 @@ test("C2 review L4: session joins use a per-install HMAC token, never the incumb
   const points = deriveCreatedVsBoot({ evidence: t.evidence, snapshot: snapshotOf(t), bootVerdict: undefined, ts: t.ts, hmacKey: KEY });
   assert.equal(points[0].attributes.session_key, expected);
   assert.notEqual(points[0].attributes.session_key, hashSessionIdentity("tmux", "work"));
+  assert.equal(points[0].entity_key, `session.created_vs_boot.${expected}`);
 });
 
 test("C2 host.daemon_gap: the boot ledger folds the longest gap between daemon observations per interval; restarts and boots counted; the cause stays unknown", () => {

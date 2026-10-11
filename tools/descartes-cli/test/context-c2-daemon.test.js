@@ -9,6 +9,7 @@ import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { runDaemonIteration } from "../src/daemon.js";
 import { appendFactPointsByFamily, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { readFactIntegrityLedger, resolveFactIntegrityPaths, writeFactIntegrityLedger } from "../src/fact-store-integrity.js";
 import { DATA_ONLY_FAMILIES, DERIVED_FAMILIES, FACT_FAMILY_IDS } from "../src/fact-families.js";
 import { finalizeContextC2, prepareContextC2 } from "../src/context-c2-daemon.js";
 import { resolveStatsStatePath, resolveSummaryChainPath, verifyTickSummaryChain } from "../src/context-summary.js";
@@ -237,6 +238,62 @@ test("C2 failed ticks leave a durable gap: the next success is marked gap and do
   assert.equal(summaries[1].attributes.sa, "unknown");
   assert.equal(summaries[1].attributes.sd, "unknown");
   assert.deepEqual(verifyTickSummaryChain(summaries).losses.map((loss) => loss.reason), ["gap"]);
+});
+
+for (const [label, damage] of [
+  ["deleted", async (file) => { await fs.rm(file); }],
+  ["unreadable", async (file) => { await fs.chmod(file, 0o000); }],
+]) {
+  test(`C2 ${label} gap state fails closed after a recorded gap`, async () => {
+    const paths = await tempPaths();
+    let attempts = 0;
+    const { state, run } = harness(paths, {
+      prepareContextC2: async (args) => {
+        attempts += 1;
+        if (attempts === 2) throw new Error("prepare gap");
+        return prepareContextC2(args);
+      },
+    });
+    await run(T0);
+    await run(T0 + HOUR);
+    const gapFile = path.join(resolveFactStorePaths(paths, "tick_summary").dir, "gap-state.json");
+    await damage(gapFile);
+    state.sessions = { after_gap: 1_000_300 };
+    await run(T0 + 2 * HOUR);
+    const summaries = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 2 * HOUR).toISOString() })).points
+      .filter((point) => point.fact_name === "tick.summary");
+    assert.deepEqual(summaries.map((point) => point.attributes.chain), ["started", "gap"]);
+    assert.equal(summaries[1].attributes.g, "unknown");
+    assert.equal(summaries[1].attributes.sa, "unknown");
+    assert.equal(summaries[1].attributes.sd, "unknown");
+    if (label === "unreadable") await fs.chmod(gapFile, 0o600);
+  });
+}
+
+test("C2 rollback loss causes one restart and one memory loss, then clean ticks continue", async () => {
+  const paths = await tempPaths();
+  const { run } = harness(paths);
+  await run(T0);
+  await run(T0 + HOUR);
+  const marker = new Date(T0 + HOUR + 1).toISOString();
+  for (const family of ["tick_summary", "context_stats"]) {
+    const read = await readFactIntegrityLedger(paths, family);
+    await writeFactIntegrityLedger(paths, family, { ...read.ledger, future_fact_dropped_total: read.ledger.future_fact_dropped_total + 1, last_future_fact_ts: marker });
+  }
+  const rollback = await run(T0 + 2 * HOUR);
+  const clean = await run(T0 + 3 * HOUR);
+  const statusOf = (result) => result.status ?? result;
+  assert.equal(statusOf(rollback).context_c2.chain, "restarted");
+  assert.equal(statusOf(rollback).context_c2.stats.memory_lost, true);
+  assert.equal(statusOf(clean).context_c2.chain, "continued");
+  assert.equal(statusOf(clean).context_c2.stats.memory_lost, false);
+  const summaries = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 3 * HOUR).toISOString() })).points
+    .filter((point) => point.fact_name === "tick.summary");
+  assert.deepEqual(summaries.map((point) => point.attributes.chain), ["started", "continued", "restarted", "continued"]);
+  const state = JSON.parse(await fs.readFile(resolveFactIntegrityPaths(paths, "context_stats").integrityFile, "utf8"));
+  assert.equal(state.last_future_fact_ts, marker);
+  const statsState = JSON.parse(await fs.readFile(resolveStatsStatePath(paths), "utf8"));
+  assert.equal(statsState.memory_lost_count, 1);
 });
 
 test("C2 finalize: a summary whose pass did not commit leaves the chain state unadvanced, so the next tick restarts the chain (unknown transitions), never continues it", async () => {
