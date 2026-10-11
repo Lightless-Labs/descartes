@@ -16,6 +16,7 @@ import {
   DEFAULT_PEER_STDDEV_FLOOR,
   PEER_COUNT_MARKERLESS_FINGERPRINT,
   PEER_COUNT_VPN_FINGERPRINT,
+  peerCountFingerprintForAvailabilitySignature,
   PEER_COUNT_DROP_RULE_ID,
   PEER_COUNT_SPIKE_RULE_ID,
   PEER_SIGNATURE_INVALID,
@@ -220,6 +221,67 @@ test("PEER_COUNT_SPIKE_RULE_ID is 'peer.count_spike'", () => {
 
 test("PEER_COUNT_DROP_RULE_ID is 'peer.count_drop'", () => {
   assert.equal(PEER_COUNT_DROP_RULE_ID, "peer.count_drop");
+});
+
+test("B1: peer identities include the availability-signature version, and v1 signatures never authorize coverage", () => {
+  assert.equal(PEER_COUNT_VPN_FINGERPRINT, "v2sig:vpn");
+  assert.equal(PEER_COUNT_MARKERLESS_FINGERPRINT, "v2sig:markerless");
+  assert.equal(peerCountFingerprintForAvailabilitySignature("v2:ok-ok-ok-ok-ok"), "v2sig:vpn");
+  assert.equal(peerCountFingerprintForAvailabilitySignature("v1:ok-ok-ok-ok-ok"), undefined);
+  assert.equal(peerCountFingerprintForAvailabilitySignature(undefined), "v2sig:markerless");
+});
+
+test("B1 daybreak reproduction: a legacy v1-derived alert stays active while v2 re-warms, then v2 raises and recovers under its own identity", async () => {
+  const paths = await tempPaths();
+  const legacyFingerprint = "v2:vpn";
+  const legacyKey = alertId(PEER_COUNT_SPIKE_RULE_ID, legacyFingerprint);
+  const legacyAlert = {
+    id: legacyKey,
+    rule_id: PEER_COUNT_SPIKE_RULE_ID,
+    fingerprint: legacyFingerprint,
+    severity: "warning",
+    title: "Peer count deviation",
+    summary: "legacy v1-derived alert",
+    diagnostics: {},
+    evidence_refs: ["peer-baseline"],
+    status: "active",
+    first_seen: tickTs(0),
+    last_seen: tickTs(30),
+    last_notified: null,
+    cooldown_until: null,
+    acknowledged_at: null,
+  };
+  const oldTicks = [];
+  for (let i = 0; i < DEFAULT_PEER_MIN_SAMPLE_COUNT; i += 1) {
+    oldTicks.push(...activeTickWithMarker(tickTs(i), 2, "v1:ok-ok-ok-ok-ok"));
+  }
+  const oldDeviationTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT);
+  oldTicks.push(...activeTickWithMarker(oldDeviationTs, 40, "v1:ok-ok-ok-ok-ok"));
+  const old = await seedAndCompute(paths, oldTicks, { now: oldDeviationTs });
+  assert.equal(old.evaluatedAlertKeys.length, 0, "v1-signature history must not evaluate any peer identity");
+
+  const v2Ticks = [];
+  for (let i = 1; i <= DEFAULT_PEER_MIN_SAMPLE_COUNT + 1; i += 1) {
+    const ts = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT + i);
+    v2Ticks.push(...activeTickWithMarker(ts, 2, "v2:ok-ok-ok-ok-ok"));
+  }
+  await appendFactPointsByFamily(paths, v2Ticks, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT * 2 + 1) });
+  const warmed = await computePeerBaselineCandidates(paths, { now: tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT * 2 + 1) });
+  assert.equal(warmed.evaluatedAlertKeys.some((id) => id === legacyKey), false, "v2 coverage must never cover the legacy identity");
+
+  const v2DeviationTs = tickTs(DEFAULT_PEER_MIN_SAMPLE_COUNT * 2 + 2);
+  await appendFactPointsByFamily(paths, activeTickWithMarker(v2DeviationTs, 40, "v2:ok-ok-ok-ok-ok"), { now: v2DeviationTs });
+  const v2Deviation = await computePeerBaselineCandidates(paths, { now: v2DeviationTs });
+  const v2Candidate = v2Deviation.candidates.find((candidate) => candidate.rule_id === PEER_COUNT_SPIKE_RULE_ID);
+  assert.equal(v2Candidate?.fingerprint, PEER_COUNT_VPN_FINGERPRINT);
+  assert.notEqual(v2Candidate?.id, legacyKey);
+
+  const merged = applyAlertCandidates([legacyAlert], v2Deviation.candidates, {
+    now: v2DeviationTs,
+    coveredAlertIds: new Set(v2Deviation.evaluatedAlertKeys),
+  }).alerts;
+  assert.equal(merged.find((alert) => alert.id === legacyKey)?.status, "active", "legacy v1-derived alert must remain active");
+  assert.equal(merged.some((alert) => alert.id === v2Candidate?.id), true, "v2 deviation must open a separate incident");
 });
 
 // ---------------------------------------------------------------------------------------------
