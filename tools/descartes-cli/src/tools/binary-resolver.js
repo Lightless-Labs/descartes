@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsyncDefault = promisify(execFile);
 const MACOS_LS = "/bin/ls";
@@ -245,8 +246,9 @@ function onlyDisabledUserAuthorities(authorities) {
   return authorities.length === 0 || authorities.every((value) => /^(?:;DisabledUser;)(?:\s+;DisabledUser;)*$/.test(value.trim()));
 }
 
-async function execLookup(execFileAsync, command, args) {
+async function execLookup(execFileAsync, command, args, signal) {
   try {
+    throwIfCollectorAborted(signal);
     const result = await execFileAsync(command, args, { timeout: 5000, maxBuffer: 256 * 1024 });
     return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   } catch (error) {
@@ -262,25 +264,25 @@ function unresolvedGroupMembership() {
   return { error: "group_membership_unverifiable" };
 }
 
-async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
+async function loadMacOsGroupWriterUids(gid, { execFileAsync, signal }) {
   const numericGid = asUid(gid);
   if (numericGid === undefined) return unresolvedGroupMembership();
 
-  const searchPolicy = await execLookup(execFileAsync, MACOS_DSCL, ["/Search", "-read", "/", "CSPSearchPath"]);
+  const searchPolicy = await execLookup(execFileAsync, MACOS_DSCL, ["/Search", "-read", "/", "CSPSearchPath"], signal);
   if (searchPolicy.error || !localAuthenticationSearchPolicy(dsclOutput(searchPolicy))) {
     return { error: "directory_bound" };
   }
 
-  const groupList = await execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Groups", "PrimaryGroupID"]);
+  const groupList = await execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Groups", "PrimaryGroupID"], signal);
   const groupName = groupList.error ? undefined : parseDsclGroupList(dsclOutput(groupList), numericGid);
   if (!groupName || !validLocalRecordName(groupName)) return unresolvedGroupMembership();
 
-  const fullRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`]);
+  const fullRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`], signal);
   let nestedGroups = fullRecord.error ? undefined : parseMacOsNestedGroups(dsclOutput(fullRecord));
   if (!fullRecord.error && nestedGroups === undefined) {
     // macOS omits an absent NestedGroups attribute from a full record, but an attribute-specific
     // read reports the absence explicitly. Never infer an empty set from the full-record omission.
-    const nestedRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "NestedGroups"]);
+    const nestedRecord = await execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "NestedGroups"], signal);
     nestedGroups = nestedRecord.error ? undefined : parseMacOsNestedGroups(dsclOutput(nestedRecord));
   }
   if (fullRecord.error || !isLocalMacOsNode(parseMacOsNode(dsclOutput(fullRecord))) || !nestedGroups || nestedGroups.length > 0) {
@@ -292,14 +294,14 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   const groupGuids = parseDsclGroupMembers(dsclOutput(fullRecord));
   if (!groupGuids) return unresolvedGroupMembership();
   const guidNames = await Promise.all(groupGuids.map(async (guid) => {
-    const result = await execLookup(execFileAsync, MACOS_DSCL, [".", "-search", "/Users", "GeneratedUID", guid]);
+    const result = await execLookup(execFileAsync, MACOS_DSCL, [".", "-search", "/Users", "GeneratedUID", guid], signal);
     return result.error ? undefined : parseDsclSearchUser(dsclOutput(result), guid);
   }));
   if (guidNames.some((name) => name === undefined)) return unresolvedGroupMembership();
 
   const [membership, primaryUsers] = await Promise.all([
-    execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "GroupMembership"]),
-    execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Users", "PrimaryGroupID"]),
+    execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Groups/${groupName}`, "GroupMembership"], signal),
+    execLookup(execFileAsync, MACOS_DSCL, [".", "-list", "/Users", "PrimaryGroupID"], signal),
   ]);
   if (membership.error) return unresolvedGroupMembership();
   const supplementaryNames = parseDsclGroupMembership(dsclOutput(membership));
@@ -310,7 +312,7 @@ async function loadMacOsGroupWriterUids(gid, { execFileAsync }) {
   const names = [...new Set([...(supplementaryNames ?? []), ...guidNames, ...primaryNames])];
   if (names.some((name) => !validLocalRecordName(name))) return unresolvedGroupMembership();
 
-  const userResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "AuthenticationAuthority", "UniqueID"])));
+  const userResults = await Promise.all(names.map((name) => execLookup(execFileAsync, MACOS_DSCL, [".", "-read", `/Users/${name}`, "AuthenticationAuthority", "UniqueID"], signal)));
   const principals = userResults.map((result, index) => {
     if (result.error) return undefined;
     const uid = parseDsclUniqueId(dsclOutput(result));
@@ -345,6 +347,7 @@ async function loadGroupWriterUids(gid, {
   platform,
   cache = {},
   execFileAsync = execFileAsyncDefault,
+  signal,
 } = {}) {
   const numericGid = asUid(gid);
   if (numericGid === undefined) return unresolvedGroupMembership();
@@ -352,7 +355,7 @@ async function loadGroupWriterUids(gid, {
   if (cache.groupWriterUids.has(numericGid)) return cache.groupWriterUids.get(numericGid);
 
   const result = platform === "darwin"
-    ? await loadMacOsGroupWriterUids(numericGid, { execFileAsync })
+    ? await loadMacOsGroupWriterUids(numericGid, { execFileAsync, signal })
     : unresolvedGroupMembership();
   cache.groupWriterUids.set(numericGid, result);
   return result;
@@ -397,9 +400,9 @@ export function parseMacOsAclStatus(stdout) {
     : "unknown";
 }
 
-export async function detectAclStatus(component, { platform, stat, execFileAsync = execFileAsyncDefault } = {}) {
+export async function detectAclStatus(component, { platform, stat, execFileAsync = execFileAsyncDefault, signal } = {}) {
   if (platform === "darwin") {
-    const result = await execLookup(execFileAsync, MACOS_LS, ["-led", component]);
+    const result = await execLookup(execFileAsync, MACOS_LS, ["-led", component], signal);
     return result.error ? "unknown" : parseMacOsAclStatus(result.stdout);
   }
   if (platform === "linux") {
@@ -409,7 +412,7 @@ export async function detectAclStatus(component, { platform, stat, execFileAsync
     for (const command of LINUX_XATTR_COMMANDS) {
       let commandUnavailable = true;
       for (const attribute of attributes) {
-        const result = await execLookup(execFileAsync, command, ["--only-values", `--name=${attribute}`, "--absolute-names", component]);
+        const result = await execLookup(execFileAsync, command, ["--only-values", `--name=${attribute}`, "--absolute-names", component], signal);
         if (!result.error) return "present";
         if (result.error.code === "ENOENT") continue;
         commandUnavailable = false;
@@ -436,6 +439,7 @@ async function inspectTrustedPath(resolvedPath, {
   groupWriterCache = {},
   aclCheckFn = detectAclStatus,
   execFileAsync = execFileAsyncDefault,
+  signal,
 } = {}) {
   const fileResult = await safeStat(statFn, resolvedPath);
   if (!fileResult.stat) return trustFailure({ resolvedPath, component: resolvedPath, reason: "stat_failed" });
@@ -482,6 +486,7 @@ async function inspectTrustedPath(resolvedPath, {
         platform,
         cache: groupWriterCache,
         execFileAsync,
+        signal,
       });
       if (!groupResult || groupResult.error || !Array.isArray(groupResult.uids)) {
         return trustFailure({ resolvedPath, component, reason: groupResult?.error ?? "group_membership_unverifiable", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
@@ -503,7 +508,7 @@ async function inspectTrustedPath(resolvedPath, {
     if ((mode & 0o002) !== 0) {
       return trustFailure({ resolvedPath, component, reason: "group_writable", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
-    const aclStatus = normalizeAclStatus(await aclCheckFn(component, { platform, stat: result.stat, execFileAsync }));
+    const aclStatus = normalizeAclStatus(await aclCheckFn(component, { platform, stat: result.stat, execFileAsync, signal }));
     if (aclStatus !== "absent") {
       return trustFailure({ resolvedPath, component, reason: aclStatus === "present" ? "acl_present" : "acl_unknown", sameUidWritableComponents, writerUids, acceptedSystemAccounts });
     }
@@ -556,6 +561,7 @@ export async function resolveCollectorBinary(binary, {
   groupWriterCache = {},
   execFileAsync = execFileAsyncDefault,
   aclCheckFn = detectAclStatus,
+  signal,
 } = {}) {
   const name = String(binary ?? "");
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
@@ -586,6 +592,7 @@ export async function resolveCollectorBinary(binary, {
       groupWriterCache,
       execFileAsync,
       aclCheckFn,
+      signal,
     });
     if (inspected.status === "resolved") {
       return { ...inspected, binary: name, candidates };
@@ -669,6 +676,7 @@ async function reverifyResolvedBinary(resolution, options) {
  * not eliminate) the resolution/exec TOCTOU window; the residual is documented for operators.
  */
 export async function runResolvedExecFile(binary, args = [], options = {}) {
+  throwIfCollectorAborted(options.signal);
   const resolution = await resolveCollectorBinary(binary, options);
   const requestedArgv = [binary, ...args];
   if (resolution.status !== "resolved") {
@@ -702,6 +710,7 @@ export async function runResolvedExecFile(binary, args = [], options = {}) {
   const execFileAsync = options.execFileAsync ?? execFileAsyncDefault;
   const command = { argv: [reverified.path, ...args], requested_binary: binary, read_only: true };
   try {
+    throwIfCollectorAborted(options.signal);
     const { stdout, stderr } = await execFileAsync(reverified.path, args, {
       timeout: options.timeout,
       maxBuffer: options.maxBuffer,

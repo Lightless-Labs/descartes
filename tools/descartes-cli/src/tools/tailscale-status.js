@@ -18,6 +18,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 
 const execFileAsync = promisify(execFile);
@@ -200,6 +201,7 @@ export async function collectTailscaleStatusEvidence(options = {}) {
 
   return timedEnvelope(async () => {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;
+    throwIfCollectorAborted(options.signal);
     const probe = await runExec("tailscale", ["status", "--json"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 
     if (isBinaryNotFound(probe)) return resultForFailure("not_found_on_known_paths", probe, { cap });
