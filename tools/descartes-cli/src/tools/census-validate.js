@@ -6,9 +6,18 @@
 
 const RFC3339_RE = /^(?:[0-9]{4})-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$/;
 
+function hasValidCalendarDate(value) {
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return Number.isInteger(daysInMonth) && day <= daysInMonth;
+}
+
 /** Exact string check for timestamps accepted as evidence metadata. */
 export function isStrictRfc3339(value) {
-  return typeof value === "string" && RFC3339_RE.test(value);
+  return typeof value === "string" && RFC3339_RE.test(value) && hasValidCalendarDate(value);
 }
 
 /** Parse only a timestamp which passed the exact RFC3339 grammar. */
