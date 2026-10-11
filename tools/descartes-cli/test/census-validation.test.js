@@ -234,6 +234,48 @@ test("registered census parsers stay fail-closed across adversarial generated in
   }
 });
 
+test("network parser grammar generators reject valid prefixes with suffix junk and invalid values", () => {
+  const cases = [
+    {
+      name: "network.parseLinuxDefaultRoutes",
+      parse: networkParsers.parseLinuxDefaultRoutes,
+      trusted: (value) => value.malformed_count === 0,
+      valid: "default via 192.168.1.1 dev eth0 metric 100",
+      invalidValue: "default via NOT_AN_IP dev eth0 metric 100",
+    },
+    {
+      name: "network.parseResolvConf",
+      parse: networkParsers.parseResolvConf,
+      trusted: (value) => value.malformed_count === 0,
+      valid: "nameserver 1.1.1.1",
+      invalidValue: "nameserver NOT_AN_IP",
+    },
+    {
+      name: "network.parseScutilDns",
+      parse: networkParsers.parseScutilDns,
+      trusted: (value) => value.malformed_count === 0,
+      valid: "resolver #1\nnameserver[0] : 1.1.1.1",
+      invalidValue: "resolver #1\nnameserver[0] : NOT_AN_IP",
+    },
+    {
+      name: "network.parseLinuxListeningSockets",
+      parse: networkParsers.parseLinuxListeningSockets,
+      trusted: (value) => value.rejected_count === 0,
+      valid: "tcp LISTEN 0 128 127.0.0.1:22 0.0.0.0:*",
+      invalidValue: "tcp LISTEN NOT_A_QUEUE 128 127.0.0.1:22 0.0.0.0:*",
+    },
+  ];
+  for (const grammar of cases) {
+    for (const [label, input] of [
+      ["suffix", `${grammar.valid} MALFORMED`],
+      ["invalid value", grammar.invalidValue],
+    ]) {
+      const result = grammar.parse(input);
+      assert.equal(grammar.trusted(result), false, `${grammar.name} trusted ${label}: ${input}`);
+    }
+  }
+});
+
 test("every exported parse* function in the touched parser modules is explicitly registered", () => {
   const modules = [
     ["net-config", netConfigParsers], ["network", networkParsers], ["vpn", vpnParsers],
