@@ -2,6 +2,21 @@
 
 **Last updated:** 2026-10-11
 
+## Context facts C2 daybreak re-gate — 2026-10-11 — local, not pushed
+
+On `feat/context-facts-c2-2026-10`, closed the remaining daybreak findings in seven atomic
+commits: `4e4c376` (red regressions and exhaustive parser/abort registries), `c62d1fe` (strict
+full-line network-config grammars), `54777ce` (shared `last` cap propagation and VPN overflow),
+`418872f` (duplicate loginctl properties), `51a6cc5` (network census validation without duplicate
+collapse), `74a4e61` (calendar-strict RFC3339), and `fa266af` (all-src subprocess abort audit and
+login opener guard). No push or merge.
+
+Focused verification passes **115/115**. Fresh-XDG full `npm test` completed with **2,615 total:
+2,552 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are environment-only: 17
+notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1` (`listen EPERM`), and 2 live-process
+provenance tests return `unknown` under restricted process introspection. No changed-area product
+test failed. `git diff --check` is clean.
+
 ## Context facts C2 census validation rework — 2026-10-11 — local, not pushed
 
 On `feat/context-facts-c2-2026-10`, closed the reported census-validation findings in two
