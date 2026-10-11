@@ -298,11 +298,11 @@ const FAMILY_BUDGET_ENTRIES = [
   // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
   // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
   ["collector_state", 8 * MIB],
-  // C2 derived families. tick_summary: one record of at most 1,013 B per structural tick; 3 MiB holds the
-  // 90-day retention at a 1 h interval (the 30-day floor is 911,700 B). context_stats: at most one
-  // episode and one daily record per tick (516 + 427 = 943 B with their entity keys); 2 MiB holds the 30-day floor
-  // (848,700 B) and, at
-  // typical volume (rare episodes, one daily record per day), the 365-day retention.
+  // C2 derived families. tick_summary: one record of at most 1,013 B per structural tick; 3 MiB holds
+  // the 90-day retention at a 1 h interval (the 30-day floor is 911,700 B). context_stats: at most one
+  // episode and one daily record per tick (516 + 427 = 943 B with their entity keys); 2 MiB holds the
+  // 30-day floor (848,700 B) and, at typical volume (rare episodes, one daily record per day), the
+  // 365-day retention.
   ["context_stats", 2 * MIB],
   ["tick_summary", 3 * MIB],
 ];
