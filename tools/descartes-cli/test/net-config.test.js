@@ -123,7 +123,7 @@ test("B2: macOS ra_prefix comes only from ndp router-advertisement prefix record
 });
 
 test("B2 reproduction: a static Linux /128 never becomes a guessed /64 ra_prefix", async () => {
-  const read = readNetConfig({
+  const result = await readNetConfig({
     platform: "linux",
     stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
     readFile: async () => "1\n",
@@ -140,7 +140,7 @@ test("B2 reproduction: a static Linux /128 never becomes a guessed /64 ra_prefix
 
 test("C0.5 darwin collector: fixed argv per component, through the resolver; the tunnel default route is never the physical interface", async () => {
   const calls = [];
-  const read = readNetConfig({
+  const result = await readNetConfig({
     platform: "darwin",
     runFixedExecFile: scripted({
       "netstat -rn -f inet": ok(NETSTAT_REAL),
