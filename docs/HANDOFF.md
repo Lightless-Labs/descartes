@@ -9,7 +9,8 @@ commits: `4e4c376` (red regressions and exhaustive parser/abort registries), `c6
 full-line network-config grammars), `54777ce` (shared `last` cap propagation and VPN overflow),
 `418872f` (duplicate loginctl properties), `51a6cc5` (network census validation without duplicate
 collapse), `74a4e61` (calendar-strict RFC3339), and `fa266af` (all-src subprocess abort audit and
-login opener guard). No push or merge.
+login opener guard). A follow-up calendar component round-trip is pending as the next local commit.
+No push or merge.
 
 Focused verification passes **115/115**. Fresh-XDG full `npm test` completed with **2,615 total:
 2,552 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are environment-only: 17
