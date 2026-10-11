@@ -274,11 +274,11 @@ test("T8: every family's default budget meets (H_max / interval) x worst-case ti
     service: 18 * MIB, process_lineage: 10 * MIB, scheduled_job: 5 * MIB, session: 4 * MIB,
     peer: 16 * MIB, canary: 4 * MIB, network: 4 * MIB, provenance: 4 * MIB,
     // Context families (C0; context plan §4): 17 MiB, sized by the data-family T8 test below.
-    host_lifecycle: 4 * MIB, network_context: 6 * MIB, session_context: 11 * MIB,
+    host_lifecycle: 7 * MIB, network_context: 6 * MIB, session_context: 11 * MIB,
     // Context plan C2 families, sized by their own T8 tests (context-c2-*.test.js).
     collector_state: 8 * MIB,
   });
-  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 94 * MIB);
+  assert.equal([...FAMILY_DEFAULT_BUDGET_BYTES.values()].reduce((a, b) => a + b, 0), 97 * MIB);
 });
 
 test("T8 config floor: resolveFactStoreBudgets rejects a value below the horizon invariant (budget_below_horizon_floor) and falls back to the default; accepts one at or above it", () => {
@@ -429,7 +429,7 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
   const { DATA_FAMILY_HORIZONS, MIN_STRUCTURAL_INTERVAL_MS } = await import("../src/fact-families.js");
   const { CONTEXT_FACT_SCHEMAS } = await import("../src/context-schemas.js");
   const { normalizeFactPoint } = await import("../src/fact-store.js");
-  const { MAX_LOGIN_ARRIVALS_PER_TICK, MAX_LOGIN_HISTORY_ROWS_PER_TICK, MAX_VPN_SERVICE_STATES_PER_TICK, CONTEXT_ENVELOPE_SOURCES } = await import("../src/context-translators.js");
+  const { MAX_LOGIN_ARRIVALS_PER_TICK, MAX_LOGIN_HISTORY_ROWS_PER_TICK, MAX_VPN_SERVICE_STATES_PER_TICK, MAX_LIFECYCLE_RECORDS_PER_TICK, CONTEXT_ENVELOPE_SOURCES } = await import("../src/context-translators.js");
   // Worst-case normalized record per context fact, from its closed schema: every field at its longest
   // valid value, the longest envelope id/tool, a digest-suffixed entity key, confidence 0.
   const longestSource = Object.values(CONTEXT_ENVELOPE_SOURCES).reduce((a, b) => (a.id.length + a.tool.length >= b.id.length + b.tool.length ? a : b));
@@ -459,10 +459,12 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     "session.login_record": 643, "session.login_history_row": 597, "session.login_census": 777, "user.presence": 508,
     // C2 facts (their families' T8 are pinned in context-c2-*.test.js).
     "collector.binary_state": 668, "net.vpn_service_census": 614, "net.vpn_service_state": 528,
+    "host.lifecycle_record": 721,
   }, "a schema change must revisit the pinned context tick shapes");
   assert.equal(FAMILY_TICK_SHAPES.get("collector_state").maxRecordBytes, worst["collector.binary_state"]);
   const tick = {
-    host_lifecycle: worst["host.boot"] + worst["host.boot_boundary"] + worst["host.clock_reading"] + worst["host.suspend"] + worst["host.boundary_census"],
+    host_lifecycle: worst["host.boot"] + worst["host.boot_boundary"] + worst["host.clock_reading"] + worst["host.suspend"] + worst["host.boundary_census"]
+      + MAX_LIFECYCLE_RECORDS_PER_TICK * worst["host.lifecycle_record"],
     network_context: worst["net.tailnet_state"] + worst["net.config_fingerprint"] + worst["net.vpn_service_census"]
       + MAX_VPN_SERVICE_STATES_PER_TICK * worst["net.vpn_service_state"],
     session_context: worst["session.login_census"] + worst["user.presence"]

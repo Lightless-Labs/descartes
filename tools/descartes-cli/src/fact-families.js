@@ -67,6 +67,7 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["host.clock_reading", "host_lifecycle"],
   ["host.suspend", "host_lifecycle"],
   ["host.boundary_census", "host_lifecycle"],
+  ["host.lifecycle_record", "host_lifecycle"],
   ["net.tailnet_state", "network_context"],
   ["net.config_fingerprint", "network_context"],
   ["net.vpn_service_census", "network_context"],
@@ -274,7 +275,8 @@ const FAMILY_BUDGET_ENTRIES = [
   // against the 30-day declared data horizon (DATA_FAMILY_HORIZON_ENTRIES), with the 4x ceiling still
   // admitting a 15-minute interval and not raising MIN_STRUCTURAL_INTERVAL_MS. Floors (1 h interval):
   // host_lifecycle 3,570,300 B; network_context 1,467,000 B; session_context 10,415,700 B.
-  ["host_lifecycle", 4 * MIB],
+  // C2: + at most 4 host.lifecycle_record per tick.
+  ["host_lifecycle", 7 * MIB],
   // C2: + the VPN service census marker and at most 8 net.vpn_service_state records per tick.
   ["network_context", 6 * MIB],
   ["session_context", 11 * MIB],
@@ -314,7 +316,8 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // records of at most 643 B.
   // A boundary census (C0.12) borrows the next structural slot, so a horizon holds at most two extra
   // ticks, inside the 1.25 headroom.
-  ["host_lifecycle", { maxRecordBytes: 0, markerBytes: 3967, entityCap: 0 }],
+  // C2: records: MAX_LIFECYCLE_RECORDS_PER_TICK x host.lifecycle_record 721.
+  ["host_lifecycle", { maxRecordBytes: 721, markerBytes: 3967, entityCap: 4 }],
   // C2: markers + vpn_service_census 614; records: MAX_VPN_SERVICE_STATES_PER_TICK x vpn_service_state 528.
   ["network_context", { maxRecordBytes: 528, markerBytes: 2244, entityCap: 8 }],
   ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],

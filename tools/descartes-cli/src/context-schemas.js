@@ -198,6 +198,23 @@ const FACT_SCHEMA_ENTRIES = [
       post_gap_s: intField(0, MAX_DURATION_S, ["kernel.boot_session", "kernel.power", "descartes.daemon"]),
     },
   }],
+  // C2 (§4.1): `last` reboot/shutdown rows, first-observed-tick dedupe. A missing shutdown row is
+  // unknown: it means neither "unclean" nor "clean". The time is the row's own local minute without a
+  // year (time_confidence), never parsed into an instant.
+  ["host.lifecycle_record", {
+    family: "host_lifecycle",
+    fields: {
+      ...commonFields(["login.utmp"]),
+      kind: enumField(["reboot", "shutdown", "unknown"], ["login.utmp"]),
+      start_text: patternField(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):[0-5][0-9]$/, 16, ["login.utmp"]),
+      time_confidence: enumField(["local_minute_no_year"], ["descartes.daemon"]),
+      end_state: enumField(["still_running", "ended", "crash", "down", "none", "unknown"], ["login.utmp"]),
+      duration_text: patternField(/^([0-9]{1,4}\+)?([01][0-9]|2[0-3]):[0-5][0-9]$/, 10, ["login.utmp"], [SENTINEL_UNKNOWN, "none"]),
+      os_release: patternField(VERSION_TOKEN_RE, 64, ["login.utmp", "kernel.boot_session"], [SENTINEL_UNKNOWN, "none"]),
+      new_rows_total: intField(0, 1000, ["descartes.daemon"]),
+      dedupe_state: enumField(["fresh", "reseeded", "unknown"], ["descartes.daemon"]),
+    },
+  }],
   // ---------------------------------------------------------------- network_context
   ["net.tailnet_state", {
     family: "network_context",

@@ -57,6 +57,8 @@ export async function readLoginSeen(descartesPaths) {
   try {
     const parsed = JSON.parse(contents);
     if (parsed?.version !== LOGIN_SEEN_VERSION || !KEY_ID_RE.test(parsed.key_id ?? "") || !validMap(parsed.records) || !validMap(parsed.history)) return { status: "corrupt", seen: null };
+    // C2: the lifecycle (reboot/shutdown row) map is optional (a C0-era state has none).
+    if (parsed.lifecycle !== undefined && !validMap(parsed.lifecycle)) return { status: "corrupt", seen: null };
     return { status: "ok", seen: parsed };
   } catch {
     return { status: "corrupt", seen: null };
@@ -97,8 +99,12 @@ export function selectNewLoginRows(seen, result, { nowMs, bootSalt, hmacKey } = 
   const dedupeState = usable ? "fresh" : "reseeded";
   const records = { ...(usable?.records ?? {}) };
   const history = { ...(usable?.history ?? {}) };
+  // C2: a C0-era state has no lifecycle map; its lifecycle rows are then "reseeded", not "fresh".
+  const lifecycle = { ...(usable?.lifecycle ?? {}) };
+  const lifecycleDedupeState = usable && usable.lifecycle !== undefined ? "fresh" : "reseeded";
   const newRecords = [];
   const newHistory = [];
+  const newLifecycle = [];
   for (const record of result?.records ?? []) {
     const digest = loginRowDigest(hmacKey, record.identity, record.source === "loginctl" ? bootSalt : "");
     if (!digest) continue;
@@ -111,10 +117,18 @@ export function selectNewLoginRows(seen, result, { nowMs, bootSalt, hmacKey } = 
     if (history[digest] === undefined) newHistory.push({ ...row, digest });
     history[digest] = nowMs;
   }
+  for (const row of result?.lifecycle?.rows ?? []) {
+    const digest = loginRowDigest(hmacKey, row.identity);
+    if (!digest) continue;
+    if (lifecycle[digest] === undefined) newLifecycle.push({ ...row, digest });
+    lifecycle[digest] = nowMs;
+  }
   return {
     newRecords,
     newHistory,
+    newLifecycle,
     dedupeState,
-    next: { version: LOGIN_SEEN_VERSION, key_id: keyId, records: prune(records, nowMs), history: prune(history, nowMs) },
+    lifecycleDedupeState,
+    next: { version: LOGIN_SEEN_VERSION, key_id: keyId, records: prune(records, nowMs), history: prune(history, nowMs), lifecycle: prune(lifecycle, nowMs) },
   };
 }

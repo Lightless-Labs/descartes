@@ -195,6 +195,7 @@ test("registered census parsers stay fail-closed across adversarial generated in
     { name: "login.parseWhoRows", parse: parseWhoRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
     { name: "login.parseLastRows", parse: parseLastRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
     { name: "last-history.parseLastRows", parse: parseSharedLastRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
+    { name: "last-history.parseLastLifecycleRows", parse: lastHistoryParsers.parseLastLifecycleRows, trusted: (value) => value.malformed === 0 && value.duplicate_count === 0 },
     { name: "loginctl.ids", parse: parseLoginctlSessionIds, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
     { name: "login.parsePlistXml", parse: loginParsers.parsePlistXml, trusted: () => false },
     { name: "login.parseConsoleUsers", parse: loginParsers.parseConsoleUsers, trusted: () => false },
@@ -289,7 +290,7 @@ test("every exported parse* function in the touched parser modules is explicitly
     "network.parseLinuxListeningSockets", "network.parseMacLsofListeningSocketsDetailed", "network.parseMacLsofListeningSockets",
     "vpn.parseWhoOutput", "vpn.parseLastOutput", "vpn.parseWgInterfaceList", "vpn.parseWgPeerList", "vpn.parseWgEndpoints",
     "vpn.parseWgHandshakes", "vpn.parseScutilNcListDetailed", "vpn.parseScutilNcList", "login.parseWhoRows", "login.parseLastRows", "login.parsePlistXml",
-    "login.parseConsoleUsers", "login.parseLoginctlSessionIds", "login.parseLoginctlShowSession", "last-history.parseLastRows",
+    "login.parseConsoleUsers", "login.parseLoginctlSessionIds", "login.parseLoginctlShowSession", "last-history.parseLastRows", "last-history.parseLastLifecycleRows",
     "host.parseSysctlKeyValues", "host.parseSysctlTimevalSeconds", "host.parseProcStatBtime", "host.parseOsReleaseBuild",
     "host.parseProcUptime", "tailscale.parseTailscaleStatusJson",
   ]);

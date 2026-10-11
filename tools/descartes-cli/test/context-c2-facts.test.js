@@ -6,8 +6,13 @@ import test from "node:test";
 import { CONTEXT_KEY_BYTES, contextHmac } from "../src/context-key.js";
 import { validateContextFact } from "../src/context-schemas.js";
 import { FACT_FAMILY_BY_NAME, FAMILY_DEFAULT_BUDGET_BYTES, FAMILY_TICK_SHAPES, familyBudgetFloorBytes } from "../src/fact-families.js";
+import { parseLastLifecycleRows, parseLastRows } from "../src/tools/last-history.js";
+import { readLoginSessions } from "../src/tools/login-sessions.js";
+import { selectNewLoginRows } from "../src/login-seen.js";
 import {
   factPointsFromBinaryStateEvidence,
+  factPointsFromLifecycleRecordEvidence,
+  MAX_LIFECYCLE_RECORDS_PER_TICK,
   factPointsFromVpnServiceEvidence,
   MAX_BINARY_STATES_PER_TICK,
   MAX_VPN_SERVICE_STATES_PER_TICK,
@@ -141,4 +146,97 @@ test("C2 net.vpn_service_state: at most 8 per tick, the rest counted as overflow
   assert.equal(points[0].attributes.services_total, "11");
   assert.equal(points[0].attributes.overflow, "3");
   assert.equal(points[0].attributes.emitted, "8");
+});
+
+const LAST_DARWIN = [
+  "thomas     ttys037  100.64.118.39          Sun Oct 11 12:53   still logged in",
+  "reboot time                                Fri Sep  4 16:10",
+  "shutdown time                              Fri Sep  4 16:08",
+  "",
+  "wtmp begins Fri Sep  4 16:10:30 2026",
+].join("\n");
+const LAST_LINUX = [
+  "alice    pts/0        203.0.113.9      Mon Oct  6 08:05   still logged in",
+  "reboot   system boot  6.8.0-45-generic Mon Oct  6 08:01   still running",
+  "reboot   system boot  6.8.0-45-generic Sun Oct  5 22:10 - 08:00  (09:49)",
+  "reboot   system boot  6.8.0-44-generic Sat Oct  4 20:10 - crash (1+00:49)",
+  "",
+  "wtmp begins Sat Oct  4 20:10:01 2026",
+].join("\n");
+
+test("C2 host.lifecycle_record parser: macOS and Linux reboot/shutdown rows by anchored grammar; the login rows are unchanged", () => {
+  const darwin = parseLastLifecycleRows(LAST_DARWIN);
+  assert.equal(darwin.malformed, 0);
+  assert.deepEqual(darwin.rows.map((r) => [r.kind, r.start_text, r.end_state, r.os_release]), [
+    ["reboot", "Fri Sep 4 16:10", "none", "none"],
+    ["shutdown", "Fri Sep 4 16:08", "none", "none"],
+  ]);
+  const linux = parseLastLifecycleRows(LAST_LINUX);
+  assert.equal(linux.malformed, 0);
+  assert.deepEqual(linux.rows.map((r) => [r.start_text, r.end_state, r.duration_text, r.os_release]), [
+    ["Mon Oct 6 08:01", "still_running", "none", "6.8.0-45-generic"],
+    ["Sun Oct 5 22:10", "ended", "09:49", "6.8.0-45-generic"],
+    ["Sat Oct 4 20:10", "crash", "1+00:49", "6.8.0-44-generic"],
+  ]);
+  // The login census parser still skips them exactly as before.
+  assert.deepEqual(parseLastRows(LAST_LINUX).rows.map((r) => r.user), ["alice"]);
+});
+
+test("C2 host.lifecycle_record parser: a lifecycle-looking row off the grammar, suffix junk, junk output or a duplicate is partial, never a clean census", () => {
+  for (const bad of [
+    "reboot time Fri Sep  4 16:10 extra",
+    "reboot time Fri Sep 32 16:10",
+    "reboot   system boot  6.8.0 Mon Oct  6 08:01   still running junk",
+    "shutdown",
+    "MALFORMED",
+  ]) assert.ok(parseLastLifecycleRows(bad).malformed > 0, bad);
+  assert.equal(parseLastLifecycleRows("reboot time  Fri Sep  4 16:10\nreboot time  Fri Sep  4 16:10").duplicate_count, 1);
+  assert.equal(parseLastLifecycleRows(undefined).malformed, 1);
+});
+
+test("C2 login collector carries the lifecycle rows of the same shared last read (no new subprocess), with their source state", async () => {
+  const calls = [];
+  const scripted = (map) => async (command, args = []) => {
+    const key = [command, ...args].join(" ");
+    calls.push(key);
+    const hit = Object.entries(map).find(([prefix]) => key.startsWith(prefix));
+    return hit ? hit[1] : { status: "not_found_on_known_paths", availability: "not_found_on_known_paths", stdout: "" };
+  };
+  const ok = (stdout) => ({ status: "ok", stdout, stderr: "" });
+  const result = await readLoginSessions({ platform: "linux", runFixedExecFile: scripted({ "last -n 50": ok(LAST_LINUX), "loginctl": ok("") }) });
+  assert.equal(calls.filter((c) => c.startsWith("last")).length, 1);
+  assert.equal(result.lifecycle.state, "ok");
+  assert.equal(result.lifecycle.rows.length, 3);
+  const failed = await readLoginSessions({ platform: "linux", runFixedExecFile: scripted({ "last -n 50": { status: "error", stdout: "", stderr: "x" }, "loginctl": ok("") }) });
+  assert.equal(failed.lifecycle.rows.length, 0);
+  assert.notEqual(failed.lifecycle.state, "ok");
+  assert.notEqual(failed.lifecycle.state, "absent");
+});
+
+test("C2 host.lifecycle_record: first-observed dedupe through the keyed login seen-state; at most 4 per tick with the total on each; no key, no record", () => {
+  const rows = parseLastLifecycleRows(LAST_LINUX).rows;
+  const result = { records: [], history: [], lifecycle: { state: "ok", rows } };
+  const first = selectNewLoginRows(null, result, { nowMs: 1000, hmacKey: KEY });
+  assert.equal(first.newLifecycle.length, 3);
+  assert.equal(first.lifecycleDedupeState, "reseeded");
+  const second = selectNewLoginRows(first.next, result, { nowMs: 2000, hmacKey: KEY });
+  assert.equal(second.newLifecycle.length, 0, "a repeated sighting is not a new row");
+  assert.equal(second.lifecycleDedupeState, "fresh");
+  const c0State = { ...first.next };
+  delete c0State.lifecycle;
+  assert.equal(selectNewLoginRows(c0State, result, { nowMs: 3000, hmacKey: KEY }).lifecycleDedupeState, "reseeded", "a C0-era state has no lifecycle memory");
+  const envelope = { id: "login-sessions", status: "ok", observation: { start_ms: 1, end_ms: 2 }, result };
+  const points = valid(factPointsFromLifecycleRecordEvidence([envelope], { ts: TS, hmacKey: KEY, dedupe: first }));
+  assert.equal(points.length, 3);
+  assert.deepEqual(points.map((p) => p.attributes.end_state), ["still_running", "ended", "crash"]);
+  for (const p of points) {
+    assert.equal(FACT_FAMILY_BY_NAME.get(p.fact_name), "host_lifecycle");
+    assert.equal(p.attributes.time_confidence, "local_minute_no_year");
+    assert.equal(p.attributes.new_rows_total, "3");
+  }
+  const many = { ...first, newLifecycle: Array.from({ length: 7 }, (_, i) => ({ ...rows[0], digest: `${i}`.padStart(32, "0") })) };
+  const capped = valid(factPointsFromLifecycleRecordEvidence([envelope], { ts: TS, hmacKey: KEY, dedupe: many }));
+  assert.equal(capped.length, MAX_LIFECYCLE_RECORDS_PER_TICK);
+  assert.equal(capped[0].attributes.new_rows_total, "7");
+  assert.deepEqual(factPointsFromLifecycleRecordEvidence([envelope], { ts: TS, hmacKey: KEY }), []);
 });

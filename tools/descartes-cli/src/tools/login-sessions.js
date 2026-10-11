@@ -23,7 +23,7 @@ import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./bina
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { finalizeCensus } from "./census-validate.js";
 import { classifyLoginOrigin, ttyClassOf } from "./login-origin.js";
-import { parseLastRows, readSharedLastHistory } from "./last-history.js";
+import { parseLastLifecycleRows, parseLastRows, readSharedLastHistory } from "./last-history.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
 
 export { parseLastRows } from "./last-history.js";
@@ -33,6 +33,8 @@ const execFileAsync = promisify(execFile);
 export const LOGIN_HISTORY_LIMIT = 50;
 export const MAX_LOGIN_RECORDS = 256;
 export const MAX_LOGINCTL_SESSIONS = 64;
+// C2: reboot/shutdown rows kept from one `last` read (bounded by the read itself; this is the clamp).
+export const MAX_LIFECYCLE_ROWS = LOGIN_HISTORY_LIMIT;
 const LOGINCTL_PROPERTIES = ["Id", "Name", "Remote", "RemoteHost", "Service", "Type", "Class", "TTY", "State", "IdleHint", "LockedHint"];
 
 function loginctlSessionBlocksMatchRequest(sessions, requestedIds) {
@@ -327,7 +329,20 @@ async function runLast(runExec, options) {
   const { rows, malformed } = shared;
   const duplicate_count = finalizeCensus({ records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]), malformed }).duplicate_count;
   const truncated = rows.length >= LOGIN_HISTORY_LIMIT;
-  return { state: malformed > 0 || duplicate_count > 0 || truncated ? "partial" : rows.length === 0 ? "absent" : "ok", rows, duplicate_count, truncated };
+  // C2 (§4.1 host.lifecycle_record): the reboot/shutdown rows of the same output, read separately so
+  // the login rows above are exactly what they were.
+  const lifecycle = parseLastLifecycleRows(probe.stdout);
+  const lifecycleTruncated = shared.truncated === true;
+  return {
+    state: malformed > 0 || duplicate_count > 0 || truncated ? "partial" : rows.length === 0 ? "absent" : "ok",
+    rows,
+    duplicate_count,
+    truncated,
+    lifecycle: {
+      state: lifecycle.malformed > 0 || lifecycle.duplicate_count > 0 || lifecycleTruncated ? "partial" : lifecycle.rows.length === 0 ? "absent" : "ok",
+      rows: lifecycle.rows.slice(0, MAX_LIFECYCLE_ROWS),
+    },
+  };
 }
 
 async function runConsole(runExec, options) {
@@ -385,6 +400,7 @@ export async function readLoginSessions(options = {}) {
   const sources = { who: "not_applicable", last: "not_applicable", console: "not_applicable", loginctl: "not_applicable" };
   const records = [];
   const history = [];
+  let lifecycle = { state: "not_applicable", rows: [] };
   let truncated = false;
   let presence = { screen_locked: "unknown", idle_hint: "unknown", source: "none" };
   const abortIfNeeded = () => throwIfCollectorAborted(options.signal);
@@ -393,6 +409,7 @@ export async function readLoginSessions(options = {}) {
     abortIfNeeded();
     const last = await runLast(runExec, options);
     sources.last = last.state;
+    lifecycle = last.lifecycle ?? { state: last.state === "absent" ? "absent" : last.state, rows: [] };
     truncated ||= last.truncated === true;
     for (const row of last.rows) {
       const { origin_class: originClass, remote_host: remoteHost } = classifyLoginOrigin(row);
@@ -456,7 +473,7 @@ export async function readLoginSessions(options = {}) {
   const states = Object.values(sources).filter((state) => state !== "not_applicable");
   const usable = states.filter((state) => state === "ok" || state === "absent" || state === "partial");
   const status = states.length === 0 ? "not_applicable" : usable.length === states.length && states.every((state) => state !== "partial") ? "ok" : usable.length > 0 ? "partial" : "unable";
-  return { platform, status, sources, records, history, presence, truncated };
+  return { platform, status, sources, records, history, presence, truncated, lifecycle };
 }
 
 export async function collectLoginSessionsEvidence(options = {}) {

@@ -29,6 +29,8 @@ export const SESSION_LOGIN_HISTORY_ROW_FACT_NAME = "session.login_history_row";
 export const SESSION_LOGIN_CENSUS_FACT_NAME = "session.login_census";
 export const USER_PRESENCE_FACT_NAME = "user.presence";
 export const COLLECTOR_BINARY_STATE_FACT_NAME = "collector.binary_state";
+export const HOST_LIFECYCLE_RECORD_FACT_NAME = "host.lifecycle_record";
+export const MAX_LIFECYCLE_RECORDS_PER_TICK = 4;
 export const NET_VPN_SERVICE_CENSUS_FACT_NAME = "net.vpn_service_census";
 export const NET_VPN_SERVICE_STATE_FACT_NAME = "net.vpn_service_state";
 export const MAX_VPN_SERVICE_STATES_PER_TICK = 8;
@@ -705,6 +707,54 @@ export function factPointsFromVpnServiceEvidence(evidence, { ts, hmacKey } = {})
       entityKey: `${NET_VPN_SERVICE_STATE_FACT_NAME}.${entry.hmac}`,
       source,
       attributes: { ...common, service_hmac: entry.hmac, state: entry.state, kind: "os_vpn_non_tailscale" },
+    }));
+  }
+  return points;
+}
+
+// ------------------------------------------------------------------------------------------------
+// C2 (§4.1): host.lifecycle_record, the `last` reboot/shutdown rows the login collector already read
+// (deduped by keyed row digest in the daemon's login seen-state: a repeated sighting is not a new row).
+// ------------------------------------------------------------------------------------------------
+
+const LIFECYCLE_KINDS = new Set(["reboot", "shutdown"]);
+const LIFECYCLE_END_STATES = new Set(["still_running", "ended", "crash", "down", "none"]);
+
+/**
+ * evidence[] + the daemon's dedupe selection -> at most MAX_LIFECYCLE_RECORDS_PER_TICK
+ * host.lifecycle_record points, each carrying the tick's total of new rows (so an overflow is
+ * visible on every emitted record). No dedupe selection (no usable key): nothing is emitted.
+ */
+export function factPointsFromLifecycleRecordEvidence(evidence, { ts, hmacKey, dedupe } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "login-sessions" && e?.source !== "daemon");
+  if (!envelope || !dedupe || !Array.isArray(dedupe.newLifecycle)) return [];
+  const result = envelope.result ?? {};
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const sourceState = COMPONENT_STATE_VALUES.has(result.lifecycle?.state) ? result.lifecycle.state : "unable";
+  const collectorState = sourceState === "absent" ? "ok" : COLLECTOR_STATE_SET.has(sourceState) ? sourceState : "unable";
+  const total = dedupe.newLifecycle.length;
+  const points = [];
+  for (const row of dedupe.newLifecycle.slice(0, MAX_LIFECYCLE_RECORDS_PER_TICK)) {
+    points.push(contextFactPoint({
+      hmacKey,
+      ts,
+      factName: HOST_LIFECYCLE_RECORD_FACT_NAME,
+      entityKey: `${HOST_LIFECYCLE_RECORD_FACT_NAME}.${contextHmac(hmacKey, "lifecycle_row_entity", row.digest)}`,
+      source: CONTEXT_ENVELOPE_SOURCES.login_sessions,
+      attributes: {
+        collector_state: collectorState,
+        obs_start_ms: msString(obsStartMs),
+        obs_end_ms: msString(obsEndMs),
+        rejected_field: "none",
+        kind: LIFECYCLE_KINDS.has(row.kind) ? row.kind : "unknown",
+        start_text: typeof row.start_text === "string" ? row.start_text : "unknown",
+        time_confidence: "local_minute_no_year",
+        end_state: LIFECYCLE_END_STATES.has(row.end_state) ? row.end_state : "unknown",
+        duration_text: typeof row.duration_text === "string" ? row.duration_text : "unknown",
+        os_release: typeof row.os_release === "string" ? row.os_release : "unknown",
+        new_rows_total: String(Math.min(total, 1000)),
+        dedupe_state: ["fresh", "reseeded"].includes(dedupe.lifecycleDedupeState) ? dedupe.lifecycleDedupeState : "unknown",
+      },
     }));
   }
   return points;
