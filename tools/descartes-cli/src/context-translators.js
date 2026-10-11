@@ -411,6 +411,13 @@ export function factPointsFromLoginSessionsEvidence(evidence, { ts, hmacKey, ded
 // ------------------------------------------------------------------------------------------------
 
 const NET_COMPONENTS = ["gateway_mac", "ra_prefix", "dhcp_domain", "configured_search_domain", "resolvers"];
+const NET_COMPONENT_PROVENANCE = {
+  gateway_mac: "net.gateway_neighbor",
+  ra_prefix: "net.router_advertisement",
+  dhcp_domain: "net.dhcp_lease",
+  configured_search_domain: "net.configured_search_domain",
+  resolvers: "net.resolver_config",
+};
 const ROUTE_KINDS = new Set(["wifi", "ethernet", "cellular", "tunnel", "bridge", "loopback", "other", "none", "unknown"]);
 // States a configuration identity may fold. `not_found_on_known_paths` is OUTSIDE the universe (I49:
 // a source whose binary is not installed, e.g. nmcli or resolvectl), so the rest still fingerprints;
@@ -431,6 +438,27 @@ function componentHmac(hmacKey, name, component) {
   if (state === "ok") return typeof component.value === "string" && component.value ? contextHmac(hmacKey, `net_${name}`, component.value) : "unknown";
   if (state === "absent" || state === "not_applicable") return "none";
   return "unknown";
+}
+
+/**
+ * Returns the exact values and physical objects fed to the aggregate network fingerprint. Keep
+ * this as the single input description used by both hashing and provenance regression tests.
+ */
+export function netConfigAggregateInputs(result = {}) {
+  const components = result.components ?? {};
+  const inputs = [
+    { field: "route_kind", provenance: "net.route_table", value: result.route?.kind },
+    { field: "route_state", provenance: "net.route_table", value: componentState(result.route) },
+  ];
+  for (const name of NET_COMPONENTS) {
+    const component = Object.prototype.hasOwnProperty.call(components, name)
+      ? components[name]
+      : name === "configured_search_domain" ? { state: "not_applicable" } : undefined;
+    const state = componentState(component);
+    inputs.push({ field: `${name}_state`, provenance: NET_COMPONENT_PROVENANCE[name], value: state });
+    inputs.push({ field: `${name}_value`, provenance: NET_COMPONENT_PROVENANCE[name], value: state === "ok" ? component.value : "" });
+  }
+  return inputs;
 }
 
 /**
@@ -476,7 +504,7 @@ export function factPointsFromNetConfigEvidence(evidence, { ts, hmacKey } = {}) 
     && !UNOBSERVED_ROUTE_KINDS.has(attributes.route_kind)
     && NET_COMPONENTS.every((name) => BENIGN_COMPONENT_STATES.has(attributes[`${name}_state`]));
   attributes.fingerprint_hmac = allObserved
-    ? contextHmac(hmacKey, "net_config_fingerprint", JSON.stringify([attributes.route_kind, routeState, ...NET_COMPONENTS.map((name) => [attributes[`${name}_state`], components[name]?.state === "ok" ? components[name].value : ""])]))
+    ? contextHmac(hmacKey, "net_config_fingerprint", JSON.stringify(netConfigAggregateInputs(result).map((input) => input.value)))
     : "unknown";
   return [contextFactPoint({ hmacKey, ts, factName: NET_CONFIG_FINGERPRINT_FACT_NAME, source: CONTEXT_ENVELOPE_SOURCES.net_config, attributes })];
 }

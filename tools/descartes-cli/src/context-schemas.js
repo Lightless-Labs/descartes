@@ -198,7 +198,7 @@ const FACT_SCHEMA_ENTRIES = [
     family: "network_context",
     fields: {
       ...commonFields(["net.route_table"]),
-      fingerprint_hmac: hmacField(["net.route_table", "net.gateway_neighbor", "net.router_advertisement", "net.dhcp_lease", "net.resolver_config"]),
+      fingerprint_hmac: hmacField(["net.route_table", "net.gateway_neighbor", "net.router_advertisement", "net.dhcp_lease", "net.configured_search_domain", "net.resolver_config"]),
       components_ok: intField(0, 6, ["descartes.daemon"]),
       route_kind: enumField(["wifi", "ethernet", "cellular", "tunnel", "bridge", "loopback", "other", "none", "unknown"], ["net.route_table"]),
       route_state: enumField(COMPONENT_STATES, ["net.route_table"]),
