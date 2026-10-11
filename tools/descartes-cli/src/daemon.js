@@ -14,6 +14,7 @@ import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.
 import { combineFamilyCompleteness } from "./fact-store-integrity.js";
 import { migrateLegacyFactStore } from "./fact-store-migration.js";
 import {
+  DERIVED_FAMILIES,
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
   FAMILY_TICK_SHAPES,
@@ -1992,6 +1993,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
       const failingFor = retentionSince !== undefined && nowMs - Date.parse(retentionSince) >= HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs;
       const oversize = Number.isSafeInteger(readBytes) && readBytes > budgetBytes + (FAMILY_TICK_SHAPES.get(family)?.worstTickBytes ?? 0);
+      if (DERIVED_FAMILIES.has(family)) {
+        // Context plan C2 (deviation 9; C2 review M2): a derived family (tick_summary, context_stats)
+        // is written and retained only by the C2 step, whose own pass outcome is on `context_c2`. It is
+        // shown here for sizing only: it never carries retention_error / retention_failing (which the
+        // incumbent daemon.fact_store.retention_failing rule reads) and never enters `state`.
+        delete entry.retention_error;
+        delete entry.retention_error_since_ts;
+        if (oversize) entry.derived_oversize = true;
+        families[family] = entry;
+        continue;
+      }
       if (failingFor || oversize || retentionFailing) entry.retention_failing = true;
       if (entry.retention_error || entry.retention_failing === true) carriedRetentionFailure = true;
       families[family] = entry;

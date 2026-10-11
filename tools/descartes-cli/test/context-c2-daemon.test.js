@@ -13,6 +13,7 @@ import { DERIVED_FAMILIES, FACT_FAMILY_IDS } from "../src/fact-families.js";
 import { finalizeContextC2, prepareContextC2 } from "../src/context-c2-daemon.js";
 import { resolveStatsStatePath, resolveSummaryChainPath, verifyTickSummaryChain } from "../src/context-summary.js";
 import { readLoginSeen } from "../src/login-seen.js";
+import { evaluateAlertRules, RETENTION_FAILURE_RULE_ID } from "../src/alert-store.js";
 
 const T0 = Date.parse("2026-10-11T08:00:00.000Z");
 const HOUR = 3_600_000;
@@ -255,5 +256,40 @@ test("C2 host.lifecycle_record: a row is consumed only when its fact persisted; 
     const written = await records(paths);
     assert.equal(written.length, 1, `${label}: the row reaches the fact history on the next tick`);
     assert.equal(await lifecycleSeen(paths), 1);
+  }
+});
+
+// C2 review M2: a derived family's size or retention never enters the daemon's health state or the
+// incumbent retention-failing alert (deviation 9); it is shown for sizing only, and its own pass's
+// outcome is on context_c2.
+test("C2 derived families: an oversize tick_summary store never turns the daemon state to error or raises the retention alert", async () => {
+  const paths = await tempPaths();
+  const { run } = harness(paths, { finalizeContextC2: async () => ({ summary: "simulated_failed_pass" }) });
+  const statusOf = (result) => result.status ?? result;
+  const before = statusOf(await run(T0));
+  const file = resolveFactStorePaths(paths, "tick_summary").factsFile;
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, "x".repeat(4 * 1024 * 1024));
+  const after = statusOf(await run(T0 + HOUR));
+  assert.equal(before.state, "ok");
+  assert.equal(after.state, "ok", "a derived family is not daemon health");
+  const entry = after.fact_store_budgets.families.tick_summary;
+  assert.equal(entry.bytes, 4 * 1024 * 1024, "still shown for sizing");
+  assert.equal(entry.derived_oversize, true, "the oversize is shown");
+  assert.equal(entry.retention_failing, undefined);
+  assert.equal(entry.retention_error, undefined);
+  const retentionCandidate = (status) => evaluateAlertRules({ metrics: [] }, status, {}).some((c) => c.rule_id === RETENTION_FAILURE_RULE_ID && c.fingerprint === "tick_summary");
+  assert.equal(retentionCandidate(after), false);
+  // Control: the incumbent rule does fire on such an entry, so the absence above is the fix.
+  const flagged = { ...after, fact_store_budgets: { families: { ...after.fact_store_budgets.families, tick_summary: { ...entry, retention_failing: true } } } };
+  assert.equal(retentionCandidate(flagged), true);
+  // The incumbent families' budget entries are the same as with C2 off.
+  const offPaths = await tempPaths();
+  const offRun = harness(offPaths, { contextC2: false }).run;
+  await offRun(T0);
+  const off = statusOf(await offRun(T0 + HOUR));
+  for (const family of INCUMBENT_FAMILIES) {
+    const strip = ({ bytes: _b, last_tick_bytes: _l, ...rest }) => rest;
+    assert.deepEqual(strip(after.fact_store_budgets.families[family]), strip(off.fact_store_budgets.families[family]), family);
   }
 });
