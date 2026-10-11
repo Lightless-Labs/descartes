@@ -130,11 +130,20 @@ test("parseTailscaleStatusJson keeps an absent LastHandshake distinct from the G
     BackendState: "Running",
     Peer: {
       [PUBLIC_KEY_A]: { PublicKey: PUBLIC_KEY_A, Online: false, ExitNode: false, ExitNodeOption: false },
-      [PUBLIC_KEY_B]: { PublicKey: PUBLIC_KEY_B, Online: false, LastHandshake: "not-a-timestamp" },
+      [PUBLIC_KEY_B]: { PublicKey: PUBLIC_KEY_B, Online: false },
     },
   }));
   assert.equal(parsed.peers[0].latest_handshake_epoch_seconds, undefined);
   assert.equal(parsed.peers[1].latest_handshake_epoch_seconds, undefined);
+});
+
+test("parseTailscaleStatusJson rejects a malformed LastHandshake instead of turning it into unknown", () => {
+  const parsed = parseTailscaleStatusJson(JSON.stringify({
+    BackendState: "Running",
+    Peer: { [PUBLIC_KEY_A]: { PublicKey: PUBLIC_KEY_A, Online: false, LastHandshake: "not-a-timestamp" } },
+  }));
+  assert.equal(parsed.peer_map_valid, false);
+  assert.deepEqual(parsed.peers, []);
 });
 
 test("parseTailscaleStatusJson rejects malformed JSON instead of partially trusting it", () => {
