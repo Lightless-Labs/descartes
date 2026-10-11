@@ -123,7 +123,7 @@ test("B2: macOS ra_prefix comes only from ndp router-advertisement prefix record
 });
 
 test("B2 reproduction: a static Linux /128 never becomes a guessed /64 ra_prefix", async () => {
-  const result = await readNetConfig({
+  const read = readNetConfig({
     platform: "linux",
     stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
     readFile: async () => "1\n",
@@ -140,7 +140,7 @@ test("B2 reproduction: a static Linux /128 never becomes a guessed /64 ra_prefix
 
 test("C0.5 darwin collector: fixed argv per component, through the resolver; the tunnel default route is never the physical interface", async () => {
   const calls = [];
-  const result = await readNetConfig({
+  const read = readNetConfig({
     platform: "darwin",
     runFixedExecFile: scripted({
       "netstat -rn -f inet": ok(NETSTAT_REAL),
@@ -225,6 +225,29 @@ test("HIGH: one malformed nmcli domain token makes the whole domain component un
   });
   assert.deepEqual(result.components.configured_search_domain, { state: "unable" });
   assert.equal(result.status, "partial");
+});
+
+test("MEDIUM: an aborted composite net read launches no subprocess after the blocked probe settles", async () => {
+  const controller = new AbortController();
+  const calls = [];
+  const read = readNetConfig({
+    platform: "linux",
+    signal: controller.signal,
+    stat: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    readFile: async () => "1\n",
+    runFixedExecFile: async (command, args) => {
+      calls.push([command, ...args]);
+      if (command === "ip" && args[0] === "route") return ok("default via 192.168.1.1 dev eth0 proto dhcp\n");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      controller.abort();
+      return ok("192.168.1.1 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n");
+    },
+  });
+  await assert.rejects(read, /collector_aborted/);
+  assert.deepEqual(calls, [
+    ["ip", "route", "show", "default"],
+    ["ip", "neigh", "show", "192.168.1.1", "dev", "eth0"],
+  ]);
 });
 
 test("HIGH: the translator keeps configured search domain separate from DHCP lease provenance", () => {

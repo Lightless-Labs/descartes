@@ -6520,6 +6520,30 @@ test("C0 review L7: the every-tick boundary probe runs under the context sub-dea
   assert.equal(result.status.boot_ledger_error, "boundary_probe_deadline_exceeded");
 });
 
+test("MEDIUM: the every-tick boundary deadline aborts the host probe", async () => {
+  const paths = await tempPaths();
+  let receivedSignal;
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ context_collector_deadline_ms: 5, collectors: { "host-lifecycle": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: { "host-lifecycle": async () => envelope("host-lifecycle", "collect_host_lifecycle", {}) },
+    hostLifecycleProbe: async ({ signal }) => {
+      receivedSignal = signal;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return hostProbe(BOOT_ONE, { bootTimeS: 1, wallMs: C12_T0, uptimeMs: 1 });
+    },
+    evaluateAlerts: false,
+    ts: new Date(C12_T0).toISOString(),
+    now: C12_T0,
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: C12_T0 }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.equal(result.status.boot_ledger_error, "boundary_probe_deadline_exceeded");
+  assert.equal(receivedSignal?.aborted, true);
+});
+
 test("C0 review M1: the bracket is never stable when the wake marker is unreadable on either side", () => {
   const noMarker = (bootId) => ({ platform: "linux", status: "ok", boot: { boot_id: bootId, boot_id_source: "proc_boot_id", boot_time_s: 1 }, clocks: { wall_ms: 1, os_uptime_ms: 1 } });
   const withMarker = { ...noMarker(BOOT_ONE), clocks: { wall_ms: 1, os_uptime_ms: 1, suspend_stats_success: 3 } };
