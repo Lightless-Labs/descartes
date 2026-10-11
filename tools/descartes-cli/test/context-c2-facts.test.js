@@ -6,7 +6,12 @@ import test from "node:test";
 import { CONTEXT_KEY_BYTES, contextHmac } from "../src/context-key.js";
 import { validateContextFact } from "../src/context-schemas.js";
 import { FACT_FAMILY_BY_NAME, FAMILY_DEFAULT_BUDGET_BYTES, FAMILY_TICK_SHAPES, familyBudgetFloorBytes } from "../src/fact-families.js";
-import { factPointsFromBinaryStateEvidence, MAX_BINARY_STATES_PER_TICK } from "../src/context-translators.js";
+import {
+  factPointsFromBinaryStateEvidence,
+  factPointsFromVpnServiceEvidence,
+  MAX_BINARY_STATES_PER_TICK,
+  MAX_VPN_SERVICE_STATES_PER_TICK,
+} from "../src/context-translators.js";
 
 const TS = "2026-10-11T10:00:00.000Z";
 const KEY = Buffer.alloc(CONTEXT_KEY_BYTES, 7);
@@ -75,4 +80,65 @@ test("C2 collector_state T8: the budget holds the 30-day horizon at the per-tick
   const many = Array.from({ length: 20 }, (_, i) => ["arp", "codesign", "crontab", "df", "id", "ifconfig", "ioreg", "ip", "ipconfig", "last", "launchctl", "loginctl", "lsof", "ndp", "netstat", "nmcli", "ps", "resolvectl", "screen", "scutil"][i]);
   const evidence = [{ id: "vpn-peer-status", result: { sources: Object.fromEntries(many.map((b) => [b, { binary_provenance: prov(b, "trusted") }])) } }];
   assert.equal(factPointsFromBinaryStateEvidence(evidence, { ts: TS, hmacKey: KEY }).length, MAX_BINARY_STATES_PER_TICK);
+});
+
+function vpnEnvelope({ status = "ok", peers = [], truncated = false, source } = {}) {
+  return { id: "vpn-peer-status", status: "ok", ...(source ? { source } : {}), observation: { start_ms: 10, end_ms: 20 }, result: { sources: { vpn_services: { status } }, peers, truncated } };
+}
+const UUID_A = "11111111-2222-3333-4444-555555555555";
+const UUID_B = "66666666-2222-3333-4444-555555555555";
+
+test("C2 net.vpn_service_state: per-service connected/not_connected from the incumbent census, uuid HMAC'd, plus a census marker; the incumbent peers are untouched", () => {
+  const peers = [
+    { source_type: "ssh", presence_state: "observed_active", remote_user: "a", remote_host: "h" },
+    { source_type: "vpn_service", presence_state: "observed_active", service_name: "Work", service_uuid: UUID_A },
+    { source_type: "vpn_service", presence_state: "observed_historical", service_name: "Home", service_uuid: UUID_B },
+  ];
+  const envelope = vpnEnvelope({ peers });
+  const before = JSON.stringify(envelope);
+  const points = valid(factPointsFromVpnServiceEvidence([envelope], { ts: TS, hmacKey: KEY }));
+  assert.equal(JSON.stringify(envelope), before, "the incumbent envelope is read, never changed");
+  const [census, ...services] = points;
+  assert.equal(census.fact_name, "net.vpn_service_census");
+  assert.equal(census.attributes.services_total, "2");
+  assert.equal(census.attributes.connected_total, "1");
+  assert.equal(census.attributes.overflow, "0");
+  assert.match(census.attributes.state_digest, /^[0-9a-f]{16}$/);
+  assert.equal(services.length, 2);
+  const byHmac = Object.fromEntries(services.map((p) => [p.attributes.service_hmac, p.attributes.state]));
+  assert.equal(byHmac[contextHmac(KEY, "vpn_service_uuid", UUID_A)], "connected");
+  assert.equal(byHmac[contextHmac(KEY, "vpn_service_uuid", UUID_B)], "not_connected");
+  assert.ok(!JSON.stringify(points).includes(UUID_A) && !JSON.stringify(points).includes("Work"));
+  for (const p of points) assert.equal(FACT_FAMILY_BY_NAME.get(p.fact_name), "network_context");
+});
+
+test("C2 net.vpn_service_state: an unusable source, a truncated census, a daemon-synthesized envelope or no key gives unknown totals and no per-service fact", () => {
+  const peers = [{ source_type: "vpn_service", presence_state: "observed_active", service_uuid: UUID_A }];
+  for (const [envelope, hmacKey, expectedState] of [
+    [vpnEnvelope({ status: "unable", peers }), KEY, "unable"],
+    [vpnEnvelope({ status: "not_applicable" }), KEY, "not_applicable"],
+    [vpnEnvelope({ peers, truncated: true }), KEY, "partial"],
+    [vpnEnvelope({ peers, source: "daemon" }), KEY, "unable"],
+    [vpnEnvelope({ peers: [{ source_type: "vpn_service", presence_state: "observed_active" }] }), KEY, "partial"],
+  ]) {
+    const points = valid(factPointsFromVpnServiceEvidence([envelope], { ts: TS, hmacKey }));
+    assert.equal(points.length, 1, JSON.stringify(envelope.result));
+    assert.equal(points[0].attributes.services_total, "unknown");
+    assert.equal(points[0].attributes.state_digest, "unknown");
+    assert.equal(points[0].attributes.collector_state, expectedState);
+  }
+  const noKey = valid(factPointsFromVpnServiceEvidence([vpnEnvelope({ peers })], { ts: TS }));
+  assert.equal(noKey.length, 1, "no usable key: no per-service fact, never an unkeyed id");
+  assert.equal(noKey[0].attributes.state_digest, "unknown");
+  assert.equal(noKey[0].attributes.overflow, "unknown");
+  assert.deepEqual(factPointsFromVpnServiceEvidence([], { ts: TS }), []);
+});
+
+test("C2 net.vpn_service_state: at most 8 per tick, the rest counted as overflow", () => {
+  const peers = Array.from({ length: 11 }, (_, i) => ({ source_type: "vpn_service", presence_state: "observed_active", service_uuid: `${String(i).padStart(8, "0")}-2222-3333-4444-555555555555` }));
+  const points = valid(factPointsFromVpnServiceEvidence([vpnEnvelope({ peers })], { ts: TS, hmacKey: KEY }));
+  assert.equal(points.length, 1 + MAX_VPN_SERVICE_STATES_PER_TICK);
+  assert.equal(points[0].attributes.services_total, "11");
+  assert.equal(points[0].attributes.overflow, "3");
+  assert.equal(points[0].attributes.emitted, "8");
 });

@@ -29,6 +29,9 @@ export const SESSION_LOGIN_HISTORY_ROW_FACT_NAME = "session.login_history_row";
 export const SESSION_LOGIN_CENSUS_FACT_NAME = "session.login_census";
 export const USER_PRESENCE_FACT_NAME = "user.presence";
 export const COLLECTOR_BINARY_STATE_FACT_NAME = "collector.binary_state";
+export const NET_VPN_SERVICE_CENSUS_FACT_NAME = "net.vpn_service_census";
+export const NET_VPN_SERVICE_STATE_FACT_NAME = "net.vpn_service_state";
+export const MAX_VPN_SERVICE_STATES_PER_TICK = 8;
 
 // The envelope ids and tool names the context collectors stamp (bounded, closed).
 export const CONTEXT_ENVELOPE_SOURCES = Object.freeze({
@@ -96,6 +99,7 @@ const TAILNET_BACKEND_STATE_VALUES = Object.freeze({
 });
 
 const TRANSLATOR_COLLECTOR_STATES = new Set(["ok", "partial", "unable", "not_applicable", "not_found_on_known_paths", "untrusted_binary", "missing_permission"]);
+const COLLECTOR_STATE_SET = TRANSLATOR_COLLECTOR_STATES;
 
 function collectorStateFromEnvelope(envelope, result) {
   if (envelope?.status === "unable") return "unable";
@@ -634,6 +638,73 @@ export function factPointsFromBinaryStateEvidence(evidence, { ts, hmacKey } = {}
       entityKey: `${COLLECTOR_BINARY_STATE_FACT_NAME}.${binary}`,
       attributes,
       source: CONTEXT_ENVELOPE_SOURCES.derived,
+    }));
+  }
+  return points;
+}
+
+// ------------------------------------------------------------------------------------------------
+// C2 (§4.2): net.vpn_service_state, from the vpn-peer-status census the daemon already holds. The
+// incumbent census lists each non-Tailscale OS VPN service as a `vpn_service` peer (connected ->
+// observed_active); this reads that list, never re-runs scutil, and changes nothing in it.
+// ------------------------------------------------------------------------------------------------
+
+/**
+ * evidence[] -> one net.vpn_service_census marker plus at most MAX_VPN_SERVICE_STATES_PER_TICK
+ * net.vpn_service_state points (service uuid HMAC'd), whenever the vpn-peer-status envelope exists.
+ * A source that did not run cleanly, or a census truncated by the shared peer cap, gives unknown
+ * totals and no per-service point: a missing service is never read as "disconnected".
+ */
+export function factPointsFromVpnServiceEvidence(evidence, { ts, hmacKey } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "vpn-peer-status");
+  if (!envelope || typeof envelope.result !== "object" || envelope.result === null) return [];
+  const result = envelope.result;
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const daemonSynthesized = envelope.source === "daemon";
+  const rawSourceState = result.sources?.vpn_services?.status;
+  const sourceState = daemonSynthesized ? "unable" : COMPONENT_STATE_VALUES.has(rawSourceState) ? rawSourceState : "unable";
+  const peers = Array.isArray(result.peers) ? result.peers : [];
+  const services = peers.filter((peer) => peer?.source_type === "vpn_service");
+  const counted = sourceState === "ok" && result.truncated !== true;
+  const wellFormed = services.every((service) => typeof service.service_uuid === "string" && service.service_uuid.length > 0
+    && ["observed_active", "observed_historical"].includes(service.presence_state));
+  const usable = counted && wellFormed;
+  const states = usable
+    ? services.map((service) => ({
+      hmac: contextHmac(hmacKey, "vpn_service_uuid", service.service_uuid),
+      state: service.presence_state === "observed_active" ? "connected" : "not_connected",
+    })).sort((a, b) => (a.hmac < b.hmac ? -1 : a.hmac > b.hmac ? 1 : 0))
+    : [];
+  const keyed = states.every((entry) => entry.hmac !== "unknown");
+  const emitted = keyed ? states.slice(0, MAX_VPN_SERVICE_STATES_PER_TICK) : [];
+  const collectorState = !usable ? (sourceState === "ok" ? "partial" : sourceState === "absent" ? "partial" : sourceState) : "ok";
+  const common = { collector_state: COLLECTOR_STATE_SET.has(collectorState) ? collectorState : "unable", obs_start_ms: msString(obsStartMs), obs_end_ms: msString(obsEndMs), rejected_field: "none" };
+  const source = CONTEXT_ENVELOPE_SOURCES.derived;
+  const points = [contextFactPoint({
+    hmacKey,
+    ts,
+    factName: NET_VPN_SERVICE_CENSUS_FACT_NAME,
+    source,
+    attributes: {
+      ...common,
+      source_state: sourceState,
+      services_total: usable ? String(states.length) : "unknown",
+      connected_total: usable ? String(states.filter((entry) => entry.state === "connected").length) : "unknown",
+      emitted: String(emitted.length),
+      overflow: usable && keyed ? String(states.length - emitted.length) : "unknown",
+      state_digest: !usable || !keyed ? "unknown"
+        : states.length === 0 ? "none"
+          : contextHmac(hmacKey, "vpn_service_states", states.map((entry) => `${entry.hmac}:${entry.state}`).join(",")),
+    },
+  })];
+  for (const entry of emitted) {
+    points.push(contextFactPoint({
+      hmacKey,
+      ts,
+      factName: NET_VPN_SERVICE_STATE_FACT_NAME,
+      entityKey: `${NET_VPN_SERVICE_STATE_FACT_NAME}.${entry.hmac}`,
+      source,
+      attributes: { ...common, service_hmac: entry.hmac, state: entry.state, kind: "os_vpn_non_tailscale" },
     }));
   }
   return points;

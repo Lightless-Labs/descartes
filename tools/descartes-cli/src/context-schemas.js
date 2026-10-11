@@ -248,6 +248,32 @@ const FACT_SCHEMA_ENTRIES = [
       observations: intField(1, 64, ["descartes.daemon"]),
     },
   }],
+  // C2 (§4.2): the OS VPN services' state, read from the vpn-peer-status census the daemon already
+  // holds (no new read). Leaves the peer population for the learners (Astra 4); the incumbent peer
+  // census is unchanged.
+  ["net.vpn_service_census", {
+    family: "network_context",
+    fields: {
+      ...commonFields(["vpn.service_config"]),
+      source_state: enumField(COMPONENT_STATES, ["vpn.service_config"]),
+      services_total: intField(0, 100000, ["vpn.service_config"]),
+      connected_total: intField(0, 100000, ["vpn.service_config"]),
+      emitted: intField(0, 8, ["descartes.daemon"]),
+      overflow: intField(0, 100000, ["descartes.daemon"]),
+      state_digest: hmacField(["vpn.service_config"], [SENTINEL_UNKNOWN, "none"]),
+    },
+  }],
+  ["net.vpn_service_state", {
+    family: "network_context",
+    fields: {
+      ...commonFields(["vpn.service_config"]),
+      service_hmac: hmacField(["vpn.service_config"]),
+      // scutil's status reduced by the incumbent census to connected / not connected; the raw status
+      // and the service type are not in that census (C2 deviation; C0.2 owns the typed source).
+      state: enumField(["connected", "not_connected", "unknown"], ["vpn.service_config"]),
+      kind: enumField(["os_vpn_non_tailscale", "unknown"], ["vpn.service_config"]),
+    },
+  }],
   // ---------------------------------------------------------------- session_context
   ["session.login_record", {
     family: "session_context",

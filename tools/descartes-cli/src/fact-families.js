@@ -69,6 +69,8 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["host.boundary_census", "host_lifecycle"],
   ["net.tailnet_state", "network_context"],
   ["net.config_fingerprint", "network_context"],
+  ["net.vpn_service_census", "network_context"],
+  ["net.vpn_service_state", "network_context"],
   ["session.login_record", "session_context"],
   ["session.login_history_row", "session_context"],
   ["session.login_census", "session_context"],
@@ -273,7 +275,8 @@ const FAMILY_BUDGET_ENTRIES = [
   // admitting a 15-minute interval and not raising MIN_STRUCTURAL_INTERVAL_MS. Floors (1 h interval):
   // host_lifecycle 3,570,300 B; network_context 1,467,000 B; session_context 10,415,700 B.
   ["host_lifecycle", 4 * MIB],
-  ["network_context", 2 * MIB],
+  // C2: + the VPN service census marker and at most 8 net.vpn_service_state records per tick.
+  ["network_context", 6 * MIB],
   ["session_context", 11 * MIB],
   // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
   // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
@@ -312,7 +315,8 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // A boundary census (C0.12) borrows the next structural slot, so a horizon holds at most two extra
   // ticks, inside the 1.25 headroom.
   ["host_lifecycle", { maxRecordBytes: 0, markerBytes: 3967, entityCap: 0 }],
-  ["network_context", { maxRecordBytes: 0, markerBytes: 1630, entityCap: 0 }],
+  // C2: markers + vpn_service_census 614; records: MAX_VPN_SERVICE_STATES_PER_TICK x vpn_service_state 528.
+  ["network_context", { maxRecordBytes: 528, markerBytes: 2244, entityCap: 8 }],
   ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],
   // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
   ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
