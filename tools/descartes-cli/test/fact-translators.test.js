@@ -911,6 +911,15 @@ test("factPointsFromTailscaleStatusEvidence returns [] for missing and unable en
   assert.deepEqual(factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({ peers: [] }, "unable")], { ts: TS }), []);
 });
 
+test("C0 review M8: when the vpn-peer-status census overran its sub-deadline (daemon-synthesized envelope, no census marker), tailscale peers are not persisted as a markerless 'complete' peer tick", () => {
+  const synthesizedVpn = { id: "vpn-peer-status", status: "unable", layer: "L0", source: "daemon", result: { status: "unable", error: "collector_deadline_exceeded" } };
+  const evidence = [synthesizedVpn, tailscaleEnvelope({ peers: [tailscalePeer()] })];
+  assert.deepEqual(factPointsFromVpnPeerEvidence(evidence, { ts: TS }), [], "no census marker for the overrun VPN read");
+  assert.deepEqual(factPointsFromTailscaleStatusEvidence(evidence, { ts: TS }), []);
+  // The VPN collector disabled (no envelope at all): the legacy markerless behaviour is unchanged.
+  assert.equal(factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({ peers: [tailscalePeer()] })], { ts: TS }).length, 1);
+});
+
 test("factPointsFromTailscaleStatusEvidence pins the tailscale public-key identity hash", () => {
   const points = factPointsFromTailscaleStatusEvidence([tailscaleEnvelope({ peers: [tailscalePeer()] })], { ts: TS });
   assert.equal(points.length, 1, "tailscale deliberately emits no shared census marker");
