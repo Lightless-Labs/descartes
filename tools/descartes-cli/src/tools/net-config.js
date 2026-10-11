@@ -13,9 +13,10 @@
 //     physical components are not_applicable: the physical interface is never guessed);
 //   - the gateway's link-layer address (macOS `arp -n <gw>`, Linux `ip neigh show <gw> dev <if>`);
 //     `absent` only when the default route has no gateway; an unresolved entry is `unable`;
-//   - the IPv6 router-advertised global /64 prefixes on that interface;
-//   - the DHCP-provided domain (macOS `ipconfig getoption <if> domain_name`; Linux via nmcli when
-//     installed, else not_found_on_known_paths);
+//   - the IPv6 router-advertised global prefixes on that interface (macOS `ndp -p`, Linux `ip -6
+//     addr` lines positively marked with `proto ra` and `dynamic`/`mngtmpaddr`);
+//   - the DHCP-provided domain (macOS `ipconfig getoption <if> domain_name`; Linux from the
+//     explicit `DHCP4.OPTION.domain_name` NetworkManager lease field, else unable);
 //   - the resolvers scoped to that interface only (macOS `scutil --dns` if_index scoping; Linux
 //     `resolvectl dns <if>`), never MagicDNS (100.100.100.100) or a tunnel's resolvers.
 // Raw values stay in memory; context-translators.js HMACs them with the per-install key.
@@ -109,12 +110,7 @@ export function parseIfconfigVerbose(stdout) {
           : /bridge/i.test(type) ? "bridge"
             : /loopback/i.test(type) ? "loopback"
               : "other";
-  const prefixes = new Set();
-  for (const match of text.matchAll(/^\s*inet6\s+([0-9a-fA-F:]+)(?:%\S+)?\s+prefixlen\s+([0-9]+)/gm)) {
-    const prefix = globalPrefix64(match[1]);
-    if (prefix) prefixes.add(prefix);
-  }
-  return { kind, prefixes: [...prefixes].sort() };
+  return { kind, prefixes: [] };
 }
 
 function expandIpv6(address) {
@@ -129,23 +125,89 @@ function expandIpv6(address) {
   return headParts.length === 8 ? headParts : undefined;
 }
 
-/** The /64 of a GLOBAL unicast IPv6 address (2000::/3), else undefined (link-local, ULA, loopback). */
-export function globalPrefix64(address) {
+function canonicalIpv6Prefix(address, prefixLength) {
   const parts = expandIpv6(String(address ?? ""));
   if (!parts || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return undefined;
-  const first = parseInt(parts[0], 16);
-  if ((first & 0xe000) !== 0x2000) return undefined;
-  return `${parts.slice(0, 4).map((part) => parseInt(part, 16).toString(16)).join(":")}::/64`;
+  if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return undefined;
+  const masked = parts.map((part, index) => {
+    const bits = Math.max(0, Math.min(16, prefixLength - index * 16));
+    const mask = bits === 0 ? 0 : (0xffff << (16 - bits)) & 0xffff;
+    return parseInt(part, 16) & mask;
+  });
+  const words = masked.map((word) => word.toString(16));
+  let bestStart = -1;
+  let bestLength = 1;
+  for (let start = 0; start < words.length;) {
+    if (words[start] !== "0") {
+      start += 1;
+      continue;
+    }
+    let end = start;
+    while (end < words.length && words[end] === "0") end += 1;
+    if (end - start > bestLength) {
+      bestStart = start;
+      bestLength = end - start;
+    }
+    start = end;
+  }
+  const rendered = bestStart >= 0
+    ? `${words.slice(0, bestStart).join(":")}::${words.slice(bestStart + bestLength).join(":")}`
+    : words.join(":");
+  return `${rendered || "::"}/${prefixLength}`;
 }
 
-/** `ip -6 addr show dev <if> scope global` -> sorted unique global /64 prefixes. */
-export function parseIpAddrInet6(stdout) {
+function isGlobalIpv6(address) {
+  const parts = expandIpv6(String(address ?? ""));
+  if (!parts || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return false;
+  return (parseInt(parts[0], 16) & 0xe000) === 0x2000;
+}
+
+/** The observed /64 of a GLOBAL unicast IPv6 address, retained for compatibility callers. */
+export function globalPrefix64(address) {
+  return isGlobalIpv6(address) ? canonicalIpv6Prefix(address, 64) : undefined;
+}
+
+/**
+ * `ip -6 addr show dev <if> scope global` -> observed RA prefixes. Static/global addresses are
+ * deliberately unable rather than converted to a guessed /64.
+ */
+export function parseLinuxRouterAdvertisementPrefixes(stdout) {
   const prefixes = new Set();
-  for (const match of String(stdout ?? "").matchAll(/inet6\s+([0-9a-fA-F:]+)\/[0-9]+/g)) {
-    const prefix = globalPrefix64(match[1]);
+  let sawGlobalAddress = false;
+  for (const rawLine of String(stdout ?? "").split("\n")) {
+    const match = /\binet6\s+([^\s/]+)\/(\d+)\s+(.+)$/.exec(rawLine.trim());
+    if (!match) continue;
+    const [, address, lengthText, flags] = match;
+    const prefixLength = Number(lengthText);
+    if (!isGlobalIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) continue;
+    sawGlobalAddress = true;
+    if (/\bproto\s+ra\b/.test(flags) && /\b(?:dynamic|mngtmpaddr)\b/.test(flags)) {
+      const prefix = canonicalIpv6Prefix(address, prefixLength);
+      if (prefix) prefixes.add(prefix);
+    }
+  }
+  if (prefixes.size > 0) return { state: "ok", prefixes: [...prefixes].sort() };
+  return { state: sawGlobalAddress ? "unable" : "absent", prefixes: [] };
+}
+
+/** `ndp -p` -> sorted unique global prefixes for the selected interface, preserving /len. */
+export function parseNdpRouterAdvertisementPrefixes(stdout, iface) {
+  const prefixes = new Set();
+  for (const rawLine of String(stdout ?? "").split("\n")) {
+    const match = /^\s*([^\s/]+)\/(\d+)\s+if=([^\s]+)/.exec(rawLine);
+    if (!match || match[3] !== iface) continue;
+    const address = match[1];
+    const prefixLength = Number(match[2]);
+    if (!isGlobalIpv6(address)) continue;
+    const prefix = canonicalIpv6Prefix(address, prefixLength);
     if (prefix) prefixes.add(prefix);
   }
   return [...prefixes].sort();
+}
+
+/** `ip -6 addr show dev <if> scope global` compatibility wrapper. */
+export function parseIpAddrInet6(stdout) {
+  return parseLinuxRouterAdvertisementPrefixes(stdout).prefixes;
 }
 
 /** `arp -n <gw>` / `ip neigh show <gw> dev <if>` -> the lowercased MAC, or undefined (incomplete). */
@@ -205,7 +267,10 @@ async function readDarwin(runExec, options) {
     // right after wake) is an unread value, never "absent".
     gatewayMac = arp.status !== "ok" ? { state: failureState(arp) } : mac ? { state: "ok", value: mac } : { state: "unable" };
   }
-  const raPrefix = ifconfig ? listComponent(ifconfig.prefixes) : { state: failureState(ifconfigProbe) };
+  const ndpProbe = await runExec("ndp", ["-p"], probeOptions(options));
+  const raPrefix = ndpProbe.status === "ok"
+    ? listComponent(parseNdpRouterAdvertisementPrefixes(ndpProbe.stdout, iface))
+    : { state: failureState(ndpProbe) };
 
   const domainProbe = await runExec("ipconfig", ["getoption", iface, "domain_name"], probeOptions(options));
   let dhcpDomain;
@@ -259,7 +324,8 @@ async function readLinux(runExec, options) {
     gatewayMac = neigh.status !== "ok" ? { state: failureState(neigh) } : mac ? { state: "ok", value: mac } : { state: "unable" };
   }
   const addr = await runExec("ip", ["-6", "addr", "show", "dev", iface, "scope", "global"], probeOptions(options));
-  const raPrefix = addr.status === "ok" ? listComponent(parseIpAddrInet6(addr.stdout)) : { state: failureState(addr) };
+  const raPrefixes = addr.status === "ok" ? parseLinuxRouterAdvertisementPrefixes(addr.stdout) : undefined;
+  const raPrefix = addr.status !== "ok" ? { state: failureState(addr) } : raPrefixes.state === "ok" ? listComponent(raPrefixes.prefixes) : { state: raPrefixes.state };
 
   const nmcli = await runExec("nmcli", ["-g", "IP4.DOMAIN", "device", "show", iface], probeOptions(options));
   let dhcpDomain;

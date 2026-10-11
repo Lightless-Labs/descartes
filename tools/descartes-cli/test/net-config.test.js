@@ -77,7 +77,7 @@ test("C0.5 parsers (real darwin output): physical default route skips the tunnel
   assert.deepEqual(choosePhysicalDefault(routes), { state: "ok", iface: "en0", gateway: "192.168.64.1" });
   assert.deepEqual(choosePhysicalDefault([{ iface: "utun4" }]), { state: "ok", kind: "tunnel", tunnel_only: true });
   assert.deepEqual(choosePhysicalDefault([]), { state: "absent", kind: "none" });
-  assert.deepEqual(parseIfconfigVerbose(IFCONFIG_REAL), { kind: "ethernet", prefixes: ["2001:db8:abcd:12::/64"] });
+  assert.deepEqual(parseIfconfigVerbose(IFCONFIG_REAL), { kind: "ethernet", prefixes: [] });
   assert.equal(parseIfconfigVerbose("\ttype: Wi-Fi\n").kind, "wifi");
   assert.equal(parseIfconfigVerbose("nothing").kind, "unknown");
   assert.equal(parseNeighborMac(ARP_REAL), "1e:f6:4c:23:af:64");
@@ -92,7 +92,7 @@ test("C0.5 parsers (linux formats)", () => {
   assert.deepEqual(parseIpRouteDefault("default via 192.168.1.1 dev wlp2s0 proto dhcp metric 600\ndefault dev wg0 scope link\n"), [
     { gateway: "192.168.1.1", iface: "wlp2s0" }, { gateway: undefined, iface: "wg0" },
   ]);
-  assert.deepEqual(parseIpAddrInet6("    inet6 2a01:e0a:1:2:3:4:5:6/64 scope global dynamic mngtmpaddr\n    inet6 fd00::1/64 scope global\n"), ["2a01:e0a:1:2::/64"]);
+  assert.deepEqual(parseIpAddrInet6("    inet6 2a01:e0a:1:2:3:4:5:6/64 scope global dynamic mngtmpaddr proto ra\n    inet6 fd00::1/64 scope global\n"), ["2a01:e0a:1:2::/64"]);
   assert.deepEqual(parseResolvectlDns("Link 3 (wlp2s0): 192.168.1.1 fe80::1%3 100.100.100.100\n"), ["192.168.1.1", "fe80::1"]);
   assert.equal(globalPrefix64("fe80::1"), undefined);
   assert.equal(globalPrefix64("fd7a:115c:a1e0::1"), undefined, "ULA is not a router-advertised global prefix");
@@ -138,12 +138,13 @@ test("C0.5 darwin collector: fixed argv per component, through the resolver; the
     runFixedExecFile: scripted({
       "netstat -rn -f inet": ok(NETSTAT_REAL),
       "ifconfig -v en0": ok(IFCONFIG_REAL),
+      "ndp -p": ok("2001:db8:abcd:12::/64 if=en0 flags=LAO vltime=infinity, pltime=infinity, expire=Never, ref=1\n  No advertising router\n"),
       "arp -n 192.168.64.1": ok(ARP_REAL),
       "ipconfig getoption en0 domain_name": { status: "error", code: 1, stdout: "", stderr: "" },
       "scutil --dns": ok(SCUTIL_DNS_REAL),
     }, calls),
   });
-  assert.deepEqual(calls, ["netstat -rn -f inet", "ifconfig -v en0", "arp -n 192.168.64.1", "ipconfig getoption en0 domain_name", "scutil --dns"]);
+  assert.deepEqual(calls, ["netstat -rn -f inet", "ifconfig -v en0", "arp -n 192.168.64.1", "ndp -p", "ipconfig getoption en0 domain_name", "scutil --dns"]);
   assert.equal(result.status, "ok");
   assert.deepEqual(result.route, { state: "ok", kind: "ethernet" });
   assert.deepEqual(result.components, {
