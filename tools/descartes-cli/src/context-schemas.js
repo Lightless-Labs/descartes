@@ -125,9 +125,13 @@ export const BINARY_TRUST_REASONS = Object.freeze([
 // record carries closed one/two-letter codes; this table is their only meaning).
 //   census state (scs, pcs): c complete, p partial, a absent (no census this tick), u unknown
 //   boundary verdict (bv): n none in this interval, v verified, u unverified, t tripwire, x unknown
-//   exposure basis (exb): bt Linux boottime-clock delta, ud macOS uptime delta (now - kern.boottime,
-//     wall-derived), xb crosses a boot, np no previous reading, ur uptime regressed, u unknown
-//   wall cross-check (wx): c consistent with the uptime delta, f wall stepped forward, b backward, u unknown
+//   exposure basis (exb): bt Linux boottime-clock delta, ud macOS uptime delta (now - kern.boottime:
+//     WALL-DERIVED and UNVERIFIED; open item 20's monotonic-clock basis is NOT met on macOS until C0.9
+//     validates an independent reading such as kern.monotonicclock_usecs, kept raw in `mono`; C2 review
+//     M5), xb crosses a boot, np no previous reading, ur uptime regressed, u unknown
+//   wall cross-check (wx): c consistent with the uptime delta, f wall stepped forward, b backward, u unknown.
+//     With exb ud (macOS) the uptime is itself wall-derived, so wx only sees a moved kern.boottime: a wall
+//     step the kernel does not fold into kern.boottime reads "c" there
 //   tailnet (tn): state letter + online letter. State: r running, l needs_login, s no_state, x stopped,
 //     m needs_machine_auth, g starting, z unrecognized, f not_found_on_known_paths, t untrusted_binary,
 //     p missing_permission, u unable/unknown. Online: t, f, u.
