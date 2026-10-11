@@ -210,26 +210,34 @@ export function globalPrefix64(address) {
  * deliberately unable rather than converted to a guessed /64.
  */
 export function parseLinuxRouterAdvertisementPrefixes(stdout) {
-  if (typeof stdout !== "string") return { state: "unable", prefixes: [] };
+  if (typeof stdout !== "string") return { state: "partial", prefixes: [] };
   const prefixes = new Set();
   let sawGlobalAddress = false;
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
-    if (line && !/\binet6\b/.test(line)
-      && !/^\d+:\s+\S+/.test(line)
-      && !/^(?:valid_lft|preferred_lft)\b/.test(line)) return { state: "unable", prefixes: [] };
-    if (/\binet6\b/.test(rawLine) && !/\binet6\s+[^\s/]+\/\d+\s+.+$/.test(rawLine.trim())) return { state: "unable", prefixes: [] };
-    const match = /\binet6\s+([^\s/]+)\/(\d+)\s+(.+)$/.exec(rawLine.trim());
-    if (!match) continue;
-    const [, address, lengthText, flags] = match;
+    if (!line) continue;
+    if (/^\d+:\s+[A-Za-z][A-Za-z0-9_.-]*(?:@[A-Za-z][A-Za-z0-9_.-]*)?:\s+<[^>]+>\s+mtu\s+\d+(?:\s+qdisc\s+\S+)?(?:\s+state\s+\S+)?(?:\s+group\s+\S+)?(?:\s+qlen\s+\d+)?$/.test(line)) continue;
+    if (/^(?:valid_lft|preferred_lft)\s+(?:forever|\d+(?:sec)?)(?:\s+preferred_lft\s+(?:forever|\d+(?:sec)?))?$/.test(line)) continue;
+    const match = /^(?:(?:\d+):\s+[A-Za-z][A-Za-z0-9_.-]*(?:@[A-Za-z][A-Za-z0-9_.-]*)?:\s+)?inet6\s+([^\s/]+)\/(\d+)\s+scope\s+(global|link|host)(?:\s+(.*))?$/.exec(line);
+    if (!match) return { state: "partial", prefixes: [] };
+    const [, address, lengthText, _scope, flags = ""] = match;
+    const flagTokens = flags ? flags.split(/\s+/) : [];
+    const validFlags = new Set(["dynamic", "mngtmpaddr", "temporary", "autoconf", "deprecated", "dadfailed", "tentative", "optimistic", "home", "stable-privacy", "nodad"]);
+    for (let index = 0; index < flagTokens.length; index += 1) {
+      if (flagTokens[index] === "proto" && ["ra", "kernel_ra"].includes(flagTokens[index + 1])) {
+        index += 1;
+        continue;
+      }
+      if (!validFlags.has(flagTokens[index])) return { state: "partial", prefixes: [] };
+    }
     const prefixLength = Number(lengthText);
-    if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return { state: "unable", prefixes: [] };
+    if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return { state: "partial", prefixes: [] };
     if (!isGlobalIpv6(address)) continue;
     sawGlobalAddress = true;
     if (/\bproto\s+(?:ra|kernel_ra)\b/.test(flags) && /\b(?:dynamic|mngtmpaddr)\b/.test(flags)) {
       const prefix = canonicalIpv6Prefix(address, prefixLength);
       if (prefix) {
-        if (prefixes.has(prefix)) return { state: "unable", prefixes: [] };
+        if (prefixes.has(prefix)) return { state: "partial", prefixes: [] };
         prefixes.add(prefix);
       }
     }
@@ -244,10 +252,10 @@ export function parseNdpRouterAdvertisementPrefixes(stdout, iface) {
   const prefixes = new Set();
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
-    if (line && !line.startsWith("No advertising router") && !/^\S+\/\d+\s+if=\S+/.test(line)) return undefined;
-    if (/\//.test(rawLine) && !/^\s*[^\s/]+\/\d+\s+if=[^\s]+/.test(rawLine)) return undefined;
-    const match = /^\s*([^\s/]+)\/(\d+)\s+if=([^\s]+)/.exec(rawLine);
-    if (!match) continue;
+    if (!line) continue;
+    if (/^No advertising router$/.test(line)) continue;
+    const match = /^([^\s/]+)\/(\d+)\s+if=([^\s]+)\s+flags=[A-Za-z]+(?:\s+vltime=(?:infinity|\d+)\s*,\s*pltime=(?:infinity|\d+)\s*,\s*expire=(?:Never|[0-9A-Za-z: -]+)\s*,\s*ref=\d+)?$/.exec(line);
+    if (!match) return undefined;
     if (!IFACE_RE.test(match[3])) return undefined;
     if (match[3] !== iface) continue;
     const address = match[1];
@@ -338,11 +346,10 @@ export function parseResolvectlDns(stdout) {
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    if (/^Global\b/i.test(line)) continue;
-    if (!/^Link\b/i.test(line) || !/^Link\s+[0-9]+\s+\([^)]*\):(?:\s+.*)?$/.test(line)) return undefined;
-    const colon = rawLine.indexOf("):");
-    if (colon < 0) continue;
-    const rest = rawLine.slice(colon + 2).trim();
+    const global = /^Global:\s*(.*)$/i.exec(line);
+    const link = /^Link\s+[0-9]+\s+\(([A-Za-z][A-Za-z0-9_.-]{0,14})\):(?:\s+(.*))?$/i.exec(line);
+    if (!global && !link) return undefined;
+    const rest = (global?.[1] ?? link?.[2] ?? "").trim();
     if (!rest) continue;
     for (const token of rest.split(/\s+/)) {
       if (!isDnsServer(token)) return undefined;
