@@ -464,8 +464,8 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     "host.daemon_gap": 679, "context.transition": 699, "session.created_vs_boot": 623,
     // Derived records: an upper bound under this generic shape (a longest envelope source, a suffixed
     // entity key, confidence, rejected_field); their exact worst cases are pinned in
-    // context-c2-summary.test.js (tick.summary 1,013 B <= 1 KiB).
-    "tick.summary": 1159, "stats.episode": 648, "stats.daily": 561,
+    // context-c2-summary.test.js (tick.summary 1,024 B <= 1 KiB plus its certificate sibling).
+    "tick.summary": 1170, "tick.summary_certificate": 1109, "stats.episode": 669, "stats.daily": 684,
   }, "a schema change must revisit the pinned context tick shapes");
   assert.equal(FAMILY_TICK_SHAPES.get("collector_state").maxRecordBytes, worst["collector.binary_state"]);
   const tick = {

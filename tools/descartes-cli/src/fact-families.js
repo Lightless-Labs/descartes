@@ -87,6 +87,7 @@ const FACT_NAME_FAMILY_PAIRS = [
   ["context.transition", "network_context"],
   ["session.created_vs_boot", "session_context"],
   ["tick.summary", "tick_summary"],
+  ["tick.summary_certificate", "tick_summary"],
   ["stats.episode", "context_stats"],
   ["stats.daily", "context_stats"],
 ];
@@ -298,11 +299,10 @@ const FAMILY_BUDGET_ENTRIES = [
   // C2: at most MAX_BINARY_STATES_PER_TICK (12) collector.binary_state records per tick. Floor (1 h
   // interval, 30 days): 720 x 12 x 668 B x 1.25 = 7,214,400 B.
   ["collector_state", 8 * MIB],
-  // C2 derived families. tick_summary: one record of at most 1,013 B per structural tick; 3 MiB holds
-  // the 90-day retention at a 1 h interval (the 30-day floor is 911,700 B). context_stats: at most one
-  // episode and one daily record per tick (531 + 442 = 973 B with their entity keys, a rejected record's
-  // confidence:0 included; C2 review L1); 2 MiB holds the 30-day floor (875,700 B) and, at typical volume (rare episodes, one daily record per day), the
-  // 365-day retention.
+  // C2 derived families. tick_summary carries a 1,024 B summary plus a 974 B certificate sibling per
+  // structural tick; 3 MiB holds the 90-day retention at a 1 h interval. context_stats carries at
+  // most one episode and one daily record per tick (548 + 556 = 1,104 B with their entity keys);
+  // 2 MiB holds the 30-day floor and, at typical volume, the 365-day retention.
   ["context_stats", 2 * MIB],
   ["tick_summary", 3 * MIB],
 ];
@@ -350,8 +350,10 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
   ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
   // C2: the exact worst cases (no envelope source, fixed entity key; pinned in context-c2-summary.test.js).
-  ["context_stats", { maxRecordBytes: 0, markerBytes: 973, entityCap: 0 }],
-  ["tick_summary", { maxRecordBytes: 0, markerBytes: 1013, entityCap: 0 }],
+  ["context_stats", { maxRecordBytes: 0, markerBytes: 548 + 556, entityCap: 0 }],
+  // C2 H1: one compact sibling certificate table accompanies each summary. The summary itself remains
+  // capped at 1 KiB; the sibling carries the full source-pass tuples referenced by its digest.
+  ["tick_summary", { maxRecordBytes: 0, markerBytes: 1024 + 974, entityCap: 0 }],
 ];
 
 export const BUDGET_INVARIANT_HEADROOM = 1.25;
@@ -463,6 +465,17 @@ export const DERIVED_FAMILIES = Object.freeze(new Set(DERIVED_FAMILY_ENTRIES.map
   if (!KNOWN_FAMILIES.has(family)) throw new Error(`fact-families: derived family ${family} is unknown`);
   return family;
 })));
+
+// Families whose writes are observational C2 data and must never influence incumbent health. The
+// derived families are already isolated from the generic pass; collector_state is C2-only but is
+// intentionally retained in its own post-incumbent pass so a storage failure cannot become a daemon
+// storage error or a retention alert.
+export const DATA_ONLY_FAMILIES = Object.freeze(new Set([
+  "collector_state",
+  ...DERIVED_FAMILIES,
+]));
+
+export const C2_ONLY_FAMILIES = Object.freeze(new Set(["collector_state"]));
 
 // H_max(f): the longest eligibility horizon of any history-dependent rule reading family f (§4.5),
 // or, for a data family, its declared data horizon.

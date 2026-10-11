@@ -8,8 +8,8 @@ import path from "node:path";
 import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { runDaemonIteration } from "../src/daemon.js";
-import { readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
-import { DERIVED_FAMILIES, FACT_FAMILY_IDS } from "../src/fact-families.js";
+import { appendFactPointsByFamily, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
+import { DATA_ONLY_FAMILIES, DERIVED_FAMILIES, FACT_FAMILY_IDS } from "../src/fact-families.js";
 import { finalizeContextC2, prepareContextC2 } from "../src/context-c2-daemon.js";
 import { resolveStatsStatePath, resolveSummaryChainPath, verifyTickSummaryChain } from "../src/context-summary.js";
 import { readLoginSeen } from "../src/login-seen.js";
@@ -121,11 +121,13 @@ test("C2 wiring: each completed structural tick appends one chained, certified t
   state.offset = -240;
   const status = await run(T0 + 2 * HOUR);
   const now = new Date(T0 + 2 * HOUR).toISOString();
-  const summaries = (await readFactPoints(paths, { family: "tick_summary", now })).points;
+  const allSummaryFamilyPoints = (await readFactPoints(paths, { family: "tick_summary", now })).points;
+  const summaries = allSummaryFamilyPoints.filter((p) => p.fact_name === "tick.summary");
   assert.equal(summaries.length, 3);
   assert.deepEqual(summaries.map((p) => p.attributes.chain), ["started", "continued", "continued"]);
   assert.deepEqual(summaries.map((p) => p.attributes.cert), ["certified", "certified", "certified"]);
-  assert.deepEqual(verifyTickSummaryChain(summaries).losses, []);
+  assert.deepEqual(verifyTickSummaryChain(allSummaryFamilyPoints).losses, []);
+  assert.equal(allSummaryFamilyPoints.filter((p) => p.fact_name === "tick.summary_certificate").length, 3);
   assert.deepEqual(summaries.map((p) => [p.attributes.sa, p.attributes.sd]), [["unknown", "unknown"], ["1", "0"], ["0", "0"]]);
   assert.equal(summaries[2].attributes.ev, "--u-u-zo", "positional: no tailscale or net-config collector in this harness");
   assert.equal(status.status?.context_c2?.summary ?? status.context_c2?.summary, "committed");
@@ -181,10 +183,60 @@ test("C2 isolation: the incumbent families are byte-identical with the C2 phase 
   const offSummaries = await readFactPoints(off.paths, { family: "tick_summary", now: new Date(T0 + HOUR).toISOString() });
   assert.equal(offSummaries.points.length, 0);
   const onSummaries = await readFactPoints(on.paths, { family: "tick_summary", now: new Date(T0 + HOUR).toISOString() });
-  assert.equal(onSummaries.points.length, 2, "the C2 phase did run in the comparison");
-  assert.equal(onSummaries.points[1].attributes.sd, "1");
+  const onSummaryPoints = onSummaries.points.filter((p) => p.fact_name === "tick.summary");
+  assert.equal(onSummaryPoints.length, 2, "the C2 phase did run in the comparison");
+  assert.equal(onSummaryPoints[1].attributes.sd, "1");
   // The C2 families are derived or context families: never an incumbent family.
   for (const family of DERIVED_FAMILIES) assert.ok(!INCUMBENT_FAMILIES.includes(family) && FACT_FAMILY_IDS.includes(family));
+});
+
+test("C2-only collector_state persistence is a separate data-only pass: ENOSPC changes context_c2 only, never incumbent health or alerts", async () => {
+  assert.ok(DATA_ONLY_FAMILIES.has("collector_state"));
+  const appendWithCollectorFailure = async (paths, points, options) => {
+    if (options.families?.length === 1 && options.families[0] === "collector_state") {
+      return { written_count: 0, families: { collector_state: { written_count: 0, budget_bytes: 1, append_error: "ENOSPC" } }, append_error: "collector_state: ENOSPC" };
+    }
+    return appendFactPointsByFamily(paths, points, options);
+  };
+  const runAll = async (overrides) => {
+    const paths = await tempPaths();
+    const { run } = harness(paths, { appendFactPoints: appendWithCollectorFailure, ...overrides });
+    return { paths, status: await run(T0) };
+  };
+  const baseline = await runAll({ contextC2: false });
+  const failed = await runAll({});
+  const statusOf = (result) => result.status?.status ?? result.status ?? result;
+  assert.equal(statusOf(failed).state, statusOf(baseline).state);
+  assert.equal(statusOf(failed).storage_write_error, undefined);
+  assert.equal(statusOf(failed).retention_error, undefined);
+  assert.equal(statusOf(failed).context_c2?.data_only?.error, "collector_state: ENOSPC");
+  assert.equal(statusOf(failed).context_c2?.data_only?.families?.collector_state?.append_error, "ENOSPC");
+  assert.deepEqual(await incumbentFiles(failed.paths), await incumbentFiles(baseline.paths));
+  const alerts = evaluateAlertRules({}, statusOf(failed), { now: new Date(T0).toISOString() });
+  assert.ok(!alerts.some((alert) => ["daemon.status.not_ok", RETENTION_FAILURE_RULE_ID].includes(alert.rule_id)));
+});
+
+test("C2 failed ticks leave a durable gap: the next success is marked gap and does not fold churn across the missing tick", async () => {
+  const paths = await tempPaths();
+  let attempts = 0;
+  const { state, run } = harness(paths, {
+    prepareContextC2: async (args) => {
+      attempts += 1;
+      if (attempts === 2) throw new Error("prepare gap");
+      return prepareContextC2(args);
+    },
+  });
+  await run(T0);
+  state.sessions = { other: 1_000_200 };
+  await run(T0 + HOUR);
+  state.sessions = { third: 1_000_300 };
+  await run(T0 + 2 * HOUR);
+  const summaries = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 2 * HOUR).toISOString() })).points.filter((p) => p.fact_name === "tick.summary");
+  assert.deepEqual(summaries.map((p) => p.attributes.chain), ["started", "gap"]);
+  assert.equal(summaries[1].attributes.g, "1");
+  assert.equal(summaries[1].attributes.sa, "unknown");
+  assert.equal(summaries[1].attributes.sd, "unknown");
+  assert.deepEqual(verifyTickSummaryChain(summaries).losses.map((loss) => loss.reason), ["gap"]);
 });
 
 test("C2 finalize: a summary whose pass did not commit leaves the chain state unadvanced, so the next tick restarts the chain (unknown transitions), never continues it", async () => {
@@ -275,7 +327,7 @@ test("C2 derived families: an oversize tick_summary store never turns the daemon
   assert.equal(after.state, "ok", "a derived family is not daemon health");
   const entry = after.fact_store_budgets.families.tick_summary;
   assert.equal(entry.bytes, 4 * 1024 * 1024, "still shown for sizing");
-  assert.equal(entry.derived_oversize, true, "the oversize is shown");
+  assert.equal(entry.derived_oversize ?? entry.data_only_oversize, true, "the oversize is shown");
   assert.equal(entry.retention_failing, undefined);
   assert.equal(entry.retention_error, undefined);
   const retentionCandidate = (status) => evaluateAlertRules({ metrics: [] }, status, {}).some((c) => c.rule_id === RETENTION_FAILURE_RULE_ID && c.fingerprint === "tick_summary");

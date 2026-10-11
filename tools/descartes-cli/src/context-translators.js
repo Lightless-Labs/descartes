@@ -825,7 +825,7 @@ export function factPointsFromSessionAttachmentEvidence(evidence, { ts, hmacKey 
       source,
       attributes: {
         ...common,
-        session_key: hashSessionIdentity("tmux", client.session_name),
+        session_key: contextHmac(hmacKey, "session_join", hashSessionIdentity("tmux", client.session_name)),
         client_tty_class: ATTACHMENT_TTY_CLASSES.has(ttyClass) ? ttyClass : "unknown",
         login_join: join,
         login_origin_class: match ? (ORIGIN_CLASSES.has(match.origin_class) ? match.origin_class : "unknown") : join === "no_login_row" ? "none" : "unknown",

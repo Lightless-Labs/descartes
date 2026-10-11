@@ -16,6 +16,7 @@
 **Reviewed:** 2026-10-11 (C0 adversarial review, NEEDS-REWORK; every finding dispositioned in "C0 review fixes (2026-10-11)" at the end of this plan)
 **Addendum:** 2026-10-11 — C2 execution on `feat/context-facts-c2b-2026-10`: the C2 data step (L1 facts, `tick_summary` with chaining and certification at derivation, per-family retention, the long-lived statistics skeleton) is implemented, DATA ONLY, after the incumbent census; not yet daybreak-gated. Deviations and deferred items are listed in "Addendum: C2 execution (2026-10-11)" at the end of this plan.
 **Reviewed:** 2026-10-11 (C2 adversarial review, NEEDS-REWORK: 1 HIGH, 7 MEDIUM, 13 LOW; every finding dispositioned in "C2 review fixes (2026-10-11)" at the end of this plan)
+**Revised:** 2026-10-11 (C2b rework — isolated C2-only persistence, durable loss/gap markers, auditable certificate tuples, certification-aware statistics, forward-only UTC buckets, and HMAC session joins)
 **Origin:** `todos/2026-10-06-session-peer-tuning.md` (operator reframe, 2026-10-06). This plan realizes Slice 12 of `docs/plans/2026-07-09-self-learning-stratified-monitoring.md:183` and generalizes it from time to all context.
 
 **Inputs to v5:**

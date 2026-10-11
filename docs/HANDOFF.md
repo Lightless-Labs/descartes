@@ -2,6 +2,23 @@
 
 **Last updated:** 2026-10-11
 
+## Context facts C2b rework — 2026-10-11 — local, not pushed
+
+Closed the daybreak BLOCKER/HIGH/MEDIUM/LOW findings on `feat/context-facts-c2b-2026-10`.
+C2-only `collector_state` writes now run in a separate post-incumbent data-only pass, with
+failures confined to `context_c2`; derived-family health/retention accounting uses one registry
+flag. Continuity readers treat a broken, missing, edited, or rollback-discarded facts ledger as
+loss. Failed or skipped C2 ticks persist a durable gap count, and the next summary emits `chain:gap`
+with unknown interval churn. Certification now persists a compact sibling tuple table and verifies
+its digest; uncertified summaries are counted separately and excluded from churn/exposure/episode
+statistics. UTC-day buckets only advance forward, and session joins use the per-install HMAC token.
+
+Focused C2/data-family verification passes **79/79**. Fresh-XDG full `npm test` completed with
+**2,673 total: 2,610 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are environment-only:
+17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1` (`listen EPERM`), and 2 live-process
+provenance checks return `unknown` under restricted process introspection. No changed-area product
+test failed. No push or merge.
+
 ## Linux iproute2 route and inet6 grammar completion — 2026-10-11 — local, not pushed
 
 Added TDD coverage and a shared strict Linux iproute2 route grammar. The route parsers now accept

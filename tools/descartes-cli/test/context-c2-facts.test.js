@@ -300,7 +300,7 @@ test("C2 session.attachment: each client joined to the login on its tty; session
   assert.equal(census.attributes.clients_total, "2");
   assert.equal(census.attributes.login_source_state, "ok");
   assert.equal(attachments.length, 2);
-  assert.equal(attachments[0].attributes.session_key, hashSessionIdentity("tmux", "work"));
+  assert.equal(attachments[0].attributes.session_key, contextHmac(KEY, "session_join", hashSessionIdentity("tmux", "work")));
   assert.equal(attachments[0].attributes.login_join, "matched");
   assert.equal(attachments[0].attributes.login_origin_class, "remote");
   assert.equal(attachments[0].attributes.client_tty_class, "ttys");

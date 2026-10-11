@@ -9,7 +9,7 @@ import test from "node:test";
 import { resolveDescartesPaths } from "../src/paths.js";
 import { CONTEXT_KEY_BYTES, contextHmac, contextKeyId } from "../src/context-key.js";
 import { CONTEXT_FACT_SCHEMAS, unableContextAttributes, validateContextFact } from "../src/context-schemas.js";
-import { appendFactPoints, MAX_FACT_ATTRIBUTE_COUNT, normalizeFactPoint, readFactPoints } from "../src/fact-store.js";
+import { appendFactPoints, MAX_FACT_ATTRIBUTE_COUNT, normalizeFactPoint, readFactPoints, resolveFactStorePaths } from "../src/fact-store.js";
 import { readFactIntegrityLedger } from "../src/fact-store-integrity.js";
 import { FAMILY_TICK_SHAPES, FACT_FAMILY_BY_NAME } from "../src/fact-families.js";
 import { factPointsFromSessionEvidence, factPointsFromVpnPeerEvidence, hashSessionIdentity } from "../src/fact-translators.js";
@@ -109,9 +109,9 @@ test("C2 tick_summary T8: the worst-case record is at most 1 KiB (pinned), carri
   };
   const longestField = Object.keys(schema.fields).sort((a, b) => b.length - a.length)[0];
   const worst = Math.max(size(attributes), size(unableContextAttributes("tick.summary", { rejectedField: longestField })));
-  assert.equal(worst, 1013, "a schema change must revisit the tick_summary record bound");
+  assert.equal(worst, 1024, "a schema change must revisit the tick_summary record bound");
   assert.ok(worst <= TICK_SUMMARY_MAX_RECORD_BYTES);
-  assert.equal(FAMILY_TICK_SHAPES.get("tick_summary").worstTickBytes, worst);
+  assert.equal(FAMILY_TICK_SHAPES.get("tick_summary").worstTickBytes, worst + 974, "the summary and its certificate sibling share the tick budget");
   assert.ok(Object.keys(schema.fields).length <= MAX_FACT_ATTRIBUTE_COUNT);
   assert.equal(FACT_FAMILY_BY_NAME.get("tick.summary"), "tick_summary");
   const [{ summary }] = chainTicks([tick({ ms: T0, sessions: { work: 1_000_100 }, uptimeMs: 50_000_000 })]);
@@ -341,9 +341,24 @@ test("C2 chain state: ledger-stamped like a seen-set; a mismatched pass, a pendi
   assert.equal((await readSummaryChainState(paths, { ledger: advanced, hmacKeyId: contextKeyId(KEY) })).status, "invalid");
 });
 
+test("C2 state readers treat continuity loss and a missing facts file as loss, never as a valid continuation", async () => {
+  const paths = await tempPaths();
+  const [{ summary }] = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1 })]);
+  const appended = await appendFactPoints(paths, [summary.point], { family: "tick_summary", now: new Date(T0).toISOString() });
+  await writeSummaryChainState(paths, summary.nextState(appended.retention.ledger_generation, appended.retention.pass_id));
+  let { ledger } = await readFactIntegrityLedger(paths, "tick_summary");
+  assert.equal((await readSummaryChainState(paths, { ledger, hmacKeyId: contextKeyId(KEY) })).status, "valid");
+  await fs.rm(resolveFactStorePaths(paths, "tick_summary").factsFile);
+  assert.equal((await readSummaryChainState(paths, { ledger, hmacKeyId: contextKeyId(KEY) })).status, "continuity_lost");
+  ledger = { ...ledger, continuity: { ...ledger.continuity, continuity_ok: false } };
+  assert.equal((await readSummaryChainState(paths, { ledger, hmacKeyId: contextKeyId(KEY) })).status, "continuity_lost");
+  ledger = { ...ledger, continuity: { ...ledger.continuity, continuity_ok: true }, last_future_fact_ts: new Date(T0 + HOUR).toISOString() };
+  assert.equal((await readSummaryChainState(paths, { ledger, hmacKeyId: contextKeyId(KEY) })).status, "continuity_lost", "rollback-discarded future records are loss");
+});
+
 test("C2 certification at derivation (I70): every contributing family's committed pass must be the ledger's and the tick inside its span", () => {
-  const ok = (generation, passId) => ({ retention: { ledger_generation: generation, pass_id: passId } });
-  const ledger = (generation, passId, extra = {}) => ({ generation, continuity: { last_committed_pass_id: passId, continuity_ok: true }, bytecap_floor_ts: null, age_floor_ts: null, ...extra });
+  const ok = (generation, passId) => ({ retention: { ledger_generation: generation, pass_id: passId, pass_time_ms: T0 } });
+  const ledger = (generation, passId, extra = {}) => ({ generation, continuity: { last_committed_pass_id: passId, continuity_ok: true, last_rewrite_newest_ts: new Date(T0).toISOString() }, bytecap_floor_ts: null, age_floor_ts: null, ...extra });
   const contributed = new Set(["session", "host_lifecycle"]);
   const certified = certifySourcePasses({ familyResults: { session: ok("g1", 4), host_lifecycle: ok("g2", 9) }, ledgers: { session: ledger("g1", 4), host_lifecycle: ledger("g2", 9) }, contributed, tsMs: T0 });
   assert.equal(certified.cert, "certified");
@@ -357,6 +372,47 @@ test("C2 certification at derivation (I70): every contributing family's committe
   assert.equal(outside.families.session.verdict, "outside_certified_span");
   const failed = certifySourcePasses({ familyResults: { session: { append_error: "x" }, host_lifecycle: ok("g2", 9) }, ledgers: {}, contributed, tsMs: T0 });
   assert.equal(failed.families.session.verdict, "pass_failed");
+  for (const family of ["session", "peer", "host_lifecycle", "network_context", "session_context"]) {
+    assert.deepEqual(Object.keys(certified.tuples[family]).sort(), ["generation", "pass_id", "pass_time_ms", "span_end_ms", "span_start_ms", "verdict"]);
+  }
+  const t = tick({ ms: T0, sessions: { work: 1_000_100 }, uptimeMs: 50_000_000 });
+  const summary = deriveTickSummary({ snapshot: snapshotOf(t), prior: { status: "missing" }, storeHadSummaries: false, certification: certified, transitions: deriveContextTransitions(undefined, snapshotOf(t)), hmacKey: KEY, version: "0.0.50", cfg: "0123456789abcdef" });
+  assert.ok(summary.certificatePoint, "the full tuple set is persisted in the sibling record");
+  assert.deepEqual(verifyTickSummaryChain([summary.point, summary.certificatePoint]).losses, []);
+  const tampered = { ...summary.certificatePoint, attributes: { ...summary.certificatePoint.attributes, s: `${summary.certificatePoint.attributes.s}|tampered` } };
+  assert.equal(verifyTickSummaryChain([summary.point, tampered]).losses[0].reason, "certificate_mismatch");
+});
+
+test("C2 statistics exclude uncertified ticks from churn, exposure and episodes while counting their exposure separately", () => {
+  const [{ snapshot, transitions, summary: original }] = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1000 })]);
+  const summary = { ...original, point: { ...original.point, attributes: { ...original.point.attributes, cert: "uncertified" } } };
+  const stats = deriveStats({ prior: { status: "missing" }, storeExisted: false, prevChain: undefined, snapshot, transitions, summary, nowIso: snapshot.ts });
+  assert.equal(stats.points.filter((point) => point.fact_name === "stats.episode").length, 0);
+  const next = stats.nextState("g", 1);
+  assert.equal(next.daily.cert, "uncertified");
+  assert.equal(next.daily.uncertified_ticks, 1);
+  assert.equal(next.daily.s_known, 0);
+  assert.equal(next.daily.ex_known, 0);
+  assert.equal(stats.points.every((point) => point.attributes.cert === "uncertified"), true);
+});
+
+test("C2 UTC-day aggregation only advances forward and records a backward clock_step on the current bucket", () => {
+  const first = chainTicks([tick({ ms: T0, sessions: { a: 1 }, uptimeMs: 1000 })])[0];
+  const initial = deriveStats({ prior: { status: "missing" }, storeExisted: false, prevChain: undefined, snapshot: first.snapshot, transitions: first.transitions, summary: first.summary, nowIso: first.snapshot.ts });
+  const state = initial.nextState("g", 1);
+  const backwardTick = tick({ ms: T0 - 12 * HOUR, sessions: { a: 1 }, uptimeMs: 1000 });
+  const backward = chainTicks([backwardTick])[0];
+  const held = deriveStats({ prior: { status: "valid", state }, storeExisted: true, prevChain: state, snapshot: backward.snapshot, transitions: backward.transitions, summary: backward.summary, nowIso: backward.snapshot.ts });
+  assert.equal(held.points.length, 0);
+  const heldState = held.nextState("g", 2);
+  assert.equal(heldState.daily.day, "2026-10-11");
+  assert.equal(heldState.daily.clock_step, "true");
+  const forwardTick = tick({ ms: T0 + 26 * HOUR, sessions: { a: 1 }, uptimeMs: 1000 });
+  const forward = chainTicks([forwardTick])[0];
+  const closed = deriveStats({ prior: { status: "valid", state: heldState }, storeExisted: true, prevChain: heldState, snapshot: forward.snapshot, transitions: forward.transitions, summary: forward.summary, nowIso: forward.snapshot.ts });
+  assert.equal(closed.points.filter((point) => point.fact_name === "stats.daily").length, 1);
+  assert.equal(closed.points[0].attributes.day, "2026-10-11");
+  assert.equal(closed.points[0].attributes.clock_step, "true");
 });
 
 test("C2 session.created_vs_boot: raw relation to the reported boot time; the verified value only after a VERIFIED boundary; arrivals only, capped", () => {
@@ -364,9 +420,9 @@ test("C2 session.created_vs_boot: raw relation to the reported boot time; the ve
   const snapshot = snapshotOf(t);
   const unverified = deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: undefined, bootVerdict: "unverified", ts: t.ts, hmacKey: KEY });
   const byKey = Object.fromEntries(unverified.map((p) => [p.attributes.session_key, p.attributes]));
-  assert.equal(byKey[hashSessionIdentity("tmux", "fresh")].relation, "after_boot_time");
-  assert.equal(byKey[hashSessionIdentity("tmux", "old")].relation, "before_boot_time");
-  assert.equal(byKey[hashSessionIdentity("tmux", "edge")].relation, "unknown", "within the resolution: unknown");
+  assert.equal(byKey[contextHmac(KEY, "session_join", hashSessionIdentity("tmux", "fresh"))].relation, "after_boot_time");
+  assert.equal(byKey[contextHmac(KEY, "session_join", hashSessionIdentity("tmux", "old"))].relation, "before_boot_time");
+  assert.equal(byKey[contextHmac(KEY, "session_join", hashSessionIdentity("tmux", "edge"))].relation, "unknown", "within the resolution: unknown");
   for (const attrs of Object.values(byKey)) {
     assert.equal(attrs.created_vs_boot, "unknown", "an unverified boundary never yields after/before_boot");
     assert.equal(attrs.basis, "boundary_unverified");
@@ -393,13 +449,17 @@ test("C2 session.created_vs_boot: raw relation to the reported boot time; the ve
   assert.deepEqual(deriveCreatedVsBoot({ evidence: t.evidence, snapshot, arrivedKeys: [], bootVerdict: "verified", ts: t.ts, hmacKey: KEY }), []);
 });
 
-test("C2 review L4: session_key is the incumbent's UNKEYED session hash, declared as such (not an HMAC field)", () => {
+test("C2 review L4: session joins use a per-install HMAC token, never the incumbent's unkeyed session hash", () => {
   for (const name of ["session.attachment", "session.created_vs_boot"]) {
     const spec = CONTEXT_FACT_SCHEMAS.get(name).fields.session_key;
-    assert.equal(spec.kind, "pattern", name);
-    assert.equal(spec.unkeyed, true, `${name}: marked unkeyed (dictionary-reversible), unlike the keyed HMAC fields`);
-    assert.deepEqual(validateContextFact(name, { ...Object.fromEntries(Object.keys(CONTEXT_FACT_SCHEMAS.get(name).fields).map((f) => [f, "unknown"])), rejected_field: "none", session_key: "zz" }).ok, false);
+    assert.equal(spec.kind, "hmac", name);
+    assert.equal(spec.unkeyed, undefined, `${name}: join token is keyed`);
   }
+  const expected = contextHmac(KEY, "session_join", hashSessionIdentity("tmux", "work"));
+  const t = tick({ ms: T0, sessions: { work: 1_000_100 }, uptimeMs: 1 });
+  const points = deriveCreatedVsBoot({ evidence: t.evidence, snapshot: snapshotOf(t), bootVerdict: undefined, ts: t.ts, hmacKey: KEY });
+  assert.equal(points[0].attributes.session_key, expected);
+  assert.notEqual(points[0].attributes.session_key, hashSessionIdentity("tmux", "work"));
 });
 
 test("C2 host.daemon_gap: the boot ledger folds the longest gap between daemon observations per interval; restarts and boots counted; the cause stays unknown", () => {
@@ -530,8 +590,8 @@ test("C2 context_stats T8: at most one episode and one daily record per tick, at
     };
     return Math.max(size(attributes), unable(unableContextAttributes(name, { rejectedField: longestField })));
   };
-  assert.deepEqual([exact("stats.episode"), exact("stats.daily")], [531, 442], "a schema change must revisit the context_stats tick shape");
-  assert.equal(FAMILY_TICK_SHAPES.get("context_stats").worstTickBytes, 531 + 442);
+  assert.deepEqual([exact("stats.episode"), exact("stats.daily")], [548, 556], "a schema change must revisit the context_stats tick shape");
+  assert.equal(FAMILY_TICK_SHAPES.get("context_stats").worstTickBytes, 548 + 556);
 });
 
 test("C2 review L7: the recorded version is Descartes's own package.json, never an unrelated one found first", async () => {

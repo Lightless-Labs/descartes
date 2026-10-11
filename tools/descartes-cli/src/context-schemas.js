@@ -61,12 +61,6 @@ function enumField(values, provenance, { required = true, unable } = {}) {
 function hmacField(provenance, sentinels = [SENTINEL_UNKNOWN], { required = true } = {}) {
   return { kind: "hmac", sentinels: new Set(sentinels), provenance, required };
 }
-// C2 review L4: a 16-hex hash that is NOT keyed (the incumbent session.presence entity hash, kept so a
-// context record joins its session). Dictionary-reversible over plausible session names, unlike an
-// HMAC field; declared as such so no reader mistakes it for a keyed value.
-function unkeyedHashField(provenance) {
-  return { ...patternField(HMAC_RE, HMAC_HEX_LENGTH, provenance), unkeyed: true };
-}
 function intField(min, max, provenance, sentinels = [SENTINEL_UNKNOWN], { required = true } = {}) {
   return { kind: "int", min, max, sentinels: new Set(sentinels), provenance, required };
 }
@@ -397,9 +391,14 @@ const FACT_SCHEMA_ENTRIES = [
     fields: {
       seq: intField(0, 2 ** 32, ["descartes.daemon"]),
       prev: hmacField(["descartes.daemon"], [SENTINEL_UNKNOWN, "none"]),
-      chain: enumField(["started", "continued", "restarted", "unknown"], ["descartes.daemon"]),
+      chain: enumField(["started", "continued", "restarted", "gap", "unknown"], ["descartes.daemon"]),
+      // Base-36 missing-tick count keeps the summary under 1 KiB; chain=gap/restarted is the
+      // memory-lost marker and the durable gap state carries the uncapped decimal count.
+      g: patternField(/^[0-9a-z]{1,7}$/, 7, ["descartes.daemon"]),
       cert: enumField(["certified", "uncertified", "unknown"], ["descartes.daemon"]),
-      certd: hmacField(["descartes.daemon"]),
+      // `cd` is the compact on-record name for the certification digest; the sibling certificate
+      // retains the descriptive `certd` name.
+      cd: hmacField(["descartes.daemon"]),
       kid: hmacField(["descartes.daemon"]),
       ver: patternField(/^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,4}$/, 12, ["descartes.daemon"]),
       cfg: hmacField(["descartes.daemon"]),
@@ -442,6 +441,22 @@ const FACT_SCHEMA_ENTRIES = [
       ssc: intField(0, 2 ** 40, ["kernel.power"], [SENTINEL_UNKNOWN, "na"]),
     },
   }],
+  // C2 H1: the summary keeps only the digest; this sibling stores the complete compact tuple for
+  // each cited source family so an old certification remains auditable after source ledgers advance.
+  ["tick.summary_certificate", {
+    family: "tick_summary",
+    fields: {
+      seq: intField(0, 2 ** 32, ["descartes.daemon"]),
+      ts_ms: intField(0, MAX_EPOCH_MS, ["descartes.daemon"]),
+      certd: hmacField(["descartes.daemon"]),
+      // family-code|generation|pass-id|pass-time-ms|span-start-ms|span-end-ms|verdict
+      s: patternField(/^[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+){6}$/, 140, ["descartes.daemon"]),
+      p: patternField(/^[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+){6}$/, 140, ["descartes.daemon"]),
+      h: patternField(/^[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+){6}$/, 140, ["descartes.daemon"]),
+      n: patternField(/^[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+){6}$/, 140, ["descartes.daemon"]),
+      x: patternField(/^[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+){6}$/, 140, ["descartes.daemon"]),
+    },
+  }],
   // ---------------------------------------------------------------- context_stats (C2, derived)
   // §8.2 long-lived statistics skeleton: DATA ONLY, read by no detector. Per-episode identity statistics
   // (computed online at derivation, while the raw census sets exist) and dated daily counts/exposure.
@@ -453,6 +468,7 @@ const FACT_SCHEMA_ENTRIES = [
       kind: enumField([...TRANSITION_DIMENSIONS, "unknown"], ["descartes.daemon"]),
       ev: patternField(SUMMARY_EVENTS_RE, 8, ["descartes.daemon"]),
       off: intField(0, 2, ["descartes.daemon"]),
+      cert: enumField(["certified", "uncertified", "unknown"], ["descartes.daemon"]),
       ...Object.fromEntries(["s", "p"].flatMap((source) => {
         const provenance = source === "s" ? ["tmux.server"] : PEER_VALUE_PROVENANCE;
         return [
@@ -467,7 +483,11 @@ const FACT_SCHEMA_ENTRIES = [
     fields: {
       day: patternField(/^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/, 10, ["descartes.daemon"]),
       memory: enumField(["continuous", "first_run", "cold_start_after_loss", "unknown"], ["descartes.daemon"]),
+      cert: enumField(["certified", "mixed", "uncertified", "unknown"], ["descartes.daemon"]),
+      clock_step: enumField(["true", "false", "unknown"], ["descartes.daemon"], { unable: "unknown" }),
       intervals: intField(0, 100000, ["descartes.daemon"]),
+      uncertified_ticks: intField(0, 100000, ["descartes.daemon"]),
+      uncertified_exposure_s: intField(0, MAX_DURATION_S, ["descartes.daemon"]),
       s_known: intField(0, 100000, ["tmux.server"]),
       p_known: intField(0, 100000, PEER_KNOWNNESS_PROVENANCE),
       s_arr: intField(0, 10000000, ["tmux.server"]),
@@ -521,8 +541,9 @@ const FACT_SCHEMA_ENTRIES = [
       dedupe_state: enumField(["fresh", "reseeded", "unavailable", "unknown"], ["descartes.daemon"]),
     },
   }],
-  // C2 (§4.3): tmux clients joined to the login on their tty (Opus L1). The session key is the
-  // incumbent session.presence entity hash (fact-translators.js hashSessionIdentity), so the two join.
+  // C2 (§4.3): tmux clients joined to the login on their tty (Opus L1). The session key is a
+  // per-install HMAC join token derived from the incumbent session identity, so the two join without
+  // persisting a dictionary-reversible session-name hash.
   ["session.attachment_census", {
     family: "session_context",
     fields: {
@@ -538,7 +559,7 @@ const FACT_SCHEMA_ENTRIES = [
     family: "session_context",
     fields: {
       ...commonFields(["tmux.server"]),
-      session_key: unkeyedHashField(["tmux.server"]),
+      session_key: hmacField(["tmux.server"]),
       client_tty_class: enumField(["console", "tty", "pts", "ttys", "unknown"], ["tmux.server"]),
       login_join: enumField(["matched", "no_login_row", "login_source_unusable", "unknown"], ["login.utmp", "login.logind", "tmux.server"]),
       login_origin_class: enumField(["console", "local_tty", "local_display", "remote", "remote_mosh", "unknown", "none"], ["login.utmp", "login.logind"]),
@@ -553,7 +574,7 @@ const FACT_SCHEMA_ENTRIES = [
     family: "session_context",
     fields: {
       ...commonFields(["tmux.server"]),
-      session_key: unkeyedHashField(["tmux.server"]),
+      session_key: hmacField(["tmux.server"]),
       multiplexer: enumField(["tmux", "screen", "unknown"], ["tmux.server"]),
       relation: enumField(["after_boot_time", "before_boot_time", "unknown"], ["tmux.server", "kernel.boot_session", "kernel.clock"]),
       created_vs_boot: enumField(["after_boot", "before_boot", "unknown"], ["tmux.server", "kernel.boot_session", "kernel.clock", "descartes.daemon"]),

@@ -35,7 +35,7 @@ import {
   SESSION_CENSUS_MARKER_ENTITY_KEY,
   SESSION_OVERFLOW_ENTITY_KEY,
 } from "./fact-translators.js";
-import { normalizeFactPoint, resolveFactStorePaths } from "./fact-store.js";
+import { normalizeFactPoint, readFactPoints, resolveFactStorePaths } from "./fact-store.js";
 import { BOOT_MEASUREMENT_RESOLUTION_S } from "./tools/host-lifecycle.js";
 import { bootIdDigest, wakeMarkerOf } from "./boot-ledger.js";
 import { CONTEXT_ENVELOPE_SOURCES, hostBootIdHmac, msString, observationInterval } from "./context-translators.js";
@@ -53,6 +53,8 @@ export const MAX_CREATED_VS_BOOT_PER_TICK = 8;
 export const TICK_SUMMARY_MAX_RECORD_BYTES = 1024;
 // The families whose committed passes a tick_summary record cites (I70).
 export const SUMMARY_SOURCE_FAMILIES = Object.freeze(["session", "peer", "host_lifecycle", "network_context", "session_context"]);
+const SUMMARY_FAMILY_CODES = Object.freeze({ session: "s", peer: "p", host_lifecycle: "h", network_context: "n", session_context: "x" });
+const SUMMARY_CODE_FAMILIES = Object.freeze(Object.fromEntries(Object.entries(SUMMARY_FAMILY_CODES).map(([family, code]) => [code, family])));
 // Episode follow-up samples at the next structural ticks (offsets 1, 2), while the pre-event set is
 // held in the stats state (§8.2: identity statistics computed online while the raw sets exist).
 export const EPISODE_MAX_OFFSET = 2;
@@ -299,6 +301,10 @@ export function resolveStatsStatePath(descartesPaths) {
   return path.join(resolveFactStorePaths(descartesPaths, "context_stats").dir, "stats-state.json");
 }
 
+export function resolveSummaryGapPath(descartesPaths) {
+  return path.join(resolveFactStorePaths(descartesPaths, "tick_summary").dir, "gap-state.json");
+}
+
 async function readJsonFile(file) {
   let contents;
   try {
@@ -319,6 +325,35 @@ async function writeJsonFile(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
   await fsp.writeFile(tmp, JSON.stringify(value), { mode: 0o600 });
   await fsp.rename(tmp, file);
+}
+
+const GAP_STATE_KEYS = ["schema_version", "missing_count", "first_ts", "reason"];
+
+function isValidGapState(value) {
+  return exactKeys(value, GAP_STATE_KEYS)
+    && value.schema_version === 1
+    && Number.isSafeInteger(value.missing_count) && value.missing_count > 0 && value.missing_count <= 2 ** 32
+    && typeof value.first_ts === "string" && Number.isFinite(Date.parse(value.first_ts))
+    && typeof value.reason === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(value.reason);
+}
+
+export async function readSummaryGapState(descartesPaths) {
+  const read = await readJsonFile(resolveSummaryGapPath(descartesPaths));
+  if (read.status !== "ok") return { status: read.status };
+  return isValidGapState(read.value) ? { status: "valid", state: read.value } : { status: "invalid" };
+}
+
+export async function writeSummaryGapState(descartesPaths, state) {
+  if (!isValidGapState(state)) throw new Error("tick_summary gap state fails its own shape");
+  await writeJsonFile(resolveSummaryGapPath(descartesPaths), state);
+}
+
+export async function clearSummaryGapState(descartesPaths) {
+  try {
+    await fsp.rm(resolveSummaryGapPath(descartesPaths));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
 }
 
 function isPlainObject(value) {
@@ -401,6 +436,21 @@ export function isValidSummaryChainState(value) {
     && CONTEXT_INT_KEYS.every((key) => optionalInt(c[key]));
 }
 
+async function familyLedgerHasLoss(descartesPaths, family, ledger) {
+  if (!ledger || ledger.continuity?.continuity_ok === false) return true;
+  // A future record discarded by retention is a rollback loss even when the remaining file is
+  // otherwise byte-consistent. The next derived record must re-anchor instead of continuing.
+  if (ledger.last_future_fact_ts !== null && ledger.last_future_fact_ts !== undefined) return true;
+  try {
+    const read = await readFactPoints(descartesPaths, { family, now: new Date().toISOString() });
+    const completeness = read.completeness ?? {};
+    return read.continuity_observation === "broken"
+      || ["this_read_loss", "future_fact"].includes(completeness.degraded_reason);
+  } catch {
+    return true;
+  }
+}
+
 /**
  * The chain state read and checked against tick_summary's ledger as it stands BEFORE this tick's
  * summary pass (seen-set style, I50): same generation, the same committed pass, no pending pass, and
@@ -415,6 +465,7 @@ export async function readSummaryChainState(descartesPaths, { ledger, hmacKeyId 
   const state = read.value;
   if (!ledger) return { status: "no_ledger" };
   if (ledger.continuity?.pending_pass) return { status: "pending_pass" };
+  if (await familyLedgerHasLoss(descartesPaths, "tick_summary", ledger)) return { status: "continuity_lost" };
   if (state.ledger_generation !== ledger.generation || state.ledger_pass_id !== ledger.continuity?.last_committed_pass_id) return { status: "lineage_mismatch" };
   if (state.hmac_key_id !== hmacKeyId) return { status: "key_changed" };
   return { status: "valid", state };
@@ -717,7 +768,7 @@ export function deriveCreatedVsBoot({ evidence, snapshot, arrivedKeys, bootVerdi
         obs_start_ms: msString(obsStartMs),
         obs_end_ms: msString(obsEndMs),
         rejected_field: "none",
-        session_key: key.split(".").pop(),
+        session_key: contextHmac(hmacKey, "session_join", key.split(".").pop()),
         multiplexer: mux,
         relation,
         created_vs_boot: verified ? (relation === "after_boot_time" ? "after_boot" : "before_boot") : "unknown",
@@ -779,7 +830,7 @@ export function certifySourcePasses({ familyResults, ledgers, contributed, tsMs 
   let certified = true;
   for (const family of SUMMARY_SOURCE_FAMILIES) {
     if (!contributed.has(family)) {
-      families[family] = { verdict: "not_contributing" };
+      families[family] = { verdict: "not_contributing", generation: null, pass_id: null, pass_time_ms: null, span_start_ms: null, span_end_ms: null };
       continue;
     }
     const result = familyResults?.[family];
@@ -794,10 +845,77 @@ export function certifySourcePasses({ familyResults, ledgers, contributed, tsMs 
       if (floors.some((floorMs) => !(tsMs > floorMs))) verdict = "outside_certified_span";
     }
     if (verdict !== "certified") certified = false;
-    families[family] = { verdict, generation: retention?.ledger_generation ?? null, pass_id: retention?.pass_id ?? null };
+    const spanStart = ledger && [ledger.bytecap_floor_ts, ledger.age_floor_ts]
+      .filter((value) => typeof value === "string")
+      .map((value) => Date.parse(value))
+      .filter(Number.isFinite)
+      .reduce((max, value) => Math.max(max, value), Number.NEGATIVE_INFINITY);
+    const spanEnd = Date.parse(ledger?.continuity?.last_rewrite_newest_ts ?? "");
+    families[family] = {
+      verdict,
+      generation: retention?.ledger_generation ?? null,
+      pass_id: retention?.pass_id ?? null,
+      pass_time_ms: Number.isSafeInteger(retention?.pass_time_ms) ? retention.pass_time_ms : null,
+      span_start_ms: Number.isFinite(spanStart) ? spanStart : null,
+      span_end_ms: Number.isFinite(spanEnd) ? spanEnd : null,
+    };
   }
-  const material = canonicalJson({ tsMs, families });
-  return { cert: certified ? "certified" : "uncertified", certd: crypto.createHash("sha256").update(`descartes.tick_summary.cert.v1\u0000${material}`).digest("hex").slice(0, 16), families };
+  const tuples = Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [family, families[family]]));
+  const material = canonicalJson({ tsMs, tuples });
+  return { cert: certified ? "certified" : "uncertified", certd: crypto.createHash("sha256").update(`descartes.tick_summary.cert.v1\u0000${material}`).digest("hex").slice(0, 16), families, tuples };
+}
+
+function certificateToken(value) {
+  return value === null || value === undefined ? "-" : String(value);
+}
+
+function certificateRow(family, tuple) {
+  return [
+    SUMMARY_FAMILY_CODES[family],
+    certificateToken(tuple?.generation),
+    certificateToken(tuple?.pass_id),
+    certificateToken(tuple?.pass_time_ms),
+    certificateToken(tuple?.span_start_ms),
+    certificateToken(tuple?.span_end_ms),
+    certificateToken(tuple?.verdict),
+  ].join("|");
+}
+
+function certificateTupleFromRow(row, expectedFamily) {
+  if (typeof row !== "string") return undefined;
+  const fields = row.split("|");
+  if (fields.length !== 7 || SUMMARY_CODE_FAMILIES[fields[0]] !== expectedFamily) return undefined;
+  const parseNullableInt = (value) => value === "-" ? null : (/^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : undefined);
+  const [, generation, passId, passTime, spanStart, spanEnd, verdict] = fields;
+  const passTimeMs = parseNullableInt(passTime);
+  const spanStartMs = parseNullableInt(spanStart);
+  const spanEndMs = parseNullableInt(spanEnd);
+  const normalizedPassId = passId === "-" ? null : (/^[0-9]+$/.test(passId) && Number.isSafeInteger(Number(passId)) ? Number(passId) : undefined);
+  if (normalizedPassId === undefined || passTimeMs === undefined || spanStartMs === undefined || spanEndMs === undefined || !["certified", "not_contributing", "pass_failed", "ledger_mismatch", "continuity_lost", "outside_certified_span"].includes(verdict)) return undefined;
+  return {
+    generation: generation === "-" ? null : generation,
+    pass_id: normalizedPassId,
+    pass_time_ms: passTimeMs,
+    span_start_ms: spanStartMs,
+    span_end_ms: spanEndMs,
+    verdict,
+  };
+}
+
+function certificateDigest(tsMs, tuples) {
+  const material = canonicalJson({ tsMs, tuples });
+  return crypto.createHash("sha256").update(`descartes.tick_summary.cert.v1\u0000${material}`).digest("hex").slice(0, 16);
+}
+
+function certificatePoint({ ts, seq, tsMs, certification }) {
+  if (!certification?.tuples) return undefined;
+  const attributes = {
+    seq: String(Math.min(seq, 2 ** 32)),
+    ts_ms: String(Math.min(tsMs, 2 ** 47)),
+    certd: certification.certd ?? "unknown",
+    ...Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [SUMMARY_FAMILY_CODES[family], certificateRow(family, certification.tuples[family])])),
+  };
+  return enforceContextSchema({ ts, fact_name: "tick.summary_certificate", entity_key: `tick.summary_certificate.${Math.min(seq, 2 ** 32)}`, attributes, sensitivity: "operational" });
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -836,12 +954,13 @@ function presenceCode(value) {
  * missing state over an existing store is a restart, never a fresh start); `lastSeq` is the last seq
  * found in the store (only used to keep seq increasing across a restart).
  */
-export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq, certification, transitions, hmacKey, version, cfg }) {
+export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq, certification, transitions, hmacKey, version, cfg, gapCount = 0 }) {
   const prevState = prior?.status === "valid" ? prior.state : undefined;
-  const chain = prevState ? "continued" : storeHadSummaries ? "restarted" : "started";
+  const hasGap = Number.isSafeInteger(gapCount) && gapCount > 0;
+  const chain = hasGap ? "gap" : prevState ? "continued" : storeHadSummaries ? "restarted" : "started";
   const seq = prevState ? prevState.seq + 1 : Number.isSafeInteger(lastSeq) ? lastSeq + 1 : 0;
-  const sessionChurn = intervalChurn(prevState?.session, snapshot.session);
-  const peerChurn = intervalChurn(prevState?.peer, snapshot.peer);
+  const sessionChurn = intervalChurn(hasGap ? undefined : prevState?.session, snapshot.session);
+  const peerChurn = intervalChurn(hasGap ? undefined : prevState?.peer, snapshot.peer);
   const cross = transitions?.cross ?? wallCrossCheck(prevState?.context, snapshot);
   const suspend = snapshot.suspend;
   const exposureHi = Number.isSafeInteger(suspend?.exposure_upper_s) ? suspend.exposure_upper_s : undefined;
@@ -853,8 +972,9 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
     seq: String(Math.min(seq, 2 ** 32)),
     prev: prevState ? prevState.record_digest : chain === "started" ? "none" : "unknown",
     chain,
+    g: Math.min(hasGap ? gapCount : 0, 2 ** 32).toString(36),
     cert: certification?.cert ?? "unknown",
-    certd: certification?.certd ?? "unknown",
+    cd: certification?.certd ?? "unknown",
     kid: contextKeyId(hmacKey),
     ver: patternOrUnknown(version, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,4}$/),
     cfg: patternOrUnknown(cfg, HEX16_RE),
@@ -898,6 +1018,7 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
   };
   const point = enforceContextSchema({ ts: snapshot.ts, fact_name: TICK_SUMMARY_FACT_NAME, entity_key: TICK_SUMMARY_FACT_NAME, attributes, sensitivity: "operational" });
   const digest = tickSummaryDigest(point);
+  const certificate = certificatePoint({ ts: snapshot.ts, seq, tsMs: snapshot.tsMs, certification });
   const nextState = (generation, passId) => ({
     schema_version: CHAIN_STATE_VERSION,
     family: "tick_summary",
@@ -911,7 +1032,7 @@ export function deriveTickSummary({ snapshot, prior, storeHadSummaries, lastSeq,
     peer: sourceStateOf(snapshot.peer),
     context: snapshotContextState(snapshot, prevState?.context),
   });
-  return { point, digest, seq, chain, sessionChurn, peerChurn, nextState };
+  return { point, certificatePoint: certificate, digest, seq, chain, sessionChurn, peerChurn, nextState };
 }
 
 /**
@@ -934,6 +1055,15 @@ export function verifyTickSummaryChain(points) {
     .sort((a, b) => seqOf(a) - seqOf(b) || Date.parse(a.ts) - Date.parse(b.ts));
   const records = [];
   const losses = [];
+  const certificates = new Map();
+  for (const point of points ?? []) {
+    if (point?.fact_name !== "tick.summary_certificate") continue;
+    const attrs = point.attributes ?? {};
+    const seq = Number(attrs.seq);
+    const tuples = Object.fromEntries(SUMMARY_SOURCE_FAMILIES.map((family) => [family, certificateTupleFromRow(attrs[SUMMARY_FAMILY_CODES[family]], family)]));
+    if (Number.isSafeInteger(seq)) certificates.set(seq, { point, attrs, tuples });
+  }
+  const enforceCertificates = certificates.size > 0;
   let previous;
   for (const point of summaries) {
     const attrs = point.attributes ?? {};
@@ -942,9 +1072,16 @@ export function verifyTickSummaryChain(points) {
       if (attrs.chain === "continued") {
         if (attrs.prev !== tickSummaryDigest(previous)) reason = "prev_mismatch";
         else if (String(Number(previous.attributes?.seq) + 1) !== attrs.seq) reason = "seq_gap";
-      } else if (attrs.chain === "restarted") reason = "restarted";
+      } else if (attrs.chain === "restarted" || attrs.chain === "gap") reason = attrs.chain;
       else reason = attrs.chain === "started" ? "started_after_records" : "chain_unknown";
-    } else if (attrs.chain === "restarted") reason = "restarted";
+    } else if (attrs.chain === "restarted" || attrs.chain === "gap") reason = attrs.chain;
+    if (enforceCertificates) {
+      const certificate = certificates.get(Number(attrs.seq));
+      const tuples = certificate?.tuples;
+      const complete = tuples && SUMMARY_SOURCE_FAMILIES.every((family) => tuples[family] !== undefined);
+      if (!certificate) reason = reason ?? "certificate_missing";
+      else if (!complete || certificate.attrs.certd !== attrs.cd || certificate.attrs.ts_ms !== String(Date.parse(point.ts)) || certificateDigest(Date.parse(point.ts), tuples) !== attrs.cd) reason = reason ?? "certificate_mismatch";
+    }
     if (reason) losses.push({ ts: point.ts, reason });
     records.push(point);
     previous = point;
@@ -957,9 +1094,9 @@ export function verifyTickSummaryChain(points) {
 // ------------------------------------------------------------------------------------------------
 
 const STATS_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "episode", "daily", "memory_lost_count", "memory_lost_ts"];
-const EPISODE_KEYS = ["eseq", "kind", "ev", "offset", "pre_session", "pre_peer"];
-const DAILY_KEYS = ["day", "memory", "intervals", "s_known", "p_known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"];
-const DAILY_COUNTERS = DAILY_KEYS.filter((key) => key !== "day" && key !== "memory");
+const EPISODE_KEYS = ["eseq", "kind", "ev", "offset", "cert", "pre_session", "pre_peer"];
+const DAILY_KEYS = ["day", "memory", "cert", "clock_step", "intervals", "uncertified_ticks", "uncertified_exposure_s", "s_known", "p_known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"];
+const DAILY_COUNTERS = DAILY_KEYS.filter((key) => !["day", "memory", "cert", "clock_step"].includes(key));
 
 function validCounter(value) {
   return Number.isSafeInteger(value) && value >= 0;
@@ -981,6 +1118,7 @@ export function isValidStatsState(value) {
     const d = value.daily;
     if (!exactKeys(d, DAILY_KEYS) || typeof d.day !== "string" || !DAY_RE.test(d.day)) return false;
     if (!["continuous", "first_run", "cold_start_after_loss"].includes(d.memory)) return false;
+    if (!["certified", "mixed", "uncertified", "unknown"].includes(d.cert) || !["true", "false"].includes(d.clock_step)) return false;
     if (!DAILY_COUNTERS.every((k) => validCounter(d[k]))) return false;
   }
   return true;
@@ -998,6 +1136,7 @@ export async function readStatsState(descartesPaths, { ledger } = {}) {
   const state = read.value;
   if (!ledger) return { status: "no_ledger" };
   if (ledger.continuity?.pending_pass) return { status: "pending_pass" };
+  if (await familyLedgerHasLoss(descartesPaths, "context_stats", ledger)) return { status: "continuity_lost" };
   if (state.ledger_generation !== ledger.generation || state.ledger_pass_id !== ledger.continuity?.last_committed_pass_id) return { status: "lineage_mismatch" };
   return { status: "valid", state };
 }
@@ -1012,7 +1151,7 @@ function utcDay(tsMs) {
 }
 
 function emptyDaily(day, memory, seq) {
-  return { day, memory, intervals: 0, s_known: 0, p_known: 0, s_arr: 0, s_dep: 0, p_arr: 0, p_dep: 0, ex_hi_s: 0, ex_known: 0, first_seq: seq, last_seq: seq };
+  return { day, memory, cert: "certified", clock_step: "false", intervals: 0, uncertified_ticks: 0, uncertified_exposure_s: 0, s_known: 0, p_known: 0, s_arr: 0, s_dep: 0, p_arr: 0, p_dep: 0, ex_hi_s: 0, ex_known: 0, first_seq: seq, last_seq: seq };
 }
 
 function episodeIdentityStats(pre, cur) {
@@ -1039,7 +1178,7 @@ function episodeIdentityStats(pre, cur) {
 }
 
 function episodePoint({ ts, episode, offset, seq, sessionStats, peerStats }) {
-  const attrs = { eseq: String(episode.eseq), sseq: String(seq), kind: episode.kind, ev: episode.ev, off: String(offset) };
+  const attrs = { eseq: String(episode.eseq), sseq: String(seq), kind: episode.kind, ev: episode.ev, off: String(offset), cert: episode.cert ?? "unknown" };
   for (const [prefix, stats] of [["s", sessionStats], ["p", peerStats]]) {
     for (const stat of ["pre", "post", "same", "recr", "dep", "arr"]) attrs[`${prefix}_${stat}`] = intOrUnknown(stats[stat]);
     attrs[`${prefix}_st`] = stats.st ?? "unknown";
@@ -1048,7 +1187,7 @@ function episodePoint({ ts, episode, offset, seq, sessionStats, peerStats }) {
 }
 
 function dailyPoint(ts, daily) {
-  const attrs = { day: daily.day, memory: daily.memory };
+  const attrs = { day: daily.day, memory: daily.memory, cert: daily.cert, clock_step: daily.clock_step };
   for (const key of DAILY_COUNTERS) attrs[key] = String(daily[key]);
   return enforceContextSchema({ ts, fact_name: STATS_DAILY_FACT_NAME, entity_key: `${STATS_DAILY_FACT_NAME}.${daily.day}`, attributes: attrs, sensitivity: "operational" });
 }
@@ -1065,42 +1204,55 @@ const EPISODE_KIND_PRIORITY = ["boot", "wake", "tailnet", "vpn", "net_config"];
  */
 export function deriveStats({ prior, storeExisted, prevChain, snapshot, transitions, summary, nowIso }) {
   const prevState = prior?.status === "valid" ? prior.state : undefined;
-  const memoryLost = !prevState && storeExisted;
+  const summaryChain = summary.point?.attributes?.chain;
+  const certified = summary.point?.attributes?.cert === "certified";
+  const memoryLost = (!prevState && storeExisted) || (storeExisted && ["restarted", "gap"].includes(summaryChain));
   const points = [];
   const day = utcDay(snapshot.tsMs);
   let daily = prevState?.daily ?? null;
-  if (daily && daily.day !== day) {
+  if (daily && day > daily.day) {
     points.push(dailyPoint(snapshot.ts, daily));
     daily = null;
+  } else if (daily && day < daily.day) {
+    // A backward wall-clock step must not create a second bucket for a day already in progress.
+    daily = { ...daily, clock_step: "true" };
   }
   if (!daily) daily = emptyDaily(day, prevState ? "continuous" : memoryLost ? "cold_start_after_loss" : "first_run", summary.seq);
   daily = { ...daily };
   daily.intervals += 1;
   daily.last_seq = summary.seq;
-  // Each source on its own knownness: an interval whose peer census was incomplete still counts the
-  // session churn it observed, and vice versa (never a zero for the unknown one).
-  if (summary.sessionChurn.arrivals !== undefined) {
-    daily.s_known += 1;
-    daily.s_arr += summary.sessionChurn.arrivals;
-    daily.s_dep += summary.sessionChurn.departures;
+  if (!certified) {
+    daily.cert = daily.uncertified_ticks === 0 && daily.cert === "certified" ? "uncertified" : "mixed";
+    daily.uncertified_ticks += 1;
+    if (Number.isSafeInteger(snapshot.suspend?.exposure_upper_s)) daily.uncertified_exposure_s += snapshot.suspend.exposure_upper_s;
+  } else {
+    daily.cert = daily.uncertified_ticks > 0 ? "mixed" : "certified";
+    // Each source on its own knownness: an interval whose peer census was incomplete still counts the
+    // session churn it observed, and vice versa (never a zero for the unknown one).
+    if (summary.sessionChurn.arrivals !== undefined) {
+      daily.s_known += 1;
+      daily.s_arr += summary.sessionChurn.arrivals;
+      daily.s_dep += summary.sessionChurn.departures;
+    }
+    if (summary.peerChurn.arrivals !== undefined) {
+      daily.p_known += 1;
+      daily.p_arr += summary.peerChurn.arrivals;
+      daily.p_dep += summary.peerChurn.departures;
+    }
+    if (Number.isSafeInteger(snapshot.suspend?.exposure_upper_s)) {
+      daily.ex_known += 1;
+      daily.ex_hi_s += snapshot.suspend.exposure_upper_s;
+    }
   }
-  if (summary.peerChurn.arrivals !== undefined) {
-    daily.p_known += 1;
-    daily.p_arr += summary.peerChurn.arrivals;
-    daily.p_dep += summary.peerChurn.departures;
-  }
-  if (Number.isSafeInteger(snapshot.suspend?.exposure_upper_s)) {
-    daily.ex_known += 1;
-    daily.ex_hi_s += snapshot.suspend.exposure_upper_s;
-  }
-  // Episodes.
-  let episode = prevState?.episode ?? null;
-  const kind = EPISODE_KIND_PRIORITY.find((dimension) => (transitions?.transitions ?? []).some((t) => t.dimension === dimension));
+  // Episodes are authority-bearing statistics only for certified summaries. An uncertified tick is a
+  // barrier: retaining the open episode would fold its next certified sample across unknown time.
+  let episode = certified ? prevState?.episode ?? null : null;
+  const kind = certified ? EPISODE_KIND_PRIORITY.find((dimension) => (transitions?.transitions ?? []).some((t) => t.dimension === dimension)) : undefined;
   if (kind) {
-    episode = { eseq: summary.seq, kind, ev: transitions.events ?? "uuuuuuuu", offset: 0, pre_session: prevChain?.session ?? null, pre_peer: prevChain?.peer ?? null };
+    episode = { eseq: summary.seq, kind, ev: transitions.events ?? "uuuuuuuu", offset: 0, cert: "certified", pre_session: prevChain?.session ?? null, pre_peer: prevChain?.peer ?? null };
     if (!prevChain) episode = { ...episode, pre_session: null, pre_peer: null };
   } else if (episode) {
-    episode = { ...episode, offset: episode.offset + 1 };
+    episode = { ...episode, offset: episode.offset + 1, cert: "certified" };
     if (episode.offset > EPISODE_MAX_OFFSET) episode = null;
   }
   if (episode) {

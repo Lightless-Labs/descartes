@@ -14,12 +14,14 @@ import { factHistoryTrustworthy, ruleEligible } from "./fact-store-completeness.
 import { combineFamilyCompleteness } from "./fact-store-integrity.js";
 import { migrateLegacyFactStore } from "./fact-store-migration.js";
 import {
-  DERIVED_FAMILIES,
+  C2_ONLY_FAMILIES,
+  DATA_ONLY_FAMILIES,
   FACT_FAMILY_IDS,
   FAMILY_DEFAULT_BUDGET_BYTES,
   FAMILY_TICK_SHAPES,
   familyBudgetCeilingBytes,
   familyBudgetFloorBytes,
+  factFamilyForName,
   MIN_STRUCTURAL_INTERVAL_MS,
   HISTORY_HORIZON_SHORT_ALERT_TICKS,
   NOVELTY_FAMILIES,
@@ -49,7 +51,7 @@ import { collectNetConfigEvidence } from "./tools/net-config.js";
 import { loginSeenToCommit, readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
 import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
 import { collectSessionAttachmentEvidence } from "./tools/session-attachment.js";
-import { admitContextC2Points, finalizeContextC2, prepareContextC2 } from "./context-c2-daemon.js";
+import { admitContextC2Points, finalizeContextC2, prepareContextC2, recordContextC2Gap } from "./context-c2-daemon.js";
 import {
   bootIdDigest,
   boundaryCensusGaps,
@@ -1515,6 +1517,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // context families with this tick's other facts. Isolated: a failure here is reported and
           // drops only the C2 points; the incumbent and C0 points above are untouched.
           let contextC2Prepared;
+          let contextC2OnlyFacts;
+          let contextC2GapReason;
           if (options.contextC2 !== false) {
             try {
               contextC2Prepared = await (options.prepareContextC2 ?? prepareContextC2)({
@@ -1529,9 +1533,12 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
               });
               // Isolation guard: a C2 point the shared pass would reject (an unregistered name refuses
               // the WHOLE batch, incumbents included) never joins it.
-              factPoints.push(...admitContextC2Points(contextC2Prepared.points));
+              const admitted = admitContextC2Points(contextC2Prepared.points);
+              factPoints.push(...admitted.filter((point) => !C2_ONLY_FAMILIES.has(factFamilyForName(point.fact_name))));
+              contextC2Prepared.points = admitted;
             } catch (error) {
               contextC2Prepared = undefined;
+              contextC2GapReason = "prepare_failed";
               contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_prepare_failed" };
               console.warn(`[daemon] context C2 derivation failed this tick (${contextC2Status.error}); incumbent and C0 facts persist as before`);
             }
@@ -1551,8 +1558,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // is reported (combined into storage_write_error/retention_error below) and never stops
           // another family from persisting. The DI seam keeps its historical name.
           const persistFacts = options.appendFactPoints ?? appendFactPointsByFamily;
+          const incumbentPoints = factPoints.filter((point) => !C2_ONLY_FAMILIES.has(factFamilyForName(point.fact_name)));
           try {
-            structuralFacts = await persistFacts(descartesPaths, factPoints, { ts, now: options.now ?? ts, budgets: effectiveBudgets });
+            structuralFacts = await persistFacts(descartesPaths, incumbentPoints, { ts, now: options.now ?? ts, budgets: effectiveBudgets, families: FACT_FAMILY_IDS.filter((family) => !DATA_ONLY_FAMILIES.has(family)) });
             if (structuralFacts?.append_error) {
               structuralFactPersistError = structuralFacts.append_error;
               console.warn(`[daemon] structural-fact-persist failed for some families this tick (${structuralFactPersistError}); the others persisted`);
@@ -1561,6 +1569,27 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             structuralFactPersistError = (error instanceof Error ? error.message : String(error)) || "unknown structural-fact-persist error";
             console.warn(`[daemon] structural-fact-persist failed this tick (${structuralFactPersistError}); degrading to written_count: 0, not fabricating a write`);
             structuralFacts = { written_count: 0, retention: undefined };
+          }
+
+          // C2-only families are a second, explicit pass. Their outcome is carried on context_c2 and
+          // is never merged into structuralFactPersistError or the incumbent retention state.
+          if (contextC2Prepared) {
+            const c2OnlyPoints = contextC2Prepared.points.filter((point) => C2_ONLY_FAMILIES.has(factFamilyForName(point.fact_name)));
+            if (c2OnlyPoints.length > 0) {
+              try {
+                contextC2OnlyFacts = await persistFacts(descartesPaths, c2OnlyPoints, {
+                  ts,
+                  now: options.now ?? ts,
+                  budgets: effectiveBudgets,
+                  families: [...C2_ONLY_FAMILIES],
+                });
+              } catch (error) {
+                const message = (error instanceof Error ? error.message : String(error)) || "context_c2_data_only_persist_failed";
+                contextC2OnlyFacts = { written_count: 0, families: { collector_state: { append_error: message } }, append_error: message };
+              }
+            }
+          } else if (contextC2GapReason === undefined && options.contextC2 === false) {
+            contextC2GapReason = "skipped";
           }
 
           // Context plan C0.4/C0.8/C0.12: the boot ledger (which consumes a pending boundary and
@@ -1618,9 +1647,32 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
                 configForHash: { watch: configSnapshot.watch, profile },
                 budgets: effectiveBudgets,
               });
+              if (contextC2OnlyFacts?.append_error || contextC2OnlyFacts?.retention_error) {
+                contextC2GapReason = "data_only_persist_failed";
+                contextC2Status = {
+                  ...contextC2Status,
+                  data_only: {
+                    error: contextC2OnlyFacts.append_error ?? contextC2OnlyFacts.retention_error,
+                    ...(contextC2OnlyFacts.families ? { families: contextC2OnlyFacts.families } : {}),
+                  },
+                };
+              }
             } catch (error) {
               contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_finalize_failed" };
+              contextC2GapReason = "finalize_failed";
               console.warn(`[daemon] context C2 summary failed this tick (${contextC2Status.error})`);
+            }
+          }
+
+          if (contextC2Prepared && contextC2Status && (contextC2Status.error || contextC2Status.summary !== "committed" || contextC2Status.stats?.error)) {
+            contextC2GapReason ??= "finalize_failed";
+          }
+          if (contextC2GapReason !== undefined) {
+            try {
+              await recordContextC2Gap(descartesPaths, { ts, reason: contextC2GapReason });
+              contextC2Status = { ...(contextC2Status ?? {}), gap: "recorded", gap_reason: contextC2GapReason };
+            } catch (error) {
+              contextC2Status = { ...(contextC2Status ?? {}), gap: "unrecorded", gap_error: (error instanceof Error ? error.message : String(error)) || "context_c2_gap_write_failed" };
             }
           }
 
@@ -1999,14 +2051,13 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
       const failingFor = retentionSince !== undefined && nowMs - Date.parse(retentionSince) >= HISTORY_HORIZON_SHORT_ALERT_TICKS * structuralIntervalMs;
       const oversize = Number.isSafeInteger(readBytes) && readBytes > budgetBytes + (FAMILY_TICK_SHAPES.get(family)?.worstTickBytes ?? 0);
-      if (DERIVED_FAMILIES.has(family)) {
-        // Context plan C2 (deviation 9; C2 review M2): a derived family (tick_summary, context_stats)
-        // is written and retained only by the C2 step, whose own pass outcome is on `context_c2`. It is
-        // shown here for sizing only: it never carries retention_error / retention_failing (which the
-        // incumbent daemon.fact_store.retention_failing rule reads) and never enters `state`.
+      if (DATA_ONLY_FAMILIES.has(family)) {
+        // C2 data-only families (collector_state and the derived summaries/statistics) are shown for
+        // sizing only. Their append/retention outcomes live on context_c2 and never become incumbent
+        // storage errors, carried retention failures, daemon health, or the incumbent retention alert.
         delete entry.retention_error;
         delete entry.retention_error_since_ts;
-        if (oversize) entry.derived_oversize = true;
+        if (oversize) entry.data_only_oversize = true;
         families[family] = entry;
         continue;
       }

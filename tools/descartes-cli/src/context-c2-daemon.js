@@ -37,9 +37,12 @@ import {
   factPointsFromTransitions,
   intervalChurn,
   readStatsState,
+  readSummaryGapState,
   readSummaryChainState,
   SUMMARY_SOURCE_FAMILIES,
   writeStatsState,
+  writeSummaryGapState,
+  clearSummaryGapState,
   writeSummaryChainState,
 } from "./context-summary.js";
 import { appendFactPoints, factStoreExists, normalizeFactPoint, readFactPoints } from "./fact-store.js";
@@ -50,6 +53,17 @@ const VERDICTS = new Set(["verified", "unverified", "tripwire"]);
 // The only families a C2 point may join the tick's shared pass in: the context families. Never an
 // incumbent family, never a derived family (those are appended by finalizeContextC2 alone).
 export const CONTEXT_C2_PASS_FAMILIES = Object.freeze(new Set(["host_lifecycle", "network_context", "session_context", "collector_state"]));
+
+export async function recordContextC2Gap(descartesPaths, { ts, reason = "failed" } = {}) {
+  const prior = await readSummaryGapState(descartesPaths);
+  const priorCount = prior.status === "valid" ? prior.state.missing_count : 0;
+  await writeSummaryGapState(descartesPaths, {
+    schema_version: 1,
+    missing_count: Math.min(priorCount + 1, 2 ** 32),
+    first_ts: prior.status === "valid" ? prior.state.first_ts : ts,
+    reason,
+  });
+}
 
 /**
  * Isolation guard for the shared pass: the tick's fact batch is refused WHOLE (incumbents included)
@@ -84,7 +98,9 @@ export async function prepareContextC2({ descartesPaths, evidence, basePoints, h
   const keyId = contextKeyId(hmacKey);
   const chainRead = await (deps.readSummaryChainState ?? readSummaryChainState)(descartesPaths, { ledger: summaryLedger.ledger ?? undefined, hmacKeyId: keyId });
   const statsRead = await (deps.readStatsState ?? readStatsState)(descartesPaths, { ledger: statsLedger.ledger ?? undefined });
-  const prevChain = chainRead.status === "valid" ? chainRead.state : undefined;
+  const gapRead = await readSummaryGapState(descartesPaths);
+  const gapCount = gapRead.status === "valid" ? gapRead.state.missing_count : gapRead.status === "invalid" ? 1 : 0;
+  const prevChain = chainRead.status === "valid" && gapCount === 0 ? chainRead.state : undefined;
   const snapshot = extractTickSnapshot({ evidence, points: [...(basePoints ?? []), ...stateless], hostFacts, ts, hmacKey, interval: daemonIntervalMs });
   const transitions = deriveContextTransitions(prevChain, snapshot);
   const sessionChurn = intervalChurn(prevChain?.session, snapshot.session);
@@ -105,7 +121,7 @@ export async function prepareContextC2({ descartesPaths, evidence, basePoints, h
   const points = [...stateless, ...created, ...gap, ...factPointsFromTransitions(transitions.transitions, { ts, hmacKey })];
   return {
     points,
-    context: { snapshot, transitions, chainRead, statsRead, prevChain, summaryLedgerReason: summaryLedger.reason, statsLedgerReason: statsLedger.reason },
+    context: { snapshot, transitions, chainRead, statsRead, prevChain, gapCount, summaryLedgerReason: summaryLedger.reason, statsLedgerReason: statsLedger.reason },
   };
 }
 
@@ -143,7 +159,7 @@ function statsLastSeq(statsRead) {
 export async function finalizeContextC2({ descartesPaths, prepared, factPoints, structuralFacts, ts, hmacKey, configForHash, budgets, deps = {} }) {
   const readLedger = deps.readFactIntegrityLedger ?? readFactIntegrityLedger;
   const append = deps.appendFactPoints ?? appendFactPoints;
-  const { snapshot, transitions, chainRead, statsRead, prevChain } = prepared.context;
+  const { snapshot, transitions, chainRead, statsRead, prevChain, gapCount = 0 } = prepared.context;
   const contributed = new Set((factPoints ?? []).map((point) => factFamilyForName(point?.fact_name)).filter((family) => SUMMARY_SOURCE_FAMILIES.includes(family)));
   const ledgers = {};
   for (const family of SUMMARY_SOURCE_FAMILIES) {
@@ -157,10 +173,10 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
   const summaryExisted = prepared.context.summaryLedgerReason !== "missing" || await factStoreExists(descartesPaths, "tick_summary");
   const statsExisted = prepared.context.statsLedgerReason !== "missing" || await factStoreExists(descartesPaths, "context_stats");
   const storeHadSummaries = summaryExisted || statsExisted;
-  const lastSeq = chainRead.status === "valid" || !storeHadSummaries ? undefined : maxDefined(await lastSummarySeq(descartesPaths, ts), statsLastSeq(statsRead));
+  const lastSeq = chainRead.status === "valid" && gapCount === 0 || !storeHadSummaries ? undefined : maxDefined(await lastSummarySeq(descartesPaths, ts), statsLastSeq(statsRead));
   const summary = deriveTickSummary({
     snapshot,
-    prior: chainRead,
+    prior: gapCount > 0 ? { status: "lost" } : chainRead,
     storeHadSummaries,
     lastSeq,
     certification,
@@ -168,6 +184,7 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
     hmacKey,
     version: descartesVersion(),
     cfg: configHash(hmacKey, configForHash),
+    gapCount,
   });
   const status = {
     chain: summary.chain,
@@ -176,7 +193,8 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
     seq: summary.seq,
     transitions: transitions.transitions.length,
   };
-  const summaryWrite = await append(descartesPaths, [summary.point], { family: "tick_summary", ts, now: ts, ...(budgets?.tick_summary ? { maxBytes: budgets.tick_summary } : {}) });
+  const summaryPoints = [summary.point, summary.certificatePoint].filter(Boolean);
+  const summaryWrite = await append(descartesPaths, summaryPoints, { family: "tick_summary", ts, now: ts, ...(budgets?.tick_summary ? { maxBytes: budgets.tick_summary } : {}) });
   if (!summaryWrite?.retention || summaryWrite.retention_error) {
     // The record reached disk but its pass did not commit: the chain state is NOT advanced, so the
     // next tick restarts the chain (unknown transitions), never continues it over an unstamped pass.
@@ -192,5 +210,6 @@ export async function finalizeContextC2({ descartesPaths, prepared, factPoints, 
   }
   const nextStats = stats.nextState(statsWrite.retention.ledger_generation, statsWrite.retention.pass_id);
   await (deps.writeStatsState ?? writeStatsState)(descartesPaths, nextStats);
+  await clearSummaryGapState(descartesPaths);
   return { ...status, summary: "committed", stats: { ...statsStatus, memory_lost_count: nextStats.memory_lost_count } };
 }

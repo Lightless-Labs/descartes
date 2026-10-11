@@ -7,6 +7,7 @@ import {
   FUTURE_FACT_TOLERANCE_MS,
   prepareFactIntegrityLedger,
   combineFamilyCompleteness,
+  observeFactContinuity,
   readFactIntegrityLedger,
   resolveFactIntegrityPaths,
   resolvePriorBytecapFloor,
@@ -502,6 +503,7 @@ async function runFactRetention(descartesPaths, options, internal = {}) {
     // name) it without re-reading the ledger.
     ledger_generation: finalizedLedger.generation,
     pass_id: prepared.passId,
+    pass_time_ms: Date.parse(nowIso),
   };
 }
 
@@ -568,6 +570,7 @@ export async function appendFactPoints(descartesPaths, factPoints, options = {})
     // one structural tick, which status compares against the budget (cap_below_tick).
     appended_bytes: Buffer.byteLength(encoded),
     retention,
+    ...(retention ? { pass_time_ms: Date.parse(normalizeTimestamp(options.now ?? options.ts)) } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
   };
 }
@@ -631,12 +634,20 @@ export async function factStoreFileBytes(descartesPaths, family) {
  */
 export async function appendFactPointsByFamily(descartesPaths, factPoints, options = {}) {
   const grouped = groupFactPointsByFamily(factPoints);
-  const { budgets, maxBytes, ...passOptions } = options;
+  const { budgets, maxBytes, families: selectedFamilies, ...passOptions } = options;
+  const familiesToProcess = selectedFamilies ?? FACT_FAMILY_IDS;
+  if (!Array.isArray(familiesToProcess) || familiesToProcess.length === 0) throw new Error("fact-store: families must be a non-empty array");
+  const selected = new Set(familiesToProcess);
+  for (const family of selected) requireFactFamily(family);
+  for (const family of grouped.keys()) {
+    if (!selected.has(family)) throw new Error(`fact-store: ${family} is outside the selected family pass`);
+  }
   const families = {};
   let writtenCount = 0;
   const appendErrors = [];
   const retentionErrors = [];
   for (const family of FACT_FAMILY_IDS) {
+    if (!selected.has(family)) continue;
     const budgetBytes = budgets?.[family] ?? maxBytes ?? FAMILY_DEFAULT_BUDGET_BYTES.get(family);
     const familyOptions = { ...passOptions, family, maxBytes: budgetBytes };
     // C2: a derived family (fact-families.js DERIVED_FAMILIES) is written only by its own derivation
@@ -851,6 +862,7 @@ async function readFamilyFactPoints(descartesPaths, family, options) {
     corrupt_count,
     schema_invalid_count: schemaInvalidCount,
     completeness,
+    continuity_observation: observeFactContinuity(integrity.ledger, live),
     family,
     // S4 status: the store's on-disk size, and whether it was ever created (facts.jsonl or ledger on
     // disk) -- a never-created store reads as `not observed (no store)`, not "still learning".
