@@ -353,6 +353,8 @@ test("status shape: the top-level keys of a clean watch-tier tick's status recor
   const result = await tick(paths, 0);
   assert.deepEqual(Object.keys(result.status).sort(), [
     "collector_statuses",
+    // Context plan C2: the tick_summary / statistics outcome (data only; never part of `state`).
+    "context_c2",
     "context_key_status",
     "fact_store_budgets",
     "fact_store_completeness",

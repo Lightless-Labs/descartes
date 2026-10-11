@@ -34,7 +34,11 @@ import { buildConstraintTarget, writeConstraints, writeLearnedConfig } from "../
 import { observeBootProbe } from "../src/boot-ledger.js";
 import { writeWatchConfig } from "../src/watch-store.js";
 import { appendFactPoints, enforceFactRetention, normalizeFactPoint, readFactPoints, resolveFactStorePaths, appendFactPointsByFamily } from "../src/fact-store.js";
-import { FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES } from "../src/fact-families.js";
+import { DERIVED_FAMILIES, FACT_FAMILY_IDS, FAMILY_DEFAULT_BUDGET_BYTES } from "../src/fact-families.js";
+
+// The collector-written families (the C2 derived families -- tick_summary, context_stats -- hold
+// derivations, not structural facts, and are asserted by their own tests).
+const STORE_FAMILY_IDS = FACT_FAMILY_IDS.filter((family) => !DERIVED_FAMILIES.has(family));
 import { resolveFactIntegrityPaths } from "../src/fact-store-integrity.js";
 import { buildHistorySummary, readDaemonStatus } from "../src/history-store.js";
 import { assertNoPiOwnedPath, resolveDescartesPaths } from "../src/paths.js";
@@ -562,7 +566,7 @@ test("defaultDaemonProfile includes an hourly structural cadence with the docume
   assert.equal(profile.structural.interval_ms, DEFAULT_STRUCTURAL_INTERVAL_MS);
   assert.equal(DEFAULT_STRUCTURAL_INTERVAL_MS, 60 * 60 * 1000);
   assert.equal(DEFAULT_STRUCTURAL_TICK_DEADLINE_MS, 45 * 1000);
-  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "net-config", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "vpn-peer-status"]);
+  assert.deepEqual(Object.keys(profile.structural.collectors).sort(), ["canary", "host-lifecycle", "login-sessions", "net-config", "network", "process-lineage", "provenance", "scheduled-jobs", "services", "sessions", "tailscale-status", "tmux-clients", "vpn-peer-status"]);
   // Review B1: the +0 boundary census writes into the session/peer families the incumbent
   // detectors score and fold, so it ships OFF until C1a/C2 can route it away from them.
   assert.deepEqual(profile.structural.boundary_census, { enabled: false });
@@ -1138,7 +1142,7 @@ test("S6b wiring: structural evidence is translated into fact-points and persist
   // appended on a successful, even zero-job, scheduled-jobs envelope) = 4.
   assert.equal(result.structuralFacts.written_count, 4);
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   assert.equal(points.length, 4);
   assert(points.some((point) => point.fact_name === "service.presence" && point.entity_key === "nginx.service"));
   assert(points.some((point) => point.fact_name === "network.listening_port.owner" && point.entity_key === "tcp:0.0.0.0:8080"));
@@ -1828,7 +1832,7 @@ test("S4: byte-identical real alerts when the learned kill switch is off, even w
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
+      return readFactPoints(...args, { families: STORE_FAMILY_IDS });
     },
   });
 
@@ -1940,7 +1944,7 @@ test("S4 structural wiring: the provenance sub-collector runs on a structural-du
     { id: "provenance-warnings", status: "ok", tool: "collect_provenance_warnings" },
   ]);
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   const warningPoint = points.find((point) => point.fact_name === "provenance.warning");
   assert.ok(warningPoint, "expected the structural provenance warning to be translated into a fact-point");
   assert.equal(warningPoint.attributes.rule_id, "public_bind_no_supervisor");
@@ -2023,7 +2027,7 @@ test("Slice 1: the sessions sub-collector runs on a structural-due tick alongsid
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "sessions"]);
   assert(result.status.structural_collector_statuses.some((entry) => entry.id === "sessions" && entry.status === "ok" && entry.tool === "collect_sessions"));
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   const sessionPoint = points.find((point) => point.fact_name === "session.presence");
   assert.ok(sessionPoint, "expected the structural session census to be translated into a fact-point");
   assert.match(sessionPoint.entity_key, /^session\.tmux\.[0-9a-f]{16}$/);
@@ -2093,7 +2097,7 @@ test("Slice 1 day-1 no-storm: the first-ever session observation seeds fact-hist
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   assert(points.some((point) => point.fact_name === "session.presence"), "expected fact-history to be seeded on first observation");
   assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("session")), false, "Slice 1 must never emit a session-related alert candidate");
 });
@@ -2178,7 +2182,7 @@ test("tailscale structural wiring persists hashed peer facts and adds no new ale
     loadWatchConfig: async () => ({ enabled: true }),
   });
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   const peerPoint = points.find((point) => point.fact_name === "peer.presence");
   assert.ok(peerPoint);
   assert.match(peerPoint.entity_key, /^peer\.tailscale\.[0-9a-f]{16}$/);
@@ -2216,7 +2220,7 @@ test("Slice 3: the vpn-peer-status sub-collector runs on a structural-due tick a
   assert.deepEqual(structuralCalls, ["services", "network", "scheduled-jobs", "vpn-peer-status"]);
   assert(result.status.structural_collector_statuses.some((entry) => entry.id === "vpn-peer-status" && entry.status === "ok" && entry.tool === "collect_vpn_peer_status"));
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   const peerPoint = points.find((point) => point.fact_name === "peer.presence");
   assert.ok(peerPoint, "expected the structural peer census to be translated into a fact-point");
   assert.match(peerPoint.entity_key, /^peer\.ssh\.[0-9a-f]{16}$/);
@@ -2276,7 +2280,7 @@ test("Slice 3 day-1 no-storm: the first-ever peer observation seeds fact-history
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   assert(points.some((point) => point.fact_name === "peer.presence"), "expected fact-history to be seeded on first observation");
   assert.equal((result.alerts?.alerts ?? []).some((alert) => String(alert.rule_id).includes("peer")), false, "Slice 3 must never emit a peer-related alert candidate");
 });
@@ -2616,7 +2620,7 @@ test("Slice 4: byte-identical real alerts when the learned kill switch is off, e
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
+      return readFactPoints(...args, { families: STORE_FAMILY_IDS });
     },
   });
 
@@ -2736,7 +2740,7 @@ test("Slice 4 ts-cohesion (integration): every session.* fact point emitted with
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   const sessionPoints = points.filter((point) => point.fact_name === "session.presence");
   assert.ok(sessionPoints.length >= 3, "expected 2 session facts + 1 census marker");
   const distinctTimestamps = new Set(sessionPoints.map((point) => point.ts));
@@ -3070,14 +3074,14 @@ test("Slice 6: byte-identical real alerts when the learned kill switch is off, e
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
+      return readFactPoints(...args, { families: STORE_FAMILY_IDS });
     },
   });
 
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
   assert.deepEqual(withHistory.alerts.candidates, baseline.alerts.candidates);
   assert.deepEqual(withHistory.alerts.notification_due_ids, baseline.alerts.notification_due_ids);
-  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store, { families: [...FACT_FAMILY_IDS] }) must never be called while the learned.json/watch.json kill switches are off");
+  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store, { families: STORE_FAMILY_IDS }) must never be called while the learned.json/watch.json kill switches are off");
 
   const persisted = await readAlertRecords(withHistoryPaths);
   assert.equal(persisted.some((alert) => alert.rule_id === CORRELATION_RULE_ID), false);
@@ -3116,7 +3120,7 @@ test("Slice 4b: byte-identical real alerts when the learned kill switch is off, 
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
+      return readFactPoints(...args, { families: STORE_FAMILY_IDS });
     },
   });
 
@@ -3305,7 +3309,7 @@ test("Slice 4c: byte-identical real alerts when the learned kill switch is off, 
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
+      return readFactPoints(...args, { families: STORE_FAMILY_IDS });
     },
   });
 
@@ -3348,7 +3352,7 @@ test("Slice 4b ts-cohesion (integration): peer.presence fact points share the sa
     writeStructuralCheckpoint: async () => ({}),
   });
 
-  const { points } = await readFactPoints(paths, { families: [...FACT_FAMILY_IDS] });
+  const { points } = await readFactPoints(paths, { families: STORE_FAMILY_IDS });
   const sessionPoints = points.filter((point) => point.fact_name === "session.presence");
   const peerPoints = points.filter((point) => point.fact_name === "peer.presence");
   assert.ok(sessionPoints.length > 0 && peerPoints.length > 0);
@@ -3561,7 +3565,7 @@ test("Scheduled-job persistence: byte-identical real alerts when the learned kil
     ts: hour(6),
     now: hour(6),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: STORE_FAMILY_IDS }); },
   });
 
   assert.deepEqual(withJobs.alerts.alerts, baseline.alerts.alerts);
@@ -3630,7 +3634,7 @@ test("Service-disappearance: byte-identical real alerts when the learned kill sw
     loadWatchConfig: async () => ({ enabled: false }),
     readFactPoints: async (...args) => {
       readFactsCalled = true;
-      return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] });
+      return readFactPoints(...args, { families: STORE_FAMILY_IDS });
     },
   });
 
@@ -3768,7 +3772,7 @@ test("Service-appearance: byte-identical real alerts when the watch kill switch 
     ts: hour(3),
     now: hour(3),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: STORE_FAMILY_IDS }); },
   });
 
   assert.deepEqual(withServices.alerts.alerts, baseline.alerts.alerts);
@@ -4047,12 +4051,12 @@ test("Slice 7.2 wiring: learned.json OFF ⇒ zero recommendations even with the 
     ts: hour(30),
     now: hour(30),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: STORE_FAMILY_IDS }); },
   });
 
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === "containment.recommend.block"), false);
   assert.equal(result.alerts.alerts.some((a) => a.rule_id === PEER_COUNT_SPIKE_RULE_ID), false, "watch.json OFF also gates the underlying peer-baseline detector itself (moved off learned.json, §12.1)");
-  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store, { families: [...FACT_FAMILY_IDS] }) must never be called while both learned.json and watch.json are OFF");
+  assert.equal(readFactsCalled, false, "readFactPoints (the FACT store, { families: STORE_FAMILY_IDS }) must never be called while both learned.json and watch.json are OFF");
 });
 
 test("Slice 7.2 wiring: no trigger present ⇒ zero recommendations (no storm on the first tick), even with both gates ON", async () => {
@@ -4125,7 +4129,7 @@ test("Slice 7.2 wiring: byte-identical real alerts when watch, learned, AND the 
     ts: hour(30),
     now: hour(30),
     loadWatchConfig: async () => ({ enabled: false }),
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: STORE_FAMILY_IDS }); },
   });
 
   assert.deepEqual(withHistory.alerts.alerts, baseline.alerts.alerts);
@@ -5703,7 +5707,7 @@ test("watch-by-default BLOCKER-2 regression: a persisted history-dependent alert
     collectors: fastCollectorFakes(),
     ts: now,
     now,
-    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: [...FACT_FAMILY_IDS] }); },
+    readFactPoints: async (...args) => { readFactsCalled = true; return readFactPoints(...args, { families: STORE_FAMILY_IDS }); },
     // Genuinely returns [] -- exactly what the real watch-gated short-circuit would produce with
     // watch:false, before ever reaching its own I/O.
     computeSessionBaselineCandidates: async () => [],
@@ -6418,7 +6422,7 @@ test("C0.8/C0.12: first observation records the boot and triggers nothing; a new
   assert.equal(state.structuralRuns, 1);
   assert.equal(state.checkpoint, C12_T0);
   let facts = await hostFacts(paths, C12_T0);
-  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
+  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.daemon_gap", "host.suspend"]);
   assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "no_previous_reading");
   assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.bracket, "stable");
 
@@ -6654,7 +6658,7 @@ test("C0.8: a failing boot probe or ledger write is reported and infers nothing 
   });
   assert.equal(result.status.boot_ledger_error, "probe exploded");
   const facts = await hostFacts(paths, C12_T0);
-  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.suspend"]);
+  assert.deepEqual(facts.map((p) => p.fact_name).sort(), ["host.boot", "host.clock_reading", "host.daemon_gap", "host.suspend"]);
   assert.equal(facts.find((p) => p.fact_name === "host.boot").attributes.boot_id_hmac, "unknown");
   assert.equal(facts.find((p) => p.fact_name === "host.suspend").attributes.interval_basis, "unknown");
 });

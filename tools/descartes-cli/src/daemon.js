@@ -47,6 +47,8 @@ import {
 import { collectNetConfigEvidence } from "./tools/net-config.js";
 import { readLoginSeen, selectNewLoginRows, writeLoginSeen } from "./login-seen.js";
 import { collectLoginSessionsEvidence } from "./tools/login-sessions.js";
+import { collectSessionAttachmentEvidence } from "./tools/session-attachment.js";
+import { finalizeContextC2, prepareContextC2 } from "./context-c2-daemon.js";
 import {
   bootIdDigest,
   boundaryCensusGaps,
@@ -279,6 +281,8 @@ export function defaultDaemonProfile() {
         "login-sessions": { enabled: true },
         // Context plan C0.5: net.config_fingerprint (HMAC'd with the per-install key). DATA only.
         "net-config": { enabled: true },
+        // Context plan C2 (§4.3 session.attachment): tmux clients joined to their login tty. DATA only.
+        "tmux-clients": { enabled: true },
       },
       // Context plan C0.12: a boundary-triggered census at +0 on a new boot id or an OS-reported
       // wake, borrowing the next structural slot (bounded; see runDaemonIteration). OFF by default
@@ -464,6 +468,7 @@ export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
   ["host-lifecycle", "host-lifecycle", "collect_host_lifecycle"],
   ["login-sessions", "login-sessions", "collect_login_sessions"],
   ["net-config", "net-config", "collect_net_config"],
+  ["tmux-clients", "tmux-clients", "collect_tmux_clients"],
 ].map((entry) => Object.freeze(entry)));
 
 // C0.7 (I25, class S): incumbent structural collectors retain main's whole-tick deadline semantics.
@@ -532,6 +537,7 @@ export async function collectStructuralContextEvidence(structuralProfile = {}, c
     "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
     "login-sessions": collectors["login-sessions"] ?? collectLoginSessionsEvidence,
     "net-config": collectors["net-config"] ?? collectNetConfigEvidence,
+    "tmux-clients": collectors["tmux-clients"] ?? collectSessionAttachmentEvidence,
   };
   const { nowFn = Date.now, ...rest } = options;
   const collectorOptions = {
@@ -1105,6 +1111,9 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
         || (Number.isSafeInteger(liveBootTime) && Number.isSafeInteger(pendingCurrent?.boot_time_s) && liveBootTime !== pendingCurrent.boot_time_s)) liveCheck = "live_boot_mismatch";
       if (liveCheck) verdict = { ...verdict, verdict: "unverified", failing_conjunct: liveCheck };
     }
+    // C2 (§4.3 created_vs_boot): the verdict is kept on the boot it verified (or not), so a later
+    // structural tick in the same boot still knows whether this boot's boundary was verified.
+    if (next.current && next.current.boot_id_digest === next.pending_boundary.current?.boot_id_digest) next.current.boundary_verdict = verdict.verdict;
     facts.boundary = {
       ...verdict,
       superseded_count: next.pending_boundary.superseded_count ?? 0,
@@ -1138,6 +1147,7 @@ export function deriveHostLifecycleContext({ ledger, probeBefore, structuralEvid
   // C2 (§4.1 host.daemon_gap): the gaps folded since the previous structural census are this
   // interval's; the accumulator restarts here (the after-probe below folds into the next one).
   facts.daemonGap = next.daemon_gap && typeof next.daemon_gap === "object" ? { ...next.daemon_gap } : undefined;
+  facts.currentBootVerdict = ["verified", "unverified", "tripwire"].includes(next.current?.boundary_verdict) ? next.current.boundary_verdict : undefined;
   next.daemon_gap = emptyDaemonGap(nowMs);
   next.last_census_ms = nowMs;
   const wallMs = probeAfter?.clocks?.wall_ms;
@@ -1305,6 +1315,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   let contextKeyStatus;
   let bootLedgerError;
   let loginSeenError;
+  let contextC2Status;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
@@ -1497,6 +1508,30 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // — alerting on a novel scheduled job (scheduled_job.appeared) is Slice B's job.
             ...factPointsFromScheduledJobsEvidence(structuralEvidence, { ts }),
           ];
+          // Context plan C2 (§4, §8): the facts that need the previous tick (transitions,
+          // created_vs_boot, the daemon gap) and the stateless C2 facts. DATA only, appended to the
+          // context families with this tick's other facts. Isolated: a failure here is reported and
+          // drops only the C2 points; the incumbent and C0 points above are untouched.
+          let contextC2Prepared;
+          if (options.contextC2 !== false) {
+            try {
+              contextC2Prepared = await (options.prepareContextC2 ?? prepareContextC2)({
+                descartesPaths,
+                evidence: structuralEvidence,
+                basePoints: factPoints,
+                hostFacts: hostContext?.facts,
+                loginDedupe,
+                ts,
+                hmacKey,
+                daemonIntervalMs: profile.interval_ms,
+              });
+              factPoints.push(...contextC2Prepared.points);
+            } catch (error) {
+              contextC2Prepared = undefined;
+              contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_prepare_failed" };
+              console.warn(`[daemon] context C2 derivation failed this tick (${contextC2Status.error}); incumbent and C0 facts persist as before`);
+            }
+          }
           // Finding F4: same isolation as the metric-persist call above -- a storage fault here must
           // not abort the tick before evaluateAndPersistAlerts, and must not fabricate a retention
           // outcome that did not happen. Finding F4-B1/F4-B2 re-gate: inline try/catch, not
@@ -1553,6 +1588,27 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
               }
             } else {
               loginSeenError = "session_context_facts_not_persisted";
+            }
+          }
+
+          // Context plan C2 (§8.1-§8.2): the tick_summary record (certified against the passes that just
+          // committed, I70) and the statistics skeleton, each in its own derived family, each state file
+          // stamped with its own pass. DATA only; reported, never fatal.
+          if (contextC2Prepared) {
+            try {
+              contextC2Status = await (options.finalizeContextC2 ?? finalizeContextC2)({
+                descartesPaths,
+                prepared: contextC2Prepared,
+                factPoints,
+                structuralFacts,
+                ts,
+                hmacKey,
+                configForHash: { watch: configSnapshot.watch, profile },
+                budgets: effectiveBudgets,
+              });
+            } catch (error) {
+              contextC2Status = { error: (error instanceof Error ? error.message : String(error)) || "context_c2_finalize_failed" };
+              console.warn(`[daemon] context C2 summary failed this tick (${contextC2Status.error})`);
             }
           }
 
@@ -1975,6 +2031,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     ...(contextKeyStatus ? { context_key_status: contextKeyStatus } : {}),
     ...(bootLedgerError ? { boot_ledger_error: bootLedgerError } : {}),
     ...(loginSeenError ? { login_seen_error: loginSeenError } : {}),
+    // Context plan C2: the tick_summary/statistics outcome (data only; never part of `state`).
+    ...(contextC2Status ? { context_c2: contextC2Status } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),
