@@ -440,12 +440,17 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
   const cap = Math.min(MAX_PEER_ENTITY_LIMIT, Math.max(1, Number(options.peerLimit) || DEFAULT_PEER_ENTITY_LIMIT));
 
   return timedEnvelope(async () => {
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const platform = options.platform ?? process.platform;
 
     const who = await collectSshWho(options);
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const last = await collectSshLast(options);
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const wireguard = await collectWireguardPeers({ ...options, platform });
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const vpnServices = await collectVpnServices({ ...options, platform });
+    if (options.signal?.aborted) throw new Error("collector_aborted");
     const establishedInbound = await collectEstablishedInbound({ ...options, platform });
 
     const sshPeers = [];

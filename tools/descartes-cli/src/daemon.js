@@ -528,6 +528,7 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
   const collectorOptions = {
     ...rest,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+    killSignal: options.killSignal ?? "SIGKILL",
   };
   const budgetMs = isPositiveFiniteNumber(deadlineMs) ? deadlineMs : Infinity;
   const censusCapMs = isPositiveFiniteNumber(structuralProfile.collector_deadline_ms) ? structuralProfile.collector_deadline_ms : DEFAULT_STRUCTURAL_COLLECTOR_DEADLINE_MS;
@@ -544,9 +545,18 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
         continue;
       }
       let outcome;
+      const controller = new AbortController();
       try {
-        outcome = await withDeadline(Promise.resolve().then(() => activeCollectors[key](collectorOptions)), Math.min(remainingMs, capMs), () => COLLECTOR_TIMED_OUT);
+        outcome = await withDeadline(
+          Promise.resolve().then(() => activeCollectors[key]({ ...collectorOptions, signal: controller.signal })),
+          Math.min(remainingMs, capMs),
+          () => {
+            controller.abort();
+            return COLLECTOR_TIMED_OUT;
+          },
+        );
       } catch {
+        controller.abort();
         outcome = undefined;
       }
       const observation = { start_ms: runStartMs, end_ms: nowFn() };

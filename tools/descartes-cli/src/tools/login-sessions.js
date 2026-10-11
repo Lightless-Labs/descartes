@@ -316,8 +316,10 @@ export async function readLoginSessions(options = {}) {
   const records = [];
   const history = [];
   let presence = { screen_locked: "unknown", idle_hint: "unknown", source: "none" };
+  const abortIfNeeded = () => { if (options.signal?.aborted) throw new Error("collector_aborted"); };
 
   if (platform === "darwin" || platform === "linux") {
+    abortIfNeeded();
     const last = await runLast(runExec, options);
     sources.last = last.state;
     for (const row of last.rows) {
@@ -327,6 +329,7 @@ export async function readLoginSessions(options = {}) {
   }
 
   if (platform === "darwin") {
+    abortIfNeeded();
     const who = await runWho(runExec, options);
     // C0 review L5: rows beyond the per-read cap are not records, so the census is partial (the
     // translator then reports the current count as unknown, never the truncated number).
@@ -335,6 +338,7 @@ export async function readLoginSessions(options = {}) {
       const { origin_class: originClass, remote_host: remoteHost } = classifyLoginOrigin(row);
       records.push({ source: "who", user: row.user, tty_class: ttyClassOf(row.tty), origin_class: originClass, service_class: "unknown", remote_host: remoteHost, identity: ["who", row.user, row.tty, row.host ?? "", row.login_text].join("\u0000") });
     }
+    abortIfNeeded();
     const consoleRead = await runConsole(runExec, options);
     sources.console = consoleRead.state === "ok" && consoleRead.users.length === 0 ? "absent" : consoleRead.state;
     if (consoleRead.state === "ok") {
@@ -349,6 +353,7 @@ export async function readLoginSessions(options = {}) {
       };
     }
   } else if (platform === "linux") {
+    abortIfNeeded();
     const logind = await runLoginctl(runExec, options);
     sources.loginctl = logind.state;
     for (const session of logind.sessions.slice(0, MAX_LOGIN_RECORDS)) {

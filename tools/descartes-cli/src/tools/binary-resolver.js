@@ -705,6 +705,8 @@ export async function runResolvedExecFile(binary, args = [], options = {}) {
     const { stdout, stderr } = await execFileAsync(reverified.path, args, {
       timeout: options.timeout,
       maxBuffer: options.maxBuffer,
+      signal: options.signal,
+      killSignal: options.killSignal ?? "SIGKILL",
     });
     return { status: "ok", stdout, stderr, command, binary: reverified };
   } catch (error) {
