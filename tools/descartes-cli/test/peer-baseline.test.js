@@ -82,7 +82,7 @@ function overflowMarkerPoint(ts) {
 
 // Slice 4c fixtures -------------------------------------------------------------------------
 
-const DEFAULT_SIGNATURE = "v1:ok-ok-ok-ok-ok";
+const DEFAULT_SIGNATURE = "v2:ok-ok-ok-ok-ok";
 
 function censusMarkerPoint(ts, signature = DEFAULT_SIGNATURE) {
   return {

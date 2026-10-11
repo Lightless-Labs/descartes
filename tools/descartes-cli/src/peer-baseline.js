@@ -50,17 +50,20 @@ export const PEER_COUNT_SPIKE_RULE_ID = "peer.count_spike";
 // Slice 4c (observed-incident collectors plan) — the sign-flipped mirror of PEER_COUNT_SPIKE_RULE_ID.
 export const PEER_COUNT_DROP_RULE_ID = "peer.count_drop";
 
-// R8 identity migration: the count input is no longer one undifferentiated global peer universe.
-// Marker-backed ticks are signed by the VPN census and therefore count only VPN-source peers;
-// markerless ticks retain the legacy all-peer count. Version both identities so a persisted alert
-// created under the old global semantics can never be recovered by a differently-scoped detector.
-export const PEER_COUNT_VPN_FINGERPRINT = "v2:vpn";
-export const PEER_COUNT_MARKERLESS_FINGERPRINT = "v2:markerless";
+// R8/B1 identity migration: the count input is no longer one undifferentiated global peer
+// universe. Marker-backed ticks are signed by the VPN census and therefore count only VPN-source
+// peers; markerless ticks retain the legacy all-peer count. The availability-signature VERSION is
+// part of the identity namespace. A v1 marker is valid historical data for re-warming/folding,
+// but it is a legacy semantic regime and can never authorize recovery or raise under the current
+// detector identity. The `v2sig:` namespace deliberately cannot collide with the old `v2:`
+// fingerprints that were persisted before this fix.
+export const PEER_COUNT_VPN_FINGERPRINT = "v2sig:vpn";
+export const PEER_COUNT_MARKERLESS_FINGERPRINT = "v2sig:markerless";
 
 export function peerCountFingerprintForAvailabilitySignature(availabilitySignature) {
-  return availabilitySignature === undefined
-    ? PEER_COUNT_MARKERLESS_FINGERPRINT
-    : PEER_COUNT_VPN_FINGERPRINT;
+  if (availabilitySignature === undefined) return PEER_COUNT_MARKERLESS_FINGERPRINT;
+  if (typeof availabilitySignature !== "string" || !availabilitySignature.startsWith("v2:")) return undefined;
+  return PEER_COUNT_VPN_FINGERPRINT;
 }
 
 const COMPLETE_PEER_SOURCE_STATUSES = new Set(["ok", "absent", "not_applicable"]);
@@ -985,14 +988,14 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   const spikeFresh = isFreshTs(windowed.last_observation?.ts, nowMs, freshnessMs);
   const dropFresh = isFreshTs(windowedDrop.last_observation?.ts, nowMs, freshnessMs);
   const currentFingerprint = peerCountFingerprintForAvailabilitySignature(currentGroups.at(-1)?.availabilitySignature);
-  const spikeCandidate = spikeFresh
+  const spikeCandidate = currentFingerprint !== undefined && spikeFresh
     ? buildCountSpikeCandidate(
       { confidence_state: windowed.confidence_state, last_observation: windowed.last_observation },
       { deviationSigma, fingerprint: currentFingerprint },
     )
     : undefined;
   if (spikeCandidate && spikeHorizonOk && censusFresh) candidates.push(spikeCandidate);
-  const dropCandidate = dropFresh
+  const dropCandidate = currentFingerprint !== undefined && dropFresh
     ? buildCountDropCandidate(
       { confidence_state: windowedDrop.confidence_state, last_observation: windowedDrop.last_observation },
       { deviationSigma, fingerprint: currentFingerprint },
@@ -1033,8 +1036,11 @@ export async function computePeerBaselineCandidates(descartesPaths, options = {}
   //     and the rule's eligibility horizon is met (S3) -- a stale tick is not evaluated.
   const spikeEvaluated = spikeFresh && windowed.confidence_state === "established";
   const dropEvaluated = dropFresh && windowedDrop.confidence_state === "established" && dropRecoveryReady;
-  const spikeKeys = spikeEvaluated && spikeHorizonOk && censusFresh ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : [];
-  const dropKeys = dropEvaluated && dropHorizonOk && censusFresh ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : [];
+  const currentIdentityEvaluable = currentFingerprint !== undefined;
+  const spikeKeys = currentIdentityEvaluable && spikeEvaluated && spikeHorizonOk && censusFresh
+    ? [alertId(PEER_COUNT_SPIKE_RULE_ID, currentFingerprint)] : [];
+  const dropKeys = currentIdentityEvaluable && dropEvaluated && dropHorizonOk && censusFresh
+    ? [alertId(PEER_COUNT_DROP_RULE_ID, currentFingerprint)] : [];
   const evaluatedAlertKeys = [...spikeKeys, ...dropKeys];
   // S6 (I11): the per-rule "would evaluate" report `baseline status` reads, from the same gates.
   // Readiness order: stale census, warm-up, no scorable observation (e.g. a markerless Tailscale
