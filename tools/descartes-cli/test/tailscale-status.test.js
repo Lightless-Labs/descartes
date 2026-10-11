@@ -261,3 +261,55 @@ test("an options.peerLimit above MAX_TAILSCALE_PEER_ENTITY_LIMIT is clamped down
   assert.equal(envelope.result.peers.length, MAX_TAILSCALE_PEER_ENTITY_LIMIT);
   assert.equal(envelope.result.truncated, true);
 });
+
+// --- Context plan C0.3: tailnet state for every probe outcome ---
+
+test("C0.3: parseTailscaleStatusJson reads BackendState without requiring Peer (logged-out daemons omit it)", () => {
+  const parsed = parseTailscaleStatusJson(JSON.stringify({ BackendState: "NeedsLogin", Health: ["not logged in"] }));
+  assert.equal(parsed.backend_state, "NeedsLogin");
+  assert.equal(parsed.peer_map_valid, false);
+  assert.deepEqual(parsed.peers, []);
+  assert.deepEqual(parsed.tailnet, { backend_state: "NeedsLogin", self_online: undefined, exit_node_in_use: undefined, health_issue_count: 1, current_tailnet_name: undefined });
+  assert.throws(() => parseTailscaleStatusJson(JSON.stringify({ Peer: {} })), SyntaxError, "BackendState stays required");
+});
+
+test("C0.3: a Running status carries Self.Online, exit-node use, the health-issue count and the raw CurrentTailnet name in memory only", () => {
+  const parsed = parseTailscaleStatusJson(JSON.stringify({
+    ...JSON.parse(runningFixture()),
+    Self: { Online: true },
+    Health: ["a", "b"],
+    ExitNodeStatus: { ID: "n1", Online: true },
+    CurrentTailnet: { Name: "corp.example", MagicDNSSuffix: "corp.ts.net", MagicDNSEnabled: true },
+  }));
+  assert.equal(parsed.peer_map_valid, true);
+  assert.deepEqual(parsed.tailnet, { backend_state: "Running", self_online: true, exit_node_in_use: true, health_issue_count: 2, current_tailnet_name: "corp.example" });
+  const noExit = parseTailscaleStatusJson(JSON.stringify({ BackendState: "Running", Peer: {}, Self: { Online: false } }));
+  assert.equal(noExit.tailnet.exit_node_in_use, false, "Running with a valid Peer map and no exit node status or exit-node peer");
+  assert.equal(noExit.tailnet.self_online, false);
+  assert.equal(noExit.tailnet.health_issue_count, undefined, "an absent Health list is unknown, never a zero");
+  const peerExit = parseTailscaleStatusJson(runningFixture());
+  assert.equal(peerExit.tailnet.exit_node_in_use, true, "a peer marked ExitNode is an exit node in use");
+});
+
+test("C0.3: logged-out outcomes without a Peer map stay logged_out and carry the tailnet state", async () => {
+  const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(JSON.stringify({ BackendState: "Stopped" })))) });
+  assert.equal(envelope.result.status, "logged_out");
+  assert.equal(envelope.status, "unable");
+  assert.deepEqual(envelope.result.peers, []);
+  assert.equal(envelope.result.tailnet.backend_state, "Stopped");
+});
+
+test("C0.3: Running without a Peer map is NOT an ok zero-peer tick for the peer census, but its tailnet state is kept", async () => {
+  const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(JSON.stringify({ BackendState: "Running", Self: { Online: true } })))) });
+  assert.equal(envelope.status, "unable");
+  assert.equal(envelope.result.status, "unable");
+  assert.deepEqual(envelope.result.peers, []);
+  assert.equal(envelope.result.tailnet.backend_state, "Running");
+  assert.equal(envelope.result.tailnet.self_online, true);
+});
+
+test("C0.3: an unrecognized BackendState keeps the peer envelope unable and records the raw state for the translator to classify", async () => {
+  const envelope = await collectTailscaleStatusEvidence({ runFixedExecFile: scriptedExec(baseScript(ok(JSON.stringify({ BackendState: "Weird", Peer: {} })))) });
+  assert.equal(envelope.result.status, "unable");
+  assert.equal(envelope.result.tailnet.backend_state, "Weird");
+});

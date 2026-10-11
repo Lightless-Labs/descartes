@@ -11,6 +11,7 @@
 //   - Every point passes its closed schema (context-schemas.js) on the way out. A rejected field
 //     yields the schema's unable shape, never the value (C0.6).
 
+import { contextHmac } from "./context-key.js";
 import { enforceContextSchema } from "./context-schemas.js";
 
 // Fixed entity keys for the per-tick context facts. Literal constants (not computed) so the T12
@@ -54,4 +55,92 @@ export function contextFactPoint({ ts, factName, entityKey, attributes, source }
 
 export function msString(value) {
   return Number.isSafeInteger(value) && value >= 0 ? String(value) : "unknown";
+}
+
+/**
+ * The observation interval of one collector run, in epoch ms (§4.4: per-collector obs_start/obs_end,
+ * distinct from the tick ts). Prefers the daemon's own stamp (envelope.observation, set by the
+ * per-collector sub-deadline runner), else the envelope trace (trace.ts is stamped when the envelope
+ * is built, latency_ms when the run finishes). Unknown when neither is valid.
+ */
+export function observationInterval(envelope) {
+  const stamped = envelope?.observation;
+  if (Number.isSafeInteger(stamped?.start_ms) && Number.isSafeInteger(stamped?.end_ms) && stamped.start_ms <= stamped.end_ms) {
+    return { obsStartMs: stamped.start_ms, obsEndMs: stamped.end_ms };
+  }
+  const endMs = Date.parse(envelope?.trace?.ts ?? "");
+  const latency = Number(envelope?.trace?.latency_ms);
+  if (Number.isFinite(endMs) && Number.isFinite(latency) && latency >= 0) {
+    return { obsStartMs: Math.max(0, Math.round(endMs - latency)), obsEndMs: Math.round(endMs) };
+  }
+  return { obsStartMs: undefined, obsEndMs: undefined };
+}
+
+// ------------------------------------------------------------------------------------------------
+// C0.3: net.tailnet_state, for EVERY tailscale probe outcome.
+// ------------------------------------------------------------------------------------------------
+
+const TAILNET_BACKEND_STATE_VALUES = Object.freeze({
+  Running: "running",
+  NeedsLogin: "needs_login",
+  NoState: "no_state",
+  Stopped: "stopped",
+  NeedsMachineAuth: "needs_machine_auth",
+  Starting: "starting",
+});
+
+const TAILNET_FAILURE_STATES = new Set(["not_found_on_known_paths", "untrusted_binary", "missing_permission", "unable"]);
+
+function boolString(value) {
+  return value === true ? "true" : value === false ? "false" : "unknown";
+}
+
+function healthBucket(count) {
+  if (!Number.isSafeInteger(count) || count < 0) return "unknown";
+  if (count === 0) return "0";
+  if (count === 1) return "1";
+  if (count <= 4) return "2-4";
+  return "5+";
+}
+
+/**
+ * evidence[] -> one net.tailnet_state point whenever the tailscale collector produced an envelope,
+ * whatever its status: a missing binary, an untrusted binary, a permission denial, an exec or parse
+ * failure and every backend state are each a VALUE of the fact (C0.3), never a dropped tick. `Online`
+ * means connected to the control plane; it does not prove peer reachability (Astra 11).
+ */
+export function factPointsFromTailnetStateEvidence(evidence, { ts, hmacKey } = {}) {
+  const envelope = (evidence ?? []).find((e) => e?.id === "tailscale-status");
+  if (!envelope) return [];
+  const result = envelope.result ?? {};
+  const { obsStartMs, obsEndMs } = observationInterval(envelope);
+  const tailnet = result.tailnet && typeof result.tailnet === "object" ? result.tailnet : undefined;
+  let state;
+  let collectorState;
+  if (tailnet && typeof tailnet.backend_state === "string") {
+    // The JSON was parsed: the backend state was observed, whatever the peer census made of it.
+    collectorState = "ok";
+    state = Object.prototype.hasOwnProperty.call(TAILNET_BACKEND_STATE_VALUES, tailnet.backend_state)
+      ? TAILNET_BACKEND_STATE_VALUES[tailnet.backend_state]
+      : "unrecognized_backend_state";
+  } else {
+    collectorState = TAILNET_FAILURE_STATES.has(result.status) ? result.status : "unable";
+    state = collectorState;
+  }
+  const observed = collectorState === "ok";
+  const attributes = {
+    collector_state: collectorState,
+    obs_start_ms: msString(obsStartMs),
+    obs_end_ms: msString(obsEndMs),
+    state,
+    self_online: observed ? boolString(tailnet.self_online) : "unknown",
+    exit_node_in_use: observed ? boolString(tailnet.exit_node_in_use) : "unknown",
+    health_issue_bucket: observed ? healthBucket(tailnet.health_issue_count) : "unknown",
+    // An absent CurrentTailnet is unknown (an older daemon may not report it), never "none".
+    current_tailnet_hmac: observed && typeof tailnet.current_tailnet_name === "string"
+      ? contextHmac(hmacKey, "tailnet_name", tailnet.current_tailnet_name)
+      : "unknown",
+    rejected_field: "none",
+  };
+  return [contextFactPoint({ ts, factName: NET_TAILNET_STATE_FACT_NAME, attributes, source: CONTEXT_ENVELOPE_SOURCES.tailscale })];
 }

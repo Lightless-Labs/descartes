@@ -37,6 +37,8 @@ import {
   factPointsFromTailscaleStatusEvidence,
   factPointsFromVpnPeerEvidence,
 } from "./fact-translators.js";
+import { factPointsFromTailnetStateEvidence } from "./context-translators.js";
+import { loadOrCreateContextKey } from "./context-key.js";
 import { computeCorrelationCandidates, CORRELATION_RULE_ID } from "./incident-correlation.js";
 import { computePeerBaselineCandidates, PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import {
@@ -1063,6 +1065,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // feed this tick's own status.state/storage_write_error below.
   let structuralFactPersistError;
   let shadowEvaluation;
+  let contextKeyStatus;
   const structuralProfile = profile.structural;
   if (structuralProfile?.interval_ms) {
     const watchConfig = configSnapshot.watch; // §8.D: per-tick snapshot (loaded once above)
@@ -1102,6 +1105,18 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // watch kill switch is enabled (already gated by the enclosing `if
           // (watchConfig.enabled)` block above) — never on a timed-out/partial tick, which
           // discards its evidence entirely rather than persisting a partial fact snapshot.
+          // Context plan C0.5/C0.6: the per-install HMAC key for context facts, loaded once per
+          // structural tick. An unusable key degrades every keyed context value to "unknown" (the
+          // translators never fall back to an unkeyed hash); its status is reported on the record.
+          const loadContextKey = options.loadContextKey ?? loadOrCreateContextKey;
+          let contextKey;
+          try {
+            contextKey = await loadContextKey(descartesPaths);
+          } catch (error) {
+            contextKey = { status: "unable", reason: "key_load_threw" };
+          }
+          const hmacKey = contextKey?.status === "ok" ? contextKey.key : undefined;
+          contextKeyStatus = contextKey?.status === "ok" ? "ok" : `unable:${contextKey?.reason ?? "unknown"}`;
           const factPoints = [
             ...factPointsFromCanaryEvidence(structuralEvidence, { ts }),
             ...factPointsFromServiceEvidence(structuralEvidence, { ts }),
@@ -1127,6 +1142,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             // extraCandidates and no census marker; vpn-peer-status remains the sole shared
             // availability/regime anchor, avoiding same-tick marker collision.
             ...factPointsFromTailscaleStatusEvidence(structuralEvidence, { ts }),
+            // Context plan C0.3: the tailnet's own state, for EVERY probe outcome (a logged-out or
+            // missing daemon is a value, not a dropped tick). DATA only: no alert candidate.
+            ...factPointsFromTailnetStateEvidence(structuralEvidence, { ts, hmacKey }),
             ...factPointsFromProcessLineageEvidence(structuralEvidence, { ts }),
             // Persistence baseline, Slice A (docs/plans/2026-08-21-agent-intrusion-detection-
             // gaps.md): scheduled-jobs structural evidence -> fact-points, same discipline as its
@@ -1569,6 +1587,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     points_written: write.written_count,
     retention: write.retention,
     ...(structuralCollectorStatuses ? { structural_collector_statuses: structuralCollectorStatuses } : {}),
+    ...(contextKeyStatus ? { context_key_status: contextKeyStatus } : {}),
     ...(storageWriteError ? { storage_write_error: storageWriteError } : {}),
     ...(retentionError ? { retention_error: retentionError } : {}),
     ...(factStoreCompleteness ? { fact_store_completeness: factStoreCompleteness } : {}),

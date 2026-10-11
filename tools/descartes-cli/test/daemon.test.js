@@ -6116,3 +6116,32 @@ test("BLOCKER 1, phase-appropriate coverage: a containment-phase detector EXCEPT
   const persisted = await readAlertRecords(paths);
   assert.equal(persisted.find((a) => a.rule_id === "containment.recommend.block")?.status, "active");
 });
+
+// --- Context plan C0.3 wiring: net.tailnet_state reaches the network_context family on every outcome ---
+
+test("C0.3 wiring: a logged-out tailscale probe persists net.tailnet_state to network_context, and no peer fact", async () => {
+  const paths = await tempPaths();
+  const result = await runDaemonIteration(paths, {
+    profile: structuralProfile({ collectors: { "tailscale-status": { enabled: true } } }),
+    collectors: fastCollectorFakes(),
+    structuralCollectors: {
+      "tailscale-status": async () => envelope("tailscale-status", "collect_tailscale_status", { status: "logged_out", peers: [], tailnet: { backend_state: "NeedsLogin" } }, "unable"),
+    },
+    evaluateAlerts: false,
+    ts: "2026-05-24T00:00:00.000Z",
+    now: Date.parse("2026-05-24T00:00:00.000Z"),
+    readStructuralCheckpoint: async () => ({ last_structural_run_ms: undefined }),
+    writeStructuralCheckpoint: async () => ({}),
+    loadLearnedConfig: async () => ({ enabled: false }),
+    loadWatchConfig: async () => ({ enabled: true }),
+  });
+  assert.ok(result.structuralFacts);
+  assert.equal(result.status.context_key_status, "ok");
+  const { points } = await readFactPoints(paths, { family: "network_context", now: Date.parse("2026-05-24T00:00:00.000Z") });
+  assert.equal(points.length, 1);
+  assert.equal(points[0].fact_name, "net.tailnet_state");
+  assert.equal(points[0].attributes.state, "needs_login");
+  assert.equal(points[0].attributes.collector_state, "ok");
+  const peer = await readFactPoints(paths, { family: "peer", now: Date.parse("2026-05-24T00:00:00.000Z") });
+  assert.equal(peer.points.length, 0);
+});

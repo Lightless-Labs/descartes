@@ -353,6 +353,7 @@ test("status shape: the top-level keys of a clean watch-tier tick's status recor
   const result = await tick(paths, 0);
   assert.deepEqual(Object.keys(result.status).sort(), [
     "collector_statuses",
+    "context_key_status",
     "fact_store_budgets",
     "fact_store_completeness",
     "integrity_level",

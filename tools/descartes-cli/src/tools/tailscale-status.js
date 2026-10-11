@@ -67,22 +67,52 @@ function parsePeer(peer) {
   };
 }
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// Context plan C0.3: the daemon's own tailnet state, kept for EVERY parsed outcome (not only
+// Running). Each field is undefined when the JSON does not carry it: an absent Health list or Self
+// object is unknown, never a zero or a false. CurrentTailnet.Name is raw here, in memory only;
+// context-translators.js HMACs it before any fact point is built.
+function parseTailnetState(parsed, peerMapValid, peers) {
+  const self = isPlainObject(parsed.Self) ? parsed.Self : undefined;
+  let exitNodeInUse;
+  if (isPlainObject(parsed.ExitNodeStatus)) exitNodeInUse = true;
+  else if (peerMapValid && peers.some((peer) => peer.is_exit_node_active)) exitNodeInUse = true;
+  else if (peerMapValid && parsed.BackendState === "Running") exitNodeInUse = false;
+  return {
+    backend_state: parsed.BackendState,
+    self_online: typeof self?.Online === "boolean" ? self.Online : undefined,
+    exit_node_in_use: exitNodeInUse,
+    health_issue_count: Array.isArray(parsed.Health) ? parsed.Health.length : undefined,
+    current_tailnet_name: isPlainObject(parsed.CurrentTailnet) && typeof parsed.CurrentTailnet.Name === "string" && parsed.CurrentTailnet.Name.length > 0
+      ? parsed.CurrentTailnet.Name
+      : undefined,
+  };
+}
+
 /**
  * Pure parser for `tailscale status --json` output. Raw public keys remain in this in-memory
  * shape only; fact-translators.js hashes them before producing persisted fact points.
+ *
+ * C0.3: BackendState is required; the Peer map is NOT (a logged-out daemon omits it). When it is
+ * absent or malformed, `peer_map_valid` is false and `peers` is empty; the collector then never
+ * reports a Running daemon as an ok zero-peer census.
  */
 export function parseTailscaleStatusJson(stdout) {
   const parsed = JSON.parse(String(stdout ?? ""));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || typeof parsed.BackendState !== "string") {
+  if (!isPlainObject(parsed) || typeof parsed.BackendState !== "string") {
     throw new SyntaxError("tailscale status JSON has no valid BackendState");
   }
-  if (!parsed.Peer || typeof parsed.Peer !== "object" || Array.isArray(parsed.Peer)) {
-    throw new SyntaxError("tailscale status JSON has no valid Peer map");
-  }
+  const peerMapValid = isPlainObject(parsed.Peer);
+  const peers = peerMapValid ? Object.values(parsed.Peer).map(parsePeer).filter(Boolean) : [];
 
   return {
     backend_state: parsed.BackendState,
-    peers: Object.values(parsed.Peer).map(parsePeer).filter(Boolean),
+    peer_map_valid: peerMapValid,
+    peers,
+    tailnet: parseTailnetState(parsed, peerMapValid, peers),
   };
 }
 
@@ -139,6 +169,7 @@ export async function collectTailscaleStatusEvidence(options = {}) {
       return {
         status: "logged_out",
         backend_state: parsed.backend_state,
+        tailnet: parsed.tailnet,
         peers: [],
         total_count: 0,
         truncated: false,
@@ -150,12 +181,18 @@ export async function collectTailscaleStatusEvidence(options = {}) {
     }
 
     if (parsed.backend_state !== "Running") {
-      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state });
+      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet });
+    }
+    // C0.3: a Running daemon whose Peer map is missing or malformed is not a peer census (never an
+    // ok zero), but its tailnet state was observed and is kept.
+    if (!parsed.peer_map_valid) {
+      return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has no valid Peer map" });
     }
 
     return {
       status: "ok",
       backend_state: parsed.backend_state,
+      tailnet: parsed.tailnet,
       total_count: parsed.peers.length,
       peers: parsed.peers.slice(0, cap),
       truncated: parsed.peers.length > cap,
