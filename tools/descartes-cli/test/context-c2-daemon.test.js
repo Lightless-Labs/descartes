@@ -271,30 +271,61 @@ for (const [label, damage] of [
   });
 }
 
-test("C2 rollback loss causes one restart and one memory loss, then clean ticks continue", async () => {
+async function runC2RollbackScenario({ stampChain, stampStats }) {
   const paths = await tempPaths();
   const { run } = harness(paths);
   await run(T0);
   await run(T0 + HOUR);
   const marker = new Date(T0 + HOUR + 1).toISOString();
-  for (const family of ["tick_summary", "context_stats"]) {
+  for (const [family, shouldStamp] of [["tick_summary", stampChain], ["context_stats", stampStats]]) {
+    if (!shouldStamp) continue;
     const read = await readFactIntegrityLedger(paths, family);
     await writeFactIntegrityLedger(paths, family, { ...read.ledger, future_fact_dropped_total: read.ledger.future_fact_dropped_total + 1, last_future_fact_ts: marker });
   }
   const rollback = await run(T0 + 2 * HOUR);
   const clean = await run(T0 + 3 * HOUR);
   const statusOf = (result) => result.status ?? result;
-  assert.equal(statusOf(rollback).context_c2.chain, "restarted");
-  assert.equal(statusOf(rollback).context_c2.stats.memory_lost, true);
-  assert.equal(statusOf(clean).context_c2.chain, "continued");
-  assert.equal(statusOf(clean).context_c2.stats.memory_lost, false);
   const summaries = (await readFactPoints(paths, { family: "tick_summary", now: new Date(T0 + 3 * HOUR).toISOString() })).points
     .filter((point) => point.fact_name === "tick.summary");
-  assert.deepEqual(summaries.map((point) => point.attributes.chain), ["started", "continued", "restarted", "continued"]);
-  const state = JSON.parse(await fs.readFile(resolveFactIntegrityPaths(paths, "context_stats").integrityFile, "utf8"));
-  assert.equal(state.last_future_fact_ts, marker);
+  const chainState = JSON.parse(await fs.readFile(resolveSummaryChainPath(paths), "utf8"));
   const statsState = JSON.parse(await fs.readFile(resolveStatsStatePath(paths), "utf8"));
-  assert.equal(statsState.memory_lost_count, 1);
+  return { rollback: statusOf(rollback), clean: statusOf(clean), summaries, chainState, statsState, marker };
+}
+
+test("C2 rollback loss in context_stats restarts stats once, while chain continues", async () => {
+  const result = await runC2RollbackScenario({ stampChain: false, stampStats: true });
+  assert.equal(result.rollback.context_c2.chain, "continued");
+  assert.equal(result.rollback.context_c2.stats.memory_lost, true);
+  assert.equal(result.clean.context_c2.chain, "continued");
+  assert.equal(result.clean.context_c2.stats.memory_lost, false);
+  assert.deepEqual(result.summaries.map((point) => point.attributes.chain), ["started", "continued", "continued", "continued"]);
+  assert.equal(result.chainState.future_loss_marker, null);
+  assert.equal(result.statsState.future_loss_marker, result.marker);
+  assert.equal(result.statsState.memory_lost_count, 1);
+});
+
+test("C2 rollback loss in tick_summary restarts chain once, while stats continue", async () => {
+  const result = await runC2RollbackScenario({ stampChain: true, stampStats: false });
+  assert.equal(result.rollback.context_c2.chain, "restarted");
+  assert.equal(result.rollback.context_c2.stats.memory_lost, false);
+  assert.equal(result.clean.context_c2.chain, "continued");
+  assert.equal(result.clean.context_c2.stats.memory_lost, false);
+  assert.deepEqual(result.summaries.map((point) => point.attributes.chain), ["started", "continued", "restarted", "continued"]);
+  assert.equal(result.chainState.future_loss_marker, result.marker);
+  assert.equal(result.statsState.future_loss_marker, null);
+  assert.equal(result.statsState.memory_lost_count, 0);
+});
+
+test("C2 rollback loss in both ledgers restarts both families once", async () => {
+  const result = await runC2RollbackScenario({ stampChain: true, stampStats: true });
+  assert.equal(result.rollback.context_c2.chain, "restarted");
+  assert.equal(result.rollback.context_c2.stats.memory_lost, true);
+  assert.equal(result.clean.context_c2.chain, "continued");
+  assert.equal(result.clean.context_c2.stats.memory_lost, false);
+  assert.deepEqual(result.summaries.map((point) => point.attributes.chain), ["started", "continued", "restarted", "continued"]);
+  assert.equal(result.chainState.future_loss_marker, result.marker);
+  assert.equal(result.statsState.future_loss_marker, result.marker);
+  assert.equal(result.statsState.memory_lost_count, 1);
 });
 
 test("C2 finalize: a summary whose pass did not commit leaves the chain state unadvanced, so the next tick restarts the chain (unknown transitions), never continues it", async () => {

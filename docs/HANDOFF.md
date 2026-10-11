@@ -2,6 +2,19 @@
 
 **Last updated:** 2026-10-11
 
+## Context facts C2b per-family rollback markers — 2026-10-11 — local, not pushed
+
+Split future-fact loss consumption by derived family. `tick_summary` chain state now reads,
+compares, and persists only the `tick_summary` ledger marker; `context_stats` state does the same
+independently for the `context_stats` ledger marker. Stats no longer treats an intact own ledger as
+memory loss merely because the sibling summary chain restarted. Added asymmetric daemon regressions
+for stats-only, chain-only, and both-ledger rollback markers; each affected family restarts once and
+then continues. Focused C2 daemon verification passes **14/14**. Fresh-XDG full `npm test` completed
+with **2,680 total: 2,617 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are
+environment-only: 17 notifier-reuse and 3 tap-bump loopback test-server cases fail with `listen
+EPERM`, and 2 live-process provenance checks return `unknown` under restricted process
+introspection. No changed-area product test failed. No push or merge.
+
 ## Context facts C2b re-gate closure — 2026-10-11 — local, not pushed
 
 Closed the remaining B1/B2/HIGH/MEDIUM/LOW findings on `feat/context-facts-c2b-2026-10` in five

@@ -1225,9 +1225,10 @@ const EPISODE_KIND_PRIORITY = ["boot", "wake", "tailnet", "vpn", "net_config"];
  */
 export function deriveStats({ prior, storeExisted, prevChain, snapshot, transitions, summary, nowIso, futureLossMarker = null }) {
   const prevState = prior?.status === "valid" ? prior.state : undefined;
-  const summaryChain = summary.point?.attributes?.chain;
   const certified = summary.point?.attributes?.cert === "certified";
-  const memoryLost = (!prevState && storeExisted) || (storeExisted && ["restarted", "gap"].includes(summaryChain));
+  // Statistics own their continuity. A tick_summary restart or gap makes the interval-derived
+  // values unknown, but it does not discard an otherwise valid context_stats state or its memory.
+  const memoryLost = !prevState && storeExisted;
   const points = [];
   const day = utcDay(snapshot.tsMs);
   let daily = prevState?.daily ?? null;
