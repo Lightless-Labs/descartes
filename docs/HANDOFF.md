@@ -4,23 +4,22 @@
 
 ## Context facts C2 daybreak rework — 2026-10-11 — local, not pushed
 
-On `feat/context-facts-c2-2026-10`, reworked all reported findings in atomic test-first commits.
-Tailscale now validates every consumed field without truthiness or string coercion and fails peer
-populations closed on malformed values. Network parsers fail closed on malformed fields and domain
-tokens, fingerprint provenance is derived from the aggregate inputs and includes
-`net.configured_search_domain`, and Linux RA parsing accepts the real `proto kernel_ra` spelling
-while still rejecting static addresses. Composite collectors check cancellation before every
-subprocess launch; fast-tick boundary probes abort their subprocess at the deadline.
+On `feat/context-facts-c2-2026-10`, closed the daybreak findings in three atomic commits:
+`e5206cb` restores main’s cancellable whole-tick deadline for every incumbent structural census;
+`e429462` makes who/last/WireGuard peer populations and v2 baseline completeness fail closed on
+malformed sources; `c0df0b7` makes login, lifecycle, network, and context translators reject
+malformed/non-string evidence, preserve envelope `unable`, require all lifecycle fields for `ok`,
+and keep invalid network components out of aggregate fingerprints. The shared abort helper is used
+before every subprocess launch in the peer and login collectors. Only the new host/login/net
+context collectors receive independent sub-deadlines after the incumbent census. The C0 addendum
+records deviation 2 as reverted. No product alert family or mutating action was added.
 
-Focused verification: Tailscale **29/29**, net-config **20/20**, combined context/parser suites
-**65/65**, and the targeted daemon deadline test **1/1**. Fresh-XDG sandbox `npm test` reports
-**2,513 passing, 23 environment failures, 35 skipped, 6 todo, 2,577 total**: one macOS
-`uv_uptime` `EPERM`, 17 notifier-reuse and 3 tap-bump loopback `listen EPERM` tests, and two
-live-process provenance checks returning `unknown` under sandbox restrictions. Fresh-XDG
-host-access `npm test` is clean: **2,536 passing, 0 failures, 35 skipped, 6 todo, 2,577 total**.
-
-Implementation/test commits: `afcbfd2`, `ce230d2`, `ca5b433`, `4d71d11`, `b6f1242`, `4c6602a`,
-`af4c461`, `9c43984`, `958e7bf`, `217e0c0`, `5bad058`, `7e4485e`. No push or merge.
+Focused verification passed: context/lifecycle/network **50/50**, login/peer/baseline **157/157**,
+daemon B2 tests including isolated context timeout **all passed**, and `git diff --check` is clean.
+Fresh-XDG full `npm test`: **2,528 passed, 22 failed, 35 skipped, 6 todo, 2,591 total**. The 22
+failures are environment-only: 17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1`
+(`listen EPERM`) in the sandbox, while 2 live-process provenance tests report `unknown` under
+sandbox process-introspection restrictions. No changed-area test failed. No push or merge.
 
 ## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
