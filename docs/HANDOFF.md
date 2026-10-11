@@ -2,6 +2,28 @@
 
 **Last updated:** 2026-10-11
 
+## Context facts C2 re-gate follow-up — 2026-10-11 — local, not pushed
+
+On `feat/context-facts-c2-2026-10`, closed the remaining HIGH/MEDIUM findings in six atomic
+commits: `63c48b1` (raw-cap last-history regression), `acc00bd` (raw source count drives
+truncation), `26bb036` (network parser prefix-junk regressions and generic grammar adversaries),
+`af93045` (full-line route/resolver/socket grammars), `8a9e2c1` (Linux inet6 flag/proto
+regressions), and `9aa5b1c` (documented iproute2 inet6 grammar). No push or merge.
+
+Focused verification passes **96/96**; `git diff --check` is clean. Fresh-XDG full `npm test`
+completed with **2,619 total: 2,556 passed, 22 failed, 35 skipped, 6 todo**. The 22 failures are
+environment-only: 17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1` (`listen EPERM`),
+and 2 live-process provenance checks return `unknown` under restricted process introspection. No
+changed-area product test failed.
+
+The `last` cap now counts non-header raw source rows before dropping reboot/shutdown/local rows,
+so 49 remote rows plus one reboot row at a 50-row cap is partial/truncated and emits the peer
+overflow marker; the correlation overflow veto is covered end-to-end. Linux route, resolv.conf,
+scutil DNS, Linux `ss`, and macOS `lsof` socket rows now consume anchored full-line grammars with
+validated values and reject suffix junk. Linux inet6 accepts the documented address flags and
+`kernel_lo`/`kernel_ra`/`kernel_ll` (plus numeric) address protocols while rejecting unknown
+tokens. No push or merge.
+
 ## Context facts C2 daybreak re-gate — 2026-10-11 — local, not pushed
 
 On `feat/context-facts-c2-2026-10`, closed the remaining daybreak findings in eight atomic
