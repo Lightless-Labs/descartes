@@ -1,6 +1,24 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-09
+**Last updated:** 2026-10-11
+
+## Context facts C2 review closure — 2026-10-11 — local, not pushed
+
+On `feat/context-facts-c2-2026-10`, closed the remaining B1/B2/B3, HIGH, MEDIUM, and LOW
+findings in atomic test-first commits. Peer availability alert identities now include the v2
+signature regime; legacy v1 identities fold but are never evaluated for recovery or new alerts.
+Router-advertisement prefixes require positive RA evidence and preserve the observed prefix
+length. Tailscale peer populations fail closed on any malformed entry. Linux configured search
+domains are tagged `net.configured_search_domain`; DHCP domains require an actual lease source.
+Collector sub-deadlines abort subprocesses and prevent later composite launches. Peer and login
+collectors share one parsed `last -n 50` result per structural tick.
+
+The focused context/peer verification passes **267/267**, and the baseline/fact-family/daemon
+regression set passes **243/243**. Required fresh-XDG `npm test` reports **2,505 passing, 23
+environment failures, 35 skipped, 6 todo, 2,569 total**. The 23 failures are one sandbox
+`uv_uptime` denial, 20 sandbox loopback `listen EPERM` notifier/tap tests, and two live-process
+provenance checks that return `unknown` under sandbox restrictions; no product-behavior failure
+remains in the task scope. No push or merge.
 
 ## Collector-source pin removal and B3 closure — 2026-10-09 — local, not pushed
 
