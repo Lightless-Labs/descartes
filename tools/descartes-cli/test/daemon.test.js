@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import {
   AUTHOR_OWNED_HISTORY_DEPENDENT_RULE_IDS,
@@ -6187,6 +6188,38 @@ test("C0.7: a hung context collector records unable and never costs the session/
   assert.equal(evidence[2].result.error, "collector_deadline_exceeded");
   const ts = "2026-05-24T00:00:00.000Z";
   assert.ok(factPointsFromSessionEvidence(evidence, { ts }).length > 0, "the census marker is still emitted");
+});
+
+test("MEDIUM: a timed-out composite collector aborts its child and launches no later subprocess", async () => {
+  const calls = [];
+  let child;
+  const runFixedExecFile = async (command, args, options = {}) => {
+    calls.push(command);
+    if (command !== "tmux") throw new Error(`unexpected subprocess after abort: ${command}`);
+    child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+      signal: options.signal,
+      killSignal: options.killSignal,
+    });
+    return await new Promise((resolve, reject) => {
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => { stderr += chunk; });
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ status: code === 0 ? "ok" : "error", stdout: "", stderr, code, signal }));
+    });
+  };
+  const evidence = await collectStructuralEvidence({
+    collector_deadline_ms: 25,
+    collectors: { sessions: { enabled: true } },
+  }, { sessions: (options) => import("../src/tools/sessions.js").then(({ collectSessionEvidence }) => collectSessionEvidence({ ...options, runFixedExecFile })) }, { deadlineMs: 1000 });
+
+  // Give the aborted child one event-loop turn to report its kill before asserting the resource
+  // boundary. The test cleans up explicitly if the pre-fix implementation failed to propagate it.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const childWasKilled = child?.killed === true || child?.exitCode !== null || child?.signalCode !== null;
+  if (!childWasKilled) child?.kill("SIGKILL");
+  assert.equal(evidence[0].result.error, "collector_deadline_exceeded");
+  assert.deepEqual(calls, ["tmux"], "screen must not be launched after the composite is aborted");
+  assert.equal(childWasKilled, true, "the timed-out subprocess must be killed");
 });
 
 test("C0.7: one census collector over its own sub-deadline is unable while the next collector still runs; an exhausted budget is explicit; a throw is unable", async () => {
