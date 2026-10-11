@@ -6190,6 +6190,30 @@ test("C0.7: a hung context collector records unable and never costs the session/
   assert.ok(factPointsFromSessionEvidence(evidence, { ts }).length > 0, "the census marker is still emitted");
 });
 
+test("LOW: peer and login collectors share one parsed last-history read per structural tick", async () => {
+  const calls = [];
+  const last = "thomas ttys037 100.64.118.39 Sun Oct 11 12:53 still logged in\n";
+  const runFixedExecFile = async (command, args = []) => {
+    calls.push([command, ...args]);
+    const key = [command, ...args].join(" ");
+    if (key === "who") return { status: "ok", stdout: "", stderr: "" };
+    if (key === "last -n 50") return { status: "ok", stdout: last, stderr: "" };
+    if (key === "wg show interfaces") return { status: "ok", stdout: "", stderr: "" };
+    if (key === "scutil --nc list") return { status: "ok", stdout: "Available network connection services in the current set (*=enabled):\n", stderr: "" };
+    if (key === "netstat -an -p tcp") return { status: "ok", stdout: "", stderr: "" };
+    if (key === "ioreg -r -k IOConsoleUsers -d 1 -a") return { status: "ok", stdout: "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>IOConsoleUsers</key><array/></dict></plist>", stderr: "" };
+    throw new Error(`unexpected subprocess: ${key}`);
+  };
+  const evidence = await collectStructuralEvidence({
+    collectors: {
+      "vpn-peer-status": { enabled: true },
+      "login-sessions": { enabled: true },
+    },
+  }, {}, { platform: "darwin", runFixedExecFile });
+  assert.deepEqual(evidence.map((item) => item.id), ["vpn-peer-status", "login-sessions"]);
+  assert.equal(calls.filter(([command, ...args]) => [command, ...args].join(" ") === "last -n 50").length, 1);
+});
+
 test("MEDIUM: a timed-out composite collector aborts its child and launches no later subprocess", async () => {
   const calls = [];
   let child;
