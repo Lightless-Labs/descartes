@@ -1,4 +1,5 @@
 import dns from "node:dns/promises";
+import { isIP } from "node:net";
 import os from "node:os";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -10,6 +11,13 @@ import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 const DNS_LOOKUP_TARGET = "example.com";
+const ROUTE_KEYWORDS = new Set(["via", "dev", "proto", "scope", "src", "metric", "mtu", "advmss", "pref", "table", "realm", "onlink"]);
+const IPV4_RE = /^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const ROUTE_IFACE_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,14}$/;
+const ROUTE_PROTO_RE = /^[A-Za-z][A-Za-z0-9_.-]*$/;
+const ROUTE_SCOPE_RE = /^(?:global|link|host|[0-9]+)$/;
+const ROUTE_TABLE_RE = /^(?:local|main|default|all|[0-9]+)$/;
+const ROUTE_REALM_RE = /^(?:0x[0-9A-Fa-f]+|[A-Za-z0-9_.-]+)$/;
 
 function attachCensusMetadata(value, metadata) {
   for (const [key, entry] of Object.entries(metadata)) Object.defineProperty(value, key, { value: entry, enumerable: false });
@@ -89,23 +97,48 @@ export function parseLinuxDefaultRoutes(stdout) {
     if (!line) continue;
     if (!line.startsWith("default")) { malformed_count += 1; continue; }
     const parts = line.split(/\s+/);
-    const valueAfter = (token) => {
-      const index = parts.indexOf(token);
-      return index >= 0 ? parts[index + 1] : undefined;
-    };
-    const metric = valueAfter("metric");
-    if (parts.some((part, index) => index > 0 && ["via", "dev", "src", "proto", "metric"].includes(part) && parts[index + 1] === undefined)) {
-      malformed_count += 1;
-      continue;
+    let gateway;
+    let interfaceName;
+    let source;
+    let protocol;
+    let metricValue;
+    const seen = new Set();
+    let valid = parts[0] === "default";
+    for (let index = 1; valid && index < parts.length;) {
+      const token = parts[index];
+      if (!ROUTE_KEYWORDS.has(token) || seen.has(token)) { valid = false; break; }
+      seen.add(token);
+      if (token === "onlink") { index += 1; continue; }
+      const value = parts[index + 1];
+      if (value === undefined || ROUTE_KEYWORDS.has(value)) { valid = false; break; }
+      if (token === "via" && !IPV4_RE.test(value)) valid = false;
+      if (token === "dev" && !ROUTE_IFACE_RE.test(value)) valid = false;
+      if (token === "src" && !IPV4_RE.test(value)) valid = false;
+      if (token === "proto" && !ROUTE_PROTO_RE.test(value)) valid = false;
+      if (token === "scope" && !ROUTE_SCOPE_RE.test(value)) valid = false;
+      if (["metric", "mtu", "advmss"].includes(token) && !/^\d+$/.test(value)) valid = false;
+      if (token === "pref" && !/^(?:low|medium|high)$/.test(value)) valid = false;
+      if (token === "table" && !ROUTE_TABLE_RE.test(value)) valid = false;
+      if (token === "realm" && !ROUTE_REALM_RE.test(value)) valid = false;
+      if (valid) {
+        if (token === "via") gateway = value;
+        if (token === "dev") interfaceName = value;
+        if (token === "src") source = value;
+        if (token === "proto") protocol = value;
+        if (token === "metric") {
+          metricValue = Number(value);
+          if (!Number.isSafeInteger(metricValue)) valid = false;
+        }
+      }
+      index += 2;
     }
-    const metricValue = metric === undefined ? undefined : /^\d+$/.test(metric) ? Number(metric) : undefined;
-    if (metric !== undefined && metricValue === undefined) { malformed_count += 1; continue; }
+    if (!valid || !interfaceName) { malformed_count += 1; continue; }
     routes.push({
       destination: "default",
-      gateway: valueAfter("via"),
-      interface: valueAfter("dev"),
-      source: valueAfter("src"),
-      protocol: valueAfter("proto"),
+      gateway,
+      interface: interfaceName,
+      source,
+      protocol,
       metric: metricValue,
       raw: line,
     });
@@ -154,9 +187,13 @@ export function parseResolvConf(contents) {
   for (const line of contents.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#") || /^(?:search|domain|options)\b/.test(trimmed)) continue;
-    const match = line.trim().match(/^nameserver\s+(\S+)/);
-    if (match) resolvers.push({ address: match[1], source: "/etc/resolv.conf" });
-    else malformed_count += 1;
+    if (/^nameserver\b/.test(trimmed)) {
+      const match = trimmed.match(/^nameserver\s+(\S+)(?:\s+#.*)?$/);
+      if (!match || isIP(match[1]) === 0) { malformed_count += 1; continue; }
+      resolvers.push({ address: match[1], source: "/etc/resolv.conf" });
+      continue;
+    }
+    malformed_count += 1;
   }
   const census = finalizeCensus({ records: resolvers, identity: (item) => item.address, cap: 8, malformed: malformed_count });
   return attachCensusMetadata(census.records, {
@@ -174,9 +211,13 @@ export function parseScutilDns(stdout) {
     const trimmed = line.trim();
     if (!trimmed || trimmed === "DNS configuration" || /^resolver #[0-9]+$/i.test(trimmed)
       || /^(?:search domain\[[0-9]+\]|domain|if_index|flags|options|order|reach)\s*:/i.test(trimmed)) continue;
-    const match = line.match(/nameserver\[[0-9]+\]\s*:\s*(\S+)/);
-    if (match) resolvers.push({ address: match[1], source: "scutil --dns" });
-    else malformed_count += 1;
+    if (/nameserver\[/i.test(line)) {
+      const match = line.match(/^\s*nameserver\[[0-9]+\]\s*:\s*(\S+)\s*$/i);
+      if (!match || isIP(match[1]) === 0) { malformed_count += 1; continue; }
+      resolvers.push({ address: match[1], source: "scutil --dns" });
+      continue;
+    }
+    malformed_count += 1;
   }
   const census = finalizeCensus({ records: resolvers, identity: (item) => item.address, cap: 8, malformed: malformed_count });
   return attachCensusMetadata(census.records, {
@@ -188,18 +229,17 @@ export function parseScutilDns(stdout) {
 
 function parseAddressPort(endpoint) {
   if (typeof endpoint !== "string") return { address: undefined, port: undefined };
-  const clean = endpoint.replace(/^\[/, "").replace(/\]$/, "");
-  if (!clean) return { address: undefined, port: undefined };
-  if (clean === "::") return { address: "[::]", port: undefined };
-
   const bracketed = endpoint.match(/^\[([^\]]+)\]:(\*|\d+)$/);
-  if (bracketed) return { address: normalizeSocketAddress(bracketed[1]), port: bracketed[2] === "*" ? undefined : Number(bracketed[2]) };
+  if (bracketed && isIP(bracketed[1]) === 6) return { address: normalizeSocketAddress(bracketed[1]), port: parseSocketPort(bracketed[2]) };
+  const unbracketed = endpoint.match(/^(\*|\d+(?:\.\d+){3}):(\*|\d+)$/);
+  if (!unbracketed || (unbracketed[1] !== "*" && isIP(unbracketed[1]) !== 4)) return { address: undefined, port: undefined };
+  return { address: unbracketed[1], port: parseSocketPort(unbracketed[2]) };
+}
 
-  const lastColon = clean.lastIndexOf(":");
-  if (lastColon === -1) return { address: clean, port: undefined };
-  const address = normalizeSocketAddress(clean.slice(0, lastColon) || "*");
-  const portText = clean.slice(lastColon + 1);
-  return { address, port: portText === "*" ? undefined : Number(portText) };
+function parseSocketPort(value) {
+  if (value === "*") return undefined;
+  const port = Number(value);
+  return Number.isSafeInteger(port) && port >= 0 && port <= 65535 ? port : Number.NaN;
 }
 
 export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
@@ -207,11 +247,18 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
   let rejected_count = 0;
   const entries = stdout.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
     const parts = line.split(/\s+/);
-    if (parts.length < 5) { rejected_count += 1; return undefined; }
+    if (parts.length !== 6) { rejected_count += 1; return undefined; }
     const local = parseAddressPort(parts[4]);
-    if (!local.address || normalizeSocketProtocol(parts[0]) === undefined || (local.port !== undefined && !Number.isSafeInteger(local.port))) { rejected_count += 1; return undefined; }
+    const peer = parseAddressPort(parts[5]);
+    const protocol = normalizeSocketProtocol(parts[0]);
+    if (!/^(?:tcp|tcp6|udp|udp6)$/.test(parts[0]) || !/^(?:LISTEN|UNCONN)$/.test(parts[1])
+      || !/^\d+$/.test(parts[2]) || !/^\d+$/.test(parts[3]) || !local.address || !peer.address
+      || (local.port !== undefined && !Number.isSafeInteger(local.port)) || (peer.port !== undefined && !Number.isSafeInteger(peer.port))) {
+      rejected_count += 1;
+      return undefined;
+    }
     return {
-      protocol: normalizeSocketProtocolForFamily(parts[0], local.address),
+      protocol: normalizeSocketProtocolForFamily(protocol, local.address),
       state: parts[1],
       local_address: local.address,
       local_port: local.port,
@@ -234,21 +281,21 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
 export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}) {
   if (typeof stdout !== "string") return { entries: [], rejected: 1, truncated: false };
   const firstLine = stdout.split("\n").find((line) => line.trim());
-  if (firstLine && !/^COMMAND\s+PID\s+USER\s+FD\s+TYPE\b/.test(firstLine.trim())) {
+  if (firstLine && !/^COMMAND\s+PID\s+USER\s+FD\s+TYPE\s+DEVICE\s+SIZE\/OFF\s+NODE\s+NAME$/.test(firstLine.trim())) {
     return { entries: [], rejected: 1, duplicate_count: 0, truncated: false };
   }
   const entries = [];
   let rejected = 0;
   for (const line of stdout.split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
-    const match = line.match(/^(\S+)\s+(\d+)\s+\S+.*\s+(TCP|UDP)\s+(.+?)(?:\s+\(LISTEN\))?$/);
-    const family = line.match(/\s(IPv[46])\s/)?.[1];
-    const protocol = normalizeSocketProtocol(match?.[3]);
+    const match = line.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(\d+[A-Za-z]+)\s+(IPv[46])\s+(\S+)\s+(\S+)\s+(TCP|UDP)\s+(\S+)(?:\s+\((LISTEN|UNCONN)\))?$/);
+    const family = match?.[5];
+    const protocol = normalizeSocketProtocol(match?.[8]);
     const isTcp = protocol === "tcp";
-    if (!match || (isTcp && !/\(LISTEN\)$/.test(line))) {
+    if (!match || (isTcp && match[10] !== "LISTEN")) {
       rejected += 1;
       continue;
     }
-    const local = parseAddressPort(match[4]);
+    const local = parseAddressPort(match[9]);
     if (!local.address) {
       rejected += 1;
       continue;
