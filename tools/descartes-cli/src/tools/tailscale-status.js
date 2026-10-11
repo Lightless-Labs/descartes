@@ -122,8 +122,13 @@ export function parseTailscaleStatusJson(stdout) {
   if (!isPlainObject(parsed) || typeof parsed.BackendState !== "string") {
     throw new SyntaxError("tailscale status JSON has no valid BackendState");
   }
-  const peerMapValid = isPlainObject(parsed.Peer);
-  const peers = peerMapValid ? Object.values(parsed.Peer).map(parsePeer).filter(Boolean) : [];
+  const peerEntries = isPlainObject(parsed.Peer) ? Object.entries(parsed.Peer) : [];
+  // A Running status is a trustworthy peer census only when EVERY entry validates. Filtering a
+  // malformed entry would turn an unreadable population into a false zero and could also make the
+  // remaining entries falsely prove that no exit node is in use.
+  const parsedPeers = peerEntries.map(([, peer]) => parsePeer(peer));
+  const peerMapValid = isPlainObject(parsed.Peer) && parsedPeers.every((peer) => peer !== undefined);
+  const peers = peerMapValid ? parsedPeers : [];
 
   return {
     backend_state: parsed.BackendState,
