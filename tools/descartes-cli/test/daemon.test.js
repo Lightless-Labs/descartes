@@ -6340,16 +6340,15 @@ test("MEDIUM: a timed-out context collector aborts its child and launches no lat
   assert.equal(childWasKilled, true, "the timed-out subprocess must be killed");
 });
 
-test("B2: the incumbent census is one cancellable structural deadline", async () => {
-  const outcome = await collectStructuralEvidence({
+test("B2: the incumbent census propagates collector rejection to the outer caller", async () => {
+  await assert.rejects(() => collectStructuralEvidence({
     collectors: { services: { enabled: true }, network: { enabled: true }, "scheduled-jobs": { enabled: true }, provenance: { enabled: true } },
   }, {
-    services: () => new Promise(() => {}),
+    services: async () => { throw new Error("incumbent boom"); },
     network: async () => envelope("network-basics", "collect_network", { listening_sockets: [] }),
     "scheduled-jobs": async () => envelope("scheduled-jobs", "collect_scheduled_jobs", { jobs: [] }),
     provenance: async () => envelope("provenance-warnings", "collect_provenance_warnings", { warnings: [] }),
-  }, { deadlineMs: 15 });
-  assert.equal(typeof outcome, "symbol");
+  }), /incumbent boom/);
 });
 
 test("C0.7: profile validation accepts positive sub-deadlines and rejects invalid ones", () => {

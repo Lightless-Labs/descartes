@@ -471,7 +471,7 @@ export const STRUCTURAL_CONTEXT_COLLECTORS = Object.freeze([
 // does not discard the incumbent snapshot.
 export const DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS = 5 * 1000;
 const COLLECTOR_TIMED_OUT = Symbol("structural-collector-timed-out");
-const STRUCTURAL_CENSUS_TIMED_OUT = Symbol("structural-census-timed-out");
+const STRUCTURAL_TICK_TIMED_OUT = Symbol("structural-tick-timed-out");
 
 function unableCollectorEnvelope(id, tool, error, observation) {
   return {
@@ -487,16 +487,8 @@ function unableCollectorEnvelope(id, tool, error, observation) {
   };
 }
 
-/**
- * Sibling to collectDaemonEvidence for the slower structural (services/network/scheduled-jobs)
- * cadence — identical enabled-flag/injectable-collectors pattern, stable evidence ordering.
- *
- * C0.7/B2: incumbent census collectors run under one cancellable structural deadline, exactly as on
- * main. If that deadline expires, this returns a sentinel and the daemon discards the entire
- * incumbent snapshot. Context collectors run only after the census and each gets an independent
- * sub-deadline; its timeout yields an `unable` envelope without affecting incumbent evidence.
- */
-export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
+/** The incumbent structural collection block, kept byte-for-byte equivalent to main's path. */
+export async function collectStructuralCensusEvidence(structuralProfile = {}, collectors = {}, options = {}) {
   const activeCollectors = {
     services: collectors.services ?? collectServiceEvidence,
     network: collectors.network ?? collectNetworkEvidence,
@@ -515,84 +507,73 @@ export async function collectStructuralEvidence(structuralProfile = {}, collecto
     "tailscale-status": collectors["tailscale-status"] ?? collectTailscaleStatusEvidence,
     canary: collectors.canary ?? (() => collectCanaryEvidence([])),
     "process-lineage": collectors["process-lineage"] ?? collectProcessLineageEvidence,
-    // Context plan C0.8/C0.9: boot identity and raw clock readings (DATA only).
+  };
+  const collectorOptions = {
+    ...options,
+    trustedBinaryPaths: options.trustedBinaryPaths ?? [],
+  };
+  const evidence = [];
+  if (structuralProfile.collectors?.services?.enabled) evidence.push(await activeCollectors.services(collectorOptions));
+  if (structuralProfile.collectors?.network?.enabled) evidence.push(await activeCollectors.network(collectorOptions));
+  if (structuralProfile.collectors?.["scheduled-jobs"]?.enabled) evidence.push(await activeCollectors["scheduled-jobs"](collectorOptions));
+  if (structuralProfile.collectors?.provenance?.enabled) evidence.push(await activeCollectors.provenance(collectorOptions));
+  if (structuralProfile.collectors?.sessions?.enabled) evidence.push(await activeCollectors.sessions(collectorOptions));
+  if (structuralProfile.collectors?.["vpn-peer-status"]?.enabled) evidence.push(await activeCollectors["vpn-peer-status"](collectorOptions));
+  if (structuralProfile.collectors?.["tailscale-status"]?.enabled) evidence.push(await activeCollectors["tailscale-status"](collectorOptions));
+  if (structuralProfile.collectors?.canary?.enabled) evidence.push(await activeCollectors.canary(collectorOptions));
+  if (structuralProfile.collectors?.["process-lineage"]?.enabled) evidence.push(await activeCollectors["process-lineage"](collectorOptions));
+  return evidence;
+}
+
+/** Context-only phase: independent per-source deadlines and cancellation, after census success. */
+export async function collectStructuralContextEvidence(structuralProfile = {}, collectors = {}, options = {}) {
+  const activeCollectors = {
     "host-lifecycle": collectors["host-lifecycle"] ?? collectHostLifecycleEvidence,
-    // Context plan C0.4: login origin (who + IOConsoleUsers / loginctl, bounded last). DATA only.
     "login-sessions": collectors["login-sessions"] ?? collectLoginSessionsEvidence,
-    // Context plan C0.5: the network-configuration fingerprint components. DATA only.
     "net-config": collectors["net-config"] ?? collectNetConfigEvidence,
   };
-  const { deadlineMs, nowFn = Date.now, ...rest } = options;
+  const { nowFn = Date.now, ...rest } = options;
   const collectorOptions = {
     ...rest,
     trustedBinaryPaths: options.trustedBinaryPaths ?? [],
     killSignal: options.killSignal ?? "SIGKILL",
     lastHistoryCache: options.lastHistoryCache ?? {},
   };
-  const budgetMs = isPositiveFiniteNumber(deadlineMs) ? deadlineMs : Infinity;
-  const contextCapMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms) ? structuralProfile.context_collector_deadline_ms : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
-  const startedMs = nowFn();
+  const capMs = isPositiveFiniteNumber(structuralProfile.context_collector_deadline_ms)
+    ? structuralProfile.context_collector_deadline_ms
+    : DEFAULT_CONTEXT_COLLECTOR_DEADLINE_MS;
   const evidence = [];
-  const runContextPhase = async (entries, capMs) => {
-    for (const [key, id, tool] of entries) {
-      if (!structuralProfile.collectors?.[key]?.enabled) continue;
-      const remainingMs = budgetMs - (nowFn() - startedMs);
-      const runStartMs = nowFn();
-      if (!(remainingMs > 0)) {
-        evidence.push(unableCollectorEnvelope(id, tool, "structural_budget_exhausted", { start_ms: runStartMs, end_ms: runStartMs }));
-        continue;
-      }
-      let outcome;
-      const controller = new AbortController();
-      try {
-        outcome = await withDeadline(
-          Promise.resolve().then(() => activeCollectors[key]({ ...collectorOptions, signal: controller.signal })),
-          Math.min(remainingMs, capMs),
-          () => {
-            controller.abort();
-            return COLLECTOR_TIMED_OUT;
-          },
-        );
-      } catch {
-        controller.abort();
-        outcome = undefined;
-      }
-      const observation = { start_ms: runStartMs, end_ms: nowFn() };
-      if (outcome === COLLECTOR_TIMED_OUT) {
-        evidence.push(unableCollectorEnvelope(id, tool, "collector_deadline_exceeded", observation));
-      } else if (!outcome || typeof outcome !== "object") {
-        evidence.push(unableCollectorEnvelope(id, tool, "collector_threw", observation));
-      } else {
-        evidence.push(outcome.observation ? outcome : { ...outcome, observation });
-      }
+  for (const [key, id, tool] of STRUCTURAL_CONTEXT_COLLECTORS) {
+    if (!structuralProfile.collectors?.[key]?.enabled) continue;
+    const runStartMs = nowFn();
+    const controller = new AbortController();
+    let outcome;
+    try {
+      outcome = await withDeadline(
+        Promise.resolve().then(() => activeCollectors[key]({ ...collectorOptions, signal: controller.signal })),
+        capMs,
+        () => {
+          controller.abort();
+          return COLLECTOR_TIMED_OUT;
+        },
+      );
+    } catch {
+      controller.abort();
+      outcome = undefined;
     }
-  };
-  const censusController = new AbortController();
-  const censusWork = (async () => {
-      for (const [key] of STRUCTURAL_CENSUS_COLLECTORS) {
-        if (!structuralProfile.collectors?.[key]?.enabled) continue;
-        const collectorOutcome = await activeCollectors[key]({ ...collectorOptions, signal: censusController.signal });
-        if (!collectorOutcome || typeof collectorOutcome !== "object") throw new Error("structural_collector_invalid_result");
-        evidence.push(collectorOutcome);
-      }
-      return evidence;
-    })();
-  const census = Number.isFinite(budgetMs)
-    ? withDeadline(censusWork, budgetMs, () => {
-      censusController.abort();
-      return STRUCTURAL_CENSUS_TIMED_OUT;
-    })
-    : censusWork;
-  let outcome;
-  try {
-    outcome = await census;
-  } catch {
-    censusController.abort();
-    return STRUCTURAL_CENSUS_TIMED_OUT;
+    const observation = { start_ms: runStartMs, end_ms: nowFn() };
+    if (outcome === COLLECTOR_TIMED_OUT) evidence.push(unableCollectorEnvelope(id, tool, "collector_deadline_exceeded", observation));
+    else if (!outcome || typeof outcome !== "object") evidence.push(unableCollectorEnvelope(id, tool, "collector_threw", observation));
+    else evidence.push(outcome.observation ? outcome : { ...outcome, observation });
   }
-  if (outcome === STRUCTURAL_CENSUS_TIMED_OUT) return outcome;
-  await runContextPhase(STRUCTURAL_CONTEXT_COLLECTORS, contextCapMs);
   return evidence;
+}
+
+/** Full structural phases for direct callers; the daemon wraps only the incumbent phase in main's deadline race. */
+export async function collectStructuralEvidence(structuralProfile = {}, collectors = {}, options = {}) {
+  const structuralOptions = { ...options, lastHistoryCache: options.lastHistoryCache ?? {} };
+  const evidence = await collectStructuralCensusEvidence(structuralProfile, collectors, structuralOptions);
+  return [...evidence, ...await collectStructuralContextEvidence(structuralProfile, collectors, structuralOptions)];
 }
 
 /**
@@ -1413,16 +1394,21 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             canary: structuralCollectors?.canary ?? (() => collectCanaryEvidence(canaries)),
           };
         }
-        // B2: incumbent census collectors retain main's cancellable whole-tick deadline. Context
-        // collectors are run by collectStructuralEvidence only after that census completes and use
-        // independent sub-deadlines that cannot discard incumbent evidence.
-        const outcome = await collectStructuralEvidence(structuralProfile, structuralCollectors, { ...collectorOptions, deadlineMs });
-        if (outcome === STRUCTURAL_CENSUS_TIMED_OUT) {
+        // B2: this is main's incumbent path: the outer deadline race wraps only the unchanged
+        // sequential census block. The context phase is invoked only after this succeeds.
+        const structuralCollectorOptions = { ...collectorOptions, lastHistoryCache: {} };
+        const outcome = await withDeadline(
+          collectStructuralCensusEvidence(structuralProfile, structuralCollectors, structuralCollectorOptions),
+          deadlineMs,
+          () => STRUCTURAL_TICK_TIMED_OUT,
+        );
+        if (outcome === STRUCTURAL_TICK_TIMED_OUT) {
           // Partial incumbent results are discarded, not partially persisted, exactly as on main.
           // The checkpoint still advances below so a repeatedly-slow host retries next interval.
           structuralCollectorStatuses = [{ status: "unable", error: "structural_tick_deadline_exceeded" }];
         } else {
-          structuralEvidence = outcome;
+          const contextEvidence = await collectStructuralContextEvidence(structuralProfile, structuralCollectors, structuralCollectorOptions);
+          structuralEvidence = [...outcome, ...contextEvidence];
           structuralCollectorStatuses = structuralEvidence.map((envelope) => ({
             id: envelope.id,
             status: envelope.status,
@@ -1587,7 +1573,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // not run on a tick where any collector overran or found the budget exhausted (an
           // envelope the daemon synthesized), since its targets' freshness then depends on which
           // collectors finished.
-          const structuralTickComplete = !structuralEvidence.some((envelope) => envelope.source === "daemon");
+          const incumbentIds = new Set(STRUCTURAL_CENSUS_COLLECTORS.map(([, id]) => id));
+          const structuralTickComplete = structuralEvidence
+            .filter((envelope) => incumbentIds.has(envelope.id))
+            .every((envelope) => envelope.source !== "daemon");
           if (learnedConfig.enabled && structuralTickComplete) {
             const evaluateShadow = options.evaluateAndLogShadowConstraints ?? evaluateAndLogShadowConstraints;
             shadowEvaluation = await evaluateShadow(descartesPaths, { ts, now: options.now ?? ts, freshnessMs: activeFreshnessMs });
