@@ -5,9 +5,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const TOOLS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "tools");
+const SRC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
 
 function toolFiles() {
-  return fs.readdirSync(TOOLS_DIR, { recursive: true, withFileTypes: true })
+  return fs.readdirSync(SRC_DIR, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
     .map((entry) => path.join(entry.parentPath ?? entry.path, entry.name));
 }
@@ -30,7 +31,7 @@ test("MEDIUM 1: every runner launch call site is individually behind the shared 
   assert.deepEqual(offenders, [], "every subprocess runner call site must have a preceding abort guard");
 });
 
-test("LOW: every execFile/spawn-family launch under src/tools has its own preceding abort guard", () => {
+test("LOW: every execFile/spawn-family launch under src has its own preceding abort guard", () => {
   const launch = /\b(?:execFile(?:Async|Sync)?|spawn(?:Sync)?)\s*\(/;
   const offenders = [];
   let callSiteCount = 0;
@@ -42,7 +43,7 @@ test("LOW: every execFile/spawn-family launch under src/tools has its own preced
       let previous = index - 1;
       while (previous >= 0 && lines[previous].trim() === "") previous -= 1;
       if (previous < 0 || !/throwIfCollectorAborted\s*\(/.test(lines[previous])) {
-        offenders.push(`${path.relative(TOOLS_DIR, filename)}:${index + 1}`);
+        offenders.push(`${path.relative(SRC_DIR, filename)}:${index + 1}`);
       }
     }
   }
