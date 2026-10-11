@@ -268,7 +268,7 @@ const FAMILY_BUDGET_ENTRIES = [
   // Context families (C0): sized like the capacity plan, (horizon / interval) x worst-case tick x 1.25,
   // against the 30-day declared data horizon (DATA_FAMILY_HORIZON_ENTRIES), with the 4x ceiling still
   // admitting a 15-minute interval and not raising MIN_STRUCTURAL_INTERVAL_MS. Floors (1 h interval):
-  // host_lifecycle 3,570,300 B; network_context 1,355,400 B; session_context 10,415,700 B.
+  // host_lifecycle 3,570,300 B; network_context 1,467,000 B; session_context 10,415,700 B.
   ["host_lifecycle", 4 * MIB],
   ["network_context", 2 * MIB],
   ["session_context", 11 * MIB],
@@ -300,13 +300,13 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // (every field at its longest valid value; fact-families.test.js "C0 data-family T8" recomputes and
   // pins these numbers). Each per-tick fact counts as a marker; host_lifecycle: boot 698 +
   // boot_boundary 928 + clock_reading 1147 + suspend 581 + boundary_census 613; network_context:
-  // tailnet_state 601 + config_fingerprint 905; session_context: login_census 777 + user.presence 508
+  // tailnet_state 601 + config_fingerprint 1029; session_context: login_census 777 + user.presence 508
   // as markers, plus at most MAX_LOGIN_ARRIVALS_PER_TICK + MAX_LOGIN_HISTORY_ROWS_PER_TICK (8 + 8)
   // records of at most 643 B.
   // A boundary census (C0.12) borrows the next structural slot, so a horizon holds at most two extra
   // ticks, inside the 1.25 headroom.
   ["host_lifecycle", { maxRecordBytes: 0, markerBytes: 3967, entityCap: 0 }],
-  ["network_context", { maxRecordBytes: 0, markerBytes: 1506, entityCap: 0 }],
+  ["network_context", { maxRecordBytes: 0, markerBytes: 1630, entityCap: 0 }],
   ["session_context", { maxRecordBytes: 643, markerBytes: 1285, entityCap: 16 }],
 ];
 

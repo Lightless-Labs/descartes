@@ -95,7 +95,7 @@ function a1PeerTick(hour, count) {
   for (let i = 0; i < count; i += 1) {
     points.push({ ts, fact_name: "peer.presence", entity_key: `peer.ssh.e-${i}`, attributes: { source_type: "ssh", presence_state: "observed_active" } });
   }
-  points.push({ ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } });
+  points.push({ ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "v2:ok-ok-ok-ok-ok" } });
   return points;
 }
 
@@ -316,7 +316,7 @@ test("baseline inspect (R8): tailscale peers are not listed as established for t
     points.push(
       { ts, fact_name: "peer.presence", entity_key: "peer.ssh.aaaaaaaaaaaaaaaa", attributes: { source_type: "ssh", presence_state: "observed_active" } },
       { ts, fact_name: "peer.presence", entity_key: "peer.tailscale.bbbbbbbbbbbbbbbb", attributes: { source_type: "tailscale", presence_state: "observed_active" } },
-      { ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } },
+      { ts, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", attributes: { availability_signature: "v2:ok-ok-ok-ok-ok" } },
     );
   }
   const readFactPoints = async () => ({ points, corrupt_count: 0, schema_invalid_count: 0, completeness: { status: "intact" } });
@@ -388,7 +388,7 @@ test("baseline status keeps rule coverage honest on overflow ticks", async () =>
   points.push(
     ...a1PeerTick(31, 40),
     { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.overflow-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { overflow: "true" } },
-    { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { availability_signature: "v1:ok-ok-ok-ok-ok" } },
+    { ts: peerTs, fact_name: "peer.presence", entity_key: "peer.census-marker.v1", source_envelope_id: "vpn-peer-status", attributes: { availability_signature: "v2:ok-ok-ok-ok-ok" } },
   );
   const readFactPoints = stubFamilyRead(points, { status: "intact" });
   const result = await buildBaselineStatus(paths, { now: a1Ts(31.5), readFactPoints });
