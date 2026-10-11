@@ -148,6 +148,7 @@ test("parseTailscaleStatusJson rejects a malformed LastHandshake instead of turn
 
 test("parseTailscaleStatusJson rejects malformed JSON instead of partially trusting it", () => {
   assert.throws(() => parseTailscaleStatusJson('{"BackendState":"Running","Peer":'), SyntaxError);
+  assert.throws(() => parseTailscaleStatusJson({ BackendState: "Running", Peer: {} }), /tailscale status JSON must be a string/);
 });
 
 test("STATIC: tailscale status has exactly one fixed read-only argv and no constructible mutating subcommand", () => {
