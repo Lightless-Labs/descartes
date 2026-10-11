@@ -855,7 +855,8 @@ export function verifyTickSummaryChain(points) {
 
 const STATS_STATE_KEYS = ["schema_version", "family", "ledger_generation", "ledger_pass_id", "episode", "daily", "memory_lost_count", "memory_lost_ts"];
 const EPISODE_KEYS = ["eseq", "kind", "ev", "offset", "pre_session", "pre_peer"];
-const DAILY_KEYS = ["day", "memory", "intervals", "known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"];
+const DAILY_KEYS = ["day", "memory", "intervals", "s_known", "p_known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"];
+const DAILY_COUNTERS = DAILY_KEYS.filter((key) => key !== "day" && key !== "memory");
 
 function validCounter(value) {
   return Number.isSafeInteger(value) && value >= 0;
@@ -877,7 +878,7 @@ export function isValidStatsState(value) {
     const d = value.daily;
     if (!exactKeys(d, DAILY_KEYS) || typeof d.day !== "string" || !DAY_RE.test(d.day)) return false;
     if (!["continuous", "first_run", "cold_start_after_loss"].includes(d.memory)) return false;
-    if (!["intervals", "known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"].every((k) => validCounter(d[k]))) return false;
+    if (!DAILY_COUNTERS.every((k) => validCounter(d[k]))) return false;
   }
   return true;
 }
@@ -908,7 +909,7 @@ function utcDay(tsMs) {
 }
 
 function emptyDaily(day, memory, seq) {
-  return { day, memory, intervals: 0, known: 0, s_arr: 0, s_dep: 0, p_arr: 0, p_dep: 0, ex_hi_s: 0, ex_known: 0, first_seq: seq, last_seq: seq };
+  return { day, memory, intervals: 0, s_known: 0, p_known: 0, s_arr: 0, s_dep: 0, p_arr: 0, p_dep: 0, ex_hi_s: 0, ex_known: 0, first_seq: seq, last_seq: seq };
 }
 
 function episodeIdentityStats(pre, cur) {
@@ -945,7 +946,7 @@ function episodePoint({ ts, episode, offset, seq, sessionStats, peerStats }) {
 
 function dailyPoint(ts, daily) {
   const attrs = { day: daily.day, memory: daily.memory };
-  for (const key of ["intervals", "known", "s_arr", "s_dep", "p_arr", "p_dep", "ex_hi_s", "ex_known", "first_seq", "last_seq"]) attrs[key] = String(daily[key]);
+  for (const key of DAILY_COUNTERS) attrs[key] = String(daily[key]);
   return enforceContextSchema({ ts, fact_name: STATS_DAILY_FACT_NAME, entity_key: `${STATS_DAILY_FACT_NAME}.${daily.day}`, attributes: attrs, sensitivity: "operational" });
 }
 
@@ -973,10 +974,15 @@ export function deriveStats({ prior, storeExisted, prevChain, snapshot, transiti
   daily = { ...daily };
   daily.intervals += 1;
   daily.last_seq = summary.seq;
-  if (summary.sessionChurn.arrivals !== undefined && summary.peerChurn.arrivals !== undefined) {
-    daily.known += 1;
+  // Each source on its own knownness: an interval whose peer census was incomplete still counts the
+  // session churn it observed, and vice versa (never a zero for the unknown one).
+  if (summary.sessionChurn.arrivals !== undefined) {
+    daily.s_known += 1;
     daily.s_arr += summary.sessionChurn.arrivals;
     daily.s_dep += summary.sessionChurn.departures;
+  }
+  if (summary.peerChurn.arrivals !== undefined) {
+    daily.p_known += 1;
     daily.p_arr += summary.peerChurn.arrivals;
     daily.p_dep += summary.peerChurn.departures;
   }

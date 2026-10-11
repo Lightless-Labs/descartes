@@ -373,7 +373,8 @@ test("C2 statistics skeleton: per-episode identity statistics at offsets 0..2 fr
   assert.equal(daily[0].day, "2026-10-11");
   assert.equal(daily[0].memory, "first_run");
   assert.equal(daily[0].intervals, "5");
-  assert.equal(daily[0].known, "4", "the first interval (no previous record) is unknown, not zero");
+  assert.equal(daily[0].s_known, "4", "the first interval (no previous record) is unknown, not zero");
+  assert.equal(daily[0].p_known, "4");
   // Persisted stats state, ledger-stamped; a lost state over an existing store is a cold start.
   const paths = await tempPaths();
   const pass = await appendFactPoints(paths, emitted, { family: "context_stats", now: new Date(T0 + 14 * HOUR).toISOString() });
@@ -389,4 +390,49 @@ test("C2 statistics skeleton: per-episode identity statistics at offsets 0..2 fr
   const state = cold.nextState("g", 1);
   assert.equal(state.memory_lost_count, 1);
   assert.equal(state.daily.memory, "cold_start_after_loss");
+});
+
+test("C2 statistics: each source's daily counts accumulate on its own knownness (a chronically incomplete peer census never hides session churn)", () => {
+  const ticks = [0, 1, 2].map((i) => {
+    const t = tick({ ms: T0 + i * HOUR, sessions: i === 2 ? { a: 1, b: 2 } : { a: 1 }, uptimeMs: 1000 + i * HOUR });
+    t.evidence[1].result.census_status = "partial";
+    t.points = [...factPointsFromSessionEvidence(t.evidence, { ts: t.ts }), ...factPointsFromVpnPeerEvidence(t.evidence, { ts: t.ts })];
+    return t;
+  });
+  const chained = chainTicks(ticks);
+  let prior = { status: "missing" };
+  let state;
+  for (const [index, { snapshot, transitions, summary }] of chained.entries()) {
+    const stats = deriveStats({ prior, storeExisted: index > 0, prevChain: index > 0 ? chained[index - 1].summary.nextState("g", index) : undefined, snapshot, transitions, summary, nowIso: snapshot.ts });
+    state = stats.nextState("sg", index + 1);
+    prior = { status: "valid", state };
+  }
+  assert.equal(state.daily.s_known, 2);
+  assert.equal(state.daily.s_arr, 1);
+  assert.equal(state.daily.p_known, 0, "the peer census was never complete");
+  assert.equal(state.daily.p_arr, 0);
+});
+
+test("C2 context_stats T8: at most one episode and one daily record per tick, at their exact worst cases (pinned)", () => {
+  const exact = (name) => {
+    const schema = CONTEXT_FACT_SCHEMAS.get(name);
+    const attributes = {};
+    for (const [field, spec] of Object.entries(schema.fields)) {
+      if (field === "rejected_field") continue;
+      const candidates = spec.kind === "enum" ? [...spec.values] : [...spec.sentinels];
+      if (spec.kind === "hmac") candidates.push("f".repeat(16));
+      if (spec.kind === "int") candidates.push(String(spec.max));
+      if (spec.kind === "pattern") candidates.push("9".repeat(spec.maxLength));
+      attributes[field] = candidates.sort((a, b) => b.length - a.length)[0];
+    }
+    const size = (attrs) => {
+      const record = normalizeFactPoint({ ts: "2026-10-11T00:00:00.000Z", fact_name: "x".repeat(name.length), entity_key: `${name}.4294967296`, attributes: attrs });
+      record.fact_name = name;
+      return Buffer.byteLength(`${JSON.stringify(record)}\n`);
+    };
+    const longestField = Object.keys(schema.fields).sort((a, b) => b.length - a.length)[0];
+    return Math.max(size(attributes), size(unableContextAttributes(name, { rejectedField: longestField })));
+  };
+  assert.deepEqual([exact("stats.episode"), exact("stats.daily")], [516, 427], "a schema change must revisit the context_stats tick shape");
+  assert.equal(FAMILY_TICK_SHAPES.get("context_stats").worstTickBytes, 516 + 427);
 });

@@ -300,7 +300,8 @@ const FAMILY_BUDGET_ENTRIES = [
   ["collector_state", 8 * MIB],
   // C2 derived families. tick_summary: one record of at most 1,013 B per structural tick; 3 MiB holds the
   // 90-day retention at a 1 h interval (the 30-day floor is 911,700 B). context_stats: at most one
-  // episode and one daily record per tick (899 B); 2 MiB holds the 30-day floor (809,100 B) and, at
+  // episode and one daily record per tick (516 + 427 = 943 B with their entity keys); 2 MiB holds the 30-day floor
+  // (848,700 B) and, at
   // typical volume (rare episodes, one daily record per day), the 365-day retention.
   ["context_stats", 2 * MIB],
   ["tick_summary", 3 * MIB],
@@ -349,7 +350,7 @@ const FAMILY_TICK_SHAPE_ENTRIES = [
   // C2: at most MAX_BINARY_STATES_PER_TICK (context-translators.js) records of at most 668 B.
   ["collector_state", { maxRecordBytes: 668, markerBytes: 0, entityCap: 12 }],
   // C2: the exact worst cases (no envelope source, fixed entity key; pinned in context-c2-summary.test.js).
-  ["context_stats", { maxRecordBytes: 0, markerBytes: 899, entityCap: 0 }],
+  ["context_stats", { maxRecordBytes: 0, markerBytes: 943, entityCap: 0 }],
   ["tick_summary", { maxRecordBytes: 0, markerBytes: 1013, entityCap: 0 }],
 ];
 

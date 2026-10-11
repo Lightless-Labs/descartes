@@ -465,7 +465,7 @@ test("C0 data-family T8: each context family's budget holds its 30-day data hori
     // Derived records: an upper bound under this generic shape (a longest envelope source, a suffixed
     // entity key, confidence, rejected_field); their exact worst cases are pinned in
     // context-c2-summary.test.js (tick.summary 1,013 B <= 1 KiB).
-    "tick.summary": 1159, "stats.episode": 648, "stats.daily": 539,
+    "tick.summary": 1159, "stats.episode": 648, "stats.daily": 561,
   }, "a schema change must revisit the pinned context tick shapes");
   assert.equal(FAMILY_TICK_SHAPES.get("collector_state").maxRecordBytes, worst["collector.binary_state"]);
   const tick = {
