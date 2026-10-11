@@ -31,6 +31,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus } from "./census-validate.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -75,13 +77,23 @@ export function parseSysctlKeyValues(stdout, keys = DARWIN_SYSCTL_KEYS) {
   if (typeof stdout !== "string") return {};
   const allowed = new Set(keys);
   const values = {};
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  const records = [];
+  let malformed_count = 0;
+  for (const rawLine of stdout.split("\n")) {
+    if (!rawLine.trim()) continue;
     const index = rawLine.indexOf(": ");
-    if (index <= 0) continue;
+    if (index <= 0) { malformed_count += 1; continue; }
     const key = rawLine.slice(0, index).trim();
-    if (!allowed.has(key) || Object.prototype.hasOwnProperty.call(values, key)) continue;
+    if (!allowed.has(key)) { malformed_count += 1; continue; }
+    records.push(key);
+    if (Object.prototype.hasOwnProperty.call(values, key)) continue;
     values[key] = rawLine.slice(index + 2).trim();
   }
+  Object.defineProperty(values, "duplicate_count", {
+    value: finalizeCensus({ records, identity: (key) => key }).duplicate_count,
+    enumerable: false,
+  });
+  Object.defineProperty(values, "malformed_count", { value: malformed_count, enumerable: false });
   return values;
 }
 
@@ -118,7 +130,7 @@ export function parseProcStatBtime(text) {
 export function parseOsReleaseBuild(text) {
   if (typeof text !== "string") return undefined;
   const fields = {};
-  for (const rawLine of String(text ?? "").split("\n")) {
+  for (const rawLine of text.split("\n")) {
     const match = /^([A-Z_]+)=(.*)$/.exec(rawLine.trim());
     if (match) fields[match[1]] = match[2].replace(/^["']|["']$/g, "");
   }
@@ -162,13 +174,17 @@ function runtimeClocks(options) {
 }
 
 async function readDarwin(options) {
-  const runExec = options.runFixedExecFile ?? ((command, args, execOptions) => runResolvedExecFile(command, args, {
-    ...execOptions,
-    timeout: execOptions.timeout ?? 2000,
-    maxBuffer: execOptions.maxBuffer ?? 64 * 1024,
-    execFileAsync,
-  }));
+  const runExec = options.runFixedExecFile ?? ((command, args, execOptions) => {
+    throwIfCollectorAborted(execOptions?.signal);
+    return runResolvedExecFile(command, args, {
+      ...execOptions,
+      timeout: execOptions.timeout ?? 2000,
+      maxBuffer: execOptions.maxBuffer ?? 64 * 1024,
+      execFileAsync,
+    });
+  });
   const { runFixedExecFile: _drop, ...resolverOptions } = options;
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("sysctl", [...DARWIN_SYSCTL_KEYS], resolverOptions);
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", binary: probe.binary, error: probe.error };
@@ -179,7 +195,7 @@ async function readDarwin(options) {
   const bootId = UUID_RE.test(values["kern.bootsessionuuid"] ?? "") ? values["kern.bootsessionuuid"].toUpperCase() : undefined;
   const monotonic = /^[0-9]{1,24} [0-9]{1,24}$/.test(values["kern.monotonicclock_usecs"] ?? "") ? values["kern.monotonicclock_usecs"] : undefined;
   return {
-    status: Object.keys(values).length === DARWIN_SYSCTL_KEYS.length && bootId ? "ok" : "partial",
+    status: Object.keys(values).length === DARWIN_SYSCTL_KEYS.length && bootId && values.duplicate_count === 0 && values.malformed_count === 0 ? "ok" : "partial",
     binary: probe.binary,
     boot: {
       boot_id: bootId,

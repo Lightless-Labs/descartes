@@ -1,4 +1,6 @@
 import { isLastDateStart } from "./login-origin.js";
+import { finalizeCensus } from "./census-validate.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const LAST_PSEUDO_USER_RE = /^(reboot|shutdown)$/i;
 
@@ -27,13 +29,15 @@ export function parseLastRows(stdout) {
     }
     rows.push({ user, tty, host, login_text: loginTokens.join(" ") });
   }
-  return { rows, malformed };
+  const census = finalizeCensus({ records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]), malformed });
+  return { rows, malformed, duplicate_count: census.duplicate_count };
 }
 
 /** Run one bounded `last` probe per shared structural-tick cache and share its parsed rows. */
 export async function readSharedLastHistory(options, runExec, probeOptions, limit) {
   const cache = options.lastHistoryCache;
   const run = async () => {
+    throwIfCollectorAborted(options.signal);
     const probe = await runExec("last", ["-n", String(limit)], probeOptions);
     return { probe, ...parseLastRows(probe.stdout) };
   };

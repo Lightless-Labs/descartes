@@ -21,6 +21,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus } from "./census-validate.js";
 import { classifyLoginOrigin, ttyClassOf } from "./login-origin.js";
 import { parseLastRows, readSharedLastHistory } from "./last-history.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
@@ -46,6 +47,7 @@ function loginctlSessionBlocksMatchRequest(sessions, requestedIds) {
 }
 
 async function defaultRunFixedExecFile(command, args, options = {}) {
+  throwIfCollectorAborted(options.signal);
   return runResolvedExecFile(command, args, {
     ...options,
     timeout: options.timeout ?? 3000,
@@ -87,7 +89,8 @@ export function parseWhoRows(stdout) {
     const [, user, tty, loginText, host] = match;
     rows.push({ user, tty, host: host || undefined, login_text: loginText.trim() });
   }
-  return { rows, malformed };
+  const census = finalizeCensus({ rows, records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]), malformed });
+  return { rows, malformed, duplicate_count: census.duplicate_count };
 }
 
 // ----------------------------------------------------------------------------------- ioreg (plist)
@@ -190,6 +193,10 @@ export function parseConsoleUsers(xml) {
   }
   const result = { users, console_locked: typeof holder.IOConsoleLocked === "boolean" ? holder.IOConsoleLocked : undefined };
   if (malformed_count > 0) result.malformed_count = malformed_count;
+  Object.defineProperty(result, "duplicate_count", {
+    value: finalizeCensus({ records: users, identity: (user) => JSON.stringify(user), malformed: malformed_count }).duplicate_count,
+    enumerable: false,
+  });
   return result;
 }
 
@@ -210,7 +217,9 @@ export function parseLoginctlSessionIds(stdout) {
     if (id && fields.length >= 2 && /^[A-Za-z0-9_-]{1,32}$/.test(id)) ids.push(id);
     else malformed_count += 1;
   }
+  const census = finalizeCensus({ records: ids, identity: (id) => id, malformed: malformed_count });
   Object.defineProperty(ids, "malformed_count", { value: malformed_count, enumerable: false });
+  Object.defineProperty(ids, "duplicate_count", { value: census.duplicate_count, enumerable: false });
   return ids;
 }
 
@@ -229,7 +238,7 @@ function parseLoginctlSessionIdsDetailed(stdout) {
     }
     ids.push(id);
   }
-  return { ids, malformed_count };
+  return { ids, malformed_count, duplicate_count: finalizeCensus({ records: ids, identity: (id) => id, malformed: malformed_count }).duplicate_count };
 }
 
 /** `loginctl show-session -p ... id1 id2` prints KEY=VALUE blocks separated by blank lines. */
@@ -261,6 +270,10 @@ export function parseLoginctlShowSession(stdout) {
   }
   flush();
   Object.defineProperty(sessions, "malformed_count", { value: malformed_count, enumerable: false });
+  Object.defineProperty(sessions, "duplicate_count", {
+    value: finalizeCensus({ records: sessions, identity: (session) => session.Id, malformed: malformed_count }).duplicate_count,
+    enumerable: false,
+  });
   return sessions;
 }
 
@@ -292,7 +305,12 @@ async function runWho(runExec, options) {
   const probe = await runExec("who", [], probeOptions(options));
   if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
   const { rows, malformed } = parseWhoRows(probe.stdout);
-  return { state: malformed > 0 ? "partial" : rows.length === 0 ? "absent" : "ok", rows };
+  const truncated = rows.length > MAX_LOGIN_RECORDS;
+  return { state: malformed > 0 || parsedDuplicateCount(rows) > 0 || truncated ? "partial" : rows.length === 0 ? "absent" : "ok", rows, duplicate_count: parsedDuplicateCount(rows), truncated };
+}
+
+function parsedDuplicateCount(rows) {
+  return finalizeCensus({ records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]) }).duplicate_count;
 }
 
 async function runLast(runExec, options) {
@@ -301,7 +319,9 @@ async function runLast(runExec, options) {
   const probe = shared.probe;
   if (probe.status !== "ok") return { state: failureState(probe), rows: [] };
   const { rows, malformed } = shared;
-  return { state: malformed > 0 ? "partial" : rows.length === 0 ? "absent" : "ok", rows };
+  const duplicate_count = finalizeCensus({ records: rows, identity: (row) => JSON.stringify([row.user, row.tty, row.host, row.login_text]), malformed }).duplicate_count;
+  const truncated = rows.length >= LOGIN_HISTORY_LIMIT;
+  return { state: malformed > 0 || duplicate_count > 0 || truncated ? "partial" : rows.length === 0 ? "absent" : "ok", rows, duplicate_count, truncated };
 }
 
 async function runConsole(runExec, options) {
@@ -310,7 +330,7 @@ async function runConsole(runExec, options) {
   if (probe.status !== "ok") return { state: failureState(probe) };
   try {
     const parsed = parseConsoleUsers(probe.stdout);
-    return { state: parsed.malformed_count > 0 ? "partial" : "ok", ...parsed };
+    return { state: parsed.malformed_count > 0 || parsed.duplicate_count > 0 ? "partial" : "ok", ...parsed };
   } catch {
     return { state: "unable" };
   }
@@ -331,12 +351,16 @@ async function runLoginctl(runExec, options) {
   const sessions = parseLoginctlShowSession(show.stdout);
   const showComplete = sessions.malformed_count === 0 && loginctlSessionBlocksMatchRequest(sessions, ids);
   const complete = parsedIds.malformed_count === 0
+    && parsedIds.duplicate_count === 0
     && allIds.length === ids.length
-    && showComplete;
+    && showComplete
+    && sessions.duplicate_count === 0;
   return {
     state: complete ? "ok" : "partial",
     sessions: showComplete ? sessions : [],
     malformed_count: parsedIds.malformed_count + (sessions.malformed_count ?? 0),
+    duplicate_count: parsedIds.duplicate_count + (sessions.duplicate_count ?? 0),
+    truncated: allIds.length > MAX_LOGINCTL_SESSIONS,
   };
 }
 
@@ -355,6 +379,7 @@ export async function readLoginSessions(options = {}) {
   const sources = { who: "not_applicable", last: "not_applicable", console: "not_applicable", loginctl: "not_applicable" };
   const records = [];
   const history = [];
+  let truncated = false;
   let presence = { screen_locked: "unknown", idle_hint: "unknown", source: "none" };
   const abortIfNeeded = () => throwIfCollectorAborted(options.signal);
 
@@ -362,6 +387,7 @@ export async function readLoginSessions(options = {}) {
     abortIfNeeded();
     const last = await runLast(runExec, options);
     sources.last = last.state;
+    truncated ||= last.truncated === true;
     for (const row of last.rows) {
       const { origin_class: originClass, remote_host: remoteHost } = classifyLoginOrigin(row);
       history.push({ user: row.user, tty_class: ttyClassOf(row.tty), origin_class: originClass, remote_host: remoteHost, identity: ["last", row.user, row.tty, row.host ?? "", row.login_text].join("\u0000") });
@@ -374,6 +400,7 @@ export async function readLoginSessions(options = {}) {
     // C0 review L5: rows beyond the per-read cap are not records, so the census is partial (the
     // translator then reports the current count as unknown, never the truncated number).
     sources.who = who.state === "ok" && who.rows.length > MAX_LOGIN_RECORDS ? "partial" : who.state;
+    truncated ||= who.truncated === true;
     for (const row of who.rows.slice(0, MAX_LOGIN_RECORDS)) {
       const { origin_class: originClass, remote_host: remoteHost } = classifyLoginOrigin(row);
       records.push({ source: "who", user: row.user, tty_class: ttyClassOf(row.tty), origin_class: originClass, service_class: "unknown", remote_host: remoteHost, identity: ["who", row.user, row.tty, row.host ?? "", row.login_text].join("\u0000") });
@@ -396,6 +423,7 @@ export async function readLoginSessions(options = {}) {
     abortIfNeeded();
     const logind = await runLoginctl(runExec, options);
     sources.loginctl = logind.state;
+    truncated ||= logind.truncated === true;
     for (const session of logind.sessions.slice(0, MAX_LOGIN_RECORDS)) {
       const { origin_class: originClass, remote_host: remoteHost } = loginctlOrigin(session);
       records.push({
@@ -422,7 +450,7 @@ export async function readLoginSessions(options = {}) {
   const states = Object.values(sources).filter((state) => state !== "not_applicable");
   const usable = states.filter((state) => state === "ok" || state === "absent" || state === "partial");
   const status = states.length === 0 ? "not_applicable" : usable.length === states.length && states.every((state) => state !== "partial") ? "ok" : usable.length > 0 ? "partial" : "unable";
-  return { platform, status, sources, records, history, presence };
+  return { platform, status, sources, records, history, presence, truncated };
 }
 
 export async function collectLoginSessionsEvidence(options = {}) {

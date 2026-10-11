@@ -26,6 +26,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus } from "./census-validate.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,6 +39,7 @@ const TUNNEL_IFACE_RE = /^(utun|ipsec|ppp|tun|tap|wg|gif|stf|tailscale|zt|vpn|no
 const MAGIC_DNS = new Set(["100.100.100.100", "fd7a:115c:a1e0::53"]);
 
 async function defaultRunFixedExecFile(command, args, options = {}) {
+  throwIfCollectorAborted(options.signal);
   return runResolvedExecFile(command, args, {
     ...options,
     timeout: options.timeout ?? 3000,
@@ -61,7 +64,7 @@ function failureState(probe) {
 const NOT_APPLICABLE = Object.freeze({ state: "not_applicable" });
 
 export function isTunnelInterface(iface) {
-  return TUNNEL_IFACE_RE.test(String(iface ?? ""));
+  return typeof iface === "string" && TUNNEL_IFACE_RE.test(iface);
 }
 
 /** `netstat -rn -f inet` -> [{ gateway, iface }] for every default route, in table order. */
@@ -78,6 +81,10 @@ export function parseNetstatDefaultRoutes(stdout) {
     if (extra.some((token) => !/^[0-9]+$/.test(token))) return undefined;
     if (destination === "default") routes.push({ gateway: IPV4_RE.test(gateway) ? gateway : undefined, iface });
   }
+  Object.defineProperty(routes, "duplicate_count", {
+    value: finalizeCensus({ records: routes, identity: (route) => JSON.stringify([route.gateway, route.iface]) }).duplicate_count,
+    enumerable: false,
+  });
   return routes;
 }
 
@@ -112,6 +119,10 @@ export function parseIpRouteDefault(stdout) {
     if (!dev) return undefined;
     routes.push({ gateway: via, iface: dev });
   }
+  Object.defineProperty(routes, "duplicate_count", {
+    value: finalizeCensus({ records: routes, identity: (route) => JSON.stringify([route.gateway, route.iface]) }).duplicate_count,
+    enumerable: false,
+  });
   return routes;
 }
 
@@ -140,6 +151,7 @@ export function parseIfconfigVerbose(stdout) {
 }
 
 function expandIpv6(address) {
+  if (typeof address !== "string") return undefined;
   const [head, tail] = address.toLowerCase().split("::");
   const headParts = head ? head.split(":") : [];
   const tailParts = tail !== undefined && tail !== "" ? tail.split(":") : [];
@@ -152,7 +164,7 @@ function expandIpv6(address) {
 }
 
 function canonicalIpv6Prefix(address, prefixLength) {
-  const parts = expandIpv6(String(address ?? ""));
+  const parts = expandIpv6(address);
   if (!parts || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return undefined;
   if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return undefined;
   const masked = parts.map((part, index) => {
@@ -183,7 +195,7 @@ function canonicalIpv6Prefix(address, prefixLength) {
 }
 
 function isGlobalIpv6(address) {
-  const parts = expandIpv6(String(address ?? ""));
+  const parts = expandIpv6(address);
   if (!parts || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return false;
   return (parseInt(parts[0], 16) & 0xe000) === 0x2000;
 }
@@ -202,6 +214,10 @@ export function parseLinuxRouterAdvertisementPrefixes(stdout) {
   const prefixes = new Set();
   let sawGlobalAddress = false;
   for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (line && !/\binet6\b/.test(line)
+      && !/^\d+:\s+\S+/.test(line)
+      && !/^(?:valid_lft|preferred_lft)\b/.test(line)) return { state: "unable", prefixes: [] };
     if (/\binet6\b/.test(rawLine) && !/\binet6\s+[^\s/]+\/\d+\s+.+$/.test(rawLine.trim())) return { state: "unable", prefixes: [] };
     const match = /\binet6\s+([^\s/]+)\/(\d+)\s+(.+)$/.exec(rawLine.trim());
     if (!match) continue;
@@ -212,7 +228,10 @@ export function parseLinuxRouterAdvertisementPrefixes(stdout) {
     sawGlobalAddress = true;
     if (/\bproto\s+(?:ra|kernel_ra)\b/.test(flags) && /\b(?:dynamic|mngtmpaddr)\b/.test(flags)) {
       const prefix = canonicalIpv6Prefix(address, prefixLength);
-      if (prefix) prefixes.add(prefix);
+      if (prefix) {
+        if (prefixes.has(prefix)) return { state: "unable", prefixes: [] };
+        prefixes.add(prefix);
+      }
     }
   }
   if (prefixes.size > 0) return { state: "ok", prefixes: [...prefixes].sort() };
@@ -224,6 +243,8 @@ export function parseNdpRouterAdvertisementPrefixes(stdout, iface) {
   if (typeof stdout !== "string") return undefined;
   const prefixes = new Set();
   for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (line && !line.startsWith("No advertising router") && !/^\S+\/\d+\s+if=\S+/.test(line)) return undefined;
     if (/\//.test(rawLine) && !/^\s*[^\s/]+\/\d+\s+if=[^\s]+/.test(rawLine)) return undefined;
     const match = /^\s*([^\s/]+)\/(\d+)\s+if=([^\s]+)/.exec(rawLine);
     if (!match) continue;
@@ -234,7 +255,10 @@ export function parseNdpRouterAdvertisementPrefixes(stdout, iface) {
     if (!expandIpv6(address) || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 128) return undefined;
     if (!isGlobalIpv6(address)) continue;
     const prefix = canonicalIpv6Prefix(address, prefixLength);
-    if (prefix) prefixes.add(prefix);
+    if (prefix) {
+      if (prefixes.has(prefix)) return undefined;
+      prefixes.add(prefix);
+    }
   }
   return [...prefixes].sort();
 }
@@ -284,6 +308,11 @@ export function parseScutilDnsForInterface(stdout, iface) {
   if (typeof stdout !== "string") return undefined;
   const servers = new Set();
   for (const block of stdout.split(/\n(?=resolver #)/)) {
+    for (const rawLine of block.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line === "DNS configuration" || /^resolver #[0-9]+$/i.test(line)) continue;
+      if (!/^(?:search domain\[[0-9]+\]|domain|nameserver\[[0-9]+\]|if_index|flags|options|order|reach)\s*:/i.test(line)) return undefined;
+    }
     const scopeLine = block.split("\n").find((line) => /if_index/i.test(line));
     if (scopeLine && !/if_index\s*:\s*[0-9]+\s*\(([^)]+)\)/.test(scopeLine)) return undefined;
     const scope = /if_index\s*:\s*[0-9]+\s*\(([^)]+)\)/.exec(block)?.[1];
@@ -293,7 +322,10 @@ export function parseScutilDnsForInterface(stdout, iface) {
       const match = /nameserver\[[0-9]+\]\s*:\s*(\S+)/i.exec(line);
       if (!match || !isDnsServer(match[1])) return undefined;
       const server = normalizeDnsServer(match[1]);
-      if (!MAGIC_DNS.has(server)) servers.add(server);
+      if (!MAGIC_DNS.has(server)) {
+        if (servers.has(server)) return undefined;
+        servers.add(server);
+      }
     }
   }
   return [...servers].sort();
@@ -304,7 +336,10 @@ export function parseResolvectlDns(stdout) {
   if (typeof stdout !== "string") return undefined;
   const servers = new Set();
   for (const rawLine of stdout.split("\n")) {
-    if (/^\s*Link\b/.test(rawLine) && !/^\s*Link\s+[0-9]+\s+\([^)]*\):(?:\s+.*)?$/.test(rawLine)) return undefined;
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^Global\b/i.test(line)) continue;
+    if (!/^Link\b/i.test(line) || !/^Link\s+[0-9]+\s+\([^)]*\):(?:\s+.*)?$/.test(line)) return undefined;
     const colon = rawLine.indexOf("):");
     if (colon < 0) continue;
     const rest = rawLine.slice(colon + 2).trim();
@@ -312,7 +347,10 @@ export function parseResolvectlDns(stdout) {
     for (const token of rest.split(/\s+/)) {
       if (!isDnsServer(token)) return undefined;
       const server = normalizeDnsServer(token);
-      if (!MAGIC_DNS.has(server)) servers.add(server);
+      if (!MAGIC_DNS.has(server)) {
+        if (servers.has(server)) return undefined;
+        servers.add(server);
+      }
     }
   }
   return [...servers].sort();
@@ -325,21 +363,25 @@ function listComponent(values, state = "ok") {
 function parseNmcliDomains(stdout, { lease = false } = {}) {
   if (typeof stdout !== "string") return undefined;
   const values = [];
+  const seen = new Set();
   for (const rawLine of stdout.split(/[\n|]/)) {
     const line = rawLine.trim();
     if (!line) continue;
     const value = lease ? /^domain_name\s*=\s*(.*)$/i.exec(line)?.[1] : line;
     if (value === undefined) {
-      if (lease && /^domain_name\b/i.test(line)) return undefined;
-      continue;
+      if (lease && /^[A-Za-z0-9_.-]+\s*=\s*.*$/.test(line)) continue;
+      return undefined;
     }
     const domains = value.trim() ? value.split(/[,\s]+/).map((item) => item.trim().toLowerCase()) : [];
     for (const domain of domains) {
       if (!DOMAIN_RE.test(domain)) return undefined;
+      if (seen.has(domain)) return undefined;
+      seen.add(domain);
       values.push(domain);
     }
   }
-  return [...new Set(values)].sort();
+  const census = finalizeCensus({ records: values, identity: (value) => value });
+  return census.complete ? [...new Set(values)].sort() : undefined;
 }
 
 async function readDarwin(runExec, options) {
@@ -348,7 +390,7 @@ async function readDarwin(runExec, options) {
   const routesProbe = await runProbe("netstat", ["-rn", "-f", "inet"]);
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
   const parsedRoutes = parseNetstatDefaultRoutes(routesProbe.stdout);
-  if (!parsedRoutes) return { route: { state: "partial", kind: "unknown" } };
+  if (!parsedRoutes || parsedRoutes.duplicate_count > 0) return { route: { state: "partial", kind: "unknown" } };
   const chosen = choosePhysicalDefault(parsedRoutes);
   if (chosen.state !== "ok" || chosen.tunnel_only) return { route: chosen };
   const { iface, gateway } = chosen;
@@ -425,7 +467,7 @@ async function readLinux(runExec, options) {
   const routesProbe = await runProbe("ip", ["route", "show", "default"]);
   if (routesProbe.status !== "ok") return { route: { state: failureState(routesProbe), kind: "unknown" } };
   const parsedRoutes = parseIpRouteDefault(routesProbe.stdout);
-  if (!parsedRoutes) return { route: { state: "partial", kind: "unknown" } };
+  if (!parsedRoutes || parsedRoutes.duplicate_count > 0) return { route: { state: "partial", kind: "unknown" } };
   const chosen = choosePhysicalDefault(parsedRoutes);
   if (chosen.state !== "ok" || chosen.tunnel_only) return { route: chosen };
   const { iface, gateway } = chosen;

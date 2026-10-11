@@ -378,8 +378,8 @@ export function unableContextAttributes(factName, { rejectedField = "none", obsS
 export function enforceContextSchema(point) {
   const verdict = validateContextFact(point.fact_name, point.attributes);
   if (verdict.ok) return point;
-  const obsStartMs = Number(point.attributes?.obs_start_ms);
-  const obsEndMs = Number(point.attributes?.obs_end_ms);
+  const obsStartMs = exactEpochStringToNumber(point.attributes?.obs_start_ms);
+  const obsEndMs = exactEpochStringToNumber(point.attributes?.obs_end_ms);
   return {
     ...point,
     attributes: unableContextAttributes(point.fact_name, {
@@ -389,4 +389,10 @@ export function enforceContextSchema(point) {
     }),
     confidence: 0,
   };
+}
+
+function exactEpochStringToNumber(value) {
+  if (typeof value !== "string" || !/^[0-9]{1,24}$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }

@@ -10,13 +10,13 @@ import {
   parseWgHandshakes,
   parseWgPeerList,
 } from "../src/tools/vpn-peer-status.js";
-import { parseTailscaleStatusJson } from "../src/tools/tailscale-status.js";
+import { collectTailscaleStatusEvidence, parseTailscaleStatusJson } from "../src/tools/tailscale-status.js";
 import {
   parseLinuxRouterAdvertisementPrefixes,
   parseNdpRouterAdvertisementPrefixes,
   parseResolvectlDns,
 } from "../src/tools/net-config.js";
-import { parseLoginctlSessionIds } from "../src/tools/login-sessions.js";
+import { parseLoginctlSessionIds, readLoginSessions } from "../src/tools/login-sessions.js";
 import { observationInterval } from "../src/context-translators.js";
 
 const KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -75,6 +75,36 @@ test("Tailscale rejects map-key/PublicKey mismatch and duplicate inner PublicKey
   assert.equal(duplicate.peer_map_valid, false);
 });
 
+test("collector populations, not just parser metadata, reject duplicate peers and strict-handshake violations", async () => {
+  const ok = (stdout) => ({ status: "ok", stdout, stderr: "" });
+  const run = async (command, args) => {
+    const key = JSON.stringify([command, ...args]);
+    const fixtures = {
+      [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0"),
+      [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok(`${KEY}\n${KEY}\n`),
+      [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok(`${KEY}\t(none)\n${KEY}\t(none)\n`),
+      [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok(`${KEY}\t0\n${KEY}\t0\n`),
+      [JSON.stringify(["who"])]: { status: "not_found_on_known_paths", stdout: "" },
+      [JSON.stringify(["last", "-n", "50"])]: { status: "not_found_on_known_paths", stdout: "" },
+      [JSON.stringify(["scutil", "--nc", "list"])]: { status: "not_found_on_known_paths", stdout: "" },
+      [JSON.stringify(["ss", "-H", "-tn", "state", "established"])]: { status: "not_found_on_known_paths", stdout: "" },
+    };
+    return fixtures[key];
+  };
+  const wg = await (await import("../src/tools/vpn-peer-status.js")).collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile: run });
+  assert.equal(wg.result.sources.wireguard.status, "partial");
+  assert.equal(wg.result.census_status, "partial");
+
+  for (const value of ["0", "2026-08-11", "10/11/2026"]) {
+    const result = await collectTailscaleStatusEvidence({
+      runFixedExecFile: async () => ok(JSON.stringify({ BackendState: "Running", Peer: { [KEY]: { PublicKey: KEY, LastHandshake: value } } })),
+    });
+    assert.equal(result.result.status, "unable", value);
+  }
+  const zero = parseTailscaleStatusJson(JSON.stringify({ BackendState: "Running", Peer: { [KEY]: { PublicKey: KEY, LastHandshake: "0001-01-01T00:00:00Z" } } }));
+  assert.equal(zero.peers[0].latest_handshake_epoch_seconds, 0);
+});
+
 test("WireGuard cap, malformed IPv6, NDP, and DNS output cannot become complete absence", async () => {
   const { collectVpnPeerStatusEvidence } = await import("../src/tools/vpn-peer-status.js");
   const ok = (stdout) => ({ status: "ok", stdout, stderr: "" });
@@ -90,6 +120,7 @@ test("WireGuard cap, malformed IPv6, NDP, and DNS output cannot become complete 
   script[JSON.stringify(["last", "-n", "50"])] = { status: "not_found_on_known_paths", stdout: "" };
   script[JSON.stringify(["scutil", "--nc", "list"])] = { status: "not_found_on_known_paths", stdout: "" };
   script[JSON.stringify(["netstat", "-an", "-p", "tcp"])] = { status: "not_found_on_known_paths", stdout: "" };
+  script[JSON.stringify(["ss", "-H", "-tn", "state", "established"])] = { status: "not_found_on_known_paths", stdout: "" };
   const result = await collectVpnPeerStatusEvidence({
     platform: "linux",
     runFixedExecFile: async (command, args) => script[JSON.stringify([command, ...args])],
@@ -108,4 +139,58 @@ test("loginctl duplicate IDs are partial and observation metadata rejects object
     trace: { ts: { toString: () => "2026-10-11T12:00:00Z" }, latency_ms: 1 },
     observation: { start_ms: { valueOf: () => 1 }, end_ms: 2 },
   }), { obsStartMs: undefined, obsEndMs: undefined });
+});
+
+test("loginctl duplicate IDs degrade the source, and malformed stamped metadata cannot fall back", async () => {
+  const result = await readLoginSessions({
+    platform: "linux",
+    runFixedExecFile: async (command) => {
+      if (command === "loginctl") return { status: "ok", stdout: "1 1000 alice seat0 tty1\n1 1000 alice seat0 tty1\n" };
+      return { status: "ok", stdout: "" };
+    },
+  });
+  assert.equal(result.sources.loginctl, "partial");
+  assert.equal(result.truncated, false);
+  assert.deepEqual(observationInterval({
+    observation: { start_ms: { valueOf: () => 1 }, end_ms: 2 },
+    trace: { ts: "2026-10-11T12:00:00Z", latency_ms: 1 },
+  }), { obsStartMs: undefined, obsEndMs: undefined });
+});
+
+test("registered census parsers stay fail-closed across adversarial generated inputs", () => {
+  const registered = [
+    { name: "wireguard.peers", parse: parseWgPeerList, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "wireguard.endpoints", parse: parseWgEndpoints, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "wireguard.handshakes", parse: parseWgHandshakes, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "loginctl.ids", parse: parseLoginctlSessionIds, trusted: (value) => value.malformed_count === 0 && value.duplicate_count === 0 },
+    { name: "linux.ipv6", parse: parseLinuxRouterAdvertisementPrefixes, trusted: (value) => value.state !== "unable" },
+    { name: "ndp", parse: (value) => parseNdpRouterAdvertisementPrefixes(value, "en0"), trusted: (value) => value !== undefined },
+    { name: "resolvectl", parse: parseResolvectlDns, trusted: (value) => value !== undefined },
+  ];
+  const generated = [
+    "MALFORMED",
+    "MALFORMED\nMALFORMED",
+    {},
+    [],
+    null,
+    "",
+    "Link 2 (en0):",
+    "No advertising router",
+  ];
+  for (const parser of registered) {
+    for (const input of generated) {
+      let result;
+      try {
+        result = parser.parse(input);
+      } catch {
+        continue;
+      }
+      if (typeof input === "string" && /MALFORMED/.test(input)) {
+        assert.equal(parser.trusted(result), false, `${parser.name} trusted ${JSON.stringify(input)}`);
+      }
+      if (input !== "" && (typeof input !== "string" || input === null)) {
+        assert.equal(parser.trusted(result), false, `${parser.name} trusted wrong type`);
+      }
+    }
+  }
 });

@@ -5,9 +5,15 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 const DNS_LOOKUP_TARGET = "example.com";
+
+function attachCensusMetadata(value, metadata) {
+  for (const [key, entry] of Object.entries(metadata)) Object.defineProperty(value, key, { value: entry, enumerable: false });
+  return value;
+}
 
 function truncate(value, max = 4096) {
   if (typeof value !== "string") return value;
@@ -15,6 +21,7 @@ function truncate(value, max = 4096) {
 }
 
 async function runFixedCommand(command, args, options = {}) {
+  throwIfCollectorAborted(options.signal);
   const result = await runResolvedExecFile(command, args, {
     ...options,
     timeout: options.timeout ?? 2500,
@@ -42,7 +49,8 @@ function uniqueBy(items, keyFn) {
 }
 
 export function normalizeSocketProtocol(protocol) {
-  const value = String(protocol ?? "").toLowerCase();
+  if (typeof protocol !== "string") return undefined;
+  const value = protocol.toLowerCase();
   if (value === "tcp4") return "tcp";
   if (value === "udp4") return "udp";
   return value;
@@ -54,9 +62,10 @@ export function normalizeSocketProtocol(protocol) {
 // persisted provenance target keys remain stable.
 export function normalizeSocketProtocolForFamily(protocol, familyOrAddress) {
   const normalized = normalizeSocketProtocol(protocol);
+  if (normalized === undefined) return undefined;
   const base = normalized.replace(/6$/, "");
   if (base !== "tcp" && base !== "udp") return normalized;
-  const hint = String(familyOrAddress ?? "").toLowerCase();
+  const hint = typeof familyOrAddress === "string" ? familyOrAddress.toLowerCase() : "";
   const ipv6 = normalized.endsWith("6")
     || hint === "ipv6"
     || hint === "6"
@@ -67,7 +76,8 @@ export function normalizeSocketProtocolForFamily(protocol, familyOrAddress) {
 }
 
 export function normalizeSocketAddress(address) {
-  return String(address ?? "") === "::" ? "[::]" : address;
+  if (typeof address !== "string") return undefined;
+  return address === "::" ? "[::]" : address;
 }
 
 export function normalizeInterfaces(interfaces = os.networkInterfaces()) {
@@ -82,64 +92,92 @@ export function normalizeInterfaces(interfaces = os.networkInterfaces()) {
 }
 
 export function parseLinuxDefaultRoutes(stdout) {
-  return stdout.split("\n").map((line) => line.trim()).filter(Boolean).filter((line) => line.startsWith("default")).map((line) => {
+  if (typeof stdout !== "string") return attachCensusMetadata([], { malformed_count: 1 });
+  const routes = [];
+  let malformed_count = 0;
+  for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (!line.startsWith("default")) { malformed_count += 1; continue; }
     const parts = line.split(/\s+/);
     const valueAfter = (token) => {
       const index = parts.indexOf(token);
       return index >= 0 ? parts[index + 1] : undefined;
     };
     const metric = valueAfter("metric");
-    return {
+    if (parts.some((part, index) => index > 0 && ["via", "dev", "src", "proto", "metric"].includes(part) && parts[index + 1] === undefined)) {
+      malformed_count += 1;
+      continue;
+    }
+    const metricValue = metric === undefined ? undefined : /^\d+$/.test(metric) ? Number(metric) : undefined;
+    if (metric !== undefined && metricValue === undefined) { malformed_count += 1; continue; }
+    routes.push({
       destination: "default",
       gateway: valueAfter("via"),
       interface: valueAfter("dev"),
       source: valueAfter("src"),
       protocol: valueAfter("proto"),
-      metric: metric === undefined ? undefined : Number(metric),
+      metric: metricValue,
       raw: line,
-    };
-  });
+    });
+  }
+  return attachCensusMetadata(routes, { malformed_count });
 }
 
 export function parseMacDefaultRoute(stdout) {
+  if (typeof stdout !== "string") return attachCensusMetadata([], { malformed_count: 1 });
   const fields = {};
+  let malformed_count = 0;
   for (const line of stdout.split("\n")) {
+    if (line.trim() && !/^\s*[^:]+:\s*.*$/.test(line)) { malformed_count += 1; continue; }
     const match = line.match(/^\s*([^:]+):\s*(.*?)\s*$/);
     if (match) fields[match[1].trim()] = match[2].trim();
   }
-  if (!fields.gateway && !fields.interface) return [];
-  return [{
+  if (!fields.gateway && !fields.interface) return attachCensusMetadata([], { malformed_count });
+  return attachCensusMetadata([{
     destination: fields.destination || fields["route to"] || "default",
     gateway: fields.gateway,
     interface: fields.interface,
     flags: fields.flags,
-  }];
+  }], { malformed_count });
 }
 
 export function parseResolvConf(contents) {
+  if (typeof contents !== "string") return attachCensusMetadata([], { malformed_count: 1 });
   const resolvers = [];
+  let malformed_count = 0;
   for (const line of contents.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || /^(?:search|domain|options)\b/.test(trimmed)) continue;
     const match = line.trim().match(/^nameserver\s+(\S+)/);
     if (match) resolvers.push({ address: match[1], source: "/etc/resolv.conf" });
+    else malformed_count += 1;
   }
-  return uniqueBy(resolvers, (item) => item.address).slice(0, 8);
+  return attachCensusMetadata(uniqueBy(resolvers, (item) => item.address).slice(0, 8), { malformed_count, truncated: resolvers.length > 8 });
 }
 
 export function parseScutilDns(stdout) {
+  if (typeof stdout !== "string") return attachCensusMetadata([], { malformed_count: 1 });
   const resolvers = [];
+  let malformed_count = 0;
   for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === "DNS configuration" || /^resolver #[0-9]+$/i.test(trimmed)
+      || /^(?:search domain\[[0-9]+\]|domain|if_index|flags|options|order|reach)\s*:/i.test(trimmed)) continue;
     const match = line.match(/nameserver\[[0-9]+\]\s*:\s*(\S+)/);
     if (match) resolvers.push({ address: match[1], source: "scutil --dns" });
+    else malformed_count += 1;
   }
-  return uniqueBy(resolvers, (item) => item.address).slice(0, 8);
+  return attachCensusMetadata(uniqueBy(resolvers, (item) => item.address).slice(0, 8), { malformed_count, truncated: resolvers.length > 8 });
 }
 
 function parseAddressPort(endpoint) {
-  const clean = String(endpoint ?? "").replace(/^\[/, "").replace(/\]$/, "");
+  if (typeof endpoint !== "string") return { address: undefined, port: undefined };
+  const clean = endpoint.replace(/^\[/, "").replace(/\]$/, "");
   if (!clean) return { address: undefined, port: undefined };
   if (clean === "::") return { address: "[::]", port: undefined };
 
-  const bracketed = String(endpoint).match(/^\[([^\]]+)\]:(\*|\d+)$/);
+  const bracketed = endpoint.match(/^\[([^\]]+)\]:(\*|\d+)$/);
   if (bracketed) return { address: normalizeSocketAddress(bracketed[1]), port: bracketed[2] === "*" ? undefined : Number(bracketed[2]) };
 
   const lastColon = clean.lastIndexOf(":");
@@ -150,10 +188,13 @@ function parseAddressPort(endpoint) {
 }
 
 export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
-  return stdout.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
+  if (typeof stdout !== "string") return attachCensusMetadata([], { rejected_count: 1, truncated: false });
+  let rejected_count = 0;
+  const entries = stdout.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
     const parts = line.split(/\s+/);
-    if (parts.length < 5) return undefined;
+    if (parts.length < 5) { rejected_count += 1; return undefined; }
     const local = parseAddressPort(parts[4]);
+    if (!local.address || normalizeSocketProtocol(parts[0]) === undefined || (local.port !== undefined && !Number.isSafeInteger(local.port))) { rejected_count += 1; return undefined; }
     return {
       protocol: normalizeSocketProtocolForFamily(parts[0], local.address),
       state: parts[1],
@@ -161,13 +202,15 @@ export function parseLinuxListeningSockets(stdout, { limit = 50 } = {}) {
       local_port: local.port,
       raw: line,
     };
-  }).filter(Boolean).slice(0, limit);
+  }).filter(Boolean);
+  return attachCensusMetadata(entries.slice(0, limit), { rejected_count, truncated: entries.length > limit });
 }
 
 export function parseMacLsofListeningSocketsDetailed(stdout, { limit = 50 } = {}) {
+  if (typeof stdout !== "string") return { entries: [], rejected: 1, truncated: false };
   const entries = [];
   let rejected = 0;
-  for (const line of String(stdout ?? "").split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
+  for (const line of stdout.split("\n").slice(1).map((item) => item.trim()).filter(Boolean)) {
     const match = line.match(/^(\S+)\s+(\d+)\s+\S+.*\s+(TCP|UDP)\s+(.+?)(?:\s+\(LISTEN\))?$/);
     const family = line.match(/\s(IPv[46])\s/)?.[1];
     const protocol = normalizeSocketProtocol(match?.[3]);
@@ -209,9 +252,10 @@ export function parseMacLsofListeningSockets(stdout, { limit = 50 } = {}) {
 async function collectDefaultRoutes(options = {}) {
   if (process.platform === "linux") {
     const command = await runFixedCommand("ip", ["route", "show", "default"], options);
+    const routes = command.status === "ok" ? parseLinuxDefaultRoutes(command.stdout) : [];
     return {
-      status: command.status,
-      routes: command.status === "ok" ? parseLinuxDefaultRoutes(command.stdout) : [],
+      status: command.status === "ok" && routes.malformed_count === 0 ? "ok" : command.status === "ok" ? "partial" : command.status,
+      routes,
       command: command.command,
       error: command.error,
       stderr: command.stderr,
@@ -219,9 +263,10 @@ async function collectDefaultRoutes(options = {}) {
   }
   if (process.platform === "darwin") {
     const command = await runFixedCommand("route", ["-n", "get", "default"], options);
+    const routes = command.status === "ok" ? parseMacDefaultRoute(command.stdout) : [];
     return {
-      status: command.status,
-      routes: command.status === "ok" ? parseMacDefaultRoute(command.stdout) : [],
+      status: command.status === "ok" && routes.malformed_count === 0 ? "ok" : command.status === "ok" ? "partial" : command.status,
+      routes,
       command: command.command,
       error: command.error,
       stderr: command.stderr,
@@ -233,16 +278,18 @@ async function collectDefaultRoutes(options = {}) {
 async function collectDnsResolvers(options = {}) {
   if (process.platform === "linux") {
     try {
-      return { status: "ok", resolvers: parseResolvConf(await fs.readFile("/etc/resolv.conf", "utf8")), sources: ["/etc/resolv.conf"] };
+      const resolvers = parseResolvConf(await fs.readFile("/etc/resolv.conf", "utf8"));
+      return { status: resolvers.malformed_count === 0 && !resolvers.truncated ? "ok" : "partial", resolvers, sources: ["/etc/resolv.conf"] };
     } catch (error) {
       return { status: "unable", resolvers: [], sources: ["/etc/resolv.conf"], error: error instanceof Error ? error.message : String(error) };
     }
   }
   if (process.platform === "darwin") {
     const command = await runFixedCommand("scutil", ["--dns"], { ...options, timeout: 2500, maxBuffer: 1024 * 512 });
+    const resolvers = command.status === "ok" ? parseScutilDns(command.stdout) : [];
     return {
-      status: command.status,
-      resolvers: command.status === "ok" ? parseScutilDns(command.stdout) : [],
+      status: command.status === "ok" && resolvers.malformed_count === 0 && !resolvers.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
+      resolvers,
       sources: ["scutil --dns"],
       command: command.command,
       error: command.error,
@@ -282,31 +329,34 @@ async function lookupWithTimeout(target, timeoutMs = 2500) {
 async function collectListeningSockets(limit, options = {}) {
   if (process.platform === "linux") {
     const command = await runFixedCommand("ss", ["-H", "-ltnu"], { ...options, timeout: 2500, maxBuffer: 1024 * 512 });
+    const sockets = command.status === "ok" ? parseLinuxListeningSockets(command.stdout, { limit }) : [];
     return {
-      status: command.status,
-      sockets: command.status === "ok" ? parseLinuxListeningSockets(command.stdout, { limit }) : [],
+      status: command.status === "ok" && sockets.rejected_count === 0 && !sockets.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
+      sockets,
       command: command.command,
       error: command.error,
       stderr: command.stderr,
-      truncated: command.status === "ok" && parseLinuxListeningSockets(command.stdout, { limit: Number.MAX_SAFE_INTEGER }).length > limit,
+      truncated: command.status === "ok" && sockets.truncated,
     };
   }
   if (process.platform === "darwin") {
     const command = await runFixedCommand("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { ...options, timeout: 3500, maxBuffer: 1024 * 512 });
+    const detailed = command.status === "ok" ? parseMacLsofListeningSocketsDetailed(command.stdout, { limit }) : { entries: [], rejected: 0, truncated: false };
     return {
-      status: command.status,
-      sockets: command.status === "ok" ? parseMacLsofListeningSockets(command.stdout, { limit }) : [],
+      status: command.status === "ok" && detailed.rejected === 0 && !detailed.truncated ? "ok" : command.status === "ok" ? "partial" : command.status,
+      sockets: detailed.entries,
       command: command.command,
       error: command.error,
       stderr: command.stderr,
-      truncated: command.status === "ok" && parseMacLsofListeningSockets(command.stdout, { limit: Number.MAX_SAFE_INTEGER }).length > limit,
+      truncated: command.status === "ok" && detailed.truncated,
     };
   }
   return { status: "unsupported", sockets: [], error: `unsupported platform: ${process.platform}`, truncated: false };
 }
 
 export async function collectNetworkEvidence({ checkDnsReachability = true, socketLimit = 50, ...options } = {}) {
-  const boundedSocketLimit = Math.min(Math.max(Number(socketLimit) || 50, 1), 200);
+  const requestedSocketLimit = typeof socketLimit === "number" && Number.isSafeInteger(socketLimit) ? socketLimit : 50;
+  const boundedSocketLimit = Math.min(Math.max(requestedSocketLimit, 1), 200);
   return timedEnvelope(async () => {
     const [defaultRoutes, dnsResolvers, listeningSockets, dnsReachability] = await Promise.all([
       collectDefaultRoutes(options),

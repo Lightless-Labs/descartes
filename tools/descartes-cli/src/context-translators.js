@@ -13,6 +13,7 @@
 
 import { contextHmac, contextKeyId } from "./context-key.js";
 import { enforceContextSchema } from "./context-schemas.js";
+import { strictRfc3339EpochMilliseconds } from "./tools/census-validate.js";
 
 // Fixed entity keys for the per-tick context facts. Literal constants (not computed) so the T12
 // source scan in fact-families.test.js resolves every emitted fact_name.
@@ -69,7 +70,8 @@ export function observationInterval(envelope) {
   if (Number.isSafeInteger(stamped?.start_ms) && Number.isSafeInteger(stamped?.end_ms) && stamped.start_ms <= stamped.end_ms) {
     return { obsStartMs: stamped.start_ms, obsEndMs: stamped.end_ms };
   }
-  const endMs = Date.parse(envelope?.trace?.ts ?? "");
+  if (stamped !== undefined && stamped !== null) return { obsStartMs: undefined, obsEndMs: undefined };
+  const endMs = strictRfc3339EpochMilliseconds(envelope?.trace?.ts);
   const latency = envelope?.trace?.latency_ms;
   if (Number.isFinite(endMs) && typeof latency === "number" && Number.isFinite(latency) && latency >= 0) {
     return { obsStartMs: Math.max(0, Math.round(endMs - latency)), obsEndMs: Math.round(endMs) };

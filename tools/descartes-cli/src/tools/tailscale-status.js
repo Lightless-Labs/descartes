@@ -20,6 +20,7 @@ import { promisify } from "node:util";
 import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./binary-resolver.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
+import { finalizeCensus, isStrictRfc3339, validateCrossReferenceKeys } from "./census-validate.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,6 +29,7 @@ export const DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 export const MAX_TAILSCALE_PEER_ENTITY_LIMIT = 200;
 
 async function runFixedExecFile(command, args, options = {}) {
+  throwIfCollectorAborted(options.signal);
   return runResolvedExecFile(command, args, {
     ...options,
     timeout: options.timeout ?? 3000,
@@ -49,7 +51,7 @@ function isPermissionDenied(probe) {
 
 function parseLastHandshake(value) {
   if (value === "0001-01-01T00:00:00Z") return 0;
-  if (typeof value !== "string") return undefined;
+  if (!isStrictRfc3339(value)) return undefined;
   const epochMilliseconds = Date.parse(value);
   return Number.isFinite(epochMilliseconds) ? Math.floor(epochMilliseconds / 1000) : undefined;
 }
@@ -158,7 +160,12 @@ export function parseTailscaleStatusJson(stdout) {
   // malformed entry would turn an unreadable population into a false zero and could also make the
   // remaining entries falsely prove that no exit node is in use.
   const parsedPeers = peerEntries.map(([, peer]) => parsePeer(peer));
-  const peerMapValid = isPlainObject(parsed.Peer) && parsedPeers.every((peer) => peer !== undefined);
+  const peerKeys = peerEntries.map(([key]) => key);
+  const publicKeys = parsedPeers.map((peer) => peer?.node_public_key).filter((key) => key !== undefined);
+  const keyReference = validateCrossReferenceKeys(peerKeys, publicKeys);
+  const peerMapValid = isPlainObject(parsed.Peer)
+    && parsedPeers.every((peer) => peer !== undefined)
+    && keyReference.ok;
   const peerShapeValid = !Object.prototype.hasOwnProperty.call(parsed, "Peer") || peerMapValid;
   const peers = peerMapValid ? parsedPeers : [];
   const tailnetValid = validateTailnetFields(parsed);
@@ -167,6 +174,8 @@ export function parseTailscaleStatusJson(stdout) {
     backend_state: parsed.BackendState,
     peer_map_valid: peerMapValid,
     peer_shape_valid: peerShapeValid,
+    peer_key_reference_valid: keyReference.ok,
+    peer_key_reference_error: keyReference.ok ? undefined : keyReference.reason,
     peers,
     tailnet: parseTailnetState(parsed, peerMapValid, peers, tailnetValid),
     tailnet_valid: tailnetValid,
@@ -197,7 +206,8 @@ function resultForFailure(status, probe, extra = {}) {
  * the single-source collector convention.
  */
 export async function collectTailscaleStatusEvidence(options = {}) {
-  const cap = Math.min(MAX_TAILSCALE_PEER_ENTITY_LIMIT, Math.max(1, Number(options.peerLimit) || DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT));
+  const requestedCap = typeof options.peerLimit === "number" && Number.isSafeInteger(options.peerLimit) ? options.peerLimit : DEFAULT_TAILSCALE_PEER_ENTITY_LIMIT;
+  const cap = Math.min(MAX_TAILSCALE_PEER_ENTITY_LIMIT, Math.max(1, requestedCap));
 
   return timedEnvelope(async () => {
     const runExec = options.runFixedExecFile ?? runFixedExecFile;
@@ -253,13 +263,18 @@ export async function collectTailscaleStatusEvidence(options = {}) {
       return resultForFailure("unable", probe, { cap, backend_state: parsed.backend_state, tailnet: parsed.tailnet, error: "tailscale status JSON has no valid Peer map" });
     }
 
+    const census = finalizeCensus({
+      records: parsed.peers,
+      identity: (peer) => peer.node_public_key,
+      cap,
+    });
     return {
-      status: "ok",
+      status: census.status,
       backend_state: parsed.backend_state,
       tailnet: parsed.tailnet,
-      total_count: parsed.peers.length,
-      peers: parsed.peers.slice(0, cap),
-      truncated: parsed.peers.length > cap,
+      total_count: census.total_count,
+      peers: census.records,
+      truncated: census.truncated,
       cap,
       elevation_candidate: false,
       command: probe.command,
