@@ -329,3 +329,22 @@ test("C2 derived families: a wiped context_stats or tick_summary directory besid
     assert.equal(c2.stats.memory_lost, false);
   }
 });
+
+// C2 review L2: an interval whose host.daemon_gap fact was not written (C2 failed or off) is carried
+// into the next interval's accumulator, never silently dropped.
+test("C2 host.daemon_gap: an interval the C2 step could not record folds into the next record, never lost", async () => {
+  const gaps = async (overridesAt) => {
+    const paths = await tempPaths();
+    const { run } = harness(paths);
+    for (const [index, nowMs] of [T0, T0 + HOUR, T0 + 2 * HOUR].entries()) await run(nowMs, overridesAt[index] ?? {});
+    return (await readFactPoints(paths, { family: "host_lifecycle", now: new Date(T0 + 2 * HOUR).toISOString() })).points
+      .filter((p) => p.fact_name === "host.daemon_gap").map((p) => p.attributes);
+  };
+  const control = await gaps({});
+  const failed = await gaps({ 1: { prepareContextC2: async () => { throw new Error("transient c2 failure"); } } });
+  assert.equal(control.length, 3);
+  assert.equal(failed.length, 2, "tick 2 wrote no gap fact");
+  const observations = (attrs) => Number(attrs.observations);
+  assert.equal(observations(failed[1]), observations(control[1]) + observations(control[2]), "the unrecorded interval's observations are carried");
+  assert.equal(failed[1].max_gap_s, String(Math.max(Number(control[1].max_gap_s), Number(control[2].max_gap_s))));
+});

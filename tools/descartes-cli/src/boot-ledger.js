@@ -66,6 +66,29 @@ export function emptyDaemonGap(sinceMs) {
   return { since_ms: Number.isSafeInteger(sinceMs) ? sinceMs : null, max_gap_ms: 0, max_gap_uptime_ms: 0, uptime_known: true, wall_known: true, observations: 0, restarts: 0, boot_changed: false };
 }
 
+/**
+ * C2 review L2: two consecutive accumulators as one (the older interval's gap fact was never written,
+ * so it is carried into the next record rather than lost). Maxima and counts combine; a maximum is
+ * known only when both halves knew it.
+ */
+export function mergeDaemonGap(older, newer) {
+  const a = older && typeof older === "object" ? older : undefined;
+  const b = newer && typeof newer === "object" ? newer : undefined;
+  if (!a) return b;
+  if (!b) return a;
+  const int = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : 0);
+  return {
+    since_ms: Number.isSafeInteger(a.since_ms) ? a.since_ms : null,
+    max_gap_ms: Math.max(int(a.max_gap_ms), int(b.max_gap_ms)),
+    max_gap_uptime_ms: Math.max(int(a.max_gap_uptime_ms), int(b.max_gap_uptime_ms)),
+    uptime_known: a.uptime_known === true && b.uptime_known === true,
+    wall_known: a.wall_known === true && b.wall_known === true,
+    observations: int(a.observations) + int(b.observations),
+    restarts: int(a.restarts) + int(b.restarts),
+    boot_changed: a.boot_changed === true || b.boot_changed === true,
+  };
+}
+
 function foldDaemonGap(ledger, { gapMs, uptimeGapMs, restarted, bootChanged }) {
   const acc = ledger.daemon_gap && typeof ledger.daemon_gap === "object" ? ledger.daemon_gap : { ...emptyDaemonGap(null), wall_known: false, uptime_known: false };
   acc.observations = (Number.isSafeInteger(acc.observations) ? acc.observations : 0) + 1;

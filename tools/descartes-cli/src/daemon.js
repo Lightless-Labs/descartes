@@ -55,6 +55,7 @@ import {
   boundaryCensusGaps,
   currentDaemonInstance,
   emptyDaemonGap,
+  mergeDaemonGap,
   observeBootProbe,
   readBootLedger,
   suspendExposure,
@@ -1572,6 +1573,11 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
             && structuralFacts.families[family] !== undefined
             && structuralFacts.families[family].append_error === undefined;
           if (hostContext?.ledger) {
+            // C2 review L2: the interval's gap accumulator was reset for a host.daemon_gap fact that the
+            // C2 step did not produce (it failed or is off): carry it into the next interval instead.
+            if (contextC2Prepared === undefined && hostContext.facts?.daemonGap) {
+              hostContext.ledger.daemon_gap = mergeDaemonGap(hostContext.facts.daemonGap, hostContext.ledger.daemon_gap);
+            }
             if (familyPersisted("host_lifecycle")) {
               try {
                 await (options.writeBootLedger ?? writeBootLedger)(descartesPaths, hostContext.ledger);
