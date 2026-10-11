@@ -8,16 +8,11 @@ import { runResolvedExecFile } from "./binary-resolver.js";
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { finalizeCensus } from "./census-validate.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
+import { parseLinuxIpRouteLine } from "./linux-iproute-grammar.js";
 
 const execFileAsync = promisify(execFile);
 const DNS_LOOKUP_TARGET = "example.com";
-const ROUTE_KEYWORDS = new Set(["via", "dev", "proto", "scope", "src", "metric", "mtu", "advmss", "pref", "table", "realm", "onlink"]);
 const IPV4_RE = /^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
-const ROUTE_IFACE_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,14}$/;
-const ROUTE_PROTO_RE = /^[A-Za-z][A-Za-z0-9_.-]*$/;
-const ROUTE_SCOPE_RE = /^(?:global|link|host|[0-9]+)$/;
-const ROUTE_TABLE_RE = /^(?:local|main|default|all|[0-9]+)$/;
-const ROUTE_REALM_RE = /^(?:0x[0-9A-Fa-f]+|[A-Za-z0-9_.-]+)$/;
 
 function attachCensusMetadata(value, metadata) {
   for (const [key, entry] of Object.entries(metadata)) Object.defineProperty(value, key, { value: entry, enumerable: false });
@@ -96,50 +91,15 @@ export function parseLinuxDefaultRoutes(stdout) {
     const line = rawLine.trim();
     if (!line) continue;
     if (!line.startsWith("default")) { malformed_count += 1; continue; }
-    const parts = line.split(/\s+/);
-    let gateway;
-    let interfaceName;
-    let source;
-    let protocol;
-    let metricValue;
-    const seen = new Set();
-    let valid = parts[0] === "default";
-    for (let index = 1; valid && index < parts.length;) {
-      const token = parts[index];
-      if (!ROUTE_KEYWORDS.has(token) || seen.has(token)) { valid = false; break; }
-      seen.add(token);
-      if (token === "onlink") { index += 1; continue; }
-      const value = parts[index + 1];
-      if (value === undefined || ROUTE_KEYWORDS.has(value)) { valid = false; break; }
-      if (token === "via" && !IPV4_RE.test(value)) valid = false;
-      if (token === "dev" && !ROUTE_IFACE_RE.test(value)) valid = false;
-      if (token === "src" && !IPV4_RE.test(value)) valid = false;
-      if (token === "proto" && !ROUTE_PROTO_RE.test(value)) valid = false;
-      if (token === "scope" && !ROUTE_SCOPE_RE.test(value)) valid = false;
-      if (["metric", "mtu", "advmss"].includes(token) && !/^\d+$/.test(value)) valid = false;
-      if (token === "pref" && !/^(?:low|medium|high)$/.test(value)) valid = false;
-      if (token === "table" && !ROUTE_TABLE_RE.test(value)) valid = false;
-      if (token === "realm" && !ROUTE_REALM_RE.test(value)) valid = false;
-      if (valid) {
-        if (token === "via") gateway = value;
-        if (token === "dev") interfaceName = value;
-        if (token === "src") source = value;
-        if (token === "proto") protocol = value;
-        if (token === "metric") {
-          metricValue = Number(value);
-          if (!Number.isSafeInteger(metricValue)) valid = false;
-        }
-      }
-      index += 2;
-    }
-    if (!valid || !interfaceName) { malformed_count += 1; continue; }
+    const parsed = parseLinuxIpRouteLine(line);
+    if (!parsed?.interfaceName) { malformed_count += 1; continue; }
     routes.push({
       destination: "default",
-      gateway,
-      interface: interfaceName,
-      source,
-      protocol,
-      metric: metricValue,
+      gateway: parsed.gateway,
+      interface: parsed.interfaceName,
+      source: parsed.source,
+      protocol: parsed.protocol,
+      metric: parsed.metric,
       raw: line,
     });
   }

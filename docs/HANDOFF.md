@@ -2,6 +2,22 @@
 
 **Last updated:** 2026-10-11
 
+## Linux iproute2 route and inet6 grammar completion — 2026-10-11 — local, not pushed
+
+Added TDD coverage and a shared strict Linux iproute2 route grammar. The route parsers now accept
+the formatter-emitted standalone route flags (`dead`, `onlink`, `pervasive`, `offload`, `trap`,
+`notify`, `linkdown`, `unresolved`, `rt_offload`, `rt_trap`, and `rt_offload_failed`) plus the
+simple key/value attributes emitted by `print_route`, while rejecting unknown tokens, duplicates,
+missing values, and trailing junk. Linux inet6 lines now accept `metric N` before `scope`, the
+named and numeric address protocols, all existing IFA flags, residual `flags HEX`, and formatter
+scope names with bounded numeric values. Required real-shape fixtures are covered.
+
+Focused network, net-config, and census-validation verification passes **51/51**. Fresh-XDG full
+`npm test` completed with **2,623 total: 2,560 passed, 22 failed, 35 skipped, 6 todo**. The 22
+failures are environment-only: 17 notifier-reuse and 3 tap-bump tests cannot bind `127.0.0.1`
+(`listen EPERM`), and 2 live-process provenance checks return `unknown` under restricted process
+introspection. No changed-area product test failed. No push or merge.
+
 ## Context facts C2 re-gate follow-up — 2026-10-11 — local, not pushed
 
 On `feat/context-facts-c2-2026-10`, closed the remaining HIGH/MEDIUM findings in six atomic

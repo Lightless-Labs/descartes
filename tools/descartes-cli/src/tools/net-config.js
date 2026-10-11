@@ -28,6 +28,7 @@ import { isBinaryNotFound, isBinaryUntrusted, runResolvedExecFile } from "./bina
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { finalizeCensus } from "./census-validate.js";
 import { throwIfCollectorAborted } from "./collector-abort.js";
+import { parseLinuxIpRouteLine } from "./linux-iproute-grammar.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -43,6 +44,7 @@ const LINUX_INET6_FLAGS = new Set([
   "autoconf",
 ]);
 const LINUX_INET6_PROTOCOLS = new Set(["unspec", "ra", "kernel_lo", "kernel_ra", "kernel_ll"]);
+const LINUX_INET6_SCOPES = new Set(["global", "link", "host", "site", "nowhere"]);
 
 async function defaultRunFixedExecFile(command, args, options = {}) {
   throwIfCollectorAborted(options.signal);
@@ -101,29 +103,9 @@ export function parseIpRouteDefault(stdout) {
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    const tokens = line.split(/\s+/);
-    if (tokens[0] !== "default") return undefined;
-    let dev;
-    let via;
-    for (let index = 1; index < tokens.length; index += 1) {
-      const token = tokens[index];
-      const value = tokens[index + 1];
-      if (["via", "dev", "proto", "scope", "src", "metric", "mtu", "advmss", "pref", "table", "realm", "onlink"].includes(token)) {
-        if (token === "onlink") continue;
-        if (!value || ["via", "dev", "proto", "scope", "src", "metric", "mtu", "advmss", "pref", "table", "realm", "onlink"].includes(value)) return undefined;
-        if (token === "via" && !IPV4_RE.test(value)) return undefined;
-        if (token === "dev" && !IFACE_RE.test(value)) return undefined;
-        if (["metric", "mtu", "advmss", "pref", "table"].includes(token) && !/^[0-9]+$/.test(value)) return undefined;
-        if (token === "src" && !IPV4_RE.test(value)) return undefined;
-        if (token === "via") via = value;
-        if (token === "dev") dev = value;
-        index += 1;
-        continue;
-      }
-      return undefined;
-    }
-    if (!dev) return undefined;
-    routes.push({ gateway: via, iface: dev });
+    const parsed = parseLinuxIpRouteLine(line);
+    if (!parsed?.interfaceName) return undefined;
+    routes.push({ gateway: parsed.gateway, iface: parsed.interfaceName });
   }
   Object.defineProperty(routes, "duplicate_count", {
     value: finalizeCensus({ records: routes, identity: (route) => JSON.stringify([route.gateway, route.iface]) }).duplicate_count,
@@ -224,14 +206,30 @@ export function parseLinuxRouterAdvertisementPrefixes(stdout) {
     if (!line) continue;
     if (/^\d+:\s+[A-Za-z][A-Za-z0-9_.-]*(?:@[A-Za-z][A-Za-z0-9_.-]*)?:\s+<[^>]+>\s+mtu\s+\d+(?:\s+qdisc\s+\S+)?(?:\s+state\s+\S+)?(?:\s+group\s+\S+)?(?:\s+qlen\s+\d+)?$/.test(line)) continue;
     if (/^(?:valid_lft|preferred_lft)\s+(?:forever|\d+(?:sec)?)(?:\s+preferred_lft\s+(?:forever|\d+(?:sec)?))?$/.test(line)) continue;
-    const match = /^(?:(?:\d+):\s+[A-Za-z][A-Za-z0-9_.-]*(?:@[A-Za-z][A-Za-z0-9_.-]*)?:\s+)?inet6\s+([^\s/]+)\/(\d+)\s+scope\s+(global|link|host)(?:\s+(.*))?$/.exec(line);
+    const match = /^(?:(?:\d+):\s+[A-Za-z][A-Za-z0-9_.-]*(?:@[A-Za-z][A-Za-z0-9_.-]*)?:\s+)?inet6\s+([^\s/]+)\/(\d+)(?:\s+metric\s+(\d+))?\s+scope\s+([^\s]+)(?:\s+(.*))?$/.exec(line);
     if (!match) return { state: "partial", prefixes: [] };
-    const [, address, lengthText, _scope, flags = ""] = match;
+    const [, address, lengthText, metricText, scope, flags = ""] = match;
+    if ((!LINUX_INET6_SCOPES.has(scope) && !/^\d+$/.test(scope))
+      || (/^\d+$/.test(scope) && Number(scope) > 255)
+      || (metricText !== undefined && (!Number.isSafeInteger(Number(metricText)) || Number(metricText) > 0xffffffff))) {
+      return { state: "partial", prefixes: [] };
+    }
     const flagTokens = flags ? flags.split(/\s+/) : [];
+    let seenProto = false;
     for (let index = 0; index < flagTokens.length; index += 1) {
       if (flagTokens[index] === "proto") {
+        if (seenProto) return { state: "partial", prefixes: [] };
         const proto = flagTokens[index + 1];
-        if (proto === undefined || (!LINUX_INET6_PROTOCOLS.has(proto) && !/^\d+$/.test(proto))) return { state: "partial", prefixes: [] };
+        if (proto === undefined || (!LINUX_INET6_PROTOCOLS.has(proto) && !/^(?:\d+|0x[0-9A-Fa-f]+)$/.test(proto))) return { state: "partial", prefixes: [] };
+        const numericProto = /^\d+$/.test(proto) ? Number(proto) : /^0x/.test(proto) ? Number.parseInt(proto, 16) : undefined;
+        if (numericProto !== undefined && (!Number.isSafeInteger(numericProto) || numericProto > 255)) return { state: "partial", prefixes: [] };
+        seenProto = true;
+        index += 1;
+        continue;
+      }
+      if (flagTokens[index] === "flags") {
+        const rawFlags = flagTokens[index + 1];
+        if (rawFlags === undefined || !/^[0-9A-Fa-f]{1,8}$/.test(rawFlags) || Number.parseInt(rawFlags, 16) > 0xffffffff) return { state: "partial", prefixes: [] };
         index += 1;
         continue;
       }
