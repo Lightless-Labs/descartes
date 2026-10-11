@@ -4,9 +4,10 @@ const LAST_PSEUDO_USER_RE = /^(reboot|shutdown)$/i;
 
 /** Shared bounded `last` parser used by both peer and login collectors. */
 export function parseLastRows(stdout) {
+  if (typeof stdout !== "string") return { rows: [], malformed: 1 };
   const rows = [];
   let malformed = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line || /^wtmp(x)? begins/i.test(line)) continue;
     const tokens = line.split(/\s+/);

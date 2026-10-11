@@ -91,6 +91,19 @@ test("parseWhoOutput on empty stdout yields zero entries", () => {
   assert.deepEqual(parseWhoOutput(""), { entries: [] });
 });
 
+test("B1 daybreak reproduction: who with one valid row plus MALFORMED is partial, never a complete census", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["who"])]: ok("alice pts/0 2026-10-11 12:00 (203.0.113.5)\nMALFORMED\n"),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_who.status, "partial");
+  assert.equal(envelope.status, "warning");
+  assert.equal(envelope.result.sources.ssh_who.malformed_count, 1);
+  assert.equal(envelope.result.peers.length, 1);
+});
+
 // ---------------------------------------------------------------------------------------------
 // parseLastOutput — per-platform hostname fixtures (must-fix 7)
 // ---------------------------------------------------------------------------------------------
@@ -139,6 +152,17 @@ test("parseLastOutput on empty stdout yields zero entries, zero malformed", () =
   assert.deepEqual(parseLastOutput(""), { entries: [], malformed_count: 0 });
 });
 
+test("B1: a malformed last row makes ssh_last partial even when valid history remains", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["last", "-n", String(DEFAULT_LAST_HISTORY_LIMIT)])]: ok("alice pts/0 host.example Sun Oct 11 12:00 still logged in\nBROKEN\n"),
+    })),
+  });
+  assert.equal(envelope.result.sources.ssh_last.status, "partial");
+  assert.equal(envelope.result.sources.ssh_last.malformed_count, 1);
+});
+
 // ---------------------------------------------------------------------------------------------
 // WireGuard parsers
 // ---------------------------------------------------------------------------------------------
@@ -166,6 +190,21 @@ test("parseWgEndpoints maps pubkey -> endpoint, treating '(none)' as no endpoint
 test("parseWgHandshakes maps pubkey -> epoch seconds, 0 means never handshaked", () => {
   const stdout = "keyA\t1720000000\nkeyB\t0\n";
   assert.deepEqual(parseWgHandshakes(stdout), { keyA: 1720000000, keyB: 0 });
+});
+
+test("B1: WireGuard malformed rows are partial and never coerced into peers", async () => {
+  const envelope = await collectVpnPeerStatusEvidence({
+    platform: "linux",
+    runFixedExecFile: scriptedExec(baseScript({
+      [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0\n"),
+      [JSON.stringify(["wg", "show", "wg0", "peers"])]: ok("keyA\nMALFORMED ROW\n"),
+      [JSON.stringify(["wg", "show", "wg0", "endpoints"])]: ok("keyA\t203.0.113.10:51820\n"),
+      [JSON.stringify(["wg", "show", "wg0", "latest-handshakes"])]: ok("keyA\t1720000000\n"),
+    })),
+  });
+  assert.equal(envelope.result.sources.wireguard.status, "partial");
+  assert.deepEqual(envelope.result.sources.wireguard.interfaces, [{ name: "wg0", status: "partial" }]);
+  assert.equal(envelope.result.peers.some((peer) => peer.source_type === "wireguard"), false);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -455,6 +494,24 @@ test("permission-denied on a per-interface wg subcommand -> that interface is 'm
   const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", runFixedExecFile });
   assert.equal(envelope.result.sources.wireguard.status, "partial");
   assert.deepEqual(envelope.result.sources.wireguard.interfaces, [{ name: "wg0", status: "missing_permission", error: "boom" }]);
+});
+
+test("MEDIUM: aborting during wg0 prevents every later wg subprocess launch", async () => {
+  const controller = new AbortController();
+  const calls = [];
+  const script = baseScript({
+    [JSON.stringify(["wg", "show", "interfaces"])]: ok("wg0 wg1\n"),
+    [JSON.stringify(["wg", "show", "wg0", "peers"])]: () => {
+      controller.abort();
+      return ok("keyA\n");
+    },
+  });
+  const envelope = await collectVpnPeerStatusEvidence({ platform: "linux", signal: controller.signal, runFixedExecFile: scriptedExec(script, calls) });
+  assert.equal(envelope.status, "unable");
+  assert.deepEqual(calls.filter(([command]) => command === "wg"), [
+    ["wg", "show", "interfaces"],
+    ["wg", "show", "wg0", "peers"],
+  ]);
 });
 
 test("permission-denied on who/last -> missing_permission, never fabricated as zero", async () => {

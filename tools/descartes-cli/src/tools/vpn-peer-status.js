@@ -37,6 +37,7 @@ import { binaryProvenance, isBinaryNotFound, isBinaryUntrusted, runResolvedExecF
 import { evidenceEnvelope, timedEnvelope } from "./envelope.js";
 import { isLastDateStart, isLocalLoginHost } from "./login-origin.js";
 import { readSharedLastHistory } from "./last-history.js";
+import { throwIfCollectorAborted } from "./collector-abort.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -94,25 +95,28 @@ function isPermissionDenied(probe) {
 const WHO_LINE_RE = /^(\S+)\s+(\S+)\s+[^(]*?(?:\((.+)\))?\s*$/;
 
 export function parseWhoOutput(stdout) {
+  if (typeof stdout !== "string") return { entries: [], malformed_count: 1 };
   const entries = [];
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  let malformed_count = 0;
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     const match = line.match(WHO_LINE_RE);
-    if (!match) continue; // unparseable line -- skipped, never fabricated into a partial entry
+    if (!match) { malformed_count += 1; continue; }
     const [, user, tty, host] = match;
     const remoteHost = host && !isLocalLoginHost(host, tty) ? host : undefined;
     entries.push({ remote_user: user, remote_host: remoteHost });
   }
-  return { entries };
+  return malformed_count > 0 ? { entries, malformed_count } : { entries };
 }
 
 async function collectSshWho(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("who", [], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (probe.status === "ok") {
-    const { entries } = parseWhoOutput(probe.stdout);
-    return { status: "ok", entries, command: probe.command, binary: probe.binary };
+    const parsed = parseWhoOutput(probe.stdout);
+    return { status: parsed.malformed_count > 0 ? "partial" : "ok", entries: parsed.entries, malformed_count: parsed.malformed_count ?? 0, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], command: probe.command, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], error: probe.error, command: probe.command, binary: probe.binary };
@@ -144,9 +148,10 @@ const LAST_LOCAL_HOST_RE = /^(-|:0(\.0)?|console)$/i;
  * whatever `last` already printed (truncated or not) is what gets captured.
  */
 export function parseLastOutput(stdout) {
+  if (typeof stdout !== "string") return { entries: [], malformed_count: 1 };
   const entries = [];
   let malformedCount = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line || LAST_TRAILER_RE.test(line)) continue;
     const tokens = line.split(/\s+/);
@@ -168,6 +173,7 @@ export function parseLastOutput(stdout) {
 async function collectSshLast(options) {
   const n = Math.max(1, Number(options.lastHistoryLimit) || DEFAULT_LAST_HISTORY_LIMIT);
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
+  throwIfCollectorAborted(options.signal);
   const shared = await readSharedLastHistory(options, runExec, probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }), n);
   const probe = shared.probe;
   if (probe.status === "ok") {
@@ -175,7 +181,7 @@ async function collectSshLast(options) {
       .filter((row) => row.host && !isLocalLoginHost(row.host, row.tty))
       .map((row) => ({ remote_user: row.user, remote_host: row.host }));
     const malformed_count = shared.malformed;
-    return { status: "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
+    return { status: malformed_count > 0 ? "partial" : "ok", entries, malformed_count, requested_n: n, command: probe.command, binary: probe.binary };
   }
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", entries: [], requested_n: n, command: probe.command, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", entries: [], requested_n: n, error: probe.error, command: probe.command, binary: probe.binary };
@@ -207,49 +213,80 @@ async function collectSshLast(options) {
 // ---------------------------------------------------------------------------------------------
 
 async function wgShowInterfaces(runExec, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", "interfaces"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowPeers(runExec, iface, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", iface, "peers"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowEndpoints(runExec, iface, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", iface, "endpoints"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 async function wgShowLatestHandshakes(runExec, iface, options) {
+  throwIfCollectorAborted(options.signal);
   return runExec("wg", ["show", iface, "latest-handshakes"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
 }
 
+function withMalformedCount(value, malformed_count) {
+  Object.defineProperty(value, "malformed_count", { value: malformed_count, enumerable: false });
+  return value;
+}
+
 export function parseWgInterfaceList(stdout) {
-  return String(stdout ?? "").split(/\s+/).map((s) => s.trim()).filter(Boolean);
+  if (typeof stdout !== "string") return withMalformedCount([], 1);
+  const values = [];
+  let malformed = 0;
+  for (const token of stdout.trim() ? stdout.trim().split(/\s+/) : []) {
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(token)) malformed += 1;
+    else values.push(token);
+  }
+  return withMalformedCount(values, malformed);
 }
 
 export function parseWgPeerList(stdout) {
-  return String(stdout ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  if (typeof stdout !== "string") return withMalformedCount([], 1);
+  const values = [];
+  let malformed = 0;
+  for (const rawLine of stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/\s/.test(line)) malformed += 1;
+    else values.push(line);
+  }
+  return withMalformedCount(values, malformed);
 }
 
 export function parseWgEndpoints(stdout) {
+  if (typeof stdout !== "string") return withMalformedCount({}, 1);
   const map = {};
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  let malformed = 0;
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    const [pubkey, endpoint] = line.split("\t");
-    if (!pubkey) continue;
+    const fields = line.split("\t");
+    if (fields.length !== 2 || !fields[0] || !fields[1]) { malformed += 1; continue; }
+    const [pubkey, endpoint] = fields;
     map[pubkey] = endpoint && endpoint !== "(none)" ? endpoint : undefined;
   }
-  return map;
+  return withMalformedCount(map, malformed);
 }
 
 export function parseWgHandshakes(stdout) {
+  if (typeof stdout !== "string") return withMalformedCount({}, 1);
   const map = {};
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  let malformed = 0;
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    const [pubkey, epochText] = line.split("\t");
-    if (!pubkey) continue;
-    const epoch = Number(epochText);
-    map[pubkey] = Number.isFinite(epoch) ? epoch : undefined;
+    const fields = line.split("\t");
+    if (fields.length !== 2 || !fields[0] || !/^[0-9]+$/.test(fields[1])) { malformed += 1; continue; }
+    const epoch = Number(fields[1]);
+    if (!Number.isSafeInteger(epoch)) { malformed += 1; continue; }
+    map[fields[0]] = epoch;
   }
-  return map;
+  return withMalformedCount(map, malformed);
 }
 
 async function collectWireguardPeers(options) {
@@ -275,17 +312,26 @@ async function collectWireguardPeers(options) {
   }
 
   const allInterfaceNames = parseWgInterfaceList(listProbe.stdout);
+  if (allInterfaceNames.malformed_count > 0) {
+    return {
+      status: "partial",
+      interfaces: allInterfaceNames.map((name) => ({ name, status: "ok" })),
+      peers: [],
+      elevation_candidate: false,
+      malformed_count: allInterfaceNames.malformed_count,
+      binary: listProbe.binary,
+    };
+  }
   const interfaceNames = allInterfaceNames.slice(0, MAX_WG_INTERFACES);
   const interfaceStatuses = [];
   const peers = [];
   let anyElevationCandidate = false;
 
   for (const iface of interfaceNames) {
-    const [peersProbe, endpointsProbe, handshakesProbe] = await Promise.all([
-      wgShowPeers(runExec, iface, options),
-      wgShowEndpoints(runExec, iface, options),
-      wgShowLatestHandshakes(runExec, iface, options),
-    ]);
+    throwIfCollectorAborted(options.signal);
+    const peersProbe = await wgShowPeers(runExec, iface, options);
+    const endpointsProbe = await wgShowEndpoints(runExec, iface, options);
+    const handshakesProbe = await wgShowLatestHandshakes(runExec, iface, options);
 
     const degraded = [peersProbe, endpointsProbe, handshakesProbe].find((probe) => probe.status !== "ok");
     if (degraded) {
@@ -298,6 +344,10 @@ async function collectWireguardPeers(options) {
     const pubkeys = parseWgPeerList(peersProbe.stdout);
     const endpoints = parseWgEndpoints(endpointsProbe.stdout);
     const handshakes = parseWgHandshakes(handshakesProbe.stdout);
+    if (pubkeys.malformed_count > 0 || endpoints.malformed_count > 0 || handshakes.malformed_count > 0) {
+      interfaceStatuses.push({ name: iface, status: "partial" });
+      continue;
+    }
 
     for (const pubkey of pubkeys) {
       peers.push({
@@ -347,9 +397,10 @@ const VPN_SERVICE_TYPE_RE = /^(?:VPN:.*|IPSec|PPP:L2TP)$/i;
 const TAILSCALE_SERVICE_TYPE_IDS = new Set(["io.tailscale.ipn.macos", "io.tailscale.ipn.macsys"]);
 
 export function parseScutilNcListDetailed(stdout) {
+  if (typeof stdout !== "string") return { services: [], unparsed_count: 1 };
   const services = [];
   let unparsed_count = 0;
-  for (const rawLine of String(stdout ?? "").split("\n")) {
+  for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     if (SCUTIL_NC_HEADER_RE.test(line)) continue;
@@ -381,6 +432,7 @@ async function collectVpnServices(options) {
   if (platform !== "darwin") return { status: "not_applicable", services: [] };
 
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("scutil", ["--nc", "list"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", services: [], binary: probe.binary };
   if (probe.status !== "ok") {
@@ -410,19 +462,23 @@ async function collectEstablishedInbound(options) {
   const runExec = options.runFixedExecFile ?? runFixedExecFile;
 
   if (platform === "linux") {
+    throwIfCollectorAborted(options.signal);
     const probe = await runExec("ss", ["-H", "-tn", "state", "established"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
     if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
     if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
     if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
-    const lines = String(probe.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+    if (typeof probe.stdout !== "string") return { status: "unable", count: 0, error: "non_string_output", binary: probe.binary };
+    const lines = probe.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
     return { status: "ok", count: lines.length, binary: probe.binary };
   }
 
+  throwIfCollectorAborted(options.signal);
   const probe = await runExec("netstat", ["-an", "-p", "tcp"], probeOptions(options, { timeout: options.timeout, maxBuffer: options.maxBuffer }));
   if (isBinaryNotFound(probe)) return { status: "not_found_on_known_paths", count: 0, binary: probe.binary };
   if (isBinaryUntrusted(probe)) return { status: "untrusted_binary", count: 0, error: probe.error, binary: probe.binary };
   if (probe.status !== "ok") return { status: "unable", count: 0, error: probe.error, binary: probe.binary };
-  const count = String(probe.stdout ?? "").split("\n").filter((line) => /established/i.test(line)).length;
+  if (typeof probe.stdout !== "string") return { status: "unable", count: 0, error: "non_string_output", binary: probe.binary };
+  const count = probe.stdout.split("\n").filter((line) => /established/i.test(line)).length;
   return { status: "ok", count, binary: probe.binary };
 }
 
@@ -488,8 +544,8 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
     return {
       platform,
       sources: {
-        ssh_who: { status: who.status, error: who.error, binary_provenance: binaryProvenance(who.binary) },
-        ssh_last: { status: last.status, error: last.error, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
+        ssh_who: { status: who.status, error: who.error, malformed_count: who.malformed_count ?? 0, binary_provenance: binaryProvenance(who.binary) },
+        ssh_last: { status: last.status, error: last.error, malformed_count: last.malformed_count ?? 0, requested_n: last.requested_n, binary_provenance: binaryProvenance(last.binary) },
         wireguard: {
           status: wireguard.status,
           error: wireguard.error,
@@ -497,6 +553,7 @@ export async function collectVpnPeerStatusEvidence(options = {}) {
           interfaces: wireguard.interfaces ?? [],
           interfaces_truncated: wireguard.interfaces_truncated ?? false,
           total_interface_count: wireguard.total_interface_count ?? (wireguard.interfaces?.length ?? 0),
+          malformed_count: wireguard.malformed_count ?? 0,
           binary_provenance: binaryProvenance(wireguard.binary),
         },
         vpn_services: {

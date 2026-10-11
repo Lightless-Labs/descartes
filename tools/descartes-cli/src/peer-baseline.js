@@ -72,11 +72,9 @@ function availabilitySignatureHasIncompleteSource(signature) {
   if (signature === undefined) return false;
   const codes = typeof signature === "string" ? signature.split(":")[1]?.split("-") : undefined;
   if (!Array.isArray(codes) || codes.length !== 5) return true;
-  // The VPN-services census is the source whose incomplete service inventory changes the
-  // identity/count universe used by these rules. Other source slots retain their existing
-  // regime behavior (for example a WireGuard permission gap is already represented by its own
-  // source status and does not make a VPN-services census incomplete).
-  return !COMPLETE_PEER_SOURCE_STATUSES.has(codes[3]);
+  // Every source slot is evidence for the same tick. A partial/unknown slot means the population
+  // was filtered or incomplete somewhere, so neither folding nor evaluation may use this tick.
+  return codes.some((code) => !COMPLETE_PEER_SOURCE_STATUSES.has(code));
 }
 
 // PROVISIONAL (mirrors session-baseline.js's own must-fix-7 constants) — placeholder defaults

@@ -26,6 +26,7 @@ import {
   computeWindowedPeerDropStats,
   computeWindowedPeerStats,
   groupPeerFactsByTick,
+  tickGroupDisposition,
   loadPeerBaselineStore,
   normalizePeerBaselineState,
   resolvePeerBaselineStorePaths,
@@ -450,6 +451,14 @@ test("groupPeerFactsByTick: a marker-bearing tick-group surfaces availabilitySig
   assert.equal(groups[0].availabilitySignature, "v1:ok-ok-partial-ok-ok");
 });
 
+test("B1 daybreak reproduction: a who partial in the v2 marker makes the whole tick incomplete", () => {
+  const groups = groupPeerFactsByTick(activeTickWithMarker(tickTs(0), 1, "v2:partial-ok-ok-ok-ok"));
+  assert.equal(tickGroupDisposition(groups[0]), "unknown");
+  const windowed = computeWindowedPeerStats(groups, { minSampleCount: 1 });
+  assert.equal(windowed.confidence_state, "provisional");
+  assert.equal(windowed.last_observation, undefined);
+});
+
 test("groupPeerFactsByTick: a marker-less legacy tick-group still produces availabilitySignature: undefined (backward-compat pin)", () => {
   const groups = groupPeerFactsByTick(activeTick(tickTs(0), 3));
   assert.equal(groups.length, 1);
@@ -808,7 +817,7 @@ test("30 missing_permission vpn_services ticks never establish or cover peer cou
 });
 
 test("computeWindowedPeerStats regime-keyed fold: confidence_state resets to 'provisional' immediately on a regime flip, even though the OLD regime was already 'established'", () => {
-  const degradedSignature = "v1:ok-ok-missing_permission-ok-ok";
+  const degradedSignature = "v2:ok-ok-ok-absent-ok";
   const preFlipTicks = [];
   for (let i = 0; i < 30; i += 1) preFlipTicks.push(...activeTickWithMarker(tickTs(i), 1, degradedSignature));
   const preFlipGroups = groupPeerFactsByTick(preFlipTicks);
