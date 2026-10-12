@@ -53,7 +53,7 @@ test("first run over an existing store writes genesis and invents no activation"
   assert.equal(report.status, "ok");
   const log = await readAlertTransitions(paths);
   assert.equal(log.status, "valid");
-  assert.deepEqual(kinds(log.records), ["genesis"]);
+  assert.deepEqual(kinds(log.records), ["genesis", "projection"], "genesis, then the chained digest of the recorded projection (review L6)");
   assert.equal(log.records[0].active_alerts, 1);
   assert.equal(log.coverage_from_ts, t(1));
 });
@@ -249,6 +249,39 @@ test("a truncated log tail (state ahead of the log) rebaselines as log_truncated
   const report = await recordAlertTransitions(paths, { now: t(3) });
   assert.equal(report.rebaselined, "log_truncated");
   const log = await readAlertTransitions(paths);
-  assert.equal(log.records.at(-1).kind, "rebaselined");
+  assert.ok(log.records.some((record) => record.kind === "rebaselined" && record.reason === "log_truncated"));
   assert.equal(log.coverage_from_ts, t(3));
+});
+
+// Adversarial review L6 (second half): the projection in alert-transitions.state.json is bound to the
+// chain by a chained `projection` digest, so editing it is a visible rebaseline, never fabricated or
+// omitted transitions under an "exact" fired_count.
+test("an edited projection in the state file rebaselines as projection_mismatch; no transition is fabricated", async () => {
+  const paths = await tempPaths();
+  const { stateFile } = resolveAlertTransitionPaths(paths);
+  await recordAlertTransitions(paths, { now: t(0) });
+  await tick(paths, [candidate()], 1);
+  const state = JSON.parse(await fs.readFile(stateFile, "utf8"));
+  state.projection.alerts[ID].status = "recovered";
+  await fs.writeFile(stateFile, JSON.stringify(state));
+  const report = await recordAlertTransitions(paths, { now: t(2) });
+  assert.equal(report.rebaselined, "projection_mismatch");
+  const log = await readAlertTransitions(paths);
+  assert.equal(log.records.filter((record) => record.kind === "activated").length, 1, "the edit fabricated no activation");
+  assert.equal(log.coverage_from_ts, t(2));
+  const steady = await recordAlertTransitions(paths, { now: t(3) });
+  assert.equal(steady.rebaselined, null);
+  assert.equal(steady.appended, 0, "an unchanged projection appends nothing");
+});
+
+test("the projection binding survives a crash between the log append and the state write", async () => {
+  const paths = await tempPaths();
+  const { stateFile } = resolveAlertTransitionPaths(paths);
+  await recordAlertTransitions(paths, { now: t(0) });
+  await tick(paths, [candidate()], 1);
+  const stale = await fs.readFile(stateFile, "utf8");
+  await tick(paths, [], 2);
+  await fs.writeFile(stateFile, stale);
+  const report = await recordAlertTransitions(paths, { now: t(3) });
+  assert.equal(report.rebaselined, null);
 });

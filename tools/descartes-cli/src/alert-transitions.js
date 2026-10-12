@@ -16,11 +16,12 @@
 // alerts that were already active), `rebaselined` (the projection could not be continued) and
 // `chain_restart` (a broken or deleted log; the broken file is kept aside) mark points before which
 // counts are lower bounds. Compaction keeps a cut header at the head of the file.
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeAlertRecord, readAlertRecords } from "./alert-store.js";
 import { EDGE_REARM_RULE_IDS } from "./alert-stream-kinds.js";
-import { appendLines, atomicWrite, GENESIS_PREV_HASH, readJsonlStrict, sealRecord, trimTornTail, verifyChain } from "./hash-chain.js";
+import { appendLines, atomicWrite, canonicalJson, GENESIS_PREV_HASH, readJsonlStrict, sealRecord, trimTornTail, verifyChain } from "./hash-chain.js";
 
 export const ALERT_TRANSITION_DOMAIN = "descartes.alert_transition.v1";
 export const ALERT_TRANSITIONS_SCHEMA_VERSION = 1;
@@ -198,6 +199,21 @@ export function foldTransitionRecords(projection, records) {
   return { v: ALERT_TRANSITIONS_SCHEMA_VERSION, alerts };
 }
 
+// Review L6: the projection the state file holds is bound to the chain. Whenever the recorded
+// projection changes, the daemon appends a `projection` record carrying its digest; the projection
+// is trusted only if it matches the last chained digest at its stamp (else: a visible rebaseline).
+export function projectionDigest(projection) {
+  return crypto.createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(projection?.alerts ?? {})))).digest("hex");
+}
+
+function lastProjectionDigest(log, uptoSeq) {
+  for (let index = (log.records ?? []).length - 1; index >= 0; index -= 1) {
+    const record = log.records[index];
+    if (record.seq <= uptoSeq && record.kind === "projection" && typeof record.digest === "string") return record.digest;
+  }
+  return typeof log.header?.projection_digest === "string" && log.header.through_seq <= uptoSeq ? log.header.projection_digest : null;
+}
+
 // ------------------------------------------------------------------------------------------------
 // Witness (review M3, M1)
 // ------------------------------------------------------------------------------------------------
@@ -342,7 +358,8 @@ async function compactIfNeeded(logFile, maxBytes, nowMs) {
   const cutRecord = records[firstKeptIndex - 1];
   // The dropped records' witness rides in the header (review M3).
   const carriedWitness = pruneTransitionWitness(foldTransitionWitness(chain.header?.carried_witness, records.slice(0, firstKeptIndex)), nowMs);
-  const header = { kind: "compacted", through_seq: cutRecord.seq, through_hash: cutRecord.hash, through_ts: cutRecord.ts, v: ALERT_TRANSITIONS_SCHEMA_VERSION, carried_witness: carriedWitness };
+  const projectionAtCut = lastProjectionDigest({ records: records.slice(0, firstKeptIndex), header: chain.header }, cutRecord.seq);
+  const header = { kind: "compacted", through_seq: cutRecord.seq, through_hash: cutRecord.hash, through_ts: cutRecord.ts, v: ALERT_TRANSITIONS_SCHEMA_VERSION, carried_witness: carriedWitness, ...(projectionAtCut ? { projection_digest: projectionAtCut } : {}) };
   await atomicWrite(logFile, [header, ...kept].map((record) => `${JSON.stringify(record)}\n`).join(""));
   return true;
 }
@@ -405,22 +422,35 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
       projection = projectAlerts(alerts);
       log = { status: "missing", head_seq: 0, head_hash: GENESIS_PREV_HASH, records: [] };
     }
-  } else if (stateRead.status === "valid" && stateRead.state.head_seq === log.head_seq && stateRead.state.head_hash === log.head_hash) {
-    projection = stateRead.state.projection;
-  } else if (stateRead.status === "valid" && stateRead.state.head_seq < log.head_seq
-    && log.records.some((record) => record.seq === stateRead.state.head_seq && record.hash === stateRead.state.head_hash)) {
-    projection = foldTransitionRecords(stateRead.state.projection, log.records.filter((record) => record.seq > stateRead.state.head_seq));
   } else {
-    // Review L6: a state stamped past the log's head means the log lost its tail: a truncation.
-    const reason = stateRead.status !== "valid" ? `state_${stateRead.status}` : (stateRead.state.head_seq > log.head_seq ? "log_truncated" : "state_mismatch");
-    leading.push({ ts: now, kind: "rebaselined", reason });
-    report.rebaselined = reason;
-    projection = projectAlerts(alerts);
+    const stamped = stateRead.status === "valid" && (
+      (stateRead.state.head_seq === log.head_seq && stateRead.state.head_hash === log.head_hash)
+      || (stateRead.state.head_seq < log.head_seq && log.records.some((record) => record.seq === stateRead.state.head_seq && record.hash === stateRead.state.head_hash)));
+    const chainedDigest = stamped ? lastProjectionDigest(log, stateRead.state.head_seq) : null;
+    const projectionBound = stamped && (chainedDigest === null || chainedDigest === projectionDigest(stateRead.state.projection));
+    if (projectionBound && stateRead.state.head_seq === log.head_seq) {
+      projection = stateRead.state.projection;
+    } else if (projectionBound) {
+      projection = foldTransitionRecords(stateRead.state.projection, log.records.filter((record) => record.seq > stateRead.state.head_seq));
+    } else {
+      // Review L6: a state stamped past the log's head means the log lost its tail (a truncation); a
+      // stamped state whose projection is not the chained one was edited.
+      const reason = stateRead.status !== "valid" ? `state_${stateRead.status}`
+        : (stamped ? "projection_mismatch" : (stateRead.state.head_seq > log.head_seq ? "log_truncated" : "state_mismatch"));
+      leading.push({ ts: now, kind: "rebaselined", reason });
+      report.rebaselined = reason;
+      projection = projectAlerts(alerts);
+    }
   }
 
   const derived = deriveAlertTransitions(projection, alerts, { now });
   const extra = (options.extraRecords ?? []).map((record) => ({ ts: now, ...record }));
   const bodies = [...leading, ...derived, ...extra];
+  // Review L6: chain the digest of the projection this tick records whenever it changes.
+  const nextProjectionDigest = projectionDigest(projectAlerts(alerts));
+  const restarting = leading.some((record) => record.kind === "chain_restart" || record.kind === "genesis");
+  const lastChained = restarting ? null : lastProjectionDigest(log, log.head_seq);
+  if (nextProjectionDigest !== lastChained) bodies.push({ ts: now, kind: "projection", digest: nextProjectionDigest });
   let head = { head_seq: log.head_seq, head_hash: log.head_hash };
   if (bodies.length > 0) {
     // A restarted chain's first record cites the lost head; seal it with that marker.
