@@ -32,15 +32,49 @@ export function sealRecord(domain, { prevHash, seq }, body) {
  * that does not parse is a torn tail (a crash mid-append), reported separately so a writer can trim it
  * before appending. Returns { exists, records, torn_tail, bad_line (1-based) | null, bytes }.
  */
-export async function readJsonlStrict(file) {
-  let raw;
+export async function readBoundedText(file, { maxBytes = 8 * 1024 * 1024, maxLines = Number.POSITIVE_INFINITY } = {}) {
+  let handle;
   try {
-    raw = await fs.readFile(file, "utf8");
+    handle = await fs.open(file, "r");
   } catch (error) {
-    if (error?.code === "ENOENT") return { exists: false, records: [], torn_tail: false, bad_line: null, bytes: 0 };
+    if (error?.code === "ENOENT") return { exists: false, text: "", bytes: 0, exceeded: false };
     throw error;
   }
-  const bytes = Buffer.byteLength(raw);
+  const chunks = [];
+  let bytes = 0;
+  let exceeded = false;
+  try {
+    const chunkSize = Math.min(64 * 1024, maxBytes + 1);
+    while (bytes <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.max(1, chunkSize));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      const allowed = Math.max(0, maxBytes - bytes);
+      if (bytesRead > allowed) {
+        chunks.push(buffer.subarray(0, allowed));
+        bytes += bytesRead;
+        exceeded = true;
+        break;
+      }
+      chunks.push(buffer.subarray(0, bytesRead));
+      bytes += bytesRead;
+      if (Buffer.concat(chunks).includes(10) && Buffer.concat(chunks).toString("utf8").split("\n").length > maxLines + 1) {
+        exceeded = true;
+        break;
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+  return { exists: true, text: Buffer.concat(chunks).toString("utf8"), bytes, exceeded };
+}
+
+export async function readJsonlStrict(file, options = {}) {
+  const bounded = await readBoundedText(file, options);
+  if (!bounded.exists) return { exists: false, records: [], torn_tail: false, bad_line: null, bytes: 0, exceeded: false };
+  const raw = bounded.text;
+  const bytes = bounded.bytes;
+  if (bounded.exceeded) return { exists: true, records: [], torn_tail: false, bad_line: null, bytes, exceeded: true };
   const endsWithNewline = raw.endsWith("\n");
   const lines = raw.split("\n");
   if (endsWithNewline) lines.pop();
@@ -53,10 +87,10 @@ export async function readJsonlStrict(file) {
       records.push(parsed);
     } catch {
       const isTail = index === lines.length - 1 && !endsWithNewline;
-      return { exists: true, records, torn_tail: isTail, bad_line: isTail ? null : index + 1, bytes };
+      return { exists: true, records, torn_tail: isTail, bad_line: isTail ? null : index + 1, bytes, exceeded: false };
     }
   }
-  return { exists: true, records, torn_tail: false, bad_line: null, bytes };
+  return { exists: true, records, torn_tail: false, bad_line: null, bytes, exceeded: false };
 }
 
 /**

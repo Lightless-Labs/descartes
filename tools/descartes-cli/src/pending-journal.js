@@ -108,6 +108,8 @@ export function emptyPendingState(family) {
     passes: {},
     items: {},
     excluded_summary: { count: 0, by_reason: {} },
+    pass_aggregate: { count: 0, first_pass_id: null, last_pass_id: null, digests: [] },
+    terminal_aggregate: { count: 0, by_state: {}, digests: [] },
     quarantine_aggregate: { count: 0, digests: [] },
     ranges: [],
     epochs: [],
@@ -124,11 +126,21 @@ function itemDigest(item) {
 }
 
 function boundState(state) {
-  // Passes behind the watermark are only audit history: keep the newest few. Unscored passes are
-  // kept in full (they are what a replay would need).
+  // Checkpoint state is an optimisation, never an unbounded replay queue. Keep the newest advertised
+  // pass window regardless of watermark; older unscored/excluded passes are retained as counts and
+  // digests and remain excluded from authority.
   const passIds = Object.keys(state.passes).map(Number).sort((a, b) => a - b);
-  const scored = passIds.filter((id) => id <= state.watermark);
-  for (const id of scored.slice(0, Math.max(0, scored.length - MAX_RETAINED_SCORED_PASSES))) delete state.passes[id];
+  const evictedPasses = passIds.slice(0, Math.max(0, passIds.length - MAX_RETAINED_SCORED_PASSES));
+  for (const id of evictedPasses) {
+    const pass = state.passes[id];
+    const digest = crypto.createHash("sha256").update(canonicalJson({ pass_id: id, pass })).digest("hex").slice(0, 16);
+    state.pass_aggregate ??= { count: 0, first_pass_id: null, last_pass_id: null, digests: [] };
+    state.pass_aggregate.count += 1;
+    state.pass_aggregate.first_pass_id ??= id;
+    state.pass_aggregate.last_pass_id = id;
+    state.pass_aggregate.digests = [...(state.pass_aggregate.digests ?? []), digest].slice(-MAX_RETAINED_SCORED_PASSES);
+    delete state.passes[id];
+  }
   if (state.ranges.length > MAX_RETAINED_RANGES) state.ranges = state.ranges.slice(-MAX_RETAINED_RANGES);
   if (state.epochs.length > MAX_RETAINED_EPOCHS) state.epochs = state.epochs.slice(-MAX_RETAINED_EPOCHS);
   // I3: quarantined items beyond the cap merge into the aggregate (never folded, never released).
@@ -137,6 +149,16 @@ function boundState(state) {
   for (const [id, item] of quarantined.slice(0, Math.max(0, quarantined.length - MAX_QUARANTINED_ITEMS))) {
     state.quarantine_aggregate.count += 1;
     state.quarantine_aggregate.digests = [...state.quarantine_aggregate.digests, itemDigest(item)].slice(-MAX_QUARANTINED_ITEMS);
+    delete state.items[id];
+  }
+  const terminal = Object.entries(state.items).filter(([, item]) => ["admitted", "excluded"].includes(item.state))
+    .sort(([, left], [, right]) => left.disposition_seq - right.disposition_seq);
+  const terminalKeep = 256;
+  for (const [id, item] of terminal.slice(0, Math.max(0, terminal.length - terminalKeep))) {
+    state.terminal_aggregate ??= { count: 0, by_state: {}, digests: [] };
+    state.terminal_aggregate.count += 1;
+    state.terminal_aggregate.by_state[item.state] = (state.terminal_aggregate.by_state[item.state] ?? 0) + 1;
+    state.terminal_aggregate.digests = [...(state.terminal_aggregate.digests ?? []), itemDigest(item)].slice(-256);
     delete state.items[id];
   }
   return state;
@@ -347,14 +369,16 @@ async function readCheckpoint(checkpointFile, family) {
  */
 export async function inspectPendingJournal(descartesPaths, family, { ledger = null, witnessExists = false } = {}) {
   const { journalFile, checkpointFile } = resolvePendingJournalPaths(descartesPaths, family);
-  let read;
-  try {
-    read = await readJsonlStrict(journalFile);
-  } catch {
-    return { status: "discontinuity", cause: "journal_unreadable", state: null, sources: {} };
-  }
   const checkpointRead = await readCheckpoint(checkpointFile, family);
   const checkpoint = checkpointRead.status === "valid" ? checkpointRead.checkpoint : null;
+  let read;
+  try {
+    read = await readJsonlStrict(journalFile, { maxBytes: MAX_JOURNAL_BYTES_BEFORE_CUT });
+  } catch {
+    return { status: "discontinuity", cause: "journal_unreadable", state: null, sources: { checkpoint, prefix: [], header: null, torn_tail: false } };
+  }
+  if (read.exceeded) return { status: "discontinuity", cause: "journal_read_cap", state: null, sources: { checkpoint, prefix: [], header: null, torn_tail: false } };
+  if (read.torn_tail) return { status: "discontinuity", cause: "journal_torn_tail", state: null, sources: { checkpoint, prefix: read.records, header: null, torn_tail: true } };
   const chain = read.bad_line === null ? verifyChain(PENDING_JOURNAL_DOMAIN, read.records, { cutKind: "cut" }) : { ...verifyChain(PENDING_JOURNAL_DOMAIN, read.records, { cutKind: "cut" }), ok: false, reason: "unparseable_line" };
   const sources = { checkpoint, prefix: chain.verified, header: chain.header, torn_tail: read.torn_tail };
 

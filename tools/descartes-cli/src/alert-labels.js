@@ -33,7 +33,7 @@ import { isUndeliverableStatus, readAlertRecords, requestAlertClosure, writeAler
 import { streamKindForRule } from "./alert-stream-kinds.js";
 import { readAlertTransitionWitness, WITNESS_LABEL_MEMORY_MS } from "./alert-transitions.js";
 import { RULE_HORIZONS } from "./fact-families.js";
-import { atomicWrite } from "./hash-chain.js";
+import { atomicWrite, readJsonlStrict } from "./hash-chain.js";
 import { appendPendingEntries, openPendingJournal, PENDING_JOURNAL_FAMILIES, pendingItemId } from "./pending-journal.js";
 
 export const ALERT_LABELS = Object.freeze(["benign", "suspicious", "expected", "mine", "confirmed_incident", "missed_incident"]);
@@ -93,25 +93,12 @@ export function normalizeLabelRecord(raw) {
 
 export async function readAlertLabels(descartesPaths) {
   const { logFile } = resolveAlertLabelPaths(descartesPaths);
-  let raw;
-  try {
-    raw = await fs.readFile(logFile, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return { labels: [], invalid: 0 };
-    throw error;
-  }
+  const read = await readJsonlStrict(logFile, { maxBytes: MAX_LABEL_LOG_BYTES, maxLines: 20000 });
+  if (!read.exists) return { labels: [], invalid: 0, tamper: null };
   const labels = [];
   let invalid = 0;
   const seen = new Set();
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      invalid += 1;
-      continue;
-    }
+  for (const parsed of read.records) {
     const label = normalizeLabelRecord(parsed);
     if (!label || seen.has(label.id)) {
       invalid += 1;
@@ -120,7 +107,9 @@ export async function readAlertLabels(descartesPaths) {
     seen.add(label.id);
     labels.push(label);
   }
-  return { labels, invalid };
+  const tamper = read.exceeded ? { kind: "label_log_read_cap", bytes: read.bytes } : (read.bad_line !== null ? { kind: "label_log_unparseable", line: read.bad_line } : null);
+  if (tamper) invalid += 1;
+  return { labels, invalid, tamper };
 }
 
 /** The quarantining labels in the log (review L4), as scopes a discontinuity re-applies. Never throws. */
@@ -268,7 +257,8 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   const ts = new Date(now ?? Date.now()).toISOString();
   const nowMs = Date.parse(ts);
   const { stateFile } = resolveAlertLabelPaths(descartesPaths);
-  const { labels, invalid } = await readAlertLabels(descartesPaths);
+  const labelRead = await readAlertLabels(descartesPaths);
+  const { labels, invalid } = labelRead;
   const stateRead = await readIngestionState(stateFile);
   const state = stateRead.state;
   // Review M1: labels.state.json is unchained, so what was ingested (and charged) is rebuilt from the
@@ -303,7 +293,8 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   const labelById = new Map(labels.map((label) => [label.id, label]));
   const queue = [...state.held.map((entry) => labelById.get(entry.id)).filter(Boolean), ...retryable, ...fresh.sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))]
     .filter((label, index, all) => all.findIndex((candidate) => candidate.id === label.id) === index);
-  const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [], discontinuities: [] };
+  const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [], discontinuities: [], tamper: labelRead.tamper };
+  if (labelRead.tamper) report.audit.push({ ...labelRead.tamper, kind: "unattributed_change", source: "labels.jsonl" });
   for (const conflict of state.__witnessConflicts ?? []) report.audit.push(conflict);
   delete state.__witnessConflicts;
   // A missing state with nothing to rebuild is a first use; a state that is invalid, or missing while
@@ -312,6 +303,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   if (stateLost) {
     report.audit.push({ kind: "label_state_rebuilt", state: stateRead.status, rebuilt_from_witness: rebuiltFromWitness });
   }
+  if (labelRead.tamper) return report;
   if (queue.length === 0 && stateRead.status === "valid" && report.audit.length === 0) return report;
 
   let alerts = await (deps.readAlertRecords ?? readAlertRecords)(descartesPaths);

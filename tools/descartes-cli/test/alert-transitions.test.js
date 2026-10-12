@@ -130,6 +130,16 @@ test("a tampered log restarts the chain, keeps the broken file aside, and marks 
   assert.ok(log.records.some((record) => record.kind === "recovered"), "the projection survives the restart via the state file");
 });
 
+test("hostile_transition_read_is_capped_before_parsing", async () => {
+  const paths = await tempPaths();
+  const { logFile } = resolveAlertTransitionPaths(paths);
+  await fs.mkdir(path.dirname(logFile), { recursive: true });
+  await fs.writeFile(logFile, "x".repeat(8 * 1024 * 1024 + 1));
+  const read = await readAlertTransitions(paths);
+  assert.equal(read.status, "broken");
+  assert.equal(read.reason, "log_read_cap");
+});
+
 test("a deleted log with a surviving state is a restart, never a fresh genesis", async () => {
   const paths = await tempPaths();
   const { logFile } = resolveAlertTransitionPaths(paths);

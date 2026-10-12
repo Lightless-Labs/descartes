@@ -384,8 +384,9 @@ function pruneTransitionWitness(witness, nowMs) {
  */
 export async function readAlertTransitions(descartesPaths) {
   const { logFile } = resolveAlertTransitionPaths(descartesPaths);
-  const read = await readJsonlStrict(logFile);
+  const read = await readJsonlStrict(logFile, { maxBytes: MAX_ALERT_TRANSITIONS_BYTES, maxLines: 200000 });
   if (!read.exists) return { status: "missing", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: false };
+  if (read.exceeded) return { status: "broken", reason: "log_read_cap", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: false, witness: emptyTransitionWitness() };
   if (read.bad_line !== null) {
     const partial = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
     return { status: "broken", reason: "unparseable_line", records: partial.verified, head_seq: partial.head_seq, head_hash: partial.head_hash, coverage_from_ts: null, torn_tail: false, witness: foldTransitionWitness(partial.header?.carried_witness, partial.verified) };
@@ -434,7 +435,7 @@ async function readState(stateFile) {
 }
 
 async function compactIfNeeded(logFile, maxBytes, nowMs) {
-  const read = await readJsonlStrict(logFile);
+  const read = await readJsonlStrict(logFile, { maxBytes: MAX_ALERT_TRANSITIONS_BYTES, maxLines: 200000 });
   if (!read.exists || read.bytes <= maxBytes) return false;
   const chain = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
   if (!chain.ok) return false;

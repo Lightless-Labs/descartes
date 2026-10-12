@@ -260,6 +260,18 @@ test("label_quarantine_write_is_transactional: journal failure leaves the label 
   assert.equal(retry.ingested.length, 1);
 });
 
+test("hostile_label_read_is_capped_at_read_time_and_visible", async () => {
+  const paths = await tempPaths();
+  const { logFile } = resolveAlertLabelPaths(paths);
+  await fs.mkdir(path.dirname(logFile), { recursive: true });
+  await fs.writeFile(logFile, `${"x".repeat(1024 * 1024 + 1)}\n`);
+  const read = await readAlertLabels(paths);
+  assert.equal(read.tamper.kind, "label_log_read_cap");
+  const report = await ingestAlertLabels(paths, { now: iso(3000) });
+  assert.equal(report.tamper.kind, "label_log_read_cap");
+  assert.ok(report.audit.some((entry) => entry.kind === "unattributed_change"));
+});
+
 test("an ingested label is never re-ingested after the label state is lost", async () => {
   const paths = await tempPaths();
   await seed(paths, [candidate(EVENT_ID, "session.churn", "k1")]);

@@ -15,6 +15,7 @@ import {
   journalCommittedPass,
   journalScoredThrough,
   MAX_OPEN_PENDING_ITEMS,
+  MAX_RETAINED_SCORED_PASSES,
   openPendingJournal,
   PENDING_JOURNAL_FAMILIES,
   pendingAdmissionStatus,
@@ -118,6 +119,49 @@ test("pending_stale_checkpoint_rebuilt: a missing or stale checkpoint is rebuilt
   const rebuilt = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(2) });
   assert.equal(rebuilt.status, "valid");
   assert.equal(rebuilt.state.watermark, 2);
+});
+
+test("torn_final_record_opens_a_discontinuity: recovery never trims a partial tail as if it were clean", async () => {
+  const paths = await tempPaths();
+  await scoredTick(paths, 1);
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await fs.appendFile(journalFile, '{"kind":"torn"');
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) });
+  assert.equal(inspected.status, "discontinuity");
+  assert.equal(inspected.cause, "journal_torn_tail");
+  const handle = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
+  assert.equal(handle.discontinuity.cause, "journal_torn_tail");
+  assert.equal(handle.state.open_epoch, 1);
+});
+
+test("journal_read_error_still_unions_checkpoint: an unreadable journal cannot release its quarantine", async () => {
+  const paths = await tempPaths();
+  const handle = await quarantinedJournal(paths);
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await fs.rm(journalFile);
+  await fs.mkdir(journalFile);
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) });
+  assert.equal(inspected.status, "discontinuity");
+  assert.equal(inspected.cause, "journal_unreadable");
+  assert.equal(inspected.sources.checkpoint.state.items[idA].state, "quarantined");
+  const recovered = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
+  assert.equal(recovered.state.items[idA].state, "quarantined");
+});
+
+test("pending_checkpoint_bounds_all_passes: 2,000 unscored passes retain at most the advertised 64", () => {
+  let state = emptyPendingState(FAMILY);
+  const entries = Array.from({ length: 2000 }, (_, index) => ({
+    seq: index + 1,
+    hash: `h${index + 1}`,
+    kind: "pass_committed",
+    pass_id: index + 1,
+    observation_ts: iso(index + 1),
+    pass_time_ms: T0 + (index + 1) * HOUR,
+    written_count: 1,
+  }));
+  state = foldPendingEntries(state, entries);
+  assert.ok(Object.keys(state.passes).length <= MAX_RETAINED_SCORED_PASSES);
+  assert.ok(state.pass_aggregate.count >= 1900);
 });
 
 test("a checkpoint that contradicts the journal is a discontinuity with an open epoch and suspended admission", async () => {
