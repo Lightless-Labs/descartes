@@ -5,7 +5,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
+import { readVerifiedAlertTransitions, reconcileAlertClosures, recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
@@ -2521,11 +2521,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     }
   }
   let labelIngestion;
+  let verifiedTransitionLog;
   if (alerts) {
+    try {
+      verifiedTransitionLog = await readVerifiedAlertTransitions(descartesPaths);
+    } catch {
+      verifiedTransitionLog = undefined;
+    }
     try {
       const handles = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).filter(([, result]) => result.handle).map(([family, result]) => [family, result.handle]));
       const ledgers = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).map(([family, result]) => [family, result.ledger ?? null]));
-      labelIngestion = await (options.ingestAlertLabels ?? ingestAlertLabels)(descartesPaths, { now: ts, handles, ledgers });
+      labelIngestion = await (options.ingestAlertLabels ?? ingestAlertLabels)(descartesPaths, { now: ts, handles, ledgers, transitionLog: verifiedTransitionLog });
       for (const { family, cause } of labelIngestion?.discontinuities ?? []) {
         await deliverPendingDiscontinuityNotice(descartesPaths, { family, cause, ts, deliverNotification: options.deliverNotification });
       }
@@ -2565,7 +2571,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         })
         .map((outcome) => ({ kind: "closure_authorized", alert_id: outcome.alertId, incident_key: outcome.incidentKey, reason: "event_delivered" }));
       labelAuthorizedClosures = (labelIngestion?.audit ?? []).filter((record) => record.kind === "closure_authorized");
-      closureReconciliation = await (options.reconcileAlertClosures ?? reconcileAlertClosures)(descartesPaths, { now: ts, authorizedClosures: [...authorizedClosures, ...labelAuthorizedClosures] });
+      closureReconciliation = await (options.reconcileAlertClosures ?? reconcileAlertClosures)(descartesPaths, { now: ts, authorizedClosures: [...authorizedClosures, ...labelAuthorizedClosures], verifiedLog: verifiedTransitionLog });
       if (closureReconciliation.changes.length > 0) await writeAlertRecords(descartesPaths, closureReconciliation.alerts);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

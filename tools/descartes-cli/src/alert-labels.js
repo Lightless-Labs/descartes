@@ -253,7 +253,7 @@ function applyLabelToAlert(alert, label, now) {
  * opened (so label entries extend the same chain); missing families are opened here. Returns
  * { ingested: [...], held: [...], released: [...], audit (transition records), notice }.
  */
-export async function ingestAlertLabels(descartesPaths, { now, handles = {}, ledgers = {}, deps = {} } = {}) {
+export async function ingestAlertLabels(descartesPaths, { now, handles = {}, ledgers = {}, transitionLog, deps = {} } = {}) {
   const ts = new Date(now ?? Date.now()).toISOString();
   const nowMs = Date.parse(ts);
   const { stateFile } = resolveAlertLabelPaths(descartesPaths);
@@ -268,7 +268,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   let witness = null;
   if (labels.length > 0 || Object.keys(state.ingested).length > 0) {
     try {
-      witness = await (deps.readAlertTransitionWitness ?? readAlertTransitionWitness)(descartesPaths);
+      witness = transitionLog?.witness ?? await (deps.readAlertTransitionWitness ?? readAlertTransitionWitness)(descartesPaths);
     } catch {
       witness = null;
     }

@@ -260,13 +260,13 @@ function repairClosedWithoutWitness(current, now, reason) {
  * transition projection is the only prior-state witness; current closed_by/reason fields are never
  * treated as proof. Returns an alert array and audit records for the caller's single daemon write.
  */
-export async function reconcileAlertClosures(descartesPaths, { now, alerts, authorizedClosures = [] } = {}) {
+export async function reconcileAlertClosures(descartesPaths, { now, alerts, authorizedClosures = [], verifiedLog } = {}) {
   const current = alerts ?? await readAlertRecords(descartesPaths);
   const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
   const stateRead = await readState(stateFile);
   let log;
   try {
-    log = await readAlertTransitions(descartesPaths, {
+    log = verifiedLog ?? await readAlertTransitions(descartesPaths, {
       verifiedHead: stateRead.status === "valid" ? stateRead.state.verified_head : null,
       verifiedContentDigest: stateRead.status === "valid" ? stateRead.state.verified_content_digest : null,
       timeBudgetMs: 25,
@@ -515,12 +515,22 @@ export async function readAlertTransitionWitness(descartesPaths) {
   const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
   let fromLog = null;
   try {
-    fromLog = (await readAlertTransitions(descartesPaths)).witness ?? null;
+    fromLog = (await readVerifiedAlertTransitions(descartesPaths)).witness ?? null;
   } catch {
     fromLog = null;
   }
   const stateRead = await readState(stateFile);
   return mergeTransitionWitness(fromLog, stateRead.status === "valid" ? stateRead.state.witness : null);
+}
+
+export async function readVerifiedAlertTransitions(descartesPaths, options = {}) {
+  const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
+  const stateRead = await readState(stateFile);
+  return readAlertTransitions(descartesPaths, {
+    verifiedHead: options.verifiedHead ?? (stateRead.status === "valid" ? stateRead.state.verified_head : null),
+    verifiedContentDigest: options.verifiedContentDigest ?? (stateRead.status === "valid" ? stateRead.state.verified_content_digest : null),
+    timeBudgetMs: options.timeBudgetMs ?? 25,
+  });
 }
 
 async function readState(stateFile) {
