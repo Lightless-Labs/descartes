@@ -516,6 +516,12 @@ These are the limits of the defensive layer today:
   ledger together defeats the on-host check. An off-host attestation and a fleet
   dead-man's-switch are future design work. A canary detects tampering, but it cannot
   protect itself against local root.
+- **Same-UID alert state has the same boundary.** A process running as Descartes' UID can
+  rewrite `alerts.json`, `labels.state.json`, required-notification state, and the chained
+  logs. C1 keeps cheap consistency checks and fails closed on ordinary read/write failures, but
+  it does not claim to prevent or reliably prove deliberate same-UID forgery (including forged
+  delivery timestamps, closure reuse, or pre-populated label state). That requires off-host
+  attestation as a separate initiative.
 - **Recommend-only.** Containment proposes an action. It never does the action. There is no
   general remediation tool yet.
 - **One instance only.** Two daemon instances on the same state directory can race the fact

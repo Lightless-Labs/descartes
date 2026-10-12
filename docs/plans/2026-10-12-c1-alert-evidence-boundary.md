@@ -9,6 +9,24 @@ Close the daybreak findings on the C1 alert foundations branch without making sa
 tampering preventable. Same-UID edits remain `unprotected_same_uid`, but every edit that
 changes alert, label, journal, or notification state must be detected, chained, and visible.
 
+## C1 addendum: same-UID evidence boundary (2026-10-12)
+
+The C1 security scope deliberately does not attempt to defend against a deliberate attacker
+running as the daemon's UID. That principal can rewrite `alerts.json`, `labels.state.json`, the
+notification outbox, and the hash-chained logs themselves; every key needed to edit those files is
+readable at the same UID. Therefore neither prevention nor reliable on-host proof of same-UID
+forgery is achievable here. In particular, C1 does not add defenses for forged `storm_covered_at`,
+`confirmed_at`, or closure records that reuse old authorizations, nor for pre-populated label-state
+entries. The existing cheap consistency checks remain because they catch accidental or non-attacker
+failures, but they are not presented as an attacker boundary.
+
+The missing-authority remedy is off-host attestation, a separate initiative tracked by the autonomy
+doctrine and this plan's §16.2 item 6. C1 instead fixes failures that require no attacker: unreadable
+closure witnesses fail closed and re-notify, label journal-open failures abort the transaction,
+required notices are queued before optional configuration is read, audit records precede delivery,
+outbox overflow/corruption stays visible, discarded storm keys above the delivered storm severity
+escalate, and closure reconciliation reuses the verified transition head.
+
 ## Atomic slices
 
 1. Closure attribution and restoration from the transition witness (B1, M2).
