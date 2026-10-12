@@ -445,7 +445,15 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
   const inspected = await inspectPendingJournal(descartesPaths, family, { ledger, witnessExists });
   if (inspected.status !== "discontinuity") {
     if (inspected.torn_tail) await trimTornTail(paths.journalFile);
-    return { family, state: inspected.state, status: inspected.status, discontinuity: null, created: inspected.status === "missing" };
+    const handle = { family, state: inspected.state, status: inspected.status, discontinuity: null, created: false };
+    if (inspected.status === "missing") {
+      // Review L1: a created journal exists on disk from the moment it is reported created (its
+      // first chained entry and a checkpoint), so the creation witness never outlives the journal it
+      // witnesses and the next tick never reads a false journal_missing.
+      await checkpointPendingJournal(descartesPaths, handle, { ledger, passId });
+      handle.created = true;
+    }
+    return handle;
   }
   const nextEpoch = 1 + Math.max(0, ...(inspected.state?.epochs ?? []).map((epoch) => epoch.epoch),
     ...(inspected.sources?.checkpoint?.state?.epochs ?? []).map((epoch) => epoch.epoch),

@@ -66,8 +66,9 @@ test("label_ingested_once_by_daemon and label_notified_on_ingest: an EVENT label
   assert.equal(first.ingested.length, 1);
   assert.equal(first.ingested[0].closed, 2);
   assert.equal(first.notice.title, "Descartes: labels ingested");
-  assert.equal(first.audit[0].kind, "label_ingested");
-  assert.equal(first.audit[0].label_id, label.id);
+  const ingestedRecord = first.audit.find((record) => record.kind === "label_ingested");
+  assert.equal(ingestedRecord.label_id, label.id);
+  assert.ok(first.audit.some((record) => record.kind === "pending_journal_created" && record.family === "session"), "a journal the ingestion creates is witnessed");
   const [alert] = await readAlertRecords(paths);
   assert.equal(alert.status, "closed");
   assert.equal(alert.incidents.k1.closed_by.ref, label.id, "every closure names its label");

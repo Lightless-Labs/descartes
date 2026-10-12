@@ -411,3 +411,18 @@ test("after a cut, an in-place checkpoint state edit is still a contradiction", 
   assert.equal(inspected.status, "discontinuity");
   assert.equal(inspected.cause, "checkpoint_contradicts_journal");
 });
+
+// Adversarial review L1: a family's first tick with no committed pass must not leave a checkpoint
+// with no journal (the next tick would read a false journal_missing discontinuity).
+test("a first tick with no committed pass creates the journal it reports, and the next tick is clean", async () => {
+  const paths = await tempPaths();
+  const { handle, report } = await journalCommittedPass(paths, FAMILY, { passResult: { written_count: 3, retention_error: "boom", retention: { pass_id: 1, pass_time_ms: T0 + HOUR } }, ledger: ledgerAt(1), ts: iso(1) });
+  assert.equal(report.mapped, "no_committed_pass");
+  assert.equal(report.created, true);
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await fs.access(journalFile);
+  await journalScoredThrough(paths, handle, { ledger: ledgerAt(1), passId: 1, scored: true, ts: iso(1) });
+  const { report: next } = await scoredTick(paths, 2, { witnessExists: true });
+  assert.equal(next.discontinuity, null);
+  assert.equal(next.mapped, "mapped");
+});

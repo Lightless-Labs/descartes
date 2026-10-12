@@ -267,6 +267,8 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
       if (!handles[family]) {
         try {
           handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts });
+          // A journal this ingestion creates is witnessed like one the pre-pass creates.
+          if (handles[family]?.created) report.audit.push({ kind: "pending_journal_created", family, opened_by: "label_ingestion" });
           // Opening a journal can itself detect a discontinuity: it must be audited and notified
           // exactly like one the pre-pass finds (the epoch re-certifies at the next clean pass).
           if (handles[family]?.discontinuity) {
