@@ -15,7 +15,9 @@ daemon ingestion and coverage-charged label budget (C1.3, item 15); `45f9cd1` th
 Detection and what fires are unchanged; notify-once guarantees hold (storm changes only add
 notifications). See "Addendum: C1 execution (2026-10-12)" in the plan for deviations (checkpoint written
 after detection; no replay before C1a; discontinuity and label-burst are notices, not alert rules) and
-deferred items. Fresh-XDG full `npm test`: **2,746 tests: 2,705 pass, 0 fail, 35 skipped, 6 todo**.
+deferred items. Self-review fixes: `4798a18` (a storm never swallows an undelivered escalation) and a
+label-opened journal epoch that could never re-certify. Fresh-XDG full `npm test`: **2,748 tests: 2,707
+pass, 0 fail, 35 skipped, 6 todo**.
 **NEXT:** daybreak gate of C1 (alert-store closure/storm, pending journal, label ingestion), then merge,
 then C1a. No push or merge.
 
