@@ -25,6 +25,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { readAlertRecords } from "./alert-store.js";
+import { readAlertTransitions } from "./alert-transitions.js";
 import { readAlertIntelligenceAudit, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import {
   DEFAULT_MIN_CHRONIC_FIRES,
@@ -619,10 +620,11 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
   const readIntelligenceConfig = runtime.readAlertIntelligenceConfig ?? readAlertIntelligenceConfig;
   const loadConstraintsFn = runtime.loadConstraints ?? loadConstraints;
   const readFacts = runtime.readFactPoints ?? readFactPoints;
+  const readTransitions = runtime.readAlertTransitions ?? readAlertTransitions;
   // Slice 9 audit — no completeness gate needed: tuning uses available facts for backtesting
   // and target mapping, and makes no absence or novelty claim from missing history.
 
-  const [alerts, auditRecords, deliveryRecords, shadowResult, intelligenceConfig, constraintsResult, factsResult] = await Promise.all([
+  const [alerts, auditRecords, deliveryRecords, shadowResult, intelligenceConfig, constraintsResult, factsResult, transitions] = await Promise.all([
     safeReadSignal(() => readAlerts(descartesPaths), "alerts.json"),
     safeReadSignal(() => readAudit(descartesPaths), "llm-decisions.jsonl"),
     safeReadSignal(() => readDelivery(descartesPaths), "notification-delivery.jsonl"),
@@ -630,11 +632,15 @@ export async function runLearnedTuningMine(descartesPaths, args, runtime = {}) {
     safeReadSignal(() => readIntelligenceConfig(descartesPaths), "alert-intelligence.json"),
     safeReadSignal(() => loadConstraintsFn(descartesPaths), "constraints.json"),
     safeReadSignal(() => readFacts(descartesPaths, { families: readerFamilies("tuning_miner"), windowMs: options.windowMs, now: runtime.now }), "facts.jsonl"),
+    // C1.2: fired_count from the daemon's activated transitions (a stable alert identity's repeated
+    // fire/recover cycles are counted, not collapsed into one snapshot record).
+    safeReadSignal(() => readTransitions(descartesPaths), "alert-transitions.jsonl"),
   ]);
 
   const calibrationReport = computeCalibrationReport(alerts, auditRecords, deliveryRecords, shadowResult?.records, {
     now,
     enabledNamespaces: intelligenceConfig?.enabled_namespaces,
+    transitions,
   });
 
   const factHistoryByTarget = buildFactHistoryByTarget(factsResult?.points);

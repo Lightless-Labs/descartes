@@ -26,10 +26,13 @@
 //     "namespace can't/doesn't reach the LLM" as "this artifact is never caught."
 //   - precision_proxy is deduplicated (an alert can be BOTH fast-recovered AND llm-suppressed --
 //     summing double-counts it) and clamped to [0,1].
-//   - fired_count is honestly a LOWER BOUND: alerts.json is a live-status snapshot, not an
-//     append-only event log (see the module comment on `computeCalibrationReport` below).
+//   - fired_count is honestly a LOWER BOUND whenever it comes from alerts.json, a live-status
+//     snapshot (see the module comment on `computeCalibrationReport` below). C1.2 (context plan §9):
+//     when the daemon's hash-chained transition log (alert-transitions.js) covers the row, fired_count
+//     counts its `activated` transitions -- one per episode -- and the lower-bound flag is false.
 
 import { readAlertRecords } from "./alert-store.js";
+import { readAlertTransitions } from "./alert-transitions.js";
 import {
   DEFAULT_ENABLED_NAMESPACES,
   classifyAlertNamespace,
@@ -198,7 +201,24 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
   // Accepted, deliberately unused in v1's row formulas -- see the doc comment above.
   void (Array.isArray(deliveryRecords) ? deliveryRecords : []);
 
-  // --- Window + closed-set filter, then group by artifact_ref (plan §2.1/§2.2) ---
+  // C1.2 (context plan §9; Astra principle audit finding 3): when the daemon's transition log is
+  // supplied, fired_count counts alert-level `activated` transitions (one per episode) in the window,
+  // so repeated fire/recover cycles under one stable alert identity are counted, not collapsed into
+  // one snapshot record. Without it (or where the log cannot cover the window) the legacy snapshot
+  // count is kept, flagged as a lower bound exactly as before.
+  const transitions = options.transitions && typeof options.transitions === "object" ? options.transitions : undefined;
+  const transitionRecords = transitions && ["valid", "broken"].includes(transitions.status) && Array.isArray(transitions.records) ? transitions.records : undefined;
+  const coverageFromMs = transitions?.coverage_from_ts ? new Date(transitions.coverage_from_ts).getTime() : undefined;
+  const inWindowMs = (ms) => Number.isFinite(ms) && (sinceMs === undefined || ms >= sinceMs) && (untilMs === undefined || ms <= untilMs);
+  const recordsByAlertId = new Map();
+  for (const record of transitionRecords ?? []) {
+    if (!record || typeof record !== "object" || typeof record.alert_id !== "string") continue;
+    const list = recordsByAlertId.get(record.alert_id) ?? [];
+    list.push(record);
+    recordsByAlertId.set(record.alert_id, list);
+  }
+
+  // --- Closed-set filter, then group by artifact_ref (plan §2.1/§2.2); the window is applied per row ---
   const rowsByRef = new Map();
   for (const alert of safeAlerts) {
     if (!alert || typeof alert !== "object") continue;
@@ -208,10 +228,13 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
     if (safeRuleId === undefined) continue; // degrade: unresolvable ref, never fabricate one
 
     const firstSeenMs = new Date(alert.first_seen).getTime();
+    let snapshotInWindow = true;
     if (Number.isFinite(firstSeenMs)) {
-      if (sinceMs !== undefined && firstSeenMs < sinceMs) continue;
-      if (untilMs !== undefined && firstSeenMs > untilMs) continue;
+      if (sinceMs !== undefined && firstSeenMs < sinceMs) snapshotInWindow = false;
+      if (untilMs !== undefined && firstSeenMs > untilMs) snapshotInWindow = false;
     }
+    const activations = (recordsByAlertId.get(alert.id) ?? []).filter((record) => record.kind === "activated" && inWindowMs(new Date(record.ts).getTime()));
+    if (!snapshotInWindow && activations.length === 0) continue;
     if (familyPrefix && !ruleId.startsWith(familyPrefix)) continue;
 
     const { rawRef, granularity } = attributeAlert(alert);
@@ -219,9 +242,12 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
     if (artifactRef === undefined) continue; // degrade: unresolvable ref, never fabricate one
 
     if (!rowsByRef.has(artifactRef)) {
-      rowsByRef.set(artifactRef, { artifact_ref: artifactRef, granularity, rule_id_family: safeRuleId, alerts: [] });
+      rowsByRef.set(artifactRef, { artifact_ref: artifactRef, granularity, rule_id_family: safeRuleId, alerts: [], snapshotAlerts: [], activations: [] });
     }
-    rowsByRef.get(artifactRef).alerts.push(alert);
+    const row = rowsByRef.get(artifactRef);
+    row.alerts.push(alert);
+    if (snapshotInWindow) row.snapshotAlerts.push(alert);
+    row.activations.push(...activations.map((record) => ({ alert, record })));
   }
 
   // --- Index audit/shadow records once, reused per row ---
@@ -242,7 +268,16 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
 
   const artifacts = [];
   for (const row of rowsByRef.values()) {
-    const firedCount = row.alerts.length;
+    // Exact only when the log is intact and covers the whole window, or (no window) when every
+    // alert of the row was first activated inside the log's coverage.
+    const bornInLog = (alert) => (recordsByAlertId.get(alert.id) ?? []).some((record) => record.kind === "activated" && record.from === "absent"
+      && Number.isFinite(coverageFromMs) && new Date(record.ts).getTime() >= coverageFromMs);
+    const logCoversRow = transitions?.status === "valid" && Number.isFinite(coverageFromMs)
+      && (sinceMs !== undefined ? coverageFromMs <= sinceMs : row.alerts.every(bornInLog));
+    const useTransitions = transitionRecords !== undefined && row.activations.length >= row.snapshotAlerts.length;
+    const firedCount = useTransitions ? row.activations.length : row.snapshotAlerts.length;
+    const firedCountIsLowerBound = !(useTransitions && logCoversRow);
+    if (firedCount === 0) continue;
     const llmNamespaceEnabled = computeLlmNamespaceEnabled(row.rule_id_family, enabledNamespaces);
 
     let autoRecoveredFastCount = 0;
@@ -251,8 +286,27 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
     let neverEscalatedCountRaw = 0;
     const fastOrSuppressedIds = new Set();
 
-    for (const alert of row.alerts) {
-      if (isFastRecovered(alert, fastRecoveryThresholdMs)) {
+    if (useTransitions) {
+      // Per episode: fast when the episode's next terminal transition is a recovery within the
+      // threshold; suppressed when an ok adjudication inside the episode chose notify:false.
+      for (const { alert, record } of row.activations) {
+        const startMs = new Date(record.ts).getTime();
+        const later = (recordsByAlertId.get(alert.id) ?? []).filter((other) => new Date(other.ts).getTime() >= startMs && other.seq > record.seq);
+        const end = later.find((other) => ["recovered", "alert_closed", "episode_ended", "activated"].includes(other.kind));
+        const episodeKey = `${alert.id}\u0000${record.seq}`;
+        if (end?.kind === "recovered" && new Date(end.ts).getTime() - startMs <= fastRecoveryThresholdMs) {
+          autoRecoveredFastCount += 1;
+          fastOrSuppressedIds.add(episodeKey);
+        }
+        const endMs = end ? new Date(end.ts).getTime() : Number.POSITIVE_INFINITY;
+        const decisions = (auditByAlertId.get(alert.id) ?? []).filter((r) => r && r.status === "ok" && r.decision && typeof r.decision === "object"
+          && new Date(r.ts).getTime() >= startMs && new Date(r.ts).getTime() <= endMs);
+        const latest = decisions.reduce((acc, r) => (!acc || new Date(r.ts).getTime() >= new Date(acc.ts).getTime() ? r : acc), undefined);
+        if (latest?.decision?.notify === false) fastOrSuppressedIds.add(episodeKey);
+      }
+    }
+    for (const alert of useTransitions ? row.alerts : row.snapshotAlerts) {
+      if (!useTransitions && isFastRecovered(alert, fastRecoveryThresholdMs)) {
         autoRecoveredFastCount += 1;
         fastOrSuppressedIds.add(alert.id);
       }
@@ -267,7 +321,7 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
         const latestOk = okRecords.reduce((latest, r) => (!latest || new Date(r.ts).getTime() >= new Date(latest.ts).getTime() ? r : latest), undefined);
         if (latestOk?.decision?.notify === false) {
           llmSuppressedCount += 1;
-          fastOrSuppressedIds.add(alert.id);
+          if (!useTransitions) fastOrSuppressedIds.add(alert.id);
         }
       }
 
@@ -303,7 +357,8 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
       // consumer (notably S14's chronically_firing -> retire decision) can't read the bare integer
       // as exact. The undercount is fail-safe (biases toward non-action), but the caveat must be
       // machine-visible on the report surface, not source-comment-only.
-      fired_count_is_lower_bound: true,
+      fired_count_is_lower_bound: firedCountIsLowerBound,
+      fired_count_source: useTransitions ? "transitions" : "snapshot",
       auto_recovered_fast_count: autoRecoveredFastCount,
       never_escalated_count: neverEscalatedCount,
       llm_adjudicated_count: llmAdjudicatedCount,
@@ -386,7 +441,7 @@ function namespaceAnnotation(row) {
 function renderRow(row) {
   const lines = [`  ${row.artifact_ref}  [${row.rule_id_family}]`];
   lines.push(
-    `    fired: ${row.fired_count} (lower bound)  auto_recovered_fast: ${row.auto_recovered_fast_count}  precision_proxy: ${row.precision_proxy === null ? "n/a" : row.precision_proxy.toFixed(2)}${row.chronically_firing ? "  ** chronically firing **" : ""}`,
+    `    fired: ${row.fired_count}${row.fired_count_is_lower_bound === false ? "" : " (lower bound)"}  auto_recovered_fast: ${row.auto_recovered_fast_count}  precision_proxy: ${row.precision_proxy === null ? "n/a" : row.precision_proxy.toFixed(2)}${row.chronically_firing ? "  ** chronically firing **" : ""}`,
   );
   lines.push(`    recall_proxy: n/a (${row.recall_proxy_reason})`);
   const annotation = namespaceAnnotation(row);
@@ -466,13 +521,15 @@ export async function runLearnedCalibration(descartesPaths, args, runtime = {}) 
   const readDelivery = runtime.readNotificationDeliveryAudit ?? readNotificationDeliveryAudit;
   const readShadow = runtime.readShadowRecords ?? readShadowRecords;
   const readIntelligenceConfig = runtime.readAlertIntelligenceConfig ?? readAlertIntelligenceConfig;
+  const readTransitions = runtime.readAlertTransitions ?? readAlertTransitions;
 
-  const [alerts, auditRecords, deliveryRecords, shadowResult, intelligenceConfig] = await Promise.all([
+  const [alerts, auditRecords, deliveryRecords, shadowResult, intelligenceConfig, transitions] = await Promise.all([
     safeReadSignal(() => readAlerts(descartesPaths), "alerts.json"),
     safeReadSignal(() => readAudit(descartesPaths), "llm-decisions.jsonl"),
     safeReadSignal(() => readDelivery(descartesPaths), "notification-delivery.jsonl"),
     safeReadSignal(() => readShadow(descartesPaths), "shadow-violations.jsonl"),
     safeReadSignal(() => readIntelligenceConfig(descartesPaths), "alert-intelligence.json"),
+    safeReadSignal(() => readTransitions(descartesPaths), "alert-transitions.jsonl"),
   ]);
 
   const report = computeCalibrationReport(alerts, auditRecords, deliveryRecords, shadowResult?.records, {
@@ -480,6 +537,7 @@ export async function runLearnedCalibration(descartesPaths, args, runtime = {}) 
     since,
     family: options.family,
     enabledNamespaces: intelligenceConfig?.enabled_namespaces,
+    transitions,
   });
 
   const familyCounts = {};
