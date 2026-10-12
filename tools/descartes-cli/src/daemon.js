@@ -6,6 +6,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { recordAlertTransitions } from "./alert-transitions.js";
+import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
+import { deliverNotificationDecision } from "./notification-delivery.js";
 import { finishPendingJournalTick, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
@@ -2505,10 +2507,32 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // Context plan C1.1 (§9): the daemon -- the transition log's only writer -- diffs the persisted
   // alert store against the log's projection after every write of this tick (detection, delivery
   // outcomes) and appends the transitions. Audit only: a failure here never affects alerting.
+  // Context plan C1.3 (§9, I27, I62): the daemon ingests the CLI's optional labels once each, by id,
+  // after this tick's delivery outcomes (so a closure applies at once to a just-delivered incident and
+  // waits for delivery otherwise), charges coverage to the label budget, and notifies the batch.
+  let labelIngestion;
+  if (alerts) {
+    try {
+      const handles = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).filter(([, result]) => result.handle).map(([family, result]) => [family, result.handle]));
+      const ledgers = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).map(([family, result]) => [family, result.ledger ?? null]));
+      labelIngestion = await (options.ingestAlertLabels ?? ingestAlertLabels)(descartesPaths, { now: ts, handles, ledgers });
+      if (labelIngestion?.notice) {
+        try {
+          await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID });
+        } catch (error) {
+          labelIngestion.notify_error = error instanceof Error ? error.message : String(error);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      labelIngestion = { status: "error", error: message, audit: [] };
+      console.warn(`descartes: label ingestion failed (${message}); alerting is unaffected`);
+    }
+  }
   let alertTransitions;
   if (alerts || pendingJournalPrePass) {
     try {
-      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, { now: ts, extraRecords: pendingJournalAuditRecords(pendingJournalPrePass) });
+      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, { now: ts, extraRecords: [...pendingJournalAuditRecords(pendingJournalPrePass), ...(labelIngestion?.audit ?? [])] });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       alertTransitions = { status: "error", error: message };
@@ -2530,7 +2554,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       pendingJournal = { status: "error", error: error instanceof Error ? error.message : String(error) };
     }
   }
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

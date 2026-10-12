@@ -167,3 +167,24 @@ test("a pending-journal failure never fails the tick or touches alerting", async
   assert.equal(result.pendingJournal, undefined);
   assert.equal(result.status.state, "ok");
 });
+
+// ------------------------------------------------------------------------------------------------
+// C1.3: the daemon ingests CLI labels after delivery and before the transition log.
+// ------------------------------------------------------------------------------------------------
+import { appendAlertLabel } from "../src/alert-labels.js";
+
+test("a CLI label is ingested by the daemon's next tick, logged and notified; it never changes what fires", async () => {
+  const paths = await tempPaths();
+  await runTicks(paths, [0.95, 0.95, 0.95]);
+  const memory = (await readAlertRecords(paths)).find((alert) => alert.rule_id === "system.memory.sustained_high");
+  await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: memory.id }, now: "2026-10-12T00:02:30.000Z" });
+  const notices = [];
+  const [result] = await runTicks(paths, [0.95], { startMinute: 3, extra: { deliverNotification: async (_p, decision, meta) => { notices.push(meta?.ruleId); return { status: "cli_only" }; } } });
+  assert.equal(result.labelIngestion.ingested.length, 1);
+  assert.equal(result.labelIngestion.ingested[0].effect, "undeclared_kind", "a fixed resource rule has no declared stream kind: recorded, never closed");
+  assert.ok(notices.includes("descartes.labels"));
+  const after = (await readAlertRecords(paths)).find((alert) => alert.id === memory.id);
+  assert.equal(after.status, "active");
+  const log = await readAlertTransitions(paths);
+  assert.ok(log.records.some((record) => record.kind === "label_ingested" && record.alert_id === memory.id));
+});
