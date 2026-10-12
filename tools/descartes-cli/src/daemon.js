@@ -2531,7 +2531,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
       if (labelIngestion?.notice) {
         try {
-          const outcome = notificationOutcome(await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID }));
+          const labelNoticeId = `${LABEL_NOTICE_RULE_ID}:${[...(labelIngestion.ingested ?? []).map((entry) => entry.id), ...(labelIngestion.held ?? []).map((entry) => entry.id)].sort().join(",")}`;
+          const outcome = notificationOutcome(await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID, required: true, requiredNoticeId: labelNoticeId }));
           if (!outcome.notified) labelIngestion.notify_error = outcome.notify_error;
         } catch (error) {
           labelIngestion.notify_error = error instanceof Error ? error.message : String(error);
@@ -2557,6 +2558,14 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         .map((outcome) => ({ kind: "closure_authorized", alert_id: outcome.alertId, incident_key: outcome.incidentKey, reason: "event_delivered" }));
       closureReconciliation = await reconcileAlertClosures(descartesPaths, { now: ts, authorizedClosures });
       if (closureReconciliation.changes.length > 0) await writeAlertRecords(descartesPaths, closureReconciliation.alerts);
+      for (const [index, notice] of (closureReconciliation.notices ?? []).entries()) {
+        await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, notice, {
+          now: ts,
+          ruleId: "integrity.unattributed_change",
+          required: true,
+          requiredNoticeId: `integrity.unattributed_change:${closureReconciliation.changes[index].digest}`,
+        });
+      }
       alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, {
         now: ts,
         extraRecords: [

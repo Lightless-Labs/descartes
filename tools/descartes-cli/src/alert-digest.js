@@ -16,6 +16,7 @@ import { resolveAlertLabelPaths } from "./alert-labels.js";
 import { atomicWrite } from "./hash-chain.js";
 import { readFactIntegrityLedger } from "./fact-store-integrity.js";
 import { inspectPendingJournal, PENDING_JOURNAL_FAMILIES, pendingAdmissionStatus } from "./pending-journal.js";
+import { deliverNotificationDecision, queuePendingNotification, readPendingNotifications, resolvePendingNotification } from "./notification-delivery.js";
 
 // §16.1 (O): the digest period. Default daily, sent only when not empty.
 export const DIGEST_PERIOD_MS = 24 * 60 * 60 * 1000;
@@ -57,7 +58,7 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
   const state = await readJsonOrNull(resolveAlertDigestPaths(descartesPaths).stateFile);
   const sinceIso = new Date(since ?? state?.last_period_end ?? (Date.parse(nowIso) - DIGEST_PERIOD_MS)).toISOString();
   const inPeriod = (ts) => ts > sinceIso && ts <= nowIso;
-  const [alerts, transitions] = await Promise.all([readAlertRecords(descartesPaths), readAlertTransitions(descartesPaths)]);
+  const [alerts, transitions, pendingNotifications] = await Promise.all([readAlertRecords(descartesPaths), readAlertTransitions(descartesPaths), readPendingNotifications(descartesPaths)]);
   const alertsById = new Map(alerts.map((alert) => [alert.id, alert]));
   const records = transitions.records.filter((record) => typeof record.ts === "string" && inPeriod(record.ts));
   const byKind = (...kinds) => records.filter((record) => kinds.includes(record.kind));
@@ -139,6 +140,7 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
       transition_log: { status: transitions.status, gaps: byKind("chain_restart", "rebaselined").map((record) => ({ ts: record.ts, kind: record.kind, reason: record.reason ?? null })) },
       journals: Object.entries(journals).filter(([, journal]) => journal.status !== "valid").map(([family, journal]) => ({ family, status: journal.status, cause: journal.cause ?? null })),
     },
+    notifications: { pending: pendingNotifications.pending ?? [] },
   };
   digest.counts = {
     admissions: digest.admissions.length,
@@ -152,6 +154,7 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
     discontinuities: digest.discontinuities.length,
     unadjudicated: digest.unadjudicated.length,
     integrity: integrity.length + digest.integrity.transition_log.gaps.length + digest.integrity.journals.length,
+    notifications_pending: digest.notifications.pending.length,
   };
   digest.empty = Object.values(digest.counts).every((count) => count === 0) && digest.admission_suspended.length === 0 && digest.tombstones_dropped.length === 0;
   return digest;
@@ -170,6 +173,7 @@ export function digestSummaryLine(digest) {
     c.discontinuities && `${c.discontinuities} discontinuit${c.discontinuities === 1 ? "y" : "ies"}`,
     c.unadjudicated && `${c.unadjudicated} unadjudicated range${c.unadjudicated === 1 ? "" : "s"}`,
     c.integrity && `${c.integrity} integrity item${c.integrity === 1 ? "" : "s"}`,
+    c.notifications_pending && `${c.notifications_pending} required notice${c.notifications_pending === 1 ? "" : "s"} pending`,
   ].filter(Boolean);
   return `${parts.join(", ") || "no changes"}. Run 'descartes alerts digest' for details.`;
 }
@@ -192,6 +196,7 @@ export function renderAlertDigest(digest) {
   for (const entry of digest.admission_suspended) lines.push(`- ${entry.family}: unattended admission suspended (${entry.reason})`);
   for (const gap of digest.integrity.transition_log.gaps) lines.push(`- transition log ${gap.kind}${gap.reason ? ` (${gap.reason})` : ""} at ${gap.ts}`);
   for (const notice of digest.integrity.active_notices) lines.push(`- integrity notice active: ${notice.rule_id}`);
+  for (const notice of digest.notifications?.pending ?? []) lines.push(`- required notification pending: ${notice.title} [${notice.digest?.slice(0, 16) ?? "no-digest"}]`);
   return lines.join("\n");
 }
 
@@ -223,15 +228,19 @@ export async function maybeSendAlertDigest(descartesPaths, { now, deliverNotific
     await atomicWrite(path.join(digestsDir, `digest-${nowIso.replaceAll(":", "-")}.json`), JSON.stringify(digest, null, 2));
     const files = (await fs.readdir(digestsDir)).filter((name) => /^digest-.*\.json$/.test(name)).sort();
     for (const name of files.slice(0, Math.max(0, files.length - MAX_RETAINED_DIGESTS))) await fs.rm(path.join(digestsDir, name), { force: true });
-    if (deliverNotification) {
+    if (deliverNotification !== null) {
       try {
-        result.delivery = await deliverNotification(descartesPaths, {
+        const digestDecision = {
           notify: true,
           severity: "info",
           title: "Descartes digest",
           body: digestSummaryLine(digest),
-        }, { now: nowIso, ruleId: DIGEST_RULE_ID });
-        if (result.delivery?.status === "error") result.delivery_error = result.delivery.error ?? "delivery_error";
+        };
+        const noticeOptions = { now: nowIso, ruleId: DIGEST_RULE_ID, required: true, requiredNoticeId: `${DIGEST_RULE_ID}:${last}`, allowCliOnly: true };
+        if (deliverNotification) await queuePendingNotification(descartesPaths, digestDecision, noticeOptions);
+        result.delivery = await (deliverNotification ?? deliverNotificationDecision)(descartesPaths, digestDecision, noticeOptions);
+        if (deliverNotification && ["delivered", "cli_only"].includes(result.delivery?.status)) await resolvePendingNotification(descartesPaths, noticeOptions.requiredNoticeId, result.delivery.status, nowIso);
+        if (["error", "disabled", "unavailable"].includes(result.delivery?.status)) result.delivery_error = result.delivery.error ?? result.delivery.reason ?? result.delivery.status;
       } catch (error) {
         result.delivery_error = error instanceof Error ? error.message : String(error);
       }
@@ -239,7 +248,7 @@ export async function maybeSendAlertDigest(descartesPaths, { now, deliverNotific
   }
   if (result.delivery_error) {
     // A failed push is retried (hourly), never dropped: the period does not advance until it lands.
-    result.status = "delivery_failed";
+    result.status = result.delivery?.status === "disabled" || result.delivery?.status === "unavailable" ? "delivery_pending" : "delivery_failed";
     await atomicWrite(stateFile, JSON.stringify({ v: 1, last_period_end: last, last_status: result.status, retry_after: new Date(Date.parse(nowIso) + DIGEST_RETRY_MS).toISOString() }));
     return result;
   }

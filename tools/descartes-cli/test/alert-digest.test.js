@@ -88,6 +88,18 @@ test("a failed digest push is retried, never dropped", async () => {
   assert.equal(ok.status, "sent");
 });
 
+test("disabled_digest_stays_pending_and_period_does_not_advance", async () => {
+  const paths = await tempPaths();
+  await maybeSendAlertDigest(paths, { now: iso(0) });
+  await apply(paths, [{ id: EVENT_ID, rule_id: "session.churn", fingerprint: "f", incident_key: "k1", severity: "warning", title: "t", summary: "s", diagnostics: {} }], HOUR);
+  const result = await maybeSendAlertDigest(paths, { now: iso(DIGEST_PERIOD_MS), deliverNotification: async () => ({ status: "disabled" }) });
+  assert.equal(result.status, "delivery_pending");
+  const state = JSON.parse(await fs.readFile(resolveAlertDigestPaths(paths).stateFile, "utf8"));
+  assert.equal(state.last_period_end, iso(0));
+  const { readPendingNotifications } = await import("../src/notification-delivery.js");
+  assert.equal((await readPendingNotifications(paths)).pending.length, 1);
+});
+
 test("storm_listed_in_digest with its count", async () => {
   const paths = await tempPaths();
   await recordAlertTransitions(paths, { now: iso(0) });

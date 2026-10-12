@@ -9,9 +9,11 @@ import {
   normalizeNotificationPayload,
   notificationDeliveryResolution,
   readNotificationDeliveryAudit,
+  readPendingNotifications,
   readNotificationDeliveryConfig,
   resolveNotificationDeliveryPaths,
   testNotificationDelivery,
+  viewPendingNotifications,
   resolveBundledMacosHelperPath,
   macosAppBundleFor,
   writeNotificationDeliveryConfig,
@@ -69,6 +71,37 @@ test("disabled delivery records a local audit without invoking adapters", async 
   });
   assert.equal(record.status, "disabled");
   assert.equal((await readNotificationDeliveryAudit(paths)).length, 1);
+});
+
+test("required_disabled_notice_stays_pending_until_cli_view", async () => {
+  const paths = await tempPaths();
+  const record = await deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
+    now: "2026-05-29T00:01:00.000Z",
+    required: true,
+    requiredNoticeId: "unattributed:abc",
+    ruleId: "integrity.unattributed_change",
+  });
+  assert.equal(record.status, "disabled");
+  assert.equal((await readPendingNotifications(paths)).pending.length, 1);
+  const viewed = await viewPendingNotifications(paths, { now: "2026-05-29T00:02:00.000Z" });
+  assert.equal(viewed.length, 1);
+  assert.equal((await readPendingNotifications(paths)).pending.length, 0);
+  assert.equal((await readPendingNotifications(paths)).seen[0].id, "unattributed:abc");
+});
+
+test("required_unavailable_notice_stays_pending", async () => {
+  const paths = await tempPaths();
+  const record = await deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
+    now: "2026-05-29T00:03:00.000Z",
+    required: true,
+    requiredNoticeId: "discontinuity:abc",
+    ruleId: "integrity.pending_discontinuity",
+    config: { enabled: true, channel: "macos-native" },
+    platform: "darwin",
+    nativeHelperBaseDir: paths.cacheDir,
+  });
+  assert.equal(record.status, "unavailable");
+  assert.equal((await readPendingNotifications(paths)).pending[0].id, "discontinuity:abc");
 });
 
 test("repeated identical delivery failures append one immutable audit row per attempt", async () => {

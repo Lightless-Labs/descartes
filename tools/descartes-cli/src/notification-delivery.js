@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import crypto from "node:crypto";
+import { atomicWrite, canonicalJson } from "./hash-chain.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,7 +17,74 @@ export function resolveNotificationDeliveryPaths(descartesPaths) {
     configFile: path.join(descartesPaths.configDir, "notifications.json"),
     auditDir: alertsDir,
     auditFile: path.join(alertsDir, "notification-delivery.jsonl"),
+    pendingFile: path.join(alertsDir, "notification-pending.json"),
   };
+}
+
+export async function readPendingNotifications(descartesPaths) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  try {
+    const parsed = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+    return {
+      v: 1,
+      pending: Array.isArray(parsed?.pending) ? parsed.pending : [],
+      seen: Array.isArray(parsed?.seen) ? parsed.seen : [],
+      resolved: Array.isArray(parsed?.resolved) ? parsed.resolved : [],
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { v: 1, pending: [], seen: [], resolved: [] };
+    return { v: 1, pending: [], seen: [], resolved: [], tamper: error?.message ?? String(error) };
+  }
+}
+
+function pendingNoticeDigest(decision, options = {}) {
+  return crypto.createHash("sha256").update(canonicalJson({ id: options.requiredNoticeId, rule_id: options.ruleId, payload: normalizeNotificationPayload(decision, options) })).digest("hex");
+}
+
+export async function queuePendingNotification(descartesPaths, decision, options = {}) {
+  if (!options.requiredNoticeId) throw new Error("required notification needs requiredNoticeId");
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const state = await readPendingNotifications(descartesPaths);
+  const payload = normalizeNotificationPayload(decision, options);
+  const id = String(options.requiredNoticeId);
+  const existing = state.pending.find((entry) => entry.id === id);
+  const entry = existing ?? {
+    id,
+    digest: pendingNoticeDigest(decision, options),
+    rule_id: options.ruleId ?? null,
+    first_seen_at: options.now ?? new Date().toISOString(),
+    severity: payload.severity,
+    title: payload.title,
+    body: payload.body,
+    attempts: 0,
+    last_status: null,
+  };
+  if (!existing) state.pending.push(entry);
+  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending.slice(-512), seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: options.now ?? new Date().toISOString() }));
+  return entry;
+}
+
+async function settlePendingNotification(descartesPaths, id, status, now) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const state = await readPendingNotifications(descartesPaths);
+  const index = state.pending.findIndex((entry) => entry.id === id);
+  if (index < 0) return;
+  const [entry] = state.pending.splice(index, 1);
+  state.resolved.push({ ...entry, resolved_at: now, resolution: status });
+  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+}
+
+export async function resolvePendingNotification(descartesPaths, id, status, now = new Date().toISOString()) {
+  return settlePendingNotification(descartesPaths, id, status, now);
+}
+
+export async function viewPendingNotifications(descartesPaths, { now = new Date().toISOString() } = {}) {
+  const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
+  const state = await readPendingNotifications(descartesPaths);
+  if (state.pending.length === 0) return [];
+  const viewed = state.pending.map((entry) => ({ ...entry, seen_at: now, resolution: "viewed" }));
+  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: [], seen: [...state.seen, ...viewed].slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+  return viewed;
 }
 
 async function ensureParent(file) {
@@ -389,30 +458,48 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
   const config = options.config ?? await readNotificationDeliveryConfig(descartesPaths);
   const payload = normalizeNotificationPayload(decision, options);
   const append = (record) => appendDeliveryAudit(descartesPaths, record, options);
+  if (options.required === true) await queuePendingNotification(descartesPaths, decision, options);
+  const finish = async (record) => {
+    if (options.required === true) {
+      const delivered = record?.status === "delivered";
+      const cliViewed = record?.status === "cli_only" && options.allowCliOnly === true;
+      if (delivered || cliViewed) await settlePendingNotification(descartesPaths, options.requiredNoticeId, delivered ? "delivered" : "cli_only", now);
+      else {
+        const state = await readPendingNotifications(descartesPaths);
+        const entry = state.pending.find((candidate) => candidate.id === options.requiredNoticeId);
+        if (entry) {
+          entry.attempts = (entry.attempts ?? 0) + 1;
+          entry.last_status = record?.status ?? "error";
+          await atomicWrite(resolveNotificationDeliveryPaths(descartesPaths).pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
+        }
+      }
+    }
+    return record;
+  };
   if (decision?.notify !== true) {
-    return append({ ts: now, status: "skipped", reason: "notify_false", channel: config.channel, payload });
+    return finish(await append({ ts: now, status: "skipped", reason: "notify_false", channel: config.channel, payload }));
   }
   if (!config.enabled) {
-    return append({ ts: now, status: "disabled", channel: config.channel, payload });
+    return finish(await append({ ts: now, status: "disabled", channel: config.channel, payload }));
   }
   const commandSpec = commandForPayload(config.channel, payload, { ...options, config });
   if (!commandSpec) {
-    return append({ ts: now, status: "cli_only", channel: config.channel, payload });
+    return finish(await append({ ts: now, status: "cli_only", channel: config.channel, payload }));
   }
   if (commandSpec.unavailable) {
-    return append({ ts: now, status: "unavailable", channel: config.channel, reason: commandSpec.unavailable, payload });
+    return finish(await append({ ts: now, status: "unavailable", channel: config.channel, reason: commandSpec.unavailable, payload }));
   }
 
   const runner = options.runner ?? execFileAsync;
   try {
     await runner(commandSpec.command, commandSpec.args, { timeout: options.timeoutMs ?? 5000, maxBuffer: 1024 * 64 });
-    return append({
+    return finish(await append({
       ts: now,
       status: "delivered",
       channel: config.channel,
       command: [commandSpec.command, ...commandSpec.args.slice(0, 3)],
       payload,
-    });
+    }));
   } catch (error) {
     // `open`-launched delivery (best_effort_status): `open` returns a nonzero exit code even on a
     // successful LaunchServices launch, so a NUMERIC-exit rejection is NOT a delivery failure — the
@@ -421,22 +508,22 @@ export async function deliverNotificationDecision(descartesPaths, decision, opti
     // follow-up). Only a spawn failure (`open` itself unrunnable — a string `error.code` like ENOENT)
     // or a timeout/kill is a real error.
     if (commandSpec.best_effort_status && typeof error?.code === "number") {
-      return append({
+      return finish(await append({
         ts: now,
         status: "delivered",
         delivery_confidence: "best_effort",
         channel: config.channel,
         command: [commandSpec.command, ...commandSpec.args.slice(0, 3)],
         payload,
-      });
+      }));
     }
-    return append({
+    return finish(await append({
       ts: now,
       status: "error",
       channel: config.channel,
       error: error instanceof Error ? error.message : String(error),
       payload,
-    });
+    }));
   }
 }
 

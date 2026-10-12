@@ -41,7 +41,7 @@ export async function journalWitness(descartesPaths, family) {
 // (the pre-pass, or label ingestion opening a journal on its own) sends it.
 // A delivery that returned a failure status was not notified (review L2). No per-notice retry is kept
 // across ticks: the digest lists every open epoch and retries its own push until it is delivered.
-const FAILED_DELIVERY_STATUSES = new Set(["error", "unavailable"]);
+const FAILED_DELIVERY_STATUSES = new Set(["error", "unavailable", "disabled", "cli_only"]);
 
 export function notificationOutcome(result) {
   const status = typeof result?.status === "string" ? result.status : null;
@@ -56,7 +56,7 @@ export async function deliverPendingDiscontinuityNotice(descartesPaths, { family
       severity: "warning",
       title: "Descartes: pending journal discontinuity",
       body: `The ${family} pending journal lost continuity (${cause}); unattended admission is suspended for it until re-certification. Detection is unaffected.`,
-    }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID });
+    }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID, required: true, requiredNoticeId: `${PENDING_DISCONTINUITY_NOTICE_ID}:${family}:${cause}` });
     return notificationOutcome(result);
   } catch (error) {
     return { notified: false, notify_status: "error", notify_error: errorMessage(error) };

@@ -8,6 +8,7 @@ export const DEFAULT_ALERT_WINDOW_MS = 15 * 60 * 1000;
 export const DELIVERY_BACKOFF_BASE_MS = 60_000;
 export const DELIVERY_BACKOFF_CAP_MS = 60 * 60 * 1000;
 export const MAX_LIVE_INCIDENTS = 256;
+export const MAX_OVERFLOW_SUMMARY = 1024;
 export const INCIDENT_STORM_KEY = "__incident_storm__";
 export const RETENTION_FAILURE_RULE_ID = "daemon.fact_store.retention_failing";
 
@@ -468,6 +469,11 @@ export function normalizeAlertRecord(record) {
     incident_storm_count: Number.isInteger(record.incident_storm_count) && record.incident_storm_count > 0 ? record.incident_storm_count : 0,
     incident_storm_notified_at: record.incident_storm_notified_at ? normalizeIso(record.incident_storm_notified_at, "incident_storm_notified_at") : null,
     incident_storm_failure_count: Number.isInteger(record.incident_storm_failure_count) && record.incident_storm_failure_count > 0 ? record.incident_storm_failure_count : 0,
+    overflow_summary: Object.fromEntries(Object.entries(record.overflow_summary ?? {}).filter(([key, entry]) => normalizeIncidentKey(key) && entry && typeof entry === "object").slice(-MAX_OVERFLOW_SUMMARY).map(([key, entry]) => [key, {
+      severity_max: String(entry.severity_max ?? "warning"),
+      first_seen: entry.first_seen ? normalizeIso(entry.first_seen, "overflow.first_seen") : firstSeen,
+      last_seen: entry.last_seen ? normalizeIso(entry.last_seen, "overflow.last_seen") : lastSeen,
+    }])),
     legacy_without_episode: legacyWithoutEpisode,
     status,
     // Same-UID state edits are outside prevention, but this marker is durable evidence that the
@@ -671,6 +677,7 @@ function syncAlertProjection(rawAlert) {
     adjudicated_at: current?.adjudicated_at ?? null,
     adjudicated_episode_key: current?.adjudicated_at ? preferredKey : null,
     adjudication: current?.adjudication ?? null,
+    overflow_summary: alert.overflow_summary,
   });
 }
 
@@ -891,8 +898,24 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       }
       const liveIncidentCount = Object.values(next.incidents).filter(isLiveIncident).length;
       if (!previousIncident && liveIncidentCount >= MAX_LIVE_INCIDENTS) {
+        const priorOverflow = next.overflow_summary?.[key];
+        const overflowPayload = candidatePayload(candidate);
+        next.overflow_summary = {
+          ...(next.overflow_summary ?? {}),
+          [key]: {
+            severity_max: alertSeverityRank(overflowPayload.severity) > alertSeverityRank(priorOverflow?.severity_max) ? overflowPayload.severity : (priorOverflow?.severity_max ?? overflowPayload.severity),
+            first_seen: priorOverflow?.first_seen ?? now,
+            last_seen: now,
+          },
+        };
+        if (priorOverflow && alertSeverityRank(overflowPayload.severity) > alertSeverityRank(priorOverflow.severity_max)) escalationsForAlert.push(key);
         overflowCount += 1;
         continue;
+      }
+      if (next.overflow_summary?.[key]) {
+        const overflowSummary = { ...next.overflow_summary };
+        delete overflowSummary[key];
+        next.overflow_summary = overflowSummary;
       }
       touchedKeys.push(key);
       const payload = candidatePayload(candidate);
@@ -959,6 +982,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         && deliveryBackoffEligible(next, new Date(now).getTime())) {
         dueForAlert.push({ alert_id: id, incident_key: INCIDENT_STORM_KEY, storm: true, incident_count: next.incident_storm_count });
       }
+      for (const key of escalationsForAlert) if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
     } else if (wasStorm && liveAfter < MAX_LIVE_INCIDENTS) {
       // I63: the storm exits once the live incidents fall below the cap with no overflow this tick.
       // Live incidents the delivered storm notification covered are marked covered at their current

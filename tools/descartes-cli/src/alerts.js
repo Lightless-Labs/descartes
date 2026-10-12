@@ -14,6 +14,8 @@ import {
   notificationPlatformNotes,
   readNotificationDeliveryConfig,
   testNotificationDelivery,
+  readPendingNotifications,
+  viewPendingNotifications,
   writeNotificationDeliveryConfig,
 } from "./notification-delivery.js";
 
@@ -155,11 +157,15 @@ export function renderAlertList(alerts, options = {}) {
     if (alert.acknowledged_at) lines.push(`  acknowledged_at=${alert.acknowledged_at}`);
     if (alert.delivery_failure_count > 0) lines.push(`  delivery= failing since ${alert.delivery_failing_since ?? alert.last_delivery_failure_at ?? "unknown"} (next attempt ${alert.next_attempt_at ?? "now"}; ${alert.delivery_failure_count} failure${alert.delivery_failure_count === 1 ? "" : "s"}${alert.delivery_failure_reason ? `: ${alert.delivery_failure_reason}` : ""})`);
   }
+  if ((options.pendingNotifications?.length ?? 0) > 0) {
+    lines.push(`Required notices pending: ${options.pendingNotifications.length}`);
+    for (const notice of options.pendingNotifications) lines.push(`- pending notice: ${notice.title} [${notice.digest?.slice(0, 16) ?? "no-digest"}]`);
+  }
   return lines.join("\n");
 }
 
 function jsonAlertPayload(alerts, options = {}) {
-  return { alerts: visibleAlerts(alerts, options) };
+  return { alerts: visibleAlerts(alerts, options), pending_notifications: options.pendingNotifications ?? [] };
 }
 
 // S13 nice-to-have: surface enabled_namespaces + critical_reservation + a corrupt-config marker,
@@ -338,6 +344,7 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     const digest = await (runtime.buildAlertDigest ?? buildAlertDigest)(descartesPaths, { now: runtime.now });
     if (options.json) output(JSON.stringify({ digest }, null, 2));
     else output(renderAlertDigest(digest));
+    await viewPendingNotifications(descartesPaths, { now: runtime.now });
     return;
   }
 
@@ -358,8 +365,11 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     // (recovery + episode/last_notified) remains exclusively the daemon's job via
     // evaluateAndPersistAlerts with the full extraCandidates set.
     const result = await evaluateAlerts(descartesPaths, { coveredAlertIds: fixedAlertIds() });
-    if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, options), notification_due_ids: result.notification_due_ids }, null, 2));
-    else output(renderAlertList(result.alerts, options));
+    const pendingNotifications = (await readPendingNotifications(descartesPaths)).pending;
+    const renderOptions = { ...options, pendingNotifications };
+    if (options.json) output(JSON.stringify({ ...jsonAlertPayload(result.alerts, renderOptions), notification_due_ids: result.notification_due_ids }, null, 2));
+    else output(renderAlertList(result.alerts, renderOptions));
+    await viewPendingNotifications(descartesPaths, { now: runtime.now });
   };
 
   if (options.subcommand === "list") {

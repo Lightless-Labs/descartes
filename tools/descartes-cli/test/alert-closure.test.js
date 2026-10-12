@@ -342,3 +342,13 @@ test("storm_escalation_notifies: an escalation of a never-delivered incident who
   assert.equal(exited.alerts[0].incidents["k-0"].storm_covered_at, null);
   assert.ok(exited.notification_due_incidents.some((entry) => entry.incident_key === "k-0"));
 });
+
+test("overflow_severity_is_retained_and_escalation_notifies_during_storm", () => {
+  const keys = Array.from({ length: MAX_LIVE_INCIDENTS }, (_, index) => `admitted-${index}`);
+  const first = applyAlertCandidates([], [...keys, "overflowed"].map((key) => candidate(key, "warning")), { now: t(0) });
+  const alert = first.alerts[0];
+  assert.equal(alert.overflow_summary.overflowed.severity_max, "warning");
+  const second = applyAlertCandidates([alert], [candidate("overflowed", "critical")], { now: t(1) });
+  assert.ok(second.notification_due_incidents.some((entry) => entry.incident_key === "overflowed"), "an overflow escalation remains visible inside the storm");
+  assert.equal(second.alerts[0].overflow_summary.overflowed.severity_max, "critical");
+});
