@@ -2,6 +2,22 @@
 
 **Last updated:** 2026-10-12
 
+## C1 adversarial review fixes — 2026-10-12 — local, not pushed
+
+The C1 adversarial review at 9e2ff10 (NEEDS-REWORK: 1 BLOCKER, 2 HIGH, 5 MEDIUM, 6 LOW) is fully addressed on
+`feat/c1-alert-foundations-2026-10`, test-first, one atomic commit per fix (`d149a4d`..`c7f3381`). Key changes:
+a covered absence now recovers a closed alert, so a whole-alert label can never silence later recurrences
+(B1); storm exit makes every undelivered, uncovered incident due (H2); each pending-journal checkpoint chains
+its state digest (`checkpointed`), so a checkpoint is never an authority (H1); restart records verify only as
+a chain's first record (M5); epochs and ranges carry across chain-level loss (M2); the transition log carries
+a witness (journal creations, epochs, ingested labels) through compaction, restarts and its state file, read
+by the pre-pass and label ingestion (M3, M1); `edge_rearm` is never a fast recovery (M4); plus L1-L6 (created
+journals exist on disk, notices after detection, escalation clears closure requests, label-log quarantines
+re-applied at a discontinuity, labels bound to their episode, truncation and projection binding in the
+transition log). Dispositions: "C1 review fixes (2026-10-12)" in the plan. Fresh-XDG full `npm test`:
+**2,774 tests: 2,733 pass, 0 fail, 35 skipped, 6 todo**. **NEXT:** re-review / daybreak gate of C1, then
+merge, then C1a (which must wire the §6.4.2 transition-log/journal cross-check). No push or merge.
+
 ## C1 alert foundations — 2026-10-12 — local, not pushed
 
 On `feat/c1-alert-foundations-2026-10` (worktree `.claude/worktrees/c1`, from local `main` @ 8dc00a7), plan
