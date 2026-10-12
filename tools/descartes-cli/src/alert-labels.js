@@ -250,7 +250,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   const fresh = labels.filter((label) => !state.ingested[label.id] && !heldIds.has(label.id) && nowMs - Date.parse(label.ts) <= LABEL_MEMORY_MS);
   const labelById = new Map(labels.map((label) => [label.id, label]));
   const queue = [...state.held.map((entry) => labelById.get(entry.id)).filter(Boolean), ...fresh.sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))];
-  const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [] };
+  const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [], discontinuities: [] };
   if (queue.length === 0 && stateRead.status !== "invalid") return report;
 
   let alerts = await (deps.readAlertRecords ?? readAlertRecords)(descartesPaths);
@@ -267,6 +267,13 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
       if (!handles[family]) {
         try {
           handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts });
+          // Opening a journal can itself detect a discontinuity: it must be audited and notified
+          // exactly like one the pre-pass finds (the epoch re-certifies at the next clean pass).
+          if (handles[family]?.discontinuity) {
+            const { epoch, cause } = handles[family].discontinuity;
+            report.discontinuities.push({ family, epoch, cause });
+            report.audit.push({ kind: "pending_discontinuity", family, epoch, cause, opened_by: "label_ingestion" });
+          }
         } catch {
           handles[family] = null;
         }

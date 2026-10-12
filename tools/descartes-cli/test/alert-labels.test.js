@@ -163,3 +163,25 @@ test("a quarantining label quarantines the alert's pending journal items; an adm
   assert.equal(inspected.state.items[pendingItemId(item)].state, "quarantined");
   assert.equal((await readAlertRecords(paths))[0].status, "active", "the LEVEL episode itself stays open");
 });
+
+test("an epoch opened by label ingestion (no pre-pass handle) is audited and re-certifies at the next clean pass", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(LEVEL_ID, "session.count_drop", "lvl:r:2")]);
+  const ledgerAt = (pass) => {
+    const ledger = createFactIntegrityLedger();
+    ledger.generation = "gen-a";
+    ledger.continuity = { ...ledger.continuity, last_committed_pass_id: pass, continuity_ok: true, pending_pass: null };
+    return ledger;
+  };
+  const { journalCommittedPass, resolvePendingJournalPaths } = await import("../src/pending-journal.js");
+  const passResult = (pass) => ({ written_count: 2, retention: { pass_id: pass, ledger_generation: "gen-a", pass_time_ms: T0 + pass * 1000 } });
+  await journalCommittedPass(paths, "session", { passResult: passResult(1), ledger: ledgerAt(1), ts: iso(1000) });
+  const { journalFile } = resolvePendingJournalPaths(paths, "session");
+  await fs.writeFile(journalFile, `${(await fs.readFile(journalFile, "utf8")).replace("pass_committed", "pass_tampered")}`);
+  await appendAlertLabel(paths, { label: "confirmed_incident", scope: { kind: "alert", alert_id: LEVEL_ID }, now: iso(2000) });
+  const report = await ingestAlertLabels(paths, { now: iso(3000) });
+  assert.equal(report.discontinuities.length, 1);
+  assert.ok(report.audit.some((record) => record.kind === "pending_discontinuity" && record.family === "session" && record.opened_by === "label_ingestion"));
+  const { report: next } = await journalCommittedPass(paths, "session", { passResult: passResult(2), ledger: ledgerAt(2), ts: iso(4000) });
+  assert.equal(next.recertified, report.discontinuities[0].epoch, "the label-opened epoch is not suspended forever");
+});

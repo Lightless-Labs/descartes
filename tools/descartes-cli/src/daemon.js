@@ -9,7 +9,7 @@ import { recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
-import { finishPendingJournalTick, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
+import { deliverPendingDiscontinuityNotice, finishPendingJournalTick, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -2517,6 +2517,9 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       const handles = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).filter(([, result]) => result.handle).map(([family, result]) => [family, result.handle]));
       const ledgers = Object.fromEntries(Object.entries(pendingJournalPrePass?.families ?? {}).map(([family, result]) => [family, result.ledger ?? null]));
       labelIngestion = await (options.ingestAlertLabels ?? ingestAlertLabels)(descartesPaths, { now: ts, handles, ledgers });
+      for (const { family, cause } of labelIngestion?.discontinuities ?? []) {
+        await deliverPendingDiscontinuityNotice(descartesPaths, { family, cause, ts, deliverNotification: options.deliverNotification });
+      }
       if (labelIngestion?.notice) {
         try {
           await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID });

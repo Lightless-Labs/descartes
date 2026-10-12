@@ -613,7 +613,10 @@ export async function journalCommittedPass(descartesPaths, family, { passResult,
   }
   // I54 exit: the first clean, certified pass with a complete census AFTER the break re-certifies.
   const openEpoch = handle.state.epochs.find((epoch) => epoch.epoch === handle.state.open_epoch);
-  if (openEpoch && censusComplete && (passResult.written_count ?? 0) > 0 && Number.isSafeInteger(openEpoch.opened_pass_id) && passId > openEpoch.opened_pass_id) {
+  // An epoch opened outside a pass (e.g. by label ingestion on a fast tick) has no opening pass id:
+  // any later certified non-empty pass is after the break.
+  const afterBreak = openEpoch && (openEpoch.opened_pass_id === null || (Number.isSafeInteger(openEpoch.opened_pass_id) && passId > openEpoch.opened_pass_id));
+  if (openEpoch && censusComplete && (passResult.written_count ?? 0) > 0 && afterBreak) {
     entries.push({ kind: "recertified", epoch: openEpoch.epoch, pass_id: passId, pass_time_ms: retention.pass_time_ms ?? null, carried_item_ids: pendingMembership(handle.state).slice(0, MAX_OPEN_PENDING_ITEMS) });
     report.recertified = openEpoch.epoch;
   }

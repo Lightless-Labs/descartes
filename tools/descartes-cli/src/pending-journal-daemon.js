@@ -33,6 +33,22 @@ async function journalWitness(descartesPaths, family) {
   }
 }
 
+// One integrity notice per epoch (I54 step 5), outside any attention budget. Whoever opens the epoch
+// (the pre-pass, or label ingestion opening a journal on its own) sends it.
+export async function deliverPendingDiscontinuityNotice(descartesPaths, { family, cause, ts, deliverNotification } = {}) {
+  try {
+    await (deliverNotification ?? deliverNotificationDecision)(descartesPaths, {
+      notify: true,
+      severity: "warning",
+      title: "Descartes: pending journal discontinuity",
+      body: `The ${family} pending journal lost continuity (${cause}); unattended admission is suspended for it until re-certification. Detection is unaffected.`,
+    }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID });
+    return { notified: true };
+  } catch (error) {
+    return { notified: false, notify_error: errorMessage(error) };
+  }
+}
+
 export async function runPendingJournalPrePass(descartesPaths, { structuralFacts, ts, deliverNotification, families = PENDING_JOURNAL_FAMILIES } = {}) {
   const results = {};
   for (const family of families) {
@@ -51,19 +67,7 @@ export async function runPendingJournalPrePass(descartesPaths, { structuralFacts
       });
       results[family] = { handle, report, ledger, passId: passResult.retention?.pass_id ?? null };
       if (report.discontinuity) {
-        // One integrity notice per epoch (I54 step 5), outside any attention budget.
-        try {
-          await (deliverNotification ?? deliverNotificationDecision)(descartesPaths, {
-            notify: true,
-            severity: "warning",
-            title: "Descartes: pending journal discontinuity",
-            body: `The ${family} pending journal lost continuity (${report.discontinuity.cause}); unattended admission is suspended for it until re-certification. Detection is unaffected.`,
-          }, { now: ts, ruleId: PENDING_DISCONTINUITY_NOTICE_ID });
-          report.notified = true;
-        } catch (error) {
-          report.notified = false;
-          report.notify_error = errorMessage(error);
-        }
+        Object.assign(report, await deliverPendingDiscontinuityNotice(descartesPaths, { family, cause: report.discontinuity.cause, ts, deliverNotification }));
       }
     } catch (error) {
       // Fail closed for the family: no admission can happen from an unreadable/unwritable journal,
