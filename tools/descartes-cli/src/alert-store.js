@@ -956,7 +956,8 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       // I63: the storm exits once the live incidents fall below the cap with no overflow this tick.
       // Live incidents the delivered storm notification covered are marked covered at their current
       // severity (an escalation still notifies); without a delivered storm notification nothing is
-      // covered, so every undelivered incident becomes due individually (never silence).
+      // covered. EVERY live incident left undelivered and uncovered then becomes due individually,
+      // whether or not it was re-emitted this tick (never silence; adversarial review H2).
       const covered = next.incident_storm_notified_at;
       for (const [key, incident] of Object.entries(next.incidents)) {
         if (!isLiveIncident(incident) || incidentDelivered(incident) || !covered) continue;
@@ -974,9 +975,10 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       next.next_attempt_at = null;
       next.last_attempt_at = null;
       next.backoff_delay_ms = null;
-      for (const key of touchedKeys) {
+      for (const key of Object.keys(next.incidents).sort()) {
         const incident = next.incidents[key];
-        if (next.legacy_without_episode || !notificationDueForIncident(next, incident, { newIncident: !incident.confirmed_at && !incident.storm_covered_at && incident.first_seen === now, nowMs: new Date(now).getTime() })) continue;
+        if (!isLiveIncident(incident) || incidentDelivered(incident)) continue;
+        if (next.legacy_without_episode || !notificationDueForIncident(next, incident, { newIncident: touchedKeys.includes(key) && !incident.confirmed_at && !incident.storm_covered_at && incident.first_seen === now, nowMs: new Date(now).getTime() })) continue;
         if (!dueForAlert.some((entry) => entry.incident_key === key)) dueForAlert.push({ alert_id: id, incident_key: key });
         if (!adjudicationForAlert.some((entry) => entry.incident_key === key)) adjudicationForAlert.push({ alert_id: id, incident_key: key });
       }

@@ -254,6 +254,41 @@ test("storm_exits_below_cap: the storm exits once live incidents fall below the 
   assert.deepEqual(escalated.notification_due_incidents, [{ alert_id: ID, incident_key: "k-20" }]);
 });
 
+// Adversarial review H2: an incident that joined a storm after its notification was delivered is not
+// covered by it; on storm exit it must become due even when the exit tick does not re-emit it.
+test("storm exit makes every live, undelivered, uncovered incident due, not only the keys re-emitted on the exit tick", async () => {
+  const paths = await tempPaths();
+  const covered = new Set();
+  const keys = Array.from({ length: MAX_LIVE_INCIDENTS }, (_, index) => `k${index}`);
+  let applied = applyAlertCandidates([], keys.map((key) => candidate(key)), { now: t(0), coveredAlertIds: covered });
+  await writeAlertRecords(paths, applied.alerts);
+  await recordAlertDeliveryOutcomes(paths, applied.notification_due_incidents.map((entry) => ({ alertId: entry.alert_id, incidentKey: entry.incident_key, status: "success" })), { now: t(1) });
+  applied = applyAlertCandidates(await readAlertRecords(paths), [candidate("overflow1")], { now: t(2), coveredAlertIds: covered });
+  assert.equal(applied.alerts[0].incident_state, "incident_storm");
+  await writeAlertRecords(paths, applied.alerts);
+  await recordAlertDeliveryOutcomes(paths, applied.notification_due_incidents.map((entry) => ({ alertId: entry.alert_id, incidentKey: entry.incident_key, status: "success" })), { now: t(3) });
+  const freed = requestAlertClosure((await readAlertRecords(paths))[0], { incidentKeys: ["k0", "k1"], reason: "label", now: t(4) });
+  assert.deepEqual(freed.closed, ["k0", "k1"]);
+  // "late" joins under the cap while other keys overflow: the storm continues, nothing individual is due.
+  applied = applyAlertCandidates([freed.alert], [candidate("late"), candidate("zz-overflow2"), candidate("zz-overflow3")], { now: t(5), coveredAlertIds: covered });
+  assert.equal(applied.alerts[0].incident_state, "incident_storm");
+  assert.equal(applied.alerts[0].incidents.late.status, "active");
+  const freedAgain = requestAlertClosure(applied.alerts[0], { incidentKeys: ["k2", "k3", "k4"], reason: "label", now: t(5) });
+  // The exit tick re-emits only k5 (delivered long ago).
+  const exited = applyAlertCandidates([freedAgain.alert], [candidate("k5")], { now: t(6), coveredAlertIds: covered });
+  assert.equal(exited.alerts[0].incident_state, "normal");
+  assert.equal(exited.alerts[0].incidents.late.storm_covered_at ?? null, null, "late post-dates the storm notification: never covered by it");
+  // zz-overflow2 also took a freed slot after the storm notification; zz-overflow3 overflowed (never admitted).
+  assert.deepEqual(exited.notification_due_incidents, [{ alert_id: ID, incident_key: "late" }, { alert_id: ID, incident_key: "zz-overflow2" }], "the post-notification incidents are due on the exit tick; nothing delivered or covered is re-notified");
+  assert.ok(exited.adjudication_due_incidents.some((entry) => entry.incident_key === "late"));
+  // A failed attempt is then retried by the retry scan even though "late" is never re-emitted.
+  await writeAlertRecords(paths, exited.alerts);
+  await recordAlertDeliveryFailure(paths, ID, { now: t(6), incidentKey: "late", reason: "unavailable" });
+  await confirmAlertDelivery(paths, ID, { now: t(6), incidentKey: "zz-overflow2" });
+  const retried = applyAlertCandidates(await readAlertRecords(paths), [candidate("k5")], { now: t(90), coveredAlertIds: covered });
+  assert.deepEqual(retried.notification_due_incidents, [{ alert_id: ID, incident_key: "late" }]);
+});
+
 test("tombstone_cap_visible: tombstones are bounded per alert and drops are counted", () => {
   const incidents = {};
   for (let index = 0; index < MAX_INCIDENT_TOMBSTONES + 3; index += 1) {
