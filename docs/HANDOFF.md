@@ -2,6 +2,26 @@
 
 **Last updated:** 2026-10-12
 
+## C1 alert evidence-boundary rework — 2026-10-12 — local, not pushed
+
+Closed the daybreak B1-B5, HIGH 1-3, and MEDIUM 1-2 findings in six atomic commits:
+`8c83f62` (daemon closure attribution and restoration), `3124231` (witness-derived label budget
+and transactional label application), `daeca16` (fail-closed pending-journal recovery, bounded
+checkpoint state and hostile reads), `32a0624` (required notification outbox, CLI visibility and
+overflow severity), `d641b83` (incremental transition verification and chain-sourced digest
+attribution), and `5ff8931` (daemon label/delivery closure witness authorization and visible retry
+failures). Same-UID writes remain `unprotected_same_uid`; they are now detected, hash-chained, and
+surfaced rather than treated as authoritative. Notifications remain optional: disabled/unavailable
+required notices stay pending until delivery or operator viewing.
+
+Focused C1 verification passes **all changed-area tests: 26/26** in the final daemon/label run; the
+earlier slices also passed their focused suites (transitions 18/18, labels 18/18, pending journal
+34/34, notification delivery 24/24, alerts 15/15, closure regressions 17/17, and digest 7/7).
+Fresh-XDG full `npm test` reports **2,789 total: 2,726 passed, 22 failed, 35 skipped, 6 todo**.
+The 22 failures are environment-only: 17 notifier-reuse and 3 tap-bump loopback test-server cases
+fail with `listen EPERM`, and 2 live-process provenance checks return `unknown` under restricted
+process introspection. No changed-area product test failed. No push or merge.
+
 ## C1 adversarial review fixes — 2026-10-12 — local, not pushed
 
 The C1 adversarial review at 9e2ff10 (NEEDS-REWORK: 1 BLOCKER, 2 HIGH, 5 MEDIUM, 6 LOW) is fully addressed on
