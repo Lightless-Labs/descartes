@@ -323,3 +323,56 @@ test("a cut journal verifies through its header; losing the checkpoint after a c
   assert.equal(lost.status, "discontinuity");
   assert.equal(lost.cause, "checkpoint_missing_after_cut");
 });
+
+// Adversarial review M5: a restart record is legitimate only as the first record of a fresh chain.
+import { sealRecord, verifyChain } from "../src/hash-chain.js";
+import { PENDING_JOURNAL_DOMAIN } from "../src/pending-journal.js";
+
+async function quarantinedJournal(paths) {
+  const ledger = ledgerAt(1);
+  const { handle } = await journalCommittedPass(paths, FAMILY, { passResult: passResult(1), ledger, ts: iso(1) });
+  await journalScoredThrough(paths, handle, { ledger, passId: 1, scored: true, ts: iso(1) });
+  await appendPendingEntries(paths, handle, [{ kind: "opened", item_id: idA, item: { ...ITEM, incident_key: "a" }, scored_pass_id: 1, pass_time_ms: T0 + HOUR }], { ledger, now: iso(1) });
+  await appendPendingEntries(paths, handle, [{ kind: "quarantined", item_id: idA, reason: "label" }], { now: iso(1), restrictiveOnly: true });
+  await checkpointPendingJournal(paths, handle, { ledger, passId: 1 });
+  return handle;
+}
+
+test("a mid-chain restart record is a chain break; its carried_state never replaces the state", async () => {
+  const paths = await tempPaths();
+  await quarantinedJournal(paths);
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) });
+  assert.equal(inspected.state.items[idA].state, "quarantined");
+  const carried = structuredClone(inspected.state);
+  delete carried.head_seq;
+  delete carried.head_hash;
+  carried.items[idA].state = "admitted";
+  carried.items[idA].disposition = { source: "earned_promotion" };
+  const forged = sealRecord(PENDING_JOURNAL_DOMAIN, { prevHash: "lost:x", seq: inspected.state.head_seq + 1 }, { v: 1, ts: iso(2), kind: "discontinuity", family: FAMILY, restart: true, epoch: 1, cause: "x", carried_state: carried });
+  await fs.appendFile(journalFile, `${JSON.stringify(forged)}\n`);
+  const after = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) });
+  assert.equal(after.status, "discontinuity");
+  assert.equal(after.cause, "chain_broken");
+  const handle = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
+  assert.equal(handle.state.items[idA].state, "quarantined", "nothing quarantined is ever released");
+});
+
+test("verifyChain accepts a restart citation only on the first record of a chain with no cut header", () => {
+  const first = sealRecord("d", { prevHash: "lost:abc", seq: 1 }, { kind: "x", restart: true });
+  assert.equal(verifyChain("d", [first]).ok, true);
+  const second = sealRecord("d", { prevHash: "lost:def", seq: 2 }, { kind: "x", restart: true });
+  assert.equal(verifyChain("d", [first, second]).ok, false);
+  const header = { kind: "compacted", through_seq: 4, through_hash: "h4" };
+  const afterCut = sealRecord("d", { prevHash: "lost:h4", seq: 5 }, { kind: "x", restart: true });
+  assert.equal(verifyChain("d", [header, afterCut]).ok, false);
+});
+
+test("a non-restart discontinuity entry's carried_state is never folded", () => {
+  const state = foldPendingEntries(emptyPendingState(FAMILY), [
+    { seq: 1, hash: "h1", kind: "opened", item_id: idA, item: ITEM, ts: iso(1) },
+    { seq: 2, hash: "h2", kind: "quarantined", item_id: idA, reason: "label", ts: iso(1) },
+    { seq: 3, hash: "h3", kind: "discontinuity", epoch: 1, cause: "x", ts: iso(2), carried_state: { items: {} } },
+  ]);
+  assert.equal(state.items[idA].state, "quarantined");
+});

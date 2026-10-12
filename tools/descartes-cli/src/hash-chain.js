@@ -84,8 +84,11 @@ export function verifyChain(domain, records, { cutKind = "compacted" } = {}) {
     const record = records[index];
     const { hash, ...rest } = record;
     const expectedSeq = prevSeq + 1;
-    // A restart record legitimately cites a lost head; it must still be the next seq.
-    const citesPrev = record.prev_hash === prevHash || (record.restart === true && typeof record.prev_hash === "string" && record.prev_hash.startsWith("lost:"));
+    // A restart record legitimately cites a lost head, but only as the FIRST record of a fresh chain
+    // (no cut header, seq 1): a writer restarts by rewriting the file. Accepted mid-chain it would let
+    // one appended record replace the state it carries (adversarial review M5).
+    const isChainStart = header === null && verified.length === 0;
+    const citesPrev = record.prev_hash === prevHash || (isChainStart && record.restart === true && typeof record.prev_hash === "string" && record.prev_hash.startsWith("lost:"));
     if (record.seq !== expectedSeq || !citesPrev || typeof hash !== "string" || recordHash(domain, rest) !== hash) {
       return { ok: false, verified, break_at: index, reason: record.seq !== expectedSeq ? "seq_gap" : (!citesPrev ? "prev_hash_mismatch" : "hash_mismatch"), head_seq: prevSeq, head_hash: prevHash, header };
     }

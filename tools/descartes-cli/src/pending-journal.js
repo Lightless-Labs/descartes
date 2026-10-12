@@ -235,7 +235,9 @@ export function foldPendingEntries(initial, entries) {
         if (state.passes[entry.pass_id]) state.passes[entry.pass_id].scored = true;
         break;
       case "discontinuity":
-        if (entry.carried_state) {
+        // Only a chain's own restart record (seq 1, restart:true) carries the surviving state; any
+        // other carried_state is ignored (review M5).
+        if (entry.carried_state && entry.restart === true && entry.seq === 1) {
           const carried = entry.carried_state;
           state = { ...emptyPendingState(state.family), ...carried, head_seq: entry.seq, head_hash: entry.hash };
         }
