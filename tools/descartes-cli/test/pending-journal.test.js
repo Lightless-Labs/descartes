@@ -178,9 +178,10 @@ test("pending_discontinuity_keeps_quarantine and pending_discontinuity_unverifie
   // Corrupt the admission entry: the verified prefix ends before it; the checkpoint (which still says
   // admitted) no longer matches the journal and is only an unverifiable survivor.
   const lines = (await fs.readFile(journalFile, "utf8")).trim().split("\n");
-  const last = JSON.parse(lines.at(-1));
-  last.source = "earned_promotion";
-  lines[lines.length - 1] = JSON.stringify(last);
+  const admissionIndex = lines.findIndex((line) => JSON.parse(line).kind === "admitted");
+  const admission = JSON.parse(lines[admissionIndex]);
+  admission.source = "earned_promotion";
+  lines[admissionIndex] = JSON.stringify(admission);
   await fs.writeFile(journalFile, `${lines.join("\n")}\n`);
   const handle = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
   assert.equal(handle.discontinuity.cause, "chain_broken");
@@ -375,4 +376,38 @@ test("a non-restart discontinuity entry's carried_state is never folded", () => 
     { seq: 3, hash: "h3", kind: "discontinuity", epoch: 1, cause: "x", ts: iso(2), carried_state: { items: {} } },
   ]);
   assert.equal(state.items[idA].state, "quarantined");
+});
+
+// Adversarial review H1: the checkpoint's state is bound to the chain by a chained `checkpointed`
+// entry carrying its digest, so editing it in place is a contradiction, before and after a cut.
+test("editing checkpoint.json state in place (stamp untouched) is checkpoint_contradicts_journal; nothing quarantined is released", async () => {
+  const paths = await tempPaths();
+  await quarantinedJournal(paths);
+  const { checkpointFile } = resolvePendingJournalPaths(paths, FAMILY);
+  const checkpoint = JSON.parse(await fs.readFile(checkpointFile, "utf8"));
+  checkpoint.state.items[idA].state = "admitted";
+  checkpoint.state.items[idA].disposition = { source: "earned_promotion" };
+  checkpoint.state.epochs = [];
+  checkpoint.state.open_epoch = null;
+  await fs.writeFile(checkpointFile, JSON.stringify(checkpoint));
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) });
+  assert.equal(inspected.status, "discontinuity");
+  assert.equal(inspected.cause, "checkpoint_contradicts_journal");
+  const handle = await openPendingJournal(paths, FAMILY, { ledger: ledgerAt(2), now: iso(2), passId: 2 });
+  assert.equal(handle.state.items[idA].state, "quarantined", "the verified journal prefix wins over the edited checkpoint");
+});
+
+test("after a cut, an in-place checkpoint state edit is still a contradiction", async () => {
+  const paths = await tempPaths();
+  const handle = await quarantinedJournal(paths);
+  await checkpointPendingJournal(paths, handle, { ledger: ledgerAt(1), passId: 1, maxJournalBytes: 10 });
+  const { checkpointFile, journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  assert.equal((await fs.readFile(journalFile, "utf8")).trim().split("\n").length, 1, "only the cut header is left");
+  assert.equal((await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) })).status, "valid");
+  const checkpoint = JSON.parse(await fs.readFile(checkpointFile, "utf8"));
+  checkpoint.state.items[idA].state = "admitted";
+  await fs.writeFile(checkpointFile, JSON.stringify(checkpoint));
+  const inspected = await inspectPendingJournal(paths, FAMILY, { ledger: ledgerAt(1) });
+  assert.equal(inspected.status, "discontinuity");
+  assert.equal(inspected.cause, "checkpoint_contradicts_journal");
 });

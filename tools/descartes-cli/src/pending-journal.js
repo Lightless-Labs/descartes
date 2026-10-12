@@ -31,7 +31,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { RULE_HORIZONS } from "./fact-families.js";
 import { RULE_STREAM_KINDS } from "./alert-stream-kinds.js";
-import { appendLines, atomicWrite, canonicalJson, GENESIS_PREV_HASH, readJsonlStrict, sealRecord, trimTornTail, verifyChain } from "./hash-chain.js";
+import { appendLines, atomicWrite, canonicalJson, GENESIS_PREV_HASH, readJsonlStrict, recordHash, sealRecord, trimTornTail, verifyChain } from "./hash-chain.js";
 import crypto from "node:crypto";
 
 export const PENDING_JOURNAL_DOMAIN = "descartes.pending_journal.v1";
@@ -39,10 +39,12 @@ export const PENDING_JOURNAL_SCHEMA_VERSION = 1;
 
 export const PENDING_ENTRY_KINDS = Object.freeze([
   "opened", "added", "admitted", "quarantined", "excluded", "revoked", "scored_through",
-  "pass_committed", "discontinuity", "recertified", "compacted", "label_marked",
+  "pass_committed", "discontinuity", "recertified", "compacted", "label_marked", "checkpointed",
 ]);
 const ENTRY_KIND_SET = new Set(PENDING_ENTRY_KINDS);
-const RESTRICTIVE_KINDS = new Set(["quarantined", "excluded", "compacted", "discontinuity", "label_marked"]);
+// `checkpointed` (review H1) binds a checkpoint's state to the chain: it carries the digest of the
+// state the checkpoint stamped at it holds. It changes no state, so it needs no certification.
+const RESTRICTIVE_KINDS = new Set(["quarantined", "excluded", "compacted", "discontinuity", "label_marked", "checkpointed"]);
 
 // I48: the closed set of explanation sources. federated_signature is reserved and inactive.
 export const EXPLANATION_SOURCES = Object.freeze(["earned_promotion", "bounded_quiet", "context_model", "label"]);
@@ -312,6 +314,15 @@ export function certifyPendingWrite({ ledger, passId, passTimeMs }) {
 
 export class PendingJournalWriteRefused extends Error {}
 
+/**
+ * The digest a `checkpointed` entry chains for a checkpoint's state (review H1): every field but the
+ * head (which the checkpointed entry itself moves), over the state as it round-trips through JSON.
+ */
+export function pendingStateDigest(state) {
+  const { head_seq: _seq, head_hash: _hash, ...rest } = JSON.parse(JSON.stringify(state ?? {}));
+  return crypto.createHash("sha256").update(canonicalJson(rest)).digest("hex");
+}
+
 // ------------------------------------------------------------------------------------------------
 // I/O
 // ------------------------------------------------------------------------------------------------
@@ -363,10 +374,17 @@ export async function inspectPendingJournal(descartesPaths, family, { ledger = n
     const stampSeq = checkpoint.stamp.journal_seq;
     if (stampSeq > chain.head_seq) return { status: "discontinuity", cause: "journal_truncated", state: null, sources };
     if (chain.header && stampSeq < chain.header.through_seq) return { status: "discontinuity", cause: "checkpoint_behind_cut", state: null, sources };
-    const atStamp = stampSeq === 0 ? { hash: GENESIS_PREV_HASH } : (chain.header && stampSeq === chain.header.through_seq
-      ? { hash: chain.header.through_hash }
-      : chain.verified.find((record) => record.seq === stampSeq));
-    if (!atStamp || atStamp.hash !== checkpoint.stamp.journal_head_hash) return { status: "discontinuity", cause: "checkpoint_contradicts_journal", state: null, sources };
+    // Review H1: a checkpoint is an optimisation, never an authority. Its state counts only if the
+    // record it is stamped at is a chained `checkpointed` entry whose digest is that state's. After a
+    // cut the record is gone from the file, so the checkpoint carries it and it must hash to the cut
+    // header's through_hash (the anchor the first record after the cut chains to).
+    const carriedRecord = checkpoint.stamp.record;
+    const atStamp = chain.header && stampSeq === chain.header.through_seq
+      ? (carriedRecord && typeof carriedRecord === "object" && carriedRecord.seq === stampSeq && carriedRecord.hash === chain.header.through_hash
+        && (() => { const { hash, ...rest } = carriedRecord; return recordHash(PENDING_JOURNAL_DOMAIN, rest) === hash; })() ? carriedRecord : null)
+      : chain.verified.find((record) => record.seq === stampSeq);
+    if (!atStamp || atStamp.hash !== checkpoint.stamp.journal_head_hash || atStamp.kind !== "checkpointed"
+      || atStamp.state_digest !== pendingStateDigest(checkpoint.state)) return { status: "discontinuity", cause: "checkpoint_contradicts_journal", state: null, sources };
     state = foldPendingEntries(checkpoint.state, chain.verified.filter((record) => record.seq > stampSeq));
   } else {
     // A missing or unreadable checkpoint with no cut is only an optimisation lost: rebuild.
@@ -492,9 +510,9 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
     carried_state: carried,
   });
   await atomicWrite(paths.journalFile, `${JSON.stringify(first)}\n`);
-  const state = foldPendingEntries(emptyPendingState(family), [first]);
-  await writeCheckpointFile(paths.checkpointFile, family, state, { generation: ledger?.generation ?? null, pass_id: passId, journal_seq: first.seq, journal_head_hash: first.hash });
-  return { family, state, status: "discontinuity", discontinuity: { epoch: nextEpoch, cause: inspected.cause, unexplained_item_id: unexplainedId } };
+  const handle = { family, state: foldPendingEntries(emptyPendingState(family), [first]), status: "discontinuity", discontinuity: { epoch: nextEpoch, cause: inspected.cause, unexplained_item_id: unexplainedId } };
+  await checkpointPendingJournal(descartesPaths, handle, { ledger, passId });
+  return handle;
 }
 
 /**
@@ -535,6 +553,7 @@ export async function appendPendingEntries(descartesPaths, handle, bodies, { led
   await appendLines(journalFile, sealed);
   handle.state = foldPendingEntries(handle.state, sealed);
   handle.appended = (handle.appended ?? 0) + sealed.length;
+  handle.lastSealed = sealed.at(-1);
   return handle;
 }
 
@@ -553,7 +572,12 @@ export async function checkpointPendingJournal(descartesPaths, handle, { ledger 
       item.ticks = item.ticks.filter((tick) => !(Date.parse(tick.ts) <= floorMs));
     }
   }
-  const stamp = { generation: ledger?.generation ?? handle.state.generation ?? null, pass_id: passId, journal_seq: handle.state.head_seq, journal_head_hash: handle.state.head_hash };
+  // Review H1: chain the digest of the state this checkpoint holds, then stamp the checkpoint at that
+  // entry and carry the sealed entry (a cut drops it from the file; the reader re-verifies it).
+  const digest = pendingStateDigest(handle.state);
+  await appendPendingEntries(descartesPaths, handle, [{ kind: "checkpointed", state_digest: digest }], { restrictiveOnly: true });
+  const record = handle.lastSealed;
+  const stamp = { generation: ledger?.generation ?? handle.state.generation ?? null, pass_id: passId, journal_seq: handle.state.head_seq, journal_head_hash: handle.state.head_hash, record };
   await writeCheckpointFile(paths.checkpointFile, handle.family, handle.state, stamp);
   let cut = false;
   try {
