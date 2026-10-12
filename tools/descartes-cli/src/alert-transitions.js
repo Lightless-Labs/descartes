@@ -158,17 +158,101 @@ function closureWitnesses(records = [], extra = []) {
 }
 
 async function priorProjectionForReconciliation(descartesPaths, log) {
+  const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
+  const stateRead = await readState(stateFile);
+  return priorProjectionFromState(log, stateRead);
+}
+
+function priorProjectionFromState(log, stateRead) {
   try {
-    const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
-    const state = JSON.parse(await fs.readFile(stateFile, "utf8"));
-    if (state?.projection?.alerts && Number.isSafeInteger(state.head_seq)) {
-      return foldTransitionRecords(state.projection, (log.records ?? []).filter((record) => record.seq > state.head_seq));
+    if (stateRead.status === "valid" && stateRead.state?.projection?.alerts && Number.isSafeInteger(stateRead.state.head_seq)) {
+      return foldTransitionRecords(stateRead.state.projection, (log.records ?? []).filter((record) => record.seq > stateRead.state.head_seq));
     }
   } catch {
     // A missing/invalid projection cannot prove a prior closure. The next chain record remains a
     // visible rebaseline; never guess a closure witness from the mutable alert store.
   }
   return null;
+}
+
+function closureChangeDigest(alertId, incidentKey, incident) {
+  return crypto.createHash("sha256").update(canonicalJson({
+    alert_id: alertId,
+    incident_key: incidentKey,
+    status: "closed",
+    reason: incident?.closed_reason ?? null,
+    closed_at: incident?.closed_at ?? null,
+    closed_by: incident?.closed_by ?? null,
+  })).digest("hex");
+}
+
+function repairClosedWithoutWitness(current, now, reason) {
+  const repaired = [];
+  const next = current.map((raw) => {
+    const alert = normalizeAlertRecord(raw);
+    let changed = false;
+    const incidents = { ...alert.incidents };
+    for (const [key, incident] of Object.entries(incidents)) {
+      if (incident.status !== "closed") continue;
+      const digest = closureChangeDigest(alert.id, key, incident);
+      incidents[key] = {
+        ...incident,
+        status: "active",
+        confirmed_at: null,
+        notified_severity: null,
+        storm_covered_at: null,
+        storm_covered_severity: null,
+        closed_reason: null,
+        closed_at: null,
+        closed_by: null,
+        close_requested: null,
+        last_attempt_at: null,
+        next_attempt_at: null,
+        backoff_delay_ms: null,
+      };
+      repaired.push({ alert_id: alert.id, incident_key: key, digest });
+      changed = true;
+    }
+    if (alert.status === "closed") {
+      const digest = closureChangeDigest(alert.id, null, alert);
+      repaired.push({ alert_id: alert.id, incident_key: null, digest });
+      changed = true;
+    }
+    if (!changed) return alert;
+    return normalizeAlertRecord({
+      ...alert,
+      status: "active",
+      closed_reason: null,
+      closed_at: null,
+      closed_by: null,
+      close_requested: null,
+      incidents,
+      integrity_status: "unattributed_change",
+      integrity_digest: repaired.at(-1).digest,
+      integrity_at: now,
+    });
+  });
+  return {
+    alerts: next,
+    changes: repaired,
+    audit: repaired.map((change) => ({
+      kind: "unattributed_change",
+      alert_id: change.alert_id,
+      incident_key: change.incident_key,
+      digest: change.digest,
+      status: "repaired",
+      reason: "closure_witness_unavailable",
+      witness_status: "unavailable",
+    })),
+    notices: repaired.map((change) => ({
+      notify: true,
+      severity: "critical",
+      title: "Descartes: alert closure witness unavailable",
+      body: `Reopened ${change.alert_id}${change.incident_key ? `/${change.incident_key}` : ""} because its daemon closure record could not be verified (${reason}). The notification is due again; inspect the transition log.`,
+    })),
+    witness_status: "unavailable",
+    witness_error: reason,
+  };
 }
 
 /**
@@ -178,9 +262,22 @@ async function priorProjectionForReconciliation(descartesPaths, log) {
  */
 export async function reconcileAlertClosures(descartesPaths, { now, alerts, authorizedClosures = [] } = {}) {
   const current = alerts ?? await readAlertRecords(descartesPaths);
-  const log = await readAlertTransitions(descartesPaths);
-  const prior = await priorProjectionForReconciliation(descartesPaths, log);
-  if (!prior) return { alerts: current, changes: [], audit: [], notices: [] };
+  const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
+  const stateRead = await readState(stateFile);
+  let log;
+  try {
+    log = await readAlertTransitions(descartesPaths, {
+      verifiedHead: stateRead.status === "valid" ? stateRead.state.verified_head : null,
+      verifiedContentDigest: stateRead.status === "valid" ? stateRead.state.verified_content_digest : null,
+      timeBudgetMs: 25,
+    });
+  } catch (error) {
+    return repairClosedWithoutWitness(current, new Date(now ?? Date.now()).toISOString(), error?.code ?? error?.message ?? String(error));
+  }
+  const prior = priorProjectionFromState(log, stateRead);
+  if (log.status !== "valid" || !prior) {
+    return repairClosedWithoutWitness(current, new Date(now ?? Date.now()).toISOString(), log.reason ?? (stateRead.status === "missing" ? "projection_missing" : `transition_log_${log.status}`));
+  }
   const authorized = closureWitnesses(log.records, authorizedClosures);
   const at = new Date(now ?? Date.now()).toISOString();
   const repaired = [];
@@ -193,7 +290,7 @@ export async function reconcileAlertClosures(descartesPaths, { now, alerts, auth
     for (const [key, incident] of Object.entries(incidents)) {
       if (incident.status !== "closed" || before.incidents?.[key]?.status === "closed") continue;
       if (authorized.has(closureKey(alert.id, key))) continue;
-      const digest = crypto.createHash("sha256").update(canonicalJson({ alert_id: alert.id, incident_key: key, status: "closed", reason: incident.closed_reason, closed_at: incident.closed_at, closed_by: incident.closed_by })).digest("hex");
+      const digest = closureChangeDigest(alert.id, key, incident);
       const priorIncident = before.incidents?.[key];
       incidents[key] = {
         ...incident,
@@ -213,7 +310,7 @@ export async function reconcileAlertClosures(descartesPaths, { now, alerts, auth
     }
     const alertWasClosed = alert.status === "closed" && before.status !== "closed" && !authorized.has(closureKey(alert.id));
     if (alertWasClosed) {
-      const digest = crypto.createHash("sha256").update(canonicalJson({ alert_id: alert.id, status: "closed", reason: alert.closed_reason, closed_at: alert.closed_at, closed_by: alert.closed_by })).digest("hex");
+      const digest = closureChangeDigest(alert.id, null, alert);
       repaired.push({ alert_id: alert.id, incident_key: null, digest });
       changed = true;
     }
@@ -232,6 +329,8 @@ export async function reconcileAlertClosures(descartesPaths, { now, alerts, auth
       title: "Descartes: unattributed alert-state change",
       body: `Restored ${change.alert_id}${change.incident_key ? `/${change.incident_key}` : ""} from the transition witness; digest ${change.digest.slice(0, 16)}.`,
     })),
+    witness_status: "valid",
+    transitionLog: log,
   };
 }
 
@@ -491,7 +590,7 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
   const { dir, logFile, stateFile, brokenFile } = resolveAlertTransitionPaths(descartesPaths);
   const alerts = options.alerts ?? await readAlertRecords(descartesPaths);
   const stateRead = await readState(stateFile);
-  let log = await readAlertTransitions(descartesPaths, { verifiedHead: stateRead.status === "valid" ? stateRead.state.verified_head : null, verifiedContentDigest: stateRead.status === "valid" ? stateRead.state.verified_content_digest : null, timeBudgetMs: options.verificationBudgetMs ?? 25 });
+  let log = options.verifiedLog ?? await readAlertTransitions(descartesPaths, { verifiedHead: stateRead.status === "valid" ? stateRead.state.verified_head : null, verifiedContentDigest: stateRead.status === "valid" ? stateRead.state.verified_content_digest : null, timeBudgetMs: options.verificationBudgetMs ?? 25 });
   const report = { status: "ok", appended: 0, restarted: null, rebaselined: null };
   let projection;
   const leading = [];

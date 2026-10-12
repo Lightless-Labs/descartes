@@ -214,6 +214,56 @@ test("same_uid_forged_closed_is_restored_and_audited: only a daemon closure witn
   assert.equal(change.digest, repaired.changes.find((entry) => entry.incident_key === "forged").digest);
 });
 
+test("unreadable closure witness fails closed and makes a closed incident due again", async () => {
+  const paths = await tempPaths();
+  const { logFile } = resolveAlertTransitionPaths(paths);
+  await recordAlertTransitions(paths, { now: t(0), alerts: [] });
+  await tick(paths, [candidate("witness-lost")], 1);
+  const [open] = await readAlertRecords(paths);
+  await writeAlertRecords(paths, [normalizeForTestClosure(open, "witness-lost")]);
+  await fs.rm(logFile);
+  await fs.mkdir(logFile, { recursive: true });
+
+  const repaired = await reconcileAlertClosures(paths, { now: t(3) });
+  assert.equal(repaired.witness_status, "unavailable");
+  assert.equal(repaired.alerts[0].status, "active");
+  assert.equal(repaired.alerts[0].incidents["witness-lost"].status, "active");
+  assert.equal(repaired.alerts[0].incidents["witness-lost"].confirmed_at, null, "the unknown closure is due again");
+  assert.ok(repaired.changes.some((change) => change.incident_key === "witness-lost"));
+  assert.ok(repaired.notices.some((notice) => notice.severity === "critical"));
+});
+
+test("closure reconciliation uses the stamped verified head for a large normal log", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: t(0), alerts: [] });
+  await recordAlertTransitions(paths, {
+    now: t(1),
+    extraRecords: Array.from({ length: 10_000 }, (_, index) => ({ kind: "test_audit", index })),
+  });
+  const reconciled = await reconcileAlertClosures(paths, { now: t(2), alerts: [] });
+  assert.equal(reconciled.transitionLog.verification, "incremental");
+});
+
+function normalizeForTestClosure(alert, incidentKey) {
+  return {
+    ...alert,
+    status: "closed",
+    closed_reason: "label",
+    closed_at: t(2),
+    closed_by: { kind: "label", ref: "forged-label" },
+    incidents: {
+      ...alert.incidents,
+      [incidentKey]: {
+        ...alert.incidents[incidentKey],
+        status: "closed",
+        closed_reason: "label",
+        closed_at: t(2),
+        closed_by: { kind: "label", ref: "forged-label" },
+      },
+    },
+  };
+}
+
 test("a missing state over an existing log rebaselines visibly", async () => {
   const paths = await tempPaths();
   const { stateFile } = resolveAlertTransitionPaths(paths);
