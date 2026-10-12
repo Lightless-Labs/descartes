@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
 import { recordAlertTransitions } from "./alert-transitions.js";
+import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
 import { finishPendingJournalTick, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
@@ -2542,6 +2543,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // C1.4 write order (§6.4.2): journal entries, then alerts.json and the transition log, then the
   // scored-through watermark. A family is scored only if the alert store persisted and none of its
   // detectors failed; otherwise its pass stays unscored and is excluded(unadjudicated) next tick.
+  // Context plan C1.5 (I75): the digest, once per period when not empty, outside any attention budget.
+  let alertDigest;
+  if (alerts) {
+    try {
+      alertDigest = await (options.maybeSendAlertDigest ?? maybeSendAlertDigest)(descartesPaths, { now: ts, deliverNotification: options.deliverNotification ?? deliverNotificationDecision });
+    } catch (error) {
+      alertDigest = { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   let pendingJournal;
   if (pendingJournalPrePass) {
     try {
@@ -2554,7 +2564,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       pendingJournal = { status: "error", error: error instanceof Error ? error.message : String(error) };
     }
   }
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion };
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions, pendingJournal, labelIngestion, alertDigest };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";

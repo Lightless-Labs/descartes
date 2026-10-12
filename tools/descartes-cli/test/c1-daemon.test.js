@@ -188,3 +188,17 @@ test("a CLI label is ingested by the daemon's next tick, logged and notified; it
   const log = await readAlertTransitions(paths);
   assert.ok(log.records.some((record) => record.kind === "label_ingested" && record.alert_id === memory.id));
 });
+
+// ------------------------------------------------------------------------------------------------
+// C1.5: the digest rides the end of the tick.
+// ------------------------------------------------------------------------------------------------
+test("the daemon starts the digest clock and evaluates it once per period, pushing nothing when empty", async () => {
+  const paths = await tempPaths();
+  const pushes = [];
+  const extra = { deliverNotification: async (_p, _d, meta) => { pushes.push(meta?.ruleId); return { status: "cli_only" }; } };
+  const [first] = await runTicks(paths, [0.2], { extra });
+  assert.equal(first.alertDigest.status, "started");
+  const [later] = await runTicks(paths, [0.2], { startMinute: 25 * 60, extra });
+  assert.equal(later.alertDigest.status, "empty");
+  assert.equal(pushes.includes("descartes.digest"), false);
+});

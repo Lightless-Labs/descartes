@@ -6,6 +6,7 @@ import {
 } from "./alert-intelligence.js";
 import { acknowledgeAlert, evaluateAlerts, fixedAlertIds, readAlertRecords } from "./alert-store.js";
 import { appendAlertLabel } from "./alert-labels.js";
+import { buildAlertDigest, renderAlertDigest } from "./alert-digest.js";
 import { parseDurationMs } from "./history-store.js";
 import {
   defaultNotificationChannel,
@@ -23,6 +24,7 @@ function alertsUsage() {
   descartes alerts ack <alert-id> [--json]
   descartes alerts label <alert-id> <label> [--incident <key>]... [--json]
   descartes alerts label <label> --family <family> --from <iso> --to <iso> [--json]
+  descartes alerts digest [--json]
   descartes alerts intelligence status [--json]
   descartes alerts intelligence enable [--json] [--model <MODEL>] [--thinking <LEVEL>] [--max-per-hour <N>]
   descartes alerts intelligence disable [--json]
@@ -46,7 +48,7 @@ Notification delivery is separately opt-in and only sends bounded LLM-authored n
 function parseAlertsArgs(args) {
   const [subcommand, ...rest] = args;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") return { subcommand: "help" };
-  if (!["list", "watch", "ack", "label", "intelligence", "notifications"].includes(subcommand)) throw new Error(`Unsupported alerts command: ${subcommand}\n\n${alertsUsage()}`);
+  if (!["list", "watch", "ack", "label", "digest", "intelligence", "notifications"].includes(subcommand)) throw new Error(`Unsupported alerts command: ${subcommand}\n\n${alertsUsage()}`);
   const options = { subcommand, json: false, all: false, intervalMs: 5000, once: false, labelPositionals: [], incidentKeys: [] };
   if (subcommand === "intelligence") {
     options.intelligenceCommand = rest.shift() ?? "status";
@@ -328,6 +330,14 @@ export async function runAlerts(descartesPaths, args, runtime = {}) {
     const record = await (runtime.appendAlertLabel ?? appendAlertLabel)(descartesPaths, { label, scope });
     if (options.json) output(JSON.stringify({ label: record }, null, 2));
     else output(`Recorded label ${record.label} (${record.id}); the daemon applies it on its next tick, charged to the weekly label budget and notified. Labels are optional.`);
+    return;
+  }
+
+  if (options.subcommand === "digest") {
+    // Read-only: the digest since the last pushed period (the daemon pushes it once per period).
+    const digest = await (runtime.buildAlertDigest ?? buildAlertDigest)(descartesPaths, { now: runtime.now });
+    if (options.json) output(JSON.stringify({ digest }, null, 2));
+    else output(renderAlertDigest(digest));
     return;
   }
 
