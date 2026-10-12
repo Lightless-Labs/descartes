@@ -56,6 +56,19 @@ test("digest_lists_every_closure_and_label, open EVENT alerts and open LEVEL epi
   assert.match(renderAlertDigest(digest), /closed alert_e000000000000001\/k1 \(label, label /);
 });
 
+test("digest_closure_source_comes_from_chain_not_current_alert_store", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: iso(0) });
+  await apply(paths, [{ id: EVENT_ID, rule_id: "session.churn", fingerprint: "f", incident_key: "k1", severity: "warning", title: "t", summary: "s", diagnostics: {} }], HOUR);
+  const alert = (await readAlertRecords(paths))[0];
+  const { requestAlertClosure } = await import("../src/alert-store.js");
+  await writeAlertRecords(paths, [requestAlertClosure(alert, { incidentKeys: ["k1"], reason: "label", now: iso(HOUR + 1), by: { kind: "label", ref: "chain-label" } }).alert]);
+  await recordAlertTransitions(paths, { now: iso(HOUR + 2) });
+  await writeAlertRecords(paths, [{ ...alert, incidents: { ...alert.incidents, k1: { ...alert.incidents.k1, status: "active", closed_by: null } } }]);
+  const digest = await buildAlertDigest(paths, { now: iso(2 * HOUR), since: iso(0) });
+  assert.deepEqual(digest.closures[0].source, { kind: "label", ref: "chain-label" });
+});
+
 test("digest_pushed_not_throttled: one push per period, only when not empty; the first run starts the clock", async () => {
   const paths = await tempPaths();
   const pushes = [];

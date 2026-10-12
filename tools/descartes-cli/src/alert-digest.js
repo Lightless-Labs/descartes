@@ -64,9 +64,10 @@ export async function buildAlertDigest(descartesPaths, { now, since } = {}) {
   const byKind = (...kinds) => records.filter((record) => kinds.includes(record.kind));
 
   const closures = byKind("incident_closed", "alert_closed").map((record) => {
-    const alert = alertsById.get(record.alert_id);
-    const closedBy = record.kind === "alert_closed" ? alert?.closed_by : alert?.incidents?.[record.incident_key]?.closed_by;
-    return { ts: record.ts, kind: record.kind, alert_id: record.alert_id, rule_id: record.rule_id, incident_key: record.incident_key ?? null, reason: record.reason ?? null, source: closedBy ?? null };
+    // Closure attribution is part of the chained transition record. The current alert store may
+    // have re-armed, been compacted, or been edited since the closure; it is never a retrospective
+    // source of provenance for a digest.
+    return { ts: record.ts, kind: record.kind, alert_id: record.alert_id, rule_id: record.rule_id, incident_key: record.incident_key ?? null, reason: record.reason ?? null, source: record.source ?? null };
   });
   const labelState = await readJsonOrNull(resolveAlertLabelPaths(descartesPaths).stateFile);
   const journals = {};

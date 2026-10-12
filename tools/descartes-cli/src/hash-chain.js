@@ -43,6 +43,7 @@ export async function readBoundedText(file, { maxBytes = 8 * 1024 * 1024, maxLin
   const chunks = [];
   let bytes = 0;
   let exceeded = false;
+  let lineCount = 0;
   try {
     const chunkSize = Math.min(64 * 1024, maxBytes + 1);
     while (bytes <= maxBytes) {
@@ -58,7 +59,8 @@ export async function readBoundedText(file, { maxBytes = 8 * 1024 * 1024, maxLin
       }
       chunks.push(buffer.subarray(0, bytesRead));
       bytes += bytesRead;
-      if (Buffer.concat(chunks).includes(10) && Buffer.concat(chunks).toString("utf8").split("\n").length > maxLines + 1) {
+      for (const byte of buffer.subarray(0, bytesRead)) if (byte === 10) lineCount += 1;
+      if (lineCount > maxLines) {
         exceeded = true;
         break;
       }
@@ -74,7 +76,8 @@ export async function readJsonlStrict(file, options = {}) {
   if (!bounded.exists) return { exists: false, records: [], torn_tail: false, bad_line: null, bytes: 0, exceeded: false };
   const raw = bounded.text;
   const bytes = bounded.bytes;
-  if (bounded.exceeded) return { exists: true, records: [], torn_tail: false, bad_line: null, bytes, exceeded: true };
+  const contentDigest = crypto.createHash("sha256").update(raw).digest("hex");
+  if (bounded.exceeded) return { exists: true, records: [], torn_tail: false, bad_line: null, bytes, exceeded: true, content_digest: contentDigest };
   const endsWithNewline = raw.endsWith("\n");
   const lines = raw.split("\n");
   if (endsWithNewline) lines.pop();
@@ -87,10 +90,10 @@ export async function readJsonlStrict(file, options = {}) {
       records.push(parsed);
     } catch {
       const isTail = index === lines.length - 1 && !endsWithNewline;
-      return { exists: true, records, torn_tail: isTail, bad_line: isTail ? null : index + 1, bytes, exceeded: false };
+      return { exists: true, records, torn_tail: isTail, bad_line: isTail ? null : index + 1, bytes, exceeded: false, content_digest: contentDigest };
     }
   }
-  return { exists: true, records, torn_tail: false, bad_line: null, bytes, exceeded: false };
+  return { exists: true, records, torn_tail: false, bad_line: null, bytes, exceeded: false, content_digest: contentDigest };
 }
 
 /**
@@ -131,6 +134,31 @@ export function verifyChain(domain, records, { cutKind = "compacted" } = {}) {
     prevSeq = record.seq;
   }
   return { ok: true, verified, break_at: null, reason: null, head_seq: prevSeq, head_hash: prevHash, header };
+}
+
+/** Verify only the suffix after a previously verified hash-chain head. The prefix remains in the
+ * returned verified list so witness folding and projection recovery retain their normal semantics. */
+export function verifyChainIncremental(domain, records, { verifiedHead = null, cutKind = "compacted", timeBudgetMs = 25 } = {}) {
+  if (!verifiedHead || !Number.isSafeInteger(verifiedHead.seq) || verifiedHead.seq <= 0) return { ...verifyChain(domain, records, { cutKind }), verification: "full" };
+  const start = records.findIndex((record) => record.seq === verifiedHead.seq && record.hash === verifiedHead.hash);
+  if (start < 0 || records[0]?.kind === cutKind) return { ...verifyChain(domain, records, { cutKind }), verification: "full_recovery" };
+  let prevHash = verifiedHead.hash;
+  let prevSeq = verifiedHead.seq;
+  const verified = records.slice(0, start + 1);
+  const started = Date.now();
+  for (let index = start + 1; index < records.length; index += 1) {
+    const record = records[index];
+    const { hash, ...rest } = record;
+    const expectedSeq = prevSeq + 1;
+    if (Date.now() - started > timeBudgetMs) return { ok: false, verified, break_at: index, reason: "verification_time_budget", head_seq: prevSeq, head_hash: prevHash, header: null, verification: "incremental" };
+    if (record.seq !== expectedSeq || record.prev_hash !== prevHash || typeof hash !== "string" || recordHash(domain, rest) !== hash) {
+      return { ok: false, verified, break_at: index, reason: record.seq !== expectedSeq ? "seq_gap" : (record.prev_hash !== prevHash ? "prev_hash_mismatch" : "hash_mismatch"), head_seq: prevSeq, head_hash: prevHash, header: null, verification: "incremental" };
+    }
+    verified.push(record);
+    prevHash = hash;
+    prevSeq = record.seq;
+  }
+  return { ok: true, verified, break_at: null, reason: null, head_seq: prevSeq, head_hash: prevHash, header: null, verification: "incremental" };
 }
 
 export async function ensureDir(dir) {

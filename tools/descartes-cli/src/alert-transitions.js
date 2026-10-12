@@ -21,7 +21,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeAlertRecord, readAlertRecords, writeAlertRecords } from "./alert-store.js";
 import { EDGE_REARM_RULE_IDS } from "./alert-stream-kinds.js";
-import { appendLines, atomicWrite, canonicalJson, GENESIS_PREV_HASH, readJsonlStrict, sealRecord, trimTornTail, verifyChain } from "./hash-chain.js";
+import { appendLines, atomicWrite, canonicalJson, GENESIS_PREV_HASH, readJsonlStrict, sealRecord, trimTornTail, verifyChain, verifyChainIncremental } from "./hash-chain.js";
 
 export const ALERT_TRANSITION_DOMAIN = "descartes.alert_transition.v1";
 export const ALERT_TRANSITIONS_SCHEMA_VERSION = 1;
@@ -382,7 +382,7 @@ function pruneTransitionWitness(witness, nowMs) {
  * records only. coverage_from_ts is the latest coverage gap (genesis, rebaseline, restart, or the
  * compaction cut): activations before it are not in the log.
  */
-export async function readAlertTransitions(descartesPaths) {
+export async function readAlertTransitions(descartesPaths, options = {}) {
   const { logFile } = resolveAlertTransitionPaths(descartesPaths);
   const read = await readJsonlStrict(logFile, { maxBytes: MAX_ALERT_TRANSITIONS_BYTES, maxLines: 200000 });
   if (!read.exists) return { status: "missing", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: false };
@@ -391,18 +391,20 @@ export async function readAlertTransitions(descartesPaths) {
     const partial = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
     return { status: "broken", reason: "unparseable_line", records: partial.verified, head_seq: partial.head_seq, head_hash: partial.head_hash, coverage_from_ts: null, torn_tail: false, witness: foldTransitionWitness(partial.header?.carried_witness, partial.verified) };
   }
-  const chain = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
+  const chain = options.verifiedHead && (!options.verifiedContentDigest || options.verifiedContentDigest === read.content_digest)
+    ? verifyChainIncremental(ALERT_TRANSITION_DOMAIN, read.records, { verifiedHead: options.verifiedHead, timeBudgetMs: options.timeBudgetMs ?? 25 })
+    : verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
   const records = chain.verified;
   const witness = foldTransitionWitness(chain.header?.carried_witness, records);
   let coverageFrom = chain.header?.through_ts ?? null;
   for (const record of records) if (COVERAGE_GAP_KINDS.has(record.kind)) coverageFrom = record.ts;
   if (!chain.ok) {
-    return { status: "broken", reason: chain.reason, records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, witness };
+    return { status: "broken", reason: chain.reason, records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, witness, verification: chain.verification ?? "full" };
   }
   if (records.length === 0 && !chain.header) {
     return { status: "missing", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: read.torn_tail, witness };
   }
-  return { status: "valid", records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, bytes: read.bytes, header: chain.header, witness };
+  return { status: "valid", records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, bytes: read.bytes, content_digest: read.content_digest, header: chain.header, witness, verification: chain.verification ?? "full" };
 }
 
 /**
@@ -488,8 +490,8 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
   const now = new Date(options.now ?? Date.now()).toISOString();
   const { dir, logFile, stateFile, brokenFile } = resolveAlertTransitionPaths(descartesPaths);
   const alerts = options.alerts ?? await readAlertRecords(descartesPaths);
-  let log = await readAlertTransitions(descartesPaths);
   const stateRead = await readState(stateFile);
+  let log = await readAlertTransitions(descartesPaths, { verifiedHead: stateRead.status === "valid" ? stateRead.state.verified_head : null, verifiedContentDigest: stateRead.status === "valid" ? stateRead.state.verified_content_digest : null, timeBudgetMs: options.verificationBudgetMs ?? 25 });
   const report = { status: "ok", appended: 0, restarted: null, rebaselined: null };
   let projection;
   const leading = [];
@@ -563,9 +565,10 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
   report.appended = bodies.length;
   report.kinds = Object.fromEntries([...new Set(bodies.map((body) => body.kind))].sort().map((kind) => [kind, bodies.filter((body) => body.kind === kind).length]));
   const witness = pruneTransitionWitness(foldTransitionWitness(priorWitness, bodies), nowMs);
-  await atomicWrite(stateFile, JSON.stringify({ v: ALERT_TRANSITIONS_SCHEMA_VERSION, head_seq: head.head_seq, head_hash: head.head_hash, projection: projectAlerts(alerts), witness, updated_at: now }));
   const maxBytes = options.maxBytes ?? MAX_ALERT_TRANSITIONS_BYTES;
   if (await compactIfNeeded(logFile, maxBytes, nowMs)) report.compacted = true;
+  const latestRead = await readJsonlStrict(logFile, { maxBytes: MAX_ALERT_TRANSITIONS_BYTES, maxLines: 200000 });
+  await atomicWrite(stateFile, JSON.stringify({ v: ALERT_TRANSITIONS_SCHEMA_VERSION, head_seq: head.head_seq, head_hash: head.head_hash, verified_head: { seq: head.head_seq, hash: head.head_hash }, verified_content_digest: latestRead.content_digest ?? null, projection: projectAlerts(alerts), witness, updated_at: now }));
   report.head_seq = head.head_seq;
   return report;
 }

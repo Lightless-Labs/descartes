@@ -76,6 +76,19 @@ test("repeated fire/recover cycles each log one activation, with incidents and r
   assert.equal(quiet.appended, 0);
 });
 
+test("transition_verification_is_incremental_from_the_verified_head", async () => {
+  const paths = await tempPaths();
+  await recordAlertTransitions(paths, { now: t(0) });
+  await tick(paths, [candidate()], 1);
+  const { stateFile } = resolveAlertTransitionPaths(paths);
+  const state = JSON.parse(await fs.readFile(stateFile, "utf8"));
+  await tick(paths, [], 2);
+  const after = JSON.parse(await fs.readFile(stateFile, "utf8"));
+  const verified = await readAlertTransitions(paths, { verifiedHead: state.verified_head, timeBudgetMs: 100 });
+  assert.equal(verified.verification, "incremental");
+  assert.deepEqual(after.verified_head, { seq: after.head_seq, hash: after.head_hash });
+});
+
 test("escalation, closure, CLI acknowledgement and storms are logged", async () => {
   const paths = await tempPaths();
   await recordAlertTransitions(paths, { now: t(0) });
