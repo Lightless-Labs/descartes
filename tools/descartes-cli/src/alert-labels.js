@@ -316,6 +316,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
     const byId = alertsById();
     // Families this label touches: open their journals now if this tick has not.
     const families = label.scope.kind === "alert" ? familiesForRule(byId.get(label.scope.alert_id)?.rule_id) : [label.scope.family];
+    let journalFailed = null;
     for (const family of families) {
       if (!handles[family]) {
         try {
@@ -332,10 +333,21 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
             report.discontinuities.push({ family, epoch, cause });
             report.audit.push({ kind: "pending_discontinuity", family, epoch, cause, opened_by: "label_ingestion" });
           }
-        } catch {
+        } catch (error) {
           handles[family] = null;
+          journalFailed = error;
+          break;
         }
       }
+    }
+    if (journalFailed) {
+      const previous = failedById.get(label.id);
+      const attempts = (previous?.attempts ?? 0) + 1;
+      const exhausted = attempts >= MAX_LABEL_RETRIES;
+      const failure = { id: label.id, attempts, exhausted, retry_at: new Date(nowMs + LABEL_RETRY_DELAY_MS * Math.min(2 ** (attempts - 1), 60)).toISOString(), error: String(journalFailed?.message ?? journalFailed) };
+      failedById.set(label.id, failure);
+      report.audit.push({ kind: "label_retry_failed", label_id: label.id, attempts, exhausted, error: failure.error, phase: "open" });
+      continue;
     }
     const charge = labelCharge(label, byId, handles);
     const remaining = LABEL_BUDGET_UNITS - consumedInWindow(state, nowMs);
@@ -354,7 +366,6 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
     // only after every family append for this label succeeds. A journal write failure leaves the
     // label un-ingested and retryable, so it cannot close an alert without quarantine evidence.
     const pendingEffects = new Map();
-    let journalFailed = null;
     for (const { family, id } of pendingItemsInScope(handles, label, byId)) {
       const handle = handles[family];
       if (!handle) continue;

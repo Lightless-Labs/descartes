@@ -260,6 +260,23 @@ test("label_quarantine_write_is_transactional: journal failure leaves the label 
   assert.equal(retry.ingested.length, 1);
 });
 
+test("label journal open failure aborts the whole label transaction and remains visible for retry", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(LEVEL_ID, "session.count_drop", "lvl:r:2")]);
+  const label = await appendAlertLabel(paths, { label: "confirmed_incident", scope: { kind: "alert", alert_id: LEVEL_ID }, now: iso(2000) });
+  const failed = await ingestAlertLabels(paths, {
+    now: iso(3000),
+    deps: { openPendingJournal: async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); } },
+  });
+  assert.equal(failed.ingested.length, 0);
+  assert.ok(failed.audit.some((entry) => entry.kind === "label_retry_failed" && entry.label_id === label.id));
+  assert.match(failed.notice?.title ?? "", /retry pending/);
+  assert.equal((await readAlertRecords(paths)).find((alert) => alert.id === LEVEL_ID).status, "active");
+  const state = JSON.parse(await fs.readFile(resolveAlertLabelPaths(paths).stateFile, "utf8"));
+  assert.equal(state.ingested[label.id], undefined, "the label is not committed when its journal cannot open");
+  assert.equal(state.failed[0].id, label.id);
+});
+
 test("hostile_label_read_is_capped_at_read_time_and_visible", async () => {
   const paths = await tempPaths();
   const { logFile } = resolveAlertLabelPaths(paths);
