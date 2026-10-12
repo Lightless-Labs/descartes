@@ -129,7 +129,7 @@ test("a closed key re-emitted at a higher severity re-opens and notifies (never 
   assert.equal(escalated.alerts[0].incidents.a.reopened_at, t(3));
 });
 
-test("a closed alert stays closed on re-emitted tombstones, re-arms on a new key, and is never recovered by coverage", async () => {
+test("a closed alert stays closed on re-emitted tombstones, re-arms on a new key, and recovers on a covered absence", async () => {
   const paths = await tempPaths();
   const alert = await deliveredAlert(paths, ["a"]);
   const closed = requestAlertClosure(alert, { reason: "label", now: t(2), closeAlert: true }).alert;
@@ -137,7 +137,9 @@ test("a closed alert stays closed on re-emitted tombstones, re-arms on a new key
   assert.equal(tombstoneOnly.alerts[0].status, "closed");
   assert.deepEqual(tombstoneOnly.notification_due_incidents, []);
   const absent = applyAlertCandidates([closed], [], { now: t(4) });
-  assert.equal(absent.alerts[0].status, "closed", "recovery never flips a closed alert");
+  assert.equal(absent.alerts[0].status, "recovered", "a covered absence ends a closed alert like any other: the next recurrence is a new episode");
+  const uncovered = applyAlertCandidates([closed], [], { now: t(4), coveredAlertIds: new Set() });
+  assert.equal(uncovered.alerts[0].status, "closed", "without coverage nothing is recovered");
   const rearmed = applyAlertCandidates([closed], [candidate("a"), candidate("b")], { now: t(5) });
   assert.equal(rearmed.alerts[0].status, "active");
   assert.equal(rearmed.alerts[0].episode_started_at, t(5), "a closed alert re-arms with a new episode");
@@ -146,6 +148,31 @@ test("a closed alert stays closed on re-emitted tombstones, re-arms on a new key
   await writeAlertRecords(paths, [closed]);
   const acked = await acknowledgeAlert(paths, ID, { now: t(6) });
   assert.equal(acked.status, "closed", "acknowledgement never re-opens a closure");
+});
+
+// Adversarial review B1: a whole-alert closure must never be absorbing. Default-keyed rules capped at
+// warning (service.disappeared, service.appeared, scheduled_job.appeared, process.lineage.novel_edge)
+// can neither present a new key nor a higher severity, so only a covered absence can end the closure.
+test("a closed alert recovers on a covered absence and every later recurrence notifies (closure is never absorbing)", async () => {
+  const SVC = "alert_5e7c000000000001";
+  const svc = () => ({ id: SVC, rule_id: "service.disappeared", fingerprint: "abcdef0123456789", severity: "warning", title: "Service disappeared", summary: "s", diagnostics: {} });
+  const covered = new Set([SVC]);
+  const paths = await tempPaths();
+  const raised = applyAlertCandidates([], [svc()], { now: t(0), coveredAlertIds: covered });
+  assert.deepEqual(raised.notification_due_incidents.map((entry) => entry.incident_key), ["default"]);
+  await writeAlertRecords(paths, raised.alerts);
+  await confirmAlertDelivery(paths, SVC, { now: t(1), incidentKey: "default" });
+  const closed = requestAlertClosure((await readAlertRecords(paths))[0], { reason: "label", now: t(2), closeAlert: true }).alert;
+  assert.equal(closed.status, "closed");
+  let current = applyAlertCandidates([closed], [], { now: t(5), coveredAlertIds: covered }).alerts;
+  assert.equal(current[0].status, "recovered");
+  assert.equal(current[0].close_requested, null, "no alert-level closure request rides into the next episode");
+  for (const minute of [10 * 24 * 60, 40 * 24 * 60]) {
+    const recurrence = applyAlertCandidates(current, [svc()], { now: t(minute), coveredAlertIds: covered });
+    assert.deepEqual(recurrence.notification_due_incidents.map((entry) => entry.incident_key), ["default"], "every recurrence after a covered absence notifies");
+    assert.equal(recurrence.alerts[0].status, "active");
+    current = applyAlertCandidates(recurrence.alerts, [], { now: t(minute + 5), coveredAlertIds: covered }).alerts;
+  }
 });
 
 test("event_incident_closes_on_delivery: a producer-declared close-on-delivery incident closes once delivered; the alert stays active", async () => {

@@ -839,7 +839,9 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       return alertSeverityRank(candidatePayload(candidate).severity) > incidentSeverityRank(incident);
     };
     // `closed` re-arms like `recovered`, but a closed alert whose candidates only re-emit its
-    // tombstoned keys stays closed (no new episode, nothing due).
+    // tombstoned keys stays closed (no new episode, nothing due). Tombstones only absorb CONTINUOUS
+    // re-emission: a covered absence ends a closed alert exactly like an active one (recovery below),
+    // so a recurrence after it is a new episode and notifies (adversarial review B1).
     const closedReopens = current?.status === "closed"
       && [...incidentCandidates.entries()].some(([key, candidate]) => reopensOrNew(key, candidate));
     const newEpisode = !current || current.status === "recovered" || closedReopens
@@ -998,12 +1000,17 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
 
   for (const [id, alert] of byId) {
     const isCovered = !coveredAlertIds || coveredAlertIds.has(alert.id);
-    if (isCovered && !activeCandidateIds.has(id) && ["active", "acknowledged"].includes(alert.status)) {
+    // A closed alert recovers too (review B1): a closure covers the episode it was made on, never a
+    // later recurrence. Without this a default-keyed, severity-capped rule (service.disappeared,
+    // service.appeared, scheduled_job.appeared, process.lineage.novel_edge) closed once would stay
+    // silent forever, since it can present neither a new key nor a higher severity.
+    if (isCovered && !activeCandidateIds.has(id) && ["active", "acknowledged", "closed"].includes(alert.status)) {
       byId.set(id, normalizeAlertRecord({
         ...alert,
         status: "recovered",
         last_seen: now,
         legacy_without_episode: false,
+        close_requested: null,
         // A closed incident stays closed: recovery is about the live condition, and the next
         // episode starts from an empty map anyway (re-arm after positive evidence).
         incidents: Object.fromEntries(Object.entries(alert.incidents ?? {}).map(([key, incident]) => [key, incident.status === "closed" ? incident : { ...incident, status: "recovered" }])),
