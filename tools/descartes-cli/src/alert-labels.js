@@ -121,6 +121,16 @@ export async function readAlertLabels(descartesPaths) {
   return { labels, invalid };
 }
 
+/** The quarantining labels in the log (review L4), as scopes a discontinuity re-applies. Never throws. */
+export async function labelQuarantineScopes(descartesPaths) {
+  try {
+    const { labels } = await readAlertLabels(descartesPaths);
+    return labels.filter((label) => QUARANTINE_LABELS.has(label.label)).map((label) => ({ label_id: label.id, ts: label.ts, scope: label.scope }));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * CLI append. Validates, re-reads the log before appending (pruning entries older than the label
  * memory once the log is past its size bound), and appends one line. Never touches alerts.json.
@@ -303,7 +313,8 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
         try {
           // The same double-wipe witness and epochs the pre-pass consults (review M3).
           const journalWitness = witness?.pending_journals?.[family];
-          handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts, witnessExists: journalWitness?.created === true, priorEpochs: journalWitness?.epochs ?? [] });
+          handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts, witnessExists: journalWitness?.created === true, priorEpochs: journalWitness?.epochs ?? [],
+            quarantineScopes: labels.filter((entry) => QUARANTINE_LABELS.has(entry.label)).map((entry) => ({ label_id: entry.id, ts: entry.ts, scope: entry.scope })) });
           // A journal this ingestion creates is witnessed like one the pre-pass creates.
           if (handles[family]?.created) report.audit.push({ kind: "pending_journal_created", family, opened_by: "label_ingestion" });
           // Opening a journal can itself detect a discontinuity: it must be audited and notified

@@ -508,3 +508,24 @@ test("the pre-pass never delivers; discontinuity notices go out after detection 
   assert.equal(delivered.length, 1);
   assert.equal(prePass.families.session.report.notified, true);
 });
+
+// Adversarial review L4: at a chain-level loss, the label log's quarantining labels are consulted, so a
+// quarantine the lost chain recorded is re-applied to every surviving item in its scope.
+import { appendAlertLabel } from "../src/alert-labels.js";
+
+test("a discontinuity re-applies the label log's quarantines to surviving items (restrictive only)", async () => {
+  const paths = await tempPaths();
+  const ledger = ledgerAt(1);
+  const { handle } = await journalCommittedPass(paths, FAMILY, { passResult: passResult(1), ledger, ts: iso(1) });
+  const opened = { ...ITEM, incident_key: "a" };
+  await appendPendingEntries(paths, handle, [{ kind: "opened", item_id: idA, item: opened, scored_pass_id: 1, pass_time_ms: T0 + HOUR }], { ledger, now: iso(1) });
+  await checkpointPendingJournal(paths, handle, { ledger, passId: 1 });
+  await appendAlertLabel(paths, { label: "suspicious", scope: { kind: "alert", alert_id: ITEM.alert_id }, now: iso(1.5) });
+  // The whole journal is lost; only the checkpoint (now unverifiable) survives, with the item pending.
+  await fs.rm(resolvePendingJournalPaths(paths, FAMILY).journalFile);
+  const prePass = await runPendingJournalPrePass(paths, { structuralFacts: { families: { session: passResult(2) } }, ts: iso(2), families: ["session"] });
+  const after = prePass.families.session.handle;
+  assert.equal(prePass.families.session.report.discontinuity?.cause, "journal_missing");
+  assert.equal(after.state.items[idA].state, "quarantined");
+  assert.equal(after.state.items[idA].disposition.from_unverifiable_source, true);
+});

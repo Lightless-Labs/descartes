@@ -5,6 +5,7 @@
 // Every failure is contained per family and reported; nothing here can fail a tick, change which
 // alerts fire, or delay a notification: the pre-pass, which runs before detection, never delivers
 // anything; its discontinuity notices go out after detection (deliverPendingJournalNotices, review L2).
+import { labelQuarantineScopes } from "./alert-labels.js";
 import { readAlertTransitionWitness } from "./alert-transitions.js";
 import { readFactIntegrityLedger } from "./fact-store-integrity.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
@@ -88,6 +89,8 @@ export async function runPendingJournalPrePass(descartesPaths, { structuralFacts
         ts,
         witnessExists: async () => (await journalWitness(descartesPaths, family)).exists,
         priorEpochs: async () => (await journalWitness(descartesPaths, family)).epochs,
+        // Review L4: the label log's quarantines, re-applied at a chain-level loss.
+        quarantineScopes: () => labelQuarantineScopes(descartesPaths),
         // The census completeness this exit needs is the family's own certified, non-empty commit;
         // C1a, which journals verdicts, tightens it to its detectors' census completeness.
         censusComplete: (passResult.written_count ?? 0) > 0,

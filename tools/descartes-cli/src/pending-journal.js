@@ -398,9 +398,27 @@ export async function inspectPendingJournal(descartesPaths, family, { ledger = n
   return { status: "valid", state, sources, checkpoint_status: checkpointRead.status, torn_tail: read.torn_tail };
 }
 
+/**
+ * Whether a pending item lies in a label's scope (an alert id with optional incident keys, or a
+ * window of this family), counting only items opened no later than the label (review L5).
+ */
+export function pendingItemInLabelScope(family, item, scope, labelTs) {
+  if (!item || !scope) return false;
+  const opened = Date.parse(item.opened_ts ?? "");
+  if (labelTs && Date.parse(labelTs) < opened) return false;
+  if (scope.kind === "alert") {
+    if (item.item?.alert_id !== scope.alert_id) return false;
+    return !scope.incident_keys || scope.incident_keys.includes(item.item?.incident_key);
+  }
+  if (scope.kind === "pending_window") {
+    return scope.family === family && opened >= Date.parse(scope.from_ts) && opened <= Date.parse(scope.to_ts);
+  }
+  return false;
+}
+
 // I54 step 1: surviving terminal dispositions keep their provenance; where sources disagree the most
 // restrictive wins, and an admission recorded only by an unverifiable source is never honoured.
-export function mergeSurvivingDispositions(family, { verifiedState, unverifiableStates = [], unverifiableQuarantines = [] }) {
+export function mergeSurvivingDispositions(family, { verifiedState, unverifiableStates = [], unverifiableQuarantines = [], quarantineScopes = [] }) {
   const merged = verifiedState ? structuredClone(verifiedState) : emptyPendingState(family);
   for (const other of unverifiableStates) {
     for (const [id, item] of Object.entries(other?.items ?? {})) {
@@ -423,6 +441,15 @@ export function mergeSurvivingDispositions(family, { verifiedState, unverifiable
     if (merged.items[id] && merged.items[id].state !== "quarantined") {
       merged.items[id].state = "quarantined";
       merged.items[id].disposition = { reason: "label", from_unverifiable_source: true };
+    }
+  }
+  // Review L4: the label log is an independent survivor. Every quarantining label it holds is
+  // re-applied to the surviving items in its scope (restrictive only: it can never release one).
+  for (const { scope, ts, label_id: labelId } of quarantineScopes) {
+    for (const item of Object.values(merged.items)) {
+      if (item.state === "quarantined" || !pendingItemInLabelScope(family, item, scope, ts)) continue;
+      item.state = "quarantined";
+      item.disposition = { reason: "label", label_id: labelId ?? null, from_unverifiable_source: true };
     }
   }
   return merged;
@@ -449,7 +476,7 @@ function unionEpochs(...lists) {
   return [...byEpoch.values()].sort((left, right) => left.epoch - right.epoch);
 }
 
-export async function openPendingJournal(descartesPaths, family, { ledger = null, now, passId = null, witnessExists = false, priorEpochs = [], unverifiableQuarantines = [] } = {}) {
+export async function openPendingJournal(descartesPaths, family, { ledger = null, now, passId = null, witnessExists = false, priorEpochs = [], unverifiableQuarantines = [], quarantineScopes = [] } = {}) {
   const ts = new Date(now ?? Date.now()).toISOString();
   const paths = resolvePendingJournalPaths(descartesPaths, family);
   const inspected = await inspectPendingJournal(descartesPaths, family, { ledger, witnessExists });
@@ -496,6 +523,14 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
     verifiedState: prefixState,
     unverifiableStates: [checkpointState].filter(Boolean),
     unverifiableQuarantines,
+    quarantineScopes: await (async () => {
+      try {
+        const scopes = typeof quarantineScopes === "function" ? await quarantineScopes() : quarantineScopes;
+        return Array.isArray(scopes) ? scopes : [];
+      } catch {
+        return [];
+      }
+    })(),
   });
   merged.family = family;
   merged.open_epoch = null;
@@ -636,11 +671,11 @@ export async function checkpointPendingJournal(descartesPaths, handle, { ledger 
  * excluded ranges, and re-certifies an open epoch at the first clean pass after the break.
  * `passResult` is the family's appendFactPointsByFamily entry for this tick.
  */
-export async function journalCommittedPass(descartesPaths, family, { passResult, ledger, ts, witnessExists = false, priorEpochs = [], censusComplete = true } = {}) {
+export async function journalCommittedPass(descartesPaths, family, { passResult, ledger, ts, witnessExists = false, priorEpochs = [], quarantineScopes = [], censusComplete = true } = {}) {
   const now = new Date(ts ?? Date.now()).toISOString();
   const retention = passResult?.retention;
   const passId = retention?.pass_id;
-  const handle = await openPendingJournal(descartesPaths, family, { ledger, now, passId: passId ?? null, witnessExists, priorEpochs });
+  const handle = await openPendingJournal(descartesPaths, family, { ledger, now, passId: passId ?? null, witnessExists, priorEpochs, quarantineScopes });
   const report = { family, status: handle.status, discontinuity: handle.discontinuity, created: handle.created === true, mapped: null, excluded_ranges: 0, recertified: null };
   if (!Number.isSafeInteger(passId) || passResult?.append_error || passResult?.retention_error) {
     report.mapped = "no_committed_pass";
