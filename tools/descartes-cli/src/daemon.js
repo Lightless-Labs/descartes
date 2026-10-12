@@ -5,6 +5,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
+import { recordAlertTransitions } from "./alert-transitions.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -2487,7 +2488,20 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     : delivered?.metricAlertFallback
       ?? (alertIntelligenceConfig?.enabled && options.deliverMetricAlertFallback !== false ? { fired: [], skipped: "intelligence_enabled" } : undefined);
   const alertIntelligence = delivered?.alertIntelligence;
-  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation };
+  // Context plan C1.1 (§9): the daemon -- the transition log's only writer -- diffs the persisted
+  // alert store against the log's projection after every write of this tick (detection, delivery
+  // outcomes) and appends the transitions. Audit only: a failure here never affects alerting.
+  let alertTransitions;
+  if (alerts) {
+    try {
+      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, { now: ts });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      alertTransitions = { status: "error", error: message };
+      console.warn(`descartes: alert transition log write failed (${message}); alerting is unaffected`);
+    }
+  }
+  return { evidence, points, write, status, alerts, alertIntelligence, sessionAlertDelivery, metricAlertFallback, alertPersistenceError, structuralEvidence, structuralFacts, shadowEvaluation, alertTransitions };
 }
 
 export const DAEMON_LABEL = "com.lightless-labs.descartes.daemon";
