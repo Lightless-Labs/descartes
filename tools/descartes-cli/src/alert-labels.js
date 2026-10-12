@@ -31,6 +31,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { isUndeliverableStatus, readAlertRecords, requestAlertClosure, writeAlertRecords } from "./alert-store.js";
 import { streamKindForRule } from "./alert-stream-kinds.js";
+import { readAlertTransitionWitness, WITNESS_LABEL_MEMORY_MS } from "./alert-transitions.js";
 import { RULE_HORIZONS } from "./fact-families.js";
 import { atomicWrite } from "./hash-chain.js";
 import { appendPendingEntries, openPendingJournal, PENDING_JOURNAL_FAMILIES, pendingItemId } from "./pending-journal.js";
@@ -47,7 +48,7 @@ export const LABEL_BUDGET_UNITS = 50;
 export const LABEL_BUDGET_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 // C1 addendum (S): how long ingested-label ids are remembered, and the label log's size bound
 // (the CLI prunes ingested-age entries beyond it).
-export const LABEL_MEMORY_MS = 30 * 24 * 60 * 60 * 1000;
+export const LABEL_MEMORY_MS = WITNESS_LABEL_MEMORY_MS;
 export const MAX_LABEL_LOG_BYTES = 1024 * 1024;
 
 const ALERT_ID_RE = /^alert_[0-9a-f]{16}$/;
@@ -246,12 +247,35 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   const { labels, invalid } = await readAlertLabels(descartesPaths);
   const stateRead = await readIngestionState(stateFile);
   const state = stateRead.state;
+  // Review M1: labels.state.json is unchained, so what was ingested (and charged) is rebuilt from the
+  // transition log's witness of chained label_ingested records. A deleted or edited state can then
+  // neither reset the label budget nor re-ingest a label.
+  let rebuiltFromWitness = 0;
+  if (labels.length > 0) {
+    let witness = null;
+    try {
+      witness = await (deps.readAlertTransitionWitness ?? readAlertTransitionWitness)(descartesPaths);
+    } catch {
+      witness = null;
+    }
+    for (const [id, entry] of Object.entries(witness?.labels ?? {})) {
+      if (state.ingested[id]) continue;
+      state.ingested[id] = { ingested_at: entry.ingested_at, charge: entry.charge ?? 0, label: entry.label ?? null, from_witness: true };
+      rebuiltFromWitness += 1;
+    }
+  }
   const heldIds = new Set(state.held.map((entry) => entry.id));
   const fresh = labels.filter((label) => !state.ingested[label.id] && !heldIds.has(label.id) && nowMs - Date.parse(label.ts) <= LABEL_MEMORY_MS);
   const labelById = new Map(labels.map((label) => [label.id, label]));
   const queue = [...state.held.map((entry) => labelById.get(entry.id)).filter(Boolean), ...fresh.sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))];
   const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [], discontinuities: [] };
-  if (queue.length === 0 && stateRead.status !== "invalid") return report;
+  // A missing state with nothing to rebuild is a first use; a state that is invalid, or missing while
+  // the witness proves ingestions, was lost: audited and notified.
+  const stateLost = labels.length > 0 && (stateRead.status === "invalid" || (stateRead.status === "missing" && rebuiltFromWitness > 0));
+  if (stateLost) {
+    report.audit.push({ kind: "label_state_rebuilt", state: stateRead.status, rebuilt_from_witness: rebuiltFromWitness });
+  }
+  if (queue.length === 0 && stateRead.status === "valid") return report;
 
   let alerts = await (deps.readAlertRecords ?? readAlertRecords)(descartesPaths);
   const alertsById = () => new Map(alerts.map((alert) => [alert.id, alert]));
@@ -356,14 +380,14 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   }
   if (alertsChanged) await (deps.writeAlertRecords ?? writeAlertRecords)(descartesPaths, alerts);
   await atomicWrite(stateFile, JSON.stringify({ ...state, updated_at: ts }));
-  if (report.ingested.length > 0 || report.held.length > 0) {
+  if (report.ingested.length > 0 || report.held.length > 0 || stateLost) {
     const closed = report.ingested.reduce((sum, entry) => sum + entry.closed, 0);
     const deferred = report.ingested.reduce((sum, entry) => sum + entry.deferred, 0);
     report.notice = {
       notify: true,
-      severity: report.held.length > 0 ? "warning" : "info",
-      title: report.held.length > 0 ? "Descartes: label budget exceeded" : "Descartes: labels ingested",
-      body: `${report.ingested.length} label${report.ingested.length === 1 ? "" : "s"} ingested (${closed} incident closure${closed === 1 ? "" : "s"}, ${deferred} waiting for delivery); ${report.held.length} held over the label budget.`,
+      severity: report.held.length > 0 || stateLost ? "warning" : "info",
+      title: report.held.length > 0 ? "Descartes: label budget exceeded" : (stateLost ? "Descartes: label state rebuilt" : "Descartes: labels ingested"),
+      body: `${report.ingested.length} label${report.ingested.length === 1 ? "" : "s"} ingested (${closed} incident closure${closed === 1 ? "" : "s"}, ${deferred} waiting for delivery); ${report.held.length} held over the label budget.${stateLost ? ` The label state was ${stateRead.status}; ${rebuiltFromWitness} ingestion${rebuiltFromWitness === 1 ? "" : "s"} rebuilt from the transition log.` : ""}`,
     };
   }
   return report;

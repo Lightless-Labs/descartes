@@ -186,3 +186,44 @@ test("an epoch opened by label ingestion (no pre-pass handle) is audited and re-
   const { report: next } = await journalCommittedPass(paths, "session", { passResult: passResult(2), ledger: ledgerAt(2), ts: iso(4000) });
   assert.equal(next.recertified, report.discontinuities[0].epoch, "the label-opened epoch is not suspended forever");
 });
+
+// Adversarial review M1: deleting (or emptying) labels.state.json must not reset the label budget or
+// re-ingest labels: consumption is rebuilt from the transition log's chained label_ingested records.
+import { recordAlertTransitions } from "../src/alert-transitions.js";
+import { resolveAlertLabelPaths } from "../src/alert-labels.js";
+
+async function daemonIngest(paths, now) {
+  const report = await ingestAlertLabels(paths, { now });
+  await recordAlertTransitions(paths, { now, extraRecords: report.audit });
+  return report;
+}
+
+test("label_log_tamper_bounded_by_label_budget: deleting the label state never resets the budget", async () => {
+  const paths = await tempPaths();
+  const ids = Array.from({ length: 120 }, (_, index) => `alert_e0000000000${String(index).padStart(5, "0")}`.slice(0, 22));
+  await seed(paths, ids.map((id) => candidate(id, "session.churn", "k")));
+  for (const id of ids) await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: id }, now: iso(2000) });
+  const first = await daemonIngest(paths, iso(3000));
+  assert.equal(first.ingested.length, LABEL_BUDGET_UNITS);
+  const { logFile, stateFile } = resolveAlertLabelPaths(paths);
+  const applied = new Set(first.ingested.map((entry) => entry.id));
+  const kept = (await fs.readFile(logFile, "utf8")).split("\n").filter((line) => line && !applied.has(JSON.parse(line).id));
+  await fs.writeFile(logFile, `${kept.join("\n")}\n`);
+  await fs.rm(stateFile);
+  const second = await daemonIngest(paths, iso(4000));
+  assert.equal(second.state, "missing");
+  assert.equal(second.ingested.length, 0, "the budget consumed in the window is rebuilt from the transition log");
+  assert.ok(second.audit.some((record) => record.kind === "label_state_rebuilt" && record.state === "missing" && record.rebuilt_from_witness === LABEL_BUDGET_UNITS));
+  assert.match(second.notice?.body ?? "", /label state/);
+  assert.equal((await readAlertRecords(paths)).filter((alert) => alert.status === "closed").length, LABEL_BUDGET_UNITS);
+});
+
+test("an ingested label is never re-ingested after the label state is lost", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(EVENT_ID, "session.churn", "k1")]);
+  await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: EVENT_ID }, now: iso(2000) });
+  assert.equal((await daemonIngest(paths, iso(3000))).ingested.length, 1);
+  await fs.rm(resolveAlertLabelPaths(paths).stateFile);
+  const again = await daemonIngest(paths, iso(4000));
+  assert.equal(again.ingested.length, 0);
+});
