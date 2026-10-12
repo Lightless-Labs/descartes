@@ -1,6 +1,23 @@
 # Descartes Handoff
 
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-12
+
+## C1 alert foundations — 2026-10-12 — local, not pushed
+
+On `feat/c1-alert-foundations-2026-10` (worktree `.claude/worktrees/c1`, from local `main` @ 8dc00a7), plan
+step C1 of `docs/plans/2026-10-06-context-aware-learned-baselines.md` is built as foundations only, in six
+atomic commits: `284a946` `closed(reason)` incident/alert status with delivery-gated closure, tombstones and
+storm exit/escalation (C1.1, item 19); `34931f3` the daemon-written hash-chained alert transition log
+(C1.1); `73db712` `fired_count` from `activated` transitions, fixing the verified tuning-loop collapse
+(C1.2); `7be24c8` the per-family pending journal with the durable pass map, scored-through watermark,
+certification at write and the discontinuity exit (C1.4, item 16); `8c792ed` the optional label log,
+daemon ingestion and coverage-charged label budget (C1.3, item 15); `45f9cd1` the daily digest (C1.5).
+Detection and what fires are unchanged; notify-once guarantees hold (storm changes only add
+notifications). See "Addendum: C1 execution (2026-10-12)" in the plan for deviations (checkpoint written
+after detection; no replay before C1a; discontinuity and label-burst are notices, not alert rules) and
+deferred items. Fresh-XDG full `npm test`: **2,746 tests: 2,705 pass, 0 fail, 35 skipped, 6 todo**.
+**NEXT:** daybreak gate of C1 (alert-store closure/storm, pending journal, label ingestion), then merge,
+then C1a. No push or merge.
 
 ## Context facts C2b per-family rollback markers — 2026-10-11 — local, not pushed
 
