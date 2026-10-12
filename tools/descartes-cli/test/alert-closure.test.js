@@ -289,6 +289,21 @@ test("storm exit makes every live, undelivered, uncovered incident due, not only
   assert.deepEqual(retried.notification_due_incidents, [{ alert_id: ID, incident_key: "late" }]);
 });
 
+// Adversarial review L3: a closure request covers the incident as it was when requested. An
+// escalation is new information the labeller never saw, so it clears the incident's own request.
+test("an escalation clears an incident's deferred closure request: the escalated incident stays open after delivery", async () => {
+  const paths = await tempPaths();
+  const applied = applyAlertCandidates([], [candidate("a", "warning"), candidate("b", "warning")], { now: t(0) });
+  const requested = requestAlertClosure(applied.alerts[0], { incidentKeys: ["a"], reason: "label", now: t(1) });
+  assert.deepEqual(requested.deferred, ["a"]);
+  const escalated = applyAlertCandidates([requested.alert], [candidate("a", "critical"), candidate("b", "warning")], { now: t(2) });
+  assert.equal(escalated.alerts[0].incidents.a.close_requested ?? null, null);
+  await writeAlertRecords(paths, escalated.alerts);
+  await confirmAlertDelivery(paths, ID, { now: t(3), incidentKey: "a" });
+  const [after] = await readAlertRecords(paths);
+  assert.equal(after.incidents.a.status, "active", "the critical escalation is never closed by a label given on the warning");
+});
+
 test("tombstone_cap_visible: tombstones are bounded per alert and drops are counted", () => {
   const incidents = {};
   for (let index = 0; index < MAX_INCIDENT_TOMBSTONES + 3; index += 1) {

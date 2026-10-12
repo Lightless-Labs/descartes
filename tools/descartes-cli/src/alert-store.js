@@ -925,7 +925,9 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
         // I63: producer-declared close-on-delivery (a learned EVENT incident). Sticky per incident.
         close_on_delivery: incident.close_on_delivery === true || candidate.close_on_delivery === true,
         ...(reopened ? { closed_reason: null, closed_at: null, closed_by: null, close_requested: null, reopened_at: now } : {}),
-        ...(previousIncident && severityEscalated ? { escalated_at: now } : {}),
+        // An escalation is new information: a closure request made on the lower severity never
+        // carries over to it (review L3).
+        ...(previousIncident && severityEscalated ? { escalated_at: now, close_requested: null } : {}),
       };
       const newIncident = !previousIncident;
       const legacySuppressed = next.legacy_without_episode;
