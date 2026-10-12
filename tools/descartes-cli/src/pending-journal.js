@@ -439,7 +439,17 @@ async function writeCheckpointFile(checkpointFile, family, state, stamp) {
  * `unexplained_discontinuity` item for genuinely uncertain membership, an open epoch). Returns a
  * handle { family, state, head: {seq, hash}, discontinuity: {epoch, cause} | null, status }.
  */
-export async function openPendingJournal(descartesPaths, family, { ledger = null, now, passId = null, witnessExists = false, unverifiableQuarantines = [] } = {}) {
+// Epochs as one list, deduplicated by epoch number (the first record of an epoch wins), oldest first.
+function unionEpochs(...lists) {
+  const byEpoch = new Map();
+  for (const epoch of lists.flat()) {
+    if (!epoch || !Number.isSafeInteger(epoch.epoch) || byEpoch.has(epoch.epoch)) continue;
+    byEpoch.set(epoch.epoch, { epoch: epoch.epoch, opened_at: epoch.opened_at ?? null, cause: epoch.cause ?? null, opened_pass_id: epoch.opened_pass_id ?? null, recertified_at: epoch.recertified_at ?? null });
+  }
+  return [...byEpoch.values()].sort((left, right) => left.epoch - right.epoch);
+}
+
+export async function openPendingJournal(descartesPaths, family, { ledger = null, now, passId = null, witnessExists = false, priorEpochs = [], unverifiableQuarantines = [] } = {}) {
   const ts = new Date(now ?? Date.now()).toISOString();
   const paths = resolvePendingJournalPaths(descartesPaths, family);
   const inspected = await inspectPendingJournal(descartesPaths, family, { ledger, witnessExists });
@@ -455,9 +465,19 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
     }
     return handle;
   }
-  const nextEpoch = 1 + Math.max(0, ...(inspected.state?.epochs ?? []).map((epoch) => epoch.epoch),
-    ...(inspected.sources?.checkpoint?.state?.epochs ?? []).map((epoch) => epoch.epoch),
-    ...((inspected.sources?.prefix ?? []).filter((record) => record.kind === "discontinuity").map((record) => record.epoch)));
+  // Review M2: the epochs every survivor knows -- the journal, its checkpoint, the verified prefix,
+  // and the transition log's witness -- so neither the epoch numbering nor the discontinuity budget
+  // restarts when no verified prefix survives.
+  let witnessedEpochs = [];
+  try {
+    witnessedEpochs = (typeof priorEpochs === "function" ? await priorEpochs() : priorEpochs) ?? [];
+  } catch {
+    witnessedEpochs = [];
+  }
+  const prefixEpochs = (inspected.sources?.prefix ?? []).filter((record) => record.kind === "discontinuity")
+    .map((record) => ({ epoch: record.epoch, opened_at: record.ts, cause: record.cause, opened_pass_id: record.pass_id ?? null }));
+  const knownEpochs = unionEpochs(inspected.state?.epochs ?? [], inspected.sources?.checkpoint?.state?.epochs ?? [], prefixEpochs, Array.isArray(witnessedEpochs) ? witnessedEpochs : []);
+  const nextEpoch = 1 + Math.max(0, ...knownEpochs.map((epoch) => epoch.epoch));
   if (inspected.chain_intact) {
     // Generation change: the chain is intact, so every certified entry stays valid; the epoch covers
     // what is scored from now on. Nothing is uncertain yet: no unexplained item.
@@ -479,6 +499,15 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
   });
   merged.family = family;
   merged.open_epoch = null;
+  // An epoch left open by a lost chain is superseded by the one opening now (which re-certifies).
+  merged.epochs = knownEpochs.map((epoch) => (epoch.recertified_at === null ? { ...epoch, superseded_by: nextEpoch } : epoch));
+  const rangeKeys = new Set();
+  merged.ranges = [...(prefixState?.ranges ?? []), ...(checkpointState?.ranges ?? [])].filter((range) => {
+    const key = canonicalJson(range);
+    if (rangeKeys.has(key)) return false;
+    rangeKeys.add(key);
+    return true;
+  }).slice(-MAX_RETAINED_RANGES);
   // I54 step 2: genuinely uncertain membership becomes ONE pending item, from the last certified
   // point (the last mapped observation any survivor knows) to now -- the whole raw window if none.
   const lastCertified = [prefixState?.last_observation_ts, checkpointState?.last_observation_ts].filter(Boolean).sort().at(-1) ?? null;
@@ -607,11 +636,11 @@ export async function checkpointPendingJournal(descartesPaths, handle, { ledger 
  * excluded ranges, and re-certifies an open epoch at the first clean pass after the break.
  * `passResult` is the family's appendFactPointsByFamily entry for this tick.
  */
-export async function journalCommittedPass(descartesPaths, family, { passResult, ledger, ts, witnessExists = false, censusComplete = true } = {}) {
+export async function journalCommittedPass(descartesPaths, family, { passResult, ledger, ts, witnessExists = false, priorEpochs = [], censusComplete = true } = {}) {
   const now = new Date(ts ?? Date.now()).toISOString();
   const retention = passResult?.retention;
   const passId = retention?.pass_id;
-  const handle = await openPendingJournal(descartesPaths, family, { ledger, now, passId: passId ?? null, witnessExists });
+  const handle = await openPendingJournal(descartesPaths, family, { ledger, now, passId: passId ?? null, witnessExists, priorEpochs });
   const report = { family, status: handle.status, discontinuity: handle.discontinuity, created: handle.created === true, mapped: null, excluded_ranges: 0, recertified: null };
   if (!Number.isSafeInteger(passId) || passResult?.append_error || passResult?.retention_error) {
     report.mapped = "no_committed_pass";

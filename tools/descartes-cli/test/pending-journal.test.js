@@ -426,3 +426,41 @@ test("a first tick with no committed pass creates the journal it reports, and th
   assert.equal(next.discontinuity, null);
   assert.equal(next.mapped, "mapped");
 });
+
+// Adversarial review M2: the discontinuity budget counts every epoch any survivor knows, so repeated
+// chain-level loss with no verified prefix still trips it.
+test("repeated first-line corruption still trips the discontinuity budget (epochs carried from every survivor)", async () => {
+  const paths = await tempPaths();
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  let pass = 1;
+  await scoredTick(paths, pass);
+  const seen = [];
+  for (let round = 0; round < 5; round += 1) {
+    const lines = (await fs.readFile(journalFile, "utf8")).split("\n");
+    lines[0] = "{not json";
+    await fs.writeFile(journalFile, lines.join("\n"));
+    pass += 1;
+    const { report } = await scoredTick(paths, pass);
+    pass += 1;
+    const { handle } = await scoredTick(paths, pass);
+    seen.push({ epoch: report.discontinuity?.epoch, admission: pendingAdmissionStatus(handle.state, iso(pass)) });
+  }
+  assert.deepEqual(seen.map((entry) => entry.epoch), [1, 2, 3, 4, 5]);
+  assert.deepEqual(seen.map((entry) => entry.admission.suspended), [false, false, false, true, true], "beyond 3 epochs in the window unattended admission stays suspended");
+});
+
+test("a witnessed double wipe carries the transition log's epochs into the budget", async () => {
+  const paths = await tempPaths();
+  const { dir } = resolvePendingJournalPaths(paths, FAMILY);
+  await scoredTick(paths, 1);
+  await fs.rm(dir, { recursive: true });
+  const priorEpochs = [1, 2, 3].map((epoch) => ({ epoch, opened_at: iso(0.5), cause: "chain_broken" }));
+  const ledger = ledgerAt(2);
+  const { report, handle } = await journalCommittedPass(paths, FAMILY, { passResult: passResult(2), ledger, ts: iso(2), witnessExists: true, priorEpochs });
+  assert.equal(report.discontinuity.cause, "journal_and_checkpoint_missing");
+  assert.equal(report.discontinuity.epoch, 4, "epoch numbers continue across a wipe");
+  assert.deepEqual(handle.state.epochs.map((epoch) => epoch.epoch), [1, 2, 3, 4]);
+  const { handle: after } = await scoredTick(paths, 3);
+  assert.equal(after.state.open_epoch, null, "re-certified");
+  assert.equal(pendingAdmissionStatus(after.state, iso(3)).suspended, true, "the budget still counts the witnessed epochs");
+});
