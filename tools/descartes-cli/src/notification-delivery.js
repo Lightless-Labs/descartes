@@ -10,6 +10,10 @@ import { atomicWrite, canonicalJson } from "./hash-chain.js";
 const execFileAsync = promisify(execFile);
 
 export const NOTIFICATION_CHANNELS = new Set(["cli", "macos-desktop", "macos-native", "linux-desktop", "syslog"]);
+export const MAX_PENDING_NOTIFICATIONS = 512;
+export const NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID = "integrity.notification_outbox";
+const NOTIFICATION_OUTBOX_OVERFLOW_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:overflow`;
+const NOTIFICATION_OUTBOX_CORRUPT_ID = `${NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID}:corrupt`;
 
 export function resolveNotificationDeliveryPaths(descartesPaths) {
   const alertsDir = path.join(descartesPaths.stateDir, "alerts");
@@ -25,6 +29,9 @@ export async function readPendingNotifications(descartesPaths) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   try {
     const parsed = JSON.parse(await fs.readFile(pendingFile, "utf8"));
+    if (parsed?.v !== 1 || !Array.isArray(parsed.pending) || !Array.isArray(parsed.seen) || !Array.isArray(parsed.resolved)) {
+      throw new Error("notification outbox has an invalid schema");
+    }
     return {
       v: 1,
       pending: Array.isArray(parsed?.pending) ? parsed.pending : [],
@@ -33,7 +40,7 @@ export async function readPendingNotifications(descartesPaths) {
     };
   } catch (error) {
     if (error?.code === "ENOENT") return { v: 1, pending: [], seen: [], resolved: [] };
-    return { v: 1, pending: [], seen: [], resolved: [], tamper: error?.message ?? String(error) };
+    return { v: 1, pending: [], seen: [], resolved: [], tamper: { kind: "notification_outbox_corrupt", message: error?.message ?? String(error) } };
   }
 }
 
@@ -41,10 +48,48 @@ function pendingNoticeDigest(decision, options = {}) {
   return crypto.createHash("sha256").update(canonicalJson({ id: options.requiredNoticeId, rule_id: options.ruleId, payload: normalizeNotificationPayload(decision, options) })).digest("hex");
 }
 
+function outboxIntegrityEntry(kind, message, now) {
+  const decision = kind === "overflow"
+    ? { notify: true, severity: "critical", title: "Descartes: required notification outbox overflowed", body: "Required notifications overflowed; unresolved notices are represented by this counted summary." }
+    : { notify: true, severity: "critical", title: "Descartes: required notification outbox corrupt", body: `The required notification outbox was corrupt (${message}); its contents were quarantined and this integrity notice remains pending.` };
+  return {
+    id: kind === "overflow" ? NOTIFICATION_OUTBOX_OVERFLOW_ID : NOTIFICATION_OUTBOX_CORRUPT_ID,
+    digest: pendingNoticeDigest(decision, { requiredNoticeId: kind === "overflow" ? NOTIFICATION_OUTBOX_OVERFLOW_ID : NOTIFICATION_OUTBOX_CORRUPT_ID, ruleId: NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID }),
+    rule_id: NOTIFICATION_OUTBOX_INTEGRITY_RULE_ID,
+    first_seen_at: now,
+    severity: decision.severity,
+    title: decision.title,
+    body: decision.body,
+    attempts: 0,
+    last_status: null,
+    ...(kind === "overflow" ? { notices_overflowed: 0 } : { corruption: message }),
+  };
+}
+
+function updateOverflowSummary(existing, count, now) {
+  const summary = existing ?? outboxIntegrityEntry("overflow", "", now);
+  const noticesOverflowed = (summary.notices_overflowed ?? 0) + count;
+  return {
+    ...summary,
+    notices_overflowed: noticesOverflowed,
+    body: `Required notification outbox overflowed; ${noticesOverflowed} unresolved notice${noticesOverflowed === 1 ? "" : "s"} are represented by this counted summary.`,
+  };
+}
+
+async function writePendingState(pendingFile, state, now) {
+  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending, seen: state.seen.slice(-MAX_PENDING_NOTIFICATIONS), resolved: state.resolved.slice(-MAX_PENDING_NOTIFICATIONS), updated_at: now }));
+}
+
 export async function queuePendingNotification(descartesPaths, decision, options = {}) {
   if (!options.requiredNoticeId) throw new Error("required notification needs requiredNoticeId");
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
-  const state = await readPendingNotifications(descartesPaths);
+  let state = await readPendingNotifications(descartesPaths);
+  const now = options.now ?? new Date().toISOString();
+  if (state.tamper) {
+    const quarantine = `${pendingFile}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
+    await fs.rename(pendingFile, quarantine);
+    state = { v: 1, pending: [outboxIntegrityEntry("corrupt", state.tamper.message, now)], seen: [], resolved: [] };
+  }
   const payload = normalizeNotificationPayload(decision, options);
   const id = String(options.requiredNoticeId);
   const existing = state.pending.find((entry) => entry.id === id);
@@ -59,14 +104,27 @@ export async function queuePendingNotification(descartesPaths, decision, options
     attempts: 0,
     last_status: null,
   };
-  if (!existing) state.pending.push(entry);
-  await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: state.pending.slice(-512), seen: state.seen.slice(-512), resolved: state.resolved.slice(-512), updated_at: options.now ?? new Date().toISOString() }));
-  return entry;
+  if (!existing) {
+    const summary = state.pending.find((candidate) => candidate.id === NOTIFICATION_OUTBOX_OVERFLOW_ID);
+    if (state.pending.length < MAX_PENDING_NOTIFICATIONS) {
+      state.pending.push(entry);
+    } else if (summary) {
+      state.pending = state.pending.filter((candidate) => candidate.id !== summary.id).slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+      state.pending.push(updateOverflowSummary(summary, 1, now));
+    } else {
+      const displaced = Math.max(1, state.pending.length - (MAX_PENDING_NOTIFICATIONS - 1));
+      state.pending = state.pending.slice(0, MAX_PENDING_NOTIFICATIONS - 1);
+      state.pending.push(updateOverflowSummary(undefined, displaced + 1, now));
+    }
+  }
+  await writePendingState(pendingFile, state, now);
+  return existing ?? entry;
 }
 
 async function settlePendingNotification(descartesPaths, id, status, now) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const state = await readPendingNotifications(descartesPaths);
+  if (state.tamper) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
   const index = state.pending.findIndex((entry) => entry.id === id);
   if (index < 0) return;
   const [entry] = state.pending.splice(index, 1);
@@ -81,6 +139,7 @@ export async function resolvePendingNotification(descartesPaths, id, status, now
 export async function viewPendingNotifications(descartesPaths, { now = new Date().toISOString() } = {}) {
   const { pendingFile } = resolveNotificationDeliveryPaths(descartesPaths);
   const state = await readPendingNotifications(descartesPaths);
+  if (state.tamper) throw new Error(`notification outbox corrupt: ${state.tamper.message}`);
   if (state.pending.length === 0) return [];
   const viewed = state.pending.map((entry) => ({ ...entry, seen_at: now, resolution: "viewed" }));
   await atomicWrite(pendingFile, JSON.stringify({ v: 1, pending: [], seen: [...state.seen, ...viewed].slice(-512), resolved: state.resolved.slice(-512), updated_at: now }));
@@ -455,10 +514,10 @@ export async function readNotificationDeliveryAudit(descartesPaths) {
 
 export async function deliverNotificationDecision(descartesPaths, decision, options = {}) {
   const now = normalizeIso(options.now ?? new Date().toISOString(), "now");
+  if (options.required === true) await queuePendingNotification(descartesPaths, decision, options);
   const config = options.config ?? await readNotificationDeliveryConfig(descartesPaths);
   const payload = normalizeNotificationPayload(decision, options);
   const append = (record) => appendDeliveryAudit(descartesPaths, record, options);
-  if (options.required === true) await queuePendingNotification(descartesPaths, decision, options);
   const finish = async (record) => {
     if (options.required === true) {
       const delivered = record?.status === "delivered";

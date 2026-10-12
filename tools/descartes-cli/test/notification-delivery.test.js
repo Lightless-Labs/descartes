@@ -7,6 +7,7 @@ import {
   defaultNotificationChannel,
   deliverNotificationDecision,
   normalizeNotificationPayload,
+  queuePendingNotification,
   notificationDeliveryResolution,
   readNotificationDeliveryAudit,
   readPendingNotifications,
@@ -102,6 +103,62 @@ test("required_unavailable_notice_stays_pending", async () => {
   });
   assert.equal(record.status, "unavailable");
   assert.equal((await readPendingNotifications(paths)).pending[0].id, "discontinuity:abc");
+});
+
+test("required notices are queued before malformed notification config is read", async () => {
+  const paths = await tempPaths();
+  const { configFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(configFile), { recursive: true });
+  await fs.writeFile(configFile, "{ malformed");
+  await assert.rejects(() => deliverNotificationDecision(paths, { notify: true, title: "Integrity", body: "State changed." }, {
+    now: "2026-05-29T00:03:30.000Z",
+    required: true,
+    requiredNoticeId: "integrity:malformed-config",
+    ruleId: "integrity.unattributed_change",
+  }));
+  assert.equal((await readPendingNotifications(paths)).pending[0].id, "integrity:malformed-config");
+});
+
+test("notification outbox overflow keeps a counted summary instead of silently evicting unresolved notices", async () => {
+  const paths = await tempPaths();
+  for (let index = 0; index < 512; index += 1) {
+    await queuePendingNotification(paths, { notify: true, title: `Notice ${index}`, body: "Pending" }, {
+      now: "2026-05-29T00:00:00.000Z",
+      required: true,
+      requiredNoticeId: `notice:${index}`,
+      ruleId: "integrity.test",
+    });
+  }
+  await queuePendingNotification(paths, { notify: true, title: "Notice 512", body: "Pending" }, {
+    now: "2026-05-29T00:00:00.000Z",
+    required: true,
+    requiredNoticeId: "notice:512",
+    ruleId: "integrity.test",
+  });
+  const state = await readPendingNotifications(paths);
+  const summary = state.pending.find((entry) => entry.rule_id === "integrity.notification_outbox");
+  assert.equal(state.pending.length, 512);
+  assert.equal(state.pending.some((entry) => entry.id === "notice:0"), true);
+  assert.equal(summary.notices_overflowed, 2, "the displaced unresolved notice and the new one are both counted");
+  assert.match(summary.body, /2/);
+});
+
+test("corrupt notification outbox is surfaced as a durable integrity notice", async () => {
+  const paths = await tempPaths();
+  const { pendingFile } = resolveNotificationDeliveryPaths(paths);
+  await fs.mkdir(path.dirname(pendingFile), { recursive: true });
+  await fs.writeFile(pendingFile, "not json");
+  assert.equal((await readPendingNotifications(paths)).tamper.kind, "notification_outbox_corrupt");
+  await queuePendingNotification(paths, { notify: true, title: "Alert", body: "Body" }, {
+    now: "2026-05-29T00:04:00.000Z",
+    required: true,
+    requiredNoticeId: "notice:after-corruption",
+    ruleId: "integrity.test",
+  });
+  const state = await readPendingNotifications(paths);
+  assert.ok(state.pending.some((entry) => entry.rule_id === "integrity.notification_outbox"));
+  assert.ok(state.pending.some((entry) => entry.id === "notice:after-corruption"));
+  assert.ok((await fs.readdir(path.dirname(pendingFile))).some((name) => name.startsWith("notification-pending.json.corrupt-")));
 });
 
 test("repeated identical delivery failures append one immutable audit row per attempt", async () => {
