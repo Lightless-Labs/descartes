@@ -5,7 +5,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { adjudicateAlertNotifications, deliverDueAlertNotifications, emitMetricAlertFallbackSignals, emitSessionAlertSignals, readAlertIntelligenceConfig } from "./alert-intelligence.js";
-import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
+import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
 import { loadWatchConfig } from "./watch-store.js";
@@ -2418,10 +2418,10 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
     const finalAlertsById = new Map((containmentAlerts.alerts ?? []).map((alert) => [alert.id, alert]));
     const dueEntryStillApplies = (entry) => {
       const finalAlert = finalAlertsById.get(entry.alert_id);
-      if (!finalAlert || ["recovered", "suppressed"].includes(finalAlert.status)) return false;
+      if (!finalAlert || isUndeliverableStatus(finalAlert.status)) return false;
       if (entry.storm) return finalAlert.incident_state === "incident_storm";
       const incident = finalAlert.incidents?.[entry.incident_key];
-      return Boolean(incident && !["recovered", "suppressed"].includes(incident.status));
+      return Boolean(incident && !isUndeliverableStatus(incident.status));
     };
     alerts = {
       ...containmentAlerts,

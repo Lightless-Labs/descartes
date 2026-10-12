@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { sanitizeDiagnostics } from "./diagnostics-sanitizer.js";
-import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures, recordAlertDeliveryOutcomes } from "./alert-store.js";
+import { alertEpisodeKey, alertSeverityRank, confirmAlertDelivery, INCIDENT_STORM_KEY, isUndeliverableStatus, readAlertRecords, recordAlertAdjudication, recordAlertDeliveryFailure, recordAlertDeliveryFailures, recordAlertDeliveryOutcomes } from "./alert-store.js";
 import { PEER_COUNT_DROP_RULE_ID, PEER_COUNT_SPIKE_RULE_ID } from "./peer-baseline.js";
 import { SERVICE_APPEARED_RULE_ID, SERVICE_DISAPPEARED_RULE_ID } from "./service-baseline.js";
 import { CANARY_TAMPERED_RULE_ID, CANARY_TRIPPED_RULE_ID } from "./canary-baseline.js";
@@ -223,13 +223,13 @@ async function deliveryStillDue(descartesPaths, alert, now, incidentKey = incide
   // The daemon path always has one; only a persisted record can prove that a stale evaluation was
   // already delivered.
   if (!current) return true;
-  if (["recovered", "suppressed"].includes(current.status)) return false;
+  if (isUndeliverableStatus(current.status)) return false;
   if (incidentKey === INCIDENT_STORM_KEY) {
     if (current.incident_storm_notified_at) return false;
     return deliveryStillDueForFields(current, now);
   }
   const incident = current.incidents?.[incidentKey];
-  if (!incident) return false;
+  if (!incident || isUndeliverableStatus(incident.status)) return false;
   const currentRank = alertSeverityRank(incident.severity_max);
   const notifiedRank = alertSeverityRank(incident.notified_severity);
   if (incident.confirmed_at && currentRank <= notifiedRank) return false;
