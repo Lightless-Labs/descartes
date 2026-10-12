@@ -352,3 +352,15 @@ test("overflow_severity_is_retained_and_escalation_notifies_during_storm", () =>
   assert.ok(second.notification_due_incidents.some((entry) => entry.incident_key === "overflowed"), "an overflow escalation remains visible inside the storm");
   assert.equal(second.alerts[0].overflow_summary.overflowed.severity_max, "critical");
 });
+
+test("an untracked overflow key above the delivered storm severity still escalates", async () => {
+  const paths = await tempPaths();
+  const live = Array.from({ length: MAX_LIVE_INCIDENTS }, (_, index) => `live-${String(index).padStart(4, "0")}`);
+  const overflow = Array.from({ length: 1_025 }, (_, index) => `overflow-${String(index).padStart(4, "0")}`);
+  const first = applyAlertCandidates([], [...live, ...overflow].map((key) => candidate(key, "warning")), { now: t(0) });
+  await writeAlertRecords(paths, first.alerts);
+  await confirmAlertDelivery(paths, ID, { now: t(1), incidentKey: INCIDENT_STORM_KEY, severity: "warning" });
+
+  const escalation = applyAlertCandidates(await readAlertRecords(paths), [candidate("overflow-0000", "critical")], { now: t(2) });
+  assert.ok(escalation.notification_due_incidents.some((entry) => entry.incident_key === "overflow-0000"));
+});

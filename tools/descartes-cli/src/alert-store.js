@@ -468,6 +468,7 @@ export function normalizeAlertRecord(record) {
     incident_state: incidentState,
     incident_storm_count: Number.isInteger(record.incident_storm_count) && record.incident_storm_count > 0 ? record.incident_storm_count : 0,
     incident_storm_notified_at: record.incident_storm_notified_at ? normalizeIso(record.incident_storm_notified_at, "incident_storm_notified_at") : null,
+    incident_storm_notified_severity: record.incident_storm_notified_severity ? String(record.incident_storm_notified_severity) : null,
     incident_storm_failure_count: Number.isInteger(record.incident_storm_failure_count) && record.incident_storm_failure_count > 0 ? record.incident_storm_failure_count : 0,
     overflow_summary: Object.fromEntries(Object.entries(record.overflow_summary ?? {}).filter(([key, entry]) => normalizeIncidentKey(key) && entry && typeof entry === "object").slice(-MAX_OVERFLOW_SUMMARY).map(([key, entry]) => [key, {
       severity_max: String(entry.severity_max ?? "warning"),
@@ -879,6 +880,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       incident_state: newEpisode ? "normal" : base.incident_state,
       incident_storm_count: newEpisode ? 0 : base.incident_storm_count,
       incident_storm_notified_at: newEpisode ? null : base.incident_storm_notified_at,
+      incident_storm_notified_severity: newEpisode ? null : base.incident_storm_notified_severity,
       legacy_without_episode: newEpisode ? base.legacy_without_episode : base.legacy_without_episode,
     };
     const wasStorm = next.incident_state === "incident_storm";
@@ -909,6 +911,12 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
           },
         };
         if (priorOverflow && alertSeverityRank(overflowPayload.severity) > alertSeverityRank(priorOverflow.severity_max)) escalationsForAlert.push(key);
+        const stormSeverity = next.incident_storm_notified_severity ?? next.severity;
+        if (!priorOverflow && next.incident_storm_notified_at && alertSeverityRank(overflowPayload.severity) > alertSeverityRank(stormSeverity)) {
+          // The bounded overflow summary may have forgotten this key. Once the storm itself was
+          // delivered, any unseen key above that delivered severity is still an escalation.
+          escalationsForAlert.push(key);
+        }
         overflowCount += 1;
         continue;
       }
@@ -1002,6 +1010,7 @@ export function applyAlertCandidates(existingAlerts, candidates, options = {}) {
       next.incident_key_overflow = false;
       next.incident_storm_count = 0;
       next.incident_storm_notified_at = null;
+      next.incident_storm_notified_severity = null;
       next.incident_storm_failure_count = 0;
       next.next_attempt_at = null;
       next.last_attempt_at = null;
@@ -1164,6 +1173,7 @@ export async function confirmAlertDelivery(descartesPaths, alertIdValue, options
       return syncAlertProjection({
         ...alert,
         incident_storm_notified_at: now,
+        incident_storm_notified_severity: options.severity ?? alert.severity,
         last_notified: now,
         last_attempt_at: now,
         delivery_failure_count: 0,
@@ -1334,6 +1344,7 @@ export async function recordAlertDeliveryOutcomes(descartesPaths, outcomes, opti
         updated.set(alert.id, syncAlertProjection({
           ...alert,
           incident_storm_notified_at: now,
+          incident_storm_notified_severity: outcome.severity ?? alert.severity,
           last_notified: now,
           last_attempt_at: now,
           delivery_failure_count: 0,
@@ -1459,6 +1470,7 @@ export async function acknowledgeAlert(descartesPaths, alertId, options = {}) {
       incident_key_overflow: false,
       incident_storm_count: 0,
       incident_storm_notified_at: null,
+      incident_storm_notified_severity: null,
       incident_storm_failure_count: 0,
       next_attempt_at: null,
       last_attempt_at: null,
