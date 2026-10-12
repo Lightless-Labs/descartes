@@ -437,14 +437,15 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   }
   if (alertsChanged) await (deps.writeAlertRecords ?? writeAlertRecords)(descartesPaths, alerts);
   await atomicWrite(stateFile, JSON.stringify({ ...state, updated_at: ts }));
-  if (report.ingested.length > 0 || report.held.length > 0 || stateLost) {
+  const retryFailures = report.audit.filter((record) => record.kind === "label_retry_failed");
+  if (report.ingested.length > 0 || report.held.length > 0 || retryFailures.length > 0 || stateLost) {
     const closed = report.ingested.reduce((sum, entry) => sum + entry.closed, 0);
     const deferred = report.ingested.reduce((sum, entry) => sum + entry.deferred, 0);
     report.notice = {
       notify: true,
-      severity: report.held.length > 0 || stateLost ? "warning" : "info",
-      title: report.held.length > 0 ? "Descartes: label budget exceeded" : (stateLost ? "Descartes: label state rebuilt" : "Descartes: labels ingested"),
-      body: `${report.ingested.length} label${report.ingested.length === 1 ? "" : "s"} ingested (${closed} incident closure${closed === 1 ? "" : "s"}, ${deferred} waiting for delivery); ${report.held.length} held over the label budget.${stateLost ? ` The label state was ${stateRead.status}; ${rebuiltFromWitness} ingestion${rebuiltFromWitness === 1 ? "" : "s"} rebuilt from the transition log.` : ""}`,
+      severity: report.held.length > 0 || retryFailures.length > 0 || stateLost ? "warning" : "info",
+      title: report.held.length > 0 ? "Descartes: label budget exceeded" : (retryFailures.length > 0 ? "Descartes: label quarantine retry pending" : (stateLost ? "Descartes: label state rebuilt" : "Descartes: labels ingested")),
+      body: `${report.ingested.length} label${report.ingested.length === 1 ? "" : "s"} ingested (${closed} incident closure${closed === 1 ? "" : "s"}, ${deferred} waiting for delivery); ${report.held.length} held over the label budget; ${retryFailures.length} quarantine write retr${retryFailures.length === 1 ? "y" : "ies"} failed.${stateLost ? ` The label state was ${stateRead.status}; ${rebuiltFromWitness} ingestion${rebuiltFromWitness === 1 ? "" : "s"} rebuilt from the transition log.` : ""}`,
     };
   }
   return report;

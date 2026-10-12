@@ -2553,10 +2553,17 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         ...(delivered?.metricAlertFallback?.delivery_outcomes ?? []),
         ...(delivered?.alertIntelligence?.delivery_outcomes ?? []),
       ];
+      const currentAlertsForWitness = await readAlertRecords(descartesPaths);
       const authorizedClosures = deliveryOutcomes
-        .filter((outcome) => outcome.status === "success")
+        .filter((outcome) => {
+          if (outcome.status !== "success") return false;
+          const alert = currentAlertsForWitness.find((entry) => entry.id === outcome.alertId);
+          const incident = alert?.incidents?.[outcome.incidentKey];
+          return incident?.status === "closed" && incident.closed_reason === "event_delivered" && incident.close_on_delivery === true;
+        })
         .map((outcome) => ({ kind: "closure_authorized", alert_id: outcome.alertId, incident_key: outcome.incidentKey, reason: "event_delivered" }));
-      closureReconciliation = await reconcileAlertClosures(descartesPaths, { now: ts, authorizedClosures });
+      const labelAuthorizedClosures = (labelIngestion?.audit ?? []).filter((record) => record.kind === "closure_authorized");
+      closureReconciliation = await reconcileAlertClosures(descartesPaths, { now: ts, authorizedClosures: [...authorizedClosures, ...labelAuthorizedClosures] });
       if (closureReconciliation.changes.length > 0) await writeAlertRecords(descartesPaths, closureReconciliation.alerts);
       for (const [index, notice] of (closureReconciliation.notices ?? []).entries()) {
         await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, notice, {
