@@ -411,8 +411,10 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
     && log.records.some((record) => record.seq === stateRead.state.head_seq && record.hash === stateRead.state.head_hash)) {
     projection = foldTransitionRecords(stateRead.state.projection, log.records.filter((record) => record.seq > stateRead.state.head_seq));
   } else {
-    leading.push({ ts: now, kind: "rebaselined", reason: stateRead.status === "valid" ? "state_mismatch" : `state_${stateRead.status}` });
-    report.rebaselined = stateRead.status === "valid" ? "state_mismatch" : `state_${stateRead.status}`;
+    // Review L6: a state stamped past the log's head means the log lost its tail: a truncation.
+    const reason = stateRead.status !== "valid" ? `state_${stateRead.status}` : (stateRead.state.head_seq > log.head_seq ? "log_truncated" : "state_mismatch");
+    leading.push({ ts: now, kind: "rebaselined", reason });
+    report.rebaselined = reason;
     projection = projectAlerts(alerts);
   }
 

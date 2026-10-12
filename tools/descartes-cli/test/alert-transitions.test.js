@@ -236,3 +236,19 @@ test("the pending-journal witness survives a broken log (restart) and a deleted 
   assert.equal(witness.pending_journals.session.created, true);
   assert.deepEqual(witness.pending_journals.session.epochs.map((epoch) => epoch.epoch), [1]);
 });
+
+// Adversarial review L6: a log that lost its tail behind the state's stamp is a truncation, and says so.
+test("a truncated log tail (state ahead of the log) rebaselines as log_truncated", async () => {
+  const paths = await tempPaths();
+  const { logFile } = resolveAlertTransitionPaths(paths);
+  await recordAlertTransitions(paths, { now: t(0) });
+  await tick(paths, [candidate()], 1);
+  await tick(paths, [], 2);
+  const lines = (await fs.readFile(logFile, "utf8")).trim().split("\n");
+  await fs.writeFile(logFile, `${lines.slice(0, -1).join("\n")}\n`);
+  const report = await recordAlertTransitions(paths, { now: t(3) });
+  assert.equal(report.rebaselined, "log_truncated");
+  const log = await readAlertTransitions(paths);
+  assert.equal(log.records.at(-1).kind, "rebaselined");
+  assert.equal(log.coverage_from_ts, t(3));
+});
