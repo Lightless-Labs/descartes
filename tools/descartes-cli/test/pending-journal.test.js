@@ -529,3 +529,26 @@ test("a discontinuity re-applies the label log's quarantines to surviving items 
   assert.equal(after.state.items[idA].state, "quarantined");
   assert.equal(after.state.items[idA].disposition.from_unverifiable_source, true);
 });
+
+test("a verified prefix headed by a restart record contributes the epochs its carried state holds", async () => {
+  const paths = await tempPaths();
+  const { journalFile, checkpointFile } = resolvePendingJournalPaths(paths, FAMILY);
+  let pass = 1;
+  await scoredTick(paths, pass);
+  for (let round = 0; round < 2; round += 1) {
+    const lines = (await fs.readFile(journalFile, "utf8")).split("\n");
+    lines[0] = "{not json";
+    await fs.writeFile(journalFile, lines.join("\n"));
+    pass += 1;
+    await scoredTick(paths, pass);
+  }
+  // Now break the tail (the prefix keeps the restart record) and lose the checkpoint.
+  const lines = (await fs.readFile(journalFile, "utf8")).trim().split("\n");
+  lines[lines.length - 1] = "{not json";
+  await fs.writeFile(journalFile, `${lines.join("\n")}\n`);
+  await fs.rm(checkpointFile);
+  pass += 1;
+  const { report, handle } = await scoredTick(paths, pass);
+  assert.equal(report.discontinuity.epoch, 3);
+  assert.deepEqual(handle.state.epochs.map((epoch) => epoch.epoch), [1, 2, 3]);
+});

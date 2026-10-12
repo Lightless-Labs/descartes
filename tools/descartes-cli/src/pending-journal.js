@@ -503,7 +503,11 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
   }
   const prefixEpochs = (inspected.sources?.prefix ?? []).filter((record) => record.kind === "discontinuity")
     .map((record) => ({ epoch: record.epoch, opened_at: record.ts, cause: record.cause, opened_pass_id: record.pass_id ?? null }));
-  const knownEpochs = unionEpochs(inspected.state?.epochs ?? [], inspected.sources?.checkpoint?.state?.epochs ?? [], prefixEpochs, Array.isArray(witnessedEpochs) ? witnessedEpochs : []);
+  // The verified prefix folded (a restart record at its head carries earlier epochs in its state).
+  const prefixState = (inspected.sources?.prefix?.length ?? 0) > 0 && !inspected.sources?.header
+    ? foldPendingEntries(emptyPendingState(family), inspected.sources.prefix)
+    : null;
+  const knownEpochs = unionEpochs(inspected.state?.epochs ?? [], inspected.sources?.checkpoint?.state?.epochs ?? [], prefixState?.epochs ?? [], prefixEpochs, Array.isArray(witnessedEpochs) ? witnessedEpochs : []);
   const nextEpoch = 1 + Math.max(0, ...knownEpochs.map((epoch) => epoch.epoch));
   if (inspected.chain_intact) {
     // Generation change: the chain is intact, so every certified entry stays valid; the epoch covers
@@ -514,9 +518,6 @@ export async function openPendingJournal(descartesPaths, family, { ledger = null
   }
   // Chain-level loss: rebuild from every surviving source.
   const checkpointState = inspected.sources?.checkpoint?.state ?? null;
-  const prefixState = (inspected.sources?.prefix?.length ?? 0) > 0 && !inspected.sources?.header
-    ? foldPendingEntries(emptyPendingState(family), inspected.sources.prefix)
-    : null;
   // The verified prefix is the verified source; a checkpoint that no longer matches the journal is
   // unverifiable. With no verified prefix, the checkpoint is the best survivor, still unverifiable.
   const merged = mergeSurvivingDispositions(family, {
