@@ -118,3 +118,21 @@ test("a persistent episode with many incidents is one activation (incidents neve
   const report = computeCalibrationReport(await readAlertRecords(paths), [], [], [], { now: at(5), transitions });
   assert.equal(report.artifacts[0].fired_count, 1);
 });
+
+// Adversarial review M4: an edge-triggered rule's recovery (recovered(edge_rearm), I42) is a re-arm,
+// not evidence the condition cleared quickly, so it never counts as a fast recovery.
+test("incumbent_edge_rearm_logged_not_evidence: recovered(edge_rearm) is never a fast recovery in calibration", () => {
+  const id = "alert_ca1edge000000001";
+  const records = [{ seq: 1, ts: at(0), kind: "genesis" }];
+  let seq = 1;
+  for (let index = 0; index < 8; index += 1) {
+    records.push({ seq: ++seq, ts: at(index + 1), kind: "activated", alert_id: id, rule_id: "session.churn", from: index === 0 ? "absent" : "recovered" });
+    records.push({ seq: ++seq, ts: at(index + 1, 5), kind: "recovered", reason: "edge_rearm", alert_id: id, rule_id: "session.churn" });
+  }
+  const alert = { id, rule_id: "session.churn", fingerprint: "global", status: "recovered", first_seen: at(1), last_seen: at(9), incidents: {}, diagnostics: {} };
+  const report = computeCalibrationReport([alert], [], [], [], { now: at(20), transitions: { status: "valid", records, coverage_from_ts: at(0) } });
+  const [row] = report.artifacts;
+  assert.equal(row.fired_count, 8);
+  assert.equal(row.auto_recovered_fast_count, 0, "an edge re-arm is not a fast recovery");
+  assert.equal(row.chronically_firing, false);
+});

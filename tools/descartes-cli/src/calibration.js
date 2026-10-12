@@ -294,7 +294,9 @@ export function computeCalibrationReport(alerts, auditRecords, deliveryRecords, 
         const later = (recordsByAlertId.get(alert.id) ?? []).filter((other) => new Date(other.ts).getTime() >= startMs && other.seq > record.seq);
         const end = later.find((other) => ["recovered", "alert_closed", "episode_ended", "activated"].includes(other.kind));
         const episodeKey = `${alert.id}\u0000${record.seq}`;
-        if (end?.kind === "recovered" && new Date(end.ts).getTime() - startMs <= fastRecoveryThresholdMs) {
+        // An edge-triggered rule's recovery (recovered(edge_rearm), I42) is a re-arm, not evidence the
+        // condition cleared: it never counts as a fast recovery (review M4).
+        if (end?.kind === "recovered" && end.reason !== "edge_rearm" && new Date(end.ts).getTime() - startMs <= fastRecoveryThresholdMs) {
           autoRecoveredFastCount += 1;
           fastOrSuppressedIds.add(episodeKey);
         }
