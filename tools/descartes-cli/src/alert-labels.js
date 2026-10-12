@@ -176,11 +176,19 @@ function scopedIncidentKeys(alert, scope) {
   return scope.incident_keys ? scope.incident_keys.filter((key) => existing.includes(key)) : existing;
 }
 
-function pendingItemsInScope(handles, scope, alertsById) {
+// Review L5: a label speaks about what existed when it was written. It never reaches an alert episode
+// or a pending item that started after its own timestamp.
+function predatesEpisode(alert, label) {
+  return Boolean(alert?.episode_started_at) && Date.parse(alert.episode_started_at) > Date.parse(label.ts);
+}
+
+function pendingItemsInScope(handles, label, alertsById) {
+  const scope = label.scope;
   const matches = [];
   for (const [family, handle] of Object.entries(handles)) {
     for (const [id, item] of Object.entries(handle?.state?.items ?? {})) {
       if (!["pending", "admitted"].includes(item.state)) continue;
+      if (Date.parse(item.opened_ts ?? "") > Date.parse(label.ts)) continue;
       if (scope.kind === "alert") {
         if (item.item?.alert_id !== scope.alert_id) continue;
         if (scope.incident_keys && !scope.incident_keys.includes(item.item?.incident_key)) continue;
@@ -202,8 +210,9 @@ function pendingItemsInScope(handles, scope, alertsById) {
  * nothing is not free.
  */
 export function labelCharge(label, alertsById, handles) {
-  const items = pendingItemsInScope(handles, label.scope, alertsById).length;
-  const incidents = label.scope.kind === "alert" ? scopedIncidentKeys(alertsById.get(label.scope.alert_id), label.scope).length : 0;
+  const items = pendingItemsInScope(handles, label, alertsById).length;
+  const alert = label.scope.kind === "alert" ? alertsById.get(label.scope.alert_id) : null;
+  const incidents = alert && !predatesEpisode(alert, label) ? scopedIncidentKeys(alert, label.scope).length : 0;
   return Math.max(1, Math.max(incidents, items));
 }
 
@@ -219,6 +228,7 @@ function applyLabelToAlert(alert, label, now) {
   const keys = scopedIncidentKeys(alert, label.scope);
   const none = { alert, closed: [], deferred: [], skipped: keys, effect: "none" };
   if (label.label === "missed_incident") return { ...none, effect: "recall_only" };
+  if (predatesEpisode(alert, label)) return { ...none, effect: "predates_episode" };
   if (!kind) return { ...none, effect: "undeclared_kind" };
   // An incumbent LEVEL episode stays open under every label (C1a, §6.5); a NOVELTY alert stays
   // active under a quarantining label while its entity is present (I74).
@@ -265,7 +275,8 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
     }
   }
   const heldIds = new Set(state.held.map((entry) => entry.id));
-  const fresh = labels.filter((label) => !state.ingested[label.id] && !heldIds.has(label.id) && nowMs - Date.parse(label.ts) <= LABEL_MEMORY_MS);
+  // A future-dated label waits for its own time (review L5: it could otherwise reach any later episode).
+  const fresh = labels.filter((label) => !state.ingested[label.id] && !heldIds.has(label.id) && Date.parse(label.ts) <= nowMs && nowMs - Date.parse(label.ts) <= LABEL_MEMORY_MS);
   const labelById = new Map(labels.map((label) => [label.id, label]));
   const queue = [...state.held.map((entry) => labelById.get(entry.id)).filter(Boolean), ...fresh.sort((a, b) => a.ts.localeCompare(b.ts) || a.id.localeCompare(b.id))];
   const report = { ingested: [], held: [], released: [], invalid, state: stateRead.status, audit: [], discontinuities: [] };
@@ -333,7 +344,7 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
       }
     }
     const journalEffects = [];
-    for (const { family, id } of pendingItemsInScope(handles, label.scope, byId)) {
+    for (const { family, id } of pendingItemsInScope(handles, label, byId)) {
       const handle = handles[family];
       if (!handle) continue;
       const entry = QUARANTINE_LABELS.has(label.label)

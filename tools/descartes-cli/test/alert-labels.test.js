@@ -227,3 +227,31 @@ test("an ingested label is never re-ingested after the label state is lost", asy
   const again = await daemonIngest(paths, iso(4000));
   assert.equal(again.ingested.length, 0);
 });
+
+// Adversarial review L5: a label applies only to the episode that existed when it was written, so a
+// held label released later (or any label) never closes a later episode the labeller never saw.
+test("a label never closes an episode that started after it was written", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(EVENT_ID, "session.churn", "k1")]);
+  const label = await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: EVENT_ID }, now: iso(2000) });
+  // The episode recovers and a new one starts before the daemon ingests the label.
+  let alerts = applyAlertCandidates(await readAlertRecords(paths), [], { now: iso(2500) }).alerts;
+  alerts = applyAlertCandidates(alerts, [candidate(EVENT_ID, "session.churn", "k1")], { now: iso(2600) }).alerts;
+  await writeAlertRecords(paths, alerts);
+  await confirmAlertDelivery(paths, EVENT_ID, { now: iso(2700), incidentKey: "k1" });
+  const report = await ingestAlertLabels(paths, { now: iso(3000) });
+  assert.equal(report.ingested[0].effect, "predates_episode");
+  assert.equal(report.ingested[0].closed, 0);
+  const [alert] = await readAlertRecords(paths);
+  assert.equal(alert.status, "active", "the later episode stays open");
+  assert.equal(label.ts, iso(2000));
+});
+
+test("a future-dated label waits until its time; it is never ingested early", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(EVENT_ID, "session.churn", "k1")]);
+  await appendAlertLabel(paths, { label: "benign", scope: { kind: "alert", alert_id: EVENT_ID }, now: iso(10 * DAY) });
+  const early = await ingestAlertLabels(paths, { now: iso(3000) });
+  assert.equal(early.ingested.length, 0);
+  assert.equal((await readAlertRecords(paths))[0].status, "active");
+});
