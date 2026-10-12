@@ -57,6 +57,30 @@ test("a transition-log failure never affects alerting", async () => {
   assert.ok((await readAlertRecords(paths)).some((alert) => alert.rule_id === "system.memory.sustained_high" && alert.status === "active"));
 });
 
+test("closure integrity audit is recorded before a delivery exception", async () => {
+  const paths = await tempPaths();
+  let captured;
+  const ts = "2026-10-12T00:00:00.000Z";
+  const result = await runDaemonIteration(paths, {
+    collectors: collectorsWithMemory(0.1),
+    ts,
+    now: ts,
+    deliverNotification: async () => { throw new Error("malformed notifications.json"); },
+    reconcileAlertClosures: async () => ({
+      alerts: await readAlertRecords(paths),
+      changes: [{ digest: "a".repeat(64) }],
+      audit: [{ kind: "unattributed_change", alert_id: "alert_test", incident_key: "k", digest: "a".repeat(64) }],
+      notices: [{ notify: true, severity: "critical", title: "Integrity", body: "State changed." }],
+    }),
+    recordAlertTransitions: async (_paths, options) => {
+      captured = options;
+      return { status: "ok" };
+    },
+  });
+  assert.equal(result.alertTransitions.status, "ok");
+  assert.ok(captured.extraRecords.some((record) => record.kind === "unattributed_change"), "the audit is durable before notification delivery runs");
+});
+
 // ------------------------------------------------------------------------------------------------
 // C1.4: the pending journal rides every completed structural tick.
 // ------------------------------------------------------------------------------------------------

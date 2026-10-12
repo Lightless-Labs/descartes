@@ -2546,6 +2546,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   }
   let alertTransitions;
   let closureReconciliation;
+  let authorizedClosures = [];
+  let labelAuthorizedClosures = [];
   if (alerts || pendingJournalPrePass) {
     try {
       const deliveryOutcomes = [
@@ -2554,7 +2556,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
         ...(delivered?.alertIntelligence?.delivery_outcomes ?? []),
       ];
       const currentAlertsForWitness = await readAlertRecords(descartesPaths);
-      const authorizedClosures = deliveryOutcomes
+      authorizedClosures = deliveryOutcomes
         .filter((outcome) => {
           if (outcome.status !== "success") return false;
           const alert = currentAlertsForWitness.find((entry) => entry.id === outcome.alertId);
@@ -2562,30 +2564,47 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           return incident?.status === "closed" && incident.closed_reason === "event_delivered" && incident.close_on_delivery === true;
         })
         .map((outcome) => ({ kind: "closure_authorized", alert_id: outcome.alertId, incident_key: outcome.incidentKey, reason: "event_delivered" }));
-      const labelAuthorizedClosures = (labelIngestion?.audit ?? []).filter((record) => record.kind === "closure_authorized");
-      closureReconciliation = await reconcileAlertClosures(descartesPaths, { now: ts, authorizedClosures: [...authorizedClosures, ...labelAuthorizedClosures] });
+      labelAuthorizedClosures = (labelIngestion?.audit ?? []).filter((record) => record.kind === "closure_authorized");
+      closureReconciliation = await (options.reconcileAlertClosures ?? reconcileAlertClosures)(descartesPaths, { now: ts, authorizedClosures: [...authorizedClosures, ...labelAuthorizedClosures] });
       if (closureReconciliation.changes.length > 0) await writeAlertRecords(descartesPaths, closureReconciliation.alerts);
-      for (const [index, notice] of (closureReconciliation.notices ?? []).entries()) {
-        await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, notice, {
-          now: ts,
-          ruleId: "integrity.unattributed_change",
-          required: true,
-          requiredNoticeId: `integrity.unattributed_change:${closureReconciliation.changes[index].digest}`,
-        });
-      }
-      alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, {
-        now: ts,
-        extraRecords: [
-          ...pendingJournalAuditRecords(pendingJournalPrePass),
-          ...(labelIngestion?.audit ?? []),
-          ...authorizedClosures,
-          ...closureReconciliation.audit,
-        ],
-      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       alertTransitions = { status: "error", error: message };
       console.warn(`descartes: alert transition log write failed (${message}); alerting is unaffected`);
+    }
+    if (closureReconciliation) {
+      const extraRecords = [
+        ...pendingJournalAuditRecords(pendingJournalPrePass),
+        ...(labelIngestion?.audit ?? []),
+        ...authorizedClosures,
+        ...closureReconciliation.audit,
+      ];
+      try {
+        // Audit records are committed before their required notices are delivered. A malformed
+        // notification config or adapter exception must never erase the durable evidence of the
+        // unattributed change that caused the notice.
+        alertTransitions = await (options.recordAlertTransitions ?? recordAlertTransitions)(descartesPaths, {
+          now: ts,
+          extraRecords,
+          verifiedLog: closureReconciliation.transitionLog,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        alertTransitions = { status: "error", error: message };
+        console.warn(`descartes: alert transition log write failed (${message}); alerting is unaffected`);
+      }
+      for (const [index, notice] of (closureReconciliation.notices ?? []).entries()) {
+        try {
+          await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, notice, {
+            now: ts,
+            ruleId: "integrity.unattributed_change",
+            required: true,
+            requiredNoticeId: `integrity.unattributed_change:${closureReconciliation.changes[index].digest}`,
+          });
+        } catch (error) {
+          console.warn(`descartes: closure integrity notice failed (${error instanceof Error ? error.message : String(error)}); it remains pending`);
+        }
+      }
     }
   }
   // C1.4 write order (§6.4.2): journal entries, then alerts.json and the transition log, then the
