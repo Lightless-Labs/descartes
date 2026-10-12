@@ -9,7 +9,7 @@ import { recordAlertTransitions } from "./alert-transitions.js";
 import { maybeSendAlertDigest } from "./alert-digest.js";
 import { ingestAlertLabels, LABEL_NOTICE_RULE_ID } from "./alert-labels.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
-import { deliverPendingDiscontinuityNotice, finishPendingJournalTick, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
+import { deliverPendingDiscontinuityNotice, deliverPendingJournalNotices, finishPendingJournalTick, notificationOutcome, pendingJournalAuditRecords, runPendingJournalPrePass } from "./pending-journal-daemon.js";
 import { alertId, evaluateAndPersistAlerts, fixedAlertIds, FIXED_ALERT_RULE_IDS, isUndeliverableStatus, readAlertRecords, RETENTION_FAILURE_RULE_ID } from "./alert-store.js";
 import { evaluateConstraints } from "./constraint-eval.js";
 import { loadConstraints, loadLearnedConfig, selectFamilyFactStoreCompleteness } from "./constraint-store.js";
@@ -1583,7 +1583,7 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
           // passes as excluded ranges, detect discontinuities and re-certify. Foundation only: it
           // never changes detection, and a failure here is reported, never fatal to the tick.
           try {
-            pendingJournalPrePass = await (options.runPendingJournalPrePass ?? runPendingJournalPrePass)(descartesPaths, { structuralFacts, ts, deliverNotification: options.deliverNotification });
+            pendingJournalPrePass = await (options.runPendingJournalPrePass ?? runPendingJournalPrePass)(descartesPaths, { structuralFacts, ts });
           } catch (error) {
             pendingJournalPrePass = undefined;
             console.warn(`descartes: pending journal pre-pass failed (${error instanceof Error ? error.message : String(error)}); detection is unaffected`);
@@ -2511,6 +2511,15 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
   // Context plan C1.3 (§9, I27, I62): the daemon ingests the CLI's optional labels once each, by id,
   // after this tick's delivery outcomes (so a closure applies at once to a just-delivered incident and
   // waits for delivery otherwise), charges coverage to the label budget, and notifies the batch.
+  // Review L2: the pre-pass's discontinuity notices go out here, after detection and delivery, so a
+  // slow or failing notification channel never delays detection.
+  if (pendingJournalPrePass) {
+    try {
+      await deliverPendingJournalNotices(descartesPaths, pendingJournalPrePass, { ts, deliverNotification: options.deliverNotification });
+    } catch (error) {
+      console.warn(`descartes: pending journal notice failed (${error instanceof Error ? error.message : String(error)}); detection is unaffected`);
+    }
+  }
   let labelIngestion;
   if (alerts) {
     try {
@@ -2522,7 +2531,8 @@ export async function runDaemonIteration(descartesPaths, options = {}) {
       }
       if (labelIngestion?.notice) {
         try {
-          await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID });
+          const outcome = notificationOutcome(await (options.deliverNotification ?? deliverNotificationDecision)(descartesPaths, labelIngestion.notice, { now: ts, ruleId: LABEL_NOTICE_RULE_ID }));
+          if (!outcome.notified) labelIngestion.notify_error = outcome.notify_error;
         } catch (error) {
           labelIngestion.notify_error = error instanceof Error ? error.message : String(error);
         }

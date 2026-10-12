@@ -485,3 +485,26 @@ test("the pre-pass reads the carried witness: a wipe after transition-log compac
   assert.equal(second.families.session.report.created, false);
   assert.equal(second.families.session.report.discontinuity?.cause, "journal_and_checkpoint_missing");
 });
+
+// Adversarial review L2: the pre-pass runs before detection, so it never waits on a notification;
+// the discontinuity notice is delivered after detection, and an error status is not "notified".
+import { deliverPendingJournalNotices } from "../src/pending-journal-daemon.js";
+
+test("the pre-pass never delivers; discontinuity notices go out after detection and an error status is not notified", async () => {
+  const paths = await tempPaths();
+  const structuralFacts = (passId) => ({ families: { session: { written_count: 3, retention: { pass_id: passId, pass_time_ms: T0 + passId * HOUR } } } });
+  const never = async () => { throw new Error("the pre-pass must not deliver"); };
+  await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(1), ts: iso(1), families: ["session"], deliverNotification: never });
+  const { journalFile } = resolvePendingJournalPaths(paths, FAMILY);
+  await fs.writeFile(journalFile, "{not json\n{}\n");
+  const prePass = await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(2), ts: iso(2), families: ["session"], deliverNotification: never });
+  assert.ok(prePass.families.session.report.discontinuity);
+  assert.equal(prePass.families.session.report.notified, undefined);
+  const failed = await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => ({ status: "error", error: "timeout" }) });
+  assert.equal(failed.length, 1);
+  assert.equal(prePass.families.session.report.notified, false);
+  assert.equal(prePass.families.session.report.notify_status, "error");
+  const delivered = await deliverPendingJournalNotices(paths, prePass, { ts: iso(2), deliverNotification: async () => ({ status: "delivered" }) });
+  assert.equal(delivered.length, 1);
+  assert.equal(prePass.families.session.report.notified, true);
+});
