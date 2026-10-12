@@ -90,7 +90,7 @@ export async function runPendingJournalPrePass(descartesPaths, { structuralFacts
         witnessExists: async () => (await journalWitness(descartesPaths, family)).exists,
         priorEpochs: async () => (await journalWitness(descartesPaths, family)).epochs,
         // Review L4: the label log's quarantines, re-applied at a chain-level loss.
-        quarantineScopes: () => labelQuarantineScopes(descartesPaths),
+        quarantineScopes: () => labelQuarantineScopes(descartesPaths, { now: ts }),
         // The census completeness this exit needs is the family's own certified, non-empty commit;
         // C1a, which journals verdicts, tightens it to its detectors' census completeness.
         censusComplete: (passResult.written_count ?? 0) > 0,

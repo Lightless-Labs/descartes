@@ -552,3 +552,11 @@ test("a verified prefix headed by a restart record contributes the epochs its ca
   assert.equal(report.discontinuity.epoch, 3);
   assert.deepEqual(handle.state.epochs.map((epoch) => epoch.epoch), [1, 2, 3]);
 });
+
+test("future-dated quarantining labels are not re-applied before their time", async () => {
+  const { labelQuarantineScopes } = await import("../src/alert-labels.js");
+  const paths = await tempPaths();
+  await appendAlertLabel(paths, { label: "suspicious", scope: { kind: "alert", alert_id: ITEM.alert_id }, now: iso(100) });
+  assert.equal((await labelQuarantineScopes(paths, { now: iso(1) })).length, 0);
+  assert.equal((await labelQuarantineScopes(paths, { now: iso(101) })).length, 1);
+});
