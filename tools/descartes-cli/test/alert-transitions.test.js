@@ -194,3 +194,45 @@ test("deriveAlertTransitions is pure and ignores carried tombstones on a closed 
   assert.equal(records[1].incident_key, "b");
   assert.equal(records[0].from, "closed");
 });
+
+// Adversarial review M3: the transition log is the double-wipe witness for the pending journals, so
+// its witness (journal creations and discontinuity epochs per family) must survive compaction, a
+// broken log and a deleted log.
+import { readAlertTransitionWitness } from "../src/alert-transitions.js";
+
+async function witnessedLog(paths) {
+  await recordAlertTransitions(paths, { now: t(0), alerts: [], extraRecords: [{ kind: "pending_journal_created", family: "session" }, { kind: "pending_discontinuity", family: "session", epoch: 1, cause: "chain_broken" }] });
+}
+
+test("the pending-journal witness survives compaction of the transition log", async () => {
+  const paths = await tempPaths();
+  await witnessedLog(paths);
+  for (let index = 1; index < 60; index += 1) {
+    await recordAlertTransitions(paths, { now: t(index), alerts: [], extraRecords: [{ kind: "excluded_unadjudicated", family: "session", ranges: 1, pad: "x".repeat(200) }], maxBytes: 4000 });
+  }
+  const log = await readAlertTransitions(paths);
+  assert.equal(log.header?.kind, "compacted");
+  assert.ok(!log.records.some((record) => record.kind === "pending_journal_created"), "the creation record itself was compacted away");
+  const witness = await readAlertTransitionWitness(paths);
+  assert.equal(witness.pending_journals.session.created, true);
+  assert.deepEqual(witness.pending_journals.session.epochs.map((epoch) => epoch.epoch), [1]);
+});
+
+test("the pending-journal witness survives a broken log (restart) and a deleted log", async () => {
+  const paths = await tempPaths();
+  const { logFile } = resolveAlertTransitionPaths(paths);
+  await witnessedLog(paths);
+  await recordAlertTransitions(paths, { now: t(1), alerts: [], extraRecords: [{ kind: "excluded_unadjudicated", family: "session", ranges: 1 }] });
+  // One corrupted byte in the first line: no verified prefix survives.
+  const raw = await fs.readFile(logFile, "utf8");
+  await fs.writeFile(logFile, `{x${raw.slice(2)}`);
+  assert.equal((await readAlertTransitionWitness(paths)).pending_journals.session.created, true, "the state file still witnesses while the log is broken");
+  const restarted = await recordAlertTransitions(paths, { now: t(2), alerts: [] });
+  assert.ok(restarted.restarted);
+  assert.equal((await readAlertTransitions(paths)).witness.pending_journals.session.created, true, "the restart record carries the witness");
+  await fs.rm(logFile);
+  await recordAlertTransitions(paths, { now: t(3), alerts: [] });
+  const witness = await readAlertTransitionWitness(paths);
+  assert.equal(witness.pending_journals.session.created, true);
+  assert.deepEqual(witness.pending_journals.session.epochs.map((epoch) => epoch.epoch), [1]);
+});

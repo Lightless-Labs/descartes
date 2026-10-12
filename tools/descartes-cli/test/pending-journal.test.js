@@ -464,3 +464,24 @@ test("a witnessed double wipe carries the transition log's epochs into the budge
   assert.equal(after.state.open_epoch, null, "re-certified");
   assert.equal(pendingAdmissionStatus(after.state, iso(3)).suspended, true, "the budget still counts the witnessed epochs");
 });
+
+// Adversarial review M3 (daemon seam): after the transition log compacted the creation record away,
+// wiping the journal directory is still a witnessed discontinuity, never a silent first run.
+import { recordAlertTransitions } from "../src/alert-transitions.js";
+import { runPendingJournalPrePass } from "../src/pending-journal-daemon.js";
+
+test("the pre-pass reads the carried witness: a wipe after transition-log compaction is a discontinuity", async () => {
+  const paths = await tempPaths();
+  const structuralFacts = (passId) => ({ families: { session: { written_count: 3, retention: { pass_id: passId, pass_time_ms: T0 + passId * HOUR } } } });
+  const first = await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(1), ts: iso(1), families: ["session"], deliverNotification: async () => ({ status: "delivered" }) });
+  assert.equal(first.families.session.report.created, true);
+  await recordAlertTransitions(paths, { now: iso(1), alerts: [], extraRecords: [{ kind: "pending_journal_created", family: "session" }] });
+  for (let index = 1; index < 60; index += 1) {
+    await recordAlertTransitions(paths, { now: iso(1 + index / 100), alerts: [], extraRecords: [{ kind: "excluded_unadjudicated", family: "session", ranges: 1, pad: "x".repeat(200) }], maxBytes: 4000 });
+  }
+  const { dir } = resolvePendingJournalPaths(paths, FAMILY);
+  await fs.rm(dir, { recursive: true });
+  const second = await runPendingJournalPrePass(paths, { structuralFacts: structuralFacts(2), ts: iso(2), families: ["session"], deliverNotification: async () => ({ status: "delivered" }) });
+  assert.equal(second.families.session.report.created, false);
+  assert.equal(second.families.session.report.discontinuity?.cause, "journal_and_checkpoint_missing");
+});

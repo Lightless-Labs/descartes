@@ -4,7 +4,7 @@
 //
 // Every failure is contained per family and reported; nothing here can fail a tick, change which
 // alerts fire, or delay a notification.
-import { readAlertTransitions } from "./alert-transitions.js";
+import { readAlertTransitionWitness } from "./alert-transitions.js";
 import { readFactIntegrityLedger } from "./fact-store-integrity.js";
 import { deliverNotificationDecision } from "./notification-delivery.js";
 import { journalCommittedPass, journalScoredThrough, pendingAdmissionStatus, PENDING_JOURNAL_FAMILIES } from "./pending-journal.js";
@@ -24,12 +24,14 @@ function errorMessage(error) {
   return (error instanceof Error ? error.message : String(error)) || "unknown pending-journal error";
 }
 
-async function journalWitness(descartesPaths, family) {
+// The transition log's witness for a family's journal (review M3): its creation and the epochs it
+// saw, from the log's records, its compaction header, any restart record and its state file.
+export async function journalWitness(descartesPaths, family) {
   try {
-    const log = await readAlertTransitions(descartesPaths);
-    return log.records.some((record) => record.kind === "pending_journal_created" && record.family === family);
+    const entry = (await readAlertTransitionWitness(descartesPaths)).pending_journals[family];
+    return { exists: entry?.created === true, epochs: entry?.epochs ?? [] };
   } catch {
-    return false;
+    return { exists: false, epochs: [] };
   }
 }
 
@@ -60,7 +62,8 @@ export async function runPendingJournalPrePass(descartesPaths, { structuralFacts
         passResult,
         ledger,
         ts,
-        witnessExists: () => journalWitness(descartesPaths, family),
+        witnessExists: async () => (await journalWitness(descartesPaths, family)).exists,
+        priorEpochs: async () => (await journalWitness(descartesPaths, family)).epochs,
         // The census completeness this exit needs is the family's own certified, non-empty commit;
         // C1a, which journals verdicts, tightens it to its detectors' census completeness.
         censusComplete: (passResult.written_count ?? 0) > 0,

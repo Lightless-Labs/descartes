@@ -28,6 +28,10 @@ export const ALERT_TRANSITIONS_SCHEMA_VERSION = 1;
 export const MAX_ALERT_TRANSITIONS_BYTES = 8 * 1024 * 1024;
 
 export const COVERAGE_GAP_KINDS = Object.freeze(new Set(["genesis", "rebaselined", "chain_restart"]));
+// The witness keeps, per pending-journal family, the epochs it saw (the newest few), and the label
+// ingestions within the label memory (review M1/M3).
+export const WITNESS_MAX_EPOCHS_PER_FAMILY = 64;
+export const WITNESS_LABEL_MEMORY_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function resolveAlertTransitionPaths(descartesPaths) {
   const dir = path.join(descartesPaths.stateDir, "alerts");
@@ -195,6 +199,71 @@ export function foldTransitionRecords(projection, records) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Witness (review M3, M1)
+// ------------------------------------------------------------------------------------------------
+//
+// The log witnesses state other files hold: that a family's pending journal exists (so wiping the
+// journal and its checkpoint is a discontinuity, not a first run), the discontinuity epochs it saw
+// (so the budget survives a wipe), and the labels the daemon ingested (so deleting the label state
+// neither resets the label budget nor re-ingests a label). Compaction and a chain restart drop the
+// records themselves, so the witness is carried: in the compaction header, on the chain_restart
+// record, and in alert-transitions.state.json. The header and state file are unchained (same-UID
+// writable, like everything here); a witness can be ADDED to, which only ever holds something back.
+
+export function emptyTransitionWitness() {
+  return { pending_journals: {}, labels: {} };
+}
+
+export function mergeTransitionWitness(...witnesses) {
+  const merged = emptyTransitionWitness();
+  for (const witness of witnesses) {
+    if (!witness || typeof witness !== "object") continue;
+    for (const [family, entry] of Object.entries(witness.pending_journals ?? {})) {
+      if (!entry || typeof entry !== "object") continue;
+      const into = merged.pending_journals[family] ?? { created: false, epochs: [] };
+      into.created = into.created || entry.created === true;
+      for (const epoch of Array.isArray(entry.epochs) ? entry.epochs : []) {
+        if (Number.isSafeInteger(epoch?.epoch) && !into.epochs.some((known) => known.epoch === epoch.epoch)) into.epochs.push({ epoch: epoch.epoch, opened_at: epoch.opened_at ?? null, cause: epoch.cause ?? null });
+      }
+      into.epochs.sort((left, right) => left.epoch - right.epoch);
+      into.epochs = into.epochs.slice(-WITNESS_MAX_EPOCHS_PER_FAMILY);
+      merged.pending_journals[family] = into;
+    }
+    for (const [labelId, entry] of Object.entries(witness.labels ?? {})) {
+      if (!entry || typeof entry.ingested_at !== "string") continue;
+      const known = merged.labels[labelId];
+      if (!known || Date.parse(entry.ingested_at) < Date.parse(known.ingested_at)) merged.labels[labelId] = { ingested_at: entry.ingested_at, charge: Number.isFinite(entry.charge) ? entry.charge : 0, label: entry.label ?? null };
+    }
+  }
+  return merged;
+}
+
+/** Folds log records into a witness (from a compaction header's carried witness, if any). Pure. */
+export function foldTransitionWitness(base, records) {
+  const fromRecords = emptyTransitionWitness();
+  for (const record of records ?? []) {
+    if (record?.carried_witness) Object.assign(fromRecords, mergeTransitionWitness(fromRecords, record.carried_witness));
+    const family = typeof record?.family === "string" ? record.family : null;
+    if (record?.kind === "pending_journal_created" && family) {
+      fromRecords.pending_journals[family] = { created: true, epochs: fromRecords.pending_journals[family]?.epochs ?? [] };
+    } else if (record?.kind === "pending_discontinuity" && family && Number.isSafeInteger(record.epoch)) {
+      Object.assign(fromRecords, mergeTransitionWitness(fromRecords, { pending_journals: { [family]: { created: true, epochs: [{ epoch: record.epoch, opened_at: record.ts ?? null, cause: record.cause ?? null }] } } }));
+    } else if (record?.kind === "label_ingested" && typeof record.label_id === "string" && typeof record.ts === "string") {
+      Object.assign(fromRecords, mergeTransitionWitness(fromRecords, { labels: { [record.label_id]: { ingested_at: record.ts, charge: record.charge, label: record.label } } }));
+    }
+  }
+  return mergeTransitionWitness(base, fromRecords);
+}
+
+function pruneTransitionWitness(witness, nowMs) {
+  const pruned = mergeTransitionWitness(witness);
+  for (const [labelId, entry] of Object.entries(pruned.labels)) {
+    if (nowMs - Date.parse(entry.ingested_at) > WITNESS_LABEL_MEMORY_MS) delete pruned.labels[labelId];
+  }
+  return pruned;
+}
+
+// ------------------------------------------------------------------------------------------------
 // Log I/O
 // ------------------------------------------------------------------------------------------------
 
@@ -209,19 +278,37 @@ export async function readAlertTransitions(descartesPaths) {
   if (!read.exists) return { status: "missing", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: false };
   if (read.bad_line !== null) {
     const partial = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
-    return { status: "broken", reason: "unparseable_line", records: partial.verified, head_seq: partial.head_seq, head_hash: partial.head_hash, coverage_from_ts: null, torn_tail: false };
+    return { status: "broken", reason: "unparseable_line", records: partial.verified, head_seq: partial.head_seq, head_hash: partial.head_hash, coverage_from_ts: null, torn_tail: false, witness: foldTransitionWitness(partial.header?.carried_witness, partial.verified) };
   }
   const chain = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
   const records = chain.verified;
+  const witness = foldTransitionWitness(chain.header?.carried_witness, records);
   let coverageFrom = chain.header?.through_ts ?? null;
   for (const record of records) if (COVERAGE_GAP_KINDS.has(record.kind)) coverageFrom = record.ts;
   if (!chain.ok) {
-    return { status: "broken", reason: chain.reason, records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail };
+    return { status: "broken", reason: chain.reason, records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, witness };
   }
   if (records.length === 0 && !chain.header) {
-    return { status: "missing", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: read.torn_tail };
+    return { status: "missing", records: [], head_seq: 0, head_hash: GENESIS_PREV_HASH, coverage_from_ts: null, torn_tail: read.torn_tail, witness };
   }
-  return { status: "valid", records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, bytes: read.bytes, header: chain.header };
+  return { status: "valid", records, head_seq: chain.head_seq, head_hash: chain.head_hash, coverage_from_ts: coverageFrom, torn_tail: read.torn_tail, bytes: read.bytes, header: chain.header, witness };
+}
+
+/**
+ * The witness from every surviving source: the log (verified records, its compaction header and any
+ * restart record's carried witness) and the state file. Never throws: an unreadable source adds
+ * nothing.
+ */
+export async function readAlertTransitionWitness(descartesPaths) {
+  const { stateFile } = resolveAlertTransitionPaths(descartesPaths);
+  let fromLog = null;
+  try {
+    fromLog = (await readAlertTransitions(descartesPaths)).witness ?? null;
+  } catch {
+    fromLog = null;
+  }
+  const stateRead = await readState(stateFile);
+  return mergeTransitionWitness(fromLog, stateRead.status === "valid" ? stateRead.state.witness : null);
 }
 
 async function readState(stateFile) {
@@ -236,7 +323,7 @@ async function readState(stateFile) {
   }
 }
 
-async function compactIfNeeded(logFile, maxBytes) {
+async function compactIfNeeded(logFile, maxBytes, nowMs) {
   const read = await readJsonlStrict(logFile);
   if (!read.exists || read.bytes <= maxBytes) return false;
   const chain = verifyChain(ALERT_TRANSITION_DOMAIN, read.records);
@@ -253,7 +340,9 @@ async function compactIfNeeded(logFile, maxBytes) {
   const firstKeptIndex = records.length - kept.length;
   if (firstKeptIndex <= 0) return false;
   const cutRecord = records[firstKeptIndex - 1];
-  const header = { kind: "compacted", through_seq: cutRecord.seq, through_hash: cutRecord.hash, through_ts: cutRecord.ts, v: ALERT_TRANSITIONS_SCHEMA_VERSION };
+  // The dropped records' witness rides in the header (review M3).
+  const carriedWitness = pruneTransitionWitness(foldTransitionWitness(chain.header?.carried_witness, records.slice(0, firstKeptIndex)), nowMs);
+  const header = { kind: "compacted", through_seq: cutRecord.seq, through_hash: cutRecord.hash, through_ts: cutRecord.ts, v: ALERT_TRANSITIONS_SCHEMA_VERSION, carried_witness: carriedWitness };
   await atomicWrite(logFile, [header, ...kept].map((record) => `${JSON.stringify(record)}\n`).join(""));
   return true;
 }
@@ -292,19 +381,22 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
   const report = { status: "ok", appended: 0, restarted: null, rebaselined: null };
   let projection;
   const leading = [];
+  const nowMs = Date.parse(now);
+  // Review M3: what the log and the state witness before this tick, carried across a restart.
+  const priorWitness = mergeTransitionWitness(log.witness, stateRead.status === "valid" ? stateRead.state.witness : null);
 
   if (log.torn_tail) await trimTornTail(logFile);
   if (log.status === "broken") {
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.rename(logFile, brokenFile).catch(async () => fs.copyFile(logFile, brokenFile));
-    leading.push({ ts: now, kind: "chain_restart", restart: true, reason: log.reason ?? "broken", lost_head_seq: log.head_seq });
+    leading.push({ ts: now, kind: "chain_restart", restart: true, reason: log.reason ?? "broken", lost_head_seq: log.head_seq, carried_witness: pruneTransitionWitness(priorWitness, nowMs) });
     report.restarted = log.reason ?? "broken";
     projection = stateRead.status === "valid" ? stateRead.state.projection : projectAlerts(alerts);
     log = { status: "missing", head_seq: 0, head_hash: `lost:${log.head_hash}`, records: [] };
   } else if (log.status === "missing") {
     if (stateRead.status === "valid") {
       // The state proves a log existed: its loss is a restart, never a silent genesis.
-      leading.push({ ts: now, kind: "chain_restart", restart: true, reason: "log_missing", lost_head_seq: stateRead.state.head_seq });
+      leading.push({ ts: now, kind: "chain_restart", restart: true, reason: "log_missing", lost_head_seq: stateRead.state.head_seq, carried_witness: pruneTransitionWitness(priorWitness, nowMs) });
       report.restarted = "log_missing";
       projection = stateRead.state.projection;
       log = { status: "missing", head_seq: 0, head_hash: `lost:${stateRead.state.head_hash}`, records: [] };
@@ -343,9 +435,10 @@ export async function recordAlertTransitions(descartesPaths, options = {}) {
   }
   report.appended = bodies.length;
   report.kinds = Object.fromEntries([...new Set(bodies.map((body) => body.kind))].sort().map((kind) => [kind, bodies.filter((body) => body.kind === kind).length]));
-  await atomicWrite(stateFile, JSON.stringify({ v: ALERT_TRANSITIONS_SCHEMA_VERSION, head_seq: head.head_seq, head_hash: head.head_hash, projection: projectAlerts(alerts), updated_at: now }));
+  const witness = pruneTransitionWitness(foldTransitionWitness(priorWitness, bodies), nowMs);
+  await atomicWrite(stateFile, JSON.stringify({ v: ALERT_TRANSITIONS_SCHEMA_VERSION, head_seq: head.head_seq, head_hash: head.head_hash, projection: projectAlerts(alerts), witness, updated_at: now }));
   const maxBytes = options.maxBytes ?? MAX_ALERT_TRANSITIONS_BYTES;
-  if (await compactIfNeeded(logFile, maxBytes)) report.compacted = true;
+  if (await compactIfNeeded(logFile, maxBytes, nowMs)) report.compacted = true;
   report.head_seq = head.head_seq;
   return report;
 }
