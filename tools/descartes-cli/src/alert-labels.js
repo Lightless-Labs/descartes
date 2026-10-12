@@ -261,8 +261,8 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
   // transition log's witness of chained label_ingested records. A deleted or edited state can then
   // neither reset the label budget nor re-ingest a label.
   let rebuiltFromWitness = 0;
+  let witness = null;
   if (labels.length > 0) {
-    let witness = null;
     try {
       witness = await (deps.readAlertTransitionWitness ?? readAlertTransitionWitness)(descartesPaths);
     } catch {
@@ -301,7 +301,9 @@ export async function ingestAlertLabels(descartesPaths, { now, handles = {}, led
     for (const family of families) {
       if (!handles[family]) {
         try {
-          handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts });
+          // The same double-wipe witness and epochs the pre-pass consults (review M3).
+          const journalWitness = witness?.pending_journals?.[family];
+          handles[family] = await openPendingJournal(descartesPaths, family, { ledger: ledgers[family] ?? null, now: ts, witnessExists: journalWitness?.created === true, priorEpochs: journalWitness?.epochs ?? [] });
           // A journal this ingestion creates is witnessed like one the pre-pass creates.
           if (handles[family]?.created) report.audit.push({ kind: "pending_journal_created", family, opened_by: "label_ingestion" });
           // Opening a journal can itself detect a discontinuity: it must be audited and notified

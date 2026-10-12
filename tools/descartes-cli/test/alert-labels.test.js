@@ -255,3 +255,18 @@ test("a future-dated label waits until its time; it is never ingested early", as
   assert.equal(early.ingested.length, 0);
   assert.equal((await readAlertRecords(paths))[0].status, "active");
 });
+
+// Adversarial review M3 (label path): a journal opened by label ingestion consults the same witness
+// as the pre-pass, so a double wipe is never turned into a fresh journal there.
+test("label ingestion opening a wiped, witnessed journal opens a discontinuity, never a fresh journal", async () => {
+  const paths = await tempPaths();
+  await seed(paths, [candidate(LEVEL_ID, "session.count_drop", "lvl:r:2")]);
+  const { resolvePendingJournalPaths } = await import("../src/pending-journal.js");
+  await openPendingJournal(paths, "session", { ledger: null, now: iso(0) });
+  await recordAlertTransitions(paths, { now: iso(0), extraRecords: [{ kind: "pending_journal_created", family: "session" }] });
+  await fs.rm(resolvePendingJournalPaths(paths, "session").dir, { recursive: true });
+  await appendAlertLabel(paths, { label: "confirmed_incident", scope: { kind: "alert", alert_id: LEVEL_ID }, now: iso(2000) });
+  const report = await ingestAlertLabels(paths, { now: iso(3000) });
+  assert.deepEqual(report.discontinuities.map((entry) => entry.cause), ["journal_and_checkpoint_missing"]);
+  assert.ok(!report.audit.some((record) => record.kind === "pending_journal_created"));
+});
